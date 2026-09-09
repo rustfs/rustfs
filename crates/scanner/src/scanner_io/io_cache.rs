@@ -71,7 +71,7 @@ pub(super) fn prepare_scoped_set_scan(
     }
     let unselected_bucket_incarnations =
         unselected_bucket_incarnation_bindings(old_cache, all_buckets, selected_buckets, current_bucket_incarnations)?;
-    let cold_bucket_reuse_proof = (!unselected_bucket_incarnations.is_empty()).then(|| ScopedColdBucketReuseProof {
+    let cold_bucket_reuse_proof = (!unselected_bucket_incarnations.is_empty()).then_some(ScopedColdBucketReuseProof {
         baseline_scan_plan_digest,
         source: generation.source,
         bucket_incarnations: unselected_bucket_incarnations,
