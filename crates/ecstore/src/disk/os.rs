@@ -1449,6 +1449,38 @@ fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
     lock
 }
 
+static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Serializes the complete xl.meta read/modify/commit transaction. This domain
+/// precedes namespace/volume publication locks, whose narrower syscall leases
+/// may retain it after cancellation of the async caller.
+pub(crate) struct MetadataMutationLease {
+    _guard: OwnedMutexGuard<()>,
+    _owner: Option<Arc<dyn Send + Sync>>,
+}
+
+pub(crate) async fn acquire_metadata_mutation_lease(
+    object: &Path,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<MetadataMutationLease> {
+    let lock = {
+        let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(AsyncMutex::new(()));
+            locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Arc::new(MetadataMutationLease {
+        _guard: lock.lock_owned().await,
+        _owner: owner,
+    })
+}
+
 /// Keeps a namespace transaction serialized even when its async waiter is
 /// cancelled while a blocking filesystem call is still running.
 pub(crate) struct NamespaceMutationLease {
@@ -2110,6 +2142,41 @@ pub(crate) async fn rename_all_with_lease(
     .await
     .map_err(to_file_error)?;
     Ok(())
+}
+
+/// Publish a conditional repair and sync its directory in one owned executor.
+/// Cancellation cannot release its metadata/fleet/tier leases between rename
+/// and fsync. The last authority check runs after destination preparation.
+pub(crate) async fn rename_reconciled_metadata(
+    source: PathBuf,
+    destination: PathBuf,
+    base_dir: PathBuf,
+    publication_root: PublicationRoot,
+    owner: Option<Arc<dyn Send + Sync>>,
+    authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
+) -> Result<()> {
+    let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
+        if !authority.is_current() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "transition reconciliation authority expired"));
+        }
+        rename_prepared(&source, &destination, &preparation)?;
+        if let Some(parent) = destination.parent() {
+            fsync_dir_std(parent)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            DiskError::OutdatedXLMeta
+        } else {
+            to_file_error(err).into()
+        }
+    })
 }
 
 #[cfg(windows)]

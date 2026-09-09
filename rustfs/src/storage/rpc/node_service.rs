@@ -182,10 +182,10 @@ fn remove_heal_control_replay(
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 // v3 additionally promises the v6 tier-delete dispatch-manifest policy; v4
-// promises the sticky per-target decommission capacity fence. The
-// existing periodic topology probe carries both capabilities so normal object
-// operations do not add another peer RPC.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 4;
+// promises the sticky per-target decommission capacity fence; v5 supports
+// conditional transition-state repair and preserves its destination binding.
+// Normal object operations reuse the periodic topology capability probe.
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 5;
 
 fn encode_heal_capability_response(
     topology_member: &str,

@@ -3904,7 +3904,9 @@ pub(crate) async fn read_legacy_transition_state_metadata_copies(
         return Err(DiskError::DiskNotFound);
     }
 
-    let (copies, errs) = SetDisks::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), false).await;
+    // Include inline bytes in the generation: a conditional repair preserves
+    // the entire xl.meta, including payloads belonging to other versions.
+    let (copies, errs) = SetDisks::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), true).await;
     for err in errs.into_iter().flatten() {
         if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) {
             return Err(err);
@@ -4262,7 +4264,7 @@ impl SetDisks {
         self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
     }
 
-    async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
+    pub(crate) async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
         let hash = self.get_object_metadata_cache_hash(bucket, object);
         let hash_bytes = hash.to_le_bytes();
         let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
