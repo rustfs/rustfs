@@ -715,7 +715,7 @@ where
     );
     let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
         &dirty_usage_snapshot,
-        dirty_usage_producer_evidence(&dirty_usage_snapshot),
+        scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources),
         distributed,
         distributed_segment_invalidation_evidence,
         cold_zero_walk_oracle,

@@ -594,6 +594,18 @@ pub struct DataUsageSnapshotIdentity {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSegmentInvalidationProof {
+    #[serde(default)]
+    pub process_epoch: String,
+    #[serde(default)]
+    pub generation_start: u64,
+    #[serde(default)]
+    pub generation_end: u64,
+    #[serde(default)]
+    pub producer_identity_coverage_complete: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataUsageSnapshotSetState {
     pub pool_index: u64,
     pub set_index: u64,
@@ -607,6 +619,8 @@ pub struct DataUsageSnapshotSetState {
     pub complete: bool,
     #[serde(default)]
     pub tombstone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_invalidation_proof: Option<DataUsageSegmentInvalidationProof>,
 }
 
 impl DataUsageInfo {
@@ -3073,6 +3087,7 @@ mod tests {
             scan_plan_digest: Some([1; 32]),
             complete: false,
             tombstone: false,
+            segment_invalidation_proof: None,
         }];
         assert!(observed_data_usage_is_newer(&partial, &authoritative));
     }
@@ -3095,6 +3110,7 @@ mod tests {
                     scan_plan_digest: Some([1; 32]),
                     complete: true,
                     tombstone: false,
+                    segment_invalidation_proof: None,
                 },
                 DataUsageSnapshotSetState {
                     pool_index: 1,
@@ -3104,6 +3120,7 @@ mod tests {
                     scan_plan_digest: Some([2; 32]),
                     complete: false,
                     tombstone: false,
+                    segment_invalidation_proof: None,
                 },
             ],
             ..Default::default()
@@ -3111,6 +3128,41 @@ mod tests {
         assert!(!partial.is_valid_partial_snapshot());
         partial.usage_snapshot_set_states[1].scan_plan_digest = Some([1; 32]);
         assert!(partial.is_valid_partial_snapshot());
+    }
+
+    #[test]
+    fn set_state_segment_invalidation_proof_is_additive() {
+        #[derive(Deserialize)]
+        struct LegacySetState {
+            pool_index: u64,
+            set_index: u64,
+            complete: bool,
+        }
+
+        let proof = DataUsageSegmentInvalidationProof {
+            process_epoch: "scanner-process".to_string(),
+            generation_start: 3,
+            generation_end: 5,
+            producer_identity_coverage_complete: true,
+        };
+        let state = DataUsageSnapshotSetState {
+            pool_index: 1,
+            set_index: 2,
+            scanner_cycle: Some(9),
+            scanner_epoch: Some(4),
+            scan_plan_digest: Some([7; 32]),
+            complete: true,
+            tombstone: false,
+            segment_invalidation_proof: Some(proof.clone()),
+        };
+        let encoded = rmp_serde::to_vec_named(&state).expect("set state should encode with additive proof");
+        let legacy: LegacySetState = rmp_serde::from_slice(&encoded).expect("legacy readers should ignore proof metadata");
+        assert_eq!(legacy.pool_index, 1);
+        assert_eq!(legacy.set_index, 2);
+        assert!(legacy.complete);
+
+        let decoded: DataUsageSnapshotSetState = rmp_serde::from_slice(&encoded).expect("new readers should restore proof");
+        assert_eq!(decoded.segment_invalidation_proof, Some(proof));
     }
 
     #[test]
