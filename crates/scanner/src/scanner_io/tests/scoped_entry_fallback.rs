@@ -275,10 +275,42 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_
     run_entry(&store, 1, Some(&hot), false, false, false).await;
     let usage = run_entry(&store, 2, Some(&hot), true, true, false).await;
     persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable whole-cycle publication should acknowledge the initial producer window");
+    put_and_settle(&store, &hot, "hot-segment/object").await;
+    record_dirty_usage_object_from_producer(
+        &hot,
+        "hot-segment/object",
+        crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
+    );
     let usage = run_entry(&store, 3, Some(&hot), true, true, true).await;
-    assert_eq!(usage.buckets_usage[&hot].objects_count, 1);
+    assert_eq!(usage.buckets_usage[&hot].objects_count, 2);
     assert_eq!(usage.buckets_usage[&cold].objects_count, 1);
-    assert_eq!(usage.objects_total_count, 2);
+    assert_eq!(usage.objects_total_count, 3);
+
+    persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable prefix publication should acknowledge the typed suffix");
+    for index in 0..=MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET {
+        record_dirty_usage_object_from_producer(
+            &hot,
+            &format!("overflow-{index}/object"),
+            crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
+        );
+    }
+    let usage = run_entry(&store, 4, Some(&hot), true, true, false).await;
+    assert_eq!(usage.objects_total_count, 3);
+
+    persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable whole-bucket fallback should acknowledge the overflow window");
+    record_dirty_usage_object_from_producer(
+        &hot,
+        "hot-segment/object",
+        crate::segment_invalidation::SegmentInvalidationProducerIdentity::Unknown,
+    );
+    let usage = run_entry(&store, 5, Some(&hot), true, false, false).await;
+    assert_eq!(usage.objects_total_count, 3);
     clear_dirty_usage_buckets_for_tests();
 }
 
