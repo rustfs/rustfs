@@ -48,6 +48,20 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "root_authority_evidence",
         "quota_authority_evidence",
     ),
+    "G02": (
+        "bounded_checkpoint_oracle",
+        "independent_version_inventory",
+    ),
+    "G03": (
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle",
+    ),
+    "G04": (
+        "cache_boundary_crash_evidence",
+        "root_floor_intent_crash_evidence",
+    ),
     "G05": (
         "per_object_outcome_oracle",
         "terminal_retention_bounds",
@@ -66,21 +80,28 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "disk_full_matrix",
         "replica_loss_matrix",
     ),
-    "G03": (
-        "durable_root_publication_proof",
-        "scoped_ack_request_identity",
-        "participating_peer_capability_snapshot",
-        "mixed_peer_ack_fallback_oracle",
-    ),
     "G09": (
         "mixed_version_reader_evidence",
         "mixed_version_writer_evidence",
         "rollback_payload_evidence",
     ),
+    "G10": (
+        "scheduler_bound_evidence",
+        "pressure_recovery_evidence",
+    ),
     "G11": (
         "maintenance_producer_matrix",
         "complete_producer_inventory",
         "segment_activation_preflight",
+    ),
+    "G12": (
+        "reset_quota_path_evidence",
+        "settlement_quota_path_evidence",
+    ),
+    "G13": (
+        "quorum_minus_one_matrix",
+        "unknown_disk_remount_matrix",
+        "object_lock_dry_run_grace_evidence",
     ),
     "G14": (
         "same_window_field_evidence",
@@ -89,15 +110,30 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "multi_pool_evidence",
         "distributed_segment_invalidation_evidence",
     ),
+    "P1": (
+        "cold_walk_share_measurement",
+        "foreground_latency_throughput_measurement",
+        "profile_evidence",
+    ),
+    "P2": (
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement",
+    ),
+    "P3": (
+        "two_hour_pressure_measurement",
+        "heal_capacity_measurement",
+        "recovery_window_measurement",
+    ),
     "P4": (
         "mrf_scale_measurement",
         "mrf_replay_cost_measurement",
         "retained_responsibility_evidence",
         "mrf_cleanup_gc_soak_evidence",
     ),
-    "P2": (
-        "post_stop_convergence_measurement",
-        "cold_segment_reuse_measurement",
+    "R-E": (
+        "fixed_budget_restart_evidence",
+        "enumeration_evidence",
+        "classification_evidence",
     ),
     "R-D": (
         "manager_disposition_evidence",
@@ -112,25 +148,25 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
     ),
 }
 SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
-    "G01": ("root_authority_evidence", "quota_authority_evidence"),
-    "G02": ("bounded_checkpoint_oracle", "independent_version_inventory"),
+    "G01": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G01"],
+    "G02": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G02"],
     "G03": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G03"],
-    "G04": ("cache_boundary_crash_evidence", "root_floor_intent_crash_evidence"),
+    "G04": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G04"],
     "G05": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G05"],
     "G06": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G06"],
-    "G07": ("mrf_responsibility_oracle", "commit_boundary_crash_matrix"),
-    "G08": ("mrf_capacity_evidence", "disk_full_matrix", "replica_loss_matrix"),
+    "G07": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G07"],
+    "G08": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G08"],
     "G09": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G09"],
-    "G10": ("scheduler_bound_evidence", "pressure_recovery_evidence"),
+    "G10": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G10"],
     "G11": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G11"],
-    "G12": ("reset_quota_path_evidence", "settlement_quota_path_evidence"),
-    "G13": ("quorum_minus_one_matrix", "unknown_disk_remount_matrix", "object_lock_dry_run_grace_evidence"),
+    "G12": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G12"],
+    "G13": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G13"],
     "G14": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G14"],
-    "P1": ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence"),
+    "P1": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P1"],
     "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
-    "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
+    "P3": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P3"],
     "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
-    "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
+    "R-E": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-E"],
     "R-D": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-D"],
     "R-L": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-L"],
 }
@@ -4670,27 +4706,14 @@ class SelfTests(unittest.TestCase):
             self.assertIn("ec8-4-multiset", status["pending_lanes"])
             self.assertIn("scheduler-pressure", status["pending_lanes"])
             requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
-            self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
-            self.assertIn("root_authority_evidence", requirements["G01"]["evidence_fields"])
-            self.assertIn("per_object_outcome_oracle", requirements["G05"]["evidence_fields"])
-            self.assertIn("truncation_behavior", requirements["G06"]["evidence_fields"])
-            self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
-            self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
-            self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
-            self.assertIn("distributed_segment_invalidation_evidence", requirements["G14"]["evidence_fields"])
-            self.assertIn("cold_segment_reuse_measurement", requirements["P2"]["evidence_fields"])
-            self.assertEqual(
-                tuple(requirements["P4"]["evidence_fields"]),
-                SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
-            )
-            self.assertIn("grace_handling", requirements["R-D"]["evidence_fields"])
-            self.assertIn("migration_gap_evidence", requirements["R-L"]["evidence_fields"])
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
+                self.assertEqual(tuple(requirements[gate]["evidence_fields"]), expected_fields, gate)
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G01", "G03", "G05", "G06", "G07", "G08", "G09", "G11", "G14", "P2", "P4", "R-D", "R-L"):
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []
@@ -4704,7 +4727,7 @@ class SelfTests(unittest.TestCase):
                 registry = read_json(root / ".config/scanner-heal-required-tests.json")
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
-                        requirement["evidence_fields"] = list(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS[gate])
+                        requirement["evidence_fields"] = list(expected_fields)
                         break
 
     def test_scanner_heal_ec84_case_rejects_wrong_erasure_geometry(self) -> None:
