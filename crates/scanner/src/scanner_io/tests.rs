@@ -367,7 +367,48 @@ fn scanner_segment_reuse_activation_replays_cold_durable_baseline() {
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
-        vec!["missing_producer_identity", "restart_gap", "missing_cold_zero_walk_oracle"]
+        vec!["missing_cold_zero_walk_oracle"]
+    );
+
+    clear_dirty_usage_buckets(dirty_usage_snapshot.buckets.as_ref());
+    record_dirty_usage_object_from_producer("photos", "2027/object", SegmentInvalidationProducerIdentity::PutObject);
+    let later_dirty_usage_snapshot =
+        snapshot_dirty_usage_buckets(&[bucket_info("photos"), bucket_info("archive")], dirty_usage_generation());
+    let preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        &later_dirty_usage_snapshot,
+        false,
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    record_dirty_usage_bucket("photos");
+    let unidentified_snapshot =
+        snapshot_dirty_usage_buckets(&[bucket_info("photos"), bucket_info("archive")], dirty_usage_generation());
+    let preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        &unidentified_snapshot,
+        false,
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert!(
+        preflight
+            .fail_closed_blockers()
+            .any(|blocker| blocker == "missing_producer_identity")
     );
     clear_dirty_usage_buckets_for_tests();
 }
@@ -1399,6 +1440,8 @@ fn dirty_usage_producer_evidence_tracks_process_local_coverage_without_durable_r
     assert!(evidence.producer_identity_coverage_complete);
     assert!(!evidence.durable_producer_identity);
     assert!(!evidence.restart_gap_absent);
+    assert_eq!(evidence.generation_start, snapshot.buckets["photos"]);
+    assert_eq!(evidence.generation_end, snapshot.buckets["photos"]);
 
     record_dirty_usage_bucket_from_producer("videos", SegmentInvalidationProducerIdentity::PutObject);
     let stale_evidence = dirty_usage_producer_evidence(&snapshot);

@@ -83,6 +83,25 @@ impl SegmentInvalidationProducerIdentity {
         Self::DirectoryObject,
     ];
 
+    pub(crate) const REQUIRED_PRODUCTION_COVERAGE_MASK: u64 = (1_u64 << 11) - 1;
+
+    pub(crate) const fn production_coverage_bit(self) -> Option<u64> {
+        match self {
+            Self::PutObject => Some(1_u64 << 0),
+            Self::DeleteObject => Some(1_u64 << 1),
+            Self::DeleteMarker => Some(1_u64 << 2),
+            Self::CompleteMultipartUpload => Some(1_u64 << 3),
+            Self::AbortMultipartUpload => Some(1_u64 << 4),
+            Self::ObjectMetadata => Some(1_u64 << 5),
+            Self::BucketMetadata => Some(1_u64 << 6),
+            Self::Replication => Some(1_u64 << 7),
+            Self::TierTransition => Some(1_u64 << 8),
+            Self::TierExpiration => Some(1_u64 << 9),
+            Self::DirectoryObject => Some(1_u64 << 10),
+            Self::Unknown | Self::TestFixture => None,
+        }
+    }
+
     pub fn producer(self) -> Option<SegmentInvalidationProducer> {
         match self {
             Self::PutObject => Some(SegmentInvalidationProducer::Put),
@@ -400,6 +419,13 @@ mod tests {
 
     #[test]
     fn segment_invalidation_producer_identities_must_be_known_and_complete() {
+        let coverage_mask = SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+            .into_iter()
+            .filter_map(SegmentInvalidationProducerIdentity::production_coverage_bit)
+            .fold(0_u64, std::ops::BitOr::bitor);
+        assert_eq!(coverage_mask, SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK);
+        assert_eq!(SegmentInvalidationProducerIdentity::Unknown.production_coverage_bit(), None);
+        assert_eq!(SegmentInvalidationProducerIdentity::TestFixture.production_coverage_bit(), None);
         assert_eq!(
             complete_segment_invalidation_producers(SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION),
             Ok(SegmentInvalidationProducer::REQUIRED.into_iter().collect())
