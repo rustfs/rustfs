@@ -1968,9 +1968,11 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                     f"{gate}.{artifact_field} artifact hash mismatch")
             artifact_format = evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
                                               r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
-            if "measurement_window_id" in item:
-                require(item["measurement_window_id"] == window_id,
-                        f"{gate}.{artifact_field} measurement window mismatch")
+            require(item.get("source_revision") == source_revision,
+                    f"{gate}.{artifact_field} source revision mismatch")
+            require(item.get("run_id") == run_id, f"{gate}.{artifact_field} run_id mismatch")
+            require(item.get("measurement_window_id") == window_id,
+                    f"{gate}.{artifact_field} measurement window mismatch")
             if is_json_artifact_format(artifact_format):
                 validate_release_bundle_json_artifact_payload(
                     artifact_path,
@@ -2346,6 +2348,8 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
                         "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
                         "sha256": digest(profile_artifact),
                         "artifact_format": "json",
+                        "source_revision": source_revision,
+                        "run_id": evidence["run_id"],
                         "measurement_window_id": evidence["measurement_window_id"],
                     }
                 evidence["profile_artifacts"] = artifacts
@@ -2783,6 +2787,9 @@ class SelfTests(unittest.TestCase):
                             "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
                             "sha256": digest(profile_artifact),
                             "artifact_format": "json",
+                            "source_revision": source_revision,
+                            "run_id": run_id,
+                            "measurement_window_id": window_id,
                         }
                     evidence["profile_artifacts"] = artifacts
                 if gate == "P1" and field == "cold_walk_share_measurement":
@@ -2977,6 +2984,20 @@ class SelfTests(unittest.TestCase):
                 "profile_evidence",
                 lambda item: item["profile_artifacts"]["rss-samples"].update({"sha256": "0" * 64}),
                 "artifact hash mismatch",
+            ),
+            (
+                "profile-artifact-source",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["allocation-profile"].update({"source_revision": "c" * 40}),
+                "source revision mismatch",
+            ),
+            (
+                "profile-artifact-run",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["flamegraph"].update({"run_id": "p1-different-profile-run"}),
+                "run_id mismatch",
             ),
             (
                 "profile-artifact-window",
@@ -3249,6 +3270,8 @@ class SelfTests(unittest.TestCase):
                     payload = read_json(artifact)
                     payload["measurement_window_id"] = evidence["measurement_window_id"]
                     write_json(artifact, payload)
+                    if "measurement_window_id" in item:
+                        item["measurement_window_id"] = evidence["measurement_window_id"]
                     item["sha256"] = digest(artifact)
                 write_json(bundle, data)
 
