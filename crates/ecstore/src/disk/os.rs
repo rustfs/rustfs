@@ -452,13 +452,13 @@ pub(crate) mod windows_rename_test_hooks {
 
 /// Test-only hooks into the destination-parent walk of rename preparation.
 ///
-/// The prune race lives between two syscalls inside
+/// Pruning and Windows sharing races live between syscalls inside
 /// [`mkdir_all_below_existing_base_std`], so only an injection at that exact
 /// point reproduces it deterministically. Hooks are keyed by the absolute path
 /// of the component just opened and queued per path: a retrying preparation
 /// visits the same component again, so a test models a pruner that keeps
 /// walking upward by queueing one hook per visit.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) mod prepare_rename_test_hooks {
     use super::*;
 
@@ -4208,11 +4208,14 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let mut handles = Vec::with_capacity(capacity);
         handles.push(publication_root.directory.clone());
         let mut guard = ExistingBaseDirectoryGuard::new(handles);
-        for component in base_relative.components() {
+        let mut components = base_relative
+            .components()
+            .map(|component| (component, FILE_OPEN))
+            .chain(relative.components().map(|component| (component, FILE_OPEN_IF)))
+            .filter(|(component, _)| !matches!(component, Component::CurDir))
+            .peekable();
+        while let Some((component, disposition)) = components.next() {
             let Component::Normal(component) = component else {
-                if matches!(component, Component::CurDir) {
-                    continue;
-                }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "rename base directory contains an invalid path component",
@@ -4222,40 +4225,22 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows publication root guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN)?;
-            guard.handles.push(child);
-        }
-        for component in relative.components() {
-            let Component::Normal(component) = component else {
-                continue;
+            // The kernel opens the final parent for write during a relative
+            // rename. Share writes from its first open: a temporary read-only
+            // share would block another rename into the same trash directory.
+            // Ancestors stay strict and no handle shares delete access, keeping
+            // every retained directory identity pinned.
+            let share_access = if components.peek().is_none() {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ
             };
-            let parent = guard
-                .handles
-                .last()
-                .ok_or_else(|| io::Error::other("Windows base directory guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF)?;
+            let child = open_windows_relative_directory_component(parent, component, disposition, share_access)?;
             guard.handles.push(child);
-        }
-
-        // Windows resolves a handle-relative rename by opening the target for
-        // write. Keep every ancestor strict, but let that internal open share
-        // the final parent. Delete sharing remains omitted, so the retained
-        // directory entry cannot be renamed or removed during publication.
-        if guard.handles.len() > 1 {
-            let component = dir_path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination parent must have a name"))?;
-            let parent_index = guard.handles.len() - 2;
-            let parent = guard
-                .handles
-                .get(parent_index)
-                .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
-            let rename_parent =
-                open_windows_relative_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
-            *guard
-                .handles
-                .last_mut()
-                .ok_or_else(|| io::Error::other("Windows destination guard is empty"))? = rename_parent;
+            #[cfg(test)]
+            if components.peek().is_none() {
+                prepare_rename_test_hooks::run_after_component_opened(dir_path);
+            }
         }
 
         Ok(guard)
@@ -5444,6 +5429,111 @@ mod tests {
 
         assert!(!src.exists());
         assert_eq!(std::fs::read(dst).expect("read committed metadata"), b"metadata");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_all_concurrent_trash_renames_remove_every_rollback_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let trash = temp_dir.path().join(".rustfs.sys/tmp/.trash");
+        std::fs::create_dir_all(&trash).expect("create trash directory");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+        let sources: Vec<_> = (0..16)
+            .map(|index| {
+                let source = temp_dir
+                    .path()
+                    .join(format!("bucket/{index}.mp4"))
+                    .join(uuid::Uuid::new_v4().to_string());
+                std::fs::create_dir_all(&source).expect("create rollback directory");
+                std::fs::write(source.join("xl.meta.bkp"), b"rollback metadata").expect("write metadata backup");
+                source
+            })
+            .collect();
+
+        let results = futures::future::join_all(sources.iter().enumerate().map(|(index, source)| {
+            super::rename_all_ignore_missing_source(source, trash.join(index.to_string()), &trash, &publication_root)
+        }))
+        .await;
+
+        for (index, (source, result)) in sources.iter().zip(results).enumerate() {
+            result.expect("concurrent rollback cleanup must reach the shared trash directory");
+            assert!(!source.exists(), "rollback cleanup must not leave a directory in the bucket");
+            assert_eq!(
+                std::fs::read(trash.join(index.to_string()).join("xl.meta.bkp")).expect("read moved metadata backup"),
+                b"rollback metadata",
+                "trash staging must retain the complete backup"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_trash_rename_succeeds_during_concurrent_parent_preparation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::{
+            Foundation::{ERROR_SHARING_VIOLATION, GENERIC_WRITE},
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+        };
+
+        // Exercise the final parent both in the existing base walk and in the
+        // creatable suffix walk. Neither may briefly deny write sharing.
+        for nested_parent in [false, true] {
+            let temp_dir = tempdir().expect("create temp dir");
+            let tmp = temp_dir.path().join(".rustfs.sys/tmp");
+            let trash = tmp.join(".trash");
+            std::fs::create_dir_all(&trash).expect("create trash directory");
+            let base = if nested_parent { &tmp } else { &trash };
+            let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+            let sources = ["first", "second"].map(|name| {
+                let source = temp_dir
+                    .path()
+                    .join("bucket")
+                    .join(name)
+                    .join(uuid::Uuid::new_v4().to_string());
+                std::fs::create_dir_all(&source).expect("create rollback directory");
+                std::fs::write(source.join("xl.meta.bkp"), name.as_bytes()).expect("write metadata backup");
+                source
+            });
+            let destinations = [trash.join("first"), trash.join("second")];
+            let first_preparation = prepare_rename_with_retry(&sources[0], &destinations[0], base, &publication_root)
+                .expect("prepare the first trash rename");
+            let first_source = sources[0].clone();
+            let first_destination = destinations[0].clone();
+            let interleaved = Arc::new(AtomicBool::new(false));
+            let interleaved_hook = Arc::clone(&interleaved);
+            prepare_rename_test_hooks::queue_after_component_opened(&trash, move || {
+                interleaved_hook.store(true, Ordering::Release);
+                rename_prepared(&first_source, &first_destination, &first_preparation)
+                    .expect("another preparation's first parent handle must allow the pending trash rename");
+            });
+
+            let second_preparation = prepare_rename_with_retry(&sources[1], &destinations[1], base, &publication_root)
+                .expect("prepare the second trash rename");
+            assert!(interleaved.load(Ordering::Acquire), "the competing parent-open window must be exercised");
+            for (path, access) in [(&tmp, GENERIC_WRITE), (&trash, DELETE)] {
+                let err = std::fs::OpenOptions::new()
+                    .access_mode(access)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+                    .expect_err("ancestor writes and final-parent deletion must remain excluded");
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code must fit i32"))
+                );
+            }
+            rename_prepared(&sources[1], &destinations[1], &second_preparation).expect("publish the second trash rename");
+            for (index, payload) in [b"first".as_slice(), b"second".as_slice()].into_iter().enumerate() {
+                assert!(!sources[index].exists(), "both rollback directories must leave the bucket");
+                assert_eq!(
+                    std::fs::read(destinations[index].join("xl.meta.bkp")).expect("read the staged backup"),
+                    payload
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
