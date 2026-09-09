@@ -61,6 +61,7 @@ their issue closes.
 | `run_scanner_heal_checkpoint_crash_evidence.py` | dev-tool | Assembles measured Scanner/Heal G02/R-E checkpoint and restart release descriptors from scanner restart diagnostic reports | `diagnose_scanner_enumeration_restart.py`; `test_scanner_heal_checkpoint_crash_evidence.sh` |
 | `run_scanner_heal_g14_multiset_evidence.py` | dev-tool | Assembles measured Scanner/Heal G14 same-window EC8+4 multi-set/multi-pool release descriptors from e2e case directories or an operator-collected proof | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_g14_multiset_evidence.sh` |
 | `run_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Runs the G09 mixed-version and rollback upgrade E2E lanes against a pinned previous release and verifies the raw evidence artifacts | `docs/testing/ci-gates.md`; `.github/workflows/e2e-upgrade.yml`; `test_scanner_heal_g09_upgrade_evidence.sh` |
+| `run_scanner_heal_scoped_ack_evidence.py` | dev-tool | Assembles measured Scanner/Heal G03 scoped ACK publication and mixed-peer fallback release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_scoped_ack_evidence.sh` |
 | `run_scanner_heal_legacy_rollback_evidence.py` | dev-tool | Assembles measured Scanner/Heal R-L legacy source-conflict, migration-gap, and source-retirement release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_legacy_rollback_evidence.sh` |
 | `run_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Assembles measured Scanner/Heal G10/P1/P3 scheduler-pressure release descriptors from a completed measured ABBA run, recovery-window proof, and profile artifacts | `docs/operations/scanner-benchmark-runbook.md`; `test_scanner_heal_scheduler_pressure_evidence.sh` |
 | `run_scanner_heal_status_outcome_evidence.py` | dev-tool | Assembles measured Scanner/Heal G05/G06/R-D status-and-outcome release descriptors from status, compatibility, and disposition artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_status_outcome_evidence.sh` |
@@ -70,6 +71,7 @@ their issue closes.
 | `test_scanner_validation_harness.sh` | dev-tool | Self-test for the scanner validation harness | — |
 | `test_scanner_heal_checkpoint_crash_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal checkpoint/crash evidence assembler | — |
 | `test_scanner_heal_authority_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G01 authority evidence assembler | — |
+| `test_scanner_heal_scoped_ack_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G03 scoped ACK evidence assembler | — |
 | `test_scanner_heal_legacy_rollback_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal R-L legacy rollback evidence assembler | — |
 | `test_scanner_heal_g14_multiset_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G14 multi-set/multi-pool evidence assembler | — |
 | `test_scanner_heal_scheduler_pressure_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal scheduler-pressure evidence assembler | — |

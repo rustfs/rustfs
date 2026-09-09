@@ -34,6 +34,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_scanner_validation_harness.sh
 	./scripts/test_scanner_heal_checkpoint_crash_evidence.sh
 	./scripts/test_scanner_heal_authority_evidence.sh
+	./scripts/test_scanner_heal_scoped_ack_evidence.sh
 	./scripts/test_scanner_heal_legacy_rollback_evidence.sh
 	./scripts/test_scanner_heal_g14_multiset_evidence.sh
 	./scripts/test_scanner_heal_scheduler_pressure_evidence.sh

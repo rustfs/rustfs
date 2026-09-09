@@ -294,6 +294,18 @@ root authority, and incomplete quota authority inputs before writing
 needs the full bundle assembler and the remaining release lanes before a release
 can be approved.
 
+Operator-collected G03 scoped ACK evidence can be packaged with:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_scoped_ack_evidence.py \
+  --proof-json /path/to/scoped-ack-proof.json \
+  --out-dir /path/to/scoped-ack-descriptor
+```
+
+The producer requires durable root publication, exact request identity,
+participating peer capability, mixed-peer fallback, and mixed-version
+provenance before writing `release-bundle-scoped-ack.json`.
+
 The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON
 artifacts with:
 
