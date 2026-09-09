@@ -3079,12 +3079,7 @@ impl ECStore {
         let store = Arc::clone(self);
         let write = async move {
             let object = "buckets/.scanner-pause-backlog.json";
-            let mut opts = ObjectOptions {
-                max_parity: true,
-                http_preconditions: Some(preconditions),
-                write_completion: crate::object_api::WriteCompletion::TailDrained,
-                ..Default::default()
-            };
+            let mut opts = ObjectOptions::default();
             // Match migration: fixed object namespace -> durable pool metadata ->
             // actual replica namespace. The replica need not be the hash-routed set.
             let object_guard = if store.single_pool() {
@@ -3110,9 +3105,14 @@ impl ECStore {
             } else {
                 None
             };
-            let result = set
-                .put_object(RUSTFS_META_BUCKET, object, &mut PutObjReader::from_vec(data), &opts)
-                .await;
+            let result = crate::data_movement::scanner_backlog::persist_native_scanner_pause_backlog_replica(
+                set,
+                data,
+                preconditions,
+                opts,
+                "publish",
+            )
+            .await;
             drop(capacity_guard);
             drop(object_guard);
             result
@@ -3747,29 +3747,37 @@ impl ECStore {
         opts: &ObjectOptions,
         no_lock: bool,
     ) -> Result<usize> {
+        let capacity_owner = DecommissionCapacityOwner::from_options(opts);
         match self
             .get_pool_info_existing_with_opts(bucket, object, &data_movement_pool_lookup_opts(opts, no_lock))
             .await
         {
-            Ok((pinfo, _)) => Ok(pinfo.index),
+            Ok((pinfo, _)) => {
+                if let Some(owner) = capacity_owner {
+                    if self.is_decommission_capacity_target_reserved(owner, pinfo.index).await? {
+                        return Ok(pinfo.index);
+                    }
+                } else {
+                    return Ok(pinfo.index);
+                }
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(err);
                 }
-
-                if let Some(owner) = DecommissionCapacityOwner::from_options(opts) {
-                    let expected_data_bytes = opts
-                        .capacity_expected_data_bytes()
-                        .or_else(|| usize::try_from(size).ok())
-                        .unwrap_or_default();
-                    return self
-                        .select_decommission_capacity_target_pool(owner, expected_data_bytes)
-                        .await;
-                }
-
-                self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
             }
         }
+        if let Some(owner) = capacity_owner {
+            let expected_data_bytes = opts
+                .capacity_expected_data_bytes()
+                .or_else(|| usize::try_from(size).ok())
+                .unwrap_or_default();
+            return self
+                .select_decommission_capacity_target_pool(owner, expected_data_bytes)
+                .await;
+        }
+
+        self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
     }
 
     async fn find_data_movement_target_info(

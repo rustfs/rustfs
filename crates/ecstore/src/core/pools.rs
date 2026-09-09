@@ -9088,7 +9088,7 @@ pub(crate) struct DecommissionPoolCapacityInfo {
 }
 
 impl DecommissionPoolCapacityInfo {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn for_test(
         pool_index: usize,
         layout: DecommissionErasureLayout,
@@ -9111,17 +9111,17 @@ impl DecommissionPoolCapacityInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 type DecommissionCapacityInfoOverrides =
     std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
 
 /// Queues capacity snapshots consumed in order by `get_decommission_all_pool_capacity_infos`;
 /// the final snapshot is retained and replayed for every subsequent sample, so tests never
 /// fall back to the host's real disk statistics once an override is installed.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn set_decommission_capacity_info_overrides_for_test(
     store_id: uuid::Uuid,
     snapshots: Vec<Vec<DecommissionPoolCapacityInfo>>,
@@ -9133,7 +9133,7 @@ pub(crate) fn set_decommission_capacity_info_overrides_for_test(
         .insert(store_id, snapshots.into());
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn take_decommission_capacity_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<DecommissionPoolCapacityInfo>> {
     let mut overrides = DECOMMISSION_CAPACITY_INFO_OVERRIDES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -11856,7 +11856,7 @@ impl ECStore {
     }
 
     async fn get_decommission_all_pool_capacity_infos(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
             return Ok(capacity_infos);
         }
@@ -11907,6 +11907,25 @@ impl ECStore {
             owner_nonce: reservation.owner_nonce,
             mutation_id: None,
         }))
+    }
+
+    pub(crate) async fn is_decommission_capacity_target_reserved(
+        &self,
+        owner: DecommissionCapacityOwner,
+        target_pool_index: usize,
+    ) -> Result<bool> {
+        let pool_meta = self.pool_meta.read().await;
+        let reservation = pool_meta
+            .pools
+            .get(owner.source_pool_index)
+            .and_then(|pool| pool.decommission.as_ref())
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .filter(|reservation| reservation.admits_owner(owner, OffsetDateTime::now_utc()))
+            .ok_or_else(|| decommission_capacity_blocked_error("decommission target selection reservation is stale"))?;
+        Ok(reservation
+            .targets
+            .iter()
+            .any(|target| target.pool_index == target_pool_index))
     }
 
     pub(crate) async fn select_decommission_capacity_target_pool(
@@ -13167,6 +13186,287 @@ impl ECStore {
         install_decommission_capacity_target_permit(self.id, target_pool_index, owner, target_guard).map(Some)
     }
 
+    #[cfg(feature = "test-util")]
+    pub async fn prepare_scanner_pause_backlog_retirement_for_test(
+        &self,
+        source_pool_index: usize,
+        source_bytes: usize,
+    ) -> Result<()> {
+        let source_bytes = source_bytes.max(1);
+        let total = source_bytes.saturating_mul(8).saturating_add(64 * 1024);
+        let capacities = (0..self.pools.len())
+            .map(|pool_index| {
+                DecommissionPoolCapacityInfo::for_test(
+                    pool_index,
+                    DecommissionErasureLayout { data: 1, parity: 0 },
+                    if pool_index == source_pool_index { 0 } else { total },
+                    total,
+                    if pool_index == source_pool_index { source_bytes } else { 0 },
+                )
+            })
+            .collect();
+        set_decommission_capacity_info_overrides_for_test(self.id, vec![capacities]);
+        self.save_current_pool_meta_for_decommission_start(&[source_pool_index], Vec::new())
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn retire_scanner_pause_backlog_for_test(
+        self: &Arc<Self>,
+        source_pool_index: usize,
+        source_set_index: usize,
+    ) -> Result<()> {
+        let set = self
+            .pools
+            .get(source_pool_index)
+            .and_then(|pool| pool.disk_set.get(source_set_index))
+            .cloned()
+            .ok_or_else(|| Error::other("scanner retirement test requested an unknown set"))?;
+        let generation = self.active_decommission_generation(source_pool_index).await?;
+        let owner = self
+            .decommission_capacity_owner_for_worker(source_pool_index, generation)
+            .await?;
+        let expected = set
+            .load_file_info_versions_exact(RUSTFS_META_BUCKET, data_movement::scanner_backlog::SCANNER_PAUSE_BACKLOG_PATH)
+            .await?
+            .unwrap_or_default();
+        match self
+            .retire_scanner_pause_backlog_entry(CancellationToken::new(), source_pool_index, generation, set, expected, owner)
+            .await?
+        {
+            DecommissionEntryAttemptOutcome::Complete => Ok(()),
+            DecommissionEntryAttemptOutcome::SourceChanged => Err(Error::other("scanner retirement source changed")),
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn stage_scanner_pause_backlog_retirement_intent_for_test(
+        &self,
+        source_pool_index: usize,
+        source_set_index: usize,
+    ) -> Result<()> {
+        let generation = self.active_decommission_generation(source_pool_index).await?;
+        let owner = self
+            .decommission_capacity_owner_for_worker(source_pool_index, generation)
+            .await?
+            .ok_or_else(|| Error::other("scanner retirement test has no capacity owner"))?;
+        let versions = self.pools[source_pool_index].disk_set[source_set_index]
+            .load_file_info_versions_exact(RUSTFS_META_BUCKET, data_movement::scanner_backlog::SCANNER_PAUSE_BACKLOG_PATH)
+            .await?
+            .ok_or_else(|| Error::other("scanner retirement test source is missing"))?;
+        let version = versions
+            .versions
+            .first()
+            .ok_or_else(|| Error::other("scanner retirement test source is empty"))?;
+        let owner = owner.with_mutation_id(decommission_capacity_version_mutation_id(owner, RUSTFS_META_BUCKET, version));
+        let size = usize::try_from(version.size).map_err(|_| Error::other("scanner retirement test source size is invalid"))?;
+        let target = self.select_decommission_capacity_target_pool(owner, size).await?;
+        let failed: Result<()> = self
+            .run_decommission_capacity_admitted_mutation(target, Some(owner), Some(size), || async {
+                Err(Error::other("injected scanner retirement target failure"))
+            })
+            .await;
+        match failed {
+            Err(err) if err.to_string().contains("injected scanner retirement target failure") => Ok(()),
+            Err(err) => Err(err),
+            Ok(()) => Err(Error::other("scanner retirement test did not retain its target intent")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retire_scanner_pause_backlog_entry(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        generation: OffsetDateTime,
+        set: Arc<SetDisks>,
+        expected: FileInfoVersions,
+        capacity_owner: Option<DecommissionCapacityOwner>,
+    ) -> Result<DecommissionEntryAttemptOutcome> {
+        let store = Arc::clone(self);
+        // The disk layer may own a rename after its waiter is canceled. Keep
+        // the topology and object fences in that operation's owning task.
+        tokio::spawn(async move {
+            let operation_gate = store.ctx.data_movement_operation_gate();
+            store
+                .run_guarded_decommission_side_effect(&rx, &operation_gate, || {
+                    store.retire_scanner_pause_backlog_entry_inner(idx, generation, set, &expected, capacity_owner)
+                })
+                .await
+        })
+        .await
+        .map_err(Error::from)?
+    }
+
+    async fn retire_scanner_pause_backlog_entry_inner(
+        &self,
+        idx: usize,
+        generation: OffsetDateTime,
+        set: Arc<SetDisks>,
+        expected: &FileInfoVersions,
+        capacity_owner: Option<DecommissionCapacityOwner>,
+    ) -> Result<DecommissionEntryAttemptOutcome> {
+        use data_movement::scanner_backlog::{
+            SCANNER_PAUSE_BACKLOG_PATH, persist_native_scanner_pause_backlog_replica, plan_scanner_pause_backlog_retirement,
+            read_scanner_pause_backlog_retirement_replicas,
+        };
+
+        if expected.versions.is_empty() && expected.free_versions.is_empty() {
+            // A canceled entry waiter may resume after the owned cleanup
+            // finished deleting its source. There is no remaining record to move.
+            return Ok(DecommissionEntryAttemptOutcome::Complete);
+        }
+        let [version] = expected.versions.as_slice() else {
+            return Err(Error::other("scanner pause backlog retirement requires exactly one source version"));
+        };
+        if version.version_id.is_some_and(|version| !version.is_nil())
+            || version.deleted
+            || version.tier_free_version()
+            || version.is_remote()
+            || !expected.free_versions.is_empty()
+        {
+            return Err(Error::other(
+                "scanner pause backlog retirement requires an unversioned local source record",
+            ));
+        }
+        let object_fence = self
+            .acquire_decommission_source_cleanup_fence(RUSTFS_META_BUCKET, SCANNER_PAUSE_BACKLOG_PATH, set.as_ref())
+            .await?;
+        // Native replica writers acquire this same fixed object domain before
+        // durable pool metadata. Keep both fences through physical source deletion.
+        let save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, snapshot) = self
+            .acquire_pool_meta_read_guard(&save_guard, "scanner pause backlog retirement admission failed")
+            .await?;
+        ensure_decommission_generation(&snapshot, idx, generation)?;
+        let owner = capacity_owner.ok_or_else(|| {
+            decommission_capacity_blocked_error("scanner pause backlog retirement has no active capacity owner")
+        })?;
+        let reservation = snapshot.pools[idx]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .filter(|reservation| reservation.admits_owner(owner, OffsetDateTime::now_utc()))
+            .ok_or_else(|| decommission_capacity_blocked_error("scanner pause backlog retirement reservation is stale"))?;
+        let mutation_id = decommission_capacity_version_mutation_id(owner, RUSTFS_META_BUCKET, version);
+        if reservation.targets.iter().any(|target| {
+            target.pending_mutation_id == Some(mutation_id)
+                || target
+                    .temporary_mutations
+                    .iter()
+                    .any(|mutation| mutation.mutation_id == mutation_id)
+        }) {
+            return Err(decommission_capacity_blocked_error(
+                "scanner pause backlog retirement has an unresolved target capacity intent",
+            ));
+        }
+        if snapshot.scanner_pause_backlog_pool_writable(idx) {
+            return Err(Error::other("scanner pause backlog source still belongs to writable membership"));
+        }
+        let sets: Vec<_> = self
+            .pools
+            .iter()
+            .enumerate()
+            .filter(|(pool_index, _)| *pool_index == idx || snapshot.scanner_pause_backlog_pool_writable(*pool_index))
+            .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
+            .collect();
+        let mut replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
+        if let Some(plan) = plan_scanner_pause_backlog_retirement(idx, &replicas)? {
+            let expected_stable_record = plan.stable_record.clone();
+            let mut phases = Vec::with_capacity(3);
+            if let Some(record) = plan.seed_record {
+                phases.push(("seed", record));
+            }
+            phases.push(("commit", plan.commit_record));
+            phases.push(("stabilize", plan.stable_record));
+            for (phase, record) in phases {
+                if object_fence.is_lock_lost()
+                    || pool_meta_guard.is_lock_lost()
+                    || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
+                {
+                    return Err(decommission_capacity_blocked_error(
+                        "scanner pause backlog retirement fence expired during native repair",
+                    ));
+                }
+                for read in replicas.iter().filter(|read| read.replica.pool_index != idx) {
+                    ensure_external_decommission_target_admission(
+                        &snapshot,
+                        read.replica.pool_index,
+                        DecommissionCapacityAdmission::ScannerBacklog,
+                    )?;
+                }
+                let results = join_all(replicas.iter().filter(|read| read.replica.pool_index != idx).map(|read| {
+                    let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
+                    let record = record.clone();
+                    let object_fence = &object_fence;
+                    let pool_meta_guard = &pool_meta_guard;
+                    async move {
+                        let mut opts = ObjectOptions {
+                            no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
+                            ..Default::default()
+                        };
+                        object_fence.add_namespace_lock_fence(&mut opts);
+                        opts.add_namespace_lock_guard(pool_meta_guard);
+                        persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase).await
+                    }
+                }))
+                .await;
+                // Every dispatched native CAS has finished before an error can
+                // release the owned task's object and durable membership fences.
+                for result in results {
+                    result?;
+                }
+                replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
+                if replicas
+                    .iter()
+                    .filter(|read| read.replica.pool_index != idx)
+                    .any(|read| read.replica.data.as_deref() != Some(record.as_slice()))
+                {
+                    return Err(Error::other(
+                        "scanner pause backlog native repair did not persist every surviving replica",
+                    ));
+                }
+                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas)?
+                    && next.stable_record != expected_stable_record
+                {
+                    return Err(Error::other("scanner pause backlog native authority changed during repair"));
+                }
+            }
+            if plan_scanner_pause_backlog_retirement(idx, &replicas)?.is_some() {
+                return Err(Error::other("scanner pause backlog native repair is not fully committed and stable"));
+            }
+        }
+        if object_fence.is_lock_lost()
+            || pool_meta_guard.is_lock_lost()
+            || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
+        {
+            return Err(decommission_capacity_blocked_error(
+                "scanner pause backlog retirement fence expired before cleanup",
+            ));
+        }
+        let result = data_movement::cleanup_source_entry_if_unchanged(
+            set,
+            RUSTFS_META_BUCKET,
+            SCANNER_PAUSE_BACKLOG_PATH,
+            expected,
+            &[],
+            data_movement::SourceCleanupBucketFence {
+                expected_incarnation_id: None,
+                lifecycle_guard: None,
+                namespace_lock_lost_signal: pool_meta_guard.lock_lost_signal(),
+                object_mutation_fence: Some(&object_fence),
+            },
+            "scanner pause backlog retirement",
+        )
+        .await;
+        match result {
+            Ok(_) => Ok(DecommissionEntryAttemptOutcome::Complete),
+            Err(data_movement::SourceCleanupError::SourceChanged) => Ok(DecommissionEntryAttemptOutcome::SourceChanged),
+            Err(data_movement::SourceCleanupError::Storage(err)) => Err(err),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(
         self,
@@ -13330,6 +13630,32 @@ impl ECStore {
         };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
+
+        if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
+            let outcome = self
+                .retire_scanner_pause_backlog_entry(rx, idx, generation, Arc::clone(&set), fivs.clone(), capacity_owner)
+                .await?;
+            if matches!(outcome, DecommissionEntryAttemptOutcome::Complete) {
+                let mut pool_meta = self.pool_meta.write().await;
+                ensure_decommission_generation(&pool_meta, idx, generation)?;
+                if let Some(version) = fivs.versions.first()
+                    && counted_versions.insert((version.version_id, false))
+                {
+                    count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), false)?;
+                }
+                track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
+                drop(pool_meta);
+                self.track_decommission_entry_progress_stage(
+                    idx,
+                    generation,
+                    &bucket,
+                    &entry.name,
+                    DECOMMISSION_STAGE_ENTRY_FINISHED,
+                )
+                .await?;
+            }
+            return Ok(outcome);
+        }
 
         let pending_mutations = if let Some(owner) = capacity_owner {
             self.pool_meta

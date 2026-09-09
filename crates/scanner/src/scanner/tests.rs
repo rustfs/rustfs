@@ -61,28 +61,43 @@ async fn setup_scanner_cycle_store_with_pool_count(
 }
 
 async fn setup_scanner_cycle_store_at_path(root: &Path, seed_usage_baseline: bool, pool_count: usize) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_sets(root, seed_usage_baseline, pool_count, 1).await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_sets(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+) -> Arc<ECStore> {
     init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::with_capacity(pool_count);
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
-        for disk_index in 0..4 {
-            let disk_path = root.join(format!("pool{pool_index}/disk{disk_index}"));
-            tokio::fs::create_dir_all(&disk_path)
-                .await
-                .expect("scanner cycle test disk should be created");
-            let mut endpoint =
-                Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
-            endpoint.set_pool_index(pool_index);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(disk_index);
-            endpoints.push(endpoint);
+        for set_index in 0..sets_per_pool {
+            for disk_index in 0..4 {
+                let disk_path = if sets_per_pool == 1 {
+                    root.join(format!("pool{pool_index}/disk{disk_index}"))
+                } else {
+                    root.join(format!("pool{pool_index}/set{set_index}/disk{disk_index}"))
+                };
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("scanner cycle test disk should be created");
+                let mut endpoint =
+                    Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(set_index);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
         }
         pools.push(PoolEndpoints {
             legacy: false,
-            set_count: 1,
+            set_count: sets_per_pool,
             drives_per_set: 4,
             endpoints: Endpoints::from(endpoints),
-            cmd_line: if pool_count == 1 {
+            cmd_line: if pool_count == 1 && sets_per_pool == 1 {
                 "scanner-cycle-metrics".to_string()
             } else {
                 format!("scanner-cycle-metrics-pool-{pool_index}")
