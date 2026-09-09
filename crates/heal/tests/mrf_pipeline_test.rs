@@ -51,6 +51,8 @@ const JOURNAL_REL: &str = "buckets/.heal/mrf/journal.bin";
 const SCOPED_JOURNAL_REL: &str = "buckets/.heal/mrf/journal-scoped.bin";
 const COMMITTED_PAYLOAD_REL: &str = ".heal-mrf-snapshot.0.bin";
 const COMMITTED_MANIFEST_REL: &str = ".heal-mrf-commit.0.bin";
+const COMMITTED_PAYLOAD_RELS: [&str; 2] = [".heal-mrf-snapshot.0.bin", ".heal-mrf-snapshot.1.bin"];
+const COMMITTED_MANIFEST_RELS: [&str; 2] = [".heal-mrf-commit.0.bin", ".heal-mrf-commit.1.bin"];
 const COMMITTED_MAGIC: &[u8; 8] = b"RFMRFC01";
 const COMMITTED_MANIFEST_LEN: usize = 8 + 1 + 16 + 8 + 8 + 32 + 32;
 
@@ -233,6 +235,44 @@ fn journal_matches_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, exp
     disk_paths
         .iter()
         .all(|path| std::fs::read(path.join(META_BUCKET).join(relative_path)).is_ok_and(|actual| actual == expected))
+}
+
+fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u64, expected_payload: &[u8]) -> bool {
+    disk_paths.iter().all(|path| {
+        let root = path.join(META_BUCKET);
+        COMMITTED_PAYLOAD_RELS
+            .into_iter()
+            .zip(COMMITTED_MANIFEST_RELS)
+            .any(|(payload_rel, manifest_rel)| {
+                let Ok(payload) = std::fs::read(root.join(payload_rel)) else {
+                    return false;
+                };
+                if payload != expected_payload {
+                    return false;
+                }
+                let Ok(manifest) = std::fs::read(root.join(manifest_rel)) else {
+                    return false;
+                };
+                if manifest.len() != COMMITTED_MANIFEST_LEN || &manifest[..8] != COMMITTED_MAGIC || manifest[8] != 1 {
+                    return false;
+                }
+                let Ok(recorded_sequence) = <[u8; 8]>::try_from(&manifest[25..33]).map(u64::from_le_bytes) else {
+                    return false;
+                };
+                let Ok(recorded_len) = <[u8; 8]>::try_from(&manifest[33..41]).map(u64::from_le_bytes) else {
+                    return false;
+                };
+                let Ok(expected_len) = u64::try_from(expected_payload.len()) else {
+                    return false;
+                };
+                if recorded_sequence != sequence || recorded_len != expected_len {
+                    return false;
+                }
+                let payload_digest: [u8; 32] = Sha256::digest(expected_payload).into();
+                let manifest_digest: [u8; 32] = Sha256::digest(&manifest[..COMMITTED_MANIFEST_LEN - 32]).into();
+                payload_digest.as_slice() == &manifest[41..73] && manifest_digest.as_slice() == &manifest[73..]
+            })
+    })
 }
 
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
@@ -630,13 +670,14 @@ fn mrf_successor_flush_child_process_fixture() {
         expected_successor.extend(journal_record(1, "successor-bucket", "first-object", None, 0));
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && committed_checkpoint_matches_on_all_disks(&disk_paths, 2, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
         })
         .await;
         assert!(
             flushed,
-            "child process must publish the pending successor snapshot before the delete phase"
+            "child process must publish the committed pending successor before the delete phase"
         );
     });
     std::process::exit(78);
@@ -678,13 +719,14 @@ fn mrf_successor_flush_waiting_child_process_fixture() {
         expected_successor.extend(journal_record(1, "service-kill-bucket", "first-object", None, 0));
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && committed_checkpoint_matches_on_all_disks(&disk_paths, 2, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
         })
         .await;
         assert!(
             flushed,
-            "child process must publish the pending successor snapshot before it can be killed"
+            "child process must publish the committed pending successor before it can be killed"
         );
         std::fs::write(&ready_path, b"ready").expect("write ready marker");
         loop {

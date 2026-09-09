@@ -22465,6 +22465,86 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn conditional_mrf_manifest_dir_fsync_failure_keeps_recovery_anchors() {
+        use tempfile::tempdir;
+
+        const MRF_COMMIT_MANIFEST_SLOT_0: &str = ".heal-mrf-commit.0.bin";
+        const MRF_COMMIT_MANIFEST_SLOT_1: &str = ".heal-mrf-commit.1.bin";
+        const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scoped.bin";
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let previous_manifest = Bytes::from_static(b"mrf-committed-manifest-v1");
+        let successor_manifest = Bytes::from_static(b"mrf-committed-manifest-v2");
+        let legacy_journal = Bytes::from_static(b"legacy-mrf-journal-records");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, None, Some(previous_manifest.clone()),)
+                .await
+                .expect("previous MRF manifest should commit"),
+            ConditionalFileUpdate::Updated
+        );
+        disk.write_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy_journal.clone())
+            .await
+            .expect("legacy MRF journal should be retained");
+
+        let manifest_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+            .expect("MRF manifest path should resolve");
+        let parent = manifest_path.parent().expect("MRF manifest path should have a parent");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(parent),
+            "system metadata MRF manifest publication must fsync the metadata directory even under relaxed durability"
+        );
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                MRF_COMMIT_MANIFEST_SLOT_0,
+                Some(previous_manifest.clone()),
+                Some(successor_manifest),
+            )
+            .await
+            .expect_err("directory fsync failure must fail the MRF manifest successor commit");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+                .await
+                .expect("previous committed MRF manifest should remain readable after rollback"),
+            previous_manifest
+        );
+
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                MRF_COMMIT_MANIFEST_SLOT_1,
+                None,
+                Some(Bytes::from_static(b"first-successor-manifest")),
+            )
+            .await
+            .expect_err("directory fsync failure must fail first MRF manifest commit");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert!(
+            matches!(
+                disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_1).await,
+                Err(DiskError::FileNotFound)
+            ),
+            "uncommitted first MRF manifest must be removed when no committed anchor exists"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy MRF journal should remain readable after failed manifest publication"),
+            legacy_journal
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn conditional_file_update_dir_fsync_failure_removes_new_file_without_anchor() {
         use tempfile::tempdir;
 

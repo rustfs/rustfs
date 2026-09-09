@@ -113,6 +113,7 @@ pub struct ErasureSetHealer {
     heal_opts: HealOpts,
     source: HealRequestSource,
     target_endpoints: Arc<[String]>,
+    pool_metadata_target_endpoints: Arc<[String]>,
     replacement_task_id: Option<String>,
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
     mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
@@ -362,6 +363,7 @@ impl ErasureSetHealer {
             heal_opts,
             source,
             target_endpoints: Vec::new().into(),
+            pool_metadata_target_endpoints: Vec::new().into(),
             replacement_task_id: None,
             replacement_target_identities: None,
             mainline_pacer: None,
@@ -382,6 +384,13 @@ impl ErasureSetHealer {
         target_endpoints.dedup();
         self.target_endpoints = target_endpoints.into();
         self.replacement_task_id = replacement_task_id;
+        self
+    }
+
+    pub(crate) fn with_pool_metadata_targets(mut self, mut target_endpoints: Vec<String>) -> Self {
+        target_endpoints.sort_unstable();
+        target_endpoints.dedup();
+        self.pool_metadata_target_endpoints = target_endpoints.into();
         self
     }
 
@@ -948,33 +957,37 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        let ordinary_opts = if self.replacement_task_id.is_none() {
+        let mut metadata_opts = self.heal_opts;
+        metadata_opts.remove = false;
+        metadata_opts.no_lock = false;
+        if self.replacement_task_id.is_none() {
             let (pool_index, set_index) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
-            if self.heal_opts.pool.is_some_and(|pool| pool != pool_index)
-                || self.heal_opts.set.is_some_and(|set| set != set_index)
+            if metadata_opts.pool.is_some_and(|pool| pool != pool_index) || metadata_opts.set.is_some_and(|set| set != set_index)
             {
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Pool metadata scope does not match resumed set {set_disk_id}"),
                 });
             }
-            Some(HealOpts {
-                dry_run: self.heal_opts.dry_run,
-                scan_mode: self.heal_opts.scan_mode,
-                pool: Some(pool_index),
-                set: Some(set_index),
-                ..Default::default()
-            })
+            metadata_opts.pool = Some(pool_index);
+            metadata_opts.set = Some(set_index);
+        }
+        let target_endpoints = if self.replacement_task_id.is_some() || self.pool_metadata_target_endpoints.is_empty() {
+            self.target_endpoints.as_ref()
         } else {
-            if self.target_endpoints.is_empty() {
+            self.pool_metadata_target_endpoints.as_ref()
+        };
+        let target_scoped_recreate = !metadata_opts.dry_run && metadata_opts.recreate && !target_endpoints.is_empty();
+        let ordinary_heal = self.replacement_task_id.is_none() && !target_scoped_recreate;
+        if !ordinary_heal {
+            if target_endpoints.is_empty() {
                 return Err(Error::TaskExecutionFailed {
                     message: "Replacement pool metadata heal requires target endpoints".to_string(),
                 });
             }
-            if !self.storage.replacement_pool_metadata_applies(&self.heal_opts).await? {
+            if !self.storage.replacement_pool_metadata_applies(&metadata_opts).await? {
                 return Ok(());
             }
-            None
-        };
+        }
 
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
@@ -992,8 +1005,8 @@ impl ErasureSetHealer {
             .set_current_item(Some(RUSTFS_META_BUCKET.to_string()), Some(POOL_META_NAME.to_string()))
             .await?;
 
-        let result = if let Some(opts) = ordinary_opts {
-            match self.storage.heal_pool_metadata(&opts).await {
+        let result = if ordinary_heal {
+            match self.storage.heal_pool_metadata(&metadata_opts).await {
                 Ok(results) if results.is_empty() => return Ok(()),
                 Ok(results) => {
                     let [result] = results.as_slice() else {
@@ -1014,10 +1027,10 @@ impl ErasureSetHealer {
         } else {
             match self
                 .storage
-                .heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &self.heal_opts)
+                .heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &metadata_opts)
                 .await
             {
-                Ok((result, None)) if target_outcomes_complete(&result, &self.target_endpoints) => {
+                Ok((result, None)) if target_outcomes_complete(&result, target_endpoints) => {
                     let object_size = result_object_size_u64(&result);
                     match self
                         .storage
@@ -1025,8 +1038,8 @@ impl ErasureSetHealer {
                             RUSTFS_META_BUCKET,
                             POOL_META_NAME,
                             None,
-                            &self.heal_opts,
-                            &self.target_endpoints,
+                            &metadata_opts,
+                            target_endpoints,
                         )
                         .await
                     {
@@ -2099,7 +2112,7 @@ mod resume_loop_tests {
         /// fake models a healthy backend unless a test explicitly revokes it.
         replacement_commit_evidence: Mutex<HashMap<String, ReplacementCommitEvidence>>,
         ordinary_pool_metadata_required: AtomicBool,
-        ordinary_pool_metadata_opts: Mutex<Vec<HealOpts>>,
+        pool_metadata_opts: Mutex<Vec<HealOpts>>,
         pool_metadata_not_applicable: AtomicBool,
         fail_pool_metadata_scope: AtomicBool,
         lifecycle_expired: Mutex<HashSet<String>>,
@@ -2190,11 +2203,14 @@ mod resume_loop_tests {
         }
         async fn heal_object(
             &self,
-            _bucket: &str,
+            bucket: &str,
             object: &str,
             version_id: Option<&str>,
-            _opts: &HealOpts,
+            opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
+            if bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME {
+                self.pool_metadata_opts.lock().expect("metadata options").push(*opts);
+            }
             self.heal_calls
                 .lock()
                 .unwrap()
@@ -2221,7 +2237,6 @@ mod resume_loop_tests {
             if !self.ordinary_pool_metadata_required.load(Ordering::SeqCst) {
                 return Ok(Vec::new());
             }
-            self.ordinary_pool_metadata_opts.lock().expect("metadata options").push(*opts);
             if !self.replacement_pool_metadata_applies(opts).await? {
                 return Ok(Vec::new());
             }
@@ -2749,7 +2764,7 @@ mod resume_loop_tests {
 
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
         {
-            let opts = env.storage.ordinary_pool_metadata_opts.lock().expect("metadata options");
+            let opts = env.storage.pool_metadata_opts.lock().expect("metadata options");
             assert_eq!(opts.len(), 1);
             assert_eq!((opts[0].pool, opts[0].set), (Some(0), Some(0)));
         }
@@ -2783,7 +2798,7 @@ mod resume_loop_tests {
             .await
             .expect("ordinary dry-run metadata work must not require a replacement commit");
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
-        let opts = env.storage.ordinary_pool_metadata_opts.lock().expect("metadata options");
+        let opts = env.storage.pool_metadata_opts.lock().expect("metadata options");
         assert_eq!(opts.len(), 1);
         assert!(opts[0].dry_run);
         assert!(!opts[0].remove);
@@ -3046,6 +3061,105 @@ mod resume_loop_tests {
             .await;
         assert!(!state.completed);
         assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn admin_recreate_target_heals_pool_metadata_before_completion() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts {
+                recreate: true,
+                remove: true,
+                no_lock: true,
+                ..Default::default()
+            },
+            HealRequestSource::Admin,
+        )
+        .with_pool_metadata_targets(vec!["replacement-a".to_string()]);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+
+        healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("admin recreate should heal and verify pool metadata");
+
+        assert!(env.resume.get_state().await.completed);
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        let opts = env.storage.pool_metadata_opts.lock().expect("metadata options");
+        assert_eq!(opts.len(), 1);
+        assert_eq!((opts[0].pool, opts[0].set), (Some(0), Some(0)));
+        assert!(opts[0].recreate);
+        assert!(!opts[0].remove);
+        assert!(!opts[0].no_lock);
+    }
+
+    #[tokio::test]
+    async fn admin_recreate_pool_metadata_validates_owner_scope_before_io() {
+        for (non_owner, unknown_scope, pool) in [(true, false, None), (false, true, None), (false, false, Some(1))] {
+            let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+            env.storage.pool_metadata_not_applicable.store(non_owner, Ordering::SeqCst);
+            env.storage.fail_pool_metadata_scope.store(unknown_scope, Ordering::SeqCst);
+            let healer = ErasureSetHealer::new(
+                env.storage.clone(),
+                Arc::new(RwLock::new(HealProgress::new())),
+                CancellationToken::new(),
+                env.healer.disk.clone(),
+                HealOpts {
+                    recreate: true,
+                    pool,
+                    ..Default::default()
+                },
+                HealRequestSource::Admin,
+            )
+            .with_pool_metadata_targets(vec!["replacement-a".to_string()]);
+
+            let set_disk_id = if non_owner { "pool_0_set_1" } else { "pool_0_set_0" };
+            let result = healer
+                .execute_heal_with_resume(&[], set_disk_id, &env.resume, &env.checkpoint)
+                .await;
+
+            assert_eq!(result.is_ok(), non_owner, "only a known non-owner may skip metadata: {result:?}");
+            assert!(env.storage.calls().is_empty(), "scope validation must precede metadata I/O");
+            assert_eq!(env.resume.get_state().await.completed, non_owner);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_recreate_pool_metadata_readback_failure_keeps_resume_state() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts {
+                recreate: true,
+                pool: Some(0),
+                set: Some(0),
+                ..Default::default()
+            },
+            HealRequestSource::Admin,
+        )
+        .with_pool_metadata_targets(vec!["replacement-a".to_string()]);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+        env.storage.set_replacement_commit_evidence(POOL_META_NAME, None, false);
+
+        let error = healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("unconfirmed admin recreate pool metadata must keep the set incomplete");
+
+        assert!(error.to_string().contains("Erasure set heal incomplete"));
+        let state = env.resume.get_state().await;
+        assert!(!state.completed);
         assert_eq!(state.retry_count, 1);
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
     }

@@ -328,18 +328,21 @@ impl HealTask {
             }
         }
 
-        let metadata_opts = HealOpts {
-            dry_run: self.options.dry_run,
-            scan_mode: self.options.scan_mode,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-            ..Default::default()
-        };
-        for result in self
-            .await_with_control(self.storage.heal_pool_metadata(&metadata_opts))
-            .await?
-        {
-            self.record_result_item(result).await;
+        if !self.options.dry_run {
+            let metadata_opts = HealOpts {
+                dry_run: self.options.dry_run,
+                recreate: self.options.recreate_missing,
+                scan_mode: self.options.scan_mode,
+                pool: self.options.pool_index,
+                set: self.options.set_index,
+                ..Default::default()
+            };
+            for result in self
+                .await_with_control(self.storage.heal_pool_metadata(&metadata_opts))
+                .await?
+            {
+                self.record_result_item(result).await;
+            }
         }
 
         if failed > 0 {

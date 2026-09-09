@@ -289,9 +289,13 @@ measured durations, P3's pressure run needs at least two hours, and P1 needs a
 symbolized profile summary with resolved samples. Every G14 field and every
 performance gate's fields must also share one `measurement_window_id`, so EC8+4,
 multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be
-stitched together from unrelated runs. Missing, synthetic, stale, tampered,
-undersized, or topology-mismatched evidence returns a compact blocked or invalid
-JSON result and a nonzero exit.
+stitched together from unrelated runs. P1 `profile_evidence` must bind every
+required profile artifact kind (`allocation-profile`, `flamegraph`,
+`rss-samples`, and `save-frequency`) with a relative path, artifact format,
+non-empty file, matching SHA256, and the same measurement window when a
+per-artifact window is declared. Missing, synthetic, stale, tampered, undersized,
+or topology-mismatched evidence returns a compact blocked or invalid JSON result
+and a nonzero exit.
 
 This command validates the evidence package; it does not create evidence. A
 handwritten JSON file, a synthetic harness pass, a single focused case, or a

@@ -168,7 +168,14 @@ class ScannerAbbaTest(unittest.TestCase):
     def measured_manifest(self):
         manifest = copy.deepcopy(self.manifest)
         manifest.update(evidence="measured", duration_seconds=900)
-        manifest["candidate"]["revision"] = "b" * 40
+        candidate_binary = self.root / "candidate-python"
+        candidate_binary.write_bytes(self.binary.read_bytes() + b"\n")
+        candidate_binary.chmod(0o755)
+        manifest["candidate"] = {
+            "binary": str(candidate_binary),
+            "sha256": harness.digest(candidate_binary),
+            "revision": "b" * 40,
+        }
         manifest["release_evidence"] = {
             "topology": {
                 "nodes": 3,
@@ -548,6 +555,12 @@ class ScannerAbbaTest(unittest.TestCase):
             "missing crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
                 fault_modes=["process-restart"],
             ),
+            "unknown crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-crash-restart", "kernel-panic"],
+            ),
+            "duplicate crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-restart", "process-crash-restart"],
+            ),
             "clean crash marker": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
                 unclean_shutdown_marker=False,
             ),
@@ -555,8 +568,23 @@ class ScannerAbbaTest(unittest.TestCase):
             "missing candidate": lambda manifest: manifest["release_evidence"]["mixed_version"].update(
                 participating_revisions=["a" * 40, "c" * 40],
             ),
+            "same mixed revision": lambda manifest: manifest["candidate"].update(
+                revision=manifest["baseline"]["revision"],
+            ),
+            "same mixed binary": lambda manifest: manifest["candidate"].update(
+                binary=manifest["baseline"]["binary"],
+                sha256=manifest["baseline"]["sha256"],
+            ),
             "missing profile": lambda manifest: manifest["release_evidence"]["profile"].update(
                 required_artifacts=["allocation-profile", "flamegraph", "rss-samples"],
+            ),
+            "unknown profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples", "save-frequency", "heapdump"],
+            ),
+            "duplicate profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=[
+                    "allocation-profile", "flamegraph", "rss-samples", "save-frequency", "flamegraph",
+                ],
             ),
             "bad profile hash": lambda manifest: manifest["release_evidence"]["profile"].update(
                 profiler_config_sha256="not-a-sha",

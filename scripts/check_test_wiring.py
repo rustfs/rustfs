@@ -23,7 +23,16 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha, write_json
+from scanner_abba import (
+    MAX_JSON_BYTES,
+    RELEASE_PROFILE_ARTIFACTS,
+    digest,
+    number,
+    read_json,
+    require,
+    sha,
+    write_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +76,18 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
     "R-D": ("manager_disposition_evidence", "event_disposition_evidence", "ledger_disposition_evidence", "grace_handling"),
     "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
+}
+SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
+    ("G03", "durable_root_publication_proof"): "durable-root-publication",
+    ("G03", "scoped_ack_request_identity"): "scoped-ack-request",
+    ("G03", "participating_peer_capability_snapshot"): "peer-capability-snapshot",
+    ("G03", "mixed_peer_ack_fallback_oracle"): "mixed-peer-ack-fallback",
+    ("G09", "mixed_version_reader_evidence"): "mixed-version-reader",
+    ("G09", "mixed_version_writer_evidence"): "mixed-version-writer",
+    ("G09", "rollback_payload_evidence"): "rollback-payload",
+    ("R-L", "legacy_source_conflict_evidence"): "legacy-source-conflict",
+    ("R-L", "migration_gap_evidence"): "migration-gap",
+    ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
 }
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
@@ -956,6 +977,9 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
     names = set()
     for case_id, requirement in cases.items():
         require(isinstance(case_id, str) and case_id, "invalid scanner/heal case identity")
+        lane = requirement.get("lane")
+        require(isinstance(lane, str) and re.fullmatch(r"[a-z0-9-]+", lane) is not None,
+                f"invalid nextest profile lane for {case_id}")
         oracle = requirement.get("oracle")
         require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
         path = Path(oracle)
@@ -1338,8 +1362,14 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
     if gate in ("G03", "G09", "R-L"):
         versions = evidence.get("versions")
         require(isinstance(versions, list) and
-                len({version for version in versions if isinstance(version, str) and version.strip()}) >= 2,
+                len(set(versions)) >= 2 and
+                all(isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+                    for version in versions),
                 f"{gate}.{field} requires mixed-version evidence")
+        require(source_revision in versions, f"{gate}.{field} versions omit tested source revision")
+        expected_role = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+        require(evidence.get("mixed_version_role") == expected_role,
+                f"{gate}.{field} mixed-version role must be {expected_role}")
     if gate in ("G04", "G07", "R-E", "R-L"):
         crash_points = evidence.get("crash_points")
         require(isinstance(crash_points, list) and crash_points,
@@ -1359,6 +1389,30 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("pools"), "G14 multi_pool_evidence.pools", 2, 1024)
     if field == "profile_evidence":
         evidence_integer(evidence.get("resolved_samples"), f"{gate}.{field}.resolved_samples", 1, 2**63 - 1)
+        profile_artifacts = evidence.get("profile_artifacts")
+        require(isinstance(profile_artifacts, dict), f"{gate}.{field} missing profile artifacts")
+        missing_artifacts = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(profile_artifacts))
+        require(not missing_artifacts,
+                f"{gate}.{field} missing profile artifacts: {', '.join(missing_artifacts)}")
+        unknown_artifacts = sorted(set(profile_artifacts) - set(RELEASE_PROFILE_ARTIFACTS))
+        require(not unknown_artifacts,
+                f"{gate}.{field} unknown profile artifacts: {', '.join(unknown_artifacts)}")
+        for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+            item = profile_artifacts[artifact_kind]
+            require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} must be an object")
+            artifact_field = f"{field}.{artifact_kind}"
+            artifact_path = release_bundle_artifact_path(bundle_path, item.get("artifact"), gate, artifact_field)
+            require(artifact_path.stat().st_size > 0, f"{gate}.{artifact_field} artifact is empty")
+            require(sha(item.get("sha256")) and digest(artifact_path) == item["sha256"],
+                    f"{gate}.{artifact_field} artifact hash mismatch")
+            evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
+                            r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+            if "measurement_window_id" in item:
+                require(item["measurement_window_id"] == window_id,
+                        f"{gate}.{artifact_field} measurement window mismatch")
+            if "resolved_samples" in item:
+                evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
+                                 0, 2**63 - 1)
     return window_id
 
 
@@ -1667,6 +1721,16 @@ class SelfTests(unittest.TestCase):
         finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
 
+    def test_scanner_heal_case_lane_is_required_for_runner_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            registry_path = root / ".config/scanner-heal-required-tests.json"
+            registry = read_json(registry_path)
+            del registry["cases"]["ec84-target-drive-restart"]["lane"]
+            write_json(registry_path, registry)
+            with self.assertRaisesRegex(ValueError, "invalid nextest profile lane for ec84-target-drive-restart"):
+                scanner_heal_oracle_names(root)
+
     def scanner_heal_release_bundle_fixture(self, directory: Path) -> tuple[Path, Path]:
         """Parser fixtures only; the bundle is not runtime evidence."""
         root, _ = self.scanner_heal_fixture(directory)
@@ -1704,7 +1768,8 @@ class SelfTests(unittest.TestCase):
                     evidence["duration_seconds"] = duration
                 evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
                 if gate in ("G03", "G09", "R-L"):
-                    evidence["versions"] = ["previous", "candidate"]
+                    evidence["versions"] = ["a" * 40, source_revision]
+                    evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
                 if gate in ("G04", "G07", "R-E", "R-L"):
                     evidence["crash_points"] = ["before-commit"]
                 if gate == "G14" and field == "ec8_4_evidence":
@@ -1715,6 +1780,16 @@ class SelfTests(unittest.TestCase):
                     evidence["pools"] = 2
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
+                    artifacts = {}
+                    for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                        artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                        write_json(artifact, {"gate": gate, "field": field, "artifact": artifact_kind})
+                        artifacts[artifact_kind] = {
+                            "artifact": artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(artifact),
+                            "artifact_format": "json",
+                        }
+                    evidence["profile_artifacts"] = artifacts
                 fields[field] = evidence
             gates[gate] = {
                 "status": "pass",
@@ -1768,7 +1843,31 @@ class SelfTests(unittest.TestCase):
             ("missing-duration", "P1", "cold_walk_share_measurement", lambda item: item.pop("duration_seconds"), "duration_seconds"),
             ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
             ("profile", "P1", "profile_evidence", lambda item: item.pop("resolved_samples"), "resolved_samples"),
+            (
+                "profile-artifact",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"].pop("flamegraph"),
+                "missing profile artifacts",
+            ),
+            (
+                "profile-artifact-hash",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["rss-samples"].update({"sha256": "0" * 64}),
+                "artifact hash mismatch",
+            ),
+            (
+                "profile-artifact-window",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["save-frequency"].update(
+                    {"measurement_window_id": "p1-different-window"}
+                ),
+                "measurement window mismatch",
+            ),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
+            ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
@@ -1781,6 +1880,26 @@ class SelfTests(unittest.TestCase):
                 self.assertEqual(status["decision"], "blocked")
                 self.assertFalse(status["release_approved"])
                 self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_mixed_version_field_roles(self) -> None:
+        for gate, field, wrong_role in (
+            ("G03", "mixed_peer_ack_fallback_oracle", "mixed-version-reader"),
+            ("G09", "mixed_version_reader_evidence", "mixed-version-writer"),
+            ("G09", "mixed_version_writer_evidence", "mixed-version-reader"),
+            ("G09", "rollback_payload_evidence", "mixed-version-reader"),
+            ("R-L", "crash_safe_source_retirement_evidence", "migration-gap"),
+        ):
+            with self.subTest(gate=gate, field=field), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                data["gates"][gate]["evidence_fields"][field]["mixed_version_role"] = wrong_role
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any("mixed-version role" in error for error in status["rejected_gates"][gate]))
 
     def test_scanner_heal_release_bundle_requires_field_provenance(self) -> None:
         for fault, mutation, expected in (

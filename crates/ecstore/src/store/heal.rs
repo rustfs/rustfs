@@ -400,6 +400,7 @@ impl ECStore {
             // never to the cluster's authoritative metadata transaction.
             let metadata_opts = HealOpts {
                 dry_run: opts.dry_run,
+                recreate: opts.recreate,
                 scan_mode: opts.scan_mode,
                 pool: Some(pool_index),
                 set: Some(set_index),
