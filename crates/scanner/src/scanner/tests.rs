@@ -9227,6 +9227,64 @@ fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acqui
 }
 
 #[test]
+fn remote_lease_validation_failure_without_movement_debt_is_activity_baseline_unavailable() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let lease_targets = scanner_activity_publication_lease_targets(&before);
+    let mut after = before.clone();
+    after
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .namespace_generation += 1;
+
+    assert_eq!(
+        before["node-2"].movement_generation, after["node-2"].movement_generation,
+        "ordinary namespace writes must not be reported as movement"
+    );
+    assert!(scanner_activity_allows_usage_publication(&after));
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(after)),
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    );
+}
+
+#[test]
+fn remote_lease_validation_failure_preserves_movement_defer_for_remote_fence_loss() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let lease_targets = scanner_activity_publication_lease_targets(&before);
+
+    let mut movement_changed = before.clone();
+    movement_changed
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .movement_generation += 1;
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(movement_changed)),
+        ScannerCycleDeferReason::DataMovement
+    );
+
+    let mut restarted = before.clone();
+    restarted.get_mut("node-2").expect("writer should be present").instance_id = "epoch-b".to_string();
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(restarted)),
+        ScannerCycleDeferReason::DataMovement
+    );
+
+    let mut blocked = before.clone();
+    blocked
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .publication_blocked = true;
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(blocked)),
+        ScannerCycleDeferReason::DataMovement
+    );
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, false, Ok(before)),
+        ScannerCycleDeferReason::DataMovement
+    );
+}
+
+#[test]
 fn post_lease_activity_proof_requires_a_complete_matching_baseline() {
     let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
     let digest = scanner_activity_snapshot_digest(&before);
