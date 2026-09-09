@@ -372,15 +372,18 @@ jobs:
             [ -f "$f" ] || { echo "missing package: $f"; exit 1; }
           done
 
+          # Plain git + token URL: the build fleet has no gh CLI.
+          ASSETS_URL="https://x-access-token:${ASSETS_TOKEN}@github.com/rustfs/auto-testing.git"
           rm -rf assets-work && mkdir assets-work
-          if ! gh repo clone rustfs/auto-testing assets-work -- --depth 1 --branch assets --quiet 2>/dev/null; then
+          if git clone -q --depth 1 --branch assets "${ASSETS_URL}" assets-work 2>/dev/null; then
+            echo "assets branch cloned"
+          else
             echo "assets branch does not exist yet; creating an orphan"
-            ( cd assets-work && git init -q -b assets )
+            git -C assets-work init -q -b assets
           fi
           cd assets-work
-          git remote add origin "https://github.com/rustfs/auto-testing.git" 2>/dev/null || \
-            git remote set-url origin "https://github.com/rustfs/auto-testing.git"
-          gh auth setup-git >/dev/null
+          git remote add origin "${ASSETS_URL}" 2>/dev/null || \
+            git remote set-url origin "${ASSETS_URL}"
 
           mkdir -p nightly
           cp "../${DEB_FILE}" "nightly/${DEB_FILE}"
