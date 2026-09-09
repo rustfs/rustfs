@@ -258,6 +258,176 @@ async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
         .await
         .expect("restart after durable path cancellation");
     assert_eq!(restarted.get_queue_length().await, 0);
+    assert_eq!(
+        restarted
+            .get_task_status_for_path("bucket", &request.id)
+            .await
+            .expect("durable cancellation remains queryable by path"),
+        HealTaskStatus::Cancelled
+    );
+    assert_eq!(
+        restarted
+            .get_task_status(&request.id)
+            .await
+            .expect("durable cancellation remains queryable by id"),
+        HealTaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_active_cancel_is_queryable_after_restart_for_scoped_admin() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    active_root(&manager, request.clone()).await;
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("durable active bucket responsibility");
+
+    manager.cancel_task(&request.id).await.expect("cancel active bucket");
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("active terminal retires intent")
+            .is_empty()
+    );
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("restart after active cancellation");
+    assert_eq!(restarted.get_queue_length().await, 0);
+    assert_eq!(
+        restarted
+            .get_task_status(&request.id)
+            .await
+            .expect("active cancellation remains queryable by id"),
+        HealTaskStatus::Cancelled
+    );
+    assert_eq!(
+        restarted
+            .get_task_status_for_path("bucket", &request.id)
+            .await
+            .expect("active cancellation remains queryable by path"),
+        HealTaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_receipt_wins_over_stale_pending_scoped_intent_after_restart() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("durable bucket responsibility");
+    manager
+        .publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source)
+        .await
+        .expect("publish terminal receipt");
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("restore stale pending intent after terminal publication");
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("terminal masks stale pending")
+            .is_empty()
+    );
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("restart with terminal and stale pending");
+    assert_eq!(restarted.get_queue_length().await, 0);
+    assert_eq!(
+        restarted
+            .get_task_status(&request.id)
+            .await
+            .expect("terminal status survives stale pending"),
+        HealTaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("durable bucket responsibility");
+    let completed = CompletedHealStatus {
+        outcome: None,
+        heal_type: request.heal_type.clone(),
+        status: HealTaskStatus::Completed,
+        progress: Some(HealProgress {
+            objects_scanned: 2,
+            objects_healed: 2,
+            bytes_processed: 128,
+            ..Default::default()
+        }),
+        retained_bytes: std::sync::OnceLock::new(),
+        result_items_truncated: false,
+        completed_at: SystemTime::now(),
+        seqed_items: Vec::new(),
+        next_seq: 0,
+        min_seq: 0,
+    };
+    assert!(
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .expect("publish completed terminal")
+    );
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("completed terminal retires intent")
+            .is_empty()
+    );
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restart after completed terminal");
+    assert_eq!(restarted.get_queue_length().await, 0);
+    assert_eq!(
+        restarted
+            .get_task_status_for_path("bucket", &request.id)
+            .await
+            .expect("completed terminal remains queryable by path"),
+        HealTaskStatus::Completed
+    );
+    let progress = restarted
+        .get_task_progress(&request.id)
+        .await
+        .expect("completed terminal exposes progress");
+    assert_eq!(progress.objects_scanned, 2);
+    assert_eq!(progress.objects_healed, 2);
 }
 
 #[tokio::test]

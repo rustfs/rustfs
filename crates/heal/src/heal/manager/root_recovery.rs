@@ -26,8 +26,10 @@ use serde::{Deserialize, Serialize};
 // The metadata bucket already exists and its parent is durable. Creating a
 // nested journal directory here would also require syncing every ancestor.
 const ROOT_RECOVERY_PREFIX: &str = "root-heal-";
+const ROOT_TERMINAL_PREFIX: &str = "terminal-root-heal-";
 const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
 const ROOT_RECOVERY_SCHEMA: u32 = 2;
+const ROOT_TERMINAL_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -197,6 +199,56 @@ struct RootHealIntent {
     created_at: SystemTime,
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootHealTerminal {
+    schema: u32,
+    task_id: String,
+    heal_type: RecoveryHealType,
+    status: HealTaskStatus,
+    progress: Option<HealProgress>,
+    completed_at: SystemTime,
+}
+
+impl RootHealTerminal {
+    fn from_completed(task_id: &str, completed: &CompletedHealStatus) -> Self {
+        Self {
+            schema: ROOT_TERMINAL_SCHEMA,
+            task_id: task_id.to_owned(),
+            heal_type: RecoveryHealType::from(&completed.heal_type),
+            status: completed.status.clone(),
+            progress: completed.progress.clone(),
+            completed_at: completed.completed_at,
+        }
+    }
+
+    fn cancelled(task_id: &str, heal_type: &HealType) -> Self {
+        Self {
+            schema: ROOT_TERMINAL_SCHEMA,
+            task_id: task_id.to_owned(),
+            heal_type: RecoveryHealType::from(heal_type),
+            status: HealTaskStatus::Cancelled,
+            progress: None,
+            completed_at: SystemTime::now(),
+        }
+    }
+
+    fn into_completed(self) -> CompletedHealStatus {
+        CompletedHealStatus {
+            outcome: None,
+            progress: self.progress,
+            retained_bytes: std::sync::OnceLock::new(),
+            heal_type: self.heal_type.into(),
+            status: self.status,
+            result_items_truncated: false,
+            completed_at: self.completed_at,
+            seqed_items: Vec::new(),
+            next_seq: 0,
+            min_seq: 0,
+        }
+    }
+}
+
 impl RootHealIntent {
     fn from_request(request: &HealRequest) -> Self {
         Self {
@@ -276,6 +328,14 @@ fn intent_path(task_id: &str) -> Result<String> {
     Ok(format!("{ROOT_RECOVERY_PREFIX}{task_id}.json"))
 }
 
+fn terminal_path(task_id: &str) -> Result<String> {
+    let parsed = uuid::Uuid::parse_str(task_id).map_err(|_| Error::Other("Invalid root heal terminal task id".to_string()))?;
+    if parsed.to_string() != task_id {
+        return Err(Error::Other("Noncanonical root heal terminal task id".to_string()));
+    }
+    Ok(format!("{ROOT_TERMINAL_PREFIX}{task_id}.json"))
+}
+
 fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     let _ = intent_path(task_id)?;
     let intent: RootHealIntent = serde_json::from_slice(bytes)
@@ -290,6 +350,17 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     }
     intent.heal_type.validate()?;
     Ok(intent)
+}
+
+fn decode_terminal(task_id: &str, bytes: &[u8]) -> Result<RootHealTerminal> {
+    let _ = terminal_path(task_id)?;
+    let terminal: RootHealTerminal = serde_json::from_slice(bytes)
+        .map_err(|error| Error::Other(format!("Invalid root heal terminal record {task_id}: {error}")))?;
+    if terminal.schema != ROOT_TERMINAL_SCHEMA || terminal.task_id != task_id {
+        return Err(Error::Other(format!("Unsupported or mismatched root heal terminal record {task_id}")));
+    }
+    terminal.heal_type.validate()?;
+    Ok(terminal)
 }
 
 impl RootHealRecovery {
@@ -335,6 +406,53 @@ impl RootHealRecovery {
             }
         }
         Ok(found)
+    }
+
+    async fn find_terminal(disks: &[DiskStore], task_id: &str) -> Result<Option<(DiskStore, EcstoreDiskBytes)>> {
+        let path = terminal_path(task_id)?;
+        let mut found = None;
+        for disk in disks {
+            EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
+            match EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, &path).await {
+                Ok(bytes) => {
+                    decode_terminal(task_id, &bytes)?;
+                    if found.is_some() {
+                        return Err(Error::Other(format!("Multiple root heal terminal owners for {task_id}")));
+                    }
+                    found = Some((disk.clone(), bytes));
+                }
+                Err(DiskError::FileNotFound) => {}
+                Err(error) => return Err(Error::Disk(error)),
+            }
+        }
+        Ok(found)
+    }
+
+    async fn persist_terminal_locked(
+        disks: &[DiskStore],
+        task_id: &str,
+        terminal: RootHealTerminal,
+    ) -> Result<Option<(DiskStore, EcstoreDiskBytes)>> {
+        let path = terminal_path(task_id)?;
+        if let Some((_, bytes)) = Self::find_terminal(disks, task_id).await? {
+            let current = decode_terminal(task_id, &bytes)?;
+            if current == terminal {
+                return Self::find(disks, task_id).await;
+            }
+            return Err(Error::Other(format!("Root heal terminal record changed for {task_id}")));
+        }
+        let pending = Self::find(disks, task_id).await?;
+        let disk = pending
+            .as_ref()
+            .map(|(disk, _)| disk.clone())
+            .or_else(|| disks.first().cloned())
+            .ok_or_else(|| Error::Other("No local disk available for root heal terminal receipt".to_string()))?;
+        let bytes = serde_json::to_vec(&terminal)
+            .map_err(|error| Error::Other(format!("Serialize root heal terminal receipt: {error}")))?;
+        match EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, &path, None, Some(bytes.into())).await? {
+            EcstoreConditionalFileUpdate::Updated => Ok(pending),
+            _ => Err(Error::Other(format!("Root heal terminal record changed for {task_id}"))),
+        }
     }
 
     pub(super) async fn persist(&self, request: &HealRequest) -> Result<()> {
@@ -450,7 +568,120 @@ impl RootHealRecovery {
         if intent_path(task_id).is_err() {
             return Ok(false);
         }
-        self.remove_pending_by_id(task_id).await
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        if Self::find_terminal(&disks, task_id).await?.is_some() {
+            if let Some((disk, bytes)) = Self::find(&disks, task_id).await? {
+                match EcstoreDiskAPI::compare_and_update_file(
+                    disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    &intent_path(task_id)?,
+                    Some(bytes),
+                    None,
+                )
+                .await?
+                {
+                    EcstoreConditionalFileUpdate::Updated => {}
+                    _ => return Err(Error::Other(format!("Root heal recovery record changed while cancelling {task_id}"))),
+                }
+            }
+            return Ok(true);
+        }
+        let Some((disk, bytes)) = Self::find(&disks, task_id).await? else {
+            return Ok(false);
+        };
+        let pending = decode_intent(task_id, &bytes)?;
+        let heal_type = HealType::from(pending.heal_type);
+        let terminal = RootHealTerminal::cancelled(task_id, &heal_type);
+        let _ = Self::persist_terminal_locked(&disks, task_id, terminal).await?;
+        match EcstoreDiskAPI::compare_and_update_file(
+            disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            &intent_path(task_id)?,
+            Some(bytes),
+            None,
+        )
+        .await?
+        {
+            EcstoreConditionalFileUpdate::Updated => Ok(true),
+            _ => Err(Error::Other(format!("Root heal recovery record changed while cancelling {task_id}"))),
+        }
+    }
+
+    pub(super) async fn persist_terminal(
+        &self,
+        task_id: &str,
+        heal_type: &HealType,
+        source: HealRequestSource,
+        completed: &CompletedHealStatus,
+    ) -> Result<bool> {
+        if !is_admin_heal_recovery(heal_type, source) || completed.heal_type != *heal_type {
+            return Ok(false);
+        }
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        let pending =
+            Self::persist_terminal_locked(&disks, task_id, RootHealTerminal::from_completed(task_id, completed)).await?;
+        if let Some((disk, bytes)) = pending {
+            match EcstoreDiskAPI::compare_and_update_file(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                &intent_path(task_id)?,
+                Some(bytes),
+                None,
+            )
+            .await?
+            {
+                EcstoreConditionalFileUpdate::Updated => {}
+                _ => {
+                    return Err(Error::Other(format!(
+                        "Root heal recovery record changed while publishing terminal {task_id}"
+                    )));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn completed(&self, task_id: &str) -> Result<Option<CompletedHealStatus>> {
+        if terminal_path(task_id).is_err() {
+            return Ok(None);
+        }
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        let Some((_, bytes)) = Self::find_terminal(&disks, task_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_terminal(task_id, &bytes)?.into_completed()))
+    }
+
+    pub(super) async fn completed_matches_path(&self, heal_path: &str) -> Result<bool> {
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        for disk in &disks {
+            EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
+            let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, "", -1).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound) => continue,
+                Err(error) => return Err(Error::Disk(error)),
+            };
+            for entry in entries {
+                let Some(task_id) = entry
+                    .strip_prefix(ROOT_TERMINAL_PREFIX)
+                    .and_then(|entry| entry.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+                let Some((_, bytes)) = Self::find_terminal(&disks, task_id).await? else {
+                    continue;
+                };
+                let heal_type = HealType::from(decode_terminal(task_id, &bytes)?.heal_type);
+                if heal_type_matches_path(&heal_type, heal_path) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
@@ -477,6 +708,9 @@ impl RootHealRecovery {
         }
         let mut requests = Vec::new();
         for task_id in ids {
+            if Self::find_terminal(&disks, &task_id).await?.is_some() {
+                continue;
+            }
             if let Some((_, bytes)) = Self::find(&disks, &task_id).await? {
                 requests.push(decode_intent(&task_id, &bytes)?.into_request());
             }

@@ -2035,7 +2035,7 @@ impl HealManager {
     /// Retrying, never Pending — then the queue, and finally a terminal
     /// completed entry. `heal_path` additionally constrains the map matches
     /// the way the `*_for_path` variants always have.
-    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> TaskStateLookup {
+    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> Result<TaskStateLookup> {
         let matches_path = |heal_type: &HealType| heal_path.is_none_or(|path| heal_type_matches_path(heal_type, path));
 
         {
@@ -2044,7 +2044,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|task| matches_path(&task.heal_type))
             {
-                return TaskStateLookup::Active(Arc::clone(task));
+                return Ok(TaskStateLookup::Active(Arc::clone(task)));
             }
         }
 
@@ -2054,7 +2054,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|retrying| matches_path(&retrying.request.heal_type))
             {
-                return TaskStateLookup::Retrying(retrying.status());
+                return Ok(TaskStateLookup::Retrying(retrying.status()));
             }
         }
 
@@ -2067,7 +2067,7 @@ impl HealManager {
             prune_completed_heal_statuses(&mut completed_heals);
             if let Some(completed) = completed_heals.get(canonical_task_id).filter(|c| matches_path(&c.heal_type)) {
                 if completed_status_is_retrying(&completed.status) {
-                    return TaskStateLookup::Completed(Arc::clone(completed));
+                    return Ok(TaskStateLookup::Completed(Arc::clone(completed)));
                 }
                 terminal_completed = Some(Arc::clone(completed));
             }
@@ -2080,7 +2080,7 @@ impl HealManager {
                 None => queue.contains_request_id(canonical_task_id),
             };
             if queued {
-                return TaskStateLookup::Queued;
+                return Ok(TaskStateLookup::Queued);
             }
         }
 
@@ -2093,15 +2093,55 @@ impl HealManager {
                 .cloned();
         }
 
-        match terminal_completed {
+        if terminal_completed.is_none()
+            && let Some(completed) = self.root_recovery.completed(canonical_task_id).await?
+            && matches_path(&completed.heal_type)
+        {
+            terminal_completed = Some(Arc::new(completed));
+        }
+
+        Ok(match terminal_completed {
             Some(completed) => TaskStateLookup::Completed(completed),
             None => TaskStateLookup::NotFound,
-        }
+        })
+    }
+
+    async fn publish_admin_terminal(
+        &self,
+        task_id: &str,
+        heal_type: &HealType,
+        source: HealRequestSource,
+        completed: &CompletedHealStatus,
+    ) -> Result<bool> {
+        self.root_recovery
+            .persist_terminal(task_id, heal_type, source, completed)
+            .await
+    }
+
+    async fn publish_admin_cancelled_terminal(
+        &self,
+        task_id: &str,
+        heal_type: &HealType,
+        source: HealRequestSource,
+    ) -> Result<bool> {
+        let completed = CompletedHealStatus {
+            outcome: None,
+            progress: None,
+            retained_bytes: std::sync::OnceLock::new(),
+            heal_type: heal_type.clone(),
+            status: HealTaskStatus::Cancelled,
+            result_items_truncated: false,
+            completed_at: SystemTime::now(),
+            seqed_items: Vec::new(),
+            next_seq: 0,
+            min_seq: 0,
+        };
+        self.publish_admin_terminal(task_id, heal_type, source, &completed).await
     }
 
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, None).await {
+        match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
             TaskStateLookup::Retrying(status) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
@@ -2121,7 +2161,7 @@ impl HealManager {
     /// full-snapshot semantics.
     pub async fn get_task_report_since(&self, task_id: &str, since: Option<u64>) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, None).await {
+        match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
             TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
@@ -2144,7 +2184,7 @@ impl HealManager {
         since: Option<u64>,
     ) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
             TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
@@ -2167,7 +2207,7 @@ impl HealManager {
     /// recently completed task, a different token is invalid for that path.
     pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
             TaskStateLookup::Retrying(status) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
@@ -2221,11 +2261,18 @@ impl HealManager {
         }
         drop(completed_heals);
 
-        let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
-        prune_completed_heal_statuses(&mut displaced_terminals);
-        displaced_terminals
-            .values()
-            .any(|terminal| heal_type_matches_path(&terminal.heal_type, heal_path))
+        {
+            let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
+            prune_completed_heal_statuses(&mut displaced_terminals);
+            if displaced_terminals
+                .values()
+                .any(|terminal| heal_type_matches_path(&terminal.heal_type, heal_path))
+            {
+                return true;
+            }
+        }
+
+        self.root_recovery.completed_matches_path(heal_path).await.unwrap_or(false)
     }
 
     /// Get task progress
@@ -2237,7 +2284,7 @@ impl HealManager {
 
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        let progress = match self.lookup_task_state(&canonical_task_id, None).await {
+        let progress = match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Some(task.get_progress().await),
             TaskStateLookup::Completed(completed) => completed.progress.clone(),
             _ => None,
@@ -2253,9 +2300,11 @@ impl HealManager {
         {
             let mut active_heals = self.active_heals.lock().await;
             if let Some(task) = active_heals.get(&canonical_task_id) {
+                let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                self.publish_admin_terminal(&canonical_task_id, &task.heal_type, task.source, &completed)
+                    .await?;
                 self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
                 task.cancel().await?;
-                let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
                 publish_completed_heal(&self.completed_heals, &self.task_aliases, &canonical_task_id, completed, true).await;
                 active_heals.remove(&canonical_task_id);
                 publish_active_heal_count(&active_heals);
@@ -2278,6 +2327,8 @@ impl HealManager {
         {
             let mut retrying_heals = self.retrying_heals.lock().await;
             if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
+                self.publish_admin_cancelled_terminal(&canonical_task_id, &retrying.request.heal_type, retrying.request.source)
+                    .await?;
                 self.root_recovery
                     .remove(&canonical_task_id, &retrying.request.heal_type, retrying.request.source)
                     .await?;
@@ -2303,6 +2354,8 @@ impl HealManager {
 
         let mut queue = self.heal_queue.lock().await;
         if let Some(request) = queue.requests().find(|request| request.id == canonical_task_id) {
+            self.publish_admin_cancelled_terminal(&canonical_task_id, &request.heal_type, request.source)
+                .await?;
             self.root_recovery
                 .remove(&request.id, &request.heal_type, request.source)
                 .await?;
@@ -2346,9 +2399,11 @@ impl HealManager {
 
             for task_id in &task_ids {
                 if let Some(task) = active_heals.get(task_id) {
+                    let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                    self.publish_admin_terminal(task_id, &task.heal_type, task.source, &completed)
+                        .await?;
                     self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
                     task.cancel().await?;
-                    let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
                     publish_completed_heal(&self.completed_heals, &self.task_aliases, task_id, completed, true).await;
                 }
                 active_heals.remove(task_id);
@@ -2376,6 +2431,8 @@ impl HealManager {
 
             for task_id in &task_ids {
                 if let Some(retrying) = retrying_heals.get(task_id) {
+                    self.publish_admin_cancelled_terminal(task_id, &retrying.request.heal_type, retrying.request.source)
+                        .await?;
                     self.root_recovery
                         .remove(task_id, &retrying.request.heal_type, retrying.request.source)
                         .await?;
@@ -2401,15 +2458,22 @@ impl HealManager {
             }
         }
 
-        let mut queue = self.heal_queue.lock().await;
-        for request in queue
-            .requests()
-            .filter(|request| heal_type_matches_path(&request.heal_type, heal_path))
-        {
+        let queued_matches = {
+            let queue = self.heal_queue.lock().await;
+            queue
+                .requests()
+                .filter(|request| heal_type_matches_path(&request.heal_type, heal_path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for request in &queued_matches {
+            self.publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source)
+                .await?;
             self.root_recovery
                 .remove(&request.id, &request.heal_type, request.source)
                 .await?;
         }
+        let mut queue = self.heal_queue.lock().await;
         let queued_cancelled = queue.remove_matching(|request| heal_type_matches_path(&request.heal_type, heal_path));
         if !queued_cancelled.is_empty() {
             publish_heal_queue_length(&queue);
