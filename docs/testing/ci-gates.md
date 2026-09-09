@@ -279,6 +279,21 @@ another platform, or `--test mixed-version|rollback` while narrowing a failure.
 It performs a free-space preflight before building so a saturated validation
 host fails before producing partial evidence.
 
+Operator-collected G01 root/quota authority evidence can be packaged with:
+
+```bash
+scripts/run_scanner_heal_authority_evidence.py \
+  --root-authority-json /path/to/root-authority.json \
+  --quota-authority-json /path/to/quota-authority.json \
+  --out-dir /path/to/authority-descriptor
+```
+
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete
+root authority, and incomplete quota authority inputs before writing
+`release-bundle-authority.json`. The descriptor validates only G01; it still
+needs the full bundle assembler and the remaining release lanes before a release
+can be approved.
+
 The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON
 artifacts with:
 
@@ -309,6 +324,14 @@ pre-mounted small filesystem. P4 is release evidence only when it completes the
 default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle
 gate validation.
 
+Legacy rollback evidence for R-L is assembled from a measured proof JSON:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_legacy_rollback_evidence.py \
+  --proof-json /path/to/legacy-rollback-proof.json \
+  --out-dir /path/to/legacy-rollback-descriptor
+```
+
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
 
@@ -316,6 +339,23 @@ the complete hard-gate bundle with:
 scripts/python_bin.sh scripts/check_test_wiring.py \
   --check-scanner-heal-release-bundle /path/to/release-evidence.json
 ```
+
+Lane descriptors can be assembled into that bundle with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --assemble-scanner-heal-release-bundle \
+  /path/to/release-bundle-g14.json \
+  /path/to/release-bundle-w16.json \
+  /path/to/assembled-release-bundle
+```
+
+The final argument is the new output directory. Every preceding argument is a
+measured descriptor, and each descriptor gate must keep its own passing status,
+lane identity, measured evidence type, complete required fields, relative
+artifact paths, and matching SHA256 hashes. The assembler may verify only the
+lanes already present; a partial assembled bundle remains blocked until all
+release gates are supplied.
 
 The bundle checker is intentionally stricter than the case checker. It requires
 schema 2 registry metadata, `evidence: measured`, the current checkout revision,

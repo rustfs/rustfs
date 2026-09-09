@@ -44,6 +44,10 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G01": (
+        "root_authority_evidence",
+        "quota_authority_evidence",
+    ),
     "G05": (
         "per_object_outcome_oracle",
         "terminal_retention_bounds",
@@ -101,6 +105,11 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "ledger_disposition_evidence",
         "grace_handling",
     ),
+    "R-L": (
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence",
+    ),
 }
 SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "G01": ("root_authority_evidence", "quota_authority_evidence"),
@@ -123,7 +132,7 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
     "R-D": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-D"],
-    "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
+    "R-L": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-L"],
 }
 SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("G03", "durable_root_publication_proof"): "durable-root-publication",
@@ -137,6 +146,18 @@ SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("R-L", "migration_gap_evidence"): "migration-gap",
     ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
 }
+SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES = (
+    "root-cas-success",
+    "root-readback-success",
+    "incomplete-root-rejected",
+    "stale-root-rejected",
+)
+SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES = (
+    "quota-floor-readback",
+    "quota-over-limit-rejected",
+    "rejected-object-invisible",
+    "quota-fails-closed-without-authority",
+)
 SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("G07", "mrf_responsibility_oracle"),
     ("G07", "commit_boundary_crash_matrix"),
@@ -318,6 +339,24 @@ SCANNER_HEAL_RELEASE_RD_GRACE_CASES = (
     "grace-expired-prunes-terminal",
     "restart-preserves-grace-clock",
 )
+SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES = {
+    "legacy_source_conflict_evidence": (
+        "data-movement-owned-target-equivalence",
+        "newer-target-conflict-rejected",
+        "legacy-part-checksum-gap-rejected",
+    ),
+    "migration_gap_evidence": (
+        "encrypted-iam-decrypt-before-normalize",
+        "empty-legacy-source-inherits-prior-responsibilities",
+        "missing-corrupt-empty-sources-fail-closed",
+    ),
+    "crash_safe_source_retirement_evidence": (
+        "source-change-capacity-failure-keeps-old-commit",
+        "torn-inactive-payload-keeps-previous-anchor",
+        "commit-boundary-lost-response-idempotent",
+        "successor-retry-validates-orphan",
+    ),
+}
 SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
     "durable_root_publication_proof": (
         "root-cas-success",
@@ -1677,6 +1716,23 @@ def is_json_artifact_format(value: str) -> bool:
 
 def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple[str, ...]:
     fields: list[str] = []
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            fields.extend((
+                "root_authority_cases",
+                "root_cas_observed",
+                "root_readback_observed",
+                "incomplete_root_rejected",
+                "stale_root_rejected",
+            ))
+        if field == "quota_authority_evidence":
+            fields.extend((
+                "quota_authority_cases",
+                "quota_floor_readback_observed",
+                "over_limit_put_rejected",
+                "rejected_object_invisible",
+                "quota_fails_closed_without_authority",
+            ))
     if gate in ("G03", "G09", "R-L"):
         fields.extend(("versions", "mixed_version_role"))
     if gate == "G02":
@@ -1853,6 +1909,28 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
                 "grace_retention_observed",
                 "grace_expiry_pruned_terminal_records",
             ))
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            fields.extend((
+                "legacy_source_conflict_cases",
+                "source_conflicts_rejected",
+                "takeover_identity_bound",
+                "legacy_checksum_gap_rejected",
+            ))
+        if field == "migration_gap_evidence":
+            fields.extend((
+                "migration_gap_cases",
+                "migration_gap_closed",
+                "legacy_sources_fail_closed",
+                "prior_responsibilities_inherited",
+            ))
+        if field == "crash_safe_source_retirement_evidence":
+            fields.extend((
+                "source_retirement_cases",
+                "source_retirement_is_crash_safe",
+                "old_source_retained_until_successor",
+                "recovered_pending_migration",
+            ))
     return tuple(dict.fromkeys(fields))
 
 
@@ -1953,6 +2031,33 @@ def release_bundle_number(value: object, name: str, minimum: int | float = 0) ->
 
 
 def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dict[str, object]) -> None:
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("root_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES,
+                f"{gate}.{field}.root_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("root_cas_observed"), f"{gate}.{field}.root_cas_observed")
+            release_bundle_bool_true(evidence.get("root_readback_observed"), f"{gate}.{field}.root_readback_observed")
+            release_bundle_bool_true(evidence.get("incomplete_root_rejected"),
+                                     f"{gate}.{field}.incomplete_root_rejected")
+            release_bundle_bool_true(evidence.get("stale_root_rejected"), f"{gate}.{field}.stale_root_rejected")
+        if field == "quota_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("quota_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES,
+                f"{gate}.{field}.quota_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("quota_floor_readback_observed"),
+                                     f"{gate}.{field}.quota_floor_readback_observed")
+            release_bundle_bool_true(evidence.get("over_limit_put_rejected"),
+                                     f"{gate}.{field}.over_limit_put_rejected")
+            release_bundle_bool_true(evidence.get("rejected_object_invisible"),
+                                     f"{gate}.{field}.rejected_object_invisible")
+            release_bundle_bool_true(evidence.get("quota_fails_closed_without_authority"),
+                                     f"{gate}.{field}.quota_fails_closed_without_authority")
+
     if gate == "G02":
         if field == "bounded_checkpoint_oracle":
             release_bundle_bool_true(evidence.get("checkpoint_progress_bounded"),
@@ -2314,6 +2419,44 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             release_bundle_bool_true(evidence.get("grace_expiry_pruned_terminal_records"),
                                      f"{gate}.{field}.grace_expiry_pruned_terminal_records")
 
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            release_bundle_exact_strings(
+                evidence.get("legacy_source_conflict_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.legacy_source_conflict_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_conflicts_rejected"),
+                                     f"{gate}.{field}.source_conflicts_rejected")
+            release_bundle_bool_true(evidence.get("takeover_identity_bound"),
+                                     f"{gate}.{field}.takeover_identity_bound")
+            release_bundle_bool_true(evidence.get("legacy_checksum_gap_rejected"),
+                                     f"{gate}.{field}.legacy_checksum_gap_rejected")
+        if field == "migration_gap_evidence":
+            release_bundle_exact_strings(
+                evidence.get("migration_gap_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.migration_gap_cases",
+            )
+            release_bundle_bool_true(evidence.get("migration_gap_closed"),
+                                     f"{gate}.{field}.migration_gap_closed")
+            release_bundle_bool_true(evidence.get("legacy_sources_fail_closed"),
+                                     f"{gate}.{field}.legacy_sources_fail_closed")
+            release_bundle_bool_true(evidence.get("prior_responsibilities_inherited"),
+                                     f"{gate}.{field}.prior_responsibilities_inherited")
+        if field == "crash_safe_source_retirement_evidence":
+            release_bundle_exact_strings(
+                evidence.get("source_retirement_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.source_retirement_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_retirement_is_crash_safe"),
+                                     f"{gate}.{field}.source_retirement_is_crash_safe")
+            release_bundle_bool_true(evidence.get("old_source_retained_until_successor"),
+                                     f"{gate}.{field}.old_source_retained_until_successor")
+            release_bundle_bool_true(evidence.get("recovered_pending_migration"),
+                                     f"{gate}.{field}.recovered_pending_migration")
+
 
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
@@ -2361,7 +2504,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
             evidence_integer(evidence.get("foreground_latency_p95_ms"),
                              f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
-    if gate in ("G11", "G13"):
+    if gate in ("G01", "G11", "G13", "R-L"):
         validate_release_bundle_domain_evidence(gate, field, evidence)
     if gate == "P1" and field == "foreground_latency_throughput_measurement":
         evidence_integer(evidence.get("foreground_latency_p95_ms"),
@@ -3317,6 +3460,22 @@ class SelfTests(unittest.TestCase):
                         "versions_retained": 16,
                         "bytes_retained": 16,
                     })
+                if gate == "G01" and field == "root_authority_evidence":
+                    evidence.update({
+                        "root_authority_cases": list(SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES),
+                        "root_cas_observed": True,
+                        "root_readback_observed": True,
+                        "incomplete_root_rejected": True,
+                        "stale_root_rejected": True,
+                    })
+                if gate == "G01" and field == "quota_authority_evidence":
+                    evidence.update({
+                        "quota_authority_cases": list(SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES),
+                        "quota_floor_readback_observed": True,
+                        "over_limit_put_rejected": True,
+                        "rejected_object_invisible": True,
+                        "quota_fails_closed_without_authority": True,
+                    })
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -3505,6 +3664,21 @@ class SelfTests(unittest.TestCase):
                     evidence["grace_window_seconds"] = 300
                     evidence["grace_retention_observed"] = True
                     evidence["grace_expiry_pruned_terminal_records"] = True
+                if gate == "R-L" and field == "legacy_source_conflict_evidence":
+                    evidence["legacy_source_conflict_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_conflicts_rejected"] = True
+                    evidence["takeover_identity_bound"] = True
+                    evidence["legacy_checksum_gap_rejected"] = True
+                if gate == "R-L" and field == "migration_gap_evidence":
+                    evidence["migration_gap_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["migration_gap_closed"] = True
+                    evidence["legacy_sources_fail_closed"] = True
+                    evidence["prior_responsibilities_inherited"] = True
+                if gate == "R-L" and field == "crash_safe_source_retirement_evidence":
+                    evidence["source_retirement_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_retirement_is_crash_safe"] = True
+                    evidence["old_source_retained_until_successor"] = True
+                    evidence["recovered_pending_migration"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
                     evidence["allocation_bytes"] = 1024
@@ -4062,6 +4236,20 @@ class SelfTests(unittest.TestCase):
             ("p1-throughput", "P1", "foreground_latency_throughput_measurement", lambda item: item.pop("throughput_ops_per_second"), "throughput_ops_per_second"),
             ("p3-fixed-load", "P3", "two_hour_pressure_measurement", lambda item: item.update({"fixed_offered_load": False}), "fixed offered load"),
             (
+                "g01-root-cases",
+                "G01",
+                "root_authority_evidence",
+                lambda item: item["root_authority_cases"].remove("stale-root-rejected"),
+                "root_authority_cases missing cases",
+            ),
+            (
+                "g01-quota-fail-closed",
+                "G01",
+                "quota_authority_evidence",
+                lambda item: item.update({"quota_fails_closed_without_authority": False}),
+                "quota_fails_closed_without_authority",
+            ),
+            (
                 "rd-manager",
                 "R-D",
                 "manager_disposition_evidence",
@@ -4183,6 +4371,12 @@ class SelfTests(unittest.TestCase):
                 "per_object_outcome_cases missing cases",
             ),
             (
+                "g01-authority-mirror",
+                lambda payload: payload["root_authority_cases"].remove("incomplete-root-rejected"),
+                ("G01", "root_authority_evidence"),
+                "root_authority_cases missing cases",
+            ),
+            (
                 "g06-truncation-mirror",
                 lambda payload: payload["truncation_cases"].remove("trailing-data-node-status-reject"),
                 ("G06", "truncation_behavior"),
@@ -4211,6 +4405,12 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload["grace_cases"].remove("grace-expired-prunes-terminal"),
                 ("R-D", "grace_handling"),
                 "grace_cases missing cases",
+            ),
+            (
+                "rl-migration-gap-mirror",
+                lambda payload: payload.update({"migration_gap_closed": False}),
+                ("R-L", "migration_gap_evidence"),
+                "migration_gap_closed",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
@@ -4305,6 +4505,27 @@ class SelfTests(unittest.TestCase):
                 "rollback_payload_evidence",
                 lambda item: item.update({"rollback_payload_replayed": False}),
                 "rollback_payload_replayed",
+            ),
+            (
+                "legacy-source-conflict-cases",
+                "R-L",
+                "legacy_source_conflict_evidence",
+                lambda item: item["legacy_source_conflict_cases"].remove("newer-target-conflict-rejected"),
+                "legacy_source_conflict_cases missing cases",
+            ),
+            (
+                "migration-gap-closed",
+                "R-L",
+                "migration_gap_evidence",
+                lambda item: item.update({"migration_gap_closed": False}),
+                "migration_gap_closed",
+            ),
+            (
+                "source-retirement-crash-safe",
+                "R-L",
+                "crash_safe_source_retirement_evidence",
+                lambda item: item.update({"source_retirement_is_crash_safe": False}),
+                "source_retirement_is_crash_safe",
             ),
             (
                 "scheduler-bounds",
@@ -4450,6 +4671,7 @@ class SelfTests(unittest.TestCase):
             self.assertIn("scheduler-pressure", status["pending_lanes"])
             requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
             self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
+            self.assertIn("root_authority_evidence", requirements["G01"]["evidence_fields"])
             self.assertIn("per_object_outcome_oracle", requirements["G05"]["evidence_fields"])
             self.assertIn("truncation_behavior", requirements["G06"]["evidence_fields"])
             self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
@@ -4462,12 +4684,13 @@ class SelfTests(unittest.TestCase):
                 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
             )
             self.assertIn("grace_handling", requirements["R-D"]["evidence_fields"])
+            self.assertIn("migration_gap_evidence", requirements["R-L"]["evidence_fields"])
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G05", "G06", "G07", "G08", "G09", "G11", "G14", "P2", "P4", "R-D"):
+            for gate in ("G01", "G03", "G05", "G06", "G07", "G08", "G09", "G11", "G14", "P2", "P4", "R-D", "R-L"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []

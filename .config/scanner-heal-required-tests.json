@@ -171,7 +171,11 @@
       "lane": "authority-coverage",
       "status": "pending",
       "description": "Complete root and quota authority coverage",
-      "requires": ["root authority evidence", "quota authority evidence"]
+      "requires": ["root authority evidence", "quota authority evidence"],
+      "evidence_fields": [
+        "root_authority_evidence",
+        "quota_authority_evidence"
+      ]
     },
     {
       "gate": "G02",
@@ -398,7 +402,12 @@
       "lane": "mixed-version-rollback",
       "status": "pending",
       "description": "Legacy source conflicts, migration gaps and crash-safe source retirement",
-      "requires": ["legacy source-conflict evidence", "migration-gap evidence", "crash-safe source retirement evidence"]
+      "requires": ["legacy source-conflict evidence", "migration-gap evidence", "crash-safe source retirement evidence"],
+      "evidence_fields": [
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence"
+      ]
     }
   ]
 }
