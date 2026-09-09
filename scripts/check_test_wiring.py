@@ -129,6 +129,17 @@ SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("P4", "retained_responsibility_evidence"),
     ("P4", "mrf_cleanup_gc_soak_evidence"),
 }
+SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS = {
+    ("G07", "mrf_responsibility_oracle"): "mrf-durable-responsibility-oracle",
+    ("G07", "commit_boundary_crash_matrix"): "mrf-commit-boundary-crash-matrix",
+    ("G08", "mrf_capacity_evidence"): "mrf-capacity-boundary",
+    ("G08", "disk_full_matrix"): "mrf-disk-full-enospc-matrix",
+    ("G08", "replica_loss_matrix"): "mrf-replica-loss-matrix",
+    ("P4", "mrf_scale_measurement"): "mrf-scale-measurement",
+    ("P4", "mrf_replay_cost_measurement"): "mrf-replay-cost-measurement",
+    ("P4", "retained_responsibility_evidence"): "mrf-retained-responsibility-soak",
+    ("P4", "mrf_cleanup_gc_soak_evidence"): "mrf-cleanup-gc-soak",
+}
 SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS = (
     "missing_producer_identity",
     "restart_gap",
@@ -1580,6 +1591,10 @@ def validate_release_bundle_json_artifact_payload(path: Path, source_revision: s
     require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
     if artifact_kind is not None:
         require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+    mrf_artifact_kind = SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS.get((gate, field))
+    if mrf_artifact_kind is not None:
+        require(payload.get("artifact_kind") == mrf_artifact_kind,
+                f"{prefix} JSON artifact kind must be {mrf_artifact_kind}")
     mirror_fields = release_bundle_json_artifact_mirrored_fields(gate, field)
     for mirror_field in mirror_fields:
         require(mirror_field in payload, f"{prefix} JSON artifact missing {mirror_field}")
@@ -2805,6 +2820,9 @@ class SelfTests(unittest.TestCase):
                     "gate": gate,
                     "field": field,
                 }
+                mrf_artifact_kind = SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS.get((gate, field))
+                if mrf_artifact_kind is not None:
+                    artifact_payload["artifact_kind"] = mrf_artifact_kind
                 for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
                     artifact_payload[mirror_field] = evidence[mirror_field]
                 write_json(artifact, artifact_payload)
@@ -3174,6 +3192,12 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload.update({"fixture": True}),
                 ("G08", "disk_full_matrix"),
                 "JSON artifact is fixture",
+            ),
+            (
+                "mrf-artifact-kind",
+                lambda payload: payload.update({"artifact_kind": "generic-json"}),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact kind must be mrf-disk-full-enospc-matrix",
             ),
             (
                 "g08-case-mirror",
