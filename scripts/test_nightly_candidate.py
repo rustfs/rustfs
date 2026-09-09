@@ -163,12 +163,13 @@ SH
                 self.assertFalse(self.store.exists())
                 self.assertEqual(list(self.root.glob("nightly-awscli.*")), [])
 
-    def test_checkout_sha_mismatch_fails_before_upload(self):
+    def test_manifest_advertises_checked_out_head_even_when_github_sha_differs(self):
+        # With a ref override (NIGHTLY_BRANCH variable / dispatch `branch`
+        # input) the checked-out HEAD intentionally differs from GITHUB_SHA;
+        # the candidate manifest must record the tree that was built.
         result = self.run_publish(GITHUB_SHA="f" * 40)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Checkout SHA", result.stderr)
-        self.assertFalse(self.output.exists())
-        self.assertFalse((self.root / "aws.log").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.manifest()["source_sha"], self.sha)
 
     def test_same_date_builds_and_reruns_keep_distinct_candidates(self):
         urls = []
