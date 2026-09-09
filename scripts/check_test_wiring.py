@@ -1961,6 +1961,24 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
                 "grace_outcomes_retained",
             ),
         }[field])
+    if gate == "G14":
+        fields.append("case_evidence")
+        if field == "same_window_field_evidence":
+            fields.append("same_window_fields")
+        if field == "ec8_4_evidence":
+            fields.append("topology")
+        if field == "multi_set_evidence":
+            fields.append("sets")
+        if field == "multi_pool_evidence":
+            fields.append("pools")
+        if field == "distributed_segment_invalidation_evidence":
+            fields.extend((
+                "invalidation_domain",
+                "distributed_ec_invalidation",
+                "peer_count",
+                "same_window_remote_proof",
+                "all_peers_bound_to_generation_window",
+            ))
     if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
         fields.extend(("replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"))
     if gate == "P4" and field == "retained_responsibility_evidence":
@@ -2050,9 +2068,57 @@ def validate_profile_json_artifact_payload(bundle_path: Path, path: Path, payloa
         evidence_integer(payload.get(metric), f"{prefix}.{metric}", 1, 2**63 - 1)
 
 
+def validate_g14_json_artifact_payload(bundle_path: Path, payload: dict[str, object],
+                                       evidence: dict[str, object] | None, gate: str, field: str,
+                                       source_revision: str, window_id: str) -> None:
+    prefix = f"{gate}.{field}"
+    require(evidence is not None, f"{prefix} JSON artifact missing outer evidence context")
+    for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
+        require(payload.get(mirror_field) == evidence.get(mirror_field),
+                f"{prefix} JSON artifact {mirror_field} mismatch")
+    cases = payload.get("case_evidence")
+    require(isinstance(cases, list) and cases, f"{prefix} JSON artifact missing case_evidence")
+    seen_cases = set()
+    for index, item in enumerate(cases):
+        require(isinstance(item, dict), f"{prefix} JSON artifact case_evidence[{index}] must be an object")
+        case = evidence_string(
+            item.get("case"),
+            f"{prefix} JSON artifact case_evidence[{index}].case",
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{1,127}",
+        )
+        require(case not in seen_cases, f"{prefix} JSON artifact case_evidence has duplicate case: {case}")
+        seen_cases.add(case)
+        artifact = release_bundle_artifact_path(
+            bundle_path,
+            item.get("artifact"),
+            gate,
+            f"{field}.case_evidence.{case}",
+        )
+        require(sha(item.get("sha256")) and digest(artifact) == item["sha256"],
+                f"{prefix} JSON artifact case_evidence[{index}] artifact hash mismatch")
+        require(item.get("source_revision") == source_revision,
+                f"{prefix} JSON artifact case_evidence[{index}].source_revision mismatch")
+        require(item.get("measurement_window_id") == window_id,
+                f"{prefix} JSON artifact case_evidence[{index}].measurement_window_id mismatch")
+        case_payload = read_json(artifact)
+        require(isinstance(case_payload, dict), f"{prefix} JSON artifact case_evidence[{index}] artifact must be a JSON object")
+        for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+            require(case_payload.get(marker) is not True,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact is {marker}")
+        require(case_payload.get("case") == case,
+                f"{prefix} JSON artifact case_evidence[{index}] artifact case mismatch")
+        if "source_revision" in case_payload:
+            require(case_payload["source_revision"] == source_revision,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact source revision mismatch")
+        if "measurement_window_id" in case_payload:
+            require(case_payload["measurement_window_id"] == window_id,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact measurement window mismatch")
+
+
 def validate_release_bundle_json_artifact_payload(bundle_path: Path, path: Path, source_revision: str, gate: str, field: str,
                                                  run_id: str, window_id: str,
-                                                 artifact_kind: str | None = None) -> None:
+                                                 artifact_kind: str | None = None,
+                                                 evidence: dict[str, object] | None = None) -> None:
     payload = read_json(path)
     prefix = f"{gate}.{field}"
     for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
@@ -2077,6 +2143,8 @@ def validate_release_bundle_json_artifact_payload(bundle_path: Path, path: Path,
     if not mirror_fields:
         return
     validate_release_bundle_domain_evidence(gate, field, payload)
+    if gate == "G14":
+        validate_g14_json_artifact_payload(bundle_path, payload, evidence, gate, field, source_revision, window_id)
     if gate in ("G03", "G09", "R-L"):
         versions = payload.get("versions")
         require(isinstance(versions, list) and
@@ -2610,7 +2678,16 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
     artifact = release_bundle_artifact_path(bundle_path, evidence.get("artifact"), gate, field)
     require(sha(evidence.get("sha256")) and digest(artifact) == evidence["sha256"], f"{gate}.{field} artifact hash mismatch")
     if is_json_artifact_format(artifact_format):
-        validate_release_bundle_json_artifact_payload(bundle_path, artifact, source_revision, gate, field, run_id, window_id)
+        validate_release_bundle_json_artifact_payload(
+            bundle_path,
+            artifact,
+            source_revision,
+            gate,
+            field,
+            run_id,
+            window_id,
+            evidence=evidence,
+        )
     summary = evidence.get("summary")
     require(isinstance(summary, str) and summary.strip(), f"{gate}.{field} missing human summary")
     if gate.startswith("P"):
@@ -3023,6 +3100,41 @@ def copy_release_bundle_profile_raw_artifact(descriptor_path: Path, bundle_dir: 
     item["sha256"] = digest(wrapper)
 
 
+def copy_release_bundle_g14_case_artifacts(descriptor_path: Path, bundle_dir: Path, evidence: dict[str, object],
+                                           gate: str, field: str) -> None:
+    wrapper = release_bundle_artifact_path(bundle_dir / "release-evidence.json", evidence.get("artifact"), gate, field)
+    payload = read_json(wrapper)
+    cases = payload.get("case_evidence")
+    require(isinstance(cases, list), f"{gate}.{field} descriptor case_evidence must be a list")
+    artifact_dir = bundle_dir / "artifacts"
+    for index, item in enumerate(cases):
+        require(isinstance(item, dict), f"{gate}.{field} descriptor case_evidence[{index}] must be an object")
+        case = evidence_string(
+            item.get("case"),
+            f"{gate}.{field}.case_evidence[{index}].case",
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{1,127}",
+        )
+        source = release_bundle_descriptor_path(
+            descriptor_path,
+            item.get("artifact"),
+            gate,
+            f"{field}.case_evidence.{case}",
+        )
+        source_sha = digest(source)
+        require(sha(item.get("sha256")) and item["sha256"] == source_sha,
+                f"{gate}.{field} descriptor case_evidence[{index}] artifact hash mismatch")
+        safe_case = re.sub(r"[^A-Za-z0-9._-]", "-", case)
+        target = artifact_dir / f"{gate}-{field}-case-{safe_case}{release_bundle_artifact_suffix(source)}"
+        require(not target.exists(), f"{gate}.{field} duplicate assembled case evidence path")
+        shutil.copyfile(source, target)
+        require(digest(target) == source_sha, f"{gate}.{field} assembled case evidence hash mismatch")
+        item["artifact"] = target.relative_to(bundle_dir).as_posix()
+        item["sha256"] = source_sha
+    write_json(wrapper, payload)
+    evidence["case_evidence"] = payload["case_evidence"]
+    evidence["sha256"] = digest(wrapper)
+
+
 def assemble_scanner_heal_release_bundle_descriptors(
     root: Path,
     descriptor_paths: list[Path],
@@ -3076,6 +3188,8 @@ def assemble_scanner_heal_release_bundle_descriptors(
                 evidence = json.loads(json.dumps(raw_evidence))
                 reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
                 copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
+                if gate == "G14":
+                    copy_release_bundle_g14_case_artifacts(descriptor_path, bundle_dir, evidence, gate, field)
                 profile_artifacts = evidence.get("profile_artifacts")
                 if profile_artifacts is not None:
                     require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
@@ -3801,6 +3915,34 @@ class SelfTests(unittest.TestCase):
                     evidence["peer_count"] = 3
                     evidence["same_window_remote_proof"] = True
                     evidence["all_peers_bound_to_generation_window"] = True
+                if gate == "G14":
+                    case_id = "ec84-multiset-multipool"
+                    case_artifact = artifact_dir / "cases" / f"{gate}-{field}-{case_id}.json"
+                    case_artifact.parent.mkdir(parents=True, exist_ok=True)
+                    write_json(case_artifact, {
+                        "schema": 1,
+                        "case": case_id,
+                        "evidence_type": "measured",
+                        "source_revision": source_revision,
+                        "measurement_window_id": window_id,
+                        "topology": {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4},
+                        "sets": 2,
+                        "pools": 2,
+                        "invalidation_domain": "distributed-ec",
+                        "distributed_ec_invalidation": True,
+                        "peer_count": 3,
+                        "same_window_remote_proof": True,
+                        "all_peers_bound_to_generation_window": True,
+                    })
+                    evidence["case_evidence"] = [
+                        {
+                            "case": case_id,
+                            "artifact": case_artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(case_artifact),
+                            "source_revision": source_revision,
+                            "measurement_window_id": window_id,
+                        },
+                    ]
                 if field == "segment_activation_preflight":
                     evidence["production_activation"] = False
                     evidence["scanner_segment_reuse_activated"] = False
@@ -4146,7 +4288,7 @@ class SelfTests(unittest.TestCase):
 
     def test_scanner_heal_release_bundle_enforces_topology_duration_profile_and_versions(self) -> None:
         for fault, gate, field, mutation, expected in (
-            ("topology", "G14", "ec8_4_evidence", lambda item: item.update({"topology": {"erasure": "EC4+2", "nodes": 2, "drives_per_node": 3}}), "EC8+4"),
+            ("topology", "G14", "ec8_4_evidence", lambda item: item.update({"topology": {"erasure": "EC4+2", "nodes": 2, "drives_per_node": 3}}), "JSON artifact topology mismatch"),
             ("missing-duration", "P1", "cold_walk_share_measurement", lambda item: item.pop("duration_seconds"), "duration_seconds"),
             ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
             ("mrf-cleanup-soak-duration", "P4", "mrf_cleanup_gc_soak_evidence", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
@@ -4304,7 +4446,7 @@ class SelfTests(unittest.TestCase):
                 lambda item: item.update({"stale_journals_after_gc": 1}),
                 "zero stale journals",
             ),
-            ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "missing fields"),
+            ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "JSON artifact same_window_fields mismatch"),
             ("activation-enabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": True}), "production activation disabled"),
             (
                 "activation-missing-fail-closed",
@@ -4409,14 +4551,14 @@ class SelfTests(unittest.TestCase):
                 "G14",
                 "distributed_segment_invalidation_evidence",
                 lambda item: item.update({"distributed_ec_invalidation": False}),
-                "peer invalidation proof",
+                "JSON artifact distributed_ec_invalidation mismatch",
             ),
             (
                 "distributed-peer-window",
                 "G14",
                 "distributed_segment_invalidation_evidence",
                 lambda item: item.update({"all_peers_bound_to_generation_window": False}),
-                "peer generation-window binding",
+                "JSON artifact all_peers_bound_to_generation_window mismatch",
             ),
             (
                 "post-stop-work-multiple",
@@ -4666,6 +4808,18 @@ class SelfTests(unittest.TestCase):
                 ("R-L", "migration_gap_evidence"),
                 "migration_gap_closed",
             ),
+            (
+                "g14-topology-mirror",
+                lambda payload: payload.update({"topology": {"erasure": "EC8+4", "nodes": 4, "drives_per_node": 4}}),
+                ("G14", "ec8_4_evidence"),
+                "JSON artifact topology mismatch",
+            ),
+            (
+                "g14-case-source",
+                lambda payload: payload["case_evidence"][0].update({"source_revision": "c" * 40}),
+                ("G14", "multi_pool_evidence"),
+                "JSON artifact case_evidence mismatch",
+            ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
@@ -4713,7 +4867,12 @@ class SelfTests(unittest.TestCase):
                     status = scanner_heal_release_bundle_status(root, bundle)
                 self.assertEqual(status["decision"], "blocked")
                 self.assertFalse(status["release_approved"])
-                self.assertTrue(any("must share one measurement window" in error
+                expected = (
+                    "case_evidence[0].measurement_window_id mismatch"
+                    if gate == "G14"
+                    else "must share one measurement window"
+                )
+                self.assertTrue(any(expected in error
                                     for error in status["rejected_gates"][gate]))
 
     def test_scanner_heal_release_bundle_requires_domain_evidence(self) -> None:

@@ -56,6 +56,20 @@ def parse_case_dir_arg(value: str) -> tuple[str | None, Path]:
     return None, Path(value).expanduser().resolve()
 
 
+def proof_case_artifact_path(proof_path: Path, sample: dict[str, Any], index: int) -> Path:
+    raw_artifact = sample.get("artifact")
+    require(isinstance(raw_artifact, str) and raw_artifact.strip(), f"G14 case evidence {index} missing artifact")
+    artifact = Path(raw_artifact)
+    require(not artifact.is_absolute() and ".." not in artifact.parts,
+            f"G14 case evidence {index} artifact path escapes proof directory")
+    resolved = (proof_path.parent / artifact).resolve()
+    require(resolved.is_relative_to(proof_path.parent.resolve()),
+            f"G14 case evidence {index} artifact path escapes proof directory")
+    require(resolved.is_file(), f"G14 case evidence {index} artifact is missing")
+    require(resolved.stat().st_size > 0, f"G14 case evidence {index} artifact is empty")
+    return resolved
+
+
 def load_proof(path: Path, source_revision: str) -> dict[str, Any]:
     proof = read_json(path)
     for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
@@ -88,11 +102,23 @@ def load_proof(path: Path, source_revision: str) -> dict[str, Any]:
         require(isinstance(sample.get("case"), str) and sample["case"].strip(), f"G14 case evidence {index} missing case")
         require(isinstance(sample.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", sample["sha256"]),
                 f"G14 case evidence {index} missing sha256")
-        if "source_revision" in sample:
-            require(sample["source_revision"] == source_revision, f"G14 case evidence {index} source revision mismatch")
-        if "measurement_window_id" in sample:
-            require(sample["measurement_window_id"] == proof["measurement_window_id"],
-                    f"G14 case evidence {index} measurement window mismatch")
+        artifact = proof_case_artifact_path(path, sample, index)
+        require(digest(artifact) == sample["sha256"], f"G14 case evidence {index} artifact hash mismatch")
+        require(sample.get("source_revision") == source_revision,
+                f"G14 case evidence {index} source revision mismatch")
+        require(sample.get("measurement_window_id") == proof["measurement_window_id"],
+                f"G14 case evidence {index} measurement window mismatch")
+        artifact_payload = read_json(artifact)
+        require(isinstance(artifact_payload, dict), f"G14 case evidence {index} artifact must be a JSON object")
+        for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+            require(artifact_payload.get(marker) is not True, f"G14 case evidence {index} artifact is {marker}")
+        require(artifact_payload.get("case") == sample["case"], f"G14 case evidence {index} artifact case mismatch")
+        if "source_revision" in artifact_payload:
+            require(artifact_payload["source_revision"] == source_revision,
+                    f"G14 case evidence {index} artifact source revision mismatch")
+        if "measurement_window_id" in artifact_payload:
+            require(artifact_payload["measurement_window_id"] == proof["measurement_window_id"],
+                    f"G14 case evidence {index} artifact measurement window mismatch")
     return proof
 
 
@@ -176,6 +202,27 @@ def copy_case_artifacts(out_dir: Path, records: list[dict[str, Any]], window_id:
     return copied
 
 
+def copy_proof_case_artifacts(out_dir: Path, proof_path: Path, samples: list[dict[str, Any]], window_id: str,
+                              source_revision: str) -> list[dict[str, Any]]:
+    case_dir = out_dir / "artifacts" / "cases"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for index, sample in enumerate(samples):
+        source = proof_case_artifact_path(proof_path, sample, index)
+        safe_case = re.sub(r"[^A-Za-z0-9._-]", "-", sample["case"])
+        target = case_dir / f"{index:02d}-{safe_case}{source.suffix or '.json'}"
+        require(not target.exists(), f"G14 case evidence {index} destination already exists")
+        shutil.copyfile(source, target)
+        copied.append({
+            "case": sample["case"],
+            "artifact": target.relative_to(out_dir).as_posix(),
+            "sha256": digest(target),
+            "source_revision": source_revision,
+            "measurement_window_id": window_id,
+        })
+    return copied
+
+
 def proof_from_case_directories(raw_values: list[str], out_dir: Path, source_revision: str) -> dict[str, Any]:
     require(raw_values, "missing G14 case directories")
     records = [load_case_directory(value, source_revision) for value in raw_values]
@@ -230,6 +277,7 @@ def write_field(out_dir: Path, field: str, proof: dict[str, Any], source_revisio
         "command": proof["command"],
         "artifact_format": "json",
         "summary": proof.get("summary") or "Measured G14 same-window EC8+4 multi-set/multi-pool proof.",
+        "case_evidence": proof["case_evidence"],
     }
     if field == "same_window_field_evidence":
         evidence["same_window_fields"] = [item for item in G14_FIELDS if item != field]
@@ -275,7 +323,15 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     source_revision = args.source_revision or git_head()
     out_dir.mkdir(parents=True)
     if args.proof_json is not None:
-        proof = load_proof(args.proof_json.resolve(), source_revision)
+        proof_path = args.proof_json.resolve()
+        proof = load_proof(proof_path, source_revision)
+        proof["case_evidence"] = copy_proof_case_artifacts(
+            out_dir,
+            proof_path,
+            proof["case_evidence"],
+            proof["measurement_window_id"],
+            source_revision,
+        )
     else:
         proof = proof_from_case_directories(args.case_dir, out_dir, source_revision)
     fields = {field: write_field(out_dir, field, proof, source_revision) for field in G14_FIELDS}
@@ -304,13 +360,35 @@ def build_descriptor(args: argparse.Namespace) -> Path:
 
 
 def write_self_test_proof(root: Path, source_revision: str) -> Path:
+    window_id = "g14-self-test-window"
+    case_evidence = []
+    for case in (
+        "ec84-target-drive-restart",
+        "multi-set-distributed-invalidation",
+        "multi-pool-distributed-invalidation",
+    ):
+        artifact = root / f"{case}.json"
+        write_json(artifact, {
+            "schema": 1,
+            "case": case,
+            "evidence_type": "measured",
+            "source_revision": source_revision,
+            "measurement_window_id": window_id,
+        })
+        case_evidence.append({
+            "case": case,
+            "artifact": artifact.relative_to(root).as_posix(),
+            "sha256": digest(artifact),
+            "source_revision": source_revision,
+            "measurement_window_id": window_id,
+        })
     proof = root / "proof.json"
     write_json(proof, {
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
         "run_id": "g14-self-test-run",
-        "measurement_window_id": "g14-self-test-window",
+        "measurement_window_id": window_id,
         "started_at": "2026-09-09T00:00:00Z",
         "finished_at": "2026-09-09T00:30:00Z",
         "command": ["scripts/run_scanner_heal_g14_multiset_evidence.py", "--proof-json", "proof.json"],
@@ -323,11 +401,7 @@ def write_self_test_proof(root: Path, source_revision: str) -> Path:
         "peer_count": 3,
         "same_window_remote_proof": True,
         "all_peers_bound_to_generation_window": True,
-        "case_evidence": [
-            {"case": "ec84-target-drive-restart", "sha256": "a" * 64},
-            {"case": "multi-set-distributed-invalidation", "sha256": "b" * 64},
-            {"case": "multi-pool-distributed-invalidation", "sha256": "c" * 64},
-        ],
+        "case_evidence": case_evidence,
     })
     return proof
 
