@@ -3463,6 +3463,11 @@ impl PoolRebalanceActivationFence {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static REBALANCE_ACTIVATION_LOCK_ATTEMPT: Arc<tokio::sync::Notify>;
+}
+
 pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
     pool: Arc<S>,
     fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
@@ -3473,17 +3478,21 @@ where
             NamespaceLock = rustfs_lock::NamespaceLockWrapper,
         >,
 {
-    // Activation lock order is always pool.bin -> rebalance.bin.
+    // Match entry admission: rebalance.bin -> pool.bin. An entry retains its
+    // run read fence while target mutations acquire the pool metadata fence;
+    // activation must not hold pool.bin while waiting for that entry to drain.
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    #[cfg(test)]
+    let _ = REBALANCE_ACTIVATION_LOCK_ATTEMPT.try_with(|attempted| attempted.notify_one());
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(activation_rebalance_meta_lock_error)?;
     let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
     let pool_meta_guard = pool_meta_lock
         .get_write_lock(get_lock_acquire_timeout())
         .await
         .map_err(activation_pool_meta_lock_error)?;
-    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-    let rebalance_meta_guard = rebalance_meta_lock
-        .get_write_lock(get_lock_acquire_timeout())
-        .await
-        .map_err(activation_rebalance_meta_lock_error)?;
 
     Ok(PoolRebalanceActivationFence {
         pool_meta_guard,
@@ -22094,7 +22103,7 @@ mod pools_tests {
                 .resources
                 .lock()
                 .expect("activation lock recorder should not be poisoned"),
-            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+            vec![REBAL_META_NAME.to_string(), POOL_META_NAME.to_string()]
         );
 
         let mut second_acquire = Box::pin(acquire_pool_rebalance_activation_locks(second.clone(), None));
@@ -22110,8 +22119,48 @@ mod pools_tests {
                 .resources
                 .lock()
                 .expect("activation lock recorder should not be poisoned"),
-            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+            vec![REBAL_META_NAME.to_string(), POOL_META_NAME.to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_activation_cancellation_releases_rebalance_fence_while_pool_fence_is_contended() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        let pool = Arc::new(ActivationLockRecorder {
+            lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+            owner: "activation-cancellation",
+            resources: StdMutex::new(Vec::new()),
+        });
+        let pool_lock = pool
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool lock should be created");
+        let pool_reader = pool_lock
+            .get_read_lock(std::time::Duration::from_secs(5))
+            .await
+            .expect("ordinary mutation should hold the pool read fence");
+        pool.resources.lock().expect("recorder should not be poisoned").clear();
+        let mut activation = Box::pin(acquire_pool_rebalance_activation_locks(Arc::clone(&pool), None));
+        assert!(matches!(futures::poll!(&mut activation), Poll::Pending));
+        assert_eq!(
+            *pool.resources.lock().expect("recorder should not be poisoned"),
+            vec![REBAL_META_NAME.to_string(), POOL_META_NAME.to_string()],
+            "activation must hold the run fence before waiting for the pool fence",
+        );
+        drop(activation);
+        let rebalance_lock = pool
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME)
+            .await
+            .expect("run lock should be created");
+        let run_writer = rebalance_lock
+            .get_write_lock(std::time::Duration::from_secs(5))
+            .await
+            .expect("cancelling activation must release its already-acquired run fence");
+        assert!(
+            !pool_reader.is_released(),
+            "cancelling activation must not release another caller's pool fence"
+        );
+        assert!(!run_writer.is_lock_lost());
     }
 
     #[test]
