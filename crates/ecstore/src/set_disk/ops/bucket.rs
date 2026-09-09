@@ -21,12 +21,72 @@
 
 use super::super::{
     BUCKET_OP_IGNORED_ERRS, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DiskError, Error, HashMap,
-    MakeBucketOptions, Result, SetDisks, is_reserved_or_invalid_bucket, join_all, reduce_write_quorum_errs,
+    MakeBucketOptions, Result, SetDisks, is_reserved_or_invalid_bucket, join_all, reduce_read_quorum_errs,
+    reduce_write_quorum_errs,
 };
 use crate::api::bucket::metadata_sys;
 use crate::disk::DiskAPI;
 
+#[derive(Clone, Copy)]
+pub(crate) enum BucketInfoQuorum {
+    Read,
+    Write,
+}
+
 impl SetDisks {
+    pub(crate) async fn stat_bucket_with_quorum(&self, bucket: &str, quorum: BucketInfoQuorum) -> Result<BucketInfo> {
+        let disks = self.disk_inventory().await;
+        let disk_count = disks.len();
+        let mut futures = Vec::with_capacity(disk_count);
+        for disk in disks {
+            let bucket = bucket.to_string();
+            futures.push(async move {
+                match disk {
+                    Some(disk) => disk.stat_volume(&bucket).await,
+                    None => Err(DiskError::DiskNotFound),
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        let mut infos = Vec::with_capacity(results.len());
+        let mut errs = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(info) => {
+                    infos.push(Some(info));
+                    errs.push(None);
+                }
+                Err(err) => {
+                    infos.push(None);
+                    errs.push(Some(err));
+                }
+            }
+        }
+
+        let error = match quorum {
+            // Bucket mutations use a majority regardless of object storage
+            // class. A namespace read must intersect that majority; object
+            // readers still enforce the persisted layout's data-shard quorum.
+            BucketInfoQuorum::Read => reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count.div_ceil(2).max(1)),
+            BucketInfoQuorum::Write => reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count / 2 + 1),
+        };
+        if let Some(err) = error {
+            return Err(err.into());
+        }
+
+        infos
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|info| BucketInfo {
+                name: info.name,
+                created: info.created,
+                ..Default::default()
+            })
+            .ok_or(Error::VolumeNotFound)
+    }
+
     pub(crate) async fn list_bucket_for_scanner(&self, _opts: &BucketOptions) -> Result<(Vec<BucketInfo>, bool)> {
         let disks = self.disk_inventory().await;
         let write_quorum = (disks.len() / 2) + 1;
@@ -131,59 +191,12 @@ impl BucketOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        let disks = self.disk_inventory().await;
-        let write_quorum = (disks.len() / 2) + 1;
-
-        let mut futures = Vec::with_capacity(disks.len());
-        for disk in disks {
-            let bucket = bucket.to_string();
-            futures.push(async move {
-                match disk {
-                    Some(disk) => disk.stat_volume(&bucket).await,
-                    None => Err(DiskError::DiskNotFound),
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
-        let mut infos = Vec::with_capacity(results.len());
-        let mut errs = Vec::with_capacity(results.len());
-        for result in results {
-            match result {
-                Ok(info) => {
-                    infos.push(Some(info));
-                    errs.push(None);
-                }
-                Err(err) => {
-                    infos.push(None);
-                    errs.push(Some(err));
-                }
-            }
-        }
-
-        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err.into());
-        }
-
-        let mut versioning = false;
-        let mut object_locking = false;
+        let mut info = self.stat_bucket_with_quorum(bucket, BucketInfoQuorum::Write).await?;
         if let Ok(sys) = metadata_sys::get(bucket).await {
-            versioning = sys.versioning();
-            object_locking = sys.object_locking();
+            info.versioning = sys.versioning();
+            info.object_locking = sys.object_locking();
         }
-
-        infos
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|info| BucketInfo {
-                name: info.name,
-                created: info.created,
-                versioning,
-                object_locking,
-                ..Default::default()
-            })
-            .ok_or(Error::VolumeNotFound)
+        Ok(info)
     }
 
     #[tracing::instrument(skip(self))]

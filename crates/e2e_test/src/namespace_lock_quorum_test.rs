@@ -25,6 +25,190 @@ const KEY: &str = "thumb/79/concurrent-overwrite.jpg";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+async fn assert_quorum_object_body(client: &Client, bucket: &str, key: &str, expected: &[u8]) -> TestResult {
+    let body = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(body.as_ref(), expected, "quorum read returned incorrect contents for {key}");
+    Ok(())
+}
+
+async fn wait_for_quorum_read_admission(clients: &[Client], bucket: &str) -> TestResult {
+    // SIGKILL can orphan a granted lease. Wait for shared metadata-lock
+    // admission before asserting the stable quorum boundary; cold bodies
+    // remain unread throughout this readiness probe.
+    let deadline =
+        tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT + std::time::Duration::from_secs(15);
+    loop {
+        let mut ready = true;
+        for client in clients {
+            for key in ["warm-small", "warm-large"] {
+                match client.head_object().bucket(bucket).key(key).send().await {
+                    Ok(_) => {}
+                    Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 503) => {
+                        ready = false;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !ready {
+                break;
+            }
+        }
+        if ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("read quorum did not become available after lease convergence for {bucket}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResult {
+    crate::common::init_logging();
+
+    for (node_count, parity) in [(4, 2), (6, 3), (6, 2)] {
+        let read_quorum = node_count - parity;
+        let write_quorum = read_quorum + usize::from(read_quorum == parity);
+        let mut cluster = RustFSTestClusterEnvironment::new(node_count).await?;
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
+        // Wait for every seed fanout before removing any physical shard.
+        cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+        cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+        cluster.set_env("RUST_LOG", "warn,rustfs_lock=debug");
+        cluster.start().await?;
+
+        let clients = cluster
+            .create_all_clients()?
+            .into_iter()
+            .map(|client| {
+                Client::from_conf(
+                    client
+                        .config()
+                        .to_builder()
+                        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                        .build(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bucket = format!("read-quorum-{node_count}-{parity}");
+        clients[0].create_bucket().bucket(&bucket).send().await?;
+        let small = b"read quorum is derived from the erasure layout".to_vec();
+        let large = (0..1_048_576)
+            .map(|index| u8::try_from(index % 251).expect("bounded payload byte"))
+            .collect::<Vec<_>>();
+        for (key, body) in [
+            ("warm-small", &small),
+            ("warm-large", &large),
+            ("cold-small", &small),
+            ("cold-large", &large),
+            ("below-quorum", &large),
+        ] {
+            clients[node_count - 1]
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(Bytes::copy_from_slice(body).into())
+                .send()
+                .await?;
+        }
+        for node in &cluster.nodes {
+            for key in ["warm-small", "warm-large", "cold-small", "cold-large", "below-quorum"] {
+                let census =
+                    crate::chaos::census_object_version_on_disk(std::path::Path::new(&node.data_dir), &bucket, key, None)?;
+                assert!(census.is_complete(), "seed shard must be complete before fault injection: {census:?}");
+                assert_eq!(census.data_blocks, Some(read_quorum));
+                assert_eq!(census.parity_blocks, Some(parity));
+            }
+        }
+        for client in &clients {
+            assert_quorum_object_body(client, &bucket, "warm-small", &small).await?;
+            assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
+        }
+
+        for offline_node in (read_quorum..node_count).rev() {
+            cluster.stop_node(offline_node)?;
+            wait_for_quorum_read_admission(&clients[..offline_node], &bucket).await?;
+            for client in clients.iter().take(offline_node) {
+                client.head_bucket().bucket(&bucket).send().await?;
+                assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
+            }
+        }
+
+        // Exercise more than the five-second positive bucket-validation TTL.
+        // Every sample must succeed; polling must not hide a transient failure.
+        let validation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            for client in clients.iter().take(read_quorum) {
+                assert_quorum_object_body(client, &bucket, "warm-small", &small).await?;
+                assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
+                let listing = client.list_objects_v2().bucket(&bucket).send().await?;
+                for key in ["warm-small", "warm-large", "cold-small", "cold-large", "below-quorum"] {
+                    assert!(listing.contents().iter().any(|entry| entry.key() == Some(key)), "listing omitted {key}");
+                }
+            }
+            if tokio::time::Instant::now() >= validation_deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        for client in clients.iter().take(read_quorum) {
+            assert_quorum_object_body(client, &bucket, "cold-small", &small).await?;
+            assert_quorum_object_body(client, &bucket, "cold-large", &large).await?;
+        }
+
+        let write = clients[0]
+            .put_object()
+            .bucket(&bucket)
+            .key("quorum-write")
+            .body(Bytes::copy_from_slice(&small).into())
+            .send()
+            .await;
+        if read_quorum >= write_quorum {
+            write?;
+        } else {
+            let error = write.expect_err("a read quorum must not authorize a write that needs more votes");
+            assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+        }
+
+        cluster.stop_node(read_quorum - 1)?;
+        for client in clients.iter().take(read_quorum - 1) {
+            match client.get_object().bucket(&bucket).key("below-quorum").send().await {
+                Ok(response) => assert!(
+                    response.body.collect().await.is_err(),
+                    "fewer than {read_quorum} valid fragments must not reconstruct an uncached object"
+                ),
+                Err(error) => assert_eq!(
+                    error.as_service_error().and_then(|error| error.meta().code()),
+                    Some("ServiceUnavailable"),
+                    "a quorum loss must not be mistaken for a missing object"
+                ),
+            }
+        }
+
+        for node in 0..read_quorum - 1 {
+            cluster.stop_node(node)?;
+        }
+        cluster.start().await?;
+        for client in &clients {
+            assert_quorum_object_body(client, &bucket, "warm-large", &large).await?;
+            assert_quorum_object_body(client, &bucket, "below-quorum", &large).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn put_object(client: Client, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
     client
         .put_object()
