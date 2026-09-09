@@ -163,13 +163,104 @@ jobs:
 
           fakeroot dpkg-deb --build "${PKG_DIR}"
           ls -lh "${DEB_FILE}"
+          echo "deb_date=${DEB_DATE}" >> "${GITHUB_OUTPUT}"
           echo "deb_file=${DEB_FILE}" >> "${GITHUB_OUTPUT}"
+
+      # Same packaging scheme as .github/workflows/package.yml (fpm), but from
+      # the locally built nightly binary instead of a release artifact, with a
+      # date-based version that mirrors the DEB.
+      - name: Build RPM package
+        id: rpm
+        shell: bash
+        env:
+          DEB_DATE: ${{ steps.deb.outputs.deb_date }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v fpm >/dev/null 2>&1; then
+            SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+            ${SUDO} apt-get update -qq && ${SUDO} apt-get install -y -qq ruby ruby-dev build-essential rpm >/dev/null
+            ${SUDO} gem install fpm --no-document >/dev/null
+          fi
+
+          RPM_FILE="rustfs-nightly-${DEB_DATE}.rpm"
+          RPM_VERSION="0"
+          RPM_RELEASE="0.nightly.${DEB_DATE//-/.}"
+
+          echo "Building RPM: ${RPM_FILE} (version ${RPM_VERSION}-${RPM_RELEASE})"
+
+          # fpm wants the config file to exist before packaging.
+          mkdir -p ./tmp-pkg/etc/default
+          cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
+          fpm -s dir -t rpm \
+            --name rustfs \
+            --version "$RPM_VERSION" \
+            --iteration "$RPM_RELEASE" \
+            --architecture x86_64 \
+            --package "$RPM_FILE" \
+            --depends "glibc >= 2.31" \
+            --maintainer "RustFS Team <support@rustfs.com>" \
+            --description "High-performance distributed object storage" \
+            --url "https://rustfs.com" \
+            --license "Apache-2.0" \
+            --after-install <(cat << 'POSTINST'
+          #!/bin/bash
+          set -e
+          if ! getent passwd rustfs > /dev/null 2>&1; then
+              useradd -r -s /bin/false -d /opt/rustfs rustfs
+          fi
+          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
+          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTINST
+            ) \
+            --before-remove <(cat << 'PRERM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
+              systemctl stop rustfs
+          fi
+          PRERM
+            ) \
+            --after-remove <(cat << 'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTRM
+            ) \
+            --config-files /etc/default/rustfs \
+            "rustfs-nightly-${DEB_DATE}/usr/bin/rustfs=/usr/bin/rustfs" \
+            ./tmp-pkg/etc/default/rustfs=/etc/default/rustfs \
+            deploy/build/rustfs.service=/lib/systemd/system/rustfs.service \
+            LICENSE=/usr/share/doc/rustfs/LICENSE \
+            README.md=/usr/share/doc/rustfs/README.md
+
+          [[ -f "$RPM_FILE" ]] || { echo "RPM build failed"; exit 1; }
+          rpm -qpl "$RPM_FILE" | grep -Fx '/usr/bin/rustfs' >/dev/null
+          stat --printf='%n %s bytes\n' "$RPM_FILE"
+          echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ steps.deb.outputs.deb_file }}
           path: ${{ steps.deb.outputs.deb_file }}
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.rpm.outputs.rpm_file }}
+          path: ${{ steps.rpm.outputs.rpm_file }}
           if-no-files-found: error
 
       # Persist the nightly deb on Cloudflare R2 (same channel as package.yml)
@@ -256,6 +347,70 @@ jobs:
           name: nightly-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.publish.outputs.candidate_file }}
           if-no-files-found: error
+
+      # Publish the deb/rpm pair to the auto-testing repo's `assets` branch so
+      # engineers can download and install the nightly directly. The branch is
+      # a single-commit orphan rewritten on every build, which keeps the repo
+      # small while the latest files stay reachable at stable raw URLs.
+      - name: Publish packages to auto-testing assets
+        env:
+          ASSETS_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
+          DEB_DATE: ${{ steps.deb.outputs.deb_date }}
+          BUILD_REF: ${{ env.NIGHTLY_BUILD_REF }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ASSETS_TOKEN}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping assets upload"
+            exit 0
+          fi
+          export GH_TOKEN="${ASSETS_TOKEN}"
+
+          for f in "${DEB_FILE}" "${RPM_FILE}"; do
+            [ -f "$f" ] || { echo "missing package: $f"; exit 1; }
+          done
+
+          rm -rf assets-work && mkdir assets-work
+          if ! gh repo clone rustfs/auto-testing assets-work -- --depth 1 --branch assets --quiet 2>/dev/null; then
+            echo "assets branch does not exist yet; creating an orphan"
+            ( cd assets-work && git init -q -b assets )
+          fi
+          cd assets-work
+          git remote add origin "https://github.com/rustfs/auto-testing.git" 2>/dev/null || \
+            git remote set-url origin "https://github.com/rustfs/auto-testing.git"
+          gh auth setup-git >/dev/null
+
+          mkdir -p nightly
+          cp "../${DEB_FILE}" "nightly/${DEB_FILE}"
+          cp "../${RPM_FILE}" "nightly/${RPM_FILE}"
+          cp "nightly/${DEB_FILE}" nightly/rustfs-nightly-latest.deb
+          cp "nightly/${RPM_FILE}" nightly/rustfs-nightly-latest.rpm
+
+          SOURCE_SHA="$(git -C .. rev-parse HEAD 2>/dev/null || echo "${GITHUB_SHA}")"
+          {
+            echo "# Nightly packages"
+            echo ""
+            echo "- Built: ${DEB_DATE} from \`${BUILD_REF}@${SOURCE_SHA:0:12}\`"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo '| File | Size | SHA256 |'
+            echo '|---|---|---|'
+            for f in "nightly/${DEB_FILE}" "nightly/${RPM_FILE}" nightly/rustfs-nightly-latest.deb nightly/rustfs-nightly-latest.rpm; do
+              printf '| %s | %s | %s |\n' "$f" "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            echo ""
+            echo "Download: replace /blob/ with /raw/ in any file URL, e.g."
+            echo "\`https://raw.githubusercontent.com/rustfs/auto-testing/assets/nightly/rustfs-nightly-latest.deb\`"
+          } > BUILD-INFO.md
+
+          git add -A
+          git -c user.name="rustfs-nightly-bot" -c user.email="support@rustfs.com" \
+            commit -q -m "nightly ${DEB_DATE} (${BUILD_REF}@${SOURCE_SHA:0:12})" \
+            --allow-empty
+          git push --force origin assets
+          echo "✅ Published ${DEB_FILE} and ${RPM_FILE} to rustfs/auto-testing@assets"
 
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #
