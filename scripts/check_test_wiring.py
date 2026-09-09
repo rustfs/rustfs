@@ -1985,7 +1985,35 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
     return tuple(dict.fromkeys(fields))
 
 
-def validate_release_bundle_json_artifact_payload(path: Path, source_revision: str, gate: str, field: str,
+PROFILE_ARTIFACT_REQUIRED_METRICS = {
+    "allocation-profile": ("resolved_samples", "allocation_bytes"),
+    "flamegraph": ("resolved_samples",),
+    "rss-samples": ("resolved_samples", "rss_peak_bytes"),
+    "save-frequency": ("resolved_samples", "save_operations", "saved_bytes"),
+}
+
+
+def validate_profile_json_artifact_payload(bundle_path: Path, path: Path, payload: dict[str, object],
+                                           gate: str, field: str, artifact_kind: str) -> None:
+    prefix = f"{gate}.{field}.{artifact_kind}"
+    raw_profile = release_bundle_artifact_path(
+        bundle_path,
+        payload.get("raw_profile_artifact"),
+        gate,
+        f"{field}.{artifact_kind}.raw_profile",
+    )
+    require(sha(payload.get("raw_profile_sha256")) and digest(raw_profile) == payload["raw_profile_sha256"],
+            f"{prefix} raw profile hash mismatch")
+    raw_bytes = evidence_integer(payload.get("raw_profile_bytes"), f"{prefix}.raw_profile_bytes", 1, 2**63 - 1)
+    require(raw_bytes == raw_profile.stat().st_size, f"{prefix} raw profile bytes mismatch")
+    evidence_string(payload.get("raw_profile_format"), f"{prefix}.raw_profile_format",
+                    r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+    require(raw_profile.resolve() != path.resolve(), f"{prefix} raw profile must be distinct from wrapper")
+    for metric in PROFILE_ARTIFACT_REQUIRED_METRICS[artifact_kind]:
+        evidence_integer(payload.get(metric), f"{prefix}.{metric}", 1, 2**63 - 1)
+
+
+def validate_release_bundle_json_artifact_payload(bundle_path: Path, path: Path, source_revision: str, gate: str, field: str,
                                                  run_id: str, window_id: str,
                                                  artifact_kind: str | None = None) -> None:
     payload = read_json(path)
@@ -2000,6 +2028,8 @@ def validate_release_bundle_json_artifact_payload(path: Path, source_revision: s
     require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
     if artifact_kind is not None:
         require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+        if field == "profile_evidence":
+            validate_profile_json_artifact_payload(bundle_path, path, payload, gate, field, artifact_kind)
     mrf_artifact_kind = SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS.get((gate, field))
     if mrf_artifact_kind is not None:
         require(payload.get("artifact_kind") == mrf_artifact_kind,
@@ -2536,7 +2566,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
     artifact = release_bundle_artifact_path(bundle_path, evidence.get("artifact"), gate, field)
     require(sha(evidence.get("sha256")) and digest(artifact) == evidence["sha256"], f"{gate}.{field} artifact hash mismatch")
     if is_json_artifact_format(artifact_format):
-        validate_release_bundle_json_artifact_payload(artifact, source_revision, gate, field, run_id, window_id)
+        validate_release_bundle_json_artifact_payload(bundle_path, artifact, source_revision, gate, field, run_id, window_id)
     summary = evidence.get("summary")
     require(isinstance(summary, str) and summary.strip(), f"{gate}.{field} missing human summary")
     if gate.startswith("P"):
@@ -2733,6 +2763,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                     f"{gate}.{artifact_field} measurement window mismatch")
             if is_json_artifact_format(artifact_format):
                 validate_release_bundle_json_artifact_payload(
+                    bundle_path,
                     artifact_path,
                     source_revision,
                     gate,
@@ -2920,6 +2951,34 @@ def copy_release_bundle_artifact(descriptor_path: Path, bundle_dir: Path, eviden
     evidence["sha256"] = source_sha
 
 
+def copy_release_bundle_profile_raw_artifact(descriptor_path: Path, bundle_dir: Path, item: dict[str, object],
+                                             gate: str, field: str, artifact_kind: str) -> None:
+    wrapper = release_bundle_artifact_path(bundle_dir / "release-evidence.json", item.get("artifact"), gate, field)
+    payload = read_json(wrapper)
+    raw_source = release_bundle_descriptor_path(
+        descriptor_path,
+        payload.get("raw_profile_artifact"),
+        gate,
+        f"{field}.raw_profile",
+    )
+    raw_sha = digest(raw_source)
+    require(sha(payload.get("raw_profile_sha256")) and payload["raw_profile_sha256"] == raw_sha,
+            f"{gate}.{field} descriptor raw profile hash mismatch")
+    raw_bytes = evidence_integer(payload.get("raw_profile_bytes"), f"{gate}.{field}.raw_profile_bytes", 1, 2**63 - 1)
+    require(raw_bytes == raw_source.stat().st_size, f"{gate}.{field} descriptor raw profile bytes mismatch")
+    artifact_dir = bundle_dir / "artifacts"
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "-", f"{gate}-{field}-{artifact_kind}-raw")
+    raw_target = artifact_dir / f"{safe_label}{release_bundle_artifact_suffix(raw_source)}"
+    require(not raw_target.exists(), f"{gate}.{field} duplicate assembled raw profile path")
+    shutil.copyfile(raw_source, raw_target)
+    require(digest(raw_target) == raw_sha, f"{gate}.{field} assembled raw profile hash mismatch")
+    payload["raw_profile_artifact"] = raw_target.relative_to(bundle_dir).as_posix()
+    payload["raw_profile_sha256"] = raw_sha
+    payload["raw_profile_bytes"] = raw_target.stat().st_size
+    write_json(wrapper, payload)
+    item["sha256"] = digest(wrapper)
+
+
 def assemble_scanner_heal_release_bundle_descriptors(
     root: Path,
     descriptor_paths: list[Path],
@@ -2987,6 +3046,15 @@ def assemble_scanner_heal_release_bundle_descriptors(
                             f"{field}.{artifact_kind}",
                             f"{gate}-{field}-{artifact_kind}",
                         )
+                        if field == "profile_evidence":
+                            copy_release_bundle_profile_raw_artifact(
+                                descriptor_path,
+                                bundle_dir,
+                                item,
+                                gate,
+                                f"{field}.{artifact_kind}",
+                                artifact_kind,
+                            )
                 fields[field] = evidence
             assembled_gates[gate] = {
                 "status": "pass",
@@ -3742,13 +3810,18 @@ class SelfTests(unittest.TestCase):
                     evidence["old_source_retained_until_successor"] = True
                     evidence["recovered_pending_migration"] = True
                 if field == "profile_evidence":
-                    evidence["resolved_samples"] = 1
-                    evidence["allocation_bytes"] = 1024
-                    evidence["rss_peak_bytes"] = 4096
-                    evidence["save_operations"] = 2
-                    evidence["saved_bytes"] = 2048
+                    profile_metrics = {
+                        "resolved_samples": 1,
+                        "allocation_bytes": 1024,
+                        "rss_peak_bytes": 4096,
+                        "save_operations": 2,
+                        "saved_bytes": 2048,
+                    }
+                    evidence.update(profile_metrics)
                     artifacts = {}
                     for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                        raw_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.raw"
+                        raw_artifact.write_text(f"{artifact_kind} measured profile sample\n", encoding="utf-8")
                         profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
                         write_json(profile_artifact, {
                             "schema": 1,
@@ -3759,6 +3832,14 @@ class SelfTests(unittest.TestCase):
                             "gate": gate,
                             "field": field,
                             "artifact_kind": artifact_kind,
+                            "raw_profile_artifact": raw_artifact.relative_to(bundle_dir).as_posix(),
+                            "raw_profile_sha256": digest(raw_artifact),
+                            "raw_profile_bytes": raw_artifact.stat().st_size,
+                            "raw_profile_format": "raw",
+                            **{
+                                metric: profile_metrics[metric]
+                                for metric in PROFILE_ARTIFACT_REQUIRED_METRICS[artifact_kind]
+                            },
                         })
                         artifacts[artifact_kind] = {
                             "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
@@ -3845,6 +3926,14 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
             self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
             self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+            profile = assembled["gates"]["P1"]["evidence_fields"]["profile_evidence"]
+            profile_artifact = profile["profile_artifacts"]["save-frequency"]
+            profile_wrapper = bundle.parent / profile_artifact["artifact"]
+            profile_payload = read_json(profile_wrapper)
+            raw_profile = bundle.parent / profile_payload["raw_profile_artifact"]
+            self.assertTrue(raw_profile.is_file())
+            self.assertEqual(profile_payload["raw_profile_sha256"], digest(raw_profile))
+            self.assertEqual(profile_artifact["sha256"], digest(profile_wrapper))
 
     def test_scanner_heal_release_bundle_assembler_merges_measured_descriptors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4419,6 +4508,18 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload.update({"run_id": "p1-different-profile-run"}),
                 ("P1", "profile_evidence", "rss-samples"),
                 "JSON artifact run_id mismatch",
+            ),
+            (
+                "profile-raw-hash",
+                lambda payload: payload.update({"raw_profile_sha256": "0" * 64}),
+                ("P1", "profile_evidence", "flamegraph"),
+                "raw profile hash mismatch",
+            ),
+            (
+                "profile-save-cost",
+                lambda payload: payload.pop("saved_bytes"),
+                ("P1", "profile_evidence", "save-frequency"),
+                "save-frequency.saved_bytes",
             ),
             (
                 "fixture-marker",

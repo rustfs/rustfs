@@ -153,19 +153,48 @@ def post_stop_convergence_multiples(report: dict[str, Any]) -> list[float]:
     return values
 
 
+PROFILE_ARTIFACT_REQUIRED_METRICS = {
+    "allocation-profile": ("resolved_samples", "allocation_bytes"),
+    "flamegraph": ("resolved_samples",),
+    "rss-samples": ("resolved_samples", "rss_peak_bytes"),
+    "save-frequency": ("resolved_samples", "save_operations", "saved_bytes"),
+}
+
+
 def copy_profile_artifacts(out_dir: Path, artifacts: dict[str, tuple[Path, str]], source_revision: str,
-                           run_id: str, window_id: str) -> dict[str, Any]:
+                           run_id: str, window_id: str, profile_costs: dict[str, int]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     profile_dir = out_dir / "artifacts" / "profiles"
+    raw_dir = profile_dir / "raw"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
     for kind in RELEASE_PROFILE_ARTIFACTS:
         source, artifact_format = artifacts[kind]
-        target = profile_dir / f"P1-profile_evidence-{kind}{source.suffix or '.artifact'}"
-        shutil.copyfile(source, target)
+        raw_target = raw_dir / f"{kind}{source.suffix or '.artifact'}"
+        shutil.copyfile(source, raw_target)
+        target = profile_dir / f"P1-profile_evidence-{kind}.json"
+        payload = {
+            "schema": 1,
+            "evidence_type": "measured",
+            "source_revision": source_revision,
+            "run_id": run_id,
+            "measurement_window_id": window_id,
+            "gate": "P1",
+            "field": "profile_evidence",
+            "artifact_kind": kind,
+            "raw_profile_name": source.name,
+            "raw_profile_artifact": raw_target.relative_to(out_dir).as_posix(),
+            "raw_profile_sha256": digest(raw_target),
+            "raw_profile_bytes": raw_target.stat().st_size,
+            "raw_profile_format": artifact_format,
+        }
+        for metric in PROFILE_ARTIFACT_REQUIRED_METRICS[kind]:
+            payload[metric] = profile_costs[metric]
+        write_json(target, payload)
         copied[kind] = {
             "artifact": target.relative_to(out_dir).as_posix(),
             "sha256": digest(target),
-            "artifact_format": artifact_format,
+            "artifact_format": "json",
             "source_revision": source_revision,
             "run_id": run_id,
             "measurement_window_id": window_id,
@@ -265,6 +294,13 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     p2_limit = float(P2_WORK_MULTIPLE_LIMIT)
     p2_worst = max(p2_multiples)
     require(p2_worst <= p2_limit, "P2 post-stop convergence exceeded work multiple limit")
+    profile_costs = {
+        "resolved_samples": positive_int_from_sources(args.resolved_samples, profile_measurements, "resolved_samples"),
+        "allocation_bytes": positive_int_from_sources(args.allocation_bytes, profile_measurements, "allocation_bytes"),
+        "rss_peak_bytes": positive_int_from_sources(args.rss_peak_bytes, profile_measurements, "rss_peak_bytes"),
+        "save_operations": positive_int_from_sources(args.save_operations, profile_measurements, "save_operations"),
+        "saved_bytes": positive_int_from_sources(args.saved_bytes, profile_measurements, "saved_bytes"),
+    }
 
     common = {
         "evidence_type": "measured",
@@ -286,6 +322,7 @@ def build_descriptor(args: argparse.Namespace) -> Path:
         source_revision,
         run_id,
         window_id,
+        profile_costs,
     )
 
     gates: dict[str, Any] = {
@@ -355,11 +392,7 @@ def build_descriptor(args: argparse.Namespace) -> Path:
                     **common,
                     "duration_seconds": duration,
                     "summary": "Measured profile artifacts are bound to the scheduler-pressure measurement window.",
-                    "resolved_samples": positive_int_from_sources(args.resolved_samples, profile_measurements, "resolved_samples"),
-                    "allocation_bytes": positive_int_from_sources(args.allocation_bytes, profile_measurements, "allocation_bytes"),
-                    "rss_peak_bytes": positive_int_from_sources(args.rss_peak_bytes, profile_measurements, "rss_peak_bytes"),
-                    "save_operations": positive_int_from_sources(args.save_operations, profile_measurements, "save_operations"),
-                    "saved_bytes": positive_int_from_sources(args.saved_bytes, profile_measurements, "saved_bytes"),
+                    **profile_costs,
                     "profile_artifacts": profile_refs,
                 }),
             },

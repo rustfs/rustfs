@@ -272,6 +272,13 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     gate,
                 )
             self.assertEqual(status["verified_gate"], gate)
+        save_frequency = profile["profile_artifacts"]["save-frequency"]
+        wrapper = args.release_bundle_descriptor_out.parent / save_frequency["artifact"]
+        payload = summary.read_json(wrapper)
+        raw_profile = args.release_bundle_descriptor_out.parent / payload["raw_profile_artifact"]
+        self.assertTrue(raw_profile.is_file())
+        self.assertEqual(payload["saved_bytes"], 8192)
+        self.assertEqual(payload["raw_profile_sha256"], sha(raw_profile))
 
     def test_release_descriptor_requires_profile_artifacts(self):
         args = type("Args", (), {
