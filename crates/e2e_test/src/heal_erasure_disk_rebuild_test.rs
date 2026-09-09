@@ -1222,6 +1222,8 @@ mod tests {
         if let Some(erasure_set_drive_count) = evidence_case.and_then(|case| case.erasure_set_drive_count) {
             cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", erasure_set_drive_count.to_string());
         }
+        // Capture physical baselines after the PUT rename fanout has drained.
+        cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
         // Heal control uses the first lexicographically sorted grid host.
         // Keep that coordinator distinct from the remote target at index 1.
         cluster.nodes.sort_by(|left, right| left.url.cmp(&right.url));

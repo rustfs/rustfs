@@ -865,6 +865,7 @@ pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, ren
 mod ctx;
 mod metadata;
 mod ops;
+pub(crate) use ops::bucket::BucketInfoQuorum;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;
