@@ -651,6 +651,14 @@ impl HealTask {
         self.batch_failure_recorded.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn batch_failure_is_retryable(&self) -> bool {
+        self.batch_failure
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|failure| failure.failed > 0 && failure.failed == failure.retryable && failure.permanent == 0)
+    }
+
     pub(crate) async fn record_batch_failure(&self, failure: BatchHealFailure) -> Error {
         self.batch_failure_recorded.store(true, Ordering::Release);
         let message = failure.to_string();
