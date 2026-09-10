@@ -17,7 +17,7 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::ReplicationMigrationBridge;
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::error::Error;
+use crate::error::{Error, Result, is_err_strict_not_found, is_err_strict_volume_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions},
@@ -33,7 +33,7 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// IAM config prefix under meta bucket (e.g. config/iam/).
 const IAM_CONFIG_PREFIX: &str = "config/iam";
@@ -211,7 +211,7 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
 /// meta bucket may not work (legacy format differs from object layer expectations).
 /// Skips buckets that already exist in RustFS (idempotent).
-pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>)
+pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>) -> Result<()>
 where
     S: BucketOperations<Error = crate::error::Error>
         + ObjectIO<
@@ -231,25 +231,18 @@ where
             DeletedObject = DeletedObject,
         >,
 {
-    let buckets_list = match store
+    let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("list buckets failed (skip migration): {e}");
-            return;
-        }
-    };
+        .await?;
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|b| b.name).collect();
 
     if buckets.is_empty() {
         debug!("No migrating bucket metadata found");
-        return;
+        return Ok(());
     }
 
     debug!("Found {} migrating bucket metadata, migrating...", buckets.len());
@@ -263,26 +256,40 @@ where
 
     for bucket in buckets {
         let meta_path = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{bucket}{SLASH_SEPARATOR}{BUCKET_METADATA_FILE}");
-        migrate_one_if_missing(store.clone(), &opts, &h, &meta_path, &format!("bucket metadata: {bucket}")).await;
+        migrate_one_if_missing(store.clone(), &opts, &h, &meta_path, &format!("bucket metadata: {bucket}")).await?;
 
         let resync_path = format!(
             "{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{bucket}{SLASH_SEPARATOR}{REPLICATION_META_DIR}{SLASH_SEPARATOR}{RESYNC_META_FILE}"
         );
-        migrate_one_if_missing(store.clone(), &opts, &h, &resync_path, &format!("bucket replication resync: {bucket}")).await;
+        migrate_one_if_missing(store.clone(), &opts, &h, &resync_path, &format!("bucket replication resync: {bucket}")).await?;
+    }
+    Ok(())
+}
+
+async fn migration_target_exists<S: EcstoreObjectOperations>(store: &S, path: &str) -> Result<bool> {
+    match store
+        .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if is_err_strict_not_found(&err) || is_err_strict_volume_not_found(&err) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
-async fn migrate_one_if_missing<S>(store: Arc<S>, opts: &ObjectOptions, headers: &HeaderMap, path: &str, label: &str)
+async fn migrate_one_if_missing<S>(
+    store: Arc<S>,
+    opts: &ObjectOptions,
+    headers: &HeaderMap,
+    path: &str,
+    label: &str,
+) -> Result<()>
 where
     S: EcstoreObjectIO + EcstoreObjectOperations,
 {
-    if store
-        .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
-        .await
-        .is_ok()
-    {
+    if migration_target_exists(store.as_ref(), path).await? {
         debug!("{label} already exists in RustFS, skip");
-        return;
+        return Ok(());
     }
 
     let mut rd = match store
@@ -290,43 +297,31 @@ where
         .await
     {
         Ok(r) => r,
-        Err(e) => {
-            debug!("read migrating {label}: {e}");
-            return;
-        }
+        // Ordinary RustFS deployments have no legacy bucket, and optional
+        // legacy settings (such as replication resync) may not exist.
+        Err(err) if is_err_strict_not_found(&err) || is_err_strict_volume_not_found(&err) => return Ok(()),
+        Err(err) => return Err(err),
     };
 
-    let data = match rd.read_all().await {
-        Ok(d) if !d.is_empty() => d,
-        Ok(_) => return,
-        Err(e) => {
-            debug!("read migrating {label} body: {e}");
-            return;
-        }
-    };
-
-    let data = match normalize_bucket_meta_blob(path, &data) {
-        Ok(Some(normalized)) => normalized,
-        Ok(None) => data,
-        Err(e) => {
-            warn!("skip {label} migration due to incompatible format: {e}");
-            return;
-        }
-    };
+    let data = rd.read_all().await?;
+    if data.is_empty() {
+        return Err(Error::other(format!("empty legacy {label}")));
+    }
+    let data = normalize_bucket_meta_blob(path, &data)
+        .map_err(|_| Error::other(format!("incompatible legacy {label}")))?
+        .unwrap_or(data);
 
     let mut put_data = PutObjReader::from_vec(data);
-    if let Err(e) = store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, opts).await {
-        warn!("write {label}: {e}");
-    } else {
-        info!("Migrated {label}");
-    }
+    store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, opts).await?;
+    info!("Migrated {label}");
+    Ok(())
 }
 
 /// Migrates IAM config from legacy meta bucket `config/iam/` to RustFS meta bucket.
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
-/// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
-pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>)
+/// An absent legacy bucket is a no-op; migration errors prevent startup readiness.
+pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>) -> Result<()>
 where
     S: ListOperations<
             Error = crate::error::Error,
@@ -366,14 +361,12 @@ where
     loop {
         let list_result = match store
             .clone()
-            .list_objects_v2(MIGRATING_META_BUCKET, &prefix, continuation, None, 500, false, None, false)
+            .list_objects_v2(MIGRATING_META_BUCKET, &prefix, continuation.clone(), None, 500, false, None, false)
             .await
         {
             Ok(r) => r,
-            Err(e) => {
-                debug!("list IAM config from legacy bucket failed (skip migration): {e}");
-                return;
-            }
+            Err(err) if is_err_strict_volume_not_found(&err) => return Ok(()),
+            Err(err) => return Err(err),
         };
 
         for obj in list_result.objects {
@@ -381,32 +374,17 @@ where
             if path.is_empty() || path.ends_with('/') {
                 continue;
             }
-            if store
-                .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
-                .await
-                .is_ok()
-            {
+            if migration_target_exists(store.as_ref(), path).await? {
                 debug!("IAM config already exists in RustFS, skip: {path}");
                 continue;
             }
-            let mut rd = match store
+            let mut rd = store
                 .get_object_reader(MIGRATING_META_BUCKET, path, None, h.clone(), &opts)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!("read migrating IAM config {path}: {e}");
-                    continue;
-                }
-            };
-            let data = match rd.read_all().await {
-                Ok(d) if !d.is_empty() => d,
-                Ok(_) => continue,
-                Err(e) => {
-                    debug!("read migrating IAM config {path} body: {e}");
-                    continue;
-                }
-            };
+                .await?;
+            let data = rd.read_all().await?;
+            if data.is_empty() {
+                return Err(Error::other(format!("empty legacy IAM config: {path}")));
+            }
             // MinIO encrypts IAM identity/service-account files at rest. Decrypt
             // before normalizing; fall back to the raw bytes when no key applies
             // (plaintext blobs, or nothing to decrypt) so existing behavior holds.
@@ -420,22 +398,17 @@ where
                     debug!("skip unsupported IAM config path during migration: {path}");
                     continue;
                 }
-                Err(e) => {
-                    warn!("skip IAM config migration due to incompatible format, path: {path}, err: {e}");
-                    continue;
-                }
+                // Parser errors may contain credential data. Report only the path.
+                Err(_) => return Err(Error::other(format!("incompatible legacy IAM config: {path}"))),
             };
             let mut put_data = PutObjReader::from_vec(data);
-            if let Err(e) = store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts).await {
-                warn!("write IAM config {path}: {e}");
-            } else {
-                info!("Migrated IAM config: {path}");
-                total_migrated += 1;
-            }
+            store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts).await?;
+            info!("Migrated IAM config: {path}");
+            total_migrated += 1;
         }
 
-        continuation = list_result.next_continuation_token.or(list_result.continuation_token);
-        if !list_result.is_truncated || continuation.is_none() {
+        continuation = next_iam_migration_page(list_result.is_truncated, continuation, list_result.next_continuation_token)?;
+        if continuation.is_none() {
             break;
         }
     }
@@ -443,10 +416,35 @@ where
     if total_migrated > 0 {
         info!("IAM migration complete: {} object(s) migrated", total_migrated);
     }
+    Ok(())
+}
+
+fn next_iam_migration_page(truncated: bool, previous: Option<String>, next: Option<String>) -> Result<Option<String>> {
+    if !truncated {
+        return Ok(None);
+    }
+    let next = next.filter(|token| !token.is_empty());
+    if next.is_none() || next == previous {
+        return Err(Error::other("legacy IAM migration listing did not advance"));
+    }
+    Ok(next)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn truncated_iam_listing_cannot_report_completed_migration() {
+        use super::next_iam_migration_page;
+        assert_eq!(next_iam_migration_page(false, Some("old".into()), None).expect("final page"), None);
+        assert_eq!(
+            next_iam_migration_page(true, Some("old".into()), Some("next".into())).expect("advancing page"),
+            Some("next".into())
+        );
+        for next in [None, Some(String::new()), Some("old".into())] {
+            assert!(next_iam_migration_page(true, Some("old".into()), next).is_err());
+        }
+    }
+
     use super::{normalize_bucket_meta_blob, normalize_iam_config_blob};
     use crate::bucket::replication::{
         BucketReplicationResyncStatus, ReplicationMigrationBridge, ResyncStatusType, TargetReplicationResyncStatus,
@@ -659,6 +657,13 @@ mod tests {
             .collect();
         crate::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), existing).await;
 
+        super::try_migrate_bucket_metadata(ecstore.clone())
+            .await
+            .expect("fresh stores do not require a legacy metadata bucket");
+        super::try_migrate_iam_config(ecstore.clone(), None)
+            .await
+            .expect("fresh stores do not require a legacy IAM bucket");
+
         let meta_path = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}interop{SLASH_SEPARATOR}{BUCKET_METADATA_FILE}");
         let put_opts = ObjectOptions::default();
 
@@ -680,8 +685,31 @@ mod tests {
             .await
             .expect("seed .minio.sys bucket metadata");
 
-        // --- Run the real startup migration. ---
-        super::try_migrate_bucket_metadata(ecstore.clone()).await;
+        // A partial import must report failure, even if the main bucket
+        // metadata copied successfully before an incompatible resync record.
+        let resync_path = format!("{BUCKET_META_PREFIX}/interop/.replication/resync.bin");
+        ecstore
+            .put_object(
+                MIGRATING_META_BUCKET,
+                &resync_path,
+                &mut PutObjReader::from_vec(b"invalid resync metadata".to_vec()),
+                &put_opts,
+            )
+            .await
+            .expect("seed malformed legacy resync metadata");
+        assert!(
+            super::try_migrate_bucket_metadata(ecstore.clone()).await.is_err(),
+            "incompatible native metadata must not be reported as a completed migration"
+        );
+        ecstore
+            .delete_object(MIGRATING_META_BUCKET, &resync_path, ObjectOptions::default())
+            .await
+            .expect("remove invalid optional legacy resync record");
+
+        // Retry the real startup migration after repairing the source.
+        super::try_migrate_bucket_metadata(ecstore.clone())
+            .await
+            .expect("native bucket metadata migration completes");
 
         // --- The migrated `.rustfs.sys` blob must carry every MinIO config, ---
         // byte-identical to the source (typed XML/JSON parsing of these fields is

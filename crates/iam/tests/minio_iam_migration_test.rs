@@ -100,6 +100,15 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         .await;
     env.make_bucket(LEGACY_META_BUCKET, false).await;
 
+    let format_path = "config/iam/format.json";
+    env.put_object_bytes(LEGACY_META_BUCKET, format_path, b"invalid IAM format".to_vec())
+        .await;
+    assert!(
+        try_migrate_iam_config(env.ecstore.clone(), None).await.is_err(),
+        "incompatible legacy IAM metadata must prevent startup readiness"
+    );
+    seed_legacy_iam_object(&env, format_path, &json!({"version": 1})).await;
+
     let regular_source = json!({
         "version": 1,
         "credentials": {
@@ -155,7 +164,12 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     )
     .await;
 
-    try_migrate_iam_config(env.ecstore.clone(), None).await;
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("legacy IAM migration completes after source repair");
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("completed legacy IAM migration is idempotent");
 
     let store = ObjectStore::new(env.ecstore);
     assert_identity_survives(
