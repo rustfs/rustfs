@@ -140,6 +140,33 @@ class ReportTests(unittest.TestCase):
         advanced = dict(current, objects_retained=1)
         self.assertFalse(replays_raw_window(previous, advanced))
 
+    def test_object_only_completion_round_is_not_a_raw_window_replay(self):
+        previous = self.report()
+        previous.update(round=0, pid=123, raw_entries=0, raw_name_bytes=0,
+                        raw_first_entry=None, raw_last_entry=None,
+                        raw_page_index_parent="bucket",
+                        raw_page_index_complete=True,
+                        raw_page_index_committed_entries=4,
+                        raw_page_index_indexed_entries=4,
+                        objects_before=2, objects_processed=2,
+                        objects_retained=4, versions_retained=4,
+                        bytes_retained=4, snapshot_complete=False,
+                        outcome="partial")
+        current = self.report()
+        current.update(round=1, pid=124, raw_entries=0, raw_name_bytes=0,
+                       raw_first_entry=None, raw_last_entry=None,
+                       raw_page_index_parent=None,
+                       raw_page_index_complete=False,
+                       raw_page_index_committed_entries=0,
+                       raw_page_index_indexed_entries=0,
+                       objects_before=4, objects_processed=1,
+                       objects_retained=4, versions_retained=4,
+                       bytes_retained=4, snapshot_complete=True,
+                       outcome="complete")
+
+        self.assertFalse(replays_raw_window(previous, current))
+        validate_recoverable_quantum([previous, current], objects=4, budget=16, require_converged=True)
+
     def test_recoverable_quantum_rejects_replayed_raw_window(self):
         previous = self.report()
         previous.update(objects_retained=0, versions_retained=0, bytes_retained=0,
