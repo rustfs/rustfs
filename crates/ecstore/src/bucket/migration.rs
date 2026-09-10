@@ -371,7 +371,13 @@ where
 
         for obj in list_result.objects {
             let path = &obj.name;
-            if path.is_empty() || path.ends_with('/') {
+            // Unsupported records must not trigger target lookups, reads, or decryption.
+            if path != IAM_FORMAT_FILE_PATH
+                && !is_identity_path(path)
+                && !is_group_path(path)
+                && !is_policy_doc_path(path)
+                && !is_policy_mapping_path(path)
+            {
                 continue;
             }
             if migration_target_exists(store.as_ref(), path).await? {

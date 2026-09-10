@@ -100,13 +100,27 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         .await;
     env.make_bucket(LEGACY_META_BUCKET, false).await;
 
+    for (path, body) in [
+        ("config/iam/empty.json", Vec::new()),
+        ("config/iam/users/ignored/extra.json", b"not JSON".to_vec()),
+    ] {
+        env.put_object_bytes(LEGACY_META_BUCKET, path, body).await;
+    }
+    try_migrate_iam_config(
+        env.ecstore.clone(),
+        Some(std::sync::Arc::new(|_| panic!("unsupported IAM records must not be decrypted"))),
+    )
+    .await
+    .expect("unsupported IAM records, including empty objects, must be skipped");
+
     let format_path = "config/iam/format.json";
-    env.put_object_bytes(LEGACY_META_BUCKET, format_path, b"invalid IAM format".to_vec())
-        .await;
-    assert!(
-        try_migrate_iam_config(env.ecstore.clone(), None).await.is_err(),
-        "incompatible legacy IAM metadata must prevent startup readiness"
-    );
+    for body in [Vec::new(), b"invalid IAM format".to_vec()] {
+        env.put_object_bytes(LEGACY_META_BUCKET, format_path, body).await;
+        let error = try_migrate_iam_config(env.ecstore.clone(), None)
+            .await
+            .expect_err("empty or incompatible supported IAM metadata must prevent startup readiness");
+        assert!(error.to_string().contains(format_path), "failure must identify the supported record");
+    }
     seed_legacy_iam_object(&env, format_path, &json!({"version": 1})).await;
 
     let regular_source = json!({
