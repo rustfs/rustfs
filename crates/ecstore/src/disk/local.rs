@@ -11033,7 +11033,9 @@ mod test {
 
         #[tokio::test]
         async fn delete_pruning_stops_at_live_metadata_below_a_guarded_ancestor() {
-            let (disk, _dir) = new_disk().await;
+            // Tuple fields drop in order, releasing the disk's root handle before the temporary directory.
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
             let base = disk.get_bucket_path(RUSTFS_META_BUCKET).expect("resolve metadata volume");
             let shared = base.join("buckets");
             let guard = Arc::new(
@@ -11075,8 +11077,9 @@ mod test {
 
         #[tokio::test]
         async fn delete_pruning_removes_empty_and_missing_ancestors_but_keeps_the_volume() {
-            let (disk, _dir) = new_disk().await;
-            ensure_test_volume(&disk, "pruning").await;
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
             let base = disk.get_bucket_path("pruning").expect("resolve test volume");
 
             for missing in [false, true] {
@@ -11102,7 +11105,8 @@ mod test {
 
         #[tokio::test]
         async fn delete_pruning_does_not_remove_the_base_or_an_outside_path() {
-            let (disk, dir) = new_disk().await;
+            let fixture = new_disk().await;
+            let (disk, dir) = &fixture;
             let base = dir.path().join("base");
             let outside = dir.path().join("outside");
             fs::create_dir(&base).await.expect("create base");
@@ -11124,8 +11128,9 @@ mod test {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
 
-            let (disk, _dir) = new_disk().await;
-            ensure_test_volume(&disk, "pruning").await;
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
             let base = disk.get_bucket_path("pruning").expect("resolve test volume");
             let backup = base.join(STORAGE_FORMAT_FILE_BACKUP);
             fs::write(&backup, b"backup").await.expect("write backup");
@@ -11160,8 +11165,9 @@ mod test {
         async fn delete_pruning_propagates_a_locked_empty_parent_error() {
             use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
-            let (disk, _dir) = new_disk().await;
-            ensure_test_volume(&disk, "pruning").await;
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
             let base = disk.get_bucket_path("pruning").expect("resolve test volume");
             let parent = base.join("parent");
             let guard = os::mkdir_all_below_existing_base_std(&parent, &base, &disk.publication_root)
