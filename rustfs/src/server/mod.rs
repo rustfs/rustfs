@@ -27,6 +27,7 @@ mod readiness;
 mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
+mod ssec_transport;
 pub mod tls_material;
 
 use tracing::warn;

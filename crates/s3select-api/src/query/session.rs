@@ -456,7 +456,12 @@ impl SessionCtxFactory {
             .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
         let metered_input_requires_single_file_scan =
             input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
-        let config = if custom_two_byte_record_delimiter
+        let normalized_csv_requires_single_file_scan =
+            context.input.request.input_serialization.csv.as_ref().is_some_and(|csv| {
+                crate::csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+            });
+        let config = if normalized_csv_requires_single_file_scan
+            || custom_two_byte_record_delimiter
             || scan_range_requires_single_file_scan
             || json_document_requires_single_file_scan
             || compressed_input_requires_single_file_scan
@@ -903,6 +908,25 @@ mod tests {
             .await
             .expect("CSV ScanRange session should be created");
 
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn unicode_csv_quotes_disable_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::get_mut(&mut context.input)
+            .expect("unique context")
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("CSV input")
+            .quote_character = Some("ع".to_owned());
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("Unicode CSV session");
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
     }
 

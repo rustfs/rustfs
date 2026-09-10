@@ -201,6 +201,7 @@ services:
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -220,6 +221,7 @@ services:
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -239,6 +241,7 @@ services:
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -258,6 +261,7 @@ services:
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:

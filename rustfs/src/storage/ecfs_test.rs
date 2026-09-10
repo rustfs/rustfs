@@ -1736,7 +1736,10 @@ mod tests {
             "https://console.localhost",
         );
         assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
-        assert_eq!(result.get(cors::standard::VARY).unwrap(), "Origin");
+        assert_eq!(
+            result.get(cors::standard::VARY).unwrap(),
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        );
 
         set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await

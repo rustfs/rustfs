@@ -129,10 +129,21 @@ jobs:
           : > target/debug/rustfs.features
 
       - name: Run upgrade compatibility test
+        env:
+          RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
         run: |
           cargo test --locked -p e2e_test \
             "upgrade_compatibility_test::${{ matrix.test }}" \
             -- --ignored --exact --nocapture
+
+      - name: Upload scanner/heal G09 evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact }}-g09-evidence-${{ github.run_number }}
+          path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload server logs
         if: always()

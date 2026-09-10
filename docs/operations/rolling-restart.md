@@ -56,8 +56,8 @@ When the whole cluster (or several nodes) went down and nodes are brought back o
    | `startup_finalization` | Last startup steps are being published. |
 
 2. Logs say what the node waits for. The IAM recovery loop retries with backoff and logs `event="iam_bootstrap_retry_failed"` with an actionable `hint` field (for example, "storage read quorum not met yet; waiting for enough cluster nodes/disks to come online"). After repeated failures the level escalates from WARN to ERROR; this still does not kill the process.
-3. Recovery is automatic. As soon as enough peers are online for the storage read quorum, the pending nodes finish IAM bootstrap on the next retry and flip `/health/ready` to `200` on their own. Restarting them does not speed anything up.
-4. Check readiness detail while waiting. `/health/ready` (and `/minio/health/ready`) return per-dependency detail during degradation; the `details` object shows `storage` / `iam` / `lock` readiness and `degradedReasons` lists machine-readable causes such as `storage_quorum_unavailable` or `lock_quorum_unavailable`:
+3. Recovery is automatic. Once storage read quorum is available, pending nodes can finish IAM bootstrap on the next retry. `/health/ready` returns `200` when storage write quorum, the metadata write gate, IAM, and lock readiness are satisfied. Restarting pending nodes does not speed this up.
+4. Check readiness detail while waiting. `/health/ready` (and `/minio/health/ready`) separate `storage` / `poolMetadata` / `iam` / `lock` readiness. `storage.ready` summarizes write quorum plus the metadata write gate; `storage.readQuorum` and `storage.writeQuorum` show the separate quorum observations. A healthy `poolMetadata.ready` does not imply storage quorum. `degradedReasons` lists machine-readable causes such as `storage_quorum_unavailable`, `storage_and_lock_unavailable`, or `pool_metadata_check_timeout`. See the [storage detail contract](../architecture/readiness-matrix.md#storage-detail-contract) for probe scopes and sampling limits:
 
    ```bash
    curl -s http://<node>:9000/health/ready | jq

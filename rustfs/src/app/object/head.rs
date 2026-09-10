@@ -381,10 +381,17 @@ impl DefaultObjectUsecase {
                     {
                         return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                     }
-                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                    return Err(enrich_delete_marker_read_error(
+                        &store,
+                        &bucket,
+                        &key,
+                        &opts,
+                        S3Error::new(S3ErrorCode::NoSuchKey),
+                    )
+                    .await);
                 }
                 // Other errors, such as insufficient permissions, still return the original error
-                return Err(ApiError::from(err).into());
+                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into()).await);
             }
         };
         if info.delete_marker {
@@ -396,9 +403,13 @@ impl DefaultObjectUsecase {
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
-                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey), &info, None));
             }
-            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+            return Err(with_delete_marker_read_headers(
+                S3Error::new(S3ErrorCode::MethodNotAllowed),
+                &info,
+                opts.version_id.as_deref(),
+            ));
         }
         if let Some(match_etag) = if_none_match
             && let Some(strong_etag) = match_etag.into_etag()

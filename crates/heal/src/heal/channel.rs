@@ -847,7 +847,7 @@ mod tests {
 
     fn create_test_heal_manager() -> Arc<HealManager> {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-        Arc::new(HealManager::new(storage, None))
+        Arc::new(HealManager::new_without_root_recovery_for_test(storage, None))
     }
 
     #[test]
@@ -1481,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_start_request_returns_admission_result() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-        let manager = Arc::new(HealManager::new(
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(
             storage,
             Some(HealConfig {
                 queue_size: 1,
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_query_request_reports_displaced_terminal_detail() {
-        let heal_manager = Arc::new(HealManager::new(
+        let heal_manager = Arc::new(HealManager::new_without_root_recovery_for_test(
             Arc::new(MockStorage),
             Some(HealConfig {
                 queue_size: 1,

@@ -26,6 +26,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
+mod root_recovery;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -94,6 +95,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         retrying_heals: &manager.retrying_heals,
         mrf_repair_notice_targets: &manager.mrf_repair_notice_targets,
         replacement_recovery_anchors: &manager.replacement_recovery_anchors,
+        root_recovery: &manager.root_recovery,
         config: &manager.config,
         statistics: &manager.statistics,
         storage: &manager.storage,
@@ -149,7 +151,7 @@ fn completed_retention_cursor_boundaries_preserve_progress() {
 
 #[tokio::test]
 async fn completed_retention_displaced_alias_does_not_resurrect_evicted_snapshot() {
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     let request = HealRequest::bucket("bucket".to_string());
     manager.insert_task_alias("alias", &request.id).await;
     let terminal = record_displaced_terminal(&manager.displaced_terminals, &request);
@@ -211,7 +213,7 @@ async fn completed_retention_clock_rollback_preserves_terminal_alias_queries() {
         },
         HealTaskStatus::Cancelled,
     ] {
-        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
         let mut snapshot = completed_retention_fixture(completed_at);
         snapshot.status = status.clone();
         let expected_progress = snapshot.progress.clone();
@@ -365,7 +367,7 @@ async fn canonical_outcome_cancel_wins_before_worker_finalizes_success() {
     use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
     use crate::heal::task::{OUTCOME_FINISH_TEST_HOOK, OutcomeFinishTestHook};
     let bucket = "canonical-outcome-cancel-before-finish";
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     let request = HealRequest::object(bucket.to_string(), "object".to_string(), None);
     let task_id = request.id.clone();
     let duplicate = HealRequest::object(bucket.to_string(), "object".to_string(), None);
@@ -416,7 +418,7 @@ async fn canonical_outcome_cancel_wins_before_worker_finalizes_success() {
 #[tokio::test]
 async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     let bucket = "completed-retention-retry-cancel";
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     let request = HealRequest::object(bucket.to_string(), "object".to_string(), None);
     let task_id = request.id.clone();
     let duplicate = HealRequest::object(bucket.to_string(), "object".to_string(), None);
@@ -471,7 +473,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
     for outcome in ["success", "failed", "cancelled"] {
         let bucket = format!("completed-retention-{outcome}");
         let hook = Arc::new(CompletedRetentionHook::default());
-        let manager = Arc::new(HealManager::new(Arc::new(MockStorage), None));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None));
         let request = HealRequest::object(bucket.clone(), "object".to_string(), None);
         let task_id = request.id.clone();
         let duplicate = HealRequest::object(bucket.clone(), "object".to_string(), None);
@@ -711,7 +713,7 @@ impl HealStorageAPI for MockStorage {
 async fn assert_heal_start_retry_control_preserves_real_executor_progress(cancel: bool) {
     for phase in ["listing", "object"] {
         let bucket = format!("heal-start-retry-deadline-{phase}-{cancel}");
-        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
         let mut request = HealRequest::new(
             HealType::Prefix {
                 bucket: bucket.clone(),
@@ -822,7 +824,7 @@ async fn heal_start_retry_cancellation_preserves_real_executor_progress() {
 
 #[tokio::test]
 async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
             task_timeout: Duration::ZERO,
@@ -861,6 +863,88 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
     manager.cancel_task(&task_id).await.expect("cancel held retry");
     hook.finish.notify_one();
     COMPLETED_RETENTION_HOOKS.lock().await.remove(&task_id);
+}
+
+#[tokio::test]
+async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            task_timeout: Duration::ZERO,
+            event_driven_scheduler_enable: false,
+            ..Default::default()
+        }),
+    );
+    let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Admin;
+    request.options.timeout = Some(Duration::from_secs(60));
+    let task_id = request.id.clone();
+    let created_at = request.created_at;
+    manager
+        .submit_heal_request(request)
+        .await
+        .expect("admit explicit-budget task");
+
+    let mut previous_remaining = Duration::from_secs(60);
+    for expected_attempt in 1..=3 {
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.retrying_heals.lock().await.contains_key(&task_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recoverable executor failure should enter retry backoff");
+
+        let retry = manager.retrying_heals.lock().await[&task_id].request.clone();
+        assert_eq!(retry.id, task_id);
+        assert_eq!(retry.created_at, created_at);
+        assert_eq!(retry.source, HealRequestSource::Admin);
+        assert_eq!(retry.retry_attempts, expected_attempt);
+        let remaining = retry.options.timeout.expect("retry retains explicit budget");
+        assert!(
+            remaining > Duration::ZERO && remaining < previous_remaining,
+            "retry attempt {expected_attempt} should carry only the unused explicit budget"
+        );
+        previous_remaining = remaining;
+        assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+        assert_eq!(manager.operations_snapshot().await.retrying_tasks, 1);
+
+        let retry_delay = recoverable_heal_retry_delay(expected_attempt);
+        tokio::time::timeout(retry_delay + Duration::from_secs(1), async {
+            loop {
+                if !manager.retrying_heals.lock().await.contains_key(&task_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry backoff should requeue the same task id");
+        assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+    }
+
+    process_manager_queue_once(&manager).await;
+    let final_error = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(HealTaskStatus::Failed { error }) = manager.get_task_status(&task_id).await {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry limit should finish as a terminal failure");
+    let final_error_lower = final_error.to_ascii_lowercase();
+    assert!(
+        final_error_lower.contains("insufficient") && final_error_lower.contains("read"),
+        "terminal failure should retain the recoverable storage error: {final_error}"
+    );
+    assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+    assert_eq!(manager.operations_snapshot().await.retrying_tasks, 0);
 }
 
 struct ManagerRecoveryTestHook {
@@ -962,7 +1046,7 @@ fn scoped_object_request(bucket: &str, object: &str, pool_index: usize, set_inde
 
 #[tokio::test]
 async fn scheduler_bulkhead_starts_other_sets_and_retains_same_set_tail() {
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     {
         let mut config = manager.config.write().await;
         config.max_concurrent_heals = 2;
@@ -1142,17 +1226,47 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
     assert_eq!(event.bucket_incarnation_id, incarnation);
     assert_eq!(event.disposition, MrfVerifiedRepairDisposition::Repaired);
 
-    assert!(
-        mrf_verified_repair_event_for_target(
-            &MrfRepairNoticeTarget {
-                kind: MrfKind::DecodeFailure,
-                ..target.clone()
-            },
-            &matching
-        )
-        .is_none(),
-        "only receipt-producing partial-write object heals can publish verified events today"
+    let decode_target = MrfRepairNoticeTarget {
+        kind: MrfKind::DecodeFailure,
+        ..target.clone()
+    };
+    let decode_outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Decode,
+            ..matching.identity.clone()
+        },
+        ..matching.clone()
+    };
+    let decode_event =
+        mrf_verified_repair_event_for_target(&decode_target, &decode_outcome).expect("decode repairs publish exact proofs");
+    assert_eq!(decode_event.kind, MrfKind::DecodeFailure);
+    assert_eq!(
+        decode_event.scope,
+        Some(MrfScope {
+            pool_index: 1,
+            set_index: 2
+        })
     );
+
+    let metadata_target = MrfRepairNoticeTarget {
+        kind: MrfKind::MetadataCorruption,
+        ..target.clone()
+    };
+    let metadata_outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Metadata,
+            version_id: None,
+            pool_index: None,
+            set_index: None,
+            ..matching.identity.clone()
+        },
+        ..matching.clone()
+    };
+    let metadata_event =
+        mrf_verified_repair_event_for_target(&metadata_target, &metadata_outcome).expect("metadata repairs publish exact proofs");
+    assert_eq!(metadata_event.kind, MrfKind::MetadataCorruption);
+    assert_eq!(metadata_event.version_id, None);
+    assert_eq!(metadata_event.scope, None);
 
     for rejected in [
         HealObjectOutcome {
@@ -1837,7 +1951,7 @@ fn test_heal_request_and_task_metric_labels_match() {
 #[tokio::test]
 async fn test_submit_heal_request_returns_merged_for_duplicate() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::new(
         HealType::Object {
@@ -1868,7 +1982,7 @@ async fn test_submit_heal_request_returns_merged_for_duplicate() {
 #[tokio::test]
 async fn test_admin_duplicate_receipt_returns_canonical_task_without_alias() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let mut original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     original.source = HealRequestSource::Admin;
     let original_id = original.id.clone();
@@ -1895,7 +2009,7 @@ async fn test_admin_duplicate_receipt_returns_canonical_task_without_alias() {
 #[tokio::test]
 async fn test_task_alias_is_removed_after_terminal_completion() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     let original_id = original.id.clone();
     let duplicate = HealRequest::object("bucket".to_string(), "object".to_string(), None);
@@ -1935,7 +2049,7 @@ async fn test_task_alias_is_removed_after_terminal_completion() {
 #[tokio::test]
 async fn test_duplicate_admission_is_atomic_with_queue_to_active_transition() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = Arc::new(HealManager::new(storage.clone(), None));
+    let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage.clone(), None));
     let mut original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     original.source = HealRequestSource::Admin;
     let original_id = original.id.clone();
@@ -2005,7 +2119,7 @@ async fn test_duplicate_admission_is_atomic_with_queue_to_active_transition() {
 #[tokio::test]
 async fn test_submit_heal_request_returns_merged_for_active_duplicate() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage.clone(), None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
     let active_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     let active_task = Arc::new(HealTask::from_request(active_request, storage));
     manager.active_heals.lock().await.insert(active_task.id.clone(), active_task);
@@ -2025,7 +2139,7 @@ async fn test_submit_heal_request_returns_merged_for_active_duplicate() {
 #[tokio::test]
 async fn test_active_duplicate_token_can_query_and_cancel_original_task() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage.clone(), None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
     let active_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     let active_task = Arc::new(HealTask::from_request(active_request, storage));
     let active_task_id = active_task.id.clone();
@@ -2067,7 +2181,7 @@ async fn test_active_duplicate_token_can_query_and_cancel_original_task() {
 #[tokio::test]
 async fn test_queued_duplicate_token_can_query_and_cancel_original_request() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let original_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     let original_task_id = original_request.id.clone();
     let duplicate_request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
@@ -2258,7 +2372,7 @@ fn durable_replacement_recovery_re_admits_only_the_matching_generation() {
 
 #[test]
 fn replacement_recovery_blocker_is_set_scoped() {
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
 
     manager.block_replacement_recovery_set("pool_0_set_0");
 
@@ -2364,7 +2478,7 @@ async fn scheduler_completes_cleanup_pending_recovery_from_manager_anchor() {
 
     let (hook, _hook_guard) = ManagerRecoveryTestHook::install(anchor.clone());
     let storage = Arc::new(MockStorage);
-    let manager = HealManager::new(storage.clone(), None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
     let mut request = HealRequest::new(
         HealType::ErasureSet {
             buckets: vec!["bucket-a".to_string()],
@@ -2499,7 +2613,7 @@ fn test_retry_request_for_recoverable_error_stops_at_limit() {
 }
 
 #[tokio::test]
-async fn test_retry_request_does_not_rescan_batch_after_object_retries_exhausted() {
+async fn test_retry_request_rescans_batch_when_all_exhausted_objects_are_retryable() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
     let result = Err(task
@@ -2513,7 +2627,32 @@ async fn test_retry_request_does_not_rescan_batch_after_object_retries_exhausted
         })
         .await);
 
-    assert!(retry_request_for_result(&task, &result).is_none());
+    let (retry_request, retry_delay, error) = retry_request_for_result_with_budget(&task, &result)
+        .await
+        .expect("all-retryable batch failure should rescan within the manager retry budget");
+
+    assert_eq!(retry_request.id, task.id);
+    assert_eq!(retry_request.retry_attempts, 1);
+    assert!(retry_delay > Duration::ZERO);
+    assert!(error.contains("Lock acquisition timeout"));
+}
+
+#[tokio::test]
+async fn test_retry_request_does_not_rescan_batch_with_permanent_failures() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
+    let result = Err(task
+        .record_batch_failure(BatchHealFailure {
+            scope: "bucket:bucket".to_string(),
+            failed: 2,
+            retryable: 1,
+            permanent: 1,
+            first_object: "object-a".to_string(),
+            first_error: "Lock acquisition timeout".to_string(),
+        })
+        .await);
+
+    assert!(retry_request_for_result_with_budget(&task, &result).await.is_none());
 }
 
 #[test]
@@ -2575,7 +2714,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
 #[tokio::test]
 async fn test_cancel_task_cancels_retrying_backoff() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let mut request = HealRequest::bucket("bucket".to_string());
     request.retry_attempts = 1;
     let task_id = request.id.clone();
@@ -2602,7 +2741,7 @@ async fn test_cancel_task_cancels_retrying_backoff() {
 #[tokio::test]
 async fn test_cancel_tasks_for_path_cancels_retrying_backoff() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let mut request = HealRequest::bucket("bucket".to_string());
     request.retry_attempts = 1;
     let task_id = request.id.clone();
@@ -2624,7 +2763,7 @@ async fn test_cancel_tasks_for_path_cancels_retrying_backoff() {
 #[tokio::test]
 async fn test_cancel_tasks_for_empty_path_cancels_queued_cluster_only() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
     let cluster_request_id = cluster_request.id.clone();
@@ -2663,7 +2802,7 @@ async fn test_cancel_tasks_for_empty_path_cancels_queued_cluster_only() {
 #[tokio::test]
 async fn test_cancel_tasks_for_empty_path_cancels_active_cluster_only() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage.clone(), None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
 
     let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
     let cluster_request_id = cluster_request.id.clone();
@@ -2694,7 +2833,7 @@ async fn test_cancel_tasks_for_empty_path_cancels_active_cluster_only() {
 #[tokio::test]
 async fn test_cancel_tasks_for_empty_path_cancels_retrying_cluster_only() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let mut cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
     cluster_request.retry_attempts = 1;
@@ -2733,7 +2872,7 @@ fn test_heal_type_matches_path_accepts_legacy_root() {
 #[tokio::test]
 async fn test_retrying_duplicate_token_can_query_and_cancel_original_retry() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let mut original_request = HealRequest::bucket("bucket".to_string());
     original_request.retry_attempts = 1;
     let original_task_id = original_request.id.clone();
@@ -2769,7 +2908,7 @@ async fn test_retrying_duplicate_token_can_query_and_cancel_original_retry() {
 #[tokio::test]
 async fn test_get_task_status_reports_pending_for_queued_request() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::bucket("bucket".to_string());
     let request_id = request.id.clone();
@@ -2793,7 +2932,7 @@ async fn test_get_task_status_reports_pending_for_queued_request() {
 #[tokio::test]
 async fn test_operations_snapshot_counts_queue_by_source_and_priority() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let mut scanner_request = HealRequest::new(
         HealType::Object {
@@ -2850,7 +2989,7 @@ async fn test_operations_snapshot_counts_queue_by_source_and_priority() {
 // HS-06 (backlog#1870): overlap policy + forceStart semantics.
 fn manager_with_policy(policy: HealOverlapPolicy) -> HealManager {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    HealManager::new(
+    HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             overlap_policy: policy,
@@ -2869,6 +3008,12 @@ fn admin_prefix_request(bucket: &str, prefix: &str) -> HealRequest {
         HealPriority::Normal,
     );
     request.source = HealRequestSource::Admin;
+    request
+}
+
+fn internal_prefix_request(bucket: &str, prefix: &str) -> HealRequest {
+    let mut request = admin_prefix_request(bucket, prefix);
+    request.source = HealRequestSource::Internal;
     request
 }
 
@@ -2980,7 +3125,7 @@ async fn admin_force_start_cancels_overlapping_active_task_first() {
 #[tokio::test]
 async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = Arc::new(HealManager::new(
+    let manager = Arc::new(HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -2988,7 +3133,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
         }),
     ));
 
-    let mut paused = admin_prefix_request("bucket-a", "logs/");
+    let mut paused = internal_prefix_request("bucket-a", "logs/");
     paused.priority = HealPriority::Low;
     let hook = Arc::new(DuplicateAdmissionTestHook {
         request_id: paused.id.clone(),
@@ -3018,7 +3163,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
     );
     *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = None;
 
-    let duplicate = admin_prefix_request("bucket-a", "logs/");
+    let duplicate = internal_prefix_request("bucket-a", "logs/");
     let duplicate_receipt = manager
         .submit_heal_request_with_receipt(duplicate)
         .await
@@ -3062,7 +3207,7 @@ async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement(
 #[tokio::test]
 async fn test_operations_snapshot_counts_active_by_source_and_priority() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let mut request = HealRequest::bucket("bucket-a".to_string());
     request.priority = HealPriority::High;
@@ -3084,7 +3229,7 @@ async fn test_operations_snapshot_counts_active_by_source_and_priority() {
 #[tokio::test]
 async fn test_operations_snapshot_counts_retry_backoff_as_owned_work() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
     let mut request = HealRequest::bucket("bucket-retry".to_string());
     request.priority = HealPriority::Urgent;
     request.source = HealRequestSource::Admin;
@@ -3110,7 +3255,7 @@ async fn test_operations_snapshot_counts_retry_backoff_as_owned_work() {
 #[tokio::test]
 async fn test_scheduler_retry_transitions_keep_continuous_single_ownership() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = Arc::new(HealManager::new(storage, None));
+    let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
     {
         let mut config = manager.config.write().await;
         config.enable_auto_heal = false;
@@ -3183,7 +3328,7 @@ async fn test_scheduler_retry_transitions_keep_continuous_single_ownership() {
 #[tokio::test]
 async fn test_active_progress_snapshot_sums_active_task_progress() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let first = Arc::new(HealTask::from_request(
         HealRequest::bucket("bucket-a".to_string()),
@@ -3228,7 +3373,7 @@ async fn test_active_progress_snapshot_sums_active_task_progress() {
 #[tokio::test]
 async fn test_get_task_status_for_path_rejects_wrong_token_when_path_is_active() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     manager
         .submit_heal_request(HealRequest::bucket("bucket".to_string()))
@@ -3244,7 +3389,7 @@ async fn test_get_task_status_for_path_rejects_wrong_token_when_path_is_active()
 #[tokio::test]
 async fn test_get_task_status_for_path_rejects_token_from_other_active_path() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let bucket_request = HealRequest::bucket("bucket".to_string());
     let other_request = HealRequest::bucket("other".to_string());
@@ -3268,7 +3413,7 @@ async fn test_get_task_status_for_path_rejects_token_from_other_active_path() {
 #[tokio::test]
 async fn test_get_task_status_for_path_does_not_accept_token_from_inactive_path() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::bucket("bucket".to_string());
     let request_id = request.id.clone();
@@ -3287,7 +3432,7 @@ async fn test_get_task_status_for_path_does_not_accept_token_from_inactive_path(
 #[tokio::test]
 async fn test_get_task_status_for_path_returns_not_found_when_path_is_inactive() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     assert!(matches!(
         manager.get_task_status_for_path("bucket", "old-token").await,
@@ -3298,7 +3443,7 @@ async fn test_get_task_status_for_path_returns_not_found_when_path_is_inactive()
 #[tokio::test]
 async fn test_get_task_status_for_empty_path_does_not_match_unrelated_tasks() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::bucket("bucket".to_string());
     let request_id = request.id.clone();
@@ -3321,7 +3466,7 @@ async fn test_get_task_status_for_empty_path_does_not_match_unrelated_tasks() {
 #[tokio::test]
 async fn test_get_task_report_queries_queued_task_by_token_without_path() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::new(
         HealType::ErasureSet {
@@ -3350,7 +3495,7 @@ async fn test_get_task_report_queries_queued_task_by_token_without_path() {
 #[tokio::test]
 async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     // A completed entry recorded in a Retrying state for a task whose
     // request is also (still) queued under the same id: the retrying
@@ -3394,7 +3539,7 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
 #[tokio::test]
 async fn test_get_task_status_reads_recent_completed_status() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     manager.completed_heals.lock().await.insert(
         "completed-token".to_string(),
@@ -3426,7 +3571,7 @@ async fn test_get_task_status_reads_recent_completed_status() {
 #[tokio::test]
 async fn test_get_task_report_for_path_reads_completed_items() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     manager.completed_heals.lock().await.insert(
         "completed-token".to_string(),
@@ -3474,7 +3619,7 @@ async fn test_get_task_report_for_path_reads_completed_items() {
 #[tokio::test]
 async fn test_get_task_report_for_empty_path_does_not_match_unrelated_tasks() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     manager
         .submit_heal_request(HealRequest::bucket("bucket".to_string()))
@@ -3490,7 +3635,7 @@ async fn test_get_task_report_for_empty_path_does_not_match_unrelated_tasks() {
 #[tokio::test]
 async fn test_cancel_task_removes_queued_request() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let request = HealRequest::bucket("bucket".to_string());
     let request_id = request.id.clone();
@@ -3514,7 +3659,7 @@ async fn mrf_ownership_unverified_completion_does_not_emit_repaired() {
     let version_id = Some([9u8; 16]);
     let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
     request.source = HealRequestSource::Mrf;
@@ -3561,7 +3706,7 @@ async fn mrf_ownership_dry_run_and_empty_window_do_not_emit_repaired() {
         } else {
             "mrf-dry-run-outcome"
         };
-        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
         let request = HealRequest::new(
             if empty_window {
                 HealType::Cluster
@@ -3617,7 +3762,7 @@ async fn mrf_ownership_queued_cancel_does_not_emit_repaired() {
     let object = "object";
     let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
     request.source = HealRequestSource::Mrf;
@@ -3648,7 +3793,7 @@ async fn mrf_ownership_queued_cancel_does_not_emit_repaired() {
 #[tokio::test]
 async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(storage, None);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
     let bucket_request = HealRequest::bucket("bucket".to_string());
     let bucket_request_id = bucket_request.id.clone();
@@ -3687,7 +3832,7 @@ async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
 #[tokio::test]
 async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -3724,7 +3869,7 @@ async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
 #[tokio::test]
 async fn test_submit_heal_request_returns_dropped_for_low_priority_when_full() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -3767,7 +3912,7 @@ async fn test_submit_heal_request_returns_dropped_for_low_priority_when_full() {
 #[tokio::test]
 async fn test_submit_heal_request_returns_full_for_normal_priority_when_full() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -3809,7 +3954,7 @@ async fn test_submit_heal_request_returns_full_for_normal_priority_when_full() {
 #[tokio::test]
 async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -3864,7 +4009,7 @@ async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
 
 #[tokio::test]
 async fn displaced_task_remains_queryable() {
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
             queue_size: 1,
@@ -3906,7 +4051,7 @@ async fn displaced_task_remains_queryable() {
 
 #[tokio::test]
 async fn displaced_archive_failure_keeps_queryable_terminal() {
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     let mut request = HealRequest::new(
         HealType::Bucket {
             bucket: "archive-failure".to_string(),
@@ -3929,7 +4074,7 @@ async fn displaced_archive_failure_keeps_queryable_terminal() {
 
 #[tokio::test]
 async fn scheduler_retry_displacement_keeps_evicted_task_queryable() {
-    let manager = Arc::new(HealManager::new(
+    let manager = Arc::new(HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
             queue_size: 1,
@@ -3994,7 +4139,7 @@ async fn scheduler_retry_displacement_keeps_evicted_task_queryable() {
 
 #[tokio::test]
 async fn concurrent_displacers_produce_one_terminal_generation() {
-    let manager = Arc::new(HealManager::new(
+    let manager = Arc::new(HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
             queue_size: 1,
@@ -4046,7 +4191,7 @@ async fn concurrent_displacers_produce_one_terminal_generation() {
 
 #[tokio::test]
 async fn successor_chain_is_bounded_and_authorized() {
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         Arc::new(MockStorage),
         Some(HealConfig {
             queue_size: 1,
@@ -4099,7 +4244,7 @@ async fn successor_chain_is_bounded_and_authorized() {
 
 #[tokio::test]
 async fn displaced_terminal_expires_after_bounded_ttl() {
-    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
     let mut request = HealRequest::new(
         HealType::Bucket {
             bucket: "expires".to_string(),
@@ -4122,7 +4267,7 @@ async fn displaced_terminal_expires_after_bounded_ttl() {
 #[tokio::test]
 async fn test_displacing_registered_mrf_task_drops_notice_ownership() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -4170,7 +4315,7 @@ async fn test_displacing_registered_mrf_task_drops_notice_ownership() {
 #[tokio::test]
 async fn test_submit_heal_request_drops_read_repair_under_pressure() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 10,
@@ -4204,7 +4349,7 @@ async fn test_submit_heal_request_drops_read_repair_under_pressure() {
 #[tokio::test]
 async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 10,
@@ -4238,7 +4383,7 @@ async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
 #[tokio::test]
 async fn test_submit_heal_request_accepts_admin_high_under_pressure() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 10,
@@ -4278,7 +4423,7 @@ async fn test_mainline_throttle_delays_background_heal_start() {
         limit: 10,
         state: AdmissionState::Open,
     });
-    let manager = HealManager::new_with_workload_provider(
+    let manager = HealManager::new_with_workload_provider_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             max_concurrent_heals: 1,
@@ -4311,7 +4456,7 @@ async fn test_mainline_throttle_delays_background_heal_start_under_write_pressur
         limit: 10,
         state: AdmissionState::Open,
     });
-    let manager = HealManager::new_with_workload_provider(
+    let manager = HealManager::new_with_workload_provider_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             max_concurrent_heals: 1,
@@ -4344,7 +4489,7 @@ async fn test_mainline_throttle_allows_admin_high_start() {
         limit: 10,
         state: AdmissionState::Saturated,
     });
-    let manager = HealManager::new_with_workload_provider(
+    let manager = HealManager::new_with_workload_provider_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             max_concurrent_heals: 1,
@@ -4370,7 +4515,7 @@ async fn test_mainline_throttle_allows_admin_high_start() {
 #[tokio::test]
 async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             max_concurrent_heals: 1,
@@ -4424,7 +4569,7 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
 #[tokio::test]
 async fn test_force_start_bypasses_duplicate_and_full_admission() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -4483,7 +4628,7 @@ async fn test_force_start_bypasses_duplicate_and_full_admission() {
 #[tokio::test]
 async fn test_force_start_marks_dedup_key_for_future_duplicates() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let manager = HealManager::new(
+    let manager = HealManager::new_without_root_recovery_for_test(
         storage,
         Some(HealConfig {
             queue_size: 1,
@@ -4534,6 +4679,48 @@ async fn test_force_start_marks_dedup_key_for_future_duplicates() {
             .await
             .expect("non-forced duplicate should merge while forced request is queued"),
         HealAdmissionResult::Merged
+    );
+}
+
+#[tokio::test]
+async fn same_request_id_replay_reuses_existing_task_without_force_start_duplication() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+
+    let mut original = admin_prefix_request("bucket", "logs/");
+    original.force_start = true;
+    let original_id = original.id.clone();
+    let accepted = manager
+        .submit_heal_request_with_receipt(original.clone())
+        .await
+        .expect("original forceStart request should queue");
+    assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+    assert_eq!(accepted.task_id, original_id);
+
+    let replayed = manager
+        .submit_heal_request_with_receipt(original.clone())
+        .await
+        .expect("same request id and payload should reuse the existing task");
+    assert_eq!(replayed.result, HealAdmissionResult::Accepted);
+    assert_eq!(replayed.task_id, original_id);
+    assert_eq!(
+        manager.get_queue_length().await,
+        1,
+        "exact forceStart replay must not create a second queued task"
+    );
+
+    let mut changed = original;
+    changed.options.remove_corrupted = true;
+    let changed = manager
+        .submit_heal_request_with_receipt(changed)
+        .await
+        .expect("same request id with a changed payload should fail closed");
+    assert_eq!(changed.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    assert_eq!(changed.task_id, original_id);
+    assert_eq!(
+        manager.get_queue_length().await,
+        1,
+        "same-id conflict must not displace or duplicate the original task"
     );
 }
 

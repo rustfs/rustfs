@@ -775,6 +775,7 @@ mod tests {
             scan_plan_digest: Some([1; 32]),
             complete: true,
             tombstone: false,
+            segment_invalidation_proof: None,
         }];
         DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
         assert_eq!(info.usage_snapshot_converged, Some(false));

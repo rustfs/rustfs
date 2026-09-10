@@ -26,6 +26,7 @@ services:
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin-local}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfssecret-local}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_OBS_USE_STDOUT=${RUSTFS_OBS_USE_STDOUT:-false}
       - RUSTFS_OBS_LOG_STDOUT_ENABLED=${RUSTFS_OBS_LOG_STDOUT_ENABLED:-false}
@@ -72,6 +73,7 @@ services:
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin-local}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfssecret-local}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_OBS_USE_STDOUT=${RUSTFS_OBS_USE_STDOUT:-false}
       - RUSTFS_OBS_LOG_STDOUT_ENABLED=${RUSTFS_OBS_LOG_STDOUT_ENABLED:-false}
@@ -118,6 +120,7 @@ services:
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin-local}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfssecret-local}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_OBS_USE_STDOUT=${RUSTFS_OBS_USE_STDOUT:-false}
       - RUSTFS_OBS_LOG_STDOUT_ENABLED=${RUSTFS_OBS_LOG_STDOUT_ENABLED:-false}
@@ -164,6 +167,7 @@ services:
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin-local}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfssecret-local}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_OBS_USE_STDOUT=${RUSTFS_OBS_USE_STDOUT:-false}
       - RUSTFS_OBS_LOG_STDOUT_ENABLED=${RUSTFS_OBS_LOG_STDOUT_ENABLED:-false}

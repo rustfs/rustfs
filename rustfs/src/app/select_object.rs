@@ -689,8 +689,8 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
             ));
         }
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
+        validate_single_character(csv.quote_character.as_deref())?;
+        validate_single_character(csv.quote_escape_character.as_deref())?;
         validate_input_record_delimiter(csv.record_delimiter.as_deref())?;
         validate_input_delimiter_pair(csv.field_delimiter.as_deref(), csv.record_delimiter.as_deref())?;
     }
@@ -776,6 +776,15 @@ fn validate_scan_range_for_object_size(request: &SelectObjectContentRequest, obj
 
 fn invalid_scan_range_error() -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
+}
+
+fn validate_single_character(value: Option<&str>) -> S3Result<()> {
+    if let Some(value) = value
+        && value.chars().count() != 1
+    {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
+    }
+    Ok(())
 }
 
 fn validate_single_byte(value: Option<&str>, code: S3ErrorCode) -> S3Result<()> {
@@ -3522,6 +3531,29 @@ mod tests {
             .expect_err("malformed ScanRange must fail before compression compatibility validation");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequestParameter);
         assert_eq!(error.message(), Some(INVALID_SCAN_RANGE_MESSAGE));
+    }
+
+    #[test]
+    fn validate_accepts_single_unicode_csv_input_quotes() {
+        for quote in ["ع", "界", "🦀"] {
+            let mut input = base_input();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.quote_character = Some(quote.to_owned());
+            csv.quote_escape_character = Some(quote.to_owned());
+            validate_select_request(&HeaderMap::new(), &mut input).expect("one Unicode scalar is a valid CSV quote");
+        }
+        for quote in ["", "عع", "e\u{301}"] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("CSV input")
+                .quote_character = Some(quote.to_owned());
+            let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("quote must be one scalar");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequestParameter);
+        }
     }
 
     #[test]

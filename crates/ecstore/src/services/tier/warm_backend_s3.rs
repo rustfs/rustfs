@@ -376,7 +376,6 @@ struct TransitionCandidateVersions {
 }
 
 impl TransitionCandidateVersions {
-    #[cfg(test)]
     fn extend(&mut self, remote_object: &str, versions: &ListVersionsResult) {
         for version in versions.versions.iter().filter(|version| version.key == remote_object) {
             if self.version_id.is_some() {
@@ -512,6 +511,20 @@ mod tests {
     }
 
     async fn candidate_probe_fixture() -> Option<(WarmBackendS3, tokio::task::JoinHandle<Vec<String>>)> {
+        scripted_probe_fixture([
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nx-amz-version-id: opaque-version\r\nConnection: close\r\n\r\nx",
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 66\r\nConnection: close\r\n\r\n<Error><Code>NoSuchObject</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: 65\r\nConnection: close\r\n\r\n<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/xml\r\nContent-Length: 72\r\nConnection: close\r\n\r\n<Error><Code>InvalidRange</Code><Message>empty version</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 67\r\nConnection: close\r\n\r\n<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+            ].into_iter().map(str::to_owned).collect()).await
+    }
+
+    async fn scripted_probe_fixture(responses: Vec<String>) -> Option<(WarmBackendS3, tokio::task::JoinHandle<Vec<String>>)> {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
@@ -522,17 +535,6 @@ mod tests {
             .expect("listener local address should be available")
             .to_string();
         let fixture = tokio::spawn(async move {
-            let responses = [
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nx-amz-version-id: opaque-version\r\nConnection: close\r\n\r\nx",
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 66\r\nConnection: close\r\n\r\n<Error><Code>NoSuchObject</Code><Message>missing</Message></Error>",
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: 65\r\nConnection: close\r\n\r\n<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
-                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/xml\r\nContent-Length: 72\r\nConnection: close\r\n\r\n<Error><Code>InvalidRange</Code><Message>empty version</Message></Error>",
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 67\r\nConnection: close\r\n\r\n<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
-            ];
             let mut requests = Vec::new();
             for response in responses {
                 let (mut stream, _) = listener.accept().await.expect("fixture should accept candidate GET");
@@ -671,6 +673,117 @@ mod tests {
         assert!(requests[6].to_ascii_lowercase().contains("?versionid=historical-version"));
         assert!(requests[7].to_ascii_lowercase().contains("?versionid=missing-version"));
         assert!(requests[8].to_ascii_lowercase().contains("?versionid=historical-version"));
+    }
+
+    fn legacy_probe_xml_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn legacy_probe_versioning_response(status: &str) -> String {
+        let state = if status.is_empty() {
+            String::new()
+        } else {
+            format!("<Status>{status}</Status>")
+        };
+        legacy_probe_xml_response(&format!(
+            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{state}</VersioningConfiguration>"
+        ))
+    }
+
+    fn legacy_probe_versions_response(versions: &[&str]) -> String {
+        let versions = versions.iter().map(|version| format!(
+            "<Version><Key>archive/object</Key><VersionId>{version}</VersionId><IsLatest>true</IsLatest><LastModified>2026-09-01T00:00:00Z</LastModified><ETag>\"legacy-etag\"</ETag><Size>7</Size><StorageClass>STANDARD</StorageClass></Version>"
+        )).collect::<String>();
+        legacy_probe_xml_response(&format!(
+            "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name><Prefix>archive/object</Prefix><KeyMarker/><VersionIdMarker/><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{versions}</ListVersionsResult>"
+        ))
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_probe_verifies_disabled_suspended_and_enabled_responses() {
+        use super::super::warm_backend::LegacyTransitionStateProbe as Probe;
+        for (initial, confirmed, version, expected) in [
+            ("", "", "null", Probe::UnversionedPresent),
+            ("Suspended", "Suspended", "null", Probe::SuspendedNullPresent),
+            ("Enabled", "Enabled", "version-a", Probe::VersionedPresent("version-a".to_string())),
+            ("Enabled", "Enabled", "null", Probe::SuspendedNullPresent),
+            ("", "", "unexpected-version", Probe::Ambiguous),
+            ("Suspended", "Enabled", "null", Probe::Ambiguous),
+        ] {
+            let responses = vec![
+                legacy_probe_versioning_response(initial),
+                legacy_probe_versions_response(&[version]),
+                legacy_probe_versioning_response(confirmed),
+            ];
+            let (backend, fixture) = scripted_probe_fixture(responses)
+                .await
+                .expect("legacy probe loopback fixture");
+            let result =
+                tokio::time::timeout(Duration::from_secs(10), backend.probe_legacy_transition_state("archive/object", None))
+                    .await
+                    .expect("legacy probe must finish")
+                    .expect("legacy probe should decode provider XML");
+            assert_eq!(result, expected, "initial={initial} confirmed={confirmed} version={version}");
+            let requests = fixture.await.expect("legacy probe fixture should finish");
+            assert_eq!(requests.len(), 3);
+            assert!(requests.iter().all(|request| request.starts_with("GET ")));
+            assert!(requests[0].lines().next().expect("request line").contains("versioning"));
+            assert!(requests[1].lines().next().expect("request line").contains("versions"));
+            assert!(requests[2].lines().next().expect("request line").contains("versioning"));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_probe_preserves_historical_exact_version() {
+        use super::super::warm_backend::LegacyTransitionStateProbe as Probe;
+        let responses = vec![
+            legacy_probe_versioning_response("Enabled"),
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nx-amz-version-id: historical-version\r\nConnection: close\r\n\r\nx".to_string(),
+            legacy_probe_versioning_response("Enabled"),
+        ];
+        let (backend, fixture) = scripted_probe_fixture(responses).await.expect("exact legacy probe fixture");
+        assert_eq!(
+            backend
+                .probe_legacy_transition_state("archive/object", Some("historical-version"))
+                .await
+                .expect("exact version proof"),
+            Probe::VersionedPresent("historical-version".to_string())
+        );
+        let requests = fixture.await.expect("exact probe fixture should finish");
+        assert!(
+            requests[1]
+                .lines()
+                .next()
+                .expect("request line")
+                .contains("versionId=historical-version")
+        );
+        assert!(requests[1].to_ascii_lowercase().contains("range: bytes=0-0"));
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_probe_retains_multiple_candidates() {
+        use super::super::warm_backend::LegacyTransitionStateProbe as Probe;
+        let responses = vec![
+            legacy_probe_versioning_response("Enabled"),
+            legacy_probe_versions_response(&["version-a", "version-b"]),
+        ];
+        let (backend, fixture) = scripted_probe_fixture(responses)
+            .await
+            .expect("ambiguous legacy probe fixture");
+        assert_eq!(
+            backend
+                .probe_legacy_transition_state("archive/object", None)
+                .await
+                .expect("ambiguous proof"),
+            Probe::Ambiguous
+        );
+        let requests = fixture.await.expect("ambiguous fixture should finish");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
     fn list_versions(versions: &[(&str, &str)], delete_markers: &[(&str, &str)], is_truncated: bool) -> ListVersionsResult {
@@ -921,6 +1034,56 @@ impl WarmBackend for WarmBackendS3 {
 
 #[async_trait::async_trait]
 impl TransitionCandidateReconciler for WarmBackendS3 {
+    async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<super::warm_backend::LegacyTransitionStateProbe, std::io::Error> {
+        use super::warm_backend::LegacyTransitionStateProbe as Probe;
+
+        let initial_versioning = self.remote_bucket_versioning().await?;
+        let candidate = if let Some(version) = remote_version.filter(|version| !version.is_empty()) {
+            validate_remote_version_id(version)?;
+            match self.probe_transition_version(object, version).await? {
+                TransitionCandidateProbe::VersionedPresent(actual) if actual == version => Some(actual),
+                TransitionCandidateProbe::Missing => return Ok(Probe::Missing),
+                _ => return Ok(Probe::Ambiguous),
+            }
+        } else {
+            let remote_object = self.get_dest(object);
+            let mut opts = ListObjectsOptions::default();
+            opts.set("prefix", &remote_object);
+            opts.set("max-keys", "1000");
+            let mut key_marker = String::new();
+            let mut version_marker = String::new();
+            let mut candidates = TransitionCandidateVersions::default();
+            let mut complete = false;
+            // This is one synchronous record inspection, not an unbounded
+            // remote history scan. The caller also bounds the whole probe.
+            for _ in 0..128 {
+                let page = self
+                    .client
+                    .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_marker, "")
+                    .await?;
+                candidates.extend(&remote_object, &page);
+                if candidates.ambiguous {
+                    return Ok(Probe::Ambiguous);
+                }
+                if !page.is_truncated {
+                    complete = true;
+                    break;
+                }
+                advance_version_markers(&mut key_marker, &mut version_marker, &page)?;
+            }
+            if !complete {
+                return Ok(Probe::Ambiguous);
+            }
+            candidates.version_id
+        };
+        let confirmed_versioning = self.remote_bucket_versioning().await?;
+        classify_legacy_transition_state(candidate.as_deref(), initial_versioning, confirmed_versioning)
+    }
+
     async fn probe_transition_candidate_for(
         &self,
         object: &str,
@@ -930,4 +1093,33 @@ impl TransitionCandidateReconciler for WarmBackendS3 {
         self.probe_transition_candidate_identity(object, identity, bucket_versioning)
             .await
     }
+}
+
+fn classify_legacy_transition_state(
+    candidate: Option<&str>,
+    initial: RemoteBucketVersioning,
+    confirmed: RemoteBucketVersioning,
+) -> Result<super::warm_backend::LegacyTransitionStateProbe, std::io::Error> {
+    use super::warm_backend::LegacyTransitionStateProbe as Probe;
+    if initial != confirmed {
+        return Ok(Probe::Ambiguous);
+    }
+    let Some(version) = candidate else {
+        return Ok(Probe::Missing);
+    };
+    if !version.is_empty() {
+        validate_remote_version_id(version)?;
+        if uuid::Uuid::parse_str(version).is_ok_and(|id| id.is_nil()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy tier probe returned a nil version identifier",
+            ));
+        }
+    }
+    Ok(match (confirmed, version) {
+        (RemoteBucketVersioning::Disabled, "" | "null") => Probe::UnversionedPresent,
+        (RemoteBucketVersioning::Disabled, _) | (_, "") => Probe::Ambiguous,
+        (_, "null") => Probe::SuspendedNullPresent,
+        (_, version) => Probe::VersionedPresent(version.to_string()),
+    })
 }

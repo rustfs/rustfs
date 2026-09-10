@@ -238,6 +238,28 @@ DEPLOY_MODE=existing \
   ./scripts/s3-tests/run.sh
 ```
 
+### KMS Test Fixtures
+
+Managed deployments enable local KMS and provision two distinct public test keys.
+`S3_KMS_KEY_ID` selects the primary key (default `rustfs-s3tests-default-key`), and
+`S3_KMS_SECONDARY_KEY_ID` selects the second key (default
+`rustfs-s3tests-secondary-key`). Their IDs and key material differ so encrypted
+copy tests exercise a change of key. The generated config sets `kms_keyid` and
+`kms_keyid2` explicitly.
+
+`S3_KMS_DEFAULT_KEY_ID` defaults to the primary key for managed local KMS. Set it
+to an empty value to start without a default key. The generated
+`kms_default_keyid` setting fixes the expectation for an SSE-KMS PUT without a
+key ID: with a configured default, the patched upstream test requires a
+successful PUT, HEAD and GET with that key ID and matching object contents;
+without one, the request must fail. The test remains in the implemented gate.
+
+For `DEPLOY_MODE=existing`, the harness does not provision keys or infer the
+server's default. Set both key IDs to keys that already exist, and set
+`S3_KMS_DEFAULT_KEY_ID` only when the target has a default. Custom config
+templates should include `kms_keyid`, `kms_keyid2`, and `kms_default_keyid`, or
+the commented placeholders from the bundled template.
+
 ### Custom Configuration Files
 
 ```bash

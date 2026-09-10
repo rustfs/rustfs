@@ -689,7 +689,11 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                );
                 Ok::<_, ApiError>(obj_info)
             }
         });
@@ -729,7 +733,11 @@ impl DefaultObjectUsecase {
             )
             .await
             .map_err(ApiError::from)?;
-        rustfs_scanner::record_dirty_usage_bucket(bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            bucket,
+            key,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+        );
         Ok(())
     }
 }

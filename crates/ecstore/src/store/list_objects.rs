@@ -164,6 +164,16 @@ pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     max_keys
 }
 
+fn list_versions_scan_limit(max_keys: i32, has_version_marker: bool) -> i32 {
+    if max_keys <= 0 {
+        return 0;
+    }
+
+    // The marker object's versions may all be filtered out after gathering.
+    // Reserve its raw entry in addition to the next-page lookahead entry.
+    max_keys_plus_one(max_keys, true) + i32::from(has_version_marker)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum GatherResultsState {
     LimitReached,
@@ -2139,15 +2149,19 @@ fn build_list_versions_next_marker(
         // here; advertise it as the literal `null` marker so a resumed listing
         // parses it back to `VersionMarker::Null` instead of a nil UUID that
         // `find_version_index` can never match (issue #6745).
-        (
-            Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)),
+        let version_marker = if last.is_dir && last.mod_time.is_none() {
+            // A CommonPrefix has no version to resume; a version marker would
+            // make the next page include this same prefix again.
+            None
+        } else {
             Some(
                 last.version_id
                     .filter(|v| !v.is_nil())
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "null".to_string()),
-            ),
-        )
+            )
+        };
+        (Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)), version_marker)
     } else if let Some(last_prefix) = prefixes.last() {
         (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
     } else {
@@ -2864,6 +2878,20 @@ fn listing_entries_supplement_target(
 ) -> Option<String> {
     if !enforce_write_quorum {
         return None;
+    }
+
+    if let Some(directory) = entries.0.iter().flatten().find(|entry| entry.is_dir()) {
+        let directory_copies = entries
+            .0
+            .iter()
+            .flatten()
+            .filter(|entry| entry.is_dir() && entry.name == directory.name)
+            .count();
+        // A committed child may have some of its directory copies only on
+        // fallback disks, just like object metadata in a partial primary sample.
+        if directory_copies < resolver.dir_quorum {
+            return Some(directory.name.clone());
+        }
     }
 
     for (idx, entry) in entries.0.iter().enumerate() {
@@ -4018,8 +4046,7 @@ impl ECStore {
             None
         };
 
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        // Always request max_keys + 1 to detect if there are more results
+        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
@@ -5325,7 +5352,7 @@ impl Sets {
             None
         };
 
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
@@ -6034,7 +6061,7 @@ impl SetDisks {
 
         let has_version_marker = version_marker.is_some();
         let version_marker = version_marker.map(parse_version_marker).transpose()?;
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
@@ -6248,7 +6275,7 @@ impl SetDisks {
             None
         };
 
-        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
@@ -7439,6 +7466,153 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::LimitReached);
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn list_versions_pagination_scan_limit_boundaries() {
+        for has_version_marker in [false, true] {
+            assert_eq!(super::list_versions_scan_limit(-1, has_version_marker), 0);
+            assert_eq!(super::list_versions_scan_limit(0, has_version_marker), 0);
+            let marker_slot = i32::from(has_version_marker);
+            assert_eq!(super::list_versions_scan_limit(1, has_version_marker), 2 + marker_slot);
+            assert_eq!(super::list_versions_scan_limit(MAX_OBJECT_LIST, has_version_marker), 1001 + marker_slot);
+            assert_eq!(super::list_versions_scan_limit(i32::MAX, has_version_marker), 1001 + marker_slot);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_versions_pagination_does_not_require_an_empty_final_page() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "version-pagination-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("pagination bucket should be created");
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+
+        for kind in ["objects", "deletes", "null", "mixed", "delimiter"] {
+            let count = if kind == "mixed" { 5 } else { 10 };
+            let mut expected = Vec::new();
+            for index in 0..count {
+                let name = if kind == "delimiter" && index % 2 == 1 {
+                    format!("{kind}/testobject-{index:02}/child")
+                } else {
+                    format!("{kind}/testobject-{index:02}")
+                };
+                let entry = match kind {
+                    "deletes" => test_delete_marker_meta_entry(&name, mod_time),
+                    "null" => test_object_meta_entry(&name),
+                    "mixed" => test_object_with_delete_marker_meta_entry(&name, mod_time, mod_time + time::Duration::SECOND),
+                    _ => test_object_meta_entry_with_erasure_versions(&name, &[(mod_time, "etag", 2, 2)]),
+                };
+                for dir in &dirs {
+                    let object_dir = dir.path().join(bucket).join(&name);
+                    tokio::fs::create_dir_all(&object_dir)
+                        .await
+                        .expect("pagination object directory should be created");
+                    tokio::fs::write(object_dir.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                        .await
+                        .expect("pagination metadata should be written");
+                }
+                if kind == "delimiter" && index % 2 == 1 {
+                    expected.push((name.trim_end_matches("child").to_owned(), None, false));
+                } else {
+                    let versions = entry.file_info_versions(bucket).expect("fixture versions should decode");
+                    expected.extend(
+                        versions
+                            .versions
+                            .iter()
+                            .map(|version| (name.clone(), version.version_id, version.deleted)),
+                    );
+                }
+            }
+            let prefix = format!("{kind}/");
+            let delimiter = (kind == "delimiter").then(|| "/".to_owned());
+            // Exercise each public/internal entry point with the reported page size.
+            // The store entry point also covers exact and one-over limit boundaries.
+            for (layer, max_keys) in [(0, 0), (0, 1), (0, 5), (0, 9), (0, 10), (0, 11), (1, 5), (2, 5), (3, 5)] {
+                if layer == 3 && delimiter.is_some() {
+                    continue;
+                }
+                let mut marker = None;
+                let mut version_marker = None;
+                let expected_pages = if max_keys == 0 {
+                    1
+                } else {
+                    10usize.div_ceil(usize::try_from(max_keys).expect("positive page size"))
+                };
+                let mut actual = Vec::new();
+                for page in 0..expected_pages {
+                    let result = match layer {
+                        0 => {
+                            store
+                                .clone()
+                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
+                                .await
+                        }
+                        1 => {
+                            store.pools[0]
+                                .clone()
+                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
+                                .await
+                        }
+                        2 => {
+                            store.pools[0].disk_set[0]
+                                .clone()
+                                .inner_list_object_versions(bucket, &prefix, marker, version_marker, delimiter.clone(), max_keys)
+                                .await
+                        }
+                        _ => {
+                            store.pools[0].disk_set[0]
+                                .clone()
+                                .inner_list_object_versions_for_recursive_delete(
+                                    bucket,
+                                    &prefix,
+                                    marker,
+                                    version_marker,
+                                    max_keys,
+                                )
+                                .await
+                        }
+                    }
+                    .expect("version page should list successfully");
+                    let page_size = usize::try_from(max_keys).expect("nonnegative page size");
+                    assert_eq!(result.objects.len() + result.prefixes.len(), (10 - page * page_size).min(page_size));
+                    let has_more = page + 1 < expected_pages;
+                    assert_eq!(result.is_truncated, has_more, "{kind}, layer {layer}, max_keys {max_keys}, page {page}");
+                    assert_eq!(
+                        result.next_marker.is_some(),
+                        has_more,
+                        "key marker must exist only when another page exists"
+                    );
+                    if !has_more {
+                        assert!(
+                            result.next_version_idmarker.is_none(),
+                            "the final page must not advertise a version marker"
+                        );
+                    }
+                    actual.extend(
+                        result
+                            .objects
+                            .into_iter()
+                            .map(|object| (object.name, object.version_id, object.delete_marker)),
+                    );
+                    actual.extend(result.prefixes.into_iter().map(|prefix| (prefix, None, false)));
+                    marker = result.next_marker;
+                    version_marker = result.next_version_idmarker;
+                }
+                // Objects and CommonPrefixes are serialized separately; compare their
+                // identities without relying on their relative position in the response.
+                actual.sort();
+                let mut expected = if max_keys == 0 { Vec::new() } else { expected.clone() };
+                expected.sort();
+                assert_eq!(actual, expected, "{kind}, layer {layer}, max_keys {max_keys}");
+            }
+        }
     }
 
     #[test]
@@ -9446,6 +9620,71 @@ mod test {
             .await
             .expect("the supplemented sample should resolve the committed delete marker");
         assert!(supplemented.is_latest_delete_marker());
+    }
+
+    #[tokio::test]
+    async fn latest_listing_supplement_checks_fallback_disks_for_common_prefix_quorum() {
+        let mut fallback_disks = Vec::new();
+        let mut fallback_tempdirs = Vec::new();
+        for index in 0..4 {
+            let tempdir = tempfile::tempdir().expect("fallback tempdir should be created");
+            let endpoint = Endpoint::try_from(tempdir.path().to_str().expect("fallback path should be utf8"))
+                .expect("fallback endpoint should parse");
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("fallback disk should be created");
+            disk.make_volume("bucket").await.expect("fallback bucket should be created");
+            for copies in [3, 4] {
+                if index < copies {
+                    let object = format!("quux-{copies}/thud");
+                    let entry = test_object_meta_entry(&object);
+                    disk.write_all("bucket", &format!("{object}/{STORAGE_FORMAT_FILE}"), bytes::Bytes::from(entry.metadata))
+                        .await
+                        .expect("fallback child metadata should be written");
+                }
+            }
+            fallback_disks.push(disk);
+            fallback_tempdirs.push(tempdir);
+        }
+        let supplement = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: "bucket".to_owned(),
+                path: String::new(),
+                recursive: false,
+                incl_deleted: false,
+                skip_hidden_prefix_check: false,
+                filter_prefix: None,
+                forward_to: None,
+                per_disk_limit: 100,
+                skip_total_timeout: true,
+                walkdir_timeout: None,
+                walkdir_stall_timeout: None,
+            },
+            Arc::new(fallback_disks),
+            FallbackClaimTracker::default(),
+        );
+        // A 16-drive EC:4 set asks 12 primary disks. A committed write may
+        // exist on eight primary disks and all four remaining fallback disks.
+        let resolver = list_metadata_resolution_params("bucket".to_owned(), 4, 12, false, 0);
+        for fallback_copies in [3, 4] {
+            let prefix = format!("quux-{fallback_copies}/");
+            let mut primary = vec![Some(test_dir_meta_entry(&prefix)); 8];
+            primary.extend([None, None, None, None]);
+            let entry =
+                resolve_listing_entries_with_supplement(MetaCacheEntries(primary), resolver.clone(), true, supplement.clone())
+                    .await;
+            assert_eq!(
+                entry.map(|entry| entry.name),
+                (fallback_copies == 4).then_some(prefix),
+                "the common prefix needs all twelve copies, including fallback disks"
+            );
+        }
     }
 
     #[test]

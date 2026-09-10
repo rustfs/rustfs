@@ -41,6 +41,12 @@ pub(crate) mod ecstore_cluster {
     };
 }
 
+/// Deployment topology. The KMS configure path needs it to tell an operator
+/// that a node-local backend cannot serve a multi-node deployment.
+pub(crate) mod ecstore_topology {
+    pub(crate) use crate::storage::storage_api::is_dist_erasure;
+}
+
 mod ecstore_config {
     pub(crate) use crate::storage::storage_api::ecstore_config::{com, init, storageclass};
 }
@@ -224,6 +230,10 @@ pub(crate) mod lifecycle {
         manual_transition_scope_admission_lease_expired, persist_manual_transition_job_progress_if_owned,
         renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel, save_manual_transition_job_record,
         update_manual_transition_job_record,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::legacy_transition_state_reconcile::{
+        LegacyTransitionStateReconcileError, LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse,
+        LegacyTransitionStateReconcileSelector,
     };
     pub(crate) type ManualTransitionCancelCheck =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionCancelCheck;

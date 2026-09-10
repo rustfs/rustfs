@@ -770,9 +770,43 @@ impl ECStore {
         Ok(())
     }
 
+    /// Prove a live bucket generation before repairing missing expansion volumes.
+    /// Unlike request validation, repair only needs one erasure set to confirm
+    /// existence; an incomplete expansion set is precisely what repair fixes.
+    /// Callers must hold the bucket namespace lock through the subsequent heal.
+    pub(crate) async fn bucket_exists_for_heal(&self, bucket: &str) -> Result<bool> {
+        let results = futures::future::join_all(
+            self.bucket_sets()
+                .map(|(_, _, set)| async move { set.get_bucket_info(bucket, &BucketOptions::default()).await }),
+        )
+        .await;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(_) => return Ok(true),
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(false),
+        }
+    }
+
     #[instrument(skip(self))]
     pub(crate) async fn get_bucket_info_from_sets(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Write)
+            .await
+    }
+
+    pub(crate) async fn get_bucket_info_from_sets_at_read_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+    ) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
             .await
     }
 
@@ -2105,6 +2139,98 @@ mod tests {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .expect("metadata initialization should recreate the bucket volume in the new pool");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_repairs_half_created_expansion_pool() {
+        // Check both pool orders: an incomplete set must not hide a later
+        // complete set, and a complete set must not weaken request validation.
+        for complete_pool in 0..2 {
+            let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+            let bucket = format!("partial-expansion-{}", Uuid::new_v4().simple());
+            for pool_index in 0..2 {
+                let present_disks = if pool_index == complete_pool { 4 } else { 2 };
+                for disk_index in 0..present_disks {
+                    tokio::fs::create_dir(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket),
+                    )
+                    .await
+                    .expect("fixture bucket volume should be created");
+                }
+            }
+            assert_eq!(
+                ecstore
+                    .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("request validation must reject a half-created expansion set"),
+                StorageError::ErasureWriteQuorum
+            );
+
+            metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+            for pool_index in 0..2 {
+                for disk_index in 0..4 {
+                    assert!(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket)
+                            .is_dir(),
+                        "metadata initialization must heal every missing expansion volume"
+                    );
+                }
+            }
+            ecstore
+                .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                .await
+                .expect("strict request validation should succeed after volume repair");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_does_not_combine_partial_set_evidence() {
+        let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("no-quorum-expansion-{}", Uuid::new_v4().simple());
+        for pool_index in 0..2 {
+            for disk_index in 0..2 {
+                tokio::fs::create_dir(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket),
+                )
+                .await
+                .expect("fixture bucket volume should be created");
+            }
+        }
+        assert_eq!(
+            ecstore
+                .bucket_exists_for_heal(&bucket)
+                .await
+                .expect_err("repair must require a complete quorum within one set"),
+            StorageError::ErasureWriteQuorum
+        );
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        for pool_index in 0..2 {
+            for disk_index in 0..4 {
+                assert_eq!(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket)
+                        .is_dir(),
+                    disk_index < 2,
+                    "unproven bucket generations must not recreate missing volumes"
+                );
+            }
+        }
     }
 
     #[tokio::test]

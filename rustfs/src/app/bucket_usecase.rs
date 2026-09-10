@@ -1389,7 +1389,10 @@ impl DefaultBucketUsecase {
         counter!("rustfs_create_bucket_total").increment(1);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
         result
     }
 
@@ -1781,7 +1784,10 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
@@ -2698,7 +2704,10 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
         Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
@@ -2733,7 +2742,10 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
