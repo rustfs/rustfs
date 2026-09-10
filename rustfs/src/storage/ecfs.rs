@@ -730,7 +730,11 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            &bucket,
+            &object,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
+        );
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
@@ -1629,7 +1633,11 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            &bucket,
+            &key,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
+        );
         result
     }
 
@@ -1733,7 +1741,10 @@ impl S3 for FS {
             );
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -1849,7 +1860,11 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            &bucket,
+            &key,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
+        );
         result
     }
 
@@ -1959,7 +1974,11 @@ impl S3 for FS {
             version_id: req.input.version_id.clone(),
         }));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            &bucket,
+            &object,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
+        );
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result

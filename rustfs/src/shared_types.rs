@@ -45,6 +45,7 @@ pub enum ReadinessDegradedReason {
     ObjectWriteStalled,
     PoolMetaWriteBlocked,
     PoolMetadataCheckTimeout,
+    StorageReadinessCheckTimeout,
     ClusterHealthTimeout,
     PeerHealthUnavailable,
     StartupFinalizationPending,
@@ -65,6 +66,7 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::ObjectWriteStalled => "object_write_stalled",
             ReadinessDegradedReason::PoolMetaWriteBlocked => "pool_meta_write_blocked",
             ReadinessDegradedReason::PoolMetadataCheckTimeout => "pool_metadata_check_timeout",
+            ReadinessDegradedReason::StorageReadinessCheckTimeout => "storage_readiness_check_timeout",
             ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
             ReadinessDegradedReason::PeerHealthUnavailable => "peer_health_unavailable",
             ReadinessDegradedReason::StartupFinalizationPending => "startup_finalization_pending",
@@ -80,6 +82,14 @@ impl ReadinessDegradedReason {
 pub struct DependencyReadinessReport {
     pub readiness: DependencyReadiness,
     pub degraded_reasons: Vec<ReadinessDegradedReason>,
+    pub storage_details: Option<StorageReadinessDetails>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageReadinessDetails {
+    pub read_quorum_ready: bool,
+    pub write_quorum_ready: bool,
+    pub pool_metadata_write_ready: bool,
 }
 
 pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyObjectInfo {

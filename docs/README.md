@@ -21,3 +21,6 @@ operators should start with:
 Other runbooks remain grouped by filename in [`operations/`](operations/);
 architecture pages link to the relevant runbook where a cross-boundary
 procedure is required.
+
+For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
+drive ownership, snapshot freshness, counter queries, and rolling upgrades.

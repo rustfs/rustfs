@@ -475,6 +475,8 @@ pub(crate) mod ecstore_disk {
         RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -952,6 +954,25 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
 }
 
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
+    let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
+    let mutation_journal = durable_dirty_usage_journal.clone();
+    rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+        mutation_journal.record_committed_mutation(bucket, object, producer);
+    })));
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
+        let producer = match source {
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
+            }
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
+            }
+        };
+        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
+    })));
+    rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
+        durable_dirty_usage_journal.clear_confirmed_buckets(cleared);
+    })));
     ecstore_bucket::replication::init_background_replication(store).await;
 }
 

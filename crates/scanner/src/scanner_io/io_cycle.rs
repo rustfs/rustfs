@@ -122,6 +122,7 @@ where
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
+        distributed_segment_invalidation_evidence: None,
     };
     if resolution.requires_full_scan {
         return default_result(ScannerBucketScanScope::default());
@@ -189,7 +190,7 @@ where
         };
         let remote_resolution = resolve_remote_dirty_usage_scope(
             resolution.requested_scope,
-            dirty_buckets,
+            resolution.dirty_usage_snapshot,
             remote_dirty_usage,
             resolution.all_buckets,
             resolution.baseline_proof,
@@ -240,12 +241,17 @@ where
         return remote_resolution;
     }
 
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        resolution.dirty_usage_snapshot,
+        distributed,
+        resolution.baseline_proof,
+    );
     default_result(scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
         (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
         true,
-        scanner_segment_reuse_activated(),
+        segment_reuse_activation_preflight.scanner_segment_reuse_activated,
         resolution.all_buckets,
         resolution.baseline_proof,
     ))
@@ -408,7 +414,9 @@ where
     )
     .await;
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
+    let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
+    let segment_invalidation_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot).segment_invalidation_proof();
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
         let _ = observer.send(scan_scope.clone());
@@ -465,12 +473,20 @@ where
         } else {
             Vec::new()
         };
+        let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+            &dirty_usage_snapshot,
+            dirty_usage_producer_evidence(&dirty_usage_snapshot),
+            distributed,
+            None,
+            false,
+        );
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
             .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+            .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
             .with_publication_expectation(publication_expectation));
     }
 
@@ -495,6 +511,7 @@ where
     );
     let bucket_failures = ScannerBucketFailureState::default();
     let pending_maintenance_work = Arc::new(AtomicBool::new(false));
+    let cold_zero_walk_reuse_observed = Arc::new(AtomicBool::new(false));
     record_set_scan_concurrency_limit(set_scan_limit);
     debug!(
         target: "rustfs::scanner::io",
@@ -588,6 +605,8 @@ where
             bucket_failures: bucket_failures.clone(),
             pending_maintenance_work: pending_maintenance_work.clone(),
             cache_cycle_floor: cache_cycle_floor.clone(),
+            cold_zero_walk_reuse_observed: cold_zero_walk_reuse_observed.clone(),
+            segment_invalidation_proof: segment_invalidation_proof.clone(),
         };
         // Spawn task to run the scanner
         let scanner_fut = tokio::spawn(async move {
@@ -691,6 +710,21 @@ where
         scan_scope_matches && !partial_buckets.is_empty(),
         scan_scope_matches && !namespace_not_found_buckets.is_empty(),
     );
+    let cold_zero_walk_oracle = scanner_cycle_cold_zero_walk_oracle(
+        &scan_scope,
+        &all_buckets,
+        completed_all_sets,
+        scan_scope_matches,
+        bucket_scan_status,
+        cold_zero_walk_reuse_observed.load(Ordering::Acquire),
+    );
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources),
+        distributed,
+        distributed_segment_invalidation_evidence,
+        cold_zero_walk_oracle,
+    );
     let pending_maintenance_work = pending_maintenance_work_for_cycle(&pending_maintenance_work, &results);
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
     let required_cycle_floor = (observed_cycle_floor > want_cycle).then_some(observed_cycle_floor);
@@ -783,6 +817,8 @@ where
         .with_observational_snapshot_published(observational_snapshot_published)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+        .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)
+        .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
         .with_required_cycle_floor(required_cycle_floor)

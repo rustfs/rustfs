@@ -211,6 +211,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageQuorumUnavailable],
+            storage_details: None,
         };
         let parts = build_health_response_parts(
             Method::GET,
@@ -233,6 +234,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
+            storage_details: None,
         };
         let parts = build_health_response_parts(
             Method::GET,
@@ -255,6 +257,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageAndIamUnavailable],
+            storage_details: None,
         };
         let parts = build_health_response_parts(
             Method::GET,
@@ -284,6 +287,7 @@ mod tests {
                     peer_health_ready: true,
                 },
                 degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::LockQuorumUnavailable],
+                storage_details: None,
             };
 
             let liveness = build_health_response_parts(
@@ -328,6 +332,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageAndIamUnavailable],
+            storage_details: None,
         };
         let parts = build_health_response_parts(
             Method::HEAD,
@@ -398,6 +403,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
+            storage_details: None,
         };
         let parts =
             build_health_response_parts(Method::HEAD, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
@@ -417,6 +423,7 @@ mod tests {
                     peer_health_ready: true,
                 },
                 degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageQuorumUnavailable],
+                storage_details: None,
             };
             let parts =
                 build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
@@ -440,6 +447,7 @@ mod tests {
                     peer_health_ready: true,
                 },
                 degraded_reasons: Vec::new(),
+                storage_details: None,
             };
             let parts = build_health_response_parts(
                 Method::GET,

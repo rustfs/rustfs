@@ -285,6 +285,20 @@ fn peer_replay_state(audience: &str) -> PeerReplayState {
         .unwrap_or_default()
 }
 
+pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()> {
+    let uri = addr
+        .parse::<Uri>()
+        .map_err(|_| std::io::Error::other("Invalid gRPC peer URI"))?;
+    let audience = uri
+        .authority()
+        .map(|authority| normalize_tonic_rpc_audience(authority.as_str()))
+        .ok_or_else(|| std::io::Error::other("Missing gRPC peer authority"))??;
+    if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
+        states.remove(&audience);
+    }
+    Ok(())
+}
+
 fn apply_peer_replay_response(
     audience: String,
     sent_state: PeerReplayState,
@@ -617,6 +631,13 @@ mod tests {
             .lock()
             .expect("peer capability cache lock must not be poisoned")
             .remove(audience);
+    }
+
+    fn set_peer_capability(audience: &str, state: PeerReplayState) {
+        PEER_REPLAY_STATES
+            .lock()
+            .expect("peer capability cache lock must not be poisoned")
+            .insert(audience.to_string(), state);
     }
 
     fn rolling_mutation_request(method: &'static str) -> tonic::Request<()> {
@@ -1088,6 +1109,23 @@ mod tests {
             "a stale dynamic-cache proof must not cross a newer authenticated boot epoch"
         );
         clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn clear_peer_replay_state_for_addr_removes_normalized_audience() {
+        let audience = "clear-peer-replay-state-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        set_peer_capability(
+            audience,
+            PeerReplayState {
+                boot_epoch: Some(boot_epoch),
+                cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+            },
+        );
+
+        clear_peer_replay_state_for_addr("http://clear-peer-replay-state-test:9000").expect("peer URI should clear replay state");
+
+        assert_eq!(peer_replay_state(audience), PeerReplayState::default());
     }
 
     #[test]

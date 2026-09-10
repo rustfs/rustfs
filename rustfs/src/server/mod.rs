@@ -27,6 +27,7 @@ mod readiness;
 mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
+mod ssec_transport;
 pub mod tls_material;
 
 use tracing::warn;
@@ -71,7 +72,7 @@ pub(crate) use prefix::{
     HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX,
     MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH,
     PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX,
-    VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
+    VERSION, console_prefix, has_path_prefix, init_console_prefix, is_admin_path, is_table_catalog_path,
 };
 pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;

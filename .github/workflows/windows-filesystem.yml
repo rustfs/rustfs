@@ -16,7 +16,7 @@ name: Windows Filesystem Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release ]
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
@@ -26,7 +26,7 @@ on:
       - ".github/actions/setup/**"
       - ".github/workflows/windows-filesystem.yml"
   pull_request:
-    branches: [ main ]
+    branches: [ main, release ]
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"

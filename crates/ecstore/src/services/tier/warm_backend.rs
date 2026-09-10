@@ -89,6 +89,18 @@ pub enum TransitionCandidateProbe {
     Unsupported,
 }
 
+/// Live evidence for repairing legacy metadata. Ordinary candidate GETs do not
+/// establish the bucket's versioning model and cannot supply this authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyTransitionStateProbe {
+    Missing,
+    UnversionedPresent,
+    SuspendedNullPresent,
+    VersionedPresent(String),
+    Ambiguous,
+    Unsupported,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TransitionCandidateIdentity {
     pub transaction_id: uuid::Uuid,
@@ -97,6 +109,14 @@ pub(crate) struct TransitionCandidateIdentity {
 
 #[async_trait::async_trait]
 pub(crate) trait TransitionCandidateReconciler {
+    async fn probe_legacy_transition_state(
+        &self,
+        _object: &str,
+        _remote_version: Option<&str>,
+    ) -> Result<LegacyTransitionStateProbe, std::io::Error> {
+        Ok(LegacyTransitionStateProbe::Unsupported)
+    }
+
     async fn probe_transition_candidate_for(
         &self,
         object: &str,
@@ -106,6 +126,14 @@ pub(crate) trait TransitionCandidateReconciler {
 
 #[async_trait::async_trait]
 pub trait WarmBackend {
+    async fn probe_legacy_metadata(
+        &self,
+        _object: &str,
+        _remote_version: Option<&str>,
+    ) -> Result<LegacyTransitionStateProbe, std::io::Error> {
+        Ok(LegacyTransitionStateProbe::Unsupported)
+    }
+
     async fn validate(&self) -> Result<(), std::io::Error> {
         Ok(())
     }
@@ -448,6 +476,18 @@ impl MeteredWarmBackend {
 
 #[async_trait::async_trait]
 impl WarmBackend for MeteredWarmBackend {
+    async fn probe_legacy_metadata(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<LegacyTransitionStateProbe, std::io::Error> {
+        let result = self.inner.probe_legacy_metadata(object, remote_version).await;
+        if matches!(result, Ok(LegacyTransitionStateProbe::Unsupported)) {
+            return result;
+        }
+        Self::record(TierRequestOperation::Probe, result)
+    }
+
     /// Delegated without a counter: only one backend issues a remote request
     /// here, and every other one takes the trait default, so a `validate`
     /// counter would mostly record requests that never happened.
@@ -524,6 +564,18 @@ struct MeteredTransitionCandidateReconciler {
 
 #[async_trait::async_trait]
 impl TransitionCandidateReconciler for MeteredTransitionCandidateReconciler {
+    async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<LegacyTransitionStateProbe, std::io::Error> {
+        let result = self.inner.probe_legacy_transition_state(object, remote_version).await;
+        if matches!(result, Ok(LegacyTransitionStateProbe::Unsupported)) {
+            return result;
+        }
+        MeteredWarmBackend::record(TierRequestOperation::Probe, result)
+    }
+
     async fn probe_transition_candidate_for(
         &self,
         object: &str,

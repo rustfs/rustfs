@@ -15,6 +15,7 @@
 // #730: data-movement migration keeps staged cleanup helpers until copy paths converge.
 
 pub(crate) mod backpressure;
+pub(crate) mod scanner_backlog;
 
 use crate::core::pools::{DecommissionCapacityOwner, decommission_capacity_mutation_id};
 use crate::error::{
@@ -984,24 +985,6 @@ fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: 
             .is_some_and(|(source_time, target_time)| target_time > source_time)
 }
 
-fn is_equivalent_scanner_backlog_replica(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
-    // Scanner publishes this exact payload to surviving sets with CAS. Each
-    // set assigns its own write time; that timestamp is not a ledger generation.
-    // Accept only an identical, known unversioned identity, never a different
-    // record based on timestamp ordering or a similarly named user object.
-    source.bucket == crate::disk::RUSTFS_META_BUCKET
-        && target.bucket == source.bucket
-        && source.name == "buckets/.scanner-pause-backlog.json"
-        && target.name == source.name
-        && is_unversioned_data_movement_object(source)
-        && is_unversioned_data_movement_object(target)
-        && !source.delete_marker
-        && source.mod_time.is_some()
-        && target.mod_time.is_some()
-        && source.etag.as_ref().is_some_and(|etag| !etag.is_empty())
-        && is_equivalent_data_movement_object_identity(source, target, false, compare_part_checksums)
-}
-
 fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
     let identity = data_movement_upload_identity(source);
     source.mod_time.is_some()
@@ -1217,7 +1200,7 @@ struct SourceCleanupDeleteBarrierState {
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
 )]
-pub(crate) struct SourceCleanupDeleteBarrier {
+pub struct SourceCleanupDeleteBarrier {
     state: Arc<SourceCleanupDeleteBarrierState>,
 }
 
@@ -1231,7 +1214,7 @@ static SOURCE_CLEANUP_DELETE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<Vec<
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
 )]
 impl SourceCleanupDeleteBarrier {
-    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+    pub fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(SourceCleanupDeleteBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
@@ -1254,7 +1237,7 @@ impl SourceCleanupDeleteBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("source cleanup should reach the pre-delete barrier");
@@ -1270,7 +1253,7 @@ impl SourceCleanupDeleteBarrier {
         self.state.is_paused.load(Ordering::Acquire)
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
     }
 }
@@ -1449,7 +1432,8 @@ fn resolve_data_movement_overwrite_resume_result_for(
     target_pool_idx: usize,
     compare_part_checksums: bool,
 ) -> Result<bool> {
-    if !should_check_data_movement_overwrite_resume(err)
+    if scanner_backlog::is_scanner_pause_backlog(&source.bucket, &source.name)
+        || !should_check_data_movement_overwrite_resume(err)
         || !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx)
     {
         return Ok(false);
@@ -1471,9 +1455,7 @@ fn resolve_data_movement_overwrite_resume_result_for(
         return Ok(true);
     }
 
-    Ok(matches!(err, Error::PreconditionFailed)
-        && (is_equivalent_scanner_backlog_replica(source, &target, compare_part_checksums)
-            || is_superseding_unversioned_data_movement_object(source, &target)))
+    Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
 }
 
 #[derive(Clone, Copy)]
@@ -1521,9 +1503,27 @@ fn data_movement_part_stage_error(
     bucket: &str,
     object: &str,
     part_number: usize,
-    err: impl std::fmt::Display,
+    err: Error,
 ) -> Error {
-    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}"))
+    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}");
+    if matches!(&err, Error::DecommissionCapacityBlocked { .. }) {
+        return data_movement_context_error(rendered, err);
+    }
+    // A missing target part is not evidence that the source can be deleted.
+    // Keep other part errors opaque to the source-cleanup classifiers.
+    Error::other(rendered)
+}
+
+#[cfg(test)]
+pub(crate) fn data_movement_part_stage_error_for_test(
+    op_label: &str,
+    stage: &str,
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    err: Error,
+) -> Error {
+    data_movement_part_stage_error(op_label, stage, bucket, object, part_number, err)
 }
 
 fn is_data_movement_part_read_error(err: &Error) -> bool {
@@ -1628,6 +1628,9 @@ async fn migrate_object_inner(
     capacity_owner: Option<DecommissionCapacityOwner>,
     mutation_fence: Option<DecommissionFixedReadAnchor>,
 ) -> Result<()> {
+    if scanner_backlog::is_scanner_pause_backlog(&bucket, &rd.object_info.name) {
+        return Err(Error::other("scanner pause backlog requires native retirement handoff"));
+    }
     let mut mutation_fence = mutation_fence;
     let object_info = rd.object_info.clone();
     let capacity_owner = capacity_owner.map(|owner| {
@@ -2428,8 +2431,15 @@ mod tests {
         let err =
             data_movement_part_stage_error("rebalance_object", "put_object_part", "bucket-a", "object-a", 7, Error::SlowDown);
         let message = err.to_string();
-        assert!(message.contains("rebalance_object: put_object_part failed for bucket-a/object-a part 7"));
-        assert!(message.contains(Error::SlowDown.to_string().as_str()));
+        assert_eq!(
+            message,
+            Error::other(format!(
+                "rebalance_object: put_object_part failed for bucket-a/object-a part 7: {}",
+                Error::SlowDown
+            ))
+            .to_string()
+        );
+        assert!(data_movement_stage_source(&err).is_none());
     }
 
     #[test]
@@ -3329,14 +3339,23 @@ mod tests {
     }
 
     #[test]
-    fn test_scanner_backlog_resume_accepts_identical_native_replica_with_older_write_time() {
+    fn test_scanner_backlog_resume_requires_native_cohort_proof_even_for_identical_payload() {
         let (source, target) = scanner_backlog_replica_pair();
         assert!(!is_owned_data_movement_target(&target), "native scanner writes are not migration copies");
         assert!(!is_equivalent_data_movement_object(&source, &target));
         assert!(
-            scanner_backlog_precondition_resumes(&source, target),
-            "identical ledger payloads have replica-local write times, not distinct committed generations"
+            !scanner_backlog_precondition_resumes(&source, target),
+            "a single identical replica cannot prove native cohort authority"
         );
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_newer_timestamp_and_full_single_replica_identity() {
+        let (source, mut target) = scanner_backlog_replica_pair();
+        target.mod_time = source.mod_time.map(|time| time + time::Duration::SECOND);
+        target.etag = Some("different-native-ledger".to_string());
+        assert!(!scanner_backlog_precondition_resumes(&source, target));
+        assert!(!scanner_backlog_precondition_resumes(&source, source.clone()));
     }
 
     #[test]

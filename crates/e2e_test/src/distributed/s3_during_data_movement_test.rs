@@ -14,9 +14,9 @@
 
 use super::harness::{
     DECOMMISSION_POOL_ID, DistCluster, DistLayout, TestResult, assert_inventory, decommission_running_with_progress,
-    decommission_status_json, put_inventory_retrying, rebalance_running_with_progress, rebalance_status_json,
-    retrying_get_equals, retrying_put, start_decommission, start_rebalance, unique_bucket, wait_for_decommission_complete,
-    wait_for_decommission_running_with_progress, wait_for_rebalance_complete, wait_for_rebalance_running_with_progress,
+    decommission_status_json, put_inventory_retrying, rebalance_active, rebalance_status_json, retrying_get_equals, retrying_put,
+    start_decommission, start_rebalance, unique_bucket, wait_for_decommission_complete,
+    wait_for_decommission_running_with_progress, wait_for_rebalance_active, wait_for_rebalance_complete,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -67,7 +67,10 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
     assert_inventory(&live, &bucket, &inventory).await?;
 
     let rebalance_id = start_rebalance(&dist.cluster).await?;
-    wait_for_rebalance_running_with_progress(&dist.cluster, &rebalance_id, Duration::from_secs(30)).await?;
+    // The status API reads persisted progress, whose first periodic save is
+    // after 30 seconds. A shorter run can remain at zero until completion.
+    // Require Started around the S3 operations and nonzero progress at completion.
+    wait_for_rebalance_active(&dist.cluster, &rebalance_id, Duration::from_secs(30)).await?;
     retrying_put(
         &live,
         &bucket,
@@ -84,11 +87,26 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
         Duration::from_secs(30),
     )
     .await?;
+    let listed = live.list_objects_v2().bucket(&bucket).send().await?;
+    assert!(
+        listed
+            .contents()
+            .iter()
+            .any(|object| object.key() == Some("during-rebalance.bin")),
+        "list during rebalance missed the newly written key"
+    );
     let status = rebalance_status_json(&dist.cluster).await?;
-    if !rebalance_running_with_progress(&status, &rebalance_id)? {
+    if !rebalance_active(&status, &rebalance_id)? {
         return Err(format!("rebalance did not remain active across the S3 operations: {status}").into());
     }
     wait_for_rebalance_complete(&dist.cluster, &rebalance_id, Duration::from_secs(180)).await?;
-    assert_inventory(&dist.client(1)?, &bucket, &inventory).await?;
+    let after = dist.client(1)?;
+    assert_inventory(&after, &bucket, &inventory).await?;
+    for (key, body) in [
+        ("during-decommission.bin", b"written-while-decommissioning".as_slice()),
+        ("during-rebalance.bin", b"written-while-rebalancing".as_slice()),
+    ] {
+        retrying_get_equals(&after, &bucket, key, body, Duration::from_secs(30)).await?;
+    }
     Ok(())
 }

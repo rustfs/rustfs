@@ -20,10 +20,10 @@ use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::{HybridBody, is_grpc_request};
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
+    ADMIN_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
     MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
-    build_health_response_parts, collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
+    build_health_response_parts, collect_probe_readiness, console_prefix, has_path_prefix, is_admin_path, is_table_catalog_path,
     kms_probe_staleness_limit, kms_ready_from_probe,
 };
 use crate::shared_types::ReadinessDegradedReason;
@@ -625,7 +625,7 @@ where
             // Create redirect response
             let redirect_response = Response::builder()
                 .status(StatusCode::FOUND)
-                .header(http::header::LOCATION, "/rustfs/console/")
+                .header(http::header::LOCATION, format!("{}/", console_prefix()))
                 .body(HybridBody::Rest {
                     rest_body: RestBody::default(),
                 })
@@ -1861,7 +1861,7 @@ fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
         || has_path_prefix(path, RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, MINIO_ADMIN_V3_PREFIX)
         || is_table_catalog_path(path)
-        || has_path_prefix(path, CONSOLE_PREFIX)
+        || has_path_prefix(path, console_prefix())
         || has_path_prefix(path, RPC_PREFIX)
     {
         return false;
@@ -2242,7 +2242,74 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn console_prefix_process_case_browser_redirect() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("redirect listener");
+        let addr = listener.local_addr().expect("redirect listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("redirect client");
+            let inner = tower::service_fn(|_request: Request<Incoming>| async {
+                Ok::<_, Infallible>(Response::new(HybridBody::<Empty<Bytes>, Empty<Bytes>>::Rest { rest_body: Empty::new() }))
+            });
+            let service = RedirectLayer.layer(inner);
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper_util::service::TowerToHyperService::new(service),
+                )
+                .await
+                .expect("redirect connection");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("redirect client");
+        let response = client
+            .get(format!("http://{addr}/"))
+            .header(http::header::USER_AGENT, "Mozilla/5.0")
+            .header(http::header::CONNECTION, "close")
+            .send()
+            .await
+            .expect("browser response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()[http::header::LOCATION], format!("{}/", console_prefix()));
+        response.bytes().await.expect("redirect body");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("bounded redirect server shutdown")
+            .expect("redirect task");
+    }
+
+    #[test]
+    fn console_prefix_process_case_classification() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = crate::server::console_prefix();
+        let console_uri = format!("{prefix}/index.html").parse().expect("console URI");
+        assert!(is_empty_body_console_path(&Method::GET, &console_uri));
+        let request = HttpRequest::builder()
+            .uri(format!("{prefix}/index.html?attributes"))
+            .body(())
+            .expect("console attributes request");
+        assert!(!is_object_attributes_request(&request));
+        let s3_request = HttpRequest::builder()
+            .uri("/bucket/object?attributes")
+            .body(())
+            .expect("S3 attributes request");
+        assert!(is_object_attributes_request(&s3_request));
+    }
+
     use super::*;
+    use crate::server::CONSOLE_PREFIX;
     use crate::server::compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer};
     use crate::server::{FAVICON_PATH, LICENSE, RemoteAddr, VERSION};
     use futures::future::{Ready, ready};
@@ -2333,7 +2400,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/metrics",
             "/minio/admin/v3/storageinfo",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             "/rustfs/rpc/test",
             "/health/ready",
             "/_iceberg/v1/config",
@@ -2624,7 +2691,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/info",
             "/minio/admin/v3/info",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             HEALTH_PREFIX,
             "/iceberg/v1/config",
             "/rustfs/rpc/v1/read-file",
@@ -3983,7 +4050,7 @@ mod tests {
             "/minio/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/rpc/read_file_stream?versionId=unused",
-            "/rustfs/console/index.html?versionId=unused",
+            &format!("{CONSOLE_PREFIX}/index.html?versionId=unused"),
             "/health?versionId=unused",
             "/health/ready?versionId=unused",
             "/profile/cpu?versionId=unused",

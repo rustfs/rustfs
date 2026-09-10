@@ -814,7 +814,11 @@ impl DefaultObjectUsecase {
                     }
                 }
 
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                );
                 Ok::<_, S3Error>((oi, dest_versioned))
             }
         });

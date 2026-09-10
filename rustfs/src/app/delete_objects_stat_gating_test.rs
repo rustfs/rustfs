@@ -25,7 +25,7 @@
 //!   deletes still inspect legacy or corrupt explicit Object Lock metadata even
 //!   when the bucket configuration is confirmed absent.
 
-use super::gating_test_env::shared_gating_ecstore;
+use super::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
 use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use super::storage_api::test::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::test::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
@@ -351,9 +351,15 @@ async fn malformed_persisted_retention_metadata_blocks_version_delete() {
         .expect("malformed retained object must survive the rejected delete");
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn recursive_force_delete_remains_allowed_for_plain_bucket() {
+fn recursive_force_delete_remains_allowed_for_plain_bucket() {
+    run_large_stack_test("recursive-force-delete-plain-bucket", || async {
+        recursive_force_delete_remains_allowed_for_plain_bucket_case().await;
+    });
+}
+
+async fn recursive_force_delete_remains_allowed_for_plain_bucket_case() {
     let ecstore = shared_gating_ecstore().await;
     let bucket = format!("force-delete-plain-{}", Uuid::new_v4());
 

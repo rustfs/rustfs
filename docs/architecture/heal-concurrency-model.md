@@ -67,6 +67,12 @@ Heal-side invariants that hold regardless of the caller:
 - Read-repair's local TTL reservation dedups only its own source and does not block heals from other sources; the namespace lock is the backstop.
 - The healing flag is never persisted, so there is no reverse risk of a leftover marker making a later commit yield incorrectly.
 
+## Graceful root-heal restart recovery
+
+Before a graceful shutdown cancels administrator cluster-wide heals, the manager saves unfinished requests on one coordinator disk as `.rustfs.sys/root-heal-<task-id>.json`. Startup replays the same task IDs and remaining execution budgets. Completion, cancellation, and replacement by `force_start` retire the record conditionally. An uncertain write or deletion does not create a fallback copy; an unsuccessful handoff retains the unclean-shutdown marker. Invalid or unsupported records remain on disk and defer root recovery without blocking the existing replacement-recovery path.
+
+This handoff covers the same coordinator and storage topology while the record disk remains configured and readable. It does not migrate records when a pool is retired or provide failover after loss of that disk. Older versions do not understand these records; cancellation while downgraded cannot retire a newer version's pending record. If a terminal budget checkpoint cannot be written, the previous record is retained and a warning is logged; the remaining-budget guarantee requires that write to succeed. The format is separate from object metadata and erasure-set checkpoints.
+
 ## Regression tests
 
 Both live in the test module of `crates/ecstore/src/set_disk/ops/heal.rs`:

@@ -95,7 +95,6 @@ fn preflight_startup_rpc_secret_with(
     }
 }
 
-const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
 const LOCAL_DECOMMISSION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 5);
@@ -280,20 +279,26 @@ where
     }
 }
 
+async fn reconcile_local_decommission_after_init(store: &Arc<ECStore>, rx: CancellationToken) -> Result<()> {
+    store
+        .ensure_pool_meta_side_effects_safe("decommission worker recovery blocked while pool metadata requires recovery")
+        .await?;
+    if store.has_active_local_decommission_worker().await {
+        return Ok(());
+    }
+    store.refresh_pool_status_meta().await?;
+    let resume_required = pool_meta_has_active_decommission(&*store.pool_meta.read().await);
+    if resume_required {
+        crate::core::pools::acquire_pool_activation_fleet_proof(&store.ctx).await?;
+    }
+    store.spawn_missing_local_decommission_routines_with_token(rx).await
+}
+
 async fn supervise_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken) {
     run_local_decommission_watchdog(rx.clone(), || {
         let store = store.clone();
         let worker_rx = rx.clone();
-        async move {
-            store
-                .ensure_pool_meta_side_effects_safe("decommission worker recovery blocked while pool metadata requires recovery")
-                .await?;
-            if store.has_active_local_decommission_worker().await {
-                return Ok(());
-            }
-            store.refresh_pool_status_meta().await?;
-            store.spawn_missing_local_decommission_routines_with_token(worker_rx).await
-        }
+        async move { reconcile_local_decommission_after_init(&store, worker_rx).await }
     })
     .await;
 }
@@ -784,14 +789,9 @@ impl ECStore {
             );
         }
         if has_local_decommission_leadership {
-            let store = self.clone();
-            let decommission_rx = rx.clone();
-            tokio::spawn(async move {
-                if !wait_for_local_decommission_resume_delay(&decommission_rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                    return;
-                }
-                supervise_local_decommission_after_init(store, decommission_rx).await;
-            });
+            // The watchdog checks recovery safety and retries transient failures.
+            // Resume persisted work without an unconditional cold-start delay.
+            tokio::spawn(supervise_local_decommission_after_init(self.clone(), rx.clone()));
         }
 
         let recovery_store = self.clone();
@@ -2105,6 +2105,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_local_decommission_watchdog_cancelled_start_does_not_reconcile() {
+        let rx = CancellationToken::new();
+        rx.cancel();
+        run_local_decommission_watchdog(rx, || async {
+            panic!("cancelled startup must not schedule persisted work");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_local_decommission_recovery_waits_for_live_fleet_proof_before_reserving_worker() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        mark_test_pool_decommissioning(&store, 0).await;
+        assert!(store.ctx.is_dist_erasure().await);
+        let worker_rx = CancellationToken::new();
+
+        {
+            let _proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+            let err = super::reconcile_local_decommission_after_init(&store, worker_rx.clone())
+                .await
+                .expect_err("cold distributed recovery must wait for live fleet proof");
+            assert!(
+                crate::core::pools::is_pool_activation_fleet_proof_error(&err),
+                "recovery must reach the live fleet proof gate: {err:?}"
+            );
+            assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+            assert!(pool_meta_has_active_decommission(&*store.pool_meta.read().await));
+        }
+
+        super::reconcile_local_decommission_after_init(&store, worker_rx.clone())
+            .await
+            .expect("restored fleet proof should admit the persisted worker");
+        assert!(store.has_active_local_decommission_worker().await);
+        worker_rx.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_local_decommission_watchdog_retries_general_failures_until_cancelled() {
         let rx = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2115,11 +2153,13 @@ mod tests {
                 let attempts = attempts.clone();
                 let rx = rx.clone();
                 async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Err(StorageError::SlowDown)
-                    } else {
-                        rx.cancel();
-                        Ok(())
+                    match attempts.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(StorageError::other("pool activation requires a live fleet capability proof")),
+                        1 => Err(StorageError::SlowDown),
+                        _ => {
+                            rx.cancel();
+                            Ok(())
+                        }
                     }
                 }
             }
@@ -2128,8 +2168,11 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         tokio::time::advance(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY).await;
-        task.await.expect("watchdog task should exit after cancellation");
+        tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        tokio::time::advance(local_decommission_watchdog_retry_delay(2)).await;
+        task.await.expect("watchdog task should exit after cancellation");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3660,6 +3703,31 @@ mod tests {
                 disk.is_online().await,
                 "the valid disk identity must prevent endpoint renewal while the IO health gate remains offline"
             );
+        }
+        OfflineTestDisks { disks }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn force_set_disk_range_offline_for_test(
+        set: &Arc<crate::set_disk::SetDisks>,
+        range: std::ops::Range<usize>,
+    ) -> OfflineTestDisks {
+        let disks = set
+            .disks
+            .read()
+            .await
+            .get(range)
+            .expect("offline test range must fit the set")
+            .iter()
+            .map(|disk| disk.clone().expect("fault-injection disk should start online"))
+            .collect::<Vec<_>>();
+        for disk in &disks {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        }
+        set.connect_disks().await;
+        for disk in &disks {
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
         }
         OfflineTestDisks { disks }
     }
@@ -12761,6 +12829,422 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn legacy_transition_state_inspection_and_apply_keep_all_disk_copies_unchanged() {
+        run_large_stack_async_test("legacy-state-reconcile-inspection", || {
+            legacy_transition_state_inspection_and_apply_case(false)
+        });
+    }
+
+    #[cfg(feature = "test-util")]
+    #[cfg(not(windows))]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn legacy_transition_state_backfill_retries_partial_commits_and_preserves_other_bytes() {
+        run_large_stack_async_test("legacy-state-reconcile-backfill", || {
+            legacy_transition_state_inspection_and_apply_case(true)
+        });
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn legacy_transition_state_inspection_and_apply_case(write_enabled: bool) {
+        #[cfg(windows)]
+        assert!(!write_enabled, "Windows supports inspection but cannot prove repair directory durability");
+        use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
+            LegacyTransitionStateReconcileOutcome as Outcome, LegacyTransitionStateReconcileRequest,
+            LegacyTransitionStateReconcileSelector,
+        };
+        for (remote_version, expected_state) in [
+            ("", rustfs_filemeta::TransitionVersionState::KnownDisabled),
+            ("null", rustfs_filemeta::TransitionVersionState::SuspendedNull),
+            ("opaque-version", rustfs_filemeta::TransitionVersionState::Exact),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("legacy reconcile store directory");
+            let (ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-state-reconcile-inspect", &[4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let tier_name = "LEGACY-RECONCILE";
+            let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+            backend.set_put_remote_version(Some(remote_version.to_string())).await;
+            let bucket = "legacy-state-reconcile-bucket";
+            let object = "archive.bin";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create legacy fixture bucket");
+            let mut reader = PutObjReader::from_vec(b"legacy reconcile body".repeat(1024));
+            let source = store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("write source");
+            {
+                // Create the fixture under the existing remote-version writer
+                // gate. This does not authorize legacy metadata reconciliation.
+                let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+                temp_env::async_with_vars(
+                    [
+                        (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                        (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                    ],
+                    store.transition_object(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.to_string(),
+                                etag: source.etag.clone().expect("source ETag"),
+                                ..Default::default()
+                            },
+                            mod_time: source.mod_time,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("transition source");
+            }
+            assert!(
+                crate::services::notification_sys::acquire_legacy_transition_state_reconcile_fleet_proof()
+                    .await
+                    .is_none(),
+                "fixture setup must not grant the missing reconciliation write capability"
+            );
+            let selector = LegacyTransitionStateReconcileSelector {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: "null".to_string(),
+            };
+            if expected_state == rustfs_filemeta::TransitionVersionState::Exact {
+                backend
+                    .set_transition_candidate_probe_override(Some(
+                        crate::services::tier::warm_backend::TransitionCandidateProbe::Ambiguous,
+                    ))
+                    .await;
+            }
+            let converged = store
+                .inspect_legacy_transition_state(selector.clone())
+                .await
+                .expect("inspect an already explicit transition");
+            assert_eq!(converged.outcome, Outcome::Migrated, "{converged:?}");
+            assert!(!converged.changed);
+            backend.set_transition_candidate_probe_override(None).await;
+            rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, remote_version.is_empty()).await;
+            let paths = (0..4)
+                .map(|disk| {
+                    temp_dir
+                        .path()
+                        .join(format!("pool0/set0/disk{disk}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"))
+                })
+                .collect::<Vec<_>>();
+            let mut original = Vec::new();
+            for path in &paths {
+                original.push(tokio::fs::read(path).await.expect("original xl.meta"));
+            }
+            backend.clear_op_log().await;
+            let inspection = store.inspect_legacy_transition_state(selector.clone());
+            assert!(
+                std::mem::size_of_val(&inspection) <= 4 * 1024,
+                "admin inspection future must remain stack-bounded"
+            );
+            let inspected = inspection.await.expect("inspect legacy state");
+            assert_eq!(inspected.outcome, Outcome::ReadyToMigrate, "{inspected:?}");
+            assert!(!inspected.readiness.post_ready, "current fleet cannot authorize conditional writes");
+            let target = inspected.target.expect("live probe should establish one model");
+            assert_eq!(target.state, expected_state);
+            let request = LegacyTransitionStateReconcileRequest {
+                confirm: true,
+                selector,
+                source: inspected.source.expect("immutable source"),
+                original_sets: inspected.original_sets,
+                target,
+                reconciliation_digest: inspected.reconciliation_digest.expect("expected tuple digest"),
+            };
+            #[cfg(not(windows))]
+            if write_enabled {
+                crate::services::notification_sys::with_legacy_transition_state_fleet_proof_for_test(async {
+                    crate::disk::local::bucket_durability::set(bucket, Some(crate::disk::local::DurabilityMode::None));
+                    let unsynced = store.reconcile_legacy_transition_state(request.clone()).await;
+                    crate::disk::local::bucket_durability::set(bucket, None);
+                    let unsynced = unsynced.expect("repair without metadata durability");
+                    assert_eq!(unsynced.outcome, Outcome::BackendUnavailable);
+                    assert!(!unsynced.changed);
+                    let rollback = paths[0].parent().expect("object directory").join(Uuid::new_v4().to_string());
+                    tokio::fs::create_dir(&rollback).await.expect("pending rollback directory");
+                    tokio::fs::write(rollback.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), &original[0])
+                        .await
+                        .expect("pending old metadata backup");
+                    let unsettled = store.reconcile_legacy_transition_state(request.clone()).await;
+                    tokio::fs::remove_dir_all(&rollback).await.expect("settle fixture rollback");
+                    let unsettled = unsettled.expect("repair must wait for rollback");
+                    assert_eq!(unsettled.outcome, Outcome::BackendUnavailable);
+                    assert!(!unsettled.changed);
+                    for (path, bytes) in paths.iter().zip(&original) {
+                        assert_eq!(tokio::fs::read(path).await.expect("blocked repair leaves original bytes"), *bytes);
+                    }
+                    // The first disk commits; the second stops after staging.
+                    // This models an interrupted cross-disk effect without rollback.
+                    let disks = store.all_set_disks()[0].disk_inventory().await;
+                    let first_disk = disks[0].as_ref().expect("first physical disk");
+                    let publication_path = first_disk
+                        .get_object_path_for_io_if_local(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+                        .expect("local disk")
+                        .expect("publication path");
+                    let crash_key = format!("{object}/{STORAGE_FORMAT_FILE}");
+                    let _hook = crate::disk::os::prepared_publication_test_hooks::install_at(
+                        crate::disk::os::prepared_publication_test_hooks::Stage::Rename,
+                        &publication_path,
+                        move || {
+                            crate::crash_inject::arm(crate::crash_inject::CrashPoint::MetaWriteAfterTmpBeforeRename, &crash_key);
+                        },
+                    );
+                    let partial = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("partial repair response");
+                    assert_eq!(partial.outcome, Outcome::BackendUnavailable, "{partial:?}");
+                    assert!(partial.changed, "first copy was committed: {partial:?}");
+                    assert!(partial.changes_indeterminate);
+                    assert_ne!(tokio::fs::read(&paths[0]).await.expect("first committed copy"), original[0]);
+                    for (path, bytes) in paths[1..].iter().zip(&original[1..]) {
+                        assert_eq!(tokio::fs::read(path).await.expect("uncommitted copy"), *bytes);
+                    }
+                    assert!(
+                        store.all_set_disks()[0]
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .is_err(),
+                        "cleanup cannot select a partial repair subset"
+                    );
+                    let repaired = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("retry original snapshot");
+                    assert_eq!(repaired.outcome, Outcome::Migrated, "{repaired:?}");
+                    assert!(repaired.changed);
+                    assert!(!repaired.changes_indeterminate);
+                    let mut committed = Vec::new();
+                    for (path, original) in paths.iter().zip(&original) {
+                        let raw = tokio::fs::read(path).await.expect("repaired copy");
+                        let metadata = FileMeta::load(&raw).expect("decode repaired copy");
+                        let previous = FileMeta::load(original).expect("decode original copy");
+                        assert_eq!(
+                            metadata.transition_reconcile_generation(None).unwrap(),
+                            previous.transition_reconcile_generation(None).unwrap()
+                        );
+                        let (_, version) = metadata.find_version(None).expect("selected version");
+                        let info = version.into_fileinfo(bucket, object, true).expect("repaired FileInfo");
+                        assert_eq!(info.transition_version_state, expected_state);
+                        assert_eq!(info.transition_version, request.target.remote_version);
+                        committed.push(raw);
+                    }
+                    assert!(
+                        store.all_set_disks()[0]
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .expect("converged cleanup snapshot")
+                            .is_some()
+                    );
+                    let replay = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("idempotent original request replay");
+                    assert_eq!(replay.outcome, Outcome::Migrated, "{replay:?}");
+                    assert!(!replay.changed);
+                    for (path, expected) in paths.iter().zip(&committed) {
+                        assert_eq!(
+                            tokio::fs::read(path).await.expect("replayed copy"),
+                            *expected,
+                            "idempotence preserves raw encoding"
+                        );
+                    }
+                    for (path, bytes) in paths.iter().zip(&original) {
+                        tokio::fs::write(path, bytes)
+                            .await
+                            .expect("reset independent cancellation fixture");
+                    }
+                    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+                    let (release, released) = std::sync::mpsc::channel::<()>();
+                    let _pause = crate::disk::os::prepared_publication_test_hooks::install_at(
+                        crate::disk::os::prepared_publication_test_hooks::Stage::Rename,
+                        &publication_path,
+                        move || {
+                            let _ = entered_tx.send(());
+                            let _ = released.recv();
+                        },
+                    );
+                    let mut repair = Box::pin(store.reconcile_legacy_transition_state(request.clone()));
+                    tokio::select! {
+                        result = &mut repair => panic!("repair completed before publication pause: {result:?}"),
+                        result = entered => result.expect("publication executor entered"),
+                    }
+                    let update_options = crate::disk::UpdateMetadataOpts::default();
+                    let mut update = Box::pin(first_disk.update_metadata(
+                        bucket,
+                        object,
+                        FileInfo {
+                            metadata: HashMap::from([("x-amz-meta-concurrent".to_string(), "kept".to_string())]),
+                            ..Default::default()
+                        },
+                        &update_options,
+                    ));
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(25), update.as_mut())
+                            .await
+                            .is_err(),
+                        "another metadata RMW must wait for publication"
+                    );
+                    drop(repair);
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(25), update.as_mut())
+                            .await
+                            .is_err(),
+                        "cancelling the coordinator must not release an in-flight disk mutation"
+                    );
+                    release.send(()).expect("resume owned publication");
+                    update.await.expect("serialized metadata update");
+                    let raw = tokio::fs::read(&paths[0])
+                        .await
+                        .expect("cancelled repair and later metadata update");
+                    let (_, version) = FileMeta::load(&raw)
+                        .expect("metadata after cancellation")
+                        .find_version(None)
+                        .expect("selected version");
+                    let info = version
+                        .into_fileinfo(bucket, object, true)
+                        .expect("metadata after serialized update");
+                    assert_eq!(info.transition_version_state, expected_state);
+                    assert_eq!(info.metadata.get("x-amz-meta-concurrent").map(String::as_str), Some("kept"));
+                    let stale = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("stale original request");
+                    assert_eq!(
+                        stale.outcome,
+                        Outcome::Corrupt,
+                        "unrelated metadata change invalidates the original generation: {stale:?}"
+                    );
+                    assert!(!stale.changed);
+                    assert_eq!(tokio::fs::read(&paths[0]).await.expect("stale write leaves bytes unchanged"), raw);
+                    assert_eq!(backend.remove_count().await, 0);
+                    // A pinned version probe uses GET to verify that exact
+                    // candidate; every backend operation still targets it.
+                    let operations = backend.op_log().await;
+                    assert!(
+                        operations.iter().all(|operation| match operation {
+                            MockWarmOp::Probe { object } | MockWarmOp::Get { object } => object == &request.source.remote_object,
+                            _ => false,
+                        }),
+                        "unexpected backend effects: {operations:?}"
+                    );
+                })
+                .await;
+                continue;
+            }
+            let mut tampered = request.clone();
+            tampered.source.remote_object.push_str("-other");
+            let probes_before = backend.op_log().await.len();
+            let rejected = store
+                .reconcile_legacy_transition_state(tampered)
+                .await
+                .expect("reject tampered tuple");
+            assert_eq!(rejected.outcome, Outcome::Corrupt);
+            assert_eq!(backend.op_log().await.len(), probes_before, "invalid digest must not probe the backend");
+            let applied = store
+                .reconcile_legacy_transition_state(request)
+                .await
+                .expect("apply must report unavailable write authority");
+            assert_eq!(applied.outcome, Outcome::BackendUnavailable, "{applied:?}");
+            assert_eq!(applied.reason_code, "write_fence_unavailable");
+            assert!(!applied.changed);
+            for (path, expected) in paths.iter().zip(&original) {
+                assert_eq!(tokio::fs::read(path).await.expect("xl.meta after inspection"), *expected);
+            }
+            assert_eq!(backend.remove_count().await, 0);
+            assert!(
+                backend
+                    .op_log()
+                    .await
+                    .iter()
+                    .all(|operation| matches!(operation, MockWarmOp::Probe { .. }))
+            );
+
+            backend.set_unreachable(true).await;
+            let unavailable = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("unreachable tier is a diagnostic outcome");
+            assert_eq!(unavailable.outcome, Outcome::BackendUnavailable);
+            assert!(!unavailable.changed);
+            backend.set_unreachable(false).await;
+            for candidate in ["", "00000000-0000-0000-0000-000000000000", "bad\nversion"] {
+                backend
+                    .set_transition_candidate_probe_override(Some(
+                        crate::services::tier::warm_backend::TransitionCandidateProbe::VersionedPresent(candidate.to_string()),
+                    ))
+                    .await;
+                let invalid_proof = store
+                    .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                        bucket: bucket.to_string(),
+                        object: object.to_string(),
+                        version_id: "null".to_string(),
+                    })
+                    .await
+                    .expect("invalid backend proof is a diagnostic outcome");
+                assert_eq!(invalid_proof.outcome, Outcome::BackendUnavailable, "{invalid_proof:?}");
+                assert!(invalid_proof.target.is_none());
+            }
+            backend.set_transition_candidate_probe_override(None).await;
+
+            backend.clear_op_log().await;
+            for path in &paths[1..] {
+                tokio::fs::remove_file(path)
+                    .await
+                    .expect("hide majority metadata copies in fixture");
+            }
+            let minority = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("inspect minority legacy record");
+            assert_eq!(
+                minority.outcome,
+                Outcome::BackendUnavailable,
+                "a minority owner must remain visible: {minority:?}"
+            );
+            assert!(
+                backend.op_log().await.is_empty(),
+                "unproven metadata quorum cannot initiate a remote probe"
+            );
+            for (path, bytes) in paths.iter().zip(&original) {
+                tokio::fs::write(path, bytes).await.expect("restore fixture copies");
+            }
+            tokio::fs::write(&paths[0], b"corrupt-xl-meta")
+                .await
+                .expect("inject corrupt copy");
+            let corrupt = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("inspect corrupt legacy record");
+            assert_eq!(corrupt.outcome, Outcome::Corrupt, "{corrupt:?}");
+            assert!(backend.op_log().await.is_empty(), "corruption must fail before backend I/O");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn legacy_unknown_unversioned_transition_supports_head_get_and_range_without_backfill() {
@@ -15202,25 +15686,24 @@ mod tests {
         assert!(deleted[0].found, "the aggregate error must retain the committed pool result");
         drop(injection);
 
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let mut metadata_absent = true;
-                for pool in &store.pools {
-                    metadata_absent &= pool
-                        .get_disks_by_key(object)
-                        .load_file_info_versions_exact(bucket, object)
-                        .await
-                        .expect("aggregate-error cleanup metadata should remain readable")
-                        .is_none();
-                }
-                if metadata_absent && backend.remove_count().await == 1 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("aggregate failure must not suppress committed receipt dispatch");
+        // Exact reads can see subquorum metadata while workers remove each
+        // disk's free version. Inspect the final state after cleanup drains.
+        wait_for_expiry_workers_idle(&store).await;
+        for pool in &store.pools {
+            assert!(
+                pool.get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("aggregate-error cleanup metadata should remain readable")
+                    .is_none(),
+                "aggregate failure must not suppress committed receipt cleanup"
+            );
+        }
+        assert_eq!(
+            backend.remove_count().await,
+            1,
+            "committed receipts must remove the shared remote object once"
+        );
         assert_eq!(backend.object_count().await, 0, "the shared remote object should be removed exactly once");
         store
             .delete_bucket(bucket, &DeleteBucketOptions::default())
@@ -16862,6 +17345,55 @@ mod tests {
             .await
             .expect("protected body should drain");
         assert_eq!(body, original_body);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn object_lock_snapshot_uses_read_quorum_bucket_existence_probe() {
+        let temp = tempfile::tempdir().expect("create degraded snapshot store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp.path(),
+            "degraded-object-lock-snapshot",
+            &[(2, 12)],
+            CancellationToken::new(),
+            None,
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("degraded-ol-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create snapshot bucket");
+        let expected_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read bucket incarnation before degrading sets");
+
+        let mut offline_disks = Vec::new();
+        for set in store.all_set_disks() {
+            offline_disks.push(force_set_disk_range_offline_for_test(&set, 6..12).await);
+        }
+
+        let snapshot = store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("read-quorum bucket existence should admit guarded Object Lock snapshot");
+        assert!(matches!(
+            snapshot.state(),
+            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        ));
+        assert!(snapshot.is_valid_for_destructive_put(store.id, &bucket, expected_incarnation));
+
+        let current_incarnation = crate::bucket::metadata_sys::get_object_lock_config_and_incarnation_from_disk_in(&ctx, &bucket)
+            .await
+            .expect("authoritative metadata read should also survive at read quorum")
+            .1;
+        assert_eq!(current_incarnation, expected_incarnation);
+
+        drop(offline_disks);
     }
 
     #[tokio::test]
@@ -18598,27 +19130,34 @@ mod tests {
                             .await
                             .expect("transition metadata should be readable");
                         let mut metadata = FileMeta::load(&encoded).expect("transition metadata should decode");
-                        let mut transitioned = metadata
-                            .get_all_file_info_versions(bucket, object, true)
-                            .expect("transitioned versions should decode")
-                            .versions
-                            .into_iter()
-                            .find(|version| version.version_id == history.version_id)
+                        let (version_index, mut transitioned) = metadata
+                            .find_version(history.version_id)
                             .expect("transitioned history should exist");
-                        transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-                        rustfs_utils::http::metadata_compat::remove_str(
-                            &mut transitioned.metadata,
+                        // Rewrite the serialized record to model legacy metadata;
+                        // ordinary writes preserve an already reconciled state.
+                        rustfs_utils::http::metadata_compat::remove_bytes(
+                            &mut transitioned.object.as_mut().expect("history should be an object").meta_sys,
                             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
                         );
-                        metadata
-                            .add_version(transitioned)
-                            .expect("unknown state should replace the transitioned version");
+                        metadata.versions[version_index] = rustfs_filemeta::FileMetaShallowVersion::try_from(transitioned)
+                            .expect("legacy history should re-encode");
                         tokio::fs::write(
                             &metadata_path,
                             metadata.marshal_msg().expect("unknown transition metadata should encode"),
                         )
                         .await
                         .expect("unknown transition metadata should be written");
+                        let encoded = tokio::fs::read(&metadata_path)
+                            .await
+                            .expect("legacy transition metadata should be readable");
+                        let legacy = FileMeta::load(&encoded)
+                            .expect("legacy transition metadata should decode")
+                            .find_version(history.version_id)
+                            .expect("legacy history should exist")
+                            .1
+                            .into_fileinfo(bucket, object, true)
+                            .expect("legacy history should decode");
+                        assert_eq!(legacy.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
                     }
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
                         action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,

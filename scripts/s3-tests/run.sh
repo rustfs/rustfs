@@ -239,6 +239,15 @@ DEPLOY_MODE="${DEPLOY_MODE:-build}"
 RUSTFS_BINARY="${RUSTFS_BINARY:-}"
 NO_CACHE="${NO_CACHE:-false}"
 S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+S3TESTS_ENABLE_LOCAL_KMS="${S3TESTS_ENABLE_LOCAL_KMS:-true}"
+S3_KMS_KEY_ID="${S3_KMS_KEY_ID:-rustfs-s3tests-default-key}"
+S3_KMS_SECONDARY_KEY_ID="${S3_KMS_SECONDARY_KEY_ID:-rustfs-s3tests-secondary-key}"
+if [ "${S3TESTS_ENABLE_LOCAL_KMS}" = "true" ] && [ "${DEPLOY_MODE}" != "existing" ]; then
+    # An explicitly empty value exercises the missing-default-key path.
+    S3_KMS_DEFAULT_KEY_ID="${S3_KMS_DEFAULT_KEY_ID-${S3_KMS_KEY_ID}}"
+else
+    S3_KMS_DEFAULT_KEY_ID="${S3_KMS_DEFAULT_KEY_ID:-}"
+fi
 
 # Additional directories (SCRIPT_DIR and PROJECT_ROOT defined earlier)
 ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
@@ -252,6 +261,9 @@ else
 fi
 DATA_DIR="${DATA_BASE}/test-data/${CONTAINER_NAME}"
 RUSTFS_PID=""
+RUSTFS_KMS_ARGS=()
+S3TESTS_KMS_HOST_KEY_DIR="${S3TESTS_KMS_KEY_DIR:-${DATA_BASE}/kms-keys/${CONTAINER_NAME}}"
+S3TESTS_KMS_RUNTIME_KEY_DIR="${S3TESTS_KMS_HOST_KEY_DIR}"
 
 if [ "${DEPLOY_MODE}" != "existing" ] && [ -z "${RUSTFS_SSE_S3_MASTER_KEY:-}" ]; then
     export RUSTFS_SSE_S3_MASTER_KEY="${S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT}"
@@ -282,6 +294,11 @@ Environment Variables:
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
+  S3TESTS_ENABLE_LOCAL_KMS - Enable local KMS for SSE-KMS cases (default: true)
+  S3_KMS_KEY_ID          - s3-tests KMS key id (default: rustfs-s3tests-default-key)
+  S3_KMS_SECONDARY_KEY_ID - Second KMS key id (default: rustfs-s3tests-secondary-key)
+  S3_KMS_DEFAULT_KEY_ID  - Expected default key (managed local KMS: primary key; existing: none; empty disables it)
+  S3TESTS_KMS_KEY_DIR    - Host key directory for local KMS (default: DATA_ROOT/kms-keys)
   RUSTFS_SCANNER_ENABLED - Enable background scanner for harness service (default: false)
   MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
@@ -345,6 +362,68 @@ cleanup() {
 
 trap cleanup EXIT
 
+prepare_s3tests_local_kms() {
+    if [ "${S3TESTS_ENABLE_LOCAL_KMS}" != "true" ]; then
+        return 0
+    fi
+    if [ "${DEPLOY_MODE}" = "existing" ]; then
+        log_warn "Skipping local KMS setup for DEPLOY_MODE=existing; configure both test key IDs and the expected default for the target service"
+        return 0
+    fi
+    if [ "${S3_KMS_KEY_ID}" = "${S3_KMS_SECONDARY_KEY_ID}" ]; then
+        log_error "S3_KMS_KEY_ID and S3_KMS_SECONDARY_KEY_ID must differ for cross-key tests"
+        return 1
+    fi
+    if [ "${DEPLOY_MODE}" = "docker" ] && [ -z "${S3TESTS_KMS_KEY_DIR:-}" ]; then
+        S3TESTS_KMS_HOST_KEY_DIR="/tmp/${CONTAINER_NAME}/kms-keys"
+        S3TESTS_KMS_RUNTIME_KEY_DIR="/data/kms-keys"
+    fi
+
+    mkdir -p "${S3TESTS_KMS_HOST_KEY_DIR}"
+    chmod 700 "${S3TESTS_KMS_HOST_KEY_DIR}"
+    local key_id key_material
+    for key_id in "${S3_KMS_KEY_ID}" "${S3_KMS_SECONDARY_KEY_ID}"; do
+        # Public, distinct test fixtures stay stable when DATA_ROOT is reused.
+        key_material="${S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT}"
+        if [ "${key_id}" = "${S3_KMS_SECONDARY_KEY_ID}" ]; then
+            key_material=$(python3 -c 'import base64, hashlib; print(base64.b64encode(hashlib.sha256(b"rustfs-s3-tests-secondary-fixture").digest()).decode())')
+        fi
+        cat > "${S3TESTS_KMS_HOST_KEY_DIR}/${key_id}.key" <<EOF
+{
+  "key_id": "${key_id}",
+  "version": 1,
+  "algorithm": "AES_256",
+  "usage": "EncryptDecrypt",
+  "status": "Active",
+  "metadata": {},
+  "created_at": "2026-01-01T00:00:00+00:00[UTC]",
+  "rotated_at": null,
+  "created_by": "s3-tests",
+  "encrypted_key_material": "${key_material}",
+  "nonce": [],
+  "at_rest_protection": "plaintext-dev-only"
+}
+EOF
+        chmod 600 "${S3TESTS_KMS_HOST_KEY_DIR}/${key_id}.key"
+    done
+    export RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS="true"
+    export RUSTFS_KMS_ENABLE="true"
+    export RUSTFS_KMS_BACKEND="local"
+    export RUSTFS_KMS_KEY_DIR="${S3TESTS_KMS_RUNTIME_KEY_DIR}"
+    RUSTFS_KMS_ARGS=(
+        --kms-enable
+        --kms-backend local
+        --kms-key-dir "${S3TESTS_KMS_RUNTIME_KEY_DIR}"
+    )
+    if [ -n "${S3_KMS_DEFAULT_KEY_ID}" ]; then
+        export RUSTFS_KMS_DEFAULT_KEY_ID="${S3_KMS_DEFAULT_KEY_ID}"
+        RUSTFS_KMS_ARGS+=(--kms-default-key-id "${S3_KMS_DEFAULT_KEY_ID}")
+    else
+        unset RUSTFS_KMS_DEFAULT_KEY_ID
+    fi
+    log_info "Using local KMS keys '${S3_KMS_KEY_ID}' and '${S3_KMS_SECONDARY_KEY_ID}' (default: '${S3_KMS_DEFAULT_KEY_ID}')"
+}
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -374,6 +453,8 @@ if [ "${DEPLOY_MODE}" != "existing" ]; then
         exit 1
     fi
 fi
+
+prepare_s3tests_local_kms
 
 # Start RustFS based on deployment mode
 if [ "${DEPLOY_MODE}" = "existing" ]; then
@@ -408,6 +489,7 @@ elif [ "${DEPLOY_MODE}" = "binary" ]; then
         --address "${S3_HOST}:${S3_PORT}" \
         --access-key "${S3_ACCESS_KEY}" \
         --secret-key "${S3_SECRET_KEY}" \
+        "${RUSTFS_KMS_ARGS[@]}" \
         "${DATA_DIR}/rustfs0" "${DATA_DIR}/rustfs1" "${DATA_DIR}/rustfs2" "${DATA_DIR}/rustfs3" \
         > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/rustfs.log" 2>&1 &
 
@@ -472,6 +554,7 @@ elif [ "${DEPLOY_MODE}" = "build" ]; then
         --address "${S3_HOST}:${S3_PORT}" \
         --access-key "${S3_ACCESS_KEY}" \
         --secret-key "${S3_SECRET_KEY}" \
+        "${RUSTFS_KMS_ARGS[@]}" \
         "${DATA_DIR}/rustfs0" "${DATA_DIR}/rustfs1" "${DATA_DIR}/rustfs2" "${DATA_DIR}/rustfs3" \
         > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/rustfs.log" 2>&1 &
 
@@ -506,6 +589,11 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
         -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
+        -e RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS="${RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS:-false}" \
+        -e RUSTFS_KMS_ENABLE="${RUSTFS_KMS_ENABLE:-false}" \
+        -e RUSTFS_KMS_BACKEND="${RUSTFS_KMS_BACKEND:-local}" \
+        -e RUSTFS_KMS_KEY_DIR="${RUSTFS_KMS_KEY_DIR:-}" \
+        -e RUSTFS_KMS_DEFAULT_KEY_ID \
         -e RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED}" \
         -e RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS}" \
         -e RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE}" \
@@ -761,6 +849,15 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
 }
+if [ -n "${S3_KMS_KEY_ID:-}" ]; then
+    tmp_conf="${CONF_OUTPUT_PATH}.tmp"
+    sed \
+        -e "s|^#kms_keyid = .*$|kms_keyid = ${S3_KMS_KEY_ID}|" \
+        -e "s|^#kms_keyid2 = .*$|kms_keyid2 = ${S3_KMS_SECONDARY_KEY_ID}|" \
+        -e "s|^#kms_default_keyid =.*$|kms_default_keyid = ${S3_KMS_DEFAULT_KEY_ID}|" \
+        "${CONF_OUTPUT_PATH}" > "${tmp_conf}"
+    mv "${tmp_conf}" "${CONF_OUTPUT_PATH}"
+fi
 
 # Step 7: Provision s3-tests alt user
 # Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API

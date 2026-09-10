@@ -67,12 +67,9 @@ const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
 // Keep this synchronized with the version served by node_service. Including
 // the local member in the minimum prevents an older coordinator from
 // self-authorizing a policy implemented only by newer remote peers.
-const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
-/// Version 5 is reserved for a fleet whose every metadata writer preserves
-/// explicit transition version state and destination identity, and implements
-/// conditional per-generation `xl.meta` writes with strong readback. The node
-/// service must not advertise this version until the conditional writer from
-/// rustfs/backlog#684 is available.
+const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 5;
+/// Version 5 preserves explicit transition state/destination bindings and
+/// supports exact-generation metadata repair with strong all-copy readback.
 const LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION: u32 = 5;
 
 fn resolve_admin_peer_probe_timeout_secs(configured: Option<u64>) -> u64 {
@@ -568,6 +565,10 @@ pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalF
     stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
 }
 
+pub(crate) fn cross_pool_fence_topology_generation(proof: &CrossPoolFenceFleetProofToken) -> String {
+    stable_tier_delete_journal_topology_generation(&proof.0.topology_fingerprint)
+}
+
 /// Acquire one non-cloneable authority that must span the complete reconcile
 /// effect window, including its final strong readback.
 pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<LegacyTransitionStateReconcileFleetProofToken> {
@@ -603,6 +604,10 @@ fn acquire_legacy_transition_state_reconcile_fleet_proof_from(
 }
 
 async fn observe_legacy_transition_state_reconcile_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    #[cfg(all(test, feature = "test-util"))]
+    if let Ok(observation) = LEGACY_RECONCILE_TEST_OBSERVATION.try_with(Clone::clone) {
+        return Some(observation);
+    }
     let notification_sys = get_global_notification_sys()?;
     let (peer_epochs, minimum_version) = timeout(
         REMOTE_VERSION_STATE_PROBE_TIMEOUT,
@@ -613,6 +618,34 @@ async fn observe_legacy_transition_state_reconcile_fleet(expected_topology: &str
     .ok()?;
     let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peer_epochs, minimum_version);
     reconcile_result.ok()
+}
+
+#[cfg(all(test, feature = "test-util"))]
+tokio::task_local! {
+    static LEGACY_RECONCILE_TEST_OBSERVATION: BTreeMap<String, Uuid>;
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn with_legacy_transition_state_fleet_proof_for_test<F: std::future::Future>(future: F) -> F::Output {
+    struct Revoke;
+    impl Drop for Revoke {
+        fn drop(&mut self) {
+            revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
+        }
+    }
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().expect("test store topology");
+    assert!(
+        publish_fleet_capability_probe_result(
+            legacy_transition_state_reconcile_fleet_proof_slot(),
+            topology,
+            Ok(BTreeMap::new()),
+            Instant::now(),
+        )
+        .is_none()
+    );
+    let _revoke = Revoke;
+    let _remote_version = install_current_remote_version_state_fleet_proof_for_test();
+    LEGACY_RECONCILE_TEST_OBSERVATION.scope(BTreeMap::new(), future).await
 }
 
 /// Revalidate the exact fleet generation captured by a reconcile token with a
@@ -631,6 +664,18 @@ pub async fn legacy_transition_state_reconcile_fleet_proof_matches(
         || observe_legacy_transition_state_reconcile_fleet(expected_topology),
     )
     .await
+}
+
+/// Final local check in the disk publication executor. The corresponding
+/// counted permit remains owned until the filesystem operation has drained.
+pub(crate) fn legacy_transition_state_reconcile_fleet_proof_current(
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+) -> bool {
+    let Some(topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else { return false };
+    let state = legacy_transition_state_reconcile_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_at(&state, proof, topology, Instant::now())
 }
 
 pub async fn acquire_ilm_recovery_export_fleet_proof() -> Option<IlmRecoveryExportFleetProofToken> {
@@ -1118,6 +1163,14 @@ pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerp
         panic!("test proof installation must not fail: {err}");
     }
     RemoteVersionStateFleetProofGuard
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_current_remote_version_state_fleet_proof_for_test() -> RemoteVersionStateFleetProofGuard {
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("the test store must bind its fleet topology before installing a writer proof");
+    install_remote_version_state_fleet_proof_for_test(topology)
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -3914,15 +3967,11 @@ mod tests {
         assert!(decommission_v3.is_err(), "v3 members do not understand the per-target decommission fence");
         assert!(reconcile_v3.is_err());
 
-        let (generic_v4, journal_v4, decommission_v4, reconcile_v4) =
-            cross_pool_fence_policy_results(peers.clone(), LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION);
+        let (generic_v4, journal_v4, decommission_v4, reconcile_v4) = cross_pool_fence_policy_results(peers.clone(), 4);
         assert!(generic_v4.is_ok());
         assert!(journal_v4.is_ok());
         assert!(decommission_v4.is_ok(), "an all-v4 fleet may create sticky per-target reservations");
-        assert!(
-            reconcile_v4.is_err(),
-            "the current local policy lacks the conditional xl.meta writer required by reconcile"
-        );
+        assert!(reconcile_v4.is_err(), "v4 does not support conditional transition metadata writes");
 
         let (generic_v5, journal_v5, decommission_v5, reconcile_v5) = cross_pool_fence_policy_results(peers, 5);
         assert!(generic_v5.is_ok());
@@ -4600,7 +4649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_transition_state_reconcile_single_node_stays_closed_before_local_cas_support() {
+    async fn legacy_transition_state_reconcile_single_node_advertises_conditional_writer() {
         let notification_sys = NotificationSys {
             peer_clients: Vec::new(),
             all_peer_clients: vec![None],
@@ -4616,8 +4665,8 @@ mod tests {
         assert_eq!(minimum_version, LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION);
         let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peers, minimum_version);
         assert!(
-            reconcile_result.is_err(),
-            "the current node must not self-authorize reconcile before the conditional writer lands"
+            reconcile_result.is_ok(),
+            "the current node implements the conditional writer and preserves repaired bindings"
         );
     }
 
