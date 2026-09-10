@@ -146,13 +146,16 @@ def build_descriptor(args: argparse.Namespace) -> Path:
         "gates": gates,
     })
     for gate in ("G11", "G13"):
-        subprocess.check_call([
+        check = subprocess.run([
             sys.executable,
             str(ROOT / "scripts/check_test_wiring.py"),
             "--check-scanner-heal-release-bundle-gate",
             str(descriptor),
             gate,
-        ], cwd=ROOT)
+        ], cwd=ROOT, capture_output=True, text=True)
+        if check.returncode != 0:
+            details = "\n".join(part for part in (check.stdout.strip(), check.stderr.strip()) if part)
+            raise ValueError(details or f"{gate} release bundle gate check failed")
     return descriptor
 
 
@@ -188,8 +191,8 @@ def write_self_test_proof(path: Path, source_revision: str) -> None:
             "unknown_producer_excluded": True,
         },
         "segment_activation_preflight": {
-            "production_activation": False,
-            "scanner_segment_reuse_activated": False,
+            "production_activation": True,
+            "scanner_segment_reuse_activated": True,
             "proof_inputs": list(wiring.SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS),
             "fail_closed_checks": list(wiring.SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS),
         },
@@ -242,6 +245,21 @@ def run_self_test() -> None:
             wiring.require("measured" in str(err), "wrong self-test failure for synthetic proof")
         else:
             raise ValueError("self-test accepted synthetic proof")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        proof = root / "maintenance-proof.json"
+        write_self_test_proof(proof, source_revision)
+        payload = wiring.read_json(proof)
+        payload["segment_activation_preflight"]["scanner_segment_reuse_activated"] = False
+        wiring.write_json(proof, payload)
+        try:
+            build_descriptor(parse_args(["--proof-json", str(proof), "--out-dir", str(root / "out")]))
+        except ValueError as err:
+            wiring.require("runtime activation gate is enabled" in str(err), "wrong self-test failure for inactive segment reuse")
+        else:
+            raise ValueError("self-test accepted inactive segment reuse proof")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

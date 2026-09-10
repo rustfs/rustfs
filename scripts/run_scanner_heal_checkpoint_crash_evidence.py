@@ -251,6 +251,7 @@ def build_descriptor(args: argparse.Namespace) -> Path:
                     "raw_entry_budget": summary["raw_entry_budget"],
                     "max_raw_entries_per_round": summary["max_raw_entries_per_round"],
                     "max_objects_processed_per_round": summary["max_objects_processed_per_round"],
+                    "bounded_work_quantum_observed": True,
                     "durable_checkpoint_committed": True,
                     "no_unbounded_tail": True,
                 }),

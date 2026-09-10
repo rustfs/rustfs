@@ -78,10 +78,27 @@ def replays_raw_window(previous, current):
             or previous["raw_first_entry"] is None or current["raw_first_entry"] is None
             or previous["raw_last_entry"] is None or current["raw_last_entry"] is None):
         return False
+    raw_page_index_progressed = (
+        previous["raw_page_index_parent"] == current["raw_page_index_parent"]
+        and (
+            current["raw_page_index_committed_entries"] > previous["raw_page_index_committed_entries"]
+            or (current["raw_page_index_complete"] and not previous["raw_page_index_complete"])
+        )
+    )
     return (previous["raw_first_entry"] == current["raw_first_entry"]
             and previous["raw_last_entry"] == current["raw_last_entry"]
             and previous["objects_retained"] == current["objects_before"]
-            and current["objects_retained"] == previous["objects_retained"])
+            and current["objects_retained"] == previous["objects_retained"]
+            and not raw_page_index_progressed)
+
+
+def fully_retained(report, objects):
+    return all(report[key] == objects for key in
+               ("objects_retained", "versions_retained", "bytes_retained"))
+
+
+def final_complete_recheck_after_full_retention(previous, current, objects):
+    return fully_retained(previous, objects) and converged(current, objects)
 
 
 def validate_recoverable_quantum(reports, *, objects, budget, require_converged):
@@ -101,7 +118,8 @@ def validate_recoverable_quantum(reports, *, objects, budget, require_converged)
                 raise ValueError("durable retained coverage did not survive process restart")
             if report["objects_retained"] < previous["objects_retained"]:
                 raise ValueError("durable retained coverage regressed across restart")
-            if replays_raw_window(previous, report):
+            if (not final_complete_recheck_after_full_retention(previous, report, objects)
+                    and replays_raw_window(previous, report)):
                 raise ValueError("raw enumeration window replayed without durable coverage")
             if (report["raw_page_index_parent"] == previous["raw_page_index_parent"]
                     and report["raw_page_index_committed_entries"] < previous["raw_page_index_committed_entries"]

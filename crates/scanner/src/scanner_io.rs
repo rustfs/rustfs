@@ -306,7 +306,7 @@ fn scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(
 
 fn resolve_remote_dirty_usage_scope(
     requested_scope: ScannerBucketScanScope,
-    mut dirty_buckets: HashSet<String>,
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
     remote_dirty_usage: VerifiedRemoteDirtyUsage,
     all_buckets: &[BucketInfo],
     baseline_proof: ScannerCacheBaselineProof<'_>,
@@ -319,12 +319,21 @@ fn resolve_remote_dirty_usage_scope(
 
     let peer_count = remote_dirty_usage.peer_count;
     let dirty_peer_count = remote_dirty_usage.dirty_peer_count;
+    let remote_dirty_buckets = remote_dirty_usage.dirty_buckets.clone();
+    let mut dirty_buckets = dirty_usage_snapshot.buckets.keys().cloned().collect::<HashSet<_>>();
     dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
     // Peer snapshots contribute bucket names only; the local prefix scopes
     // would narrow a bucket a peer dirtied elsewhere, so the merged scope
     // stays at bucket granularity (same rule as the local fallthrough).
-    let scope =
-        scoped_scan_scope_from_dirty_buckets(requested_scope, dirty_buckets, None, true, false, all_buckets, baseline_proof);
+    let scope = scoped_scan_scope_from_dirty_buckets(
+        requested_scope.clone(),
+        dirty_buckets.clone(),
+        None,
+        true,
+        false,
+        all_buckets,
+        baseline_proof,
+    );
     if scope.is_default() {
         return default_result(scope);
     }
@@ -358,19 +367,45 @@ fn resolve_remote_dirty_usage_scope(
     }
     let has_scoped_acknowledgements = !scoped_acknowledgements.is_empty();
 
+    let distributed_segment_invalidation_evidence =
+        (dirty_peer_count > 0 && has_scoped_acknowledgements).then_some(DistributedSegmentInvalidationEvidence {
+            invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
+            distributed_ec_invalidation: true,
+            peer_count,
+            dirty_peer_count,
+            same_window_remote_proof: true,
+            all_peers_bound_to_generation_window: true,
+        });
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_baseline_with_evidence(
+        dirty_usage_snapshot,
+        true,
+        baseline_proof,
+        distributed_segment_invalidation_evidence,
+    );
+    let scope = if segment_reuse_activation_preflight.scanner_segment_reuse_activated {
+        let local_only_scopes = dirty_usage_snapshot
+            .scopes
+            .iter()
+            .filter(|(bucket, _)| !remote_dirty_buckets.contains(bucket.as_str()))
+            .map(|(bucket, scope)| (bucket.clone(), scope.clone()))
+            .collect::<DirtyUsageBucketScopes>();
+        scoped_scan_scope_from_dirty_buckets(
+            requested_scope,
+            dirty_buckets,
+            (!local_only_scopes.is_empty()).then_some(&local_only_scopes),
+            true,
+            true,
+            all_buckets,
+            baseline_proof,
+        )
+    } else {
+        scope
+    };
+
     ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: scoped_acknowledgements,
-        distributed_segment_invalidation_evidence: (dirty_peer_count > 0 && has_scoped_acknowledgements).then_some(
-            DistributedSegmentInvalidationEvidence {
-                invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
-                distributed_ec_invalidation: true,
-                peer_count,
-                dirty_peer_count,
-                same_window_remote_proof: true,
-                all_peers_bound_to_generation_window: true,
-            },
-        ),
+        distributed_segment_invalidation_evidence,
     }
 }
 
@@ -596,7 +631,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
         production_activation: true,
         producer_identity_coverage_complete: dirty_usage_producer_evidence.producer_identity_coverage_complete,
         durable_producer_identity: dirty_usage_producer_evidence.durable_producer_identity,
-        durable_dirty_producer_journal: dirty_usage_producer_evidence.durable_producer_identity,
+        durable_dirty_producer_journal: dirty_usage_producer_evidence.durable_dirty_producer_journal,
         restart_gap_absent: dirty_usage_producer_evidence.restart_gap_absent,
         generation_window_bound: dirty_usage_snapshot.covers_all_pending
             && dirty_usage_snapshot.generation != 0
@@ -617,13 +652,22 @@ fn scanner_segment_reuse_activation_preflight_for_baseline(
     distributed: bool,
     baseline_proof: ScannerCacheBaselineProof<'_>,
 ) -> ScannerSegmentReuseActivationPreflight {
+    scanner_segment_reuse_activation_preflight_for_baseline_with_evidence(dirty_usage_snapshot, distributed, baseline_proof, None)
+}
+
+fn scanner_segment_reuse_activation_preflight_for_baseline_with_evidence(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    distributed: bool,
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+) -> ScannerSegmentReuseActivationPreflight {
     let (dirty_usage_producer_evidence, cold_zero_walk_oracle) =
         scanner_segment_reuse_baseline_producer_evidence(dirty_usage_snapshot, baseline_proof);
     scanner_segment_reuse_activation_preflight_for_cycle(
         dirty_usage_snapshot,
         dirty_usage_producer_evidence,
         distributed,
-        None,
+        distributed_segment_invalidation_evidence,
         cold_zero_walk_oracle,
     )
 }
@@ -1568,14 +1612,14 @@ pub(crate) use cache::{
     current_cache_root_or_prepare_with_generation,
 };
 pub use dirty_usage::{
-    ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageSnapshot,
-    ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError,
+    ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,
+    ScannerDirtyUsageSnapshot, ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError,
     ScannerDurableDirtyUsageReplayRecord, ScannerDurableDirtyUsageReplayScope, acknowledge_dirty_usage_generation,
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
     replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer,
+    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};
