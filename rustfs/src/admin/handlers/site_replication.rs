@@ -313,6 +313,8 @@ struct SRPeerJoinResponse {
     peer: PeerInfo,
     #[serde(rename = "initialSyncErrorMessage", default, skip_serializing_if = "String::is_empty")]
     initial_sync_error_message: String,
+    #[serde(rename = "initialSyncDeferred", default, skip_serializing_if = "std::ops::Not::not")]
+    initial_sync_deferred: bool,
     /// Whether the receiving site actually applied this join.
     ///
     /// Three-valued on purpose. `None` means the peer did not report — MinIO
@@ -331,6 +333,8 @@ struct SRPeerJoinEnvelope {
     request: SRPeerJoinReq,
     #[serde(rename = "deferSyncStateEnable", default, skip_serializing_if = "std::ops::Not::not")]
     defer_sync_state_enable: bool,
+    #[serde(rename = "deferInitialSync", default, skip_serializing_if = "std::ops::Not::not")]
+    defer_initial_sync: bool,
 }
 
 #[derive(Debug, Default)]
@@ -6747,6 +6751,7 @@ fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPe
         return Ok(SRPeerJoinResponse {
             peer: fallback_peer,
             initial_sync_error_message: String::new(),
+            initial_sync_deferred: false,
             applied: None,
         });
     }
@@ -6853,66 +6858,86 @@ impl Operation for SiteReplicationAddHandler {
                         updated_at: state.updated_at,
                     },
                     defer_sync_state_enable: true,
+                    defer_initial_sync: true,
                 };
                 let peer_join_path = with_site_replication_bootstrap_token(
                     SITE_REPLICATION_PEER_JOIN_PATH,
                     &add_in_progress_guard.token.to_string(),
                 );
 
-                let mut joined_endpoints = HashSet::new();
+                // Install every site's service account before any receiver probes or
+                // backfills to a peer that may not have joined yet. Reuse the join
+                // snapshot for the second pass without repeating IAM/topology writes.
+                // Only peers acknowledging deferral get a second request; older
+                // receivers retain their one-pass behavior and reported errors.
+                let initial_sync_path = format!("{peer_join_path}&initial-sync=true");
                 let mut initial_sync_errors = SiteReplicationErrorSummary::default();
-                for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
-                    if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
-                        || !joined_endpoints.insert(site_identity_key(&site.endpoint))
-                    {
-                        continue;
-                    }
+                let mut deferred_endpoints = HashSet::new();
+                for (path, defer_initial_sync) in [(&peer_join_path, true), (&initial_sync_path, false)] {
+                    let mut joined_endpoints = HashSet::new();
+                    for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
+                        if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
+                            || (!defer_initial_sync && !deferred_endpoints.contains(&site_identity_key(&site.endpoint)))
+                            || !joined_endpoints.insert(site_identity_key(&site.endpoint))
+                        {
+                            continue;
+                        }
 
-                    let mut peer_join_req = join_req.clone();
-                    peer_join_req.request.svc_acct_parent = site.access_key.clone();
-                    let connection = PeerConnection::try_from(site)?;
-                    let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
-                        .send(&site.secret_key, &peer_join_req)
-                        .await?;
+                        let mut peer_join_req = join_req.clone();
+                        peer_join_req.defer_initial_sync = defer_initial_sync;
+                        peer_join_req.request.svc_acct_parent = site.access_key.clone();
+                        let connection = PeerConnection::try_from(site)?;
+                        let body = PeerAdminRequest::put(&connection, path, &site.access_key)
+                            .send(&site.secret_key, &peer_join_req)
+                            .await?;
 
-                    let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
-                        .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
-                    fallback_peer.deployment_id = preflight.deployment_id.clone();
-                    let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
-                        S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("parse peer join response from {} failed: {e}", site.endpoint),
-                        )
-                    })?;
-                    if !join_response.initial_sync_error_message.is_empty() {
-                        initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+                        let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
+                            .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
+                        fallback_peer.deployment_id = preflight.deployment_id.clone();
+                        let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("parse peer join response from {} failed: {e}", site.endpoint),
+                            )
+                        })?;
+                        if join_response.initial_sync_deferred {
+                            if defer_initial_sync {
+                                deferred_endpoints.insert(site_identity_key(&site.endpoint));
+                            } else {
+                                initial_sync_errors.push(format!("{}: peer did not complete initial sync", site.endpoint));
+                            }
+                        }
+                        if !join_response.initial_sync_error_message.is_empty() {
+                            initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+                        }
+                        // An explicit no-op join. The peer answered 200 but wrote nothing —
+                        // its persisted state is already newer than the snapshot it was
+                        // sent — so the add is only PARTIALLY configured and saying
+                        // "configured successfully" would be a lie (rustfs/rustfs#5963).
+                        // `None` (a MinIO peer, or one older than the field) is not a
+                        // no-op signal and is deliberately not reported.
+                        if join_response.applied == Some(false) {
+                            let phase = if defer_initial_sync { "join" } else { "initial sync" };
+                            initial_sync_errors.push(format!(
+                                "{}: peer did not apply the {phase} (its site replication state is newer than the snapshot it was sent); \
+                                 the site is not configured against this peer",
+                                site.endpoint
+                            ));
+                        }
+                        state = reconcile_peer_with_actual_identity(state, join_response.peer);
+                        let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("peer join response from {} did not identify the requested site", site.endpoint),
+                            )
+                        })?;
+                        validate_proposed_peer(&reconciled_peer).map_err(|err| {
+                            S3Error::with_message(
+                                S3ErrorCode::InvalidRequest,
+                                format!("invalid peer join response from {}: {err}", site.endpoint),
+                            )
+                        })?;
                     }
-                    // An explicit no-op join. The peer answered 200 but wrote nothing —
-                    // its persisted state is already newer than the snapshot it was
-                    // sent — so the add is only PARTIALLY configured and saying
-                    // "configured successfully" would be a lie (rustfs/rustfs#5963).
-                    // `None` (a MinIO peer, or one older than the field) is not a
-                    // no-op signal and is deliberately not reported.
-                    if join_response.applied == Some(false) {
-                        initial_sync_errors.push(format!(
-                            "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
-                             the site is not configured against this peer",
-                            site.endpoint
-                        ));
-                    }
-                    state = reconcile_peer_with_actual_identity(state, join_response.peer);
-                    let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
-                        S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("peer join response from {} did not identify the requested site", site.endpoint),
-                        )
-                    })?;
-                    validate_proposed_peer(&reconciled_peer).map_err(|err| {
-                        S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!("invalid peer join response from {}: {err}", site.endpoint),
-                        )
-                    })?;
                 }
 
                 mark_unknown_peer_sync_enabled(&mut state.peers);
@@ -7186,6 +7211,24 @@ impl Operation for SiteReplicationNetPerfHandler {
 
 pub struct SRPeerJoinHandler {}
 
+fn ensure_initial_sync_join_current(state: &SiteReplicationState, join_req: &SRPeerJoinReq) -> S3Result<()> {
+    if !state.enabled()
+        || join_req.updated_at.is_none()
+        || state.updated_at != join_req.updated_at
+        || state.service_account_access_key.is_empty()
+        || state.service_account_access_key != join_req.svc_acct_access_key
+        || state.pending_remove.is_some()
+        || state.pending_rotation.is_some()
+        || pending_endpoint_refresh(state).is_some()
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication changed before initial sync; re-run replicate add"
+        ));
+    }
+    Ok(())
+}
+
 /// What the join admission decided about an incoming peer join. The verdict —
 /// and the committed state the back-fill afterwards needs — travel out of
 /// [`admit_peer_join`] instead of being answered where they are decided.
@@ -7348,6 +7391,7 @@ fn superseded_join_response(peer: PeerInfo) -> SRPeerJoinResponse {
     SRPeerJoinResponse {
         peer,
         initial_sync_error_message: String::new(),
+        initial_sync_deferred: false,
         applied: Some(false),
     }
 }
@@ -7357,6 +7401,7 @@ fn applied_join_response(peer: PeerInfo, initial_sync_error_message: String) -> 
     SRPeerJoinResponse {
         peer,
         initial_sync_error_message,
+        initial_sync_deferred: false,
         applied: Some(true),
     }
 }
@@ -7366,17 +7411,30 @@ impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
+        let initial_sync_only = query_pairs(&req.uri).get("initial-sync").is_some_and(|value| value == "true");
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         // The body is fully read before the admission takes the lifecycle
         // guard: a sender that stalls mid-body must not block this node's
         // add/remove/rotate/reconciler.
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
         let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
+        let defer_initial_sync = join_envelope.defer_initial_sync;
         let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
-        let committed =
-            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?;
+        let _initial_sync_guard = if initial_sync_only {
+            Some(SiteReplicationLifecycleGuard::acquire().await?)
+        } else {
+            None
+        };
+        let committed = if initial_sync_only {
+            let state = load_site_replication_state().await?;
+            ensure_initial_sync_join_current(&state, &join_req)?;
+            let local_peer = local_peer_at_endpoint(local_endpoint, &state);
+            PeerJoinOutcome::Applied(Box::new(state), local_peer)
+        } else {
+            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?
+        };
         // Committed; the reverse-reachability probe and the bucket back-fill
         // run outside the transaction — their transport helpers' retry-event
         // bookkeeping re-enters it (P1-15).
@@ -7393,6 +7451,12 @@ impl Operation for SRPeerJoinHandler {
                 return json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
+        if defer_initial_sync && !initial_sync_only {
+            let mut response =
+                applied_join_response(state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer), String::new());
+            response.initial_sync_deferred = true;
+            return json_response(StatusCode::OK, &response);
+        }
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
         // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
@@ -13767,6 +13831,7 @@ mod tests {
             assert_eq!(response.peer.deployment_id, "remote-deployment");
             assert_eq!(response.peer.endpoint, "https://remote.example.com");
             assert!(response.initial_sync_error_message.is_empty());
+            assert!(!response.initial_sync_deferred);
             assert_eq!(
                 response.applied, None,
                 "a MinIO empty-body success reports nothing; it must not read as a no-op join"
@@ -13776,6 +13841,7 @@ mod tests {
         let json = serde_json::to_vec(&SRPeerJoinResponse {
             peer: peer("actual", "https://actual.example.com"),
             initial_sync_error_message: "sync failed".to_string(),
+            initial_sync_deferred: false,
             applied: Some(true),
         })
         .expect("serialize join response");
@@ -14628,6 +14694,69 @@ mod tests {
         assert_eq!(value.get("deferSyncStateEnable"), Some(&Value::Bool(true)));
     }
 
+    #[test]
+    fn test_initial_sync_join_requires_the_committed_snapshot() {
+        let now = OffsetDateTime::now_utc();
+        let mut state = SiteReplicationState {
+            updated_at: Some(now),
+            service_account_access_key: "replicator".to_string(),
+            peers: BTreeMap::from([
+                ("a".to_string(), peer("a", "https://a.example.com")),
+                ("b".to_string(), peer("b", "https://b.example.com")),
+            ]),
+            ..Default::default()
+        };
+        let mut request = SRPeerJoinReq {
+            updated_at: Some(now),
+            svc_acct_access_key: "replicator".to_string(),
+            ..Default::default()
+        };
+        ensure_initial_sync_join_current(&state, &request).expect("same committed join");
+        for timestamp in [None, Some(now - time::Duration::SECOND), Some(now + time::Duration::SECOND)] {
+            request.updated_at = timestamp;
+            assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        }
+        request.updated_at = Some(now);
+        request.svc_acct_access_key = "another-replicator".to_string();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        request.svc_acct_access_key.clone_from(&state.service_account_access_key);
+        state.pending_remove = Some(PendingRemove::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_remove = None;
+        state.pending_rotation = Some(PendingRotation::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_rotation = None;
+        state.pending_endpoint_refresh = Some(PendingEndpointRefresh::default());
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.pending_endpoint_refresh = None;
+        state.service_account_access_key.clear();
+        request.svc_acct_access_key.clear();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+        state.service_account_access_key = "replicator".to_string();
+        request.svc_acct_access_key.clone_from(&state.service_account_access_key);
+        state.peers.clear();
+        assert!(ensure_initial_sync_join_current(&state, &request).is_err());
+    }
+
+    #[test]
+    fn test_join_initial_sync_deferral_preserves_legacy_requests() {
+        let legacy: SRPeerJoinEnvelope = serde_json::from_str("{}").expect("legacy join");
+        assert!(!legacy.defer_initial_sync);
+        assert!(serde_json::to_value(&legacy).unwrap().get("deferInitialSync").is_none());
+        let deferred: SRPeerJoinEnvelope = serde_json::from_str(r#"{"deferInitialSync":true}"#).expect("deferred join");
+        assert!(deferred.defer_initial_sync);
+        assert_eq!(serde_json::to_value(deferred).unwrap()["deferInitialSync"], true);
+        let mut response = applied_join_response(peer("b", "https://b.example.com"), String::new());
+        assert!(serde_json::to_value(&response).unwrap().get("initialSyncDeferred").is_none());
+        response.initial_sync_deferred = true;
+        let wire = serde_json::to_vec(&response).unwrap();
+        assert!(
+            parse_peer_join_response(&wire, PeerInfo::default())
+                .unwrap()
+                .initial_sync_deferred
+        );
+    }
+
     // BUG2: pre-existing-bucket back-fill failures must be surfaced in the add response's
     // initial_sync_error_message, not swallowed behind an unqualified success.
     #[test]
@@ -14680,6 +14809,7 @@ mod tests {
         let value = serde_json::to_value(SRPeerJoinResponse {
             peer: peer("remote", "https://remote.example.com"),
             initial_sync_error_message: "bucket setup failed".to_string(),
+            initial_sync_deferred: false,
             applied: Some(true),
         })
         .expect("serialize peer join response");
@@ -14691,6 +14821,7 @@ mod tests {
         let value = serde_json::to_value(SRPeerJoinResponse {
             peer: peer("remote", "https://remote.example.com"),
             initial_sync_error_message: String::new(),
+            initial_sync_deferred: false,
             applied: None,
         })
         .expect("serialize peer join response");

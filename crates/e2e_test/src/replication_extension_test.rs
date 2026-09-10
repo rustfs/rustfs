@@ -6383,6 +6383,18 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
     let relayed_key = "after-edit-from-relay.txt";
     let relayed_payload = b"site replication after endpoint edit from relay".to_vec();
 
+    // The first joining receiver owns data before the third site has the
+    // shared account. Initial probes and backfill must wait for every join.
+    target_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&target_env, bucket).await?;
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+
     let add_status = site_replication_add(
         &source_env,
         &[
@@ -6410,7 +6422,10 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
         ],
     )
     .await?;
-    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+    assert!(
+        add_status.success && add_status.err_detail.is_empty() && add_status.initial_sync_error_message.is_empty(),
+        "unexpected site add result: {add_status:?}"
+    );
 
     let source_info = wait_for_site_replication_enabled(&source_env, 3).await?;
     let _target_info = wait_for_site_replication_enabled(&target_env, 3).await?;
@@ -6421,19 +6436,11 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
-    source_client.create_bucket().bucket(bucket).send().await?;
-    enable_bucket_versioning(&source_env, bucket).await?;
-    wait_for_bucket_on_target(&target_client, bucket).await?;
-    wait_for_bucket_on_target(&relay_client, bucket).await?;
-    source_client
-        .put_object()
-        .bucket(bucket)
-        .key(baseline_key)
-        .body(ByteStream::from(baseline_payload.clone()))
-        .send()
-        .await?;
-    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
-    assert_eq!(replicated_baseline, baseline_payload);
+    for client in [&source_client, &relay_client] {
+        wait_for_bucket_on_target(client, bucket).await?;
+        let backfilled = wait_for_object_on_target(client, bucket, baseline_key).await?;
+        assert_eq!(backfilled, baseline_payload);
+    }
 
     let old_target_address = target_env.address.clone();
     let new_target_port = RustFSTestEnvironment::find_available_port().await?;
