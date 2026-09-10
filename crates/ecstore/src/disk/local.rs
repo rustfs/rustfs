@@ -11557,7 +11557,10 @@ mod test {
 
         let moved = root.path().join("moved");
         std::fs::rename(&directory, &moved).expect("mtime helper must release its handles before cleanup");
-        assert_eq!(std::fs::read(moved.join("payload")).expect("read preserved payload"), b"unchanged payload");
+        assert_eq!(
+            std::fs::read(moved.join("payload")).expect("read preserved payload"),
+            b"unchanged payload"
+        );
     }
 
     #[tokio::test]
