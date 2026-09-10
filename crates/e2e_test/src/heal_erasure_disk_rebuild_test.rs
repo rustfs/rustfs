@@ -22,7 +22,11 @@ mod tests {
         init_logging, rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
-    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::{
+        error::{ProvideErrorMetadata, SdkError},
+        operation::put_object::PutObjectError,
+        primitives::ByteStream,
+    };
     use http::Method;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
@@ -584,6 +588,10 @@ mod tests {
             && operations["activeTasks"].as_u64() == Some(1)
             && operations["retryingTasks"].as_u64() == Some(0)
             && operations["activeBySource"]["admin"].as_u64() == Some(1)
+    }
+
+    fn is_service_unavailable_put(error: &SdkError<PutObjectError>) -> bool {
+        error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
     }
 
     async fn replacement_recovery_status(
@@ -1342,18 +1350,41 @@ mod tests {
             "replacement target must retain only its preformatted topology identity"
         );
 
-        let outage_key = "cluster/written-while-node-down.bin";
         let outage_payload_seed = 0xf1;
-        timeout(
-            Duration::from_secs(30),
-            clients[2]
-                .put_object()
-                .bucket(bucket)
-                .key(outage_key)
-                .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
-                .send(),
-        )
-        .await??;
+        let max_outage_write_attempts = if outage_target_manifest_required {
+            1
+        } else {
+            topology.total_drives().max(1)
+        };
+        let mut outage_key = None;
+        for attempt in 0..max_outage_write_attempts {
+            let candidate_key = if max_outage_write_attempts == 1 {
+                "cluster/written-while-node-down.bin".to_string()
+            } else {
+                format!("cluster/written-while-node-down-{attempt:04}.bin")
+            };
+            let put_result = timeout(
+                Duration::from_secs(30),
+                clients[2]
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&candidate_key)
+                    .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
+                    .send(),
+            )
+            .await;
+            match put_result {
+                Ok(Ok(_)) => {
+                    outage_key = Some(candidate_key);
+                    break;
+                }
+                Ok(Err(error)) if !outage_target_manifest_required && is_service_unavailable_put(&error) => {}
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let outage_key = outage_key
+            .ok_or_else(|| format!("no online pool accepted an outage object after {max_outage_write_attempts} candidates"))?;
 
         let mut outage_peer_erasure_indices = HashSet::new();
         for (node_index, node) in cluster.nodes.iter().enumerate() {
@@ -1361,7 +1392,7 @@ mod tests {
                 continue;
             }
             for (drive_index, drive) in node.data_dirs.iter().enumerate() {
-                let census = census_object_version_on_disk(Path::new(drive), bucket, outage_key, None)?;
+                let census = census_object_version_on_disk(Path::new(drive), bucket, &outage_key, None)?;
                 if !census.has_xl_meta {
                     continue;
                 }
@@ -1457,7 +1488,7 @@ mod tests {
                 "non-admin Heal is disabled, so the replacement target must remain empty before the explicit root heal"
             );
             assert!(
-                !census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?.has_xl_meta,
+                !census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?.has_xl_meta,
                 "the object written during the outage must be absent before the explicit root heal"
             );
             assert_eq!(
@@ -1744,10 +1775,10 @@ mod tests {
         loop {
             let baseline_recovered = metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len();
             let outage_recovered =
-                !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, outage_key);
+                !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, &outage_key);
             if baseline_recovered && outage_recovered {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
+                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata_matches = match &expected_pool_metadata {
                     Some(expected) => {
                         census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?
@@ -1764,7 +1795,7 @@ mod tests {
             }
             if Instant::now() >= heal_deadline {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
+                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata =
                     census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
                 let final_status = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key)
@@ -1802,7 +1833,7 @@ mod tests {
                 expected.key
             );
         }
-        let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
+        let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
         if outage_target_manifest_required {
             assert!(
                 outage_census.is_complete(),
@@ -1825,7 +1856,7 @@ mod tests {
             .iter()
             .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
-        assert!(expected_keys.insert(outage_key.to_string()));
+        assert!(expected_keys.insert(outage_key.clone()));
         let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
@@ -1849,7 +1880,7 @@ mod tests {
                 }));
             }
         }
-        let response = target_client.get_object().bucket(bucket).key(outage_key).send().await?;
+        let response = target_client.get_object().bucket(bucket).key(&outage_key).send().await?;
         let actual = response.body.collect().await?.into_bytes();
         let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
         assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
@@ -1860,7 +1891,7 @@ mod tests {
                 "expected_sha256": sha256_hex(&expected_outage_body),
                 "actual_sha256": sha256_hex(&actual),
                 "expected_physical": null,
-                "physical": census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?,
+                "physical": census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?,
             }));
         }
 
