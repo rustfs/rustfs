@@ -822,7 +822,7 @@ async fn scan_exact_free_version_targets(
     let mut targets = Vec::new();
     for pool in &api.pools {
         for set in &pool.disk_set {
-            let versions = match set.load_file_info_versions_exact(&oi.bucket, &oi.name).await {
+            let versions = match set.load_file_info_versions_for_tier_cleanup(&oi.bucket, &oi.name).await {
                 Ok(Some(versions)) => versions,
                 Ok(None) => continue,
                 Err(err) if is_err_strict_volume_not_found(&err) => continue,
@@ -8098,6 +8098,75 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_overwrite_cleanup_retains_a_minority_live_remote_reference() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("overwrite-minority-{}", Uuid::new_v4());
+        let object = "still-referenced";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity.clone())).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list persisted cleanup owner");
+        let owner = page.items.into_iter().find(|oi| oi.bucket == bucket).expect("seeded owner");
+        backend
+            .set_put_remote_version(Some(owner.transitioned_object.version_id.clone()))
+            .await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        lease
+            .put(
+                &owner.transitioned_object.name,
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"old")),
+                3,
+            )
+            .await
+            .expect("seed referenced remote bytes");
+        drop(lease);
+        let path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let cleanup_metadata = fs::read(&path).await.expect("save completed replica");
+        let mut live = FileInfo::new(object, 2, 2);
+        live.volume = bucket.clone();
+        live.erasure.index = 1;
+        live.data_dir = Some(Uuid::new_v4());
+        live.mod_time = Some(OffsetDateTime::now_utc());
+        live.size = 3;
+        live.add_object_part(1, "149603e6c03516362a8da23f624db945".to_string(), 3, live.mod_time, 3, None, None);
+        live.transition_status = TRANSITION_COMPLETE.to_string();
+        live.transition_tier = "WARM".to_string();
+        live.transitioned_objname = owner.transitioned_object.name.clone();
+        live.transition_version = Some(owner.transitioned_object.version_id.clone());
+        live.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::insert_str(&mut live.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity);
+        let mut old_metadata = FileMeta::new();
+        old_metadata.add_version(live).expect("prepare minority live source");
+        fs::write(&path, old_metadata.marshal_msg().expect("encode live source"))
+            .await
+            .expect("model one replica retained by an interrupted overwrite");
+
+        let err = super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+            .await
+            .expect_err("quorum free versions cannot erase a minority live reference");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&owner.transitioned_object.name).await);
+
+        fs::write(&path, cleanup_metadata)
+            .await
+            .expect("complete replica convergence");
+        assert!(
+            super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+                .await
+                .expect("converged cleanup can delete the exact remote owner")
+        );
+        assert_eq!(backend.remove_count().await, 1);
+        assert!(!backend.contains(&owner.transitioned_object.name).await);
     }
 
     #[cfg(feature = "test-util")]
