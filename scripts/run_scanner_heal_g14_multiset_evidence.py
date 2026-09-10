@@ -48,6 +48,11 @@ def positive_int(value: Any, name: str, minimum: int = 1) -> int:
     return value
 
 
+def reject_non_measured_markers(payload: dict[str, Any], label: str) -> None:
+    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+        require(payload.get(marker) is not True, f"{label} is {marker}")
+
+
 def parse_case_dir_arg(value: str) -> tuple[str | None, Path]:
     if "=" in value:
         case_id, raw_path = value.split("=", 1)
@@ -72,8 +77,7 @@ def proof_case_artifact_path(proof_path: Path, sample: dict[str, Any], index: in
 
 def load_proof(path: Path, source_revision: str) -> dict[str, Any]:
     proof = read_json(path)
-    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
-        require(proof.get(marker) is not True, f"G14 proof is {marker}")
+    reject_non_measured_markers(proof, "G14 proof")
     require(proof.get("schema") == 1, "unsupported G14 proof schema")
     require(proof.get("evidence_type") == "measured", "G14 proof must be measured")
     require(proof.get("source_revision") == source_revision, "G14 proof source revision mismatch")
@@ -110,8 +114,7 @@ def load_proof(path: Path, source_revision: str) -> dict[str, Any]:
                 f"G14 case evidence {index} measurement window mismatch")
         artifact_payload = read_json(artifact)
         require(isinstance(artifact_payload, dict), f"G14 case evidence {index} artifact must be a JSON object")
-        for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
-            require(artifact_payload.get(marker) is not True, f"G14 case evidence {index} artifact is {marker}")
+        reject_non_measured_markers(artifact_payload, f"G14 case evidence {index} artifact")
         require(artifact_payload.get("case") == sample["case"], f"G14 case evidence {index} artifact case mismatch")
         if "source_revision" in artifact_payload:
             require(artifact_payload["source_revision"] == source_revision,
@@ -127,6 +130,10 @@ def load_case_directory(raw_value: str, source_revision: str) -> dict[str, Any]:
     require(directory.is_dir(), f"G14 case directory is missing: {directory}")
     run = read_json(directory / "run.json")
     execution = read_json(directory / "execution.json")
+    require(isinstance(run, dict), "G14 case run must be a JSON object")
+    require(isinstance(execution, dict), "G14 case execution must be a JSON object")
+    reject_non_measured_markers(run, "G14 case run")
+    reject_non_measured_markers(execution, "G14 case execution")
     require(run.get("schema") == 1, "G14 case run schema mismatch")
     require(isinstance(run.get("run_id"), str) and re.fullmatch(r"[0-9a-f]{32}", run["run_id"]),
             "invalid G14 case run id")
@@ -156,6 +163,7 @@ def load_case_directory(raw_value: str, source_revision: str) -> dict[str, Any]:
     if expected_case is not None:
         require(oracle.get("case") == expected_case, "G14 case directory case id mismatch")
     require(oracle.get("source_revision") == source_revision, "G14 oracle source revision mismatch")
+    reject_non_measured_markers(oracle, "G14 oracle")
     require(oracle.get("evidence") in {"process-restart", "process-crash-restart"}, "G14 oracle has wrong evidence type")
     topology = oracle.get("topology")
     require(isinstance(topology, dict), "G14 oracle missing topology")
@@ -503,6 +511,27 @@ def run_self_test() -> None:
             require("multi-set/multi-pool" in str(err), "wrong self-test failure for missing multi-pool case")
         else:
             raise ValueError("self-test accepted case evidence without multi-pool proof")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        multi_pool = write_self_test_case_dir(root, source_revision, "background-target-crash-ec8-4-multi-pool", 3, 3)
+        oracle_path = multi_pool / "background-target-crash-ec8-4-multi-pool.json"
+        oracle = read_json(oracle_path)
+        oracle["fixture_only"] = True
+        write_json(oracle_path, oracle)
+        execution = read_json(multi_pool / "execution.json")
+        execution["artifacts"][oracle_path.name] = digest(oracle_path)
+        write_json(multi_pool / "execution.json", execution)
+        try:
+            build_descriptor(parse_args([
+                "--case-dir", f"background-target-crash-ec8-4-multi-pool={multi_pool}",
+                "--out-dir", str(root / "out"),
+            ]))
+        except ValueError as err:
+            require("G14 oracle is fixture_only" in str(err), "wrong self-test failure for fixture oracle")
+        else:
+            raise ValueError("self-test accepted fixture-only G14 case oracle")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

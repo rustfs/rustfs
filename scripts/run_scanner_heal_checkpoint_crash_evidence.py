@@ -32,6 +32,11 @@ def positive_int(value: Any, name: str, minimum: int = 1) -> int:
     return value
 
 
+def reject_non_measured_markers(payload: dict[str, Any], label: str) -> None:
+    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+        require(payload.get(marker) is not True, f"{label} is {marker}")
+
+
 def timestamp(value: Any, name: str) -> str:
     require(isinstance(value, str) and value.endswith("Z"), f"invalid {name}")
     datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -63,6 +68,7 @@ def load_reports(directory: Path) -> list[dict[str, Any]]:
         "raw_page_index_indexed_entries",
     }
     for index, report in enumerate(reports):
+        reject_non_measured_markers(report, f"round {index}")
         require(report.get("schema") == 1, f"round {index} has wrong schema")
         require(report.get("round") == index, f"round {index} order mismatch")
         for key in (
@@ -88,8 +94,7 @@ def load_reports(directory: Path) -> list[dict[str, Any]]:
 
 def require_measured_manifest(path: Path, source_revision: str) -> dict[str, Any]:
     manifest = read_json(path)
-    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
-        require(manifest.get(marker) is not True, f"checkpoint/crash manifest is {marker}")
+    reject_non_measured_markers(manifest, "checkpoint/crash manifest")
     require(manifest.get("schema") == 1, "unsupported manifest schema")
     require(manifest.get("evidence_type") == "measured", "manifest must be measured")
     require(manifest.get("source_revision") == source_revision, "manifest source revision mismatch")
@@ -108,8 +113,7 @@ def derived_measured_manifest(directory: Path, source_revision: str, reports: li
     request_path = directory / "request.json"
     request = read_json(request_path)
     require(isinstance(request, dict), "diagnostic request must be a JSON object")
-    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
-        require(request.get(marker) is not True, f"diagnostic request is {marker}")
+    reject_non_measured_markers(request, "diagnostic request")
     objects = positive_int(request.get("objects"), "request.objects")
     raw_entry_budget = positive_int(request.get("raw_entry_budget"), "request.raw_entry_budget")
     final_round = positive_int(request.get("round"), "request.round", 0)
@@ -422,6 +426,24 @@ def run_self_test() -> None:
             require("convergence" in str(err), "wrong self-test failure for non-converged diagnostic")
         else:
             raise ValueError("self-test accepted non-converged diagnostic")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        manifest, diagnostic = write_self_test_inputs(root, source_revision)
+        report = read_json(diagnostic / "round-0.json")
+        report["synthetic"] = True
+        write_json(diagnostic / "round-0.json", report)
+        try:
+            build_descriptor(parse_args([
+                "--manifest", str(manifest),
+                "--diagnostic-dir", str(diagnostic),
+                "--out-dir", str(root / "out"),
+            ]))
+        except ValueError as err:
+            require("round 0 is synthetic" in str(err), "wrong self-test failure for synthetic round report")
+        else:
+            raise ValueError("self-test accepted synthetic diagnostic round report")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
