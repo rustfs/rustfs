@@ -50,7 +50,7 @@ use crate::services::notification_sys::{
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
 use crate::set_disk::{
     SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_lock_optimization_enabled, is_object_lock_diag_enabled, same_distributed_lock_domain,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
 use crate::storage_api_contracts::{
     list::ListOperations as _,
@@ -3440,10 +3440,15 @@ impl ECStore {
 
         for pool in &self.pools {
             let hashed_set = pool.get_disks_by_key(object);
-            let lock_domain_already_held = !distributed
-                || locked_sets
-                    .iter()
-                    .any(|locked_set| same_distributed_lock_domain(&locked_set.lockers, &hashed_set.lockers));
+            let mut lock_domain_already_held = !distributed;
+            if !lock_domain_already_held {
+                for locked_set in &locked_sets {
+                    if locked_set.shares_namespace_lock_domain(&hashed_set).await {
+                        lock_domain_already_held = true;
+                        break;
+                    }
+                }
+            }
             if lock_domain_already_held {
                 continue;
             }
@@ -3500,10 +3505,15 @@ impl ECStore {
         let mut locked_sets = vec![fixed_set];
         for pool in &self.pools {
             for set in &pool.disk_set {
-                let lock_domain_already_held = !distributed
-                    || locked_sets
-                        .iter()
-                        .any(|locked_set| same_distributed_lock_domain(&locked_set.lockers, &set.lockers));
+                let mut lock_domain_already_held = !distributed;
+                if !lock_domain_already_held {
+                    for locked_set in &locked_sets {
+                        if locked_set.shares_namespace_lock_domain(set).await {
+                            lock_domain_already_held = true;
+                            break;
+                        }
+                    }
+                }
                 if lock_domain_already_held {
                     continue;
                 }
@@ -3581,10 +3591,15 @@ impl ECStore {
         let mut locked_sets = vec![fixed_set];
         for pool in &self.pools {
             for set in &pool.disk_set {
-                let lock_domain_already_held = !distributed
-                    || locked_sets
-                        .iter()
-                        .any(|locked_set| same_distributed_lock_domain(&locked_set.lockers, &set.lockers));
+                let mut lock_domain_already_held = !distributed;
+                if !lock_domain_already_held {
+                    for locked_set in &locked_sets {
+                        if locked_set.shares_namespace_lock_domain(set).await {
+                            lock_domain_already_held = true;
+                            break;
+                        }
+                    }
+                }
                 if lock_domain_already_held {
                     continue;
                 }
@@ -3667,11 +3682,15 @@ impl ECStore {
                 .get(pool_idx)
                 .ok_or_else(|| Error::other(format!("invalid data movement publication pool {pool_idx}")))?;
             let set = pool.get_disks_by_key(object);
-            let lock_domain_already_held = !locked_sets.is_empty()
-                && (!distributed
-                    || locked_sets.iter().any(|locked_set: &Arc<crate::set_disk::SetDisks>| {
-                        same_distributed_lock_domain(&locked_set.lockers, &set.lockers)
-                    }));
+            let mut lock_domain_already_held = !locked_sets.is_empty() && !distributed;
+            if !lock_domain_already_held {
+                for locked_set in &locked_sets {
+                    if locked_set.shares_namespace_lock_domain(&set).await {
+                        lock_domain_already_held = true;
+                        break;
+                    }
+                }
+            }
             if lock_domain_already_held {
                 continue;
             }
@@ -5717,6 +5736,7 @@ mod tests {
         GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource, clear_get_object_body_cache_hook,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
     };
+    use crate::set_disk::same_distributed_lock_domain;
     use crate::set_disk::{SetDisks, disk_call_counters};
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
