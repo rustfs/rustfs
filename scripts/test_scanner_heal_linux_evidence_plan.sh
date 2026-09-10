@@ -49,6 +49,73 @@ test -s "$PLAN_PATH"
 rg -q '"evidence_type": "plan_only"' "$PLAN_PATH"
 rg -q '"stop_on_product_failure": true' "$PLAN_PATH"
 
+if "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" \
+  --phase functional \
+  --source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --status-root "$TMP_DIR/missing-run" >"$TMP_DIR/status-missing.json"; then
+  echo "missing evidence status should fail closed" >&2
+  exit 1
+fi
+rg -q '"decision": "blocked"' "$TMP_DIR/status-missing.json"
+rg -q '"release_approved": false' "$TMP_DIR/status-missing.json"
+rg -q '"next_step"' "$TMP_DIR/status-missing.json"
+
+if "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" \
+  --phase functional \
+  --status-root "$TMP_DIR/missing-run" \
+  --run-preflight >/dev/null 2>"$TMP_DIR/status-mode.err"; then
+  echo "status mode should reject preflight execution" >&2
+  exit 1
+fi
+rg -q "status-root cannot be combined" "$TMP_DIR/status-mode.err"
+
+"${RUSTFS_PYTHON_BIN:-python3}" - "$RUNNER" "$TMP_DIR/complete-run" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+runner = pathlib.Path(sys.argv[1])
+run_root = pathlib.Path(sys.argv[2])
+plan = json.loads(subprocess.check_output([
+    sys.executable,
+    str(runner),
+    "--phase",
+    "functional",
+    "--source-revision",
+    "a" * 40,
+    "--format",
+    "json",
+], text=True))
+for stage in plan["stages"]:
+    for step in stage["steps"]:
+        for output in step.get("expected_outputs", []):
+            path = pathlib.Path(output.replace("$RUN_ROOT", str(run_root)))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n")
+status = json.loads(subprocess.check_output([
+    sys.executable,
+    str(runner),
+    "--phase",
+    "functional",
+    "--source-revision",
+    "a" * 40,
+    "--status-root",
+    str(run_root),
+], text=True))
+assert status["decision"] == "complete"
+assert status["release_approved"] is False
+assert status["artifact_totals"]["missing"] == 0
+PY
+
+if "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" \
+  --phase performance \
+  --run-preflight >/dev/null 2>"$TMP_DIR/no-preflight.err"; then
+  echo "preflight execution without the preflight stage should fail" >&2
+  exit 1
+fi
+rg -q "requires the preflight stage" "$TMP_DIR/no-preflight.err"
+
 if "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" --source-revision bad >/dev/null 2>"$TMP_DIR/bad.err"; then
   echo "invalid source revision should fail" >&2
   exit 1
