@@ -375,6 +375,17 @@ scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
 The plan is only an execution manifest. Its `evidence_type` is `plan_only`, and
 it cannot satisfy any Gxx/Wxx/Rxx gate. Use `--run-preflight` only for the
 lightweight registry and runner self-tests before starting a long Linux run.
+After or during a Linux run, check which planned artifacts are still missing
+without approving the release bundle:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
+  --status-root /path/to/run-root --format json
+```
+
+The status command exits nonzero while evidence is missing or malformed and
+keeps `release_approved: false`; use its `pending_gates` and `next_step` fields
+for issue writeback and failure triage.
 
 Lane descriptors can be assembled into that bundle with:
 
