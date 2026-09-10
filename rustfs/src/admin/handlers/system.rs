@@ -73,6 +73,7 @@ const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/r
 const SITE_REPLICATION_REPAIR_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair";
 const SITE_REPLICATION_REPAIR_STATUS_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair/status";
 const IAM_POLICY_ATTACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/attach";
+const DATA_USAGE_INFO_ROUTE: &str = "/rustfs/admin/v3/datausageinfo";
 const IAM_POLICY_DETACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/detach";
 const IAM_POLICY_ENTITIES_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy-entities";
 const IAM_ACCESS_KEYS_BULK_ROUTE: &str = "/rustfs/admin/v3/list-access-keys-bulk";
@@ -1077,12 +1078,25 @@ fn advertised_admin_capabilities() -> Vec<AdvertisedAdminCapability> {
         ("admin.account.mfa", HttpMethod::Get, ACCOUNT_MFA_ROUTE),
         ("admin.mfa.challenge", HttpMethod::Get, MFA_CHALLENGE_ROUTE),
         ("admin.user.mfa", HttpMethod::Get, USER_MFA_ROUTE),
+        // `rc du` is gated on this name. Before it was advertised the client
+        // inferred it from a `1.0.0-rc.` version prefix, which no longer
+        // matches once the server reports `1.0.0` (backlog#2367 E-2).
+        ("admin.data-usage", HttpMethod::Get, DATA_USAGE_INFO_ROUTE),
     ]
     .into_iter()
     .map(|(name, method, route)| AdvertisedAdminCapability {
         name,
         status: admin_route_capability(method, route),
     })
+    .chain(std::iter::once(AdvertisedAdminCapability {
+        // `rc watch` streams `GET /{bucket}?events=`, a misc extension route
+        // dispatched by `admin::router` rather than an admin policy route,
+        // so its status is not an inventory lookup (same version-prefix
+        // inference on the client as `admin.data-usage`).
+        name: "listen_notification",
+        status: CapabilityStatus::supported()
+            .with_reason("bucket listen notification (?events=) is dispatched by the admin router"),
+    }))
     .collect()
 }
 
@@ -1258,6 +1272,9 @@ mod tests {
             "admin.iam.access-keys-bulk",
             "admin.iam.access-keys-bulk.ldap",
             "admin.iam.access-keys-bulk.openid",
+            // rc pinned these two by version prefix until 1.0.0 (backlog#2367 E-2).
+            "admin.data-usage",
+            "listen_notification",
         ];
         for name in expected_supported {
             let entry = response

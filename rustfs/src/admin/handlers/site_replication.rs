@@ -3853,6 +3853,30 @@ fn pending_remote_peer_ids(peers: &BTreeMap<String, PeerInfo>, local_peer: &Peer
         .collect()
 }
 
+/// The peers a pending remove / rotation still has to notify: every remote
+/// peer that has not acked, with the local site excluded by the same
+/// deployment-id-or-endpoint identity [`pending_remote_peer_ids`] finalizes
+/// on. The tick-driven `local_peer` carries the node's own listen address
+/// rather than the registered site endpoint (and a handler's carries the
+/// request `Host`, which behind a load balancer differs too), so an
+/// endpoint-only check dialed the site itself, timed out against the
+/// lifecycle lock this very request holds, and reported the operation as
+/// `Partial` (backlog#2367 A-4).
+fn pending_peers_awaiting_notification<'a>(
+    peers: &'a BTreeMap<String, PeerInfo>,
+    local_peer: &PeerInfo,
+    acked_deployment_ids: &BTreeSet<String>,
+) -> Vec<&'a PeerInfo> {
+    peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                && !acked_deployment_ids.contains(&peer.deployment_id)
+        })
+        .collect()
+}
+
 fn pending_all_remote_peers_acked(
     peers: &BTreeMap<String, PeerInfo>,
     local_peer: &PeerInfo,
@@ -4068,12 +4092,7 @@ async fn drive_pending_rotation(pending: &PendingRotation, local_peer: &PeerInfo
     };
 
     let mut peer_errors = Vec::new();
-    for peer in pending.peers.values() {
-        if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-            || pending.acked_deployment_ids.contains(&peer.deployment_id)
-        {
-            continue;
-        }
+    for peer in pending_peers_awaiting_notification(&pending.peers, local_peer, &pending.acked_deployment_ids) {
         // A superseded join returns BEFORE `apply_iam`, so a no-op answer
         // means the peer never installed the new secret. Acking it would
         // finalize a rotation half the mesh cannot authenticate against
@@ -4376,12 +4395,9 @@ async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerI
     if secret_candidates.is_empty() {
         peer_errors.push("site replication service account secret unavailable".to_string());
     } else {
-        for peer in pending_remove.original_peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
-            {
-                continue;
-            }
+        for peer in
+            pending_peers_awaiting_notification(&pending_remove.original_peers, local_peer, &pending_remove.acked_deployment_ids)
+        {
             if let Err(err) = PeerAdminRequest::put(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_REMOVE_PATH,
@@ -4931,7 +4947,7 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         return Ok(());
     };
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    ensure_site_replication_bucket_targets_with_runtime(
+    let written = ensure_site_replication_bucket_targets_with_runtime(
         bucket,
         &runtime.state,
         &runtime.local_peer,
@@ -4939,7 +4955,11 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         &runtime.service_account_secret_key,
         expected_incarnation_id,
     )
-    .await
+    .await?;
+    if written {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_targets", false).await;
+    }
+    Ok(())
 }
 
 async fn ensure_site_replication_bucket_setup(bucket: &str) -> S3Result<bool> {
@@ -5009,6 +5029,9 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
+    if removed > 0 {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_cleanup", true).await;
+    }
     Ok(removed)
 }
 
@@ -5325,7 +5348,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         let local_peer = current_local_runtime_peer(&target_state);
         let _targets_guard = lock_bucket_targets_metadata(&bucket.name).await;
         let replication_config = bucket_replication_config_for_target_refresh(&bucket.name).await?;
-        ensure_site_replication_bucket_targets_with_runtime(
+        let written = ensure_site_replication_bucket_targets_with_runtime(
             &bucket.name,
             &target_state,
             &local_peer,
@@ -5334,6 +5357,9 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             expected_incarnation_id,
         )
         .await?;
+        if written {
+            reload_bucket_metadata_on_peers(&bucket.name, "site_replication_endpoint_refresh", false).await;
+        }
 
         rewritten.push(bucket.name.clone());
 
@@ -5377,16 +5403,12 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
         ..Default::default()
     };
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
-        Err(err) => {
-            entry.status = "failed".to_string();
-            entry.err_detail = summarize_peer_error_detail(&err.to_string());
-            return entry;
-        }
-    };
-    let targets = match metadata_sys::list_bucket_targets(bucket).await {
-        Ok(targets) => targets,
+    // Read what is persisted, not this node's cache: the wiring may have
+    // been written by another node moments ago (`start_site_bucket_resync`
+    // already reads its targets from disk), and an operator resync must see
+    // the same records the drive will use.
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             entry.status = "failed".to_string();
             entry.err_detail = summarize_peer_error_detail(&err.to_string());
@@ -5417,6 +5439,15 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
     entry
 }
 
+/// The persisted replication configuration and bucket targets, bypassing the
+/// node-local metadata cache. `ConfigNotFound` surfaces for a bucket without
+/// a replication configuration, matching the cached read's error.
+async fn site_bucket_resync_persisted_wiring(bucket: &str) -> Result<(ReplicationConfiguration, BucketTargets), StorageError> {
+    let metadata = metadata_sys::get_config_from_disk(bucket).await?;
+    let config = metadata.replication_config.ok_or(StorageError::ConfigNotFound)?;
+    Ok((config, metadata.bucket_target_config.unwrap_or_default()))
+}
+
 async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
@@ -5439,17 +5470,8 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         }
     };
 
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
-        Err(err) => {
-            bucket_status.status = "failed".to_string();
-            bucket_status.err_detail = err.to_string();
-            return bucket_status;
-        }
-    };
-
-    let targets = match metadata_sys::list_bucket_targets_from_disk(bucket).await {
-        Ok(targets) => targets,
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             bucket_status.status = "failed".to_string();
             bucket_status.err_detail = err.to_string();
@@ -6045,6 +6067,10 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     }
     drop(lifecycle_guard);
     drop(targets_guard);
+
+    if !skip_config_write {
+        reload_bucket_metadata_on_peers(&item.bucket, "site_replication_bucket_meta", item.r#type == "lc-config").await;
+    }
 
     if item.r#type == "replication-config" {
         // Rebuild the local outbound rules too: a site that joined an already-replicated
@@ -7432,6 +7458,7 @@ impl Operation for SRPeerBucketOpsHandler {
                 )
                 .await
                 .map_err(ApiError::from)?;
+                reload_bucket_metadata_on_peers(&bucket, "site_replication_make_bucket", false).await;
             }
             "configure-replication" => {
                 store
@@ -15433,5 +15460,55 @@ mod tests {
             !apply.contains("metadata_sys::update_if_incarnation(&item.bucket"),
             "no replicated config write may bypass the source stamp"
         );
+    }
+
+    /// backlog#2367 A-4: `remove --all` notified "the peer" at the site's own
+    /// registered endpoint. The tick-driven local peer carries the node's
+    /// listen address, so an endpoint-only self check let the loop dial the
+    /// site itself and report `Partial: failed to notify 1 peer(s)`.
+    #[test]
+    fn pending_notifications_skip_the_local_site_by_deployment_id() {
+        let local_registered = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://site-b.example.com:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "http://site-a.example.com:9000")
+        };
+        let acked = PeerInfo {
+            deployment_id: "site-c".to_string(),
+            ..peer("site-c", "http://site-c.example.com:9000")
+        };
+        let peers = BTreeMap::from([
+            (local_registered.deployment_id.clone(), local_registered.clone()),
+            (remote.deployment_id.clone(), remote),
+            (acked.deployment_id.clone(), acked.clone()),
+        ]);
+        let acked_ids = BTreeSet::from([acked.deployment_id]);
+
+        // The tick resolves the local peer from its own listen address.
+        let local_from_tick = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://127.0.0.1:9000")
+        };
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_from_tick, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"], "the local site and the acked peer are never dialed");
+
+        // Identity stays consistent with what finalization waits for.
+        assert_eq!(
+            pending_remote_peer_ids(&peers, &local_from_tick),
+            BTreeSet::from(["site-a".to_string(), "site-c".to_string()])
+        );
+
+        // A handler-resolved local peer (registered endpoint) agrees.
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_registered, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"]);
     }
 }
