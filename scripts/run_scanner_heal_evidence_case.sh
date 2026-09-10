@@ -28,6 +28,9 @@ The script intentionally runs a single case, not the release pseudo-case. After
 a successful case run it verifies that the release gate still remains blocked.
 Set RUSTFS_E2E_TEST_PORT_MIN and RUSTFS_E2E_TEST_PORT_RANGE to move the e2e
 port allocator when the default 20000..30000 test range is unavailable.
+Set RUSTFS_SCANNER_HEAL_SKIP_CLEAN=1 to reuse an existing cargo target directory
+while narrowing a case locally; release evidence should keep the default clean
+build.
 USAGE
 }
 
@@ -109,7 +112,7 @@ apply_runtime_profile() {
             export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-180}"
             ;;
         background-ec8-4-multi-pool)
-            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-16}"
+            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-96}"
             export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-4194304}"
             export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-240}"
             ;;
@@ -255,18 +258,31 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "commit tracked source changes before creating evidence" >&2
     exit 1
 fi
+NOFILE_SOFT="$(ulimit -Sn)"
+NOFILE_HARD="$(ulimit -Hn)"
+if [[ "$NOFILE_SOFT" =~ ^[0-9]+$ && "$NOFILE_HARD" =~ ^[0-9]+$ && "$NOFILE_SOFT" -lt 65535 ]]; then
+    if [[ "$NOFILE_HARD" -ge 65535 ]]; then
+        ulimit -n 65535 || true
+    elif [[ "$NOFILE_HARD" -gt "$NOFILE_SOFT" ]]; then
+        ulimit -n "$NOFILE_HARD" || true
+    fi
+fi
 mkdir -p "$(dirname "$RUN_DIR")"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-scanner-heal-evidence.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-}"
-cargo clean -p rustfs
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+DEBUG_DIR="$TARGET_DIR/debug"
+if [[ "${RUSTFS_SCANNER_HEAL_SKIP_CLEAN:-0}" != "1" ]]; then
+    cargo clean -p rustfs
+fi
 if [[ -n "$BUILD_FEATURES" ]]; then
     cargo build --locked -p rustfs --bins --features "$BUILD_FEATURES"
 else
     cargo build --locked -p rustfs --bins
 fi
-printf '%s' "$BUILD_FEATURES" >"$ROOT/target/debug/rustfs.features"
+printf '%s' "$BUILD_FEATURES" >"$DEBUG_DIR/rustfs.features"
 
 LISTING_TMP="$TMP_DIR/listing.json"
 NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
@@ -278,12 +294,12 @@ cargo nextest list --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --message-
 TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 
 export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-default}"
-"$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$ROOT/target/debug/rustfs" "$TEST_BINARY"
+"$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$DEBUG_DIR/rustfs" "$TEST_BINARY"
 cp "$LISTING_TMP" "$RUN_DIR/listing.json"
 export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/e2e-logs}"
 mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
-JUNIT_PATH="$ROOT/target/nextest/$PROFILE/junit.xml"
+JUNIT_PATH="$TARGET_DIR/nextest/$PROFILE/junit.xml"
 rm -f "$JUNIT_PATH"
 set +e
 NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
