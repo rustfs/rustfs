@@ -50,6 +50,10 @@ def command(*parts: str) -> list[str]:
     return list(parts)
 
 
+def expected_outputs(*parts: str) -> list[str]:
+    return list(parts)
+
+
 def git_output(*args: str) -> str:
     return subprocess.check_output(command("git", *args), cwd=ROOT, text=True).strip()
 
@@ -166,6 +170,14 @@ def concrete_case_steps(registry: dict[str, Any]) -> list[dict[str, Any]]:
                     f"$RUN_ROOT/cases/{case_id}",
                 )
             ],
+            "expected_outputs": expected_outputs(
+                f"$RUN_ROOT/cases/{case_id}/run.json",
+                f"$RUN_ROOT/cases/{case_id}/execution.json",
+                f"$RUN_ROOT/cases/{case_id}/listing.json",
+                f"$RUN_ROOT/cases/{case_id}/junit.xml",
+                f"$RUN_ROOT/cases/{case_id}/{cases[case_id]['oracle']}",
+                f"$RUN_ROOT/cases/{case_id}/release-status.json",
+            ),
         }
         for case_id in ordered_cases
     ]
@@ -189,6 +201,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/authority",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/authority/release-bundle-authority.json"),
         },
         {
             "id": "checkpoint-and-restart",
@@ -204,6 +217,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/checkpoint",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/checkpoint/release-bundle-checkpoint-crash.json"),
         },
         {
             "id": "status-and-outcome",
@@ -231,6 +245,12 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/status-outcome",
                 ),
             ],
+            "expected_outputs": expected_outputs(
+                "$RUN_ROOT/raw/status-outcome/status-outcome.json",
+                "$RUN_ROOT/raw/status-outcome/status-compat.json",
+                "$RUN_ROOT/raw/status-outcome/disposition.json",
+                "$RUN_ROOT/descriptors/status-outcome/release-bundle-status-outcome.json",
+            ),
         },
         {
             "id": "ec8-4-multiset-descriptor",
@@ -248,6 +268,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/g14",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/g14/release-bundle-g14.json"),
         },
         {
             "id": "w16-recovery-intent",
@@ -260,6 +281,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/w16",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/w16/release-bundle-w16.json"),
         },
         {
             "id": "mrf-responsibility",
@@ -272,6 +294,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/w13",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/w13/release-bundle-w13.json"),
         },
         {
             "id": "mixed-version-rollback",
@@ -300,6 +323,11 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/legacy-rollback",
                 ),
             ],
+            "expected_outputs": expected_outputs(
+                "$RUN_ROOT/g09/release-bundle-g09.json",
+                "$RUN_ROOT/descriptors/scoped-ack/release-bundle-scoped-ack.json",
+                "$RUN_ROOT/descriptors/legacy-rollback/release-bundle-legacy-rollback.json",
+            ),
         },
         {
             "id": "maintenance-producers",
@@ -315,6 +343,7 @@ def descriptor_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/maintenance",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/maintenance/release-bundle-maintenance.json"),
         },
     ]
 
@@ -339,6 +368,7 @@ def performance_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/abba/data",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/abba/out/report.json"),
         },
         {
             "id": "scheduler-pressure",
@@ -364,6 +394,7 @@ def performance_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/descriptors/scheduler-pressure",
                 )
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/scheduler-pressure/release-bundle-scheduler-pressure.json"),
         },
     ]
 
@@ -399,6 +430,7 @@ def bundle_steps() -> list[dict[str, Any]]:
                     "$RUN_ROOT/release-bundle/release-evidence.json",
                 ),
             ],
+            "expected_outputs": expected_outputs("$RUN_ROOT/release-bundle/release-evidence.json"),
         }
     ]
 
@@ -469,6 +501,109 @@ def iter_preflight_commands(plan: dict[str, Any]) -> list[list[str]]:
     return commands
 
 
+def render_run_root_path(value: str, run_root: Path) -> Path:
+    rendered = value.replace("$RUN_ROOT", str(run_root))
+    return Path(rendered)
+
+
+def check_expected_output(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"path": str(path), "status": "missing"}
+    if not path.is_file():
+        return {"path": str(path), "status": "invalid", "error": "expected a file"}
+    size = path.stat().st_size
+    if size <= 0:
+        return {"path": str(path), "status": "empty", "bytes": size}
+    return {"path": str(path), "status": "present", "bytes": size}
+
+
+def covered_gates(step: dict[str, Any]) -> list[str]:
+    covers = step.get("covers")
+    if not isinstance(covers, dict):
+        return []
+    gate = covers.get("gate")
+    gates = covers.get("gates")
+    if isinstance(gate, str):
+        return [gate]
+    if isinstance(gates, list):
+        return [item for item in gates if isinstance(item, str)]
+    return []
+
+
+def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
+    run_root = run_root.resolve()
+    stage_statuses = []
+    totals = {"present": 0, "missing": 0, "empty": 0, "invalid": 0, "expected": 0}
+    pending_gates: set[str] = set()
+    next_step: dict[str, Any] | None = None
+    for stage in plan["stages"]:
+        step_statuses = []
+        for step in stage["steps"]:
+            outputs = [
+                check_expected_output(render_run_root_path(path, run_root))
+                for path in step.get("expected_outputs", [])
+            ]
+            counts = {"present": 0, "missing": 0, "empty": 0, "invalid": 0}
+            for output in outputs:
+                counts[output["status"]] += 1
+            for key in counts:
+                totals[key] += counts[key]
+            totals["expected"] += len(outputs)
+            if not outputs:
+                status = "not_tracked"
+            elif counts["invalid"] or counts["empty"]:
+                status = "invalid"
+            elif counts["missing"]:
+                status = "pending" if counts["present"] == 0 else "partial"
+            else:
+                status = "complete"
+            if status in {"pending", "partial", "invalid"}:
+                pending_gates.update(covered_gates(step))
+                if next_step is None:
+                    next_step = {
+                        "stage": stage["id"],
+                        "step": step["id"],
+                        "status": status,
+                        "commands": step["commands"],
+                    }
+            step_statuses.append({
+                "id": step["id"],
+                "status": status,
+                "covers": step.get("covers", {}),
+                "outputs": outputs,
+            })
+        tracked = [step for step in step_statuses if step["status"] != "not_tracked"]
+        if not tracked:
+            stage_state = "not_tracked"
+        elif all(step["status"] == "complete" for step in tracked):
+            stage_state = "complete"
+        elif any(step["status"] == "invalid" for step in tracked):
+            stage_state = "invalid"
+        elif any(step["status"] in {"complete", "partial"} for step in tracked):
+            stage_state = "partial"
+        else:
+            stage_state = "pending"
+        stage_statuses.append({"id": stage["id"], "status": stage_state, "steps": step_statuses})
+    if totals["invalid"] or totals["empty"]:
+        decision = "invalid"
+    elif totals["missing"]:
+        decision = "blocked"
+    else:
+        decision = "complete"
+    return {
+        "schema": 1,
+        "kind": "scanner-heal-linux-evidence-status",
+        "decision": decision,
+        "release_approved": False,
+        "source_revision": plan["source_revision"],
+        "run_root": str(run_root),
+        "artifact_totals": totals,
+        "pending_gates": sorted(pending_gates),
+        "next_step": next_step,
+        "stages": stage_statuses,
+    }
+
+
 def run_preflight(plan: dict[str, Any]) -> int:
     commands = iter_preflight_commands(plan)
     if not commands:
@@ -511,6 +646,20 @@ def self_test() -> None:
     path = write_plan(out_dir, plan)
     loaded = json.loads(path.read_text())
     assert loaded["source_revision"] == revision
+    status = build_status(plan, out_dir / "empty-run")
+    assert status["decision"] == "blocked"
+    assert status["release_approved"] is False
+    assert status["pending_gates"]
+    complete_root = out_dir / "complete-run"
+    for stage in plan["stages"]:
+        for step in stage["steps"]:
+            for output in step.get("expected_outputs", []):
+                path = render_run_root_path(output, complete_root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+    complete = build_status(plan, complete_root)
+    assert complete["decision"] == "complete"
+    assert complete["release_approved"] is False
     print("PASS: scanner/heal Linux evidence plan self-test")
 
 
@@ -522,6 +671,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--write-plan", action="store_true")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--run-preflight", action="store_true")
+    parser.add_argument("--status-root", type=Path)
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -537,7 +687,13 @@ def main(argv: list[str] | None = None) -> int:
         phases = set(args.phase or ["all"])
         if "all" in phases and len(phases) > 1:
             raise ValueError("--phase all cannot be combined with another phase")
+        if args.status_root is not None and (args.write_plan or args.run_preflight):
+            raise ValueError("--status-root cannot be combined with --write-plan or --run-preflight")
         plan = build_plan(registry, source_revision(args.source_revision), phases)
+        if args.status_root is not None:
+            status = build_status(plan, args.status_root)
+            print(json.dumps(status, indent=2, sort_keys=True))
+            return 0 if status["decision"] == "complete" else 3
         if args.write_plan:
             path = write_plan(args.out_dir.resolve(), plan)
             print(path)
