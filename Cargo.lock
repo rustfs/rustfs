@@ -3986,7 +3986,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_test"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -9476,7 +9476,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9624,7 +9624,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-audit"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "const-str",
  "futures",
@@ -9646,7 +9646,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-checksums"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -9662,7 +9662,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-common"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "metrics",
@@ -9675,7 +9675,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-concurrency"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "insta",
@@ -9688,7 +9688,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-config"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "const-str",
  "hotpath",
@@ -9698,7 +9698,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-credentials"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -9712,7 +9712,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-crypto"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -9733,7 +9733,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-data-usage"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "rmp-serde",
@@ -9743,7 +9743,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ecstore"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -9879,7 +9879,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-extension-schema"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "serde",
@@ -9889,7 +9889,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-filemeta"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "byteorder",
@@ -9917,7 +9917,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -9954,7 +9954,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal-contracts"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -9964,7 +9964,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-iam"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10013,7 +10013,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-core"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "bytes",
  "hotpath",
@@ -10025,7 +10025,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-metrics"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "criterion",
  "hotpath",
@@ -10089,7 +10089,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-keystone"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "bytes",
  "futures",
@@ -10116,7 +10116,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kms"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10166,14 +10166,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-license"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rustfs-lifecycle"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -10195,7 +10195,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lock"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "compact_str",
@@ -10218,7 +10218,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-log-analyzer"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "chrono",
  "flate2",
@@ -10237,7 +10237,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-madmin"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "http 1.5.0",
@@ -10275,7 +10275,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-notify"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10310,7 +10310,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-capacity"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "criterion",
  "futures",
@@ -10329,7 +10329,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-data-cache"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "bytes",
  "criterion",
@@ -10346,7 +10346,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-obs"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -10404,7 +10404,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-policy"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -10435,7 +10435,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protocols"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
@@ -10497,7 +10497,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protos"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "flatbuffers",
  "hotpath",
@@ -10522,7 +10522,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-replication"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "byteorder",
  "bytes",
@@ -10540,7 +10540,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -10584,7 +10584,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio-v2"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -10607,7 +10607,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-client"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -10651,7 +10651,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-ops"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "rustfs-s3-types",
@@ -10659,7 +10659,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-types"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "serde",
@@ -10668,7 +10668,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-api"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -10703,7 +10703,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-query"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -10724,7 +10724,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10770,7 +10770,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner-metrics"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "chrono",
  "jiff",
@@ -10785,7 +10785,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-security-governance"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "thiserror 2.0.20",
@@ -10793,7 +10793,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-signer"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -10811,7 +10811,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-storage-api"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -10826,7 +10826,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-targets"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -10880,7 +10880,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-test-utils"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "hotpath",
  "rustfs-data-usage",
@@ -10896,7 +10896,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-tls-runtime"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "arc-swap",
  "hotpath",
@@ -10917,7 +10917,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-trusted-proxies"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -10954,7 +10954,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-utils"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "base64-simd",
  "blake2",
@@ -10996,7 +10996,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-zip"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
