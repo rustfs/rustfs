@@ -598,7 +598,7 @@ fn is_console_redirect_request<B>(req: &HttpRequest<B>) -> bool {
             .get(http::header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|user_agent| user_agent.contains("Mozilla"))
-        && (path.is_empty() || path == "/rustfs" || path == "/index.html")
+        && (path.is_empty() || CONSOLE_PREFIX.strip_suffix("/console") == Some(path) || path == "/index.html")
 }
 
 impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for RedirectService<S>
@@ -625,7 +625,7 @@ where
             // Create redirect response
             let redirect_response = Response::builder()
                 .status(StatusCode::FOUND)
-                .header(http::header::LOCATION, "/rustfs/console/")
+                .header(http::header::LOCATION, format!("{CONSOLE_PREFIX}/"))
                 .body(HybridBody::Rest {
                     rest_body: RestBody::default(),
                 })
@@ -2333,7 +2333,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/metrics",
             "/minio/admin/v3/storageinfo",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             "/rustfs/rpc/test",
             "/health/ready",
             "/_iceberg/v1/config",
@@ -2624,7 +2624,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/info",
             "/minio/admin/v3/info",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             HEALTH_PREFIX,
             "/iceberg/v1/config",
             "/rustfs/rpc/v1/read-file",
@@ -2670,7 +2670,11 @@ mod tests {
 
     #[test]
     fn console_redirect_request_id_contract_follows_redirect_enablement() {
-        for path in ["/", "/rustfs", "/index.html"] {
+        for path in [
+            "/",
+            CONSOLE_PREFIX.strip_suffix("/console").expect("console namespace"),
+            "/index.html",
+        ] {
             let request = Request::builder()
                 .method(Method::GET)
                 .uri(path)
@@ -3983,7 +3987,7 @@ mod tests {
             "/minio/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/rpc/read_file_stream?versionId=unused",
-            "/rustfs/console/index.html?versionId=unused",
+            &format!("{CONSOLE_PREFIX}/index.html?versionId=unused"),
             "/health?versionId=unused",
             "/health/ready?versionId=unused",
             "/profile/cpu?versionId=unused",

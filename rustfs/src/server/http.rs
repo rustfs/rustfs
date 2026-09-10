@@ -18,7 +18,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    ReadinessGateLayer, RemoteAddr, ShutdownHandle,
+    CONSOLE_PREFIX, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
@@ -1219,7 +1219,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console",
-            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"),
+            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}{CONSOLE_PREFIX}/index.html"),
             "Startup endpoint available"
         );
         info!(
@@ -1228,7 +1228,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console_localhost",
-            endpoint = %format!("{protocol}://127.0.0.1:{local_port}/rustfs/console/index.html"),
+            endpoint = %format!("{protocol}://127.0.0.1:{local_port}{CONSOLE_PREFIX}/index.html"),
             "Startup endpoint available"
         );
     } else {

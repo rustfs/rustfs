@@ -1317,7 +1317,7 @@ mod tests {
         assert!(is_probe_path("/rustfs/admin/v3/info"));
         assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
         assert!(is_probe_path("/_iceberg/v1/config"));
-        assert!(is_probe_path("/rustfs/console/"));
+        assert!(is_probe_path(&format!("{}/", crate::server::CONSOLE_PREFIX)));
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));
         assert!(!is_probe_path("/bucket/object"));

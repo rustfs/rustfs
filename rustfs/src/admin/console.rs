@@ -867,9 +867,14 @@ mod tests {
     async fn console_config_handler_serializes_admin_discovery_paths() {
         init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
 
-        let response = config_handler(Uri::from_static("http://127.0.0.1:9001/rustfs/console/api/v1/config"), HeaderMap::new())
-            .await
-            .into_response();
+        let response = config_handler(
+            format!("http://127.0.0.1:9001{CONSOLE_PREFIX}/api/v1/config")
+                .parse()
+                .expect("console URI"),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body();
@@ -889,7 +894,8 @@ mod tests {
 
     #[test]
     fn external_admin_paths_are_not_console_paths() {
-        assert!(is_console_path("/rustfs/console/"));
+        assert!(is_console_path(&format!("{CONSOLE_PREFIX}/")));
+        assert!(!is_console_path(&format!("{CONSOLE_PREFIX}-other/index.html")));
         assert!(is_console_path("/apple-touch-icon.png"));
         assert!(is_console_path("/apple-touch-icon-precomposed.png"));
         assert!(!is_console_path("/minio/admin/v3/info"));

@@ -83,10 +83,12 @@ pub(crate) const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 /// MinIO-compatible admin API prefix accepted by RustFS.
 pub(crate) const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 
-/// Predefined console prefix for RustFS server routes.
-/// This prefix is used for endpoints that handle console-related tasks
-/// such as user interface and management.
-pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
+/// Console prefix embedded at build time; it must match the console static assets.
+/// An unset or empty RUSTFS_CONSOLE_BASE_PATH preserves the default route.
+pub(crate) const CONSOLE_PREFIX: &str = match option_env!("RUSTFS_CONSOLE_BASE_PATH") {
+    Some(path) if !path.is_empty() => path,
+    _ => "/rustfs/console",
+};
 
 /// Predefined RPC prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle remote procedure calls (RPC).
