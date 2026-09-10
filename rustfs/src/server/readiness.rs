@@ -137,7 +137,7 @@ fn is_probe_path(path: &str) -> bool {
     let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
         || is_table_catalog_path(path)
-        || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
+        || has_path_prefix(path, crate::server::console_prefix())
         || has_path_prefix(path, crate::server::RPC_PREFIX)
         || has_path_prefix(path, crate::server::ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_PREFIX)
@@ -1158,6 +1158,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_prefix_process_case_classification() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = crate::server::console_prefix();
+        assert!(is_probe_path(&format!("{prefix}/index.html")));
+        assert!(!is_probe_path(&format!("{prefix}-other/index.html")));
+        assert!(!is_probe_path("/bucket/object"));
+    }
+
     use super::*;
     use crate::storage_api::server::readiness::{DiskOption, new_disk};
     use rustfs_madmin::{BackendInfo, Disk};
