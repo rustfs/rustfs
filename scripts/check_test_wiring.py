@@ -1708,8 +1708,11 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(isinstance(objects, list) and requirement["min_objects"] <= len(objects) <= requirement["max_objects"],
                     "incomplete/oversized object oracle")
             require(len({obj["key"] for obj in objects}) == len(objects), "duplicate object identity")
-            require(sum(obj["expected_physical"] is None for obj in objects) == 1,
-                    "only the outage object may lack a pre-fault target manifest")
+            outage_object_count = sum(obj["expected_physical"] is None for obj in objects)
+            if expected_outage_target_required:
+                require(outage_object_count == 1, "required outage object is missing from the oracle")
+            else:
+                require(outage_object_count in (0, 1), "optional outage object count must be zero or one")
             for obj in objects:
                 require(isinstance(obj["key"], str) and 0 < len(obj["key"].encode()) <= 1024, "invalid object identity")
                 require(obj["version_id"] is None, "this case only covers unversioned objects")

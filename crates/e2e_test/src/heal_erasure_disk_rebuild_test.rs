@@ -1382,55 +1382,61 @@ mod tests {
                 Err(_) => return Err(format!("outage PUT {bucket}/{candidate} exceeded 30s").into()),
             }
         }
-        let outage_key =
-            outage_key.ok_or_else(|| format!("no outage PUT reached an online pool after {max_outage_attempts} attempts"))?;
+        if outage_key.is_none() && outage_target_manifest_required {
+            return Err(format!("no outage PUT reached an online pool after {max_outage_attempts} attempts").into());
+        }
 
-        let mut outage_peer_erasure_indices = HashSet::new();
-        for (node_index, node) in cluster.nodes.iter().enumerate() {
-            if node_index == 1 {
-                continue;
-            }
-            for (drive_index, drive) in node.data_dirs.iter().enumerate() {
-                let census = census_object_version_on_disk(Path::new(drive), bucket, &outage_key, None)?;
-                if !census.has_xl_meta {
+        let mut missing_outage_erasure_indices = HashSet::new();
+        if let Some(outage_key) = outage_key.as_deref() {
+            let mut outage_peer_erasure_indices = HashSet::new();
+            for (node_index, node) in cluster.nodes.iter().enumerate() {
+                if node_index == 1 {
                     continue;
                 }
+                for (drive_index, drive) in node.data_dirs.iter().enumerate() {
+                    let census = census_object_version_on_disk(Path::new(drive), bucket, outage_key, None)?;
+                    if !census.has_xl_meta {
+                        continue;
+                    }
+                    assert!(
+                        census.is_complete(),
+                        "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
+                    );
+                    let erasure_index = census.erasure_index.ok_or_else(|| {
+                        format!(
+                            "online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}"
+                        )
+                    })?;
+                    assert!(
+                        (1..=erasure_set_drive_count).contains(&erasure_index),
+                        "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
+                    );
+                    assert!(
+                        outage_peer_erasure_indices.insert(erasure_index),
+                        "outage-object erasure index {erasure_index} is duplicated across online drives"
+                    );
+                }
+            }
+            assert!(
+                !outage_peer_erasure_indices.is_empty() && outage_peer_erasure_indices.len() <= erasure_set_drive_count,
+                "outage-object must occupy one non-empty erasure set"
+            );
+            if outage_target_manifest_required {
+                let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
                 assert!(
-                    census.is_complete(),
-                    "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
-                );
-                let erasure_index = census.erasure_index.ok_or_else(|| {
-                    format!("online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}")
-                })?;
-                assert!(
-                    (1..=erasure_set_drive_count).contains(&erasure_index),
-                    "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
-                );
-                assert!(
-                    outage_peer_erasure_indices.insert(erasure_index),
-                    "outage-object erasure index {erasure_index} is duplicated across online drives"
+                    outage_peer_erasure_indices.len() >= min_online_data_shards,
+                    "online drives in the selected erasure set must retain at least the EC data quorum"
                 );
             }
-        }
-        assert!(
-            !outage_peer_erasure_indices.is_empty() && outage_peer_erasure_indices.len() <= erasure_set_drive_count,
-            "outage-object must occupy one non-empty erasure set"
-        );
-        if outage_target_manifest_required {
-            let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
-            assert!(
-                outage_peer_erasure_indices.len() >= min_online_data_shards,
-                "online drives in the selected erasure set must retain at least the EC data quorum"
-            );
-        }
-        let missing_outage_erasure_indices = (1..=erasure_set_drive_count)
-            .filter(|index| !outage_peer_erasure_indices.contains(index))
-            .collect::<HashSet<_>>();
-        if outage_target_manifest_required {
-            assert!(
-                !missing_outage_erasure_indices.is_empty(),
-                "the stopped target must account for at least one missing outage-object erasure index"
-            );
+            missing_outage_erasure_indices = (1..=erasure_set_drive_count)
+                .filter(|index| !outage_peer_erasure_indices.contains(index))
+                .collect::<HashSet<_>>();
+            if outage_target_manifest_required {
+                assert!(
+                    !missing_outage_erasure_indices.is_empty(),
+                    "the stopped target must account for at least one missing outage-object erasure index"
+                );
+            }
         }
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
@@ -1486,10 +1492,12 @@ mod tests {
                 0,
                 "non-admin Heal is disabled, so the replacement target must remain empty before the explicit root heal"
             );
-            assert!(
-                !census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?.has_xl_meta,
-                "the object written during the outage must be absent before the explicit root heal"
-            );
+            if let Some(outage_key) = outage_key.as_deref() {
+                assert!(
+                    !census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?.has_xl_meta,
+                    "the object written during the outage must be absent before the explicit root heal"
+                );
+            }
             assert_eq!(
                 pre_heal_replacement["cluster"]["records"].as_array().map(Vec::len),
                 Some(0),
@@ -1773,11 +1781,20 @@ mod tests {
         let heal_deadline = Instant::now() + Duration::from_secs(heal_timeout_secs);
         loop {
             let baseline_recovered = metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len();
-            let outage_recovered =
-                !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, &outage_key);
+            let outage_recovered = match outage_key.as_deref() {
+                Some(outage_key) => {
+                    !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, outage_key)
+                }
+                None => !outage_target_manifest_required,
+            };
             if baseline_recovered && outage_recovered {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
+                let outage_complete = match outage_key.as_deref() {
+                    Some(outage_key) if outage_target_manifest_required => {
+                        census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?.is_complete()
+                    }
+                    _ => true,
+                };
                 let pool_metadata_matches = match &expected_pool_metadata {
                     Some(expected) => {
                         census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?
@@ -1785,16 +1802,18 @@ mod tests {
                     }
                     None => true,
                 };
-                if matching == expected_manifests.len()
-                    && (!outage_target_manifest_required || outage_census.is_complete())
-                    && pool_metadata_matches
-                {
+                if matching == expected_manifests.len() && outage_complete && pool_metadata_matches {
                     break;
                 }
             }
             if Instant::now() >= heal_deadline {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
+                let outage_diagnostic = match outage_key.as_deref() {
+                    Some(outage_key) => {
+                        format!("{:?}", census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?)
+                    }
+                    None => "not_admitted".to_string(),
+                };
                 let pool_metadata =
                     census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
                 let final_status = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key)
@@ -1816,7 +1835,7 @@ mod tests {
                     Err(_) => "replacement status request exceeded 5s diagnostic budget".to_string(),
                 };
                 return Err(format!(
-                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
+                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_diagnostic}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
                     expected_manifests.len()
                 )
                 .into());
@@ -1832,8 +1851,11 @@ mod tests {
                 expected.key
             );
         }
-        let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
         if outage_target_manifest_required {
+            let outage_key = outage_key
+                .as_deref()
+                .ok_or("required outage object was not admitted before final target validation")?;
+            let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
             assert!(
                 outage_census.is_complete(),
                 "outage object must have a complete target shard: {outage_census:?}"
@@ -1855,7 +1877,9 @@ mod tests {
             .iter()
             .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
-        assert!(expected_keys.insert(outage_key.clone()));
+        if let Some(outage_key) = outage_key.as_ref() {
+            assert!(expected_keys.insert(outage_key.clone()));
+        }
         let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
@@ -1879,19 +1903,21 @@ mod tests {
                 }));
             }
         }
-        let response = target_client.get_object().bucket(bucket).key(&outage_key).send().await?;
-        let actual = response.body.collect().await?.into_bytes();
-        let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
-        assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
-        if evidence_run.is_some() {
-            evidence_objects.push(serde_json::json!({
-                "key": outage_key, "version_id": null,
-                "expected_bytes": expected_outage_body.len(), "actual_bytes": actual.len(),
-                "expected_sha256": sha256_hex(&expected_outage_body),
-                "actual_sha256": sha256_hex(&actual),
-                "expected_physical": null,
-                "physical": census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?,
-            }));
+        if let Some(outage_key) = outage_key.as_deref() {
+            let response = target_client.get_object().bucket(bucket).key(outage_key).send().await?;
+            let actual = response.body.collect().await?.into_bytes();
+            let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
+            assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
+            if evidence_run.is_some() {
+                evidence_objects.push(serde_json::json!({
+                    "key": outage_key, "version_id": null,
+                    "expected_bytes": expected_outage_body.len(), "actual_bytes": actual.len(),
+                    "expected_sha256": sha256_hex(&expected_outage_body),
+                    "actual_sha256": sha256_hex(&actual),
+                    "expected_physical": null,
+                    "physical": census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?,
+                }));
+            }
         }
 
         let terminal_deadline = Instant::now() + Duration::from_secs(30);
@@ -1947,6 +1973,7 @@ mod tests {
                 "sets": topology.set_count(evidence_context.case.erasure_set_drive_count),
                 "pools": topology.pool_count(),
                 "outage_target_manifest_required": outage_target_manifest_required,
+                "outage_write_admitted": outage_key.is_some(),
                 "distributed_ec_invalidation": true,
                 "peer_count": cluster.nodes.len(),
                 "same_window_remote_proof": true,
