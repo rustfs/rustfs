@@ -428,6 +428,7 @@ SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
         "exact-generation",
         "scanner-instance",
         "participating-peer-set",
+        "cleared-count-bound",
     ),
     "participating_peer_capability_snapshot": (
         "supports-scoped-ack",
@@ -452,6 +453,7 @@ SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS = {
         "scanner_instance_observed",
         "participating_peer_set_observed",
         "whole_cycle_fallback_observed",
+        "cleared_count_bound_observed",
     ),
     "participating_peer_capability_snapshot": (
         "capability_probe_observed",
@@ -1827,6 +1829,7 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
                 "raw_entry_budget",
                 "max_raw_entries_per_round",
                 "max_objects_processed_per_round",
+                "bounded_work_quantum_observed",
                 "durable_checkpoint_committed",
                 "no_unbounded_tail",
             ))
@@ -2255,6 +2258,8 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
                                            f"{gate}.{field}.max_objects_processed_per_round", 1, 4096)
             require(max_raw <= budget, f"{gate}.{field} raw entries exceed fixed budget")
             require(max_objects <= budget, f"{gate}.{field} processed objects exceed fixed budget")
+            release_bundle_bool_true(evidence.get("bounded_work_quantum_observed"),
+                                     f"{gate}.{field}.bounded_work_quantum_observed")
             release_bundle_bool_true(evidence.get("durable_checkpoint_committed"),
                                      f"{gate}.{field}.durable_checkpoint_committed")
             release_bundle_bool_true(evidence.get("no_unbounded_tail"), f"{gate}.{field}.no_unbounded_tail")
@@ -2772,10 +2777,10 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
         require(evidence.get("stale_journals_after_gc") == 0,
                 f"{gate}.{field} requires zero stale journals after GC")
     if field == "segment_activation_preflight":
-        require(evidence.get("production_activation") is False,
-                f"{gate}.{field} must keep production activation disabled")
-        require(evidence.get("scanner_segment_reuse_activated") is False,
-                f"{gate}.{field} must prove the runtime activation gate is disabled")
+        require(evidence.get("production_activation") is True,
+                f"{gate}.{field} must prove production activation is enabled")
+        require(evidence.get("scanner_segment_reuse_activated") is True,
+                f"{gate}.{field} must prove the runtime activation gate is enabled")
         evidence_exact_strings(evidence.get("proof_inputs"),
                                SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS,
                                f"{gate}.{field}.proof_inputs")
@@ -3319,6 +3324,7 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
                     "raw_entry_budget": 8,
                     "max_raw_entries_per_round": 8,
                     "max_objects_processed_per_round": 8,
+                    "bounded_work_quantum_observed": True,
                     "durable_checkpoint_committed": True,
                     "no_unbounded_tail": True,
                 })
@@ -3739,6 +3745,7 @@ class SelfTests(unittest.TestCase):
                         "raw_entry_budget": 8,
                         "max_raw_entries_per_round": 8,
                         "max_objects_processed_per_round": 8,
+                        "bounded_work_quantum_observed": True,
                         "durable_checkpoint_committed": True,
                         "no_unbounded_tail": True,
                     })
@@ -3944,8 +3951,8 @@ class SelfTests(unittest.TestCase):
                         },
                     ]
                 if field == "segment_activation_preflight":
-                    evidence["production_activation"] = False
-                    evidence["scanner_segment_reuse_activated"] = False
+                    evidence["production_activation"] = True
+                    evidence["scanner_segment_reuse_activated"] = True
                     evidence["proof_inputs"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS)
                     evidence["fail_closed_checks"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS)
                 if field == "cold_segment_reuse_measurement":
@@ -4447,7 +4454,14 @@ class SelfTests(unittest.TestCase):
                 "zero stale journals",
             ),
             ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "JSON artifact same_window_fields mismatch"),
-            ("activation-enabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": True}), "production activation disabled"),
+            ("activation-disabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": False}), "production activation is enabled"),
+            (
+                "activation-runtime-disabled",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item.update({"scanner_segment_reuse_activated": False}),
+                "runtime activation gate is enabled",
+            ),
             (
                 "activation-missing-fail-closed",
                 "G11",

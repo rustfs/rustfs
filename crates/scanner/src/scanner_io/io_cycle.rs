@@ -190,7 +190,7 @@ where
         };
         let remote_resolution = resolve_remote_dirty_usage_scope(
             resolution.requested_scope,
-            dirty_buckets,
+            resolution.dirty_usage_snapshot,
             remote_dirty_usage,
             resolution.all_buckets,
             resolution.baseline_proof,

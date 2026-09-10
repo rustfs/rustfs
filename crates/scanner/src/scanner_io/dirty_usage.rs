@@ -30,6 +30,8 @@ pub(super) static DIRTY_USAGE_PRODUCER_IDENTITIES: LazyLock<StdMutex<DirtyUsageP
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 static DIRTY_USAGE_CLEAR_OBSERVER: LazyLock<StdRwLock<Option<ScannerDirtyUsageClearObserver>>> =
     LazyLock::new(|| StdRwLock::new(None));
+static DIRTY_USAGE_MUTATION_OBSERVER: LazyLock<StdRwLock<Option<ScannerDirtyUsageMutationObserver>>> =
+    LazyLock::new(|| StdRwLock::new(None));
 pub(super) static DIRTY_USAGE_PRODUCER_COVERAGE: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
@@ -53,6 +55,8 @@ pub struct ScannerDirtyUsageBucket {
 }
 
 pub type ScannerDirtyUsageClearObserver = Arc<dyn Fn(Vec<ScannerDirtyUsageBucket>) + Send + Sync + 'static>;
+pub type ScannerDirtyUsageMutationObserver =
+    Arc<dyn Fn(&str, &str, crate::segment_invalidation::SegmentInvalidationProducerIdentity) + Send + Sync + 'static>;
 
 /// A non-durable optimization hint for a dirty bucket.
 ///
@@ -83,6 +87,7 @@ pub(super) type DirtyUsageProducerIdentities = BTreeMap<String, DirtyUsageProduc
 pub(super) struct DirtyUsageProducerEvidence {
     pub(super) producer_identity_coverage_complete: bool,
     pub(super) durable_producer_identity: bool,
+    pub(super) durable_dirty_producer_journal: bool,
     pub(super) restart_gap_absent: bool,
     pub(super) generation_window_bound: bool,
     pub(super) generation_start: u64,
@@ -112,6 +117,15 @@ pub fn set_scanner_dirty_usage_clear_observer(
     std::mem::replace(&mut *slot, observer)
 }
 
+pub fn set_scanner_dirty_usage_mutation_observer(
+    observer: Option<ScannerDirtyUsageMutationObserver>,
+) -> Option<ScannerDirtyUsageMutationObserver> {
+    let mut slot = DIRTY_USAGE_MUTATION_OBSERVER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *slot, observer)
+}
+
 fn notify_dirty_usage_clear(cleared: Vec<ScannerDirtyUsageBucket>) {
     if cleared.is_empty() {
         return;
@@ -122,6 +136,30 @@ fn notify_dirty_usage_clear(cleared: Vec<ScannerDirtyUsageBucket>) {
         .clone();
     if let Some(observer) = observer {
         observer(cleared);
+    }
+}
+
+fn notify_dirty_usage_mutation(
+    bucket: &str,
+    object: &str,
+    producers: &[crate::segment_invalidation::SegmentInvalidationProducerIdentity],
+) {
+    if bucket.is_empty() {
+        return;
+    }
+    let observer = DIRTY_USAGE_MUTATION_OBSERVER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(observer) = observer else {
+        return;
+    };
+    if producers.is_empty() {
+        observer(bucket, object, crate::segment_invalidation::SegmentInvalidationProducerIdentity::Unknown);
+    } else {
+        for producer in producers {
+            observer(bucket, object, *producer);
+        }
     }
 }
 
@@ -566,6 +604,7 @@ mod scoped_dirty_usage_tests {
         let evidence = dirty_usage_producer_evidence(&snapshot);
         assert!(evidence.producer_identity_coverage_complete);
         assert!(evidence.durable_producer_identity);
+        assert!(evidence.durable_dirty_producer_journal);
         assert!(evidence.restart_gap_absent);
         assert_eq!(evidence.generation_start, 7);
         assert_eq!(evidence.generation_end, 7);
@@ -583,7 +622,42 @@ mod scoped_dirty_usage_tests {
         );
         let changed_evidence = dirty_usage_producer_evidence(&changed);
         assert!(!changed_evidence.durable_producer_identity);
+        assert!(!changed_evidence.durable_dirty_producer_journal);
         assert!(!changed_evidence.restart_gap_absent);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn dirty_usage_mutation_observer_tracks_typed_and_conservative_events() {
+        use std::sync::{Arc, Mutex};
+
+        clear_dirty_usage_buckets_for_tests();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = observed.clone();
+        let previous = set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+            observed_clone.lock().expect("observer lock should not be poisoned").push((
+                bucket.to_string(),
+                object.to_string(),
+                producer,
+            ));
+        })));
+
+        record_dirty_usage_object_from_producer("photos", "2026/image.jpg", SegmentInvalidationProducerIdentity::PutObject);
+        record_dirty_usage_bucket("archive");
+        set_scanner_dirty_usage_mutation_observer(previous);
+
+        assert_eq!(
+            *observed.lock().expect("observer lock should not be poisoned"),
+            vec![
+                (
+                    "photos".to_string(),
+                    "2026/image.jpg".to_string(),
+                    SegmentInvalidationProducerIdentity::PutObject,
+                ),
+                ("archive".to_string(), String::new(), SegmentInvalidationProducerIdentity::Unknown,),
+            ]
+        );
         clear_dirty_usage_buckets_for_tests();
     }
 
@@ -745,6 +819,7 @@ fn record_dirty_usage_bucket_inner<I>(bucket: &str, producers: I)
 where
     I: IntoIterator<Item = crate::segment_invalidation::SegmentInvalidationProducerIdentity>,
 {
+    let producers = producers.into_iter().collect::<Vec<_>>();
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
@@ -752,7 +827,12 @@ where
         let generation = advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         dirty_buckets.insert(bucket.to_string(), generation);
         dirty_scopes.insert(bucket.to_string(), DirtyUsageBucketScope::WholeBucket);
-        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, bucket, generation, producers);
+        record_segment_invalidation_producer_identities_for_generation(
+            &mut producer_identities,
+            bucket,
+            generation,
+            producers.iter().copied(),
+        );
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
@@ -760,6 +840,7 @@ where
     // admin/console consumers never ride the full TTL after a change
     // (rustfs/backlog#1872).
     crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
+    notify_dirty_usage_mutation(bucket, "", &producers);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
@@ -817,11 +898,17 @@ where
         if overflowed {
             *scope = DirtyUsageBucketScope::WholeBucket;
         }
-        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, bucket, generation, producers);
+        record_segment_invalidation_producer_identities_for_generation(
+            &mut producer_identities,
+            bucket,
+            generation,
+            producers.iter().copied(),
+        );
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
     crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
+    notify_dirty_usage_mutation(bucket, object, &producers);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
@@ -1193,7 +1280,7 @@ pub(super) fn dirty_usage_producer_evidence(snapshot: &DirtyUsageSnapshot) -> Di
         && DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire)
             & crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK
             == crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK;
-    let durable_producer_identity = producer_identity_coverage_complete
+    let durable_dirty_producer_journal = producer_identity_coverage_complete
         && snapshot
             .buckets
             .keys()
@@ -1205,8 +1292,9 @@ pub(super) fn dirty_usage_producer_evidence(snapshot: &DirtyUsageSnapshot) -> Di
 
     DirtyUsageProducerEvidence {
         producer_identity_coverage_complete,
-        durable_producer_identity,
-        restart_gap_absent: durable_producer_identity,
+        durable_producer_identity: durable_dirty_producer_journal,
+        durable_dirty_producer_journal,
+        restart_gap_absent: durable_dirty_producer_journal,
         generation_window_bound,
         generation_start: if generation_window_bound { generation_start } else { 0 },
         generation_end: if generation_window_bound { generation_end } else { 0 },
