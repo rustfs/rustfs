@@ -11510,12 +11510,54 @@ mod test {
     /// stale deterministically, instead of sleeping and hoping the filesystem
     /// timestamp granularity (or a backward wall-clock step) cooperates.
     fn backdate_mtime(path: &Path, age: Duration) {
-        use std::fs::{File, FileTimes};
+        use std::fs::{FileTimes, OpenOptions};
         let mtime = std::time::SystemTime::now() - age;
-        File::open(path)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+            // Directories need backup semantics, and changing mtime needs attribute-write access.
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options
+            .open(path)
             .expect("path should open to backdate its mtime")
             .set_times(FileTimes::new().set_modified(mtime))
             .expect("mtime should rewind into the past");
+    }
+
+    #[test]
+    fn cleanup_tmp_on_startup_backdate_mtime_preserves_files_and_directory_contents() {
+        use std::time::SystemTime;
+
+        let root = tempfile::tempdir().expect("create timestamp fixture root");
+        let directory = root.path().join("directory");
+        let file = directory.join("payload");
+        std::fs::create_dir(&directory).expect("create timestamp fixture directory");
+        std::fs::write(&file, b"unchanged payload").expect("write timestamp fixture payload");
+        let age = Duration::from_secs(60);
+        // Filesystems may round stored timestamps; do not require subsecond precision or sleep.
+        let rounding = Duration::from_secs(2);
+
+        for path in [&file, &directory] {
+            let earliest = SystemTime::now() - age - rounding;
+            backdate_mtime(path, age);
+            let latest = SystemTime::now() - age + rounding;
+            let modified = std::fs::metadata(path)
+                .expect("read backdated path metadata")
+                .modified()
+                .expect("read backdated modification time");
+            assert!(modified >= earliest && modified <= latest, "mtime must be backdated for {path:?}");
+        }
+
+        let moved = root.path().join("moved");
+        std::fs::rename(&directory, &moved).expect("mtime helper must release its handles before cleanup");
+        assert_eq!(std::fs::read(moved.join("payload")).expect("read preserved payload"), b"unchanged payload");
     }
 
     #[tokio::test]
