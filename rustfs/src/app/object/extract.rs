@@ -627,6 +627,7 @@ struct ExtractPreparedMember<R = ExtractStagedBody> {
     write_plan: WritePlan,
     opts: ObjectOptions,
     replication: ReplicateDecision,
+    producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity,
     staging_permit: OwnedSemaphorePermit,
     member_permit: OwnedSemaphorePermit,
 }
@@ -765,6 +766,7 @@ where
         write_plan,
         opts,
         replication,
+        producer_identity,
         staging_permit,
         member_permit,
     } = member;
@@ -793,7 +795,7 @@ where
     // the scanner before its post-store awaits, then retains the lifecycle slot
     // through quota, cache, replication, and event construction.
     if !context.wrote_any_entry.swap(true, Ordering::AcqRel) {
-        rustfs_scanner::record_dirty_usage_bucket(&context.bucket);
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(&context.bucket, producer_identity);
     }
     let success =
         complete_extract_member_post_commit(context, key, opts, replication, obj_info, backfilled_old_current_size).await;
@@ -2042,7 +2044,7 @@ impl DefaultObjectUsecase {
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
             original_sse,
             ssekms_key_id,
-            false,
+            sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some(),
         );
         if effective_sse
             .as_ref()
@@ -2603,6 +2605,7 @@ impl DefaultObjectUsecase {
                                         write_plan,
                                         opts,
                                         replication,
+                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
                                         staging_permit,
                                         member_permit,
                                     },
@@ -2627,6 +2630,7 @@ impl DefaultObjectUsecase {
                                         write_plan,
                                         opts,
                                         replication,
+                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
                                         staging_permit,
                                         member_permit,
                                     },
@@ -2656,6 +2660,11 @@ impl DefaultObjectUsecase {
                 write_plan,
                 opts,
                 replication,
+                producer_identity: if is_dir {
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject
+                } else {
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject
+                },
                 staging_permit,
                 member_permit,
             });

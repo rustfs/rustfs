@@ -77,4 +77,30 @@ cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distribut
 
 The upgrade topology is `ClusterTopology::single_pool(4)` (4 nodes × 1 drive). That matches the proven mixed-version fixture in `upgrade_compatibility_test`; 4×4 localhost drives are rejected by the previous release's same-device disk check.
 
+Scanner/Heal G09 release evidence can be collected on Linux x86_64 with the
+same pinned previous-release binary used by `e2e-upgrade.yml`:
+
+```bash
+scripts/run_scanner_heal_g09_upgrade_evidence.sh
+```
+
+The runner builds the current `rustfs` binary, downloads and verifies the
+pinned previous release, runs the mixed-version rolling-upgrade and rollback
+tests, and leaves the required raw G09 artifacts under
+`target/scanner-heal-g09-upgrade-evidence/<timestamp>/`. These artifacts are
+inputs for the Scanner/Heal release bundle gate; the runner does not mark the
+full release matrix complete by itself.
+
+The distributed Scanner/Heal EC8+4 restart case is registered as
+`ec84-target-drive-restart` and selected by this profile:
+
+```bash
+scripts/run_scanner_heal_evidence_case.sh --case ec84-target-drive-restart
+```
+
+That command records the current build, runs exactly the registered
+`distributed::heal_test` case, validates the JUnit/listing/oracle receipt, and
+keeps the wider release gate blocked until the remaining release evidence lanes
+have measured artifacts.
+
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update the Linux and Darwin entries with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> <platform>` after adding or renaming a case.

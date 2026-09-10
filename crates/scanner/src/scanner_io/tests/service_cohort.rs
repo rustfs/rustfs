@@ -16,23 +16,29 @@ use super::*;
 use crate::data_usage_define::{DATA_USAGE_OBJ_NAME_PATH, read_config_with_revision};
 
 async fn create_cohort_bucket(store: &ECStore, bucket: &str) {
+    create_cohort_bucket_objects(store, bucket, 1).await;
+}
+
+async fn create_cohort_bucket_objects(store: &ECStore, bucket: &str, objects: usize) {
     store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("fixture bucket");
     for set in store.all_set_disks() {
-        let mut reader = ScannerPutObjReader::from_vec(b"cohort".to_vec());
-        set.put_object(
-            bucket,
-            "initial",
-            &mut reader,
-            &ScannerObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("fixture object and all rename tails should persist");
+        for index in 0..objects {
+            let mut reader = ScannerPutObjReader::from_vec(b"cohort".to_vec());
+            set.put_object(
+                bucket,
+                &format!("object-{index:04}"),
+                &mut reader,
+                &ScannerObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fixture object and all rename tails should persist");
+        }
     }
 }
 
@@ -165,6 +171,92 @@ async fn service_cohort_production_dispatch_services_waiters_across_sources() {
         assert!(cache.info.scan_progress.is_some());
         assert!(cache.info.scan_plan_digest.is_none(), "mixed coverage must remain non-authoritative");
     }
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_bucket() {
+    let (_dir, store) = setup_two_pool_scanner_store().await;
+    clear_dirty_usage_buckets_for_tests();
+    let flat = format!("a-flat-{}", Uuid::new_v4().simple());
+    let small = format!("z-small-{}", Uuid::new_v4().simple());
+    create_cohort_bucket_objects(&store, &flat, 6).await;
+    create_cohort_bucket(&store, &small).await;
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+
+    let expected_flat = store
+        .all_set_disks()
+        .iter()
+        .map(|set| (DataUsageCacheSource::new(set.pool_index, set.set_index), flat.clone()))
+        .collect::<HashSet<_>>();
+    let expected_small = store
+        .all_set_disks()
+        .iter()
+        .map(|set| (DataUsageCacheSource::new(set.pool_index, set.set_index), small.clone()))
+        .collect::<HashSet<_>>();
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+    );
+    let (result, usage) = run_cohort_cycle(&store, cohort.clone(), 1, budget.clone()).await;
+    assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+    assert!(usage.is_none(), "wide-bucket budget exhaustion must not publish a partial aggregate");
+    assert!(budget.budget_elapsed());
+    let first_round_admitted = cohort
+        .lock()
+        .expect("cohort lock")
+        .admitted_members()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert!(
+        !first_round_admitted.is_disjoint(&expected_flat),
+        "the first fixed budget round should exercise the wide flat bucket"
+    );
+    assert!(
+        first_round_admitted.is_disjoint(&expected_small),
+        "a small bucket not yet reached by the real scanner must not be marked admitted"
+    );
+
+    for cycle in 2..=4 {
+        let ctx = CancellationToken::new();
+        let (result, usage) = run_cohort_cycle(
+            &store,
+            cohort.clone(),
+            cycle,
+            ScannerCycleBudget::new_with_progress_tracking(
+                &ctx,
+                ScannerCycleBudgetConfig {
+                    max_objects: Some(1),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+        assert!(usage.is_none(), "mixed partial coverage still cannot publish the set root");
+    }
+    let admitted_after_budgeted_rounds = cohort
+        .lock()
+        .expect("cohort lock")
+        .admitted_members()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert!(
+        expected_small.is_subset(&admitted_after_budgeted_rounds),
+        "tracked small buckets must receive real execution opportunities within their fixed service-round bound"
+    );
+
+    let ctx = CancellationToken::new();
+    let (result, usage) =
+        run_cohort_cycle(&store, cohort, 5, ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default())).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(usage.expect("final complete aggregate").objects_total_count, 14);
     clear_dirty_usage_buckets_for_tests();
 }
 

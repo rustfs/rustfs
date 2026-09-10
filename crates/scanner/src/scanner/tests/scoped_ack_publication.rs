@@ -432,7 +432,12 @@ async fn scoped_ack_publication_stale_baseline_cannot_prove_a_replaced_root() {
 #[tokio::test]
 #[serial]
 async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish() {
-    for mutation in ["remote_ack_target", "publication_epoch", "remote_lease_targets"] {
+    for mutation in [
+        "remote_ack_target",
+        "remote_scoped_ack_target",
+        "publication_epoch",
+        "remote_lease_targets",
+    ] {
         let (_directory, store) = candidate_store().await;
         let (scan, candidate) = complete_candidate(&store, PROOF_CYCLE).await;
         let baseline = read_data_usage_persist_baseline(store.clone())
@@ -464,6 +469,18 @@ async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish
                 host: "proof-peer:9000".to_string(),
                 instance_id: crate::scanner_activity_epoch().to_string(),
                 kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Generation(changed_generation),
+            }]),
+            "remote_scoped_ack_target" => scan.with_remote_dirty_usage_acknowledgements(vec![ScannerDirtyUsageAcknowledgement {
+                host: "proof-peer:9000".to_string(),
+                instance_id: crate::scanner_activity_epoch().to_string(),
+                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                    owner_id: crate::scanner_activity_epoch().to_string(),
+                    entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                        bucket: PROOF_BUCKET.to_string(),
+                        bucket_incarnation: uuid::Uuid::from_u128(0x11111111111111111111111111111111),
+                        generation: changed_generation,
+                    }],
+                },
             }]),
             "publication_epoch" => scan.with_publication_epoch(Some(changed_epoch)),
             "remote_lease_targets" => scan.with_remote_publication_lease_targets(vec![(

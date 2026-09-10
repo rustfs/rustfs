@@ -29,7 +29,7 @@ MIN_MINOR=11
 UV_PYTHON_SPEC="${RUSTFS_UV_PYTHON:-3.12}"
 
 version_ok() {
-    "$1" -c "import sys; raise SystemExit(0 if sys.version_info >= (${MIN_MAJOR}, ${MIN_MINOR}) else 1)" \
+    "$@" -c "import sys; raise SystemExit(0 if sys.version_info >= (${MIN_MAJOR}, ${MIN_MINOR}) else 1)" \
         >/dev/null 2>&1
 }
 
@@ -55,20 +55,25 @@ if [ "${1:-}" = "--print-interpreter" ]; then
 fi
 
 if [ -n "${RUSTFS_PYTHON:-}" ]; then
-    if ! command -v "${RUSTFS_PYTHON}" >/dev/null 2>&1; then
+    read -r -a rustfs_python_cmd <<< "${RUSTFS_PYTHON}"
+    if [ "${#rustfs_python_cmd[@]}" -eq 0 ]; then
         echo >&2 "❌ RUSTFS_PYTHON='${RUSTFS_PYTHON}' is not an executable command."
         exit 1
     fi
-    if ! version_ok "${RUSTFS_PYTHON}"; then
+    if ! command -v "${rustfs_python_cmd[0]}" >/dev/null 2>&1; then
+        echo >&2 "❌ RUSTFS_PYTHON='${RUSTFS_PYTHON}' is not an executable command."
+        exit 1
+    fi
+    if ! version_ok "${rustfs_python_cmd[@]}"; then
         echo >&2 "❌ RUSTFS_PYTHON='${RUSTFS_PYTHON}' is older than Python ${MIN_MAJOR}.${MIN_MINOR}."
         echo >&2 "   The repository's checkers import tomllib (Python ${MIN_MAJOR}.${MIN_MINOR}+)."
         exit 1
     fi
     if [ "${print_only}" = "1" ]; then
-        command -v "${RUSTFS_PYTHON}"
+        printf '%s\n' "${RUSTFS_PYTHON}"
         exit 0
     fi
-    exec "${RUSTFS_PYTHON}" "$@"
+    exec "${rustfs_python_cmd[@]}" "$@"
 fi
 
 for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do

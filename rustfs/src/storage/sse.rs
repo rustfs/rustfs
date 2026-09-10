@@ -74,6 +74,7 @@ use super::storage_api::ecstore_object::{
     EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
     ReadEncryptionMode, ReadEncryptionRequest,
 };
+use crate::runtime_sources::current_kms_runtime_service_manager;
 use crate::storage::access::{ReqInfo, request_context_from_req, resource_free_condition_values};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
@@ -2758,7 +2759,32 @@ async fn apply_managed_encryption_material_inner(
     // key it will actually be encrypted under.
     authorize_sse_kms_key(principal, encryption_type, KmsAction::GenerateDataKeyAction, &kms_key_to_use).await?;
 
-    let provider = get_sse_dek_provider().await?;
+    // A node-local master key is the explicit SSE-S3 fallback. Letting it serve
+    // an SSE-KMS request would persist an `aws:kms` marker and a KMS key id
+    // that never wrapped the data key, so refuse rather than downgrade.
+    //
+    // The refusal sits after the authorization gate so an unauthorized caller
+    // still sees AccessDenied whatever the KMS runtime state is, and it asks
+    // the resolved provider rather than a parallel availability signal,
+    // because the provider is what actually wraps the DEK.
+    let provider = match get_sse_dek_provider().await {
+        Ok(provider) => {
+            if matches!(encryption_type, SSEType::SseKms) && provider.wraps_dek_with_local_master_key() {
+                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable().await));
+            }
+            provider
+        }
+        // With no master key set the local fallback fails with an SSE-S3-worded
+        // configuration error. An SSE-KMS request never asked for that provider,
+        // so it gets the SSE-KMS refusal instead of a message naming the wrong
+        // scheme.
+        Err(err) => {
+            if matches!(encryption_type, SSEType::SseKms) && runtime_sources::current_encryption_service().await.is_none() {
+                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable().await));
+            }
+            return Err(err);
+        }
+    };
     let object_context = build_object_encryption_context(bucket, key, ssekms_context.as_ref());
     let (data_key, encrypted_data_key) = provider.generate_sse_dek(&object_context, &kms_key_to_use).await?;
 
@@ -2788,6 +2814,27 @@ async fn apply_managed_encryption_material_inner(
         managed_kms_context: matches!(encryption_type, SSEType::SseKms).then_some(ssekms_context.unwrap_or_default()),
         managed_sealed_key,
     })
+}
+
+/// Whether this node has a KMS configured that is not currently serving, which
+/// separates a transient outage (retryable, 503) from a deployment that never
+/// configured KMS at all (a client-side configuration error, 400).
+async fn kms_configured_but_unavailable() -> bool {
+    match current_kms_runtime_service_manager() {
+        Some(manager) => !matches!(manager.get_status().await, rustfs_kms::KmsServiceStatus::NotConfigured),
+        None => false,
+    }
+}
+
+fn sse_kms_unavailable_error(configured_but_unavailable: bool) -> ApiError {
+    if configured_but_unavailable {
+        return ApiError::from(StorageError::other(KmsUnavailableError));
+    }
+    ApiError {
+        code: S3ErrorCode::InvalidRequest,
+        message: "SSE-KMS requires a configured and running KMS service".to_string(),
+        source: None,
+    }
 }
 
 async fn apply_managed_decryption_material(
@@ -3234,6 +3281,16 @@ pub trait SseDekProvider: Send + Sync {
         Err(ApiError::from(StorageError::other(
             "This DEK provider cannot rewrap KMS-wrapped data keys",
         )))
+    }
+
+    /// Whether this provider wraps data keys with a node-local master key
+    /// instead of a KMS service.
+    ///
+    /// SSE-KMS must never be served by such a provider: the stored object would
+    /// claim `aws:kms` and name a KMS key id that never wrapped anything.
+    /// Defaults to false so only the local fallback has to declare itself.
+    fn wraps_dek_with_local_master_key(&self) -> bool {
+        false
     }
 
     /// Decrypt a DEK from positively identified legacy managed metadata.
@@ -3758,6 +3815,10 @@ impl LocalSseDekProvider {
 
 #[async_trait]
 impl SseDekProvider for LocalSseDekProvider {
+    fn wraps_dek_with_local_master_key(&self) -> bool {
+        true
+    }
+
     async fn generate_sse_dek(
         &self,
         _context: &ObjectEncryptionContext,
@@ -4342,6 +4403,127 @@ mod tests {
         assert_eq!(corrupt.code, S3ErrorCode::InternalError);
         assert_eq!(missing.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
         assert_eq!(super::kms_data_plane_error_class(&missing), "key_not_found");
+    }
+
+    #[test]
+    fn sse_kms_never_falls_back_to_the_local_sse_s3_provider() {
+        let unconfigured = super::sse_kms_unavailable_error(false);
+        assert_eq!(unconfigured.code, S3ErrorCode::InvalidRequest);
+        assert!(unconfigured.message.contains("SSE-KMS requires"));
+
+        let stopped = super::sse_kms_unavailable_error(true);
+        assert_eq!(stopped.code, S3ErrorCode::ServiceUnavailable);
+    }
+
+    fn managed_write(algorithm: &'static str, kms_key_id: Option<&str>) -> EncryptionRequest<'static> {
+        EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(algorithm)),
+            ssekms_key_id: kms_key_id.map(str::to_string),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 128,
+            principal: None,
+        }
+    }
+
+    /// A bucket default naming a KMS key, on a node with no KMS, used to write
+    /// the object under the local master key while stamping `aws:kms` and that
+    /// never-consulted key id into the metadata (backlog#2368 B4).
+    #[tokio::test]
+    async fn sse_kms_write_is_refused_when_only_a_local_master_key_is_available() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode_to_string([9u8; 32]))),
+            ],
+            async {
+                let error = sse_encryption(managed_write(
+                    ServerSideEncryption::AWS_KMS,
+                    Some("arn:aws:kms:us-east-1:123:key/nonexistent"),
+                ))
+                .await
+                .expect_err("SSE-KMS must not be served by the local master key");
+
+                assert_eq!(error.code, S3ErrorCode::InvalidRequest);
+                assert!(error.message.contains("SSE-KMS requires"), "message was {}", error.message);
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
+    }
+
+    /// Without a master key the local fallback fails with an SSE-S3-worded
+    /// configuration error. An SSE-KMS request must not be told to set
+    /// `RUSTFS_SSE_S3_MASTER_KEY`.
+    #[tokio::test]
+    async fn sse_kms_refusal_names_sse_kms_rather_than_the_sse_s3_master_key() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+            ],
+            async {
+                let error = sse_encryption(managed_write(ServerSideEncryption::AWS_KMS, Some("finance-key")))
+                    .await
+                    .expect_err("SSE-KMS must be refused when no KMS is configured");
+
+                assert_eq!(error.code, S3ErrorCode::InvalidRequest);
+                assert!(error.message.contains("SSE-KMS requires"), "message was {}", error.message);
+                assert!(
+                    !error.message.contains("RUSTFS_SSE_S3_MASTER_KEY"),
+                    "an SSE-KMS refusal must not name the SSE-S3 master key: {}",
+                    error.message
+                );
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
+    }
+
+    /// The SSE-S3 local fallback itself is unchanged: refusing SSE-KMS must not
+    /// take the documented no-KMS deployment down with it.
+    #[tokio::test]
+    async fn sse_s3_write_still_uses_the_local_master_key_fallback() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode_to_string([9u8; 32]))),
+            ],
+            async {
+                let material = sse_encryption(managed_write(ServerSideEncryption::AES256, None))
+                    .await
+                    .expect("SSE-S3 keeps its local master key fallback")
+                    .expect("managed sse-s3 material");
+
+                assert_eq!(material.sse_type, SSEType::SseS3);
+                assert_eq!(material.algorithm, ServerSideEncryption::AES256);
+
+                // No object may claim aws:kms while its DEK is wrapped locally.
+                let metadata = encryption_material_to_metadata(&material).expect("sse-s3 metadata should serialize");
+                assert!(
+                    !metadata.iter().any(|(_, value)| value == ServerSideEncryption::AWS_KMS),
+                    "local-master-key material must never be stamped aws:kms: {metadata:?}"
+                );
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
     }
 
     #[test]
@@ -5757,8 +5939,11 @@ mod tests {
         })
         .await
         .expect_err("mismatched kms context should fail");
-        assert_eq!(err.code, S3ErrorCode::InternalError);
-        assert_eq!(err.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "Encryption context mismatch: Context mismatch for key 'tenant': expected 'alpha', got 'beta'"
+        );
         assert_eq!(super::kms_data_plane_error_class(&err), "context_mismatch");
 
         manager.stop().await.expect("kms service should stop cleanly");

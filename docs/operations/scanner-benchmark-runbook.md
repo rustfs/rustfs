@@ -39,8 +39,8 @@ The `scanner` and `heal` subsystems are served by `GetConfigKVHandler` (`rustfs/
 The `--abba` mode runs five independent scenario cells: `cold-hot`, `fresh-hot`,
 `multi-hot-new`, `running-heal`, and `mrf-replay`. Each scenario runs at least
 three A1/B1/B2/A2 groups for both baseline/candidate with background work on,
-and candidate-only background off/on. A measured leg lasts at least 900
-seconds; the minimum matrix contains 120 legs (30 hours before setup/oracles).
+and candidate-only background off/on. A measured release leg lasts at least 7200
+seconds; the minimum matrix contains 120 legs (240 hours before setup/oracles).
 The existing `performance-ab.yml` supplies the pattern for immutable build
 provenance and failure propagation, but its short Warp workload is not this
 scanner gate. No scheduled workflow starts this matrix automatically.
@@ -63,9 +63,10 @@ The manifest has the following JSON contract (all fields are required):
 | Field | Value |
 |---|---|
 | `schema`, `evidence` | `1`, and `measured` or `synthetic`. |
-| `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 900..86400 seconds for measured runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
+| `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 7200..86400 seconds for measured release runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
 | `baseline`, `candidate` | Each contains executable `binary`, full 40-character `revision`, and verified `sha256`. The runner rehashes binaries before every leg. |
 | `fixed` | `config_sha256`, `dataset_sha256`, `release_flags`, `durability`, `disk_type`, `cache_state`, `load_command`, `resource_isolation`, `topology` (`EC8+4`), and positive `offered_load_ops`. Hashes use 64 lowercase hexadecimal characters. |
+| `release_evidence` | Required for `measured` runs. It binds the 3x4 EC8+4 topology, multi-pool/multi-set coverage, per-node metrics endpoints, same-window distributed sampling, process restart and crash-restart fault modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact requirements. Synthetic runs do not need this field and still cannot approve release evidence. |
 | `oracles` | A map with all five scenario names. Each value contains positive integer `objects`, `versions`, `bytes`, and `sha256` of the independently prepared canonical object/version/content manifest. |
 | `expected_healed_objects` | A map with all five scenario names and independently seeded repair counts. Running-heal and MRF-replay require a positive count. |
 
@@ -75,6 +76,14 @@ object/version/content result. Fix the foreground arrival rate (offered load),
 cache preparation procedure, configuration, and hardware across every leg.
 Do not include credentials in the manifest, adapter output, or saved commands;
 the collector reads `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` from its environment.
+The adapter must echo the measured run's `release_evidence` object in every
+measurement response. A mismatch fails the cell because it means the deployment,
+mixed-version set, crash mode, or profiler contract no longer matches the
+operator-reviewed manifest. This echo is provenance binding only; it does not
+replace the independent correctness oracle, distributed metrics samples, profile
+artifacts, or ABBA comparison thresholds. The summary tool revalidates the same
+manifest contract before it can print a measured PASS result, so hand-built or
+trimmed reports without this provenance fail closed.
 
 #### Deployment Adapter Contract
 
@@ -150,6 +159,14 @@ delay counts are both retained so an operator can reject unrelated or
 process-lifetime counter contamination. Correct repair oracles and the existing
 regression limits still apply in every case.
 
+The `running-heal` build comparison also records a `w11` section for the bounded
+retry-window evidence. `status=observed` requires same-window healthy-page
+latency improvement, reduced heal lock-wait p99, bounded candidate RSS growth,
+and a candidate attempt-cost value. `rss_regression` means latency and lock-wait
+improved but RSS exceeded the allowed growth limit; `no_measured_benefit` means
+attempt-cost evidence exists without the full W11 benefit; `pending` means the
+attempt-cost evidence needed for the comparison is missing.
+
 For P2, `measure.convergence` contains booleans `writes_stopped`,
 `last_mutation_observed`, `first_complete_publication`; numeric
 `last_mutation_time`, `last_mutation_observed_time`, `writes_stopped_time`, `window_start`, `window_end`,
@@ -204,6 +221,17 @@ The command prints only `PASS scanner_heal_perf ...` for measured passing ABBA
 evidence, otherwise `FAIL scanner_heal_perf ...`. The JSON and Markdown outputs
 carry the key p99/throughput/P1/P2/cache-cost fields and artifact provenance
 hashes; raw per-cell logs remain in the original artifact tree for audit.
+Failed or interrupted ABBA reports that contain only `status`, `performance`,
+`completed_cells`, and `error` also summarize as `FAIL`; they do not become
+performance evidence, and a missing comparison matrix is accepted only for a
+non-passing report.
+Measured passing reports must also retain the W10/W11 foreground-pressure,
+heal-lock-wait, and heal-attempt-cost fields emitted by the ABBA evaluator. If
+those fields are removed, empty, malformed, or length-mismatched, the quiet
+summary fails closed instead of treating the report as performance evidence. For
+`running-heal` build comparisons, the summary additionally requires the emitted
+W11 section to be `observed` and to retain the RSS-growth, lock-wait,
+healthy-page-latency, and candidate attempt-cost values.
 
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,

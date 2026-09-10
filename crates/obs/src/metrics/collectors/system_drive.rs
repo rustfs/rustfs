@@ -193,31 +193,35 @@ pub(crate) fn collect_drive_runtime_detailed_metrics(stats: &[DriveRuntimeDetail
     let mut metrics = Vec::with_capacity(metric_capacity);
 
     for stat in stats {
+        let first_metric = metrics.len();
         let server_label = stat.stats.server.as_str();
         let drive_label = stat.stats.drive.as_str();
         let topology_labels = topology_labels(stat);
 
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_TOTAL_BYTES_MD,
-            stat.stats.total_bytes as f64,
-            server_label,
-            drive_label,
-        );
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_USED_BYTES_MD,
-            stat.stats.used_bytes as f64,
-            server_label,
-            drive_label,
-        );
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_FREE_BYTES_MD,
-            stat.stats.free_bytes as f64,
-            server_label,
-            drive_label,
-        );
+        push_drive_metric(&mut metrics, &DRIVE_PRESENT_MD, 1.0, server_label, drive_label);
+        if stat.stats.capacity_observation_state != "missing" {
+            push_drive_metric(
+                &mut metrics,
+                &DRIVE_TOTAL_BYTES_MD,
+                stat.stats.total_bytes as f64,
+                server_label,
+                drive_label,
+            );
+            push_drive_metric(
+                &mut metrics,
+                &DRIVE_USED_BYTES_MD,
+                stat.stats.used_bytes as f64,
+                server_label,
+                drive_label,
+            );
+            push_drive_metric(
+                &mut metrics,
+                &DRIVE_FREE_BYTES_MD,
+                stat.stats.free_bytes as f64,
+                server_label,
+                drive_label,
+            );
+        }
         push_drive_metric(
             &mut metrics,
             &DRIVE_CAPACITY_OBSERVATION_AGE_SECONDS_MD,
@@ -352,6 +356,13 @@ pub(crate) fn collect_drive_runtime_detailed_metrics(stats: &[DriveRuntimeDetail
                 );
             }
         }
+        for metric in &mut metrics[first_metric..] {
+            if metric.metric_type == crate::metrics::schema::MetricType::Counter {
+                metric
+                    .labels
+                    .push((DISK_ID_LABEL, Cow::Owned(stat.disk_id.clone().unwrap_or_default())));
+            }
+        }
     }
 
     metrics
@@ -409,6 +420,46 @@ pub fn collect_process_disk_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counters_follow_physical_disk_identity_and_unknown_slots_stay_present() {
+        let mut drive = DriveRuntimeDetailedStats {
+            disk_id: Some("old-disk".into()),
+            pool_index: Some("0".into()),
+            set_index: Some("0".into()),
+            drive_index: Some("1".into()),
+            api_calls: vec![("read_all".into(), 7)],
+            stats: DriveDetailedStats {
+                server: "node1:9000".into(),
+                drive: "/data".into(),
+                writes_total: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for id in ["old-disk", "new-disk"] {
+            drive.disk_id = Some(id.into());
+            let metrics = collect_drive_runtime_detailed_metrics(&[drive.clone()]);
+            let counters = metrics
+                .iter()
+                .filter(|metric| metric.metric_type == crate::metrics::schema::MetricType::Counter)
+                .collect::<Vec<_>>();
+            assert_eq!(counters.len(), 2);
+            assert!(
+                counters
+                    .iter()
+                    .all(|metric| metric.labels.iter().any(|(key, value)| *key == DISK_ID_LABEL && value == id))
+            );
+        }
+        drive.disk_id = None;
+        let metrics = collect_drive_runtime_detailed_metrics(&[drive]);
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "rustfs_system_drive_present" && metric.value == 1.0)
+        );
+        assert!(!metrics.iter().any(|metric| metric.name == "rustfs_system_drive_info"));
+    }
     use crate::metrics::report::report_metrics;
     use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
     use std::collections::BTreeSet;
@@ -474,7 +525,7 @@ mod tests {
         let metrics = collect_drive_runtime_detailed_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 36);
+        assert_eq!(metrics.len(), 37);
 
         // Verify total bytes metric
         let total_bytes_name = DRIVE_TOTAL_BYTES_MD.get_full_metric_name();
@@ -513,10 +564,11 @@ mod tests {
                 SET_INDEX_LABEL,
                 DRIVE_INDEX_LABEL,
                 API_LABEL,
+                DISK_ID_LABEL,
             ],
         );
-        assert_metric_label_keys(&metrics, &DRIVE_WRITES_TOTAL_MD, 11.0, &[SERVER_LABEL, DRIVE_LABEL]);
-        assert_metric_label_keys(&metrics, &DRIVE_DELETES_TOTAL_MD, 4.0, &[SERVER_LABEL, DRIVE_LABEL]);
+        assert_metric_label_keys(&metrics, &DRIVE_WRITES_TOTAL_MD, 11.0, &[SERVER_LABEL, DRIVE_LABEL, DISK_ID_LABEL]);
+        assert_metric_label_keys(&metrics, &DRIVE_DELETES_TOTAL_MD, 4.0, &[SERVER_LABEL, DRIVE_LABEL, DISK_ID_LABEL]);
     }
 
     #[test]
@@ -551,7 +603,7 @@ mod tests {
 
         let metrics = collect_drive_detailed_metrics(&stats);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 9);
         assert!(
             metrics
                 .iter()

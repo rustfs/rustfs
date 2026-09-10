@@ -13,5 +13,5 @@ expression: capabilities_snapshot(backend.capabilities())
   "rotate": true,
   "schedule_deletion": true,
   "update_key_metadata": false,
-  "versioning": true
+  "versioning": false
 }

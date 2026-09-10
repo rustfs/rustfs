@@ -182,10 +182,10 @@ fn remove_heal_control_replay(
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 // v3 additionally promises the v6 tier-delete dispatch-manifest policy; v4
-// promises the sticky per-target decommission capacity fence. The
-// existing periodic topology probe carries both capabilities so normal object
-// operations do not add another peer RPC.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 4;
+// promises the sticky per-target decommission capacity fence; v5 supports
+// conditional transition-state repair and preserves its destination binding.
+// Normal object operations reuse the periodic topology capability probe.
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 5;
 
 fn encode_heal_capability_response(
     topology_member: &str,
@@ -3100,7 +3100,7 @@ mod tests {
         rustfs_heal_contracts::heal_channel::HealChannelRequest,
         rustfs_protos::heal_control::RequestMetadata,
     ) {
-        let manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(HealControlMockStorage), None));
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request(
             "bucket".to_string(),
             Some("prefix".to_string()),
@@ -3338,8 +3338,8 @@ mod tests {
         } if task_id == next_id && task_id != first_id));
         assert_eq!(
             manager.operations_snapshot().await.queue_length,
-            2,
-            "a caller must not treat a new forced request as an idempotent transport retry"
+            1,
+            "a fresh forceStart should replace the previous same-target queued task"
         );
     }
 
@@ -3475,6 +3475,9 @@ mod tests {
             1,
             "post-admission response loss must leave exactly one canonical task"
         );
+        if let Some(cache) = super::HEAL_CONTROL_REPLAY_CACHE.get() {
+            cache.lock().await.clear();
+        }
 
         let mut retry = connect_faulty_heal_control_client(
             Arc::clone(&manager),
@@ -3554,8 +3557,8 @@ mod tests {
         ));
         assert_eq!(
             manager.operations_snapshot().await.queue_length,
-            2,
-            "a new forceStart request must be counted as a distinct canonical task"
+            1,
+            "a fresh forceStart should replace the previous same-target queued task"
         );
     }
 
@@ -3607,7 +3610,7 @@ mod tests {
             } if task_id == first_id
         ));
 
-        let restarted_manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let restarted_manager = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(HealControlMockStorage), None));
         let mut restarted_peer = connect_faulty_heal_control_client(
             Arc::clone(&restarted_manager),
             fingerprint,
@@ -3660,7 +3663,7 @@ mod tests {
 
     #[tokio::test]
     async fn heal_control_executor_preserves_canonical_token_and_drops_query_results() {
-        let manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(HealControlMockStorage), None));
         let coordinator_epoch = 7;
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
         let now = i64::try_from(now).expect("test clock should fit in i64");

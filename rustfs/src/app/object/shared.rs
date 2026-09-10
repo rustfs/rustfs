@@ -16,6 +16,7 @@
 
 use super::*;
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
+use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -30,6 +31,87 @@ pub(super) const ACCEPT_RANGES_BYTES: &str = "bytes";
 pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
+
+fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
+    let code = if version_id.is_some() {
+        S3ErrorCode::MethodNotAllowed
+    } else {
+        S3ErrorCode::NoSuchKey
+    };
+    err.code() == &code && err.status_code() == code.status_code()
+}
+
+/// A delete marker is an error response, but its identity is still part of the
+/// S3 read contract. Never attach the identity of a different explicit version
+/// or turn an unrelated failure into a marker response.
+pub(super) fn with_delete_marker_read_headers(mut err: S3Error, info: &ObjectInfo, version_id: Option<&str>) -> S3Error {
+    if !info.delete_marker || !is_delete_marker_read_error(&err, version_id) {
+        return err;
+    }
+    let marker_version = info.version_id.unwrap_or_else(Uuid::nil);
+    if let Some(requested) = version_id {
+        let requested = if requested.eq_ignore_ascii_case(NULL_VERSION_ID) {
+            Ok(Uuid::nil())
+        } else {
+            Uuid::parse_str(requested)
+        };
+        if requested.ok() != Some(marker_version) {
+            return err;
+        }
+    }
+    let version = if marker_version.is_nil() {
+        HeaderValue::from_static(NULL_VERSION_ID)
+    } else {
+        let Ok(version) = HeaderValue::from_str(&marker_version.to_string()) else {
+            return err;
+        };
+        version
+    };
+    let mut headers = err.headers().cloned().unwrap_or_default();
+    // s3s replaces, rather than extends, the serialized error's header map.
+    // Keep its XML content type when adding our custom error headers.
+    headers
+        .entry(http::header::CONTENT_TYPE)
+        .or_insert(HeaderValue::from_static("application/xml"));
+    headers.insert(X_AMZ_DELETE_MARKER, HeaderValue::from_static("true"));
+    headers.insert(X_AMZ_VERSION_ID, version);
+    if version_id.is_some()
+        && let Some(mod_time) = info.mod_time
+        && let Ok(date) = mod_time.to_offset(time::UtcOffset::UTC).format(&RFC1123)
+        && let Ok(value) = HeaderValue::from_str(&date)
+    {
+        headers.insert(http::header::LAST_MODIFIED, value);
+    }
+    err.set_headers(headers);
+    err
+}
+
+/// Recover marker metadata only after a local read and its existing fallbacks
+/// have failed. Successful reads, unversioned misses and other error classes
+/// do not pay for another lookup. A racing PUT/purge or failed metadata lookup
+/// must keep the original failure, never resurrect an object or invent an ID.
+pub(super) async fn enrich_delete_marker_read_error(
+    store: &ECStore,
+    bucket: &str,
+    key: &str,
+    opts: &ObjectOptions,
+    err: S3Error,
+) -> S3Error {
+    if !(opts.versioned || opts.version_suspended || opts.version_id.is_some())
+        || !is_delete_marker_read_error(&err, opts.version_id.as_deref())
+    {
+        return err;
+    }
+    let mut metadata_opts = opts.clone();
+    // The read already chose its error. This lookup supplies identity only;
+    // object-body conditions cannot replace that error or hide its marker.
+    metadata_opts.http_preconditions = None;
+    metadata_opts.part_number = None;
+    match store.get_object_info_for_delete(bucket, key, &metadata_opts).await {
+        Ok(info) => with_delete_marker_read_headers(err, &info, opts.version_id.as_deref()),
+        Err(_) => err,
+    }
+}
 
 pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
     let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
@@ -240,10 +322,8 @@ pub(super) fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
 /// A request-level value always wins; the bucket default only fills a gap, and
 /// the unknown-algorithm fallback lives once in [`bucket_default_write_sse`].
 ///
-/// `has_explicit_ssec` suppresses the default entirely. Only COPY passes `true`
-/// today: its destination may carry SSE-C, which must not also be given managed
-/// encryption. PUT and extract pass `false`, matching their current behaviour —
-/// see backlog#1826 for the divergence that leaves.
+/// `has_explicit_ssec` suppresses the default entirely: an SSE-C destination
+/// must not also be given managed encryption.
 ///
 /// Callers layering further overrides (PUT's `ciphertext_passthrough`) apply
 /// them to the returned pair.
@@ -263,7 +343,14 @@ pub(super) fn resolve_bucket_default_sse(
     };
 
     let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
-    let effective_kms_key_id = requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()));
+    let effective_kms_key_id = if effective_sse
+        .as_ref()
+        .is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS)
+    {
+        requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()))
+    } else {
+        requested_kms_key_id
+    };
     (effective_sse, effective_kms_key_id)
 }
 
@@ -1015,6 +1102,117 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn delete_marker_read_headers_round_trip_uuid_and_null_errors() {
+        let uuid = Uuid::parse_str("9341ae04-d4ce-468c-a4e1-6501d58cd6b7").unwrap();
+        let modified = time::macros::datetime!(2026-09-09 12:30:45 +08:00);
+        for stored_version in [Some(uuid), Some(Uuid::nil()), None] {
+            let expected_version = stored_version
+                .filter(|id| !id.is_nil())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let info = ObjectInfo {
+                delete_marker: true,
+                version_id: stored_version,
+                mod_time: Some(modified),
+                ..Default::default()
+            };
+            let explicit = stored_version.unwrap_or_else(Uuid::nil).to_string().to_uppercase();
+            for requested in [None, Some(explicit.as_str()), Some(expected_version.as_str())] {
+                let code = if requested.is_some() {
+                    S3ErrorCode::MethodNotAllowed
+                } else {
+                    S3ErrorCode::NoSuchKey
+                };
+                let status = code.status_code().unwrap();
+                let error = with_delete_marker_read_headers(S3Error::new(code), &info, requested);
+                let response = error.to_http_response().expect("marker error must serialize");
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+                assert_eq!(response.headers()[X_AMZ_DELETE_MARKER], "true");
+                assert_eq!(response.headers()[X_AMZ_VERSION_ID], expected_version);
+                if requested.is_some() {
+                    assert_eq!(response.headers()[http::header::LAST_MODIFIED], "Wed, 09 Sep 2026 04:30:45 GMT");
+                } else {
+                    assert!(!response.headers().contains_key(http::header::LAST_MODIFIED));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delete_marker_read_headers_preserve_error_context() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let mut original = S3Error::with_message(S3ErrorCode::NoSuchKey, "original local read failure");
+        original.set_source(Box::new(io::Error::other("original storage cause")));
+        original.set_request_id("request-id");
+        original.set_status_code(StatusCode::NOT_FOUND);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test-existing", HeaderValue::from_static("preserved"));
+        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/custom+xml"));
+        original.set_headers(headers);
+        let error = with_delete_marker_read_headers(original, &info, None);
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(error.status_code(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(error.message(), Some("original local read failure"));
+        assert_eq!(error.request_id(), Some("request-id"));
+        assert_eq!(error.source().unwrap().to_string(), "original storage cause");
+        assert_eq!(error.headers().unwrap()["x-test-existing"], "preserved");
+        assert_eq!(error.headers().unwrap()[http::header::CONTENT_TYPE], "application/custom+xml");
+        assert_eq!(error.headers().unwrap()[X_AMZ_DELETE_MARKER], "true");
+
+        let explicit = info.version_id.unwrap().to_string();
+        let error = with_delete_marker_read_headers(S3Error::new(S3ErrorCode::MethodNotAllowed), &info, Some(&explicit));
+        assert!(
+            !error.headers().unwrap().contains_key(http::header::LAST_MODIFIED),
+            "missing metadata cannot invent a date"
+        );
+    }
+
+    #[test]
+    fn delete_marker_read_headers_reject_unrelated_failures_and_versions() {
+        let marker_id = Uuid::new_v4();
+        let version = marker_id.to_string();
+        let mut info = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(marker_id),
+            ..Default::default()
+        };
+        for (requested, code) in [
+            (None, S3ErrorCode::AccessDenied),
+            (None, S3ErrorCode::InternalError),
+            (None, S3ErrorCode::PreconditionFailed),
+            (None, S3ErrorCode::NotModified),
+            (None, S3ErrorCode::NoSuchVersion),
+            (None, S3ErrorCode::MethodNotAllowed),
+            (Some(version.as_str()), S3ErrorCode::NoSuchKey),
+            (Some(version.as_str()), S3ErrorCode::AccessDenied),
+        ] {
+            let error = with_delete_marker_read_headers(S3Error::new(code), &info, requested);
+            assert!(error.headers().is_none());
+        }
+        let wrong_version = Uuid::new_v4().to_string();
+        for requested in [wrong_version.as_str(), "null", "", "not-a-version", "bad\r\nheader: injected"] {
+            let error = with_delete_marker_read_headers(S3Error::new(S3ErrorCode::MethodNotAllowed), &info, Some(requested));
+            assert!(error.headers().is_none());
+        }
+        let mut original = S3Error::new(S3ErrorCode::NoSuchKey);
+        original.set_status_code(StatusCode::FORBIDDEN);
+        let error = with_delete_marker_read_headers(original, &info, None);
+        assert_eq!(error.status_code(), Some(StatusCode::FORBIDDEN));
+        assert!(error.headers().is_none());
+
+        info.delete_marker = false;
+        let error = with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey), &info, None);
+        assert!(error.headers().is_none(), "a racing PUT is not a delete marker");
+        let error = with_delete_marker_read_headers(S3Error::new(S3ErrorCode::MethodNotAllowed), &info, Some(&version));
+        assert!(error.headers().is_none());
+    }
+
+    #[test]
     fn parse_expires_header_accepts_http_date() {
         let expires = parse_expires_header(Some("Wed, 21 Oct 2015 07:28:00 GMT"))
             .expect("valid Expires header should parse")
@@ -1185,6 +1383,21 @@ mod tests {
 
         assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(
+            Some(&config),
+            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            None,
+            false,
+        );
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
     #[test]

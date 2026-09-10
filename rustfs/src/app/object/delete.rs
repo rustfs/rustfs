@@ -797,6 +797,18 @@ impl DefaultObjectUsecase {
         let resp_elements =
             build_event_resp_elements(&S3Response::new(DeleteObjectsOutput::default()), &request_context.request_id);
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
+        let delete_producers = delete_results
+            .iter()
+            .filter_map(|result| {
+                result.delete_object.as_ref().map(|deleted_object| {
+                    if deleted_object.delete_marker && result.requested_version_id.is_none() {
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteMarker
+                    } else {
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let notify_bucket = bucket.clone();
         spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
@@ -838,7 +850,7 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         if deleted_any {
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            rustfs_scanner::record_dirty_usage_bucket_from_producers(&bucket, delete_producers);
         }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
@@ -1101,7 +1113,10 @@ impl DefaultObjectUsecase {
             let manager = get_capacity_manager();
             manager.record_write_operation().await;
             let _ = helper.complete(&result);
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                &bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject,
+            );
             return result;
         }
 
@@ -1175,7 +1190,12 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+        let producer = if delete_marker && version_id_clone.is_none() {
+            rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteMarker
+        } else {
+            rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject
+        };
+        rustfs_scanner::record_dirty_usage_object_from_producer(&bucket, &key, producer);
         result
     }
 }
@@ -1190,6 +1210,215 @@ mod tests {
         ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
     };
     use std::sync::Arc;
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_read_delete_marker_headers_in_single_and_multi_pool() {
+        crate::app::gating_test_env::run_large_stack_test("read-marker-headers", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+            let single_pool = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&single_pool)).await;
+            }
+            let ambient = current_app_context().expect("read API test context");
+            let (_temp_dir, _disk_paths, multi_pool) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            for (pool_count, store) in [(1, single_pool), (2, multi_pool)] {
+                let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+                let usecase = DefaultObjectUsecase::with_context(Some(context));
+                for suspended in [false, true] {
+                    let bucket = format!("read-marker-headers-{pool_count}-{}", Uuid::new_v4());
+                    store
+                        .make_bucket(
+                            &bucket,
+                            &MakeBucketOptions {
+                                versioning_enabled: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create versioned read fixture");
+                    let key = "history";
+                    let payload = b"historical payload behind the marker";
+                    let original = store
+                        .put_object(
+                            &bucket,
+                            key,
+                            &mut PutObjReader::from_vec(payload.to_vec()),
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write historical version");
+                    if suspended {
+                        store
+                            .update_bucket_metadata_config(
+                                &bucket,
+                                crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                                b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                            )
+                            .await
+                            .expect("suspend versioning before creating the null marker");
+                    }
+                    // get_opts still reads versioning through the ambient metadata
+                    // facade. Publish the fixture's actual config there while the
+                    // request-bound context keeps object I/O on the selected store.
+                    let metadata = store.get_bucket_metadata(&bucket).await.expect("fixture bucket metadata");
+                    crate::app::storage_api::test::set_bucket_metadata(bucket.clone(), (*metadata).clone())
+                        .await
+                        .expect("publish fixture versioning config");
+                    let read_opts = get_opts(&bucket, key, None, None, &HeaderMap::new())
+                        .await
+                        .expect("read fixture versioning config");
+                    assert_eq!(read_opts.versioned, !suspended);
+                    assert_eq!(read_opts.version_suspended, suspended);
+                    let marker = store
+                        .delete_object(
+                            &bucket,
+                            key,
+                            ObjectOptions {
+                                versioned: !suspended,
+                                version_suspended: suspended,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create latest delete marker");
+                    let marker_id = delete_response_version_id(marker.version_id, false).expect("marker identity");
+                    assert_eq!(marker_id == "null", suspended);
+
+                    for explicit in [false, true] {
+                        let requested_version = explicit.then(|| marker_id.clone());
+                        let get = GetObjectInput::builder()
+                            .bucket(bucket.clone())
+                            .key(key.to_string())
+                            .version_id(requested_version.clone())
+                            .build()
+                            .expect("GET request");
+                        let head = HeadObjectInput::builder()
+                            .bucket(bucket.clone())
+                            .key(key.to_string())
+                            .version_id(requested_version)
+                            .build()
+                            .expect("HEAD request");
+                        let get_error = usecase
+                            .execute_get_object(build_request(get, Method::GET))
+                            .await
+                            .expect_err("marker GET");
+                        let head_error = usecase
+                            .execute_head_object(build_request(head, Method::HEAD))
+                            .await
+                            .expect_err("marker HEAD");
+                        for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
+                            assert_eq!(
+                                error.code(),
+                                if explicit {
+                                    &S3ErrorCode::MethodNotAllowed
+                                } else {
+                                    &S3ErrorCode::NoSuchKey
+                                }
+                            );
+                            let headers = error
+                                .headers()
+                                .unwrap_or_else(|| panic!("{method} marker response omitted headers"));
+                            assert_eq!(headers.get("x-amz-delete-marker").expect("marker header"), "true");
+                            assert_eq!(headers.get("x-amz-version-id").expect("version header"), marker_id.as_str());
+                            if explicit {
+                                let modified = marker
+                                    .mod_time
+                                    .expect("marker timestamp")
+                                    .format(&RFC1123)
+                                    .expect("HTTP date");
+                                assert_eq!(headers.get("last-modified").expect("marker timestamp header"), modified.as_str());
+                            }
+                            let wire = error.to_http_response().expect("serialize marker error response");
+                            assert_eq!(
+                                wire.status(),
+                                if explicit {
+                                    StatusCode::METHOD_NOT_ALLOWED
+                                } else {
+                                    StatusCode::NOT_FOUND
+                                }
+                            );
+                            assert_eq!(wire.headers()["x-amz-delete-marker"], "true");
+                            assert_eq!(wire.headers()["x-amz-version-id"], marker_id.as_str());
+                            assert_eq!(wire.headers()[http::header::CONTENT_TYPE], "application/xml");
+                        }
+                    }
+
+                    let original_id = original.version_id.expect("historical version id").to_string();
+                    let get = GetObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .version_id(Some(original_id.clone()))
+                        .build()
+                        .expect("historical GET request");
+                    let response = usecase
+                        .execute_get_object(build_request(get, Method::GET))
+                        .await
+                        .expect("historical GET");
+                    assert!(!response.headers.contains_key("x-amz-delete-marker"));
+                    let mut body = response.output.body.expect("historical body");
+                    let mut actual = Vec::new();
+                    while let Some(chunk) = body.next().await {
+                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
+                    }
+                    assert_eq!(actual, payload);
+                    let head = HeadObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .version_id(Some(original_id.clone()))
+                        .build()
+                        .expect("historical HEAD request");
+                    let response = usecase
+                        .execute_head_object(build_request(head, Method::HEAD))
+                        .await
+                        .expect("historical HEAD");
+                    assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
+                    assert_eq!(response.output.version_id.as_deref(), Some(original_id.as_str()));
+                    assert!(!response.headers.contains_key("x-amz-delete-marker"));
+
+                    for (absent_key, version) in [("missing", None), (key, Some(Uuid::new_v4().to_string()))] {
+                        let get = GetObjectInput::builder()
+                            .bucket(bucket.clone())
+                            .key(absent_key.to_string())
+                            .version_id(version.clone())
+                            .build()
+                            .expect("missing GET request");
+                        let head = HeadObjectInput::builder()
+                            .bucket(bucket.clone())
+                            .key(absent_key.to_string())
+                            .version_id(version)
+                            .build()
+                            .expect("missing HEAD request");
+                        let get_error = usecase
+                            .execute_get_object(build_request(get, Method::GET))
+                            .await
+                            .expect_err("missing GET");
+                        let head_error = usecase
+                            .execute_head_object(build_request(head, Method::HEAD))
+                            .await
+                            .expect_err("missing HEAD");
+                        for error in [get_error, head_error] {
+                            assert_eq!(error.code().status_code(), Some(StatusCode::NOT_FOUND));
+                            assert!(
+                                error
+                                    .headers()
+                                    .is_none_or(|headers| !headers.contains_key("x-amz-delete-marker"))
+                            );
+                            assert!(
+                                error
+                                    .headers()
+                                    .is_none_or(|headers| !headers.contains_key("x-amz-version-id"))
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     #[serial_test::serial]

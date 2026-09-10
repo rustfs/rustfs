@@ -61,10 +61,14 @@ pub fn create_ahm_services_cancel_token() -> CancellationToken {
 }
 
 /// Shutdown all heal services gracefully
-pub fn shutdown_ahm_services() {
+pub async fn shutdown_ahm_services() -> Result<()> {
+    if let Some(manager) = get_heal_manager() {
+        manager.stop().await?;
+    }
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+    Ok(())
 }
 
 struct HealRuntime {

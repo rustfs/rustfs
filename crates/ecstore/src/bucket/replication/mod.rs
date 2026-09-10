@@ -92,3 +92,6 @@ pub use replication_target_boundary::SsecPassthroughCapability;
 pub use replication_target_boundary::VersionIdentityCapability;
 pub use replication_target_boundary::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
+pub use runtime_boundary::{
+    ScannerDirtyUsageMutationObserver, ScannerDirtyUsageMutationSource, set_scanner_dirty_usage_mutation_observer,
+};

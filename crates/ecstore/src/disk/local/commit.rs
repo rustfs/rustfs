@@ -279,11 +279,14 @@ impl LocalDisk {
             Some(token) => Some(self.claim_quota_mutation_fence(dst_volume, dst_path, token).await?),
             None => None,
         };
+        // Quota admission -> metadata RMW -> namespace/volume publication.
+        let metadata_lease =
+            os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, state.namespace_owner.take()).await;
         let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
             &self.root,
             dst_volume,
             &destination_object_path,
-            state.namespace_owner.take(),
+            Some(metadata_lease),
         )
         .await;
         if let Some(claim) = quota_fence_claim {

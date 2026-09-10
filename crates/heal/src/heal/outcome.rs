@@ -110,7 +110,8 @@ impl HealObjectReceipt {
             && self.identity.version_id == expected.version_id
             && self.identity.pool_index == expected.pool_index
             && self.identity.set_index == expected.set_index
-            && self.identity.bucket_incarnation_id.is_some()
+            && self.identity.bucket_incarnation_id == expected.bucket_incarnation_id
+            && expected.bucket_incarnation_id.is_some()
     }
 }
 
@@ -208,7 +209,7 @@ pub fn legacy_wire_status<'a>(
     {
         return Err(HealOutcomeWireError::ContradictoryCompletion);
     }
-    let (adapted, detail) = legacy_execution_status(summary, None, execution, &counters);
+    let (adapted, detail) = legacy_execution_status(summary, None, execution, &counters, first_failed_wire_object(wire));
     Ok((
         adapted,
         if adapted != summary {
@@ -232,15 +233,16 @@ fn legacy_execution_status<'a>(
     detail: Option<String>,
     execution: HealExecutionOutcome,
     counters: &HealOutcomeCounters,
+    first_failure: Option<String>,
 ) -> (&'a str, Option<String>) {
     if summary != "finished" {
         return (summary, detail);
     }
     match execution {
-        HealExecutionOutcome::CompletedWithErrors => (
-            "stopped",
-            Some(format!("heal traversal completed with errors: {} failed objects", counters.failed)),
-        ),
+        HealExecutionOutcome::CompletedWithErrors => {
+            let detail = format!("heal traversal completed with errors: {} failed objects", counters.failed);
+            ("stopped", Some(append_first_failure(detail, first_failure)))
+        }
         HealExecutionOutcome::Aborted(reason) => {
             let reason = match reason {
                 HealAbortReason::Cancelled => "cancelled",
@@ -265,7 +267,7 @@ fn legacy_execution_status<'a>(
 
 impl HealTaskOutcome {
     pub(crate) fn legacy_status<'a>(&self, summary: &'a str, detail: Option<String>) -> (&'a str, Option<String>) {
-        legacy_execution_status(summary, detail, self.execution, &self.counters)
+        legacy_execution_status(summary, detail, self.execution, &self.counters, self.first_failed_object())
     }
 
     pub(crate) fn start(&mut self) {
@@ -344,6 +346,72 @@ impl HealTaskOutcome {
             .saturating_add(self.retained_object_bytes)
             .saturating_add(self.objects.capacity().saturating_mul(size_of::<HealObjectOutcome>()))
     }
+
+    fn first_failed_object(&self) -> Option<String> {
+        self.objects.iter().find_map(first_failed_outcome_object)
+    }
+}
+
+fn append_first_failure(mut detail: String, first_failure: Option<String>) -> String {
+    if let Some(first_failure) = first_failure {
+        detail.push_str("; ");
+        detail.push_str(&first_failure);
+    }
+    detail
+}
+
+fn first_failed_outcome_object(item: &HealObjectOutcome) -> Option<String> {
+    let HealObjectDisposition::Failed(class) = item.disposition else {
+        return None;
+    };
+    Some(format_first_failed_object(
+        &item.identity.bucket,
+        &item.identity.object,
+        item.identity.version_id.as_deref(),
+        failure_class_label(class),
+        item.detail.as_deref(),
+    ))
+}
+
+fn first_failed_wire_object(wire: &serde_json::Value) -> Option<String> {
+    let objects = wire.get("objects")?.as_array()?;
+    objects.iter().find_map(|item| {
+        let disposition = item.get("disposition")?;
+        if disposition.get("state")?.as_str()? != "failed" {
+            return None;
+        }
+        let identity = item.get("identity")?;
+        let bucket = identity.get("bucket")?.as_str()?;
+        let object = identity.get("object")?.as_str()?;
+        let version_id = identity.get("versionId").and_then(serde_json::Value::as_str);
+        let class = disposition
+            .get("details")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let detail = item.get("detail").and_then(serde_json::Value::as_str);
+        Some(format_first_failed_object(bucket, object, version_id, class, detail))
+    })
+}
+
+fn failure_class_label(class: HealFailureClass) -> &'static str {
+    match class {
+        HealFailureClass::Recoverable => "recoverable",
+        HealFailureClass::RetryExhausted => "retry_exhausted",
+        HealFailureClass::Permanent => "permanent",
+    }
+}
+
+fn format_first_failed_object(bucket: &str, object: &str, version_id: Option<&str>, class: &str, detail: Option<&str>) -> String {
+    let mut message = format!("first failed object {bucket}/{object} ({class})");
+    if let Some(version_id) = version_id.filter(|version_id| !version_id.is_empty()) {
+        message.push_str(", version ");
+        message.push_str(version_id);
+    }
+    if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
+        message.push_str(": ");
+        message.push_str(detail);
+    }
+    message
 }
 
 #[cfg(test)]
@@ -496,20 +564,30 @@ mod canonical_outcome_tests {
 
     #[test]
     fn positive_receipt_requires_exact_identity_and_bucket_incarnation() {
-        let expected = item(HealObjectDisposition::Unknown).identity;
+        let incarnation = Uuid::new_v4();
+        let expected = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..item(HealObjectDisposition::Unknown).identity
+        };
         let mut receipt = HealObjectReceipt {
             identity: expected.clone(),
             disposition: HealObjectDisposition::Repaired,
         };
 
+        receipt.identity.bucket_incarnation_id = None;
         assert!(
             !receipt.verified_for(&expected),
             "a positive storage receipt without bucket incarnation must remain untrusted"
         );
 
-        let incarnation = Uuid::new_v4();
         receipt.identity.bucket_incarnation_id = Some(incarnation);
         assert!(receipt.verified_for(&expected));
+
+        receipt.identity.bucket_incarnation_id = Some(Uuid::new_v4());
+        assert!(
+            !receipt.verified_for(&expected),
+            "a storage receipt for a different bucket incarnation must not clear the requested responsibility"
+        );
 
         receipt.identity.version_id = Some("older-version".to_string());
         assert!(

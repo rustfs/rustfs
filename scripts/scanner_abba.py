@@ -14,21 +14,41 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 SCENARIOS = ("cold-hot", "fresh-hot", "multi-hot-new", "running-heal", "mrf-replay")
 LEGS = ("A1", "B1", "B2", "A2")
 MAX_JSON_BYTES = 1024 * 1024
 METRICS = (
-    "p99_ms", "throughput_ops", "rss_bytes", "cpu_seconds", "iops", "rpc_count",
+    "p95_ms", "p99_ms", "throughput_ops", "rss_bytes", "cpu_seconds", "iops", "rpc_count",
     "cache_clone_bytes", "encode_bytes", "save_bytes", "oldest_age_seconds",
     "walk_objects", "cold_walk_objects", "healed_objects", "errors", "requests",
     "foreground_pressure_samples", "foreground_pressure_high_samples",
     "heal_mainline_throttle_delayed",
     "heal_lock_wait_p99_ms", "heal_attempts", "heal_attempt_failures",
     "heal_retry_attempts",
+    "heal_start_p95_ms", "heal_duplicate_task_count", "heal_lock_hold_p95_ms",
 )
 REPEATABILITY_LIMIT = Decimal("0.05")
 P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
+W11_RSS_GROWTH_LIMIT = Decimal("0.05")
+RELEASE_PROFILE_ARTIFACTS = (
+    "allocation-profile",
+    "flamegraph",
+    "rss-samples",
+    "save-frequency",
+)
+MIN_MEASURED_RELEASE_DURATION_SECONDS = 7200
+RELEASE_FAULT_MODES = (
+    "process-restart",
+    "process-crash-restart",
+)
+RELEASE_SCHEDULER_BOUNDS = (
+    "admission-retry-idempotency",
+    "deadline-budget",
+    "lock-hold-bound",
+    "minimum-progress",
+)
 
 
 def require(condition, message):
@@ -120,7 +140,7 @@ def validate_manifest(manifest):
     number(fixed.get("offered_load_ops"), "offered load", 1)
     require(type(manifest.get("rounds")) is int and 3 <= manifest["rounds"] <= 10,
             "rounds must be 3..10")
-    minimum = 900 if manifest["evidence"] == "measured" else 1
+    minimum = MIN_MEASURED_RELEASE_DURATION_SECONDS if manifest["evidence"] == "measured" else 1
     require(type(manifest.get("duration_seconds")) is int and
             minimum <= manifest["duration_seconds"] <= 86400, "invalid duration_seconds")
     number(manifest.get("min_free_bytes"), "min_free_bytes", 1)
@@ -140,6 +160,116 @@ def validate_manifest(manifest):
         number(manifest["expected_healed_objects"].get(scenario), f"{scenario} expected repairs")
         if scenario in ("running-heal", "mrf-replay"):
             require(manifest["expected_healed_objects"][scenario] > 0, f"{scenario} requires repairs")
+    validate_release_evidence_manifest(manifest)
+
+
+def release_evidence_integer(value, name, minimum=1, maximum=1024):
+    require(type(value) is int and minimum <= value <= maximum, f"invalid release_evidence.{name}")
+    return value
+
+
+def release_evidence_string(value, name):
+    require(isinstance(value, str) and value.strip(), f"missing release_evidence.{name}")
+    return value
+
+
+def release_evidence_bool(value, name):
+    require(type(value) is bool, f"invalid release_evidence.{name}")
+    return value
+
+
+def release_evidence_true(value, name):
+    release_evidence_bool(value, name)
+    require(value is True, f"missing release_evidence.{name}")
+
+
+def release_evidence_exact_strings(value, expected, name):
+    require(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value),
+            f"invalid release_evidence.{name}")
+    observed = set(value)
+    require(len(observed) == len(value), f"duplicate release_evidence.{name}")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"missing release_evidence.{name}: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"unknown release_evidence.{name}: {', '.join(unknown)}")
+    return value
+
+
+def validate_release_evidence_manifest(manifest):
+    if manifest["evidence"] != "measured":
+        return
+
+    evidence = manifest.get("release_evidence")
+    require(isinstance(evidence, dict), "missing release_evidence for measured ABBA")
+
+    topology = evidence.get("topology")
+    require(isinstance(topology, dict), "missing release_evidence.topology")
+    nodes = release_evidence_integer(topology.get("nodes"), "topology.nodes", 3, 64)
+    drives = release_evidence_integer(topology.get("drives_per_node"), "topology.drives_per_node", 1, 64)
+    set_size = release_evidence_integer(topology.get("erasure_set_size"), "topology.erasure_set_size", 12, 12)
+    data = release_evidence_integer(topology.get("erasure_data_blocks"), "topology.erasure_data_blocks", 8, 8)
+    parity = release_evidence_integer(topology.get("erasure_parity_blocks"), "topology.erasure_parity_blocks", 4, 4)
+    require(data + parity == set_size, "release_evidence.topology must be EC8+4")
+    require(nodes * drives >= set_size, "release_evidence.topology cannot host one EC8+4 set")
+    pools = release_evidence_integer(topology.get("pools"), "topology.pools", 1)
+    sets_total = release_evidence_integer(topology.get("sets_total"), "topology.sets_total", 1)
+    sampled_pools = release_evidence_integer(topology.get("sampled_pools"), "topology.sampled_pools", 2)
+    sampled_sets = release_evidence_integer(topology.get("sampled_sets"), "topology.sampled_sets", 2)
+    require(sampled_pools <= pools, "release_evidence.topology sampled pools exceed total pools")
+    require(sampled_sets <= sets_total, "release_evidence.topology sampled sets exceed total sets")
+
+    distributed = evidence.get("distributed")
+    require(isinstance(distributed, dict), "missing release_evidence.distributed")
+    endpoints = distributed.get("metrics_endpoints")
+    require(isinstance(endpoints, list) and len(endpoints) >= nodes, "missing release_evidence.distributed.metrics_endpoints")
+    require(
+        all(isinstance(endpoint, str) and endpoint.strip() for endpoint in endpoints)
+        and len(set(endpoints)) == len(endpoints),
+        "invalid release_evidence.distributed.metrics_endpoints",
+    )
+    release_evidence_string(distributed.get("failure_domain"), "distributed.failure_domain")
+    release_evidence_true(distributed.get("same_window_sampling"), "distributed.same_window_sampling")
+
+    scheduler = evidence.get("scheduler")
+    require(isinstance(scheduler, dict), "missing release_evidence.scheduler")
+    release_evidence_exact_strings(scheduler.get("bounds"), RELEASE_SCHEDULER_BOUNDS, "scheduler.bounds")
+    release_evidence_integer(scheduler.get("max_deferred_items"), "scheduler.max_deferred_items", 1, 2**31 - 1)
+    release_evidence_integer(scheduler.get("max_deferred_bytes"), "scheduler.max_deferred_bytes", 1, 2**63 - 1)
+    release_evidence_integer(scheduler.get("max_retry_age_seconds"), "scheduler.max_retry_age_seconds", 1, 86400)
+    release_evidence_true(scheduler.get("duplicate_task_bound_observed"), "scheduler.duplicate_task_bound_observed")
+
+    crash = evidence.get("crash_restart")
+    require(isinstance(crash, dict), "missing release_evidence.crash_restart")
+    release_evidence_exact_strings(crash.get("fault_modes"), RELEASE_FAULT_MODES, "crash_restart.fault_modes")
+    release_evidence_true(crash.get("unclean_shutdown_marker"), "crash_restart.unclean_shutdown_marker")
+
+    mixed = evidence.get("mixed_version")
+    require(isinstance(mixed, dict), "missing release_evidence.mixed_version")
+    baseline_revision = manifest["baseline"]["revision"]
+    candidate_revision = manifest["candidate"]["revision"]
+    require(baseline_revision != candidate_revision,
+            "release_evidence.mixed_version requires distinct baseline and candidate revisions")
+    require(manifest["baseline"]["sha256"] != manifest["candidate"]["sha256"],
+            "release_evidence.mixed_version requires distinct baseline and candidate binaries")
+    revisions = mixed.get("participating_revisions")
+    require(
+        isinstance(revisions, list)
+        and len(set(revisions)) >= 2
+        and all(isinstance(revision, str) and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
+                for revision in revisions),
+        "invalid release_evidence.mixed_version.participating_revisions",
+    )
+    for revision in (baseline_revision, candidate_revision):
+        require(revision in revisions, "release_evidence.mixed_version omits tested build revision")
+    for key in ("reader", "writer", "rollback_payload"):
+        require(mixed.get(key) is True, f"missing release_evidence.mixed_version.{key}")
+
+    profile = evidence.get("profile")
+    require(isinstance(profile, dict), "missing release_evidence.profile")
+    release_evidence_exact_strings(profile.get("required_artifacts"), RELEASE_PROFILE_ARTIFACTS,
+                                   "profile.required_artifacts")
+    for key in ("collector_config_sha256", "profiler_config_sha256"):
+        require(sha(profile.get(key)), f"invalid release_evidence.profile.{key}")
 
 
 class OwnedCommand:
@@ -254,6 +384,8 @@ def validate_result(result, request, expected):
     require(result.get("build") == request["build"], "deployed build provenance mismatch")
     require(result.get("data_dir") == request["data_dir"], "adapter data isolation mismatch")
     require(result.get("background") == request["background"], "background mode mismatch")
+    if request["evidence"] == "measured":
+        require(result.get("release_evidence") == request["release_evidence"], "release evidence provenance mismatch")
     require(type(result.get("sample_count")) is int and 1 <= result["sample_count"] <= 3600,
             "sample_count must be 1..3600")
     number(result.get("elapsed_seconds"), "elapsed_seconds", request["duration_seconds"])
@@ -267,6 +399,9 @@ def validate_result(result, request, expected):
             "foreground pressure high samples exceed samples")
     require(metrics["heal_attempt_failures"] <= metrics["heal_attempts"], "heal failures exceed attempts")
     require(metrics["heal_retry_attempts"] <= metrics["heal_attempts"], "heal retries exceed attempts")
+    require(metrics["heal_duplicate_task_count"] == 0, "duplicate heal task admission")
+    require(metrics["heal_start_p95_ms"] > 0, "zero heal start p95")
+    require(metrics["heal_lock_hold_p95_ms"] > 0, "zero heal lock hold p95")
     require(metrics["errors"] == 0, "workload request errors")
     require(metrics["cold_walk_objects"] <= metrics["walk_objects"], "cold walk exceeds total walk")
     require(result.get("oracle") == expected, "object/version/byte oracle mismatch")
@@ -346,6 +481,48 @@ def running_heal_pacing(group, baseline, candidate, p99, throughput, noisy):
     }
 
 
+def bounded_retry_window(group, baseline, candidate, p99, throughput, noisy, candidate_attempt_costs):
+    if group[0]["scenario"] != "running-heal" or group[0]["comparison"] != "build":
+        return {"status": "not_applicable"}
+
+    rss_growth = relative_change_or_none(candidate["rss_bytes"], baseline["rss_bytes"], "rss_bytes")
+    lock_wait_change = relative_change_or_none(
+        candidate["heal_lock_wait_p99_ms"], baseline["heal_lock_wait_p99_ms"], "heal lock wait p99",
+    )
+    latency_improved = p99 < 0 or throughput > 0
+    lock_wait_improved = lock_wait_change is not None and lock_wait_change < 0
+    rss_within_limit = rss_growth is not None and rss_growth <= W11_RSS_GROWTH_LIMIT
+    attempt_cost_available = bool(candidate_attempt_costs)
+    status = (
+        "inconclusive"
+        if noisy
+        else "observed"
+        if latency_improved and lock_wait_improved and rss_within_limit and attempt_cost_available
+        else "rss_regression"
+        if latency_improved and lock_wait_improved and not rss_within_limit
+        else "no_measured_benefit"
+        if attempt_cost_available
+        else "pending"
+    )
+    return {
+        "status": status,
+        "rss_growth_limit": float(W11_RSS_GROWTH_LIMIT),
+        "rss_growth": None if rss_growth is None else float(rss_growth),
+        "rss_within_limit": rss_within_limit,
+        "baseline_rss_bytes": float(baseline["rss_bytes"]),
+        "candidate_rss_bytes": float(candidate["rss_bytes"]),
+        "baseline_heal_lock_wait_p99_ms": float(baseline["heal_lock_wait_p99_ms"]),
+        "candidate_heal_lock_wait_p99_ms": float(candidate["heal_lock_wait_p99_ms"]),
+        "heal_lock_wait_p99_change": None if lock_wait_change is None else float(lock_wait_change),
+        "healthy_page_latency_observed": latency_improved,
+        "foreground_p99_change": float(p99),
+        "foreground_throughput_change": float(throughput),
+        "candidate_attempt_cost_per_healed_object": (
+            None if not candidate_attempt_costs else float(max(candidate_attempt_costs))
+        ),
+    }
+
+
 def convergence(result):
     window = result.get("convergence")
     if not window or window.get("writes_stopped") is not True or window.get("last_mutation_observed") is not True or window.get("first_complete_publication") is not True:
@@ -376,6 +553,7 @@ def evaluate(cells):
         noise = max(drift, repeat_drift) > REPEATABILITY_LIMIT
         a = {key: (decimal_number(a1[key], key) + decimal_number(a2[key], key)) / Decimal("2") for key in METRICS}
         b = {key: (decimal_number(b1[key], key) + decimal_number(b2[key], key)) / Decimal("2") for key in METRICS}
+        p95 = max(a["p95_ms"], b["p95_ms"])
         p99 = relative_change(b["p99_ms"], a["p99_ms"], "p99_ms")
         throughput = relative_change(b["throughput_ops"], a["throughput_ops"], "throughput_ops")
         thresholds = {"p99_regression": Decimal("0.10") if control else Decimal("0.05"),
@@ -392,7 +570,11 @@ def evaluate(cells):
             required = ratio(a["cold_walk_objects"], a["walk_objects"], "cold walk baseline") * Decimal("0.80")
             reduction = Decimal("1") - ratio(b["walk_objects"], a["walk_objects"], "walk reduction")
             p1 = {"required_reduction": float(required), "observed_reduction": float(reduction),
-                  "repeatability_drift": report_number(work_drift)}
+                  "repeatability_drift": report_number(work_drift),
+                  "baseline_walk_objects": int(a["walk_objects"]),
+                  "baseline_cold_walk_objects": int(a["cold_walk_objects"]),
+                  "candidate_walk_objects": int(b["walk_objects"]),
+                  "candidate_cold_walk_objects": int(b["cold_walk_objects"])}
             if group[0]["scenario"] == "cold-hot":
                 # Compare counts before division can round repeating decimal ratios.
                 passed &= a["walk_objects"] - b["walk_objects"] >= a["cold_walk_objects"] * Decimal("0.80")
@@ -406,12 +588,17 @@ def evaluate(cells):
             value for cell, value in zip(group, attempt_costs) if cell["leg"].startswith("B") and value is not None
         ]
         w10 = running_heal_pacing(group, a, b, p99, throughput, noise)
+        w11 = bounded_retry_window(group, a, b, p99, throughput, noise, candidate_attempt_costs)
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
         comparisons.append({"scenario": group[0]["scenario"], "comparison": group[0]["comparison"],
                             "round": group[0]["round"], "status": "inconclusive" if noise else ("fail" if not passed else "inconclusive" if p2_pending else "pass"),
                             "a2_a1_drift": report_number(drift), "b2_b1_drift": report_number(repeat_drift),
+                            "foreground_p95_ms": float(p95),
+                            "foreground_p99_ms": float(max(a["p99_ms"], b["p99_ms"])),
+                            "throughput_ops": float(min(a["throughput_ops"], b["throughput_ops"])),
+                            "error_rate": float(max(a["errors"] / a["requests"], b["errors"] / b["requests"])),
                             "p99_regression": float(p99), "throughput_change": float(throughput),
                             "thresholds": {key: float(value) for key, value in thresholds.items()},
                             "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
@@ -422,7 +609,14 @@ def evaluate(cells):
                                 "candidate_vs_baseline": scanner_cache_cost_change(b, a),
                             },
                             "w10": w10,
+                            "w11": w11,
                             "w10_w11": {
+                                "foreground_pressure_samples": [
+                                    cell["result"]["metrics"]["foreground_pressure_samples"] for cell in group
+                                ],
+                                "foreground_pressure_high_samples": [
+                                    cell["result"]["metrics"]["foreground_pressure_high_samples"] for cell in group
+                                ],
                                 "foreground_pressure_high_sample_ratios": [
                                     float(pressure_high_ratio(cell["result"]["metrics"])) for cell in group
                                 ],
@@ -435,6 +629,17 @@ def evaluate(cells):
                                 "candidate_attempt_cost_per_healed_object": (
                                     None if not candidate_attempt_costs else float(max(candidate_attempt_costs))
                                 ),
+                            },
+                            "w09": {
+                                "heal_start_p95_ms": [
+                                    cell["result"]["metrics"]["heal_start_p95_ms"] for cell in group
+                                ],
+                                "heal_duplicate_task_count": [
+                                    cell["result"]["metrics"]["heal_duplicate_task_count"] for cell in group
+                                ],
+                                "heal_lock_hold_p95_ms": [
+                                    cell["result"]["metrics"]["heal_lock_hold_p95_ms"] for cell in group
+                                ],
                             }})
     return ("fail" if failed else "inconclusive" if inconclusive else "pass"), comparisons
 
@@ -445,6 +650,9 @@ def collect_live(prepared, request, request_path, adapter):
     connection = prepared["collector"]
     require(set(connection) == {"alias", "endpoint", "metrics_endpoints"}, "invalid collector connection")
     require(all(isinstance(value, str) and value for value in connection.values()), "missing collector endpoint")
+    expected_metrics_endpoints = None
+    if request.get("evidence") == "measured":
+        expected_metrics_endpoints = request["release_evidence"]["distributed"]["metrics_endpoints"]
     output = request_path.parent / "telemetry"
     args = ["bash", str(collector), "--alias", connection["alias"], "--endpoint", connection["endpoint"],
             "--metrics-endpoints", connection["metrics_endpoints"], "--deployment", "distributed",
@@ -470,6 +678,9 @@ def collect_live(prepared, request, request_path, adapter):
                 require(isinstance(status.get("healOperations"), dict) and status["healOperations"], "invalid heal status response")
             metrics = list((output / "metrics").glob("admin-metrics.*.ndjson"))
             endpoints = [endpoint for endpoint in connection["metrics_endpoints"].split(",") if endpoint]
+            if expected_metrics_endpoints is not None:
+                require(endpoints == expected_metrics_endpoints,
+                        "collector metrics endpoints do not match release evidence")
             require(metrics and len(metrics) == len(endpoints) * len(samples), "missing distributed metrics samples")
             for sample in metrics:
                 # The collector requests n=1, so each file contains one final JSON record.
@@ -497,6 +708,8 @@ def run(manifest, adapter, output, data_root):
     require(shutil.disk_usage(data_root).free >= manifest["min_free_bytes"], "insufficient free disk space")
     manifest["adapter_sha256"] = digest(adapter)
     manifest["collector_sha256"] = digest(Path(__file__).with_name("run_scanner_validation_harness.sh"))
+    started_at = datetime.now(timezone.utc).replace(microsecond=0)
+    manifest["started_at"] = started_at.isoformat().replace("+00:00", "Z")
     write_json(output / "manifest.json", manifest)
     cells = []
     write_json(output / "report.json", {"status": "incomplete", "performance": "pending"})
@@ -518,6 +731,8 @@ def run(manifest, adapter, output, data_root):
                                    "duration_seconds": manifest["duration_seconds"], "data_dir": str(data_dir),
                                    "expected_healed_objects": manifest["expected_healed_objects"][scenario],
                                    "expected_oracle": manifest["oracles"][scenario]}
+                        if manifest["evidence"] == "measured":
+                            request["release_evidence"] = manifest["release_evidence"]
                         require(digest(Path(request["build"]["binary"])) == request["build"]["sha256"], "binary changed during run")
                         require(digest(adapter) == manifest["adapter_sha256"], "adapter changed during run")
                         require(shutil.disk_usage(data_root).free >= manifest["min_free_bytes"], "insufficient free disk space")
@@ -543,14 +758,19 @@ def run(manifest, adapter, output, data_root):
                             require(stopped.get("stopped") is True, "adapter failed to stop deployment")
         status, comparisons = evaluate(cells)
         synthetic = manifest["evidence"] == "synthetic"
+        finished_at = datetime.now(timezone.utc).replace(microsecond=0)
         report = {"status": "synthetic_validated" if synthetic and status == "pass" else status,
                   "evidence": manifest["evidence"], "performance": "pending" if synthetic else status,
-                  "cells": len(cells), "comparisons": comparisons}
+                  "cells": len(cells), "comparisons": comparisons,
+                  "started_at": manifest["started_at"], "finished_at": finished_at.isoformat().replace("+00:00", "Z")}
         write_json(output / "report.json", report)
         return 0 if status == "pass" else 3 if status == "inconclusive" else 1
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+        finished_at = datetime.now(timezone.utc).replace(microsecond=0)
         write_json(output / "report.json", {"status": "failed", "performance": "pending",
-                                            "completed_cells": len(cells), "error": str(error)})
+                                            "completed_cells": len(cells), "error": str(error),
+                                            "started_at": manifest.get("started_at"),
+                                            "finished_at": finished_at.isoformat().replace("+00:00", "Z")})
         raise
 
 

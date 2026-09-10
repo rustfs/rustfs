@@ -69,7 +69,7 @@ fn describe_metric_once(name: &'static str, metric_type: MetricType, help: &Cow<
     }
 }
 
-fn counter_value_from_f64(value: f64) -> Option<u64> {
+pub(crate) fn counter_value_from_f64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
     }

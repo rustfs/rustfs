@@ -51,7 +51,7 @@ fn main() {
         }
     }
     let revision = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
-    let dirty = git(&root, &["status", "--porcelain", "--untracked-files=normal"]).is_none_or(|status| !status.is_empty());
+    let dirty = git(&root, &["status", "--porcelain", "--untracked-files=no"]).is_none_or(|status| !status.is_empty());
     let lock = git(&root, &["hash-object", "Cargo.lock"]).unwrap_or_else(|| "unknown".to_owned());
     let mut features = std::env::vars()
         .filter_map(|(key, _)| {

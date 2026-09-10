@@ -280,6 +280,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
+    let mut heal_handoff_complete = true;
     let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
     for step in &background_steps {
         match step {
@@ -305,7 +306,19 @@ pub(crate) async fn run_startup_shutdown_sequence(
                     state = "stopping",
                     "Background service shutdown started"
                 );
-                shutdown_ahm_services();
+                if let Err(error) = shutdown_ahm_services().await {
+                    heal_handoff_complete = false;
+                    warn!(
+                        target: "rustfs::main::handle_shutdown",
+                        event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                        component = LOG_COMPONENT_MAIN,
+                        subsystem = LOG_SUBSYSTEM_STARTUP,
+                        service = "ahm",
+                        state = "handoff_failed",
+                        error = %error,
+                        "Heal shutdown handoff failed; retaining unclean-shutdown markers"
+                    );
+                }
             }
         }
     }
@@ -411,7 +424,9 @@ pub(crate) async fn run_startup_shutdown_sequence(
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
     // The data plane is drained: record this shutdown as clean so the next
     // startup skips the unclean-restart erasure-set heal.
-    rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+    if heal_handoff_complete {
+        rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+    }
     state_manager.update(ServiceState::Stopped);
     info!(
         target: "rustfs::main::handle_shutdown",

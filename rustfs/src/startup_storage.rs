@@ -152,6 +152,7 @@ pub(crate) async fn init_startup_storage_runtime(
     readiness: Arc<GlobalReadiness>,
     instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
+    rustfs_scanner::register_scanner_pause_backlog_retirement();
     let ctx = CancellationToken::new();
 
     debug!(
@@ -195,6 +196,7 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
     shutdown_token: CancellationToken,
     instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
+    rustfs_scanner::register_scanner_pause_backlog_retirement();
     let store =
         match ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), shutdown_token.clone(), instance_ctx).await {
             Ok(store) => store,
