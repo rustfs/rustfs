@@ -62,6 +62,26 @@ Current guidance:
 - `RUSTFS_CORS_ALLOWED_ORIGINS` defaults to empty, so the S3 endpoint emits no generic CORS headers unless configured. Set `*` for wildcard origins without credentials, or a comma-separated allow-list for credentialed explicit origins.
 - `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` defaults to `*` for the console service.
 
+## Console URL prefix
+
+`RUSTFS_CONSOLE_PREFIX` changes the embedded console URL prefix. The default is
+`/rustfs/console`. For example, `RUSTFS_CONSOLE_PREFIX=/console` serves the UI at
+`http://localhost:9001/console/`. Nested prefixes such as `/management/console`
+are supported; one trailing slash is removed. Restart the server after changing it.
+
+The prefix must be a non-root absolute path of at most 256 bytes, with nonempty
+segments containing only ASCII letters, digits, `-`, `_`, `.`, or `~`. Dot
+segments, encoded characters, and overlaps with reserved admin, RPC, health,
+profiling, browser entry, and icon routes are rejected at startup. `/` is not supported.
+Choose a prefix that does not collide with S3 bucket paths.
+
+The console routes, embedded frontend asset URLs, browser redirects, and OIDC
+console redirects use this prefix. Admin API paths and the identity provider's
+`/rustfs/admin/v3/oidc/callback/...` URL remain unchanged. `RUSTFS_CONSOLE_ADDRESS`
+continues to control only the listening address and port. Bundled console assets
+must be built with the default `/rustfs/console` base path; the server adapts their
+text references when serving a custom prefix.
+
 ## Browser redirect environment variables
 
 - `RUSTFS_BROWSER_REDIRECT_URL` sets the externally reachable browser origin used for OIDC callback, console success redirect, and logout fallback URLs. Configure it to the public scheme and authority without a path, for example `https://console.example.com`. In load-balancer deployments, keep OIDC authorize and callback requests on the same backend node because the in-flight OIDC `state` is local to the RustFS node.

@@ -86,7 +86,76 @@ pub(crate) const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 /// Predefined console prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle console-related tasks
 /// such as user interface and management.
-pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
+pub(crate) const CONSOLE_PREFIX: &str = rustfs_config::DEFAULT_CONSOLE_PREFIX;
+
+static CONFIGURED_CONSOLE_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The prefix is fixed before listeners start; request handling never reads the environment.
+pub(crate) fn console_prefix() -> &'static str {
+    CONFIGURED_CONSOLE_PREFIX.get().map(String::as_str).unwrap_or(CONSOLE_PREFIX)
+}
+
+pub(crate) fn init_console_prefix() -> std::io::Result<()> {
+    let raw = match std::env::var(rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => CONSOLE_PREFIX.to_string(),
+        Err(err) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err)),
+    };
+    let prefix = validate_console_prefix(&raw)?;
+    if CONFIGURED_CONSOLE_PREFIX.get_or_init(|| prefix.clone()) != &prefix {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RUSTFS_CONSOLE_PREFIX cannot change after server initialization",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_console_prefix(raw: &str) -> std::io::Result<String> {
+    let prefix = raw.strip_suffix('/').unwrap_or(raw);
+    // Keep the value safe in HTTP headers, Axum routes, and embedded HTML/JS.
+    if !prefix.starts_with('/')
+        || prefix.len() > 256
+        || prefix[1..].split('/').any(|segment| {
+            segment.is_empty()
+                || matches!(segment, "." | "..")
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RUSTFS_CONSOLE_PREFIX must be a non-root absolute path of at most 256 bytes with nonempty URL-safe segments",
+        ));
+    }
+    let reserved = [
+        ADMIN_PREFIX,
+        MINIO_ADMIN_PREFIX,
+        TABLE_CATALOG_PREFIX,
+        TABLE_CATALOG_COMPAT_PREFIX,
+        RPC_PREFIX,
+        TONIC_PREFIX,
+        "/rustfs/peer",
+        HEALTH_PREFIX,
+        "/minio/health",
+        "/profile",
+        "/index.html",
+        FAVICON_PATH,
+        APPLE_TOUCH_ICON_PATH,
+        APPLE_TOUCH_ICON_PRECOMPOSED_PATH,
+    ];
+    if reserved
+        .iter()
+        .any(|path| has_path_prefix(prefix, path) || has_path_prefix(path, prefix))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RUSTFS_CONSOLE_PREFIX overlaps a reserved server route",
+        ));
+    }
+    Ok(prefix.to_string())
+}
 
 /// Predefined RPC prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle remote procedure calls (RPC).
@@ -111,3 +180,146 @@ pub const LOGO: &str = r#"
 ░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
 
 "#;
+
+#[cfg(test)]
+mod console_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn console_prefix_validation() {
+        for (raw, expected) in [
+            (CONSOLE_PREFIX, CONSOLE_PREFIX),
+            ("/console", "/console"),
+            ("/management/console/", "/management/console"),
+            ("/health-dashboard", "/health-dashboard"),
+        ] {
+            assert_eq!(validate_console_prefix(raw).expect("valid console prefix"), expected);
+        }
+        for raw in [
+            "",
+            "/",
+            "console",
+            "//console",
+            "/console//",
+            "/a//b",
+            "/a/../b",
+            "/a/./b",
+            "/%2e%2e",
+            "/console?x=1",
+            "/console#x",
+            "/console\\x",
+            "/a\n",
+            "/{param}",
+            "/<script>",
+            "/控制台",
+            "/rustfs",
+            "/rustfs/admin",
+            "/rustfs/admin/v3/ui",
+            "/minio",
+            "/minio/admin",
+            "/health",
+            "/health/ui",
+            "/iceberg",
+            "/_iceberg/v1",
+            "/rustfs/rpc",
+            "/rustfs/peer",
+            "/node_service.NodeService",
+            "/profile",
+            "/index.html",
+            "/favicon.ico",
+            "/index.html",
+        ] {
+            assert_eq!(validate_console_prefix(raw).expect_err(raw).kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert!(validate_console_prefix(&format!("/{}", "a".repeat(255))).is_ok());
+        assert!(validate_console_prefix(&format!("/{}", "a".repeat(256))).is_err());
+    }
+
+    #[test]
+    fn configured_console_prefix_subprocesses() {
+        // Startup configuration is process-wide; isolate each value from other unit tests.
+        for prefix in [None, Some("/console"), Some("/management/console/")] {
+            let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["console_prefix_process_case", "--test-threads=1"])
+                .env("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS", "1")
+                .env("RUSTFS_BROWSER_REDIRECT_URL", "https://console.example.com")
+                .env("RUSTFS_HEALTH_ENDPOINT_ENABLE", "true")
+                .env("RUSTFS_CONSOLE_RATE_LIMIT_ENABLE", "false");
+            if let Some(prefix) = prefix {
+                command.env(rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX, prefix);
+            } else {
+                command.env_remove(rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX);
+            }
+            let output = command.output().expect("run isolated console tests");
+            assert!(
+                output.status.success(),
+                "prefix {prefix:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_prefix_process_case_routes() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+        init_console_prefix().expect("initialize configured console prefix");
+        let expected = std::env::var(rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX).unwrap_or_else(|_| CONSOLE_PREFIX.to_string());
+        let prefix = expected.trim_end_matches('/');
+        assert_eq!(console_prefix(), prefix);
+        assert!(crate::admin::console::is_console_path(&format!("{prefix}/index.html")));
+        assert!(!crate::admin::console::is_console_path(&format!("{prefix}-other/index.html")));
+        for path in ["/rustfs/admin/v3/info", "/minio/admin/v3/info", "/health", "/bucket/object"] {
+            assert!(!crate::admin::console::is_console_path(path), "reserved or S3 path {path}");
+        }
+        assert_eq!(
+            crate::server::compress::PathCategory::classify(&format!("{prefix}/asset.js")),
+            crate::server::compress::PathCategory::Console
+        );
+        if prefix != CONSOLE_PREFIX {
+            assert!(!crate::admin::console::is_console_path(CONSOLE_PREFIX));
+        }
+        crate::admin::console::init_console_cfg(std::net::Ipv4Addr::LOCALHOST.into(), 9001);
+        let router = crate::admin::console::make_console_server();
+        for (suffix, expected_status, expected_ready) in [
+            ("/health", StatusCode::OK, None),
+            ("/health/live", StatusCode::OK, None),
+            ("/health/ready", StatusCode::SERVICE_UNAVAILABLE, Some(false)),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{prefix}{suffix}"))
+                        .body(Body::empty())
+                        .expect("health request"),
+                )
+                .await
+                .expect("health response");
+            assert_eq!(response.status(), expected_status, "{suffix}");
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.expect("health body");
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("health JSON");
+            assert_eq!(payload.get("ready").and_then(serde_json::Value::as_bool), expected_ready, "{suffix}");
+        }
+        for suffix in ["/version", "/license"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{prefix}{suffix}"))
+                        .body(Body::empty())
+                        .expect("console request"),
+                )
+                .await
+                .expect("console response");
+            assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+            assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/json");
+        }
+    }
+}
