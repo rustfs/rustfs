@@ -219,7 +219,10 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        let lock_registry = runtime_sources::lock_registry();
+        let pool_lockers = runtime_sources::lock_registry()
+            .as_ref()
+            .map(|registry| registry.clients_for_endpoints(endpoints.endpoints.as_ref()))
+            .unwrap_or_default();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
@@ -270,10 +273,6 @@ impl Sets {
                 }
             }
 
-            let lockers = lock_registry
-                .as_ref()
-                .map(|registry| registry.clients_for_endpoints(&set_endpoints))
-                .unwrap_or_default();
             let set_disks = SetDisks::new_with_instance_ctx(
                 runtime_sources::local_node_name().await,
                 Arc::new(RwLock::new(set_drive)),
@@ -283,7 +282,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
-                lockers,
+                pool_lockers.clone(),
                 instance_ctx.clone(),
             )
             .await;
