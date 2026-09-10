@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
     "test-and-lint", "test-ilm-integration-serial", "test-and-lint-rio-v2",
+    "offline-enrollment-root-boundary",
     "connect-short-credential-boundary", "test-and-lint-protocols",
     "build-rustfs-debug-binary", "uring-integration", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
