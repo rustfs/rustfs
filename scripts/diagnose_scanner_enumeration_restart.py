@@ -74,6 +74,10 @@ def converged(report, objects):
 
 
 def replays_raw_window(previous, current):
+    if (previous["raw_entries"] == 0 or current["raw_entries"] == 0
+            or previous["raw_first_entry"] is None or current["raw_first_entry"] is None
+            or previous["raw_last_entry"] is None or current["raw_last_entry"] is None):
+        return False
     return (previous["raw_first_entry"] == current["raw_first_entry"]
             and previous["raw_last_entry"] == current["raw_last_entry"]
             and previous["objects_retained"] == current["objects_before"]
