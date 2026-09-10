@@ -140,6 +140,11 @@ class ReportTests(unittest.TestCase):
         advanced = dict(current, objects_retained=1)
         self.assertFalse(replays_raw_window(previous, advanced))
 
+        finalization = dict(current, raw_entries=0, raw_first_entry=None,
+                            raw_last_entry=None, raw_name_bytes=0,
+                            objects_processed=1)
+        self.assertFalse(replays_raw_window(previous, finalization))
+
     def test_recoverable_quantum_rejects_replayed_raw_window(self):
         previous = self.report()
         previous.update(objects_retained=0, versions_retained=0, bytes_retained=0,
@@ -190,6 +195,25 @@ class ReportTests(unittest.TestCase):
                       raw_page_index_committed_entries=1,
                       raw_page_index_indexed_entries=1)
         validate_recoverable_quantum([first, second], objects=4, budget=16, require_converged=False)
+
+    def test_recoverable_quantum_allows_no_raw_finalization_after_full_processing(self):
+        first = self.report()
+        first.update(snapshot_complete=False, outcome="partial", objects_before=0,
+                     objects_processed=4, objects_retained=4, versions_retained=4,
+                     bytes_retained=4, raw_page_index_parent="bucket",
+                     raw_page_index_complete=False, raw_page_index_committed_entries=4,
+                     raw_page_index_indexed_entries=4)
+        second = self.report()
+        second.update(round=1, pid=124, raw_entries=0, raw_first_entry=None,
+                      raw_last_entry=None, raw_name_bytes=0, objects_before=4,
+                      objects_processed=1, objects_retained=4,
+                      versions_retained=4, bytes_retained=4,
+                      snapshot_complete=True, outcome="complete",
+                      raw_page_index_parent=None,
+                      raw_page_index_complete=False,
+                      raw_page_index_committed_entries=0,
+                      raw_page_index_indexed_entries=0)
+        validate_recoverable_quantum([first, second], objects=4, budget=16, require_converged=True)
 
     def test_recoverable_quantum_rejects_missing_processing_stage(self):
         report = self.report()

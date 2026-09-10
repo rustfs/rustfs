@@ -460,6 +460,10 @@ mod tests {
         .collect()
     }
 
+    fn transient_degraded_request_error(error: &str) -> bool {
+        error.contains("ServiceUnavailable") || error.contains("503")
+    }
+
     fn matching_manifest_count(
         disk: &Path,
         bucket: &str,
@@ -1344,16 +1348,50 @@ mod tests {
 
         let outage_key = "cluster/written-while-node-down.bin";
         let outage_payload_seed = 0xf1;
-        timeout(
-            Duration::from_secs(30),
-            clients[2]
-                .put_object()
-                .bucket(bucket)
-                .key(outage_key)
-                .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
-                .send(),
-        )
-        .await??;
+        let outage_put_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match timeout(
+                Duration::from_secs(10),
+                clients[2]
+                    .put_object()
+                    .bucket(bucket)
+                    .key(outage_key)
+                    .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => break,
+                Ok(Err(error))
+                    if Instant::now() < outage_put_deadline && transient_degraded_request_error(&error.to_string()) =>
+                {
+                    info!(
+                        event = "heal_interruption_outage_put_retry",
+                        component = "e2e_test",
+                        subsystem = "heal",
+                        interruption_kind,
+                        "Retrying outage object PUT after transient degraded-cluster response"
+                    );
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Ok(Err(error)) => {
+                    return Err(format!("outage object PUT failed after target interruption: {error}").into());
+                }
+                Err(error) if Instant::now() < outage_put_deadline => {
+                    info!(
+                        event = "heal_interruption_outage_put_retry",
+                        component = "e2e_test",
+                        subsystem = "heal",
+                        interruption_kind,
+                        "Retrying outage object PUT after timeout: {error}"
+                    );
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    return Err(format!("outage object PUT timed out after target interruption: {error}").into());
+                }
+            }
+        }
 
         let mut outage_peer_erasure_indices = HashSet::new();
         for (node_index, node) in cluster.nodes.iter().enumerate() {
