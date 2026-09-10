@@ -52,8 +52,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ExpirationStatus,
-    LifecycleRule, LifecycleRuleFilter, NoncurrentVersionTransition, RestoreRequest, Transition, TransitionStorageClass,
-    VersioningConfiguration,
+    LifecycleRule, LifecycleRuleFilter, MetadataDirective, NoncurrentVersionTransition, RestoreRequest, Transition,
+    TransitionStorageClass, VersioningConfiguration,
 };
 use http::Method;
 use serde::Deserialize;
@@ -960,6 +960,81 @@ async fn test_hermetic_transition_main_path() -> TestResult {
 
     wait_for_cold_tier_empty(&cold_client, StdDuration::from_secs(90)).await?;
 
+    Ok(())
+}
+
+/// PUT and materialized self-copy must retain cleanup ownership of a replaced
+/// transitioned null version while publishing the new bytes and metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_hermetic_transition_overwrite_and_self_copy() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "coldtieradmin".to_string();
+    cold.secret_key = "coldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    start_tier_source(&mut hot, crate::common::FAST_DATA_USAGE_SCANNER_ENV).await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+    hot_client.create_bucket().bucket(SOURCE_BUCKET).send().await?;
+
+    let data = payload();
+    for self_copy in [false, true] {
+        hot_client
+            .put_bucket_lifecycle_configuration()
+            .bucket(SOURCE_BUCKET)
+            .lifecycle_configuration(BucketLifecycleConfiguration::builder().rules(transition_rule()?).build()?)
+            .send()
+            .await?;
+        put_multipart_object(&hot_client, SOURCE_BUCKET, OBJECT_KEY, &data).await?;
+        wait_for_transition(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(90)).await?;
+        assert_eq!(cold_tier_object_count(&cold_client).await?, 1);
+        // Keep the replacement local so disappearance of the old remote
+        // object cannot be confused with another automatic transition.
+        hot_client.delete_bucket_lifecycle().bucket(SOURCE_BUCKET).send().await?;
+
+        let expected = if self_copy { data.clone() } else { vec![0x73; 513] };
+        if self_copy {
+            hot_client
+                .copy_object()
+                .bucket(SOURCE_BUCKET)
+                .key(OBJECT_KEY)
+                .copy_source(format!("{SOURCE_BUCKET}/{}", urlencoding::encode(OBJECT_KEY)))
+                .metadata_directive(MetadataDirective::Replace)
+                .content_type("text/plain")
+                .metadata("replacement", "kept")
+                .send()
+                .await?;
+        } else {
+            hot_client
+                .put_object()
+                .bucket(SOURCE_BUCKET)
+                .key(OBJECT_KEY)
+                .body(ByteStream::from(expected.clone()))
+                .content_type("text/plain")
+                .metadata("replacement", "kept")
+                .send()
+                .await?;
+        }
+        wait_for_cold_tier_empty(&cold_client, StdDuration::from_secs(90)).await?;
+        let current = hot_client.get_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+        assert_eq!(current.content_type(), Some("text/plain"));
+        assert_eq!(current.metadata().and_then(|m| m.get("replacement")).map(String::as_str), Some("kept"));
+        assert!(
+            current
+                .metadata()
+                .is_none_or(|metadata| !metadata.contains_key(USER_META_KEY))
+        );
+        assert_eq!(current.body.collect().await?.into_bytes().as_ref(), expected.as_slice());
+        hot_client
+            .delete_object()
+            .bucket(SOURCE_BUCKET)
+            .key(OBJECT_KEY)
+            .send()
+            .await?;
+    }
     Ok(())
 }
 

@@ -165,6 +165,40 @@ if not status.get("pending_gates"):
 PY
 }
 
+nextest_junit_candidates() {
+    local target_dir="$1"
+    local profile="$2"
+    local primary="$target_dir/nextest/$profile/junit.xml"
+    local fallback="$ROOT/target/nextest/$profile/junit.xml"
+    printf '%s\n' "$primary"
+    if [[ "$fallback" != "$primary" ]]; then
+        printf '%s\n' "$fallback"
+    fi
+}
+
+remove_nextest_junit_candidates() {
+    local target_dir="$1"
+    local profile="$2"
+    local candidate
+    while IFS= read -r candidate; do
+        rm -f "$candidate"
+    done < <(nextest_junit_candidates "$target_dir" "$profile")
+}
+
+copy_nextest_junit() {
+    local target_dir="$1"
+    local profile="$2"
+    local run_dir="$3"
+    local candidate
+    while IFS= read -r candidate; do
+        if [[ -f "$candidate" ]]; then
+            cp "$candidate" "$run_dir/junit.xml"
+            return 0
+        fi
+    done < <(nextest_junit_candidates "$target_dir" "$profile")
+    return 1
+}
+
 run_self_test() {
     if "$0" --case release --plan-only >/dev/null 2>&1; then
         echo "self-test failed: release pseudo-case must not be runnable" >&2
@@ -186,6 +220,24 @@ run_self_test() {
             return 1
         fi
     done < <(case_ids)
+
+    local junit_profile="scanner-heal-junit-self-test-$$"
+    local junit_run_dir="$ROOT/target/scanner-heal-junit-self-test-$$"
+    local junit_target_dir="$ROOT/target/scanner-heal-junit-custom-target-$$"
+    local junit_fallback="$ROOT/target/nextest/$junit_profile/junit.xml"
+    mkdir -p "$(dirname "$junit_fallback")" "$junit_run_dir"
+    printf '<testsuites />\n' >"$junit_fallback"
+    if ! copy_nextest_junit "$junit_target_dir" "$junit_profile" "$junit_run_dir"; then
+        echo "self-test failed: nextest junit fallback was not copied" >&2
+        rm -rf "$junit_run_dir" "$junit_target_dir" "$(dirname "$junit_fallback")"
+        return 1
+    fi
+    if ! cmp -s "$junit_fallback" "$junit_run_dir/junit.xml"; then
+        echo "self-test failed: copied nextest junit fallback changed content" >&2
+        rm -rf "$junit_run_dir" "$junit_target_dir" "$(dirname "$junit_fallback")"
+        return 1
+    fi
+    rm -rf "$junit_run_dir" "$junit_target_dir" "$(dirname "$junit_fallback")"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -300,8 +352,7 @@ export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/e2e-logs}"
 export RUSTFS_HEAL_CHAOS_LOG_DIR="${RUSTFS_HEAL_CHAOS_LOG_DIR:-$RUSTFS_E2E_LOG_DIR}"
 mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
-JUNIT_PATH="$TARGET_DIR/nextest/$PROFILE/junit.xml"
-rm -f "$JUNIT_PATH"
+remove_nextest_junit_candidates "$TARGET_DIR" "$PROFILE"
 set +e
 NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
 HTTP_PROXY= \
@@ -311,9 +362,7 @@ cargo nextest run --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --no-tests=
 STATUS=$?
 set -e
 
-if [[ -f "$JUNIT_PATH" ]]; then
-    cp "$JUNIT_PATH" "$RUN_DIR/junit.xml"
-fi
+copy_nextest_junit "$TARGET_DIR" "$PROFILE" "$RUN_DIR" || true
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --finish-scanner-heal "$RUN_DIR" "$STATUS"
 
 if [[ "$STATUS" -ne 0 ]]; then

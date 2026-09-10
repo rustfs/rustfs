@@ -3821,6 +3821,13 @@ impl SetDisks {
             }
 
             fi.metadata = user_defined;
+            if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
+                // Every disk must publish the same cleanup owner alongside a
+                // replaced null version. This transient key is not persisted
+                // on the new object; recovery discovers the free-version in
+                // the committed xl.meta even if this request is cancelled.
+                fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            }
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -18172,6 +18179,102 @@ mod put_object_tmp_cleanup_tests {
 
         drop(barrier);
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn tier_overwrite_failed_quorum_and_cancellation_preserve_live_source() {
+        for cancel_before_rename in [false, true] {
+            let (dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "tier-overwrite-failure";
+            let object = "still-live";
+            make_completion_test_bucket(&disks, bucket).await;
+            let old_body = vec![0x31; TEST_OBJECT_SIZE];
+            let mut metadata = HashMap::from([(
+                "x-amz-restore".to_string(),
+                "ongoing-request=\"false\", expiry-date=\"2099-01-01T00:00:00Z\"".to_string(),
+            )]);
+            for (suffix, value) in [
+                (rustfs_utils::http::SUFFIX_TRANSITION_STATUS, "complete".to_string()),
+                (rustfs_utils::http::SUFFIX_TRANSITION_TIER, "WARM".to_string()),
+                (rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME, "remote/still-live".to_string()),
+                (rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID, "exact-live-version".to_string()),
+                (rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE, "exact".to_string()),
+                (rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32)),
+            ] {
+                rustfs_utils::http::insert_str(&mut metadata, suffix, value);
+            }
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(old_body.clone()),
+                &ObjectOptions {
+                    user_defined: metadata,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed live transitioned source");
+            wait_for_tmp_workspace_to_drain(&dirs, "seed write must drain").await;
+            let before = set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read original metadata")
+                .expect("original exists");
+
+            if cancel_before_rename {
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterQuotaReservation);
+                let writer = Arc::clone(&set);
+                let put = tokio::spawn(async move {
+                    writer
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut PutObjReader::from_vec(vec![0x32; TEST_OBJECT_SIZE]),
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                });
+                barrier.wait_until_paused().await;
+                put.abort();
+                assert!(put.await.expect_err("cancel paused replacement").is_cancelled());
+                wait_for_tmp_workspace_to_drain(&dirs, "cancelled replacement must roll back").await;
+                drop(barrier);
+            } else {
+                let _fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
+                let err = set
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![0x32; TEST_OBJECT_SIZE]),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("two disk commits cannot satisfy write quorum three");
+                assert!(matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)), "{err}");
+            }
+            let after = set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read rolled-back metadata")
+                .expect("live source must survive");
+            assert_eq!(after.versions, before.versions, "failed replacement must preserve the live version");
+            assert_eq!(
+                after.free_versions, before.free_versions,
+                "failed replacement must not publish a cleanup owner"
+            );
+            let mut reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("live source remains readable");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read original bytes");
+            assert_eq!(actual, old_body);
+        }
     }
 
     #[tokio::test]

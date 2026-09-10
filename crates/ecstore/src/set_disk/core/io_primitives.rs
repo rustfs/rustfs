@@ -3077,6 +3077,23 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, false).await
+    }
+
+    pub(crate) async fn load_file_info_versions_for_tier_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, true).await
+    }
+
+    async fn load_file_info_versions_for_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+        retain_unconfirmed_tier_references: bool,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
         let disk_object = rustfs_utils::path::encode_dir_object(object);
         let disks = self.get_disks_internal().await;
         if disks.is_empty() {
@@ -3152,12 +3169,24 @@ impl SetDisks {
             )));
         }
 
-        let file_info_versions = FileMeta {
+        let mut file_info_versions = FileMeta {
             versions,
             ..Default::default()
         }
         .get_all_file_info_versions(bucket, object, true)
         .map_err(decode_error)?;
+        if retain_unconfirmed_tier_references {
+            // A failed overwrite may leave its live source on a minority
+            // of disks. Preserve that reference even if quorum merging
+            // selects only the replacement and its cleanup owner.
+            file_info_versions.versions.extend(
+                transition_copies
+                    .into_values()
+                    .flatten()
+                    .map(|(version, _)| version)
+                    .filter(|version| !version.tier_free_version()),
+            );
+        }
 
         for file_info in file_info_versions
             .versions
@@ -12212,6 +12241,64 @@ mod tests {
         let result = set.update_object_meta("bucket", "object", with_metadata, &[None, None]).await;
 
         assert!(result.is_err(), "missing disks must prevent metadata write quorum");
+    }
+
+    #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_unreadable_disk_despite_metadata_quorum() {
+        let bucket = "tier-unreadable-disk";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        for index in 1..=3 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            fi.erasure.index = index;
+            disk.write_metadata(bucket, bucket, object, fi.clone())
+                .await
+                .expect("seed metadata quorum");
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        disks.push(None);
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's unreadable-replica fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "unreadable replica may still reference the old remote object"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_minority_metadata_in_an_absent_set() {
+        let bucket = "tier-minority-metadata";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        for index in 1..=4 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            if index == 1 {
+                let mut fi = metadata_test_fileinfo(object);
+                fi.mod_time = Some(OffsetDateTime::now_utc());
+                disk.write_metadata(bucket, bucket, object, fi)
+                    .await
+                    .expect("seed minority metadata");
+            }
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's minority-ownership fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "absence on a majority cannot prove this physical set has no remote reference"
+        );
     }
 
     #[tokio::test]

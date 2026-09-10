@@ -480,7 +480,110 @@ impl FileMeta {
         Ok(())
     }
 
-    pub fn add_version(&mut self, mut fi: FileInfo) -> Result<()> {
+    pub fn add_version(&mut self, fi: FileInfo) -> Result<()> {
+        if let Some(free_version) = self.overwritten_tier_free_version(&fi)? {
+            // The replacement and its cleanup owner must share one xl.meta
+            // commit. Keep the original intact if either insertion fails.
+            let mut next = self.clone();
+            next.add_version_inner(fi)?;
+            next.add_version_filemata(free_version)?;
+            *self = next;
+            return Ok(());
+        }
+        self.add_version_inner(fi)
+    }
+
+    fn overwritten_tier_free_version(&self, fi: &FileInfo) -> Result<Option<FileMetaVersion>> {
+        use rustfs_utils::http::{
+            SUFFIX_TIER_FV_ID, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE,
+            get_consistent_bytes, get_consistent_str, has_internal_suffix, strip_internal_prefix_preserving_case,
+        };
+
+        if fi.version_id.is_some_and(|id| !id.is_nil()) || !contains_key_str(&fi.metadata, SUFFIX_TIER_FV_ID) {
+            return Ok(None);
+        }
+        let Some(existing) = self
+            .versions
+            .iter()
+            .find(|v| v.header.version_id.is_none_or(|id| id.is_nil()))
+        else {
+            return Ok(None);
+        };
+        let old = existing.parse_version_meta()?;
+        let Some(mut object) = old.object else {
+            return Ok(None);
+        };
+        let status = get_consistent_bytes(&object.meta_sys, SUFFIX_TRANSITION_STATUS);
+        if status.is_none()
+            && object
+                .meta_sys
+                .keys()
+                .any(|key| has_internal_suffix(key, SUFFIX_TRANSITION_STATUS))
+        {
+            // Empty status is a valid local object. The reader distinguishes
+            // it from conflicting aliases before the ordinary overwrite.
+            object.into_fileinfo(&fi.volume, &fi.name, false)?;
+            return Ok(None);
+        }
+        if status != Some(TRANSITION_COMPLETE.as_bytes()) {
+            return Ok(None);
+        }
+        // Reuse the reader's alias/state validation. A legacy empty remote
+        // version is valid and must not be mistaken for conflicting aliases.
+        object.into_fileinfo(&fi.volume, &fi.name, false)?;
+        if object
+            .meta_sys
+            .keys()
+            .any(|key| has_internal_suffix(key, SUFFIX_TRANSITION_TIER_DESTINATION_ID))
+            && get_consistent_bytes(&object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID).is_none()
+        {
+            return Err(Error::FileCorrupt);
+        }
+        let transition_suffixes = [
+            SUFFIX_TRANSITION_STATUS,
+            SUFFIX_TRANSITION_TIER,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME,
+            SUFFIX_TRANSITIONED_VERSION_ID,
+            SUFFIX_TRANSITIONED_VERSION_STATE,
+        ];
+        let replacement = MetaObject::from(fi.clone());
+        if transition_suffixes
+            .iter()
+            .all(|suffix| get_consistent_bytes(&object.meta_sys, suffix) == get_consistent_bytes(&replacement.meta_sys, suffix))
+        {
+            return Ok(None);
+        }
+        let id = get_consistent_str(&fi.metadata, SUFFIX_TIER_FV_ID).ok_or(Error::FileCorrupt)?;
+        let id = Uuid::parse_str(id)?;
+        if id.is_nil() || self.versions.iter().any(|version| version.header.version_id == Some(id)) {
+            return Err(Error::FileCorrupt);
+        }
+        // The reader also accepts legacy key casing. Canonicalize only this
+        // cleanup source so init_free_version preserves every accepted field,
+        // including an explicitly empty unversioned remote version.
+        for suffix in transition_suffixes {
+            let value = object
+                .meta_sys
+                .iter()
+                .find(|(key, _)| {
+                    strip_internal_prefix_preserving_case(key).is_some_and(|found| found.eq_ignore_ascii_case(suffix))
+                })
+                .map(|(_, value)| value.clone());
+            if let Some(value) = value {
+                rustfs_utils::http::insert_bytes(&mut object.meta_sys, suffix, value);
+            }
+        }
+        let (free_version, created) = object.init_free_version(fi)?;
+        if !created {
+            return Err(Error::FileCorrupt);
+        }
+        Ok(Some(free_version))
+    }
+
+    fn add_version_inner(&mut self, mut fi: FileInfo) -> Result<()> {
+        rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID);
         // empty version_id means "null" (versioning disabled/suspended)
         if fi.version_id.is_none() {
             fi.version_id = Some(Uuid::nil());
@@ -1461,6 +1564,235 @@ mod test {
             let replaced = fm.versions[0].parse_version_meta().expect("parse null replacement");
             assert_eq!(replaced.object.expect("object version").size, 42);
         });
+    }
+
+    fn tier_overwrite_fixture(state: crate::TransitionVersionState) -> (FileMeta, FileInfo) {
+        let mut source = FileInfo::new("object", 2, 2);
+        source.erasure.index = 1;
+        source.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture timestamp"));
+        source.data_dir = Some(Uuid::new_v4());
+        source.transition_status = TRANSITION_COMPLETE.to_string();
+        source.transition_tier = "WARM".to_string();
+        source.transitioned_objname = "remote/old-object".to_string();
+        source.transition_version_state = state;
+        source.transition_version = match state {
+            crate::TransitionVersionState::Exact => Some("opaque-provider-version".to_string()),
+            crate::TransitionVersionState::SuspendedNull => Some("null".to_string()),
+            _ => None,
+        };
+        rustfs_utils::http::insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "ab".repeat(32),
+        );
+        if state == crate::TransitionVersionState::KnownDisabled {
+            rustfs_utils::http::insert_str(
+                &mut source.metadata,
+                rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+                String::new(),
+            );
+        }
+        let mut meta = FileMeta::new();
+        meta.add_version(source.clone()).expect("seed transitioned null version");
+        (meta, source)
+    }
+
+    #[test]
+    fn tier_overwrite_preserves_exact_cleanup_owner_across_reload() {
+        use crate::TransitionVersionState::{Exact, KnownDisabled, SuspendedNull, Unknown};
+        use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_TIER_FV_ID};
+
+        for state in [Exact, KnownDisabled, SuspendedNull, Unknown] {
+            for inline in [false, true] {
+                let (mut meta, _) = tier_overwrite_fixture(state);
+                let old = meta.versions[0].parse_version_meta().expect("old metadata");
+                let old = old.object.expect("old object");
+                let id = Uuid::new_v4();
+                let mut replacement = FileInfo::new("object", 2, 2);
+                replacement.version_id = inline.then_some(Uuid::nil());
+                replacement.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("fixture timestamp"));
+                replacement.data_dir = Some(Uuid::new_v4());
+                replacement.size = 3;
+                if inline {
+                    replacement.data = Some(Bytes::from_static(b"new"));
+                }
+                replacement.set_tier_free_version_id(&id.to_string());
+
+                meta.add_version(replacement.clone())
+                    .expect("replace transitioned null version");
+                let bytes = meta.marshal_msg().expect("persist replacement and cleanup owner");
+                let mut reopened = FileMeta::load(&bytes).expect("reopen committed metadata");
+                assert_eq!(reopened.versions.len(), 2);
+                let (_, free) = reopened.find_version(Some(id)).expect("durable cleanup owner");
+                assert!(free.free_version());
+                let marker = free.delete_marker.expect("cleanup marker");
+                for suffix in [
+                    rustfs_utils::http::SUFFIX_TRANSITION_TIER,
+                    rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
+                    rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+                    rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+                ] {
+                    for prefix in [RUSTFS_INTERNAL_PREFIX, MINIO_INTERNAL_PREFIX] {
+                        let key = format!("{prefix}{suffix}");
+                        assert_eq!(marker.meta_sys.get(&key), old.meta_sys.get(&key), "{state:?}: {key}");
+                    }
+                }
+                let (_, current) = reopened.find_version(None).expect("replacement survives restart");
+                let current = current.object.expect("replacement object");
+                assert_eq!(current.size, 3);
+                assert!(!rustfs_utils::http::contains_key_bytes(&current.meta_sys, SUFFIX_TIER_FV_ID));
+                reopened
+                    .add_version(replacement)
+                    .expect("replaying replacement is idempotent");
+                assert_eq!(reopened.versions.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn tier_overwrite_rejects_cleanup_failure_without_mutating_source() {
+        for id in ["not-a-uuid".to_string(), Uuid::nil().to_string()] {
+            let (mut meta, _) = tier_overwrite_fixture(crate::TransitionVersionState::Exact);
+            let before = meta.clone();
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.mod_time = Some(OffsetDateTime::now_utc());
+            replacement.set_tier_free_version_id(&id);
+            assert!(meta.add_version(replacement).is_err());
+            assert_eq!(meta, before, "invalid cleanup identity must preserve source");
+        }
+        with_object_max_versions_for_test(1, || {
+            let (mut meta, _) = tier_overwrite_fixture(crate::TransitionVersionState::KnownDisabled);
+            let before = meta.clone();
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.mod_time = Some(OffsetDateTime::now_utc());
+            replacement.data = Some(Bytes::from_static(b"new"));
+            replacement.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            assert_eq!(
+                meta.add_version(replacement)
+                    .expect_err("cleanup owner exceeds version limit"),
+                Error::MaxVersionsExceeded
+            );
+            assert_eq!(meta, before, "failed cleanup insertion must also preserve inline bytes");
+        });
+    }
+
+    #[test]
+    fn tier_overwrite_allows_empty_transition_status_on_local_source() {
+        let mut source = FileInfo::new("object", 2, 2);
+        source.mod_time = Some(OffsetDateTime::now_utc());
+        source.data = Some(Bytes::from_static(b"old"));
+        rustfs_utils::http::insert_str(&mut source.metadata, rustfs_utils::http::SUFFIX_TRANSITION_STATUS, String::new());
+        let mut meta = FileMeta::new();
+        meta.add_version(source)
+            .expect("seed readable local metadata with empty status");
+        let mut replacement = FileInfo::new("object", 2, 2);
+        replacement.mod_time = Some(OffsetDateTime::now_utc());
+        replacement.size = 3;
+        replacement.data = Some(Bytes::from_static(b"new"));
+        replacement.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        meta.add_version(replacement)
+            .expect("an ordinary overwrite must still succeed");
+        assert_eq!(meta.versions.len(), 1);
+        let (_, current) = meta.find_version(None).expect("replacement remains visible");
+        assert_eq!(current.object.expect("ordinary object").size, 3);
+        assert!(!meta.versions[0].header.free_version());
+    }
+
+    #[test]
+    fn tier_overwrite_preserves_legacy_metadata_casing() {
+        use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX};
+
+        for state in [
+            crate::TransitionVersionState::Exact,
+            crate::TransitionVersionState::KnownDisabled,
+        ] {
+            let (mut meta, _) = tier_overwrite_fixture(state);
+            let mut source = meta.versions[0].parse_version_meta().expect("seeded source");
+            let object = source.object.as_mut().expect("transitioned source");
+            let expected = object.meta_sys.clone();
+            object.meta_sys = object
+                .meta_sys
+                .drain()
+                .map(|(key, value)| (key.to_ascii_uppercase(), value))
+                .collect();
+            meta.versions[0] = FileMetaShallowVersion::try_from(source).expect("legacy key casing");
+            let id = Uuid::new_v4();
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.mod_time = Some(OffsetDateTime::now_utc());
+            replacement.set_tier_free_version_id(&id.to_string());
+            meta.add_version(replacement).expect("overwrite readable legacy source");
+            let reopened = FileMeta::load(&meta.marshal_msg().expect("persist overwrite")).expect("reopen overwrite");
+            let (_, owner) = reopened
+                .find_version(Some(id))
+                .expect("legacy source must retain cleanup ownership");
+            let marker = owner.delete_marker.expect("cleanup marker");
+            for suffix in [
+                rustfs_utils::http::SUFFIX_TRANSITION_TIER,
+                rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
+                rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+                rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+            ] {
+                for prefix in [RUSTFS_INTERNAL_PREFIX, MINIO_INTERNAL_PREFIX] {
+                    let key = format!("{prefix}{suffix}");
+                    assert_eq!(marker.meta_sys.get(&key), expected.get(&key), "legacy {state:?}: {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tier_overwrite_rejects_conflicting_remote_metadata_aliases() {
+        use rustfs_utils::http::{
+            MINIO_INTERNAL_PREFIX, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE,
+        };
+        for suffix in [
+            SUFFIX_TRANSITION_STATUS,
+            SUFFIX_TRANSITION_TIER,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME,
+            SUFFIX_TRANSITIONED_VERSION_ID,
+            SUFFIX_TRANSITIONED_VERSION_STATE,
+        ] {
+            let (mut meta, _) = tier_overwrite_fixture(crate::TransitionVersionState::Exact);
+            let mut old = meta.versions[0].parse_version_meta().expect("seeded source metadata");
+            old.object
+                .as_mut()
+                .expect("transitioned source")
+                .meta_sys
+                .insert(format!("{MINIO_INTERNAL_PREFIX}{suffix}"), b"conflicting-value".to_vec());
+            meta.versions[0] = FileMetaShallowVersion::try_from(old).expect("encode conflicting aliases");
+            let before = meta.clone();
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.mod_time = Some(OffsetDateTime::now_utc());
+            replacement.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            assert_eq!(
+                meta.add_version(replacement)
+                    .expect_err("ambiguous ownership must fail closed"),
+                Error::FileCorrupt
+            );
+            assert_eq!(meta, before, "conflicting {suffix} must not erase the old remote tuple");
+        }
+    }
+
+    #[test]
+    fn tier_overwrite_keeps_retained_remote_and_versioned_copy_ownership() {
+        let (mut meta, mut source) = tier_overwrite_fixture(crate::TransitionVersionState::Exact);
+        source.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        meta.add_version(source.clone())
+            .expect("restore retains the same remote owner");
+        assert_eq!(meta.versions.len(), 1);
+        source.version_id = Some(Uuid::new_v4());
+        source.transition_status.clear();
+        source.transition_tier.clear();
+        source.transitioned_objname.clear();
+        source.transition_version = None;
+        source.transition_version_state = crate::TransitionVersionState::Unknown;
+        meta.add_version(source).expect("versioned write retains historical source");
+        assert_eq!(meta.versions.len(), 2);
+        assert!(meta.versions.iter().all(|version| !version.header.free_version()));
     }
 
     #[test]
