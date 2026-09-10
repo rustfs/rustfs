@@ -1220,7 +1220,7 @@ impl ExpiryState {
 
         while state.tasks_tx.len() < n {
             let (tx, rx) = mpsc::channel(EXPIRY_WORKER_QUEUE_CAPACITY);
-            let api = api.clone();
+            let api = Arc::downgrade(&api);
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             let stats = Arc::clone(&state.stats);
             let recovery_notify = Arc::clone(&state.recovery_notify);
@@ -1248,14 +1248,18 @@ impl ExpiryState {
 
     async fn worker(
         rx: &mut Receiver<Option<ExpiryOpType>>,
-        api: Arc<ECStore>,
+        api: Weak<ECStore>,
         stats: Arc<ExpiryStats>,
         recovery_notify: Arc<Notify>,
     ) {
-        let cancel_token = api.ctx.background_cancel_token().unwrap_or_else(|| {
+        let Some(initial_api) = api.upgrade() else {
+            return;
+        };
+        let cancel_token = initial_api.ctx.background_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new).clone()
         });
+        drop(initial_api);
 
         loop {
             select! {
@@ -1284,6 +1288,9 @@ impl ExpiryState {
                     let v = v.expect("received None after None check");
                     stats.decrement_pending_tasks();
                     let _active_task = ExpiryActiveTask::begin(Arc::clone(&stats));
+                    let Some(api) = api.upgrade() else {
+                        return;
+                    };
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
                         //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
@@ -7759,8 +7766,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
@@ -7861,8 +7869,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
 
         stats.increment_pending_tasks();
@@ -8031,7 +8040,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -8118,7 +8127,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -8225,7 +8234,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
-        let worker_store = Arc::clone(&ecstore);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
             ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
@@ -8279,8 +8288,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let worker_stats = Arc::clone(&stats);
         let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::downgrade(&ecstore);
         let worker = tokio::spawn(async move {
-            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
         });
         let oi = ObjectInfo {
             bucket: format!("missing-bucket-{}", Uuid::new_v4()),
