@@ -3281,6 +3281,65 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_rebuilds_missing_part_when_metadata_remains_current() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-missing-part-current-meta";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let payload = vec![0x7b; 1024 * 1024];
+        let mut reader = PutObjReader::from_vec(payload);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before shard loss");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let missing_part = temp_dirs[1]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        tokio::fs::remove_file(&missing_part)
+            .await
+            .expect("target shard should be removed while xl.meta remains current");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after a single shard is removed");
+
+        assert!(error.is_none(), "deep heal should recover the missing shard: {error:?}");
+        assert_eq!(result.after.drives[1].state, DriveState::Ok.to_string());
+        assert!(
+            missing_part.exists(),
+            "deep heal must reconstruct the missing shard on the original disk slot"
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_target_readback_checks_the_requested_historical_version() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "replacement-target-readback-versioned";
