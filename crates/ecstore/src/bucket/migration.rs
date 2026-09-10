@@ -53,7 +53,7 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 enum MigrationMetadataError {
     #[error("empty legacy metadata: {0}")]
     Empty(String),
@@ -70,6 +70,20 @@ impl From<MigrationMetadataError> for Error {
         // Keep the record path in the typed source, not in the quorum grouping key.
         Self::other_with_context(message, error)
     }
+}
+
+/// Converts a migration failure at the startup boundary, rendering the safe
+/// record path while leaving storage-layer error grouping stable.
+pub fn migration_startup_error(error: Error) -> std::io::Error {
+    if let Error::Io(io_error) = &error
+        && let Some(metadata_error) = io_error
+            .get_ref()
+            .and_then(|context| context.source())
+            .and_then(|source| source.downcast_ref::<MigrationMetadataError>())
+    {
+        return std::io::Error::other(metadata_error.clone());
+    }
+    std::io::Error::other(error)
 }
 
 /// Callback used to decrypt an at-rest config blob during MinIO -> RustFS migration.
@@ -461,7 +475,13 @@ mod tests {
     fn migration_errors_group_by_cause_and_retain_typed_record_context() {
         use super::{Error, MigrationMetadataError};
 
-        for make_error in [MigrationMetadataError::Empty, MigrationMetadataError::Incompatible] {
+        for (make_error, message) in [
+            (
+                MigrationMetadataError::Empty as fn(String) -> MigrationMetadataError,
+                "empty legacy metadata",
+            ),
+            (MigrationMetadataError::Incompatible, "incompatible legacy metadata"),
+        ] {
             let first: Error = make_error("buckets/first/.metadata.bin".into()).into();
             let second: Error = make_error("buckets/second/.metadata.bin".into()).into();
             assert_eq!(first, second, "record paths must not fragment error grouping");
@@ -474,6 +494,14 @@ mod tests {
                 .expect("record context must remain in the error source");
             assert!(detail.downcast_ref::<MigrationMetadataError>().is_some());
             assert!(detail.to_string().contains("buckets/first/.metadata.bin"));
+
+            let startup_error = super::migration_startup_error(make_error("buckets/startup/.metadata.bin".into()).into());
+            assert!(
+                startup_error
+                    .get_ref()
+                    .is_some_and(|source| source.is::<MigrationMetadataError>())
+            );
+            assert_eq!(startup_error.to_string(), format!("{message}: buckets/startup/.metadata.bin"));
         }
         assert_ne!(
             Error::from(MigrationMetadataError::Empty("record".into())),

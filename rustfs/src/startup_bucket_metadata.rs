@@ -62,10 +62,10 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, c
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    try_migrate_bucket_metadata(store.clone()).await.map_err(IoError::other)?;
+    try_migrate_bucket_metadata(store.clone()).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
-    try_migrate_iam_config(store).await.map_err(IoError::other)?;
+    try_migrate_iam_config(store).await?;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx.clone(), false);
 
     Ok(buckets)
@@ -82,9 +82,9 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    try_migrate_bucket_metadata(store.clone()).await.map_err(IoError::other)?;
+    try_migrate_bucket_metadata(store.clone()).await?;
 
-    try_migrate_iam_config(store.clone()).await.map_err(IoError::other)?;
+    try_migrate_iam_config(store.clone()).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);

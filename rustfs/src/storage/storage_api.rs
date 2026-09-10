@@ -1185,17 +1185,21 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> Result<()> {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store).await
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
-pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) -> Result<()> {
+pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) -> std::io::Result<()> {
     // MinIO encrypts IAM identity/service-account files at rest with a key derived
     // from the root credentials. Inject the IAM crate's decryption so those blobs
     // are decrypted before normalization instead of being skipped as "incompatible".
     let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
         Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
-    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn)).await
+    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn))
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
 pub(crate) fn init_ecstore_config() {
