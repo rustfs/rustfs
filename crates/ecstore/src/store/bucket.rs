@@ -801,6 +801,15 @@ impl ECStore {
             .await
     }
 
+    pub(crate) async fn get_bucket_info_from_sets_at_read_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+    ) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+            .await
+    }
+
     async fn get_bucket_info_from_sets_with_quorum(
         &self,
         bucket: &str,

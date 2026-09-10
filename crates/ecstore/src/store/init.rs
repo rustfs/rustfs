@@ -3707,6 +3707,31 @@ mod tests {
         OfflineTestDisks { disks }
     }
 
+    #[cfg(feature = "test-util")]
+    async fn force_set_disk_range_offline_for_test(
+        set: &Arc<crate::set_disk::SetDisks>,
+        range: std::ops::Range<usize>,
+    ) -> OfflineTestDisks {
+        let disks = set
+            .disks
+            .read()
+            .await
+            .get(range)
+            .expect("offline test range must fit the set")
+            .iter()
+            .map(|disk| disk.clone().expect("fault-injection disk should start online"))
+            .collect::<Vec<_>>();
+        for disk in &disks {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        }
+        set.connect_disks().await;
+        for disk in &disks {
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        }
+        OfflineTestDisks { disks }
+    }
+
     fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
         let now = OffsetDateTime::now_utc();
         let mut pool_stats = vec![RebalanceStats::default(); pool_count];
@@ -17320,6 +17345,55 @@ mod tests {
             .await
             .expect("protected body should drain");
         assert_eq!(body, original_body);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn object_lock_snapshot_uses_read_quorum_bucket_existence_probe() {
+        let temp = tempfile::tempdir().expect("create degraded snapshot store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp.path(),
+            "degraded-object-lock-snapshot",
+            &[(2, 12)],
+            CancellationToken::new(),
+            None,
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("degraded-ol-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create snapshot bucket");
+        let expected_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read bucket incarnation before degrading sets");
+
+        let mut offline_disks = Vec::new();
+        for set in store.all_set_disks() {
+            offline_disks.push(force_set_disk_range_offline_for_test(&set, 6..12).await);
+        }
+
+        let snapshot = store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("read-quorum bucket existence should admit guarded Object Lock snapshot");
+        assert!(matches!(
+            snapshot.state(),
+            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        ));
+        assert!(snapshot.is_valid_for_destructive_put(store.id, &bucket, expected_incarnation));
+
+        let current_incarnation = crate::bucket::metadata_sys::get_object_lock_config_and_incarnation_from_disk_in(&ctx, &bucket)
+            .await
+            .expect("authoritative metadata read should also survive at read quorum")
+            .1;
+        assert_eq!(current_incarnation, expected_incarnation);
+
+        drop(offline_disks);
     }
 
     #[tokio::test]
