@@ -1425,7 +1425,7 @@ mod tests {
             replacement_format,
             expected_pool_metadata,
         } = select_replacement_drive(&cluster, 1, background_enabled)?;
-        let replacement_global_drive_index = 1 * topology.drives_per_node + replacement_drive_index;
+        let replacement_global_drive_index = topology.drives_per_node + replacement_drive_index;
         let replacement_set_slot = replacement_global_drive_index % erasure_set_drive_count;
         let default_online_object_count = if !outage_target_manifest_required { 64 } else { 24 };
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
@@ -1585,15 +1585,10 @@ mod tests {
             }
         };
 
-        if !outage_write_deferred_until_rejoin {
-            if outage_peer_manifest.erasure_indices.is_empty() {
-                outage_peer_manifest = collect_outage_peer_manifest(&cluster, 1, bucket, &outage_key, erasure_set_drive_count)?;
-                replacement_outage_erasure_index = outage_candidate_replacement_erasure_index(
-                    &outage_peer_manifest,
-                    erasure_set_drive_count,
-                    replacement_set_slot,
-                );
-            }
+        if !outage_write_deferred_until_rejoin && outage_peer_manifest.erasure_indices.is_empty() {
+            outage_peer_manifest = collect_outage_peer_manifest(&cluster, 1, bucket, &outage_key, erasure_set_drive_count)?;
+            replacement_outage_erasure_index =
+                outage_candidate_replacement_erasure_index(&outage_peer_manifest, erasure_set_drive_count, replacement_set_slot);
         }
         assert!(
             outage_write_deferred_until_rejoin
