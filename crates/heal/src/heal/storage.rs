@@ -20,6 +20,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
 use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
@@ -355,6 +356,14 @@ pub trait HealStorageAPI: Send + Sync {
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
 
+    /// Return the current bucket incarnation for exact MRF durable proof
+    /// matching. Alternate backends that cannot expose this must return
+    /// `None`, leaving replay anchors retained instead of acknowledged with an
+    /// incomplete identity.
+    async fn mrf_bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
+
     /// Aggregate usage-cache baselines for the requested buckets.
     async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         Ok(None)
@@ -382,6 +391,11 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
+
+    /// Stable bucket incarnation observed before an object heal starts.
+    async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
 
     /// Heal object using ecstore
     async fn heal_object(
@@ -809,6 +823,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
+    async fn mrf_bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
+    }
+
     async fn erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         if buckets.is_empty() {
             return Ok(None);
@@ -1026,6 +1048,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 }
             }
         }
+    }
+
+    async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
     }
 
     async fn heal_object(

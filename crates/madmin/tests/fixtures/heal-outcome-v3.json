@@ -98,7 +98,7 @@
     "cliExit": 1,
     "response": {
       "summary": "stopped",
-      "detail": "heal traversal completed with errors: 1 failed objects; heal result items were truncated",
+      "detail": "heal traversal completed with errors: 1 failed objects; first failed object bucket/object (retry_exhausted); heal result items were truncated",
       "startTime": "2026-01-01T00:00:00Z",
       "settings": {
         "recursive": true,
@@ -274,7 +274,7 @@
     "cliExit": 1,
     "response": {
       "summary": "stopped",
-      "detail": "heal traversal completed with errors: 1 failed objects; heal result items were truncated",
+      "detail": "heal traversal completed with errors: 1 failed objects; first failed object bucket/object (retry_exhausted); heal result items were truncated",
       "startTime": "2026-01-01T00:00:00Z",
       "settings": {
         "recursive": true,

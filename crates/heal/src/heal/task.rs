@@ -45,7 +45,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
+use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, POOL_META_NAME, RUSTFS_META_BUCKET};
 
 #[cfg(test)]
 pub(crate) struct OutcomeFinishTestHook {
@@ -106,7 +106,7 @@ const EVENT_HEAL_ERASURE_SET_STAGE: &str = "heal_erasure_set_stage";
 const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
 
 /// Heal type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealType {
     /// Cluster heal
     Cluster,
@@ -209,7 +209,7 @@ impl HealPriority {
 }
 
 /// Heal options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealOptions {
     /// Scan mode
     pub scan_mode: HealScanMode,
@@ -513,6 +513,11 @@ impl HealTask {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn set_execution_elapsed_for_test(&self, elapsed: Duration) {
+        *self.task_start_instant.write().await = Some(Instant::now() - elapsed);
+    }
+
     pub(crate) async fn retry_request_with_remaining_timeout(&self) -> Result<HealRequest> {
         let mut request = self.retry_request();
         if self.options.timeout.is_some() {
@@ -574,6 +579,18 @@ impl HealTask {
         }
     }
 
+    pub(super) async fn outcome_bucket_incarnation_id(&self, bucket: &str, dry_run: bool) -> Result<Option<Uuid>> {
+        if dry_run {
+            return Ok(None);
+        }
+        match self.await_with_control(self.storage.bucket_incarnation_id(bucket)).await {
+            Ok(incarnation_id) => Ok(incarnation_id),
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn single_object_identity(&self) -> Option<HealObjectIdentity> {
         let (bucket, object, version) = match &self.heal_type {
             HealType::Object {
@@ -597,6 +614,9 @@ impl HealTask {
         expected: HealObjectIdentity,
         receipt: Option<HealObjectReceipt>,
     ) -> bool {
+        if self.options.dry_run || self.cancel_token.is_cancelled() {
+            return false;
+        }
         let Some(receipt) = receipt else {
             return false;
         };
@@ -629,6 +649,14 @@ impl HealTask {
 
     pub(crate) fn has_batch_failure(&self) -> bool {
         self.batch_failure_recorded.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn batch_failure_is_retryable(&self) -> bool {
+        self.batch_failure
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|failure| failure.failed > 0 && failure.failed == failure.retryable && failure.permanent == 0)
     }
 
     pub(crate) async fn record_batch_failure(&self, failure: BatchHealFailure) -> Error {

@@ -8,10 +8,20 @@
 
 | Method | Config tag | Credential lifetime | Background renewal | Recommended for |
 | --- | --- | --- | --- | --- |
-| Static token | `Token` | Whatever the operator provisioned; RustFS never renews it | None | Development; short-lived experiments |
+| Static token | `Token` | Whatever the operator provisioned; read from Vault at login | Renewed at half TTL when Vault reports the token as renewable | Development; short-lived experiments |
 | AppRole | `AppRole` | Lease-bound token obtained by login; renewed by RustFS | Renew at half TTL, re-login on failure | Production without a Vault Agent sidecar |
 | Kubernetes | `Kubernetes` | Lease-bound token obtained by login; renewed by RustFS | Renew at half TTL, re-login on failure | Production on Kubernetes, with no credential to distribute |
 | Agent token file | `TokenFile` | Owned by Vault Agent; RustFS only re-reads the sink file | File re-read once per poll interval | Production with a Vault Agent (or equivalent) managing auth |
+
+### Static token: what RustFS now knows about it
+
+`vault token create` grants a 768-hour TTL by default, so a static token normally *does* expire. At login RustFS calls `auth/token/lookup-self` and adopts whatever Vault reports:
+
+- **No expiry** (a root or periodic-root token, `ttl` 0): unchanged — no lease is tracked, no renewal task runs, and the token is never refused locally.
+- **Expiring and renewable:** the ordinary renewal loop takes over, renewing at half the remaining TTL and publishing the remaining-TTL gauge.
+- **Expiring but not renewable:** a `vault_static_token_not_renewable` warning is logged with the remaining TTL, the gauge is published, and requests fail closed inside the safety window rather than lapsing mid-flight against Vault. Rotate to a fresh token, or move to AppRole, Kubernetes, or an agent-managed token file.
+
+The probe never fails the login. A token whose policy omits `lookup-self` (Vault's `default` policy grants it), or a Vault that is unreachable at that moment, logs `vault_static_token_lookup_failed` and falls back to the previous behaviour — no lease tracked, no renewal — so a deployment that works today keeps working. That fallback lasts for the life of the client generation, so treat the warning as something to fix rather than tolerate.
 
 Exactly one method must be configured. Setting `RUSTFS_KMS_VAULT_TOKEN_FILE` together with any other method, or `RUSTFS_KMS_VAULT_KUBERNETES_ROLE` together with `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID`, is rejected at startup with a configuration error because the effective identity would be ambiguous. A leftover `RUSTFS_KMS_VAULT_TOKEN` alongside a configured login method is tolerated and ignored, so a stale variable cannot silently downgrade the identity.
 

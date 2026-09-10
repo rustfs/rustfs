@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::data_usage_define::{UNKNOWN_TIER, UnknownTierStats, hash_path};
+use crate::data_usage_define::{DataUsageSegmentInvalidationProof, UNKNOWN_TIER, UnknownTierStats, hash_path};
 use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage, TierAccountingProof};
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32]);
@@ -174,6 +174,27 @@ fn completed_data_usage_info_rejects_duplicate_bucket_inventory() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let buckets = vec!["bucket".to_string(), "bucket".to_string()];
     assert!(completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_carries_segment_invalidation_proof_to_set_state() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let proof = DataUsageSegmentInvalidationProof {
+        process_epoch: "scanner-process".to_string(),
+        generation_start: 5,
+        generation_end: 8,
+        producer_identity_coverage_complete: true,
+        cold_zero_walk_oracle: true,
+    };
+    let mut set = completed_root_cache("bucket", 2, 10, source);
+    set.info.segment_invalidation_proof = Some(proof.clone());
+
+    let (usage, _) =
+        completed_usage_for_scope(&[set], &HashSet::from([source]), &["bucket".to_string()], &[], true, false, false)
+            .expect("complete set should publish root usage");
+
+    assert_eq!(usage.usage_snapshot_set_states.len(), 1);
+    assert_eq!(usage.usage_snapshot_set_states[0].segment_invalidation_proof, Some(proof));
 }
 
 #[test]
@@ -350,6 +371,7 @@ fn set_membership_add_remove_uses_generation_and_tombstone() {
         scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
         complete: false,
         tombstone: true,
+        segment_invalidation_proof: None,
     };
     let encoded = serde_json::to_vec(&state).expect("set state should serialize");
     let decoded: DataUsageSnapshotSetState = serde_json::from_slice(&encoded).expect("set state should deserialize");
@@ -371,6 +393,7 @@ fn set_membership_add_remove_uses_generation_and_tombstone() {
                 scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
                 complete: true,
                 tombstone: false,
+                segment_invalidation_proof: None,
             },
             state,
         ],

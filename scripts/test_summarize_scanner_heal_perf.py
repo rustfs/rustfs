@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import contextlib
 import hashlib
 import io
@@ -15,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import summarize_scanner_heal_perf as summary
+import check_test_wiring as wiring
 
 
 def sha(path: Path) -> str:
@@ -33,6 +35,10 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.abba = self.root / "abba"
         self.abba.mkdir()
         self.manifest = {
+            "schema": 1,
+            "evidence": "measured",
+            "rounds": 3,
+            "duration_seconds": summary.MIN_MEASURED_RELEASE_DURATION_SECONDS,
             "fixed": {
                 "config_sha256": "1" * 64,
                 "dataset_sha256": "2" * 64,
@@ -45,25 +51,150 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "candidate": {"revision": "b" * 40, "sha256": "4" * 64},
             "adapter_sha256": "5" * 64,
             "collector_sha256": "6" * 64,
+            "release_evidence": {
+                "topology": {
+                    "nodes": 3,
+                    "drives_per_node": 4,
+                    "pools": 2,
+                    "sets_total": 2,
+                    "sampled_pools": 2,
+                    "sampled_sets": 2,
+                    "erasure_set_size": 12,
+                    "erasure_data_blocks": 8,
+                    "erasure_parity_blocks": 4,
+                },
+                "distributed": {
+                    "metrics_endpoints": ["https://node-1:9000", "https://node-2:9000", "https://node-3:9000"],
+                    "failure_domain": "three-node-localhost-lab",
+                    "same_window_sampling": True,
+                },
+                "scheduler": {
+                    "bounds": ["admission-retry-idempotency", "deadline-budget", "lock-hold-bound", "minimum-progress"],
+                    "max_deferred_items": 128,
+                    "max_deferred_bytes": 1048576,
+                    "max_retry_age_seconds": 300,
+                    "duplicate_task_bound_observed": True,
+                },
+                "crash_restart": {
+                    "fault_modes": ["process-restart", "process-crash-restart"],
+                    "unclean_shutdown_marker": True,
+                },
+                "mixed_version": {
+                    "participating_revisions": ["a" * 40, "b" * 40],
+                    "reader": True,
+                    "writer": True,
+                    "rollback_payload": True,
+                },
+                "profile": {
+                    "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
+                    "collector_config_sha256": "7" * 64,
+                    "profiler_config_sha256": "8" * 64,
+                    "measurements": {
+                        "resolved_samples": 120,
+                        "allocation_bytes": 4096,
+                        "rss_peak_bytes": 10485760,
+                        "save_operations": 64,
+                        "saved_bytes": 8192,
+                    },
+                },
+                "heal_capacity": {
+                    "objects": 96,
+                    "versions": 96,
+                    "bytes": 12582912,
+                    "completed_objects": 96,
+                },
+                "recovery_window": {
+                    "pressure_recovery_window_seconds": 45,
+                    "heal_lock_wait_p99_ms": 8,
+                    "recovery_p95_ms": 1500,
+                    "recovery_p99_ms": 2200,
+                },
+            },
         }
         self.comparison = {
             "scenario": "cold-hot",
             "comparison": "build",
             "round": 1,
             "status": "pass",
+            "foreground_p95_ms": 8.0,
+            "foreground_p99_ms": 10.0,
+            "throughput_ops": 100.0,
+            "error_rate": 0.0,
             "p99_regression": 0.02,
             "throughput_change": -0.01,
-            "p1": {"required_reduction": 0.8, "observed_reduction": 0.82, "repeatability_drift": 0.01},
+            "p1": {
+                "required_reduction": 0.8,
+                "observed_reduction": 0.82,
+                "repeatability_drift": 0.01,
+                "baseline_walk_objects": 100,
+                "baseline_cold_walk_objects": 100,
+                "candidate_walk_objects": 20,
+                "candidate_cold_walk_objects": 0,
+            },
             "p2_post_stop_work_multiples": [None, 1.1, 1.0, None],
+            "w10_w11": {
+                "foreground_pressure_samples": [10, 10, 10, 10],
+                "foreground_pressure_high_samples": [0, 3, 3, 0],
+                "foreground_pressure_high_sample_ratios": [0.0, 0.25, 0.25, 0.0],
+                "heal_lock_wait_p99_ms": [12.0, 8.0, 9.0, 13.0],
+                "attempt_cost_per_healed_object": [None, 1.2, 1.3, None],
+                "candidate_attempt_cost_per_healed_object": 1.3,
+            },
+            "w09": {
+                "heal_start_p95_ms": [42.0, 40.0, 41.0, 43.0],
+                "heal_duplicate_task_count": [0, 0, 0, 0],
+                "heal_lock_hold_p95_ms": [7.0, 6.0, 6.5, 7.5],
+            },
+            "w10": {
+                "status": "not_applicable",
+                "pacing_observed": False,
+            },
+            "w11": {"status": "not_applicable"},
         }
         self.report = {
             "status": "pass",
             "performance": "pass",
             "evidence": "measured",
             "cells": 120,
-            "comparisons": [self.comparison],
+            "comparisons": self.full_comparisons(),
+            "started_at": "2026-09-09T00:00:00Z",
+            "finished_at": "2026-09-09T02:30:00Z",
         }
         self.write_inputs()
+
+    def full_comparisons(self):
+        comparisons = []
+        for scenario in summary.SCENARIOS:
+            for comparison in ("build", "background"):
+                for round_id in range(1, 4):
+                    row = copy.deepcopy(self.comparison)
+                    row.update(scenario=scenario, comparison=comparison, round=round_id)
+                    if scenario == "running-heal" and comparison == "build":
+                        row["w10"] = {
+                            "status": "observed",
+                            "pacing_observed": True,
+                            "candidate_pressure_high_ratio": 0.3,
+                            "candidate_delay_events": 3,
+                            "foreground_p99_change": -0.02,
+                            "foreground_throughput_change": 0.01,
+                        }
+                        row["w11"] = {
+                            "status": "observed",
+                            "rss_growth_limit": 0.05,
+                            "rss_growth": 0.01,
+                            "rss_within_limit": True,
+                            "baseline_rss_bytes": 1000000.0,
+                            "candidate_rss_bytes": 1010000.0,
+                            "baseline_heal_lock_wait_p99_ms": 12.0,
+                            "candidate_heal_lock_wait_p99_ms": 8.0,
+                            "heal_lock_wait_p99_change": -0.33,
+                            "healthy_page_latency_observed": True,
+                            "foreground_p99_change": -0.02,
+                            "foreground_throughput_change": 0.01,
+                            "candidate_attempt_cost_per_healed_object": 1.3,
+                        }
+                    comparisons.append(row)
+        return comparisons
 
     def write_inputs(self):
         (self.abba / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
@@ -96,7 +227,70 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         result = summary.build_summary(args)
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["abba"]["provenance"]["manifest_sha256"], sha(self.abba / "manifest.json"))
+        self.assertEqual(result["abba"]["w09_duplicate_task_count"], 0.0)
+        self.assertEqual(result["abba"]["w09_worst_heal_start_p95_ms"], 43.0)
+        self.assertEqual(
+            [row["status"] for row in result["abba"]["w11_running_heal_build"]],
+            ["observed", "observed", "observed"],
+        )
+        self.assertIn("w11_running_heal_build_statuses: observed,observed,observed", summary.markdown(result))
         self.assertEqual(result["cache_cost"]["max_save_body_amplification"], 2.0)
+
+    def test_release_descriptor_binds_g10_p1_p3_measured_artifacts(self):
+        profile_paths = []
+        for kind in summary.RELEASE_PROFILE_ARTIFACTS:
+            artifact = self.root / f"{kind}.artifact"
+            artifact.write_text(f"{kind} measured profile\n", encoding="utf-8")
+            profile_paths.append(f"{kind}={artifact}")
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "release_bundle_descriptor_out": self.root / "release-descriptor.json",
+            "release_source_revision": "b" * 40,
+            "release_profile_artifact": profile_paths,
+        })
+        result = summary.build_summary(args)
+        summary.write_release_bundle_descriptor(args, result)
+        descriptor = summary.read_json(args.release_bundle_descriptor_out)
+        self.assertEqual(sorted(descriptor["gates"]), ["G10", "P1", "P3"])
+        self.assertEqual(
+            descriptor["gates"]["G10"]["evidence_fields"]["scheduler_bound_evidence"]["scheduler_bounds"],
+            list(summary.RELEASE_SCHEDULER_BOUNDS),
+        )
+        profile = descriptor["gates"]["P1"]["evidence_fields"]["profile_evidence"]
+        self.assertEqual(sorted(profile["profile_artifacts"]), sorted(summary.RELEASE_PROFILE_ARTIFACTS))
+        self.assertEqual(
+            profile["measurement_window_id"],
+            descriptor["gates"]["P3"]["evidence_fields"]["two_hour_pressure_measurement"]["measurement_window_id"],
+        )
+        for gate in ("G10", "P1", "P3"):
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = wiring.scanner_heal_release_bundle_gate_status(
+                    Path(__file__).resolve().parents[1],
+                    args.release_bundle_descriptor_out,
+                    gate,
+                )
+            self.assertEqual(status["verified_gate"], gate)
+        save_frequency = profile["profile_artifacts"]["save-frequency"]
+        wrapper = args.release_bundle_descriptor_out.parent / save_frequency["artifact"]
+        payload = summary.read_json(wrapper)
+        raw_profile = args.release_bundle_descriptor_out.parent / payload["raw_profile_artifact"]
+        self.assertTrue(raw_profile.is_file())
+        self.assertEqual(payload["saved_bytes"], 8192)
+        self.assertEqual(payload["raw_profile_sha256"], sha(raw_profile))
+
+    def test_release_descriptor_requires_profile_artifacts(self):
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "release_bundle_descriptor_out": self.root / "release-descriptor.json",
+            "release_source_revision": "b" * 40,
+            "release_profile_artifact": [],
+        })
+        with self.assertRaisesRegex(ValueError, "missing profile artifacts"):
+            summary.write_release_bundle_descriptor(args, summary.build_summary(args))
 
     def test_synthetic_report_fails_as_performance_conclusion(self):
         self.report.update(status="synthetic_validated", performance="pending", evidence="synthetic")
@@ -111,6 +305,158 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         result = summary.build_summary(args)
         self.assertEqual(result["verdict"], "FAIL")
         self.assertIn("synthetic evidence", result["reason"])
+
+    def test_failed_abba_report_without_comparisons_writes_fail_closed_summary(self):
+        self.report = {
+            "status": "failed",
+            "performance": "pending",
+            "completed_cells": 7,
+            "error": "collector failed",
+        }
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        result = summary.build_summary(args)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["abba"]["completed_cells"], 7)
+        self.assertEqual(result["abba"]["comparisons_total"], 0)
+        self.assertIn("collector failed", result["reason"])
+        self.assertIn("- completed_cells: 7", summary.markdown(result))
+        self.assertIn("- error: collector failed", summary.markdown(result))
+
+    def test_passing_abba_report_requires_comparisons(self):
+        del self.report["comparisons"]
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "passing report requires comparisons"):
+            summary.build_summary(args)
+
+    def test_passing_abba_report_requires_complete_matrix(self):
+        cases = {
+            "trimmed": lambda: self.report["comparisons"].pop(),
+            "duplicate": lambda: self.report["comparisons"].__setitem__(1, copy.deepcopy(self.report["comparisons"][0])),
+            "bad cells": lambda: self.report.update(cells=119),
+            "bad evidence": lambda: self.manifest.update(evidence="synthetic"),
+            "outside": lambda: self.report["comparisons"][0].update(round=99),
+            "failed comparison": lambda: self.report["comparisons"][0].update(status="inconclusive"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(fault=name):
+                self.setUp()
+                mutate()
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "ABBA matrix|manifest/report evidence|comparison"):
+                    summary.build_summary(args)
+
+    def test_passing_measured_report_requires_two_hour_window(self):
+        self.manifest["duration_seconds"] = summary.MIN_MEASURED_RELEASE_DURATION_SECONDS - 1
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "two hours"):
+            summary.build_summary(args)
+
+    def test_passing_abba_report_requires_w10_w11_evidence(self):
+        for fault in ("missing", "pressure", "lock", "attempt", "length", "range", "w11-missing", "w11-pending"):
+            with self.subTest(fault=fault):
+                self.setUp()
+                target = self.report["comparisons"][0]
+                if fault == "missing":
+                    del target["w10_w11"]
+                elif fault == "pressure":
+                    del target["w10_w11"]["foreground_pressure_high_sample_ratios"]
+                elif fault == "lock":
+                    del target["w10_w11"]["heal_lock_wait_p99_ms"]
+                elif fault == "attempt":
+                    del target["w10_w11"]["attempt_cost_per_healed_object"]
+                elif fault == "length":
+                    target["w10_w11"]["attempt_cost_per_healed_object"] = [None]
+                elif fault == "w11-missing":
+                    running_heal = next(
+                        comparison for comparison in self.report["comparisons"]
+                        if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build"
+                    )
+                    del running_heal["w11"]
+                elif fault == "w11-pending":
+                    running_heal = next(
+                        comparison for comparison in self.report["comparisons"]
+                        if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build"
+                    )
+                    running_heal["w11"]["status"] = "pending"
+                else:
+                    target["w10_w11"]["foreground_pressure_high_sample_ratios"] = [1.5, 0.0, 0.0, 0.0]
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "W10/W11|W11|performance evidence|length mismatch|above maximum"):
+                    summary.build_summary(args)
+
+    def test_passing_abba_report_requires_w09_evidence(self):
+        cases = {
+            "missing": lambda row: row.pop("w09"),
+            "start": lambda row: row["w09"].pop("heal_start_p95_ms"),
+            "zero start": lambda row: row["w09"].update(heal_start_p95_ms=[0, 40.0, 41.0, 43.0]),
+            "duplicates": lambda row: row["w09"].update(heal_duplicate_task_count=[0, 1, 0, 0]),
+            "unknown duplicates": lambda row: row["w09"].update(heal_duplicate_task_count=[None, 0, 0, 0]),
+            "lock": lambda row: row["w09"].pop("heal_lock_hold_p95_ms"),
+            "zero lock": lambda row: row["w09"].update(heal_lock_hold_p95_ms=[0, 6.0, 6.5, 7.5]),
+            "length": lambda row: row["w09"].update(heal_lock_hold_p95_ms=[1]),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(fault=name):
+                self.setUp()
+                mutate(self.report["comparisons"][0])
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "W09|performance evidence|above maximum|length mismatch|must be measured"):
+                    summary.build_summary(args)
+
+    def test_passing_measured_report_requires_release_evidence_manifest(self):
+        del self.manifest["release_evidence"]
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "release_evidence"):
+            summary.build_summary(args)
 
     def test_requires_cache_profile_when_requested(self):
         args = type("Args", (), {

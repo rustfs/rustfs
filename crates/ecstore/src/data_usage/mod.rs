@@ -3397,6 +3397,7 @@ mod tests {
             scan_plan_digest: Some([1; 32]),
             complete: false,
             tombstone: false,
+            segment_invalidation_proof: None,
         }];
         partial.buckets_usage.insert(
             "bucket".to_string(),
@@ -3469,6 +3470,7 @@ mod tests {
                 scan_plan_digest: Some([1; 32]),
                 complete: true,
                 tombstone: false,
+                segment_invalidation_proof: None,
             }],
             ..Default::default()
         };

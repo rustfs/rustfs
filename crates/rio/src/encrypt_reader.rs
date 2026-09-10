@@ -327,6 +327,55 @@ where
     }
 }
 
+/// Read-side switch for the pre-`1.0.0-alpha.91` nonce layout, in which a whole
+/// v1 segment reused the part nonce for every block.
+///
+/// On by default, because turning it off refuses to decrypt objects written
+/// before that release. Block zero's derived nonce equals that base nonce, so
+/// the layout also lets a frame encrypted at index zero authenticate anywhere
+/// in its segment; the in-segment layout lock catches that as soon as a later
+/// frame disagrees, but a stream that is nothing but repeats of frame zero has
+/// no such later frame. A deployment with no pre-alpha.91 objects should set
+/// this to `false` to remove that surface outright (backlog#2369 P2).
+///
+// RUSTFS_COMPAT_TODO(backlog-2369-legacy-nonce-fallback): Remove after the
+// minimum supported direct-upgrade release and after migration tooling has
+// rewritten every pre-alpha.91 encrypted object.
+pub const ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK: &str = "RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK";
+const DEFAULT_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK: bool = true;
+
+fn legacy_nonce_fallback_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK,
+            DEFAULT_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK,
+                DEFAULT_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK,
+            )
+        })
+    }
+}
+
+/// The nonce layout selected while decoding a legacy v1 segment.
+///
+/// A historical writer used one of these layouts consistently for every
+/// block in a segment. Once a non-zero block identifies that layout, accepting
+/// another layout would let an attacker replay a block encrypted at index zero.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V1NonceLayout {
+    Current,
+    LegacyBlock,
+    ReusedPart,
+}
+
 pin_project! {
     /// A reader wrapper that decrypts data on the fly using AES-256-GCM.
     /// This is a demonstration. For production, use a secure and audited crypto library.
@@ -358,6 +407,8 @@ pin_project! {
         segment_frames: usize,
         stream_saw_v2: bool,
         segments_completed: usize,
+        v1_nonce_layout: Option<V1NonceLayout>,
+        legacy_nonce_fallback: bool,
     }
 }
 
@@ -391,6 +442,8 @@ where
             segment_frames: 0,
             stream_saw_v2: false,
             segments_completed: 0,
+            v1_nonce_layout: None,
+            legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
         }
     }
 
@@ -441,6 +494,8 @@ where
             segment_frames: 0,
             stream_saw_v2: false,
             segments_completed: 0,
+            v1_nonce_layout: None,
+            legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
         }
     }
 }
@@ -547,6 +602,7 @@ where
                     *this.segment_frame_version = None;
                     *this.saw_final_frame = false;
                     *this.segment_frames = 0;
+                    *this.v1_nonce_layout = None;
 
                     if *this.multipart_mode {
                         let next_part = if *this.current_part_index + 1 < this.multipart_parts.len() {
@@ -696,26 +752,46 @@ where
                     *this.base_nonce
                 };
                 let legacy_block_nonce = derive_block_nonce(&legacy_part_nonce, *this.block_index);
-                match this.cipher.decrypt(&nonce, ciphertext) {
-                    Ok(plaintext) => plaintext,
-                    Err(primary_err) => {
-                        let legacy_nonce =
-                            Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
-
-                        match this.cipher.decrypt(&legacy_nonce, ciphertext) {
-                            Ok(plaintext) => plaintext,
-                            Err(_) => {
-                                // Accept previously written streams that reused the part nonce
-                                // for every block inside a segment.
-                                let legacy_part_nonce = Nonce::try_from(legacy_part_nonce.as_slice())
-                                    .map_err(|_| Error::other("invalid nonce length"))?;
-                                this.cipher
-                                    .decrypt(&legacy_part_nonce, ciphertext)
-                                    .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
-                            }
+                let legacy_part_nonce =
+                    Nonce::try_from(legacy_part_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+                let legacy_block_nonce =
+                    Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+                let layouts = [
+                    (V1NonceLayout::Current, &nonce),
+                    (V1NonceLayout::LegacyBlock, &legacy_block_nonce),
+                    (V1NonceLayout::ReusedPart, &legacy_part_nonce),
+                ];
+                let selected = if *this.block_index == 0 { None } else { *this.v1_nonce_layout };
+                let mut plaintext = None;
+                let mut last_error = None;
+                for (layout, candidate_nonce) in layouts {
+                    if selected.is_some_and(|expected| expected != layout) {
+                        continue;
+                    }
+                    if layout == V1NonceLayout::ReusedPart && !*this.legacy_nonce_fallback {
+                        continue;
+                    }
+                    match this.cipher.decrypt(candidate_nonce, ciphertext) {
+                        Ok(value) => {
+                            plaintext = Some((value, layout));
+                            break;
                         }
+                        Err(error) => last_error = Some(error),
                     }
                 }
+                let (plaintext, layout) = plaintext.ok_or_else(|| {
+                    Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "decrypt error: {}",
+                            last_error.map_or_else(|| "nonce layout rejected".to_string(), |error| error.to_string())
+                        ),
+                    )
+                })?;
+                if *this.block_index > 0 && this.v1_nonce_layout.is_none() {
+                    *this.v1_nonce_layout = Some(layout);
+                }
+                plaintext
             };
             if *this.current_frame_type == FRAME_TYPE_V2_FINAL {
                 *this.saw_final_frame = true;
@@ -1001,6 +1077,154 @@ mod tests {
             .expect("operation should succeed");
 
         assert_eq!(&decrypted, data);
+    }
+
+    /// Encrypts `block_count` full v1 blocks, then overwrites frame one with a
+    /// verbatim copy of frame zero. Every frame is the same length, so the
+    /// stream keeps its original size and the forgery is invisible to any
+    /// length check.
+    async fn v1_stream_with_frame_zero_replayed_at_index_one(key: [u8; 32], nonce: [u8; 12], block_count: usize) -> Vec<u8> {
+        assert!(block_count >= 2, "a replay needs at least two frames");
+        let mut data = Vec::with_capacity(ENCRYPTION_BLOCK_SIZE * block_count);
+        for index in 0..block_count {
+            data.extend(std::iter::repeat_n(0xA1u8.wrapping_add(index as u8 * 17), ENCRYPTION_BLOCK_SIZE));
+        }
+
+        let mut encrypt_reader = EncryptReader::new(Cursor::new(data), key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.expect("encrypt v1 frames");
+
+        // Header layout: [type][len:24][crc:32]; `len` counts the payload plus
+        // its own 4-byte CRC field, so the frame occupies 8 + (len - 4) bytes.
+        let declared_len = (encrypted[1] as usize) | ((encrypted[2] as usize) << 8) | ((encrypted[3] as usize) << 16);
+        let frame_len = 8 + declared_len - 4;
+        let replayed_first = encrypted[..frame_len].to_vec();
+        encrypted[frame_len..frame_len * 2].copy_from_slice(&replayed_first);
+        encrypted
+    }
+
+    #[tokio::test]
+    async fn decrypt_reader_rejects_a_replayed_first_v1_frame() {
+        let key = [0x11; 32];
+        let nonce = [0x22; 12];
+        let encrypted = v1_stream_with_frame_zero_replayed_at_index_one(key, nonce, 3).await;
+
+        let mut decrypt_reader = DecryptReader::new(Cursor::new(encrypted), key, nonce);
+        let error = decrypt_reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("a repeated index-zero frame must not authenticate at index one");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The in-segment layout lock must not cost compatibility: every legacy v1
+    /// shape the fallback chain exists for still decrypts under the default.
+    #[tokio::test]
+    async fn legacy_v1_streams_still_decrypt_under_the_default_fallback() {
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK, None::<&str>)], async {
+            assert!(legacy_nonce_fallback_enabled(), "the legacy nonce fallback must stay on by default");
+
+            let mut key = [0u8; 32];
+            let mut nonce = [0u8; 12];
+            rand::rng().fill_bytes(&mut key);
+            rand::rng().fill_bytes(&mut nonce);
+            let mut data = vec![0u8; ENCRYPTION_BLOCK_SIZE * 3 + 17];
+            rand::rng().fill(&mut data[..]);
+
+            // Modern single-part stream.
+            let mut encrypted = Vec::new();
+            EncryptReader::new(Cursor::new(data.clone()), key, nonce)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("modern v1 stream should encrypt");
+            let mut decrypted = Vec::new();
+            DecryptReader::new(Cursor::new(encrypted), key, nonce)
+                .read_to_end(&mut decrypted)
+                .await
+                .expect("modern v1 stream should decrypt");
+            assert_eq!(decrypted, data);
+
+            // Pre-alpha.91 stream that reused the part nonce for every block.
+            let legacy = encrypt_with_legacy_nonce_reuse(&data, key, nonce);
+            let mut decrypted = Vec::new();
+            DecryptReader::new(Cursor::new(legacy), key, nonce)
+                .read_to_end(&mut decrypted)
+                .await
+                .expect("a reused-nonce legacy stream should still decrypt");
+            assert_eq!(decrypted, data);
+        })
+        .await;
+    }
+
+    /// The residual after the layout lock: a stream that is nothing but repeats
+    /// of frame zero has no later frame to disagree with the reused-part
+    /// layout, so only turning the fallback off rejects it.
+    #[tokio::test]
+    async fn a_two_frame_replay_is_closed_only_by_disabling_the_legacy_fallback() {
+        let key = [0x33; 32];
+        let nonce = [0x44; 12];
+        let encrypted = v1_stream_with_frame_zero_replayed_at_index_one(key, nonce, 2).await;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK, None::<&str>)], async {
+            let mut forged = Vec::new();
+            DecryptReader::new(Cursor::new(encrypted.clone()), key, nonce)
+                .read_to_end(&mut forged)
+                .await
+                .expect("with the fallback on this forgery is still accepted");
+            assert_eq!(forged.len(), ENCRYPTION_BLOCK_SIZE * 2);
+            assert_eq!(
+                &forged[..ENCRYPTION_BLOCK_SIZE],
+                &forged[ENCRYPTION_BLOCK_SIZE..],
+                "the accepted forgery is frame zero's plaintext twice over"
+            );
+        })
+        .await;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK, Some("false"))], async {
+            let error = DecryptReader::new(Cursor::new(encrypted.clone()), key, nonce)
+                .read_to_end(&mut Vec::new())
+                .await
+                .expect_err("with the fallback off the replayed frame must not authenticate");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        })
+        .await;
+    }
+
+    /// Turning the fallback off removes exactly the third layout: modern v1
+    /// streams keep decrypting, pre-alpha.91 reused-nonce streams stop.
+    #[tokio::test]
+    async fn disabling_the_legacy_nonce_fallback_refuses_only_reused_part_nonces() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+        let mut data = vec![0u8; ENCRYPTION_BLOCK_SIZE * 3 + 17];
+        rand::rng().fill(&mut data[..]);
+
+        let mut modern = Vec::new();
+        EncryptReader::new(Cursor::new(data.clone()), key, nonce)
+            .read_to_end(&mut modern)
+            .await
+            .expect("modern v1 stream should encrypt");
+        let legacy = encrypt_with_legacy_nonce_reuse(&data, key, nonce);
+
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK, Some("false"))], async {
+            assert!(!legacy_nonce_fallback_enabled(), "the switch must be observed");
+
+            let mut decrypted = Vec::new();
+            DecryptReader::new(Cursor::new(modern), key, nonce)
+                .read_to_end(&mut decrypted)
+                .await
+                .expect("modern v1 streams must keep decrypting with the fallback off");
+            assert_eq!(decrypted, data);
+
+            let error = DecryptReader::new(Cursor::new(legacy), key, nonce)
+                .read_to_end(&mut Vec::new())
+                .await
+                .expect_err("the third layout must be gone when the fallback is off");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -128,6 +128,79 @@ pub(super) mod cleanup_io_fault {
     }
 }
 
+#[cfg(test)]
+pub(super) mod recovery_intent_accept_fault {
+    use super::*;
+
+    enum Fault {
+        Corrupt,
+        Running,
+    }
+
+    static NEXT_ACCEPT_READBACK_FAULT: StdMutex<Option<Fault>> = StdMutex::new(None);
+
+    pub(in crate::scanner) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *NEXT_ACCEPT_READBACK_FAULT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    pub(in crate::scanner) fn corrupt_next_accept_readback() -> Guard {
+        install(Fault::Corrupt)
+    }
+
+    pub(in crate::scanner) fn advance_next_accept_readback_to_running() -> Guard {
+        install(Fault::Running)
+    }
+
+    fn install(fault: Fault) -> Guard {
+        let mut slot = NEXT_ACCEPT_READBACK_FAULT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(slot.is_none(), "only one recovery intent accept readback fault may be installed");
+        *slot = Some(fault);
+        Guard
+    }
+
+    pub(super) async fn maybe_apply<S>(storeapi: Arc<S>, path: &str) -> Result<(), ScannerError>
+    where
+        S: ScannerObjectIO,
+    {
+        let Some(fault) = NEXT_ACCEPT_READBACK_FAULT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return Ok(());
+        };
+        match fault {
+            Fault::Corrupt => save_config(storeapi, path, b"{corrupt".to_vec()).await.map_err(|err| {
+                ScannerError::Other(format!("failed to inject scanner recovery intent accept readback fault: {err}"))
+            }),
+            Fault::Running => {
+                let mut record = read_recovery_intent_record(storeapi.clone(), path).await?.ok_or_else(|| {
+                    ScannerError::Other("scanner recovery intent disappeared before fault injection".to_string())
+                })?;
+                record.state = SCANNER_RECOVERY_INTENT_STATE_RUNNING.to_string();
+                save_config(
+                    storeapi,
+                    path,
+                    serde_json::to_vec(&record)
+                        .map_err(|err| ScannerError::Other(format!("failed to encode scanner recovery intent fault: {err}")))?,
+                )
+                .await
+                .map_err(|err| {
+                    ScannerError::Other(format!("failed to inject scanner recovery intent accept readback fault: {err}"))
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScannerCycleRecoveryStatus {
     /// The immutable primary object whose revision is being guarded.
@@ -564,6 +637,17 @@ fn compare_recovery_intent(
     }
 }
 
+fn confirm_recovery_intent_acceptance(
+    expected: ScannerRecoveryIntentRecord,
+    persisted: ScannerRecoveryIntentRecord,
+) -> ScannerRecoveryIntentAcceptResult {
+    if persisted == expected {
+        ScannerRecoveryIntentAcceptResult::Accepted { record: persisted }
+    } else {
+        compare_recovery_intent(&expected, persisted)
+    }
+}
+
 async fn read_recovery_intent_record(
     storeapi: Arc<impl ScannerObjectIO>,
     path: &str,
@@ -757,7 +841,20 @@ pub async fn accept_scanner_usage_recovery_intent(
         .map_err(|err| ScannerError::Other(format!("failed to encode scanner recovery intent: {err}")))?;
     match save_config_with_preconditions(storeapi.clone(), &path, encoded, DataUsageCacheRevision::Missing.preconditions()).await
     {
-        Ok(_) => Ok(ScannerRecoveryIntentAcceptResult::Accepted { record: candidate }),
+        Ok(_) => {
+            #[cfg(test)]
+            recovery_intent_accept_fault::maybe_apply(storeapi.clone(), &path).await?;
+            let persisted = match read_recovery_intent_record(storeapi.clone(), &path).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    return Err(ScannerError::Other(
+                        "scanner recovery intent disappeared before acceptance confirmation".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(confirm_recovery_intent_acceptance(candidate, persisted))
+        }
         Err(EcstoreError::PreconditionFailed) => {
             let existing = read_recovery_intent_record(storeapi, &path).await?;
             let Some(existing) = existing else {

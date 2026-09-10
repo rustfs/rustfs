@@ -1,0 +1,189 @@
+rule_files:
+- ../prometheus-rules/rustfs-storage.yml
+evaluation_interval: 15s
+tests:
+- name: owners, pools, clusters and observer views remain distinct in mixed versions
+  interval: 1m
+  input_series:
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data",pool_index="0",set_index="0",drive_index="0"}
+    values: 100x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector",server="n1",drive="/data",pool_index="0",set_index="0",drive_index="1"}
+    values: 100x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n2",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n2",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="n2",collection_scope="local",job="rustfs",instance="collector",server="n2",drive="/data",pool_index="1",set_index="0",drive_index="0"}
+    values: 100x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n3",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n3",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="n3",collection_scope="local",job="rustfs",instance="collector",server="n3",drive="/data",pool_index="1",set_index="0",drive_index="1"}
+    values: 100x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="b",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="b",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="b",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data",pool_index="0",set_index="0",drive_index="0"}
+    values: 1000x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="b",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="b",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="b",observer="n1",collection_scope="local",job="rustfs",instance="collector",server="n1",drive="/data",pool_index="0",set_index="0",drive_index="1"}
+    values: 1000x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="b",observer="n2",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="b",observer="n2",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="b",observer="n2",collection_scope="local",job="rustfs",instance="collector",server="n2",drive="/data",pool_index="1",set_index="0",drive_index="0"}
+    values: 1000x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="b",observer="n3",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="b",observer="n3",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="b",observer="n3",collection_scope="local",job="rustfs",instance="collector",server="n3",drive="/data",pool_index="1",set_index="0",drive_index="1"}
+    values: 1000x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_cluster_capacity_raw_total_bytes{rustfs_cluster_id="a",observer="n0",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 400x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_cluster_capacity_raw_total_bytes{rustfs_cluster_id="a",observer="n1",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 300x8
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="old",server="n0",drive="/data",job="rustfs",instance="collector"}
+    values: 999x8
+  promql_expr_test:
+  - expr: sum by (rustfs_cluster_id) (rustfs:storage:current{source_metric="rustfs_system_drive_total_bytes",collection_scope="local"})
+    eval_time: 2m
+    exp_samples:
+    - labels: '{rustfs_cluster_id="a"}'
+      value: 400
+    - labels: '{rustfs_cluster_id="b"}'
+      value: 4000
+  - expr: count by (rustfs_cluster_id,pool_index) (rustfs:storage:current{source_metric="rustfs_system_drive_total_bytes"})
+    eval_time: 2m
+    exp_samples:
+    - labels: '{rustfs_cluster_id="a",pool_index="0"}'
+      value: 2
+    - labels: '{rustfs_cluster_id="a",pool_index="1"}'
+      value: 2
+    - labels: '{rustfs_cluster_id="b",pool_index="0"}'
+      value: 2
+    - labels: '{rustfs_cluster_id="b",pool_index="1"}'
+      value: 2
+  - expr: sum(rustfs:storage:current{source_metric="rustfs_cluster_capacity_raw_total_bytes",rustfs_cluster_id="a",observer="n0"})
+    eval_time: 2m
+    exp_samples:
+    - labels: '{}'
+      value: 400
+  - expr: sum(rustfs:storage:current{source_metric="rustfs_cluster_capacity_raw_total_bytes",rustfs_cluster_id="a",observer="n1"})
+    eval_time: 2m
+    exp_samples:
+    - labels: '{}'
+      value: 300
+- name: removed values and identities cannot rejoin new snapshots; stalled sources expire
+  interval: 1m
+  input_series:
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0 60 _ _ _ _ _ _ _
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_info{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data",disk_id="old"}
+    values: 1 1 _ _ _ _ _ _ _
+  - series: rustfs_system_drive_info{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data",disk_id="new"}
+    values: _ _ 1 1 1 1 1 1 1
+  - series: rustfs_system_drive_waiting_io{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data"}
+    values: 7 7 _ _ _ _ _ _ _
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector",server="n1",drive="/data"}
+    values: 100 100 _ _ _ _ _ _ _
+  promql_expr_test:
+  - expr: rustfs:storage:current{source_metric="rustfs_system_drive_info",disk_id="old"}
+    eval_time: 2m
+    exp_samples: []
+  - expr: rustfs:storage:current{source_metric="rustfs_system_drive_waiting_io"}
+    eval_time: 2m
+    exp_samples: []
+  - expr: count(rustfs:storage:current{source_metric="rustfs_system_drive_info",disk_id="new"})
+    eval_time: 2m
+    exp_samples:
+    - labels: '{}'
+      value: 1
+  - expr: rustfs:storage:current{source_metric="rustfs_system_drive_total_bytes"}
+    eval_time: 5m
+    exp_samples: []
+  - expr: rustfs:storage_snapshot:fresh{observer="n1"}
+    eval_time: 5m
+    exp_samples: []
+- name: counters reset independently; filter versions before rate and sum rates across owners
+  interval: 1m
+  input_series:
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_api_calls_total{rustfs_cluster_id="a",observer="n0",collection_scope="local",job="rustfs",instance="collector",server="n0",drive="/data",disk_id="n0-disk",api="read_all"}
+    values: 0 60 120 30 90 150 210
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0+60x8
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x8
+  - series: rustfs_system_drive_api_calls_total{rustfs_cluster_id="a",observer="n1",collection_scope="local",job="rustfs",instance="collector",server="n1",drive="/data",disk_id="n1-disk",api="read_all"}
+    values: 0+120x6
+  - series: rustfs_system_drive_api_calls_total{rustfs_cluster_id="a",server="n0",drive="/data",observer="old"}
+    values: 0+999x6
+  promql_expr_test:
+  - expr: sum(resets(rustfs_system_drive_api_calls_total{collection_scope="local"}[5m]))
+    eval_time: 5m
+    exp_samples:
+    - labels: '{}'
+      value: 1
+  - expr: sum(rate(rustfs_system_drive_api_calls_total{collection_scope="local"}[2m]) and ignoring(source_metric) rustfs:storage:current{source_metric="rustfs_system_drive_api_calls_total"})
+    eval_time: 5m
+    exp_samples:
+    - labels: '{}'
+      value: 3
+- name: completed slow collection has no validity budget
+  interval: 1m
+  input_series:
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="slow",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: 0+60x3
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="slow",collection_scope="cluster",job="rustfs",instance="collector"}
+    values: '0x3'
+  promql_expr_test:
+  - expr: rustfs:storage_snapshot:fresh{observer="slow"}
+    eval_time: 2m
+    exp_samples: []
+- name: submillisecond publication and millisecond OTLP samples share a cutoff
+  interval: 1m
+  input_series:
+  - series: rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id="a",observer="submillisecond",collection_scope="local",job="rustfs",instance="collector"}
+    values: 0.0009+60x3
+  - series: rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id="a",observer="submillisecond",collection_scope="local",job="rustfs",instance="collector"}
+    values: 180x3
+  - series: rustfs_system_drive_total_bytes{rustfs_cluster_id="a",observer="submillisecond",collection_scope="local",job="rustfs",instance="collector",server="submillisecond",drive="/data"}
+    values: 100x3
+  promql_expr_test:
+  - expr: count(rustfs:storage:current{source_metric="rustfs_system_drive_total_bytes",observer="submillisecond"})
+    eval_time: 2m15s
+    exp_samples:
+    - labels: '{}'
+      value: 1

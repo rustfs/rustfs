@@ -392,6 +392,7 @@ zip = { workspace = true }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }
+rustfs-heal = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true

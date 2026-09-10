@@ -61,28 +61,72 @@ async fn setup_scanner_cycle_store_with_pool_count(
 }
 
 async fn setup_scanner_cycle_store_at_path(root: &Path, seed_usage_baseline: bool, pool_count: usize) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_sets(root, seed_usage_baseline, pool_count, 1).await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_sets(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_layout(root, seed_usage_baseline, pool_count, sets_per_pool, 4).await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_layout(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+    drives_per_set: usize,
+) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+        root,
+        seed_usage_baseline,
+        pool_count,
+        sets_per_pool,
+        drives_per_set,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+    drives_per_set: usize,
+    preinitialize_disks: bool,
+) -> Arc<ECStore> {
     init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::with_capacity(pool_count);
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
-        for disk_index in 0..4 {
-            let disk_path = root.join(format!("pool{pool_index}/disk{disk_index}"));
-            tokio::fs::create_dir_all(&disk_path)
-                .await
-                .expect("scanner cycle test disk should be created");
-            let mut endpoint =
-                Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
-            endpoint.set_pool_index(pool_index);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(disk_index);
-            endpoints.push(endpoint);
+        for set_index in 0..sets_per_pool {
+            for disk_index in 0..drives_per_set {
+                let disk_path = if sets_per_pool == 1 {
+                    root.join(format!("pool{pool_index}/disk{disk_index}"))
+                } else {
+                    root.join(format!("pool{pool_index}/set{set_index}/disk{disk_index}"))
+                };
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("scanner cycle test disk should be created");
+                let mut endpoint =
+                    Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(set_index);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
         }
         pools.push(PoolEndpoints {
             legacy: false,
-            set_count: 1,
-            drives_per_set: 4,
+            set_count: sets_per_pool,
+            drives_per_set,
             endpoints: Endpoints::from(endpoints),
-            cmd_line: if pool_count == 1 {
+            cmd_line: if pool_count == 1 && sets_per_pool == 1 {
                 "scanner-cycle-metrics".to_string()
             } else {
                 format!("scanner-cycle-metrics-pool-{pool_index}")
@@ -93,9 +137,11 @@ async fn setup_scanner_cycle_store_at_path(root: &Path, seed_usage_baseline: boo
     let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
     instance_ctx.set_endpoints(endpoint_pools.clone());
-    init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
-        .await
-        .expect("scanner cycle test disks should initialize");
+    if preinitialize_disks {
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("scanner cycle test disks should initialize");
+    }
     let store = ECStore::new_with_instance_ctx(
         "127.0.0.1:0".parse().expect("test address should parse"),
         endpoint_pools,
@@ -7634,6 +7680,25 @@ async fn scanner_cycle_confirms_lost_remote_ack_from_activity_snapshot() {
         "a new peer instance cannot confirm whether the old ACK reached durable dirty state"
     );
 
+    let mut stale_activity = scanner_node_activity("epoch-a", 7, 3);
+    stale_activity.dirty_usage_generation = 4;
+    let stale_clean_activity = BTreeMap::from([("node-2".to_string(), stale_activity)]);
+    let stale_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "response lost before newer generation was observed",
+        ))),
+        || async { Ok(stale_clean_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, stale_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a clean peer snapshot from before the acknowledged generation cannot prove the ACK reached durable dirty state"
+    );
+
     let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
     written_activity.dirty_usage_generation = 6;
     written_activity.dirty_usage_pending = true;
@@ -7705,6 +7770,47 @@ async fn scanner_cycle_confirms_lost_scoped_ack_only_after_same_instance_clean_a
         scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, peer_restarted),
         ScannerCycleOutcome::CompletedWithPendingMaintenance,
         "a restarted peer cannot prove the scoped ACK reached the old scanner instance"
+    );
+
+    let mut stale_activity = scanner_node_activity("epoch-a", 7, 3);
+    stale_activity.dirty_usage_generation = 4;
+    let stale_clean_activity = BTreeMap::from([("node-2".to_string(), stale_activity)]);
+    let stale_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "scoped ACK transport failed before the requested generation was observed",
+        ))),
+        || async { Ok(stale_clean_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, stale_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a clean peer snapshot from before the scoped ACK generation cannot prove the ACK reached durable dirty state"
+    );
+
+    let empty_scoped_ack = ScannerDirtyUsageAcknowledgement {
+        host: "node-2".to_string(),
+        instance_id: "epoch-a".to_string(),
+        kind: ScannerDirtyUsageAcknowledgementKind::Scoped {
+            owner_id: Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+            entries: Vec::new(),
+        },
+    };
+    let empty_scoped_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        &[empty_scoped_ack],
+        std::future::ready(Err::<bool, _>(std::io::Error::other("empty scoped ACK failed before peer delivery"))),
+        || async { Ok(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))])) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, empty_scoped_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "an empty scoped ACK has no durable generation to reconcile after response loss"
     );
 
     let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
@@ -9208,6 +9314,64 @@ fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acqui
     assert!(
         acknowledgements.is_empty(),
         "a rejected publication must not acknowledge the peer's dirty usage"
+    );
+}
+
+#[test]
+fn remote_lease_validation_failure_without_movement_debt_is_activity_baseline_unavailable() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let lease_targets = scanner_activity_publication_lease_targets(&before);
+    let mut after = before.clone();
+    after
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .namespace_generation += 1;
+
+    assert_eq!(
+        before["node-2"].movement_generation, after["node-2"].movement_generation,
+        "ordinary namespace writes must not be reported as movement"
+    );
+    assert!(scanner_activity_allows_usage_publication(&after));
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(after)),
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    );
+}
+
+#[test]
+fn remote_lease_validation_failure_preserves_movement_defer_for_remote_fence_loss() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let lease_targets = scanner_activity_publication_lease_targets(&before);
+
+    let mut movement_changed = before.clone();
+    movement_changed
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .movement_generation += 1;
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(movement_changed)),
+        ScannerCycleDeferReason::DataMovement
+    );
+
+    let mut restarted = before.clone();
+    restarted.get_mut("node-2").expect("writer should be present").instance_id = "epoch-b".to_string();
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(restarted)),
+        ScannerCycleDeferReason::DataMovement
+    );
+
+    let mut blocked = before.clone();
+    blocked
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .publication_blocked = true;
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, true, Ok(blocked)),
+        ScannerCycleDeferReason::DataMovement
+    );
+    assert_eq!(
+        scanner_remote_publication_lease_failure_defer_reason(&lease_targets, false, Ok(before)),
+        ScannerCycleDeferReason::DataMovement
     );
 }
 

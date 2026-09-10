@@ -34,6 +34,17 @@ pub const STATE_LABEL: &str = "state";
 
 /// All drive-related labels
 pub const ALL_DRIVE_LABELS: [&str; 2] = [SERVER_LABEL, DRIVE_LABEL];
+/// Physical disk identity separates counter resets caused by disk replacement.
+pub const DRIVE_COUNTER_LABELS: [&str; 3] = [SERVER_LABEL, DRIVE_LABEL, DISK_ID_LABEL];
+pub const DRIVE_TOPOLOGY_API_COUNTER_LABELS: [&str; 7] = [
+    SERVER_LABEL,
+    DRIVE_LABEL,
+    POOL_INDEX_LABEL,
+    SET_INDEX_LABEL,
+    DRIVE_INDEX_LABEL,
+    API_LABEL,
+    DISK_ID_LABEL,
+];
 /// Drive labels with erasure-set topology.
 pub const DRIVE_TOPOLOGY_LABELS: [&str; 5] = [
     SERVER_LABEL,
@@ -69,6 +80,15 @@ pub const DRIVE_TOPOLOGY_API_LABELS: [&str; 6] = [
     DRIVE_INDEX_LABEL,
     API_LABEL,
 ];
+
+pub static DRIVE_PRESENT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("present".to_string()),
+        "Configured local drive slot",
+        &ALL_DRIVE_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
 
 pub static DRIVE_INFO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
@@ -119,7 +139,7 @@ pub static DRIVE_API_CALLS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::Custom("api_calls_total".to_string()),
         "Total drive API calls by operation",
-        &DRIVE_TOPOLOGY_API_LABELS,
+        &DRIVE_TOPOLOGY_API_COUNTER_LABELS,
         subsystems::SYSTEM_DRIVE,
     )
 });
@@ -209,7 +229,7 @@ pub static DRIVE_TIMEOUT_ERRORS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|
     new_counter_md(
         MetricName::DriveTimeoutErrorsTotal,
         "Total timeout errors on a drive",
-        &ALL_DRIVE_LABELS[..],
+        &DRIVE_COUNTER_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });
@@ -218,7 +238,7 @@ pub static DRIVE_IO_ERRORS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::DriveIOErrorsTotal,
         "Total I/O errors on a drive",
-        &ALL_DRIVE_LABELS[..],
+        &DRIVE_COUNTER_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });
@@ -227,7 +247,7 @@ pub static DRIVE_AVAILABILITY_ERRORS_MD: LazyLock<MetricDescriptor> = LazyLock::
     new_counter_md(
         MetricName::DriveAvailabilityErrorsTotal,
         "Total availability errors (I/O errors, timeouts) on a drive",
-        &ALL_DRIVE_LABELS[..],
+        &DRIVE_COUNTER_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });
@@ -263,7 +283,7 @@ pub static DRIVE_WRITES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| 
     new_counter_md(
         MetricName::DriveWritesTotal,
         "Total successful write operations on a drive",
-        &ALL_DRIVE_LABELS[..],
+        &DRIVE_COUNTER_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });
@@ -272,7 +292,7 @@ pub static DRIVE_DELETES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(||
     new_counter_md(
         MetricName::DriveDeletesTotal,
         "Total successful delete operations on a drive",
-        &ALL_DRIVE_LABELS[..],
+        &DRIVE_COUNTER_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });

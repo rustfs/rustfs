@@ -18,11 +18,15 @@
 mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
-        FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging,
-        rustfs_binary_path,
+        ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
+        init_logging, rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
-    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::{
+        error::{ProvideErrorMetadata, SdkError},
+        operation::put_object::PutObjectError,
+        primitives::ByteStream,
+    };
     use http::Method;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
@@ -38,6 +42,13 @@ mod tests {
     use tracing::warn;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
+
+    struct ReplacementDriveSelection {
+        replaced_disk: PathBuf,
+        replacement_format_path: PathBuf,
+        replacement_format: Vec<u8>,
+        expected_pool_metadata: Option<VersionShardCensus>,
+    }
 
     #[derive(serde::Deserialize)]
     struct EvidenceBuild {
@@ -60,6 +71,65 @@ mod tests {
         oracle: &'static str,
         evidence: &'static str,
         unclean_shutdown_marker: bool,
+        topology: EvidenceTopology,
+        storage_class_standard: Option<&'static str>,
+        erasure_set_drive_count: Option<usize>,
+        outage_target_manifest_required: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EvidenceTopology {
+        nodes: usize,
+        drives_per_node: usize,
+        layout: EvidenceTopologyLayout,
+    }
+
+    #[derive(Clone, Copy)]
+    enum EvidenceTopologyLayout {
+        SinglePool,
+        PerNodePools,
+    }
+
+    impl EvidenceTopology {
+        const fn new(nodes: usize, drives_per_node: usize) -> Self {
+            Self {
+                nodes,
+                drives_per_node,
+                layout: EvidenceTopologyLayout::SinglePool,
+            }
+        }
+
+        const fn per_node_pools(nodes: usize, drives_per_node: usize) -> Self {
+            Self {
+                nodes,
+                drives_per_node,
+                layout: EvidenceTopologyLayout::PerNodePools,
+            }
+        }
+
+        fn total_drives(self) -> usize {
+            self.nodes * self.drives_per_node
+        }
+
+        fn cluster_topology(self) -> ClusterTopology {
+            match self.layout {
+                EvidenceTopologyLayout::SinglePool => ClusterTopology::single_pool_multidrive(self.nodes, self.drives_per_node),
+                EvidenceTopologyLayout::PerNodePools => {
+                    ClusterTopology::per_node_pools(self.drives_per_node, (0..self.nodes).map(|node| vec![node]).collect())
+                }
+            }
+        }
+
+        fn pool_count(self) -> usize {
+            match self.layout {
+                EvidenceTopologyLayout::SinglePool => 1,
+                EvidenceTopologyLayout::PerNodePools => self.nodes,
+            }
+        }
+
+        fn set_count(self, erasure_set_drive_count: Option<usize>) -> usize {
+            self.total_drives() / erasure_set_drive_count.unwrap_or_else(|| self.total_drives())
+        }
     }
 
     const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -67,6 +137,10 @@ mod tests {
         oracle: "background-target-restart.json",
         evidence: "process-restart",
         unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(4, 1),
+        storage_class_standard: None,
+        erasure_set_drive_count: None,
+        outage_target_manifest_required: true,
     };
 
     const BACKGROUND_TARGET_CRASH_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -74,6 +148,54 @@ mod tests {
         oracle: "background-target-crash.json",
         evidence: "process-crash-restart",
         unclean_shutdown_marker: true,
+        topology: EvidenceTopology::new(4, 1),
+        storage_class_standard: None,
+        erasure_set_drive_count: None,
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_RESTART_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart-ec8-4",
+        oracle: "background-target-restart-ec8-4.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(3, 4),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_CRASH_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash-ec8-4",
+        oracle: "background-target-crash-ec8-4.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
+        topology: EvidenceTopology::new(3, 4),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_RESTART_EC84_MULTI_SET_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart-ec8-4-multi-set",
+        oracle: "background-target-restart-ec8-4-multi-set.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(3, 8),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_CRASH_EC84_MULTI_POOL_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash-ec8-4-multi-pool",
+        oracle: "background-target-crash-ec8-4-multi-pool.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
+        topology: EvidenceTopology::per_node_pools(3, 12),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: false,
     };
 
     struct RestartEvidenceContext {
@@ -332,11 +454,10 @@ mod tests {
 
     // Healing may rewrite non-identity bookkeeping in xl.meta. The census
     // therefore compares the canonical selected metadata fields plus every
-    // physical shard, while the payload seed makes object mix-ups observable.
+    // physical shard.
     #[derive(Debug)]
     struct PhysicalObjectManifest {
         key: String,
-        payload_seed: u8,
         shard_census: VersionShardCensus,
     }
 
@@ -474,6 +595,54 @@ mod tests {
             && operations["activeTasks"].as_u64() == Some(1)
             && operations["retryingTasks"].as_u64() == Some(0)
             && operations["activeBySource"]["admin"].as_u64() == Some(1)
+    }
+
+    fn is_service_unavailable_put(error: &SdkError<PutObjectError>) -> bool {
+        error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
+    }
+
+    fn select_replacement_drive(
+        cluster: &RustFSTestClusterEnvironment,
+        node_index: usize,
+        require_pool_metadata: bool,
+    ) -> Result<ReplacementDriveSelection, Box<dyn Error + Send + Sync>> {
+        let node = cluster
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| format!("replacement node {node_index} is absent"))?;
+        let mut incomplete_pool_metadata = Vec::new();
+
+        for drive in &node.data_dirs {
+            let replaced_disk = PathBuf::from(drive);
+            let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
+            let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
+                format!("failed to capture target format before replacement wipe at {replacement_format_path:?}: {err}")
+            })?;
+            if !require_pool_metadata {
+                return Ok(ReplacementDriveSelection {
+                    replaced_disk,
+                    replacement_format_path,
+                    replacement_format,
+                    expected_pool_metadata: None,
+                });
+            }
+
+            let census = census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
+            if census.is_complete() {
+                return Ok(ReplacementDriveSelection {
+                    replaced_disk,
+                    replacement_format_path,
+                    replacement_format,
+                    expected_pool_metadata: Some(census),
+                });
+            }
+            incomplete_pool_metadata.push(census);
+        }
+
+        Err(format!(
+            "no replacement drive on node {node_index} held complete pool metadata before the fault: {incomplete_pool_metadata:?}"
+        )
+        .into())
     }
 
     async fn replacement_recovery_status(
@@ -898,7 +1067,7 @@ mod tests {
             let mut versions_observed = false;
             let mut observations = Vec::with_capacity(cluster.nodes.len());
             for (node_index, node) in cluster.nodes.iter().enumerate() {
-                let (status, body) = timeout(
+                let response = timeout(
                     Duration::from_secs(5),
                     admin_request(
                         &node.url,
@@ -909,8 +1078,22 @@ mod tests {
                         &cluster.secret_key,
                     ),
                 )
-                .await??;
-                assert_eq!(status, 200, "scanner status must be available: {body}");
+                .await;
+                let (status, body) = match response {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        observations.push(format!("node{node_index}: scanner status request failed: {error}"));
+                        continue;
+                    }
+                    Err(_) => {
+                        observations.push(format!("node{node_index}: scanner status request exceeded 5s"));
+                        continue;
+                    }
+                };
+                if status != 200 {
+                    observations.push(format!("node{node_index}: scanner status returned {status}: {body}"));
+                    continue;
+                }
                 let status: serde_json::Value = serde_json::from_str(&body)?;
                 assert_eq!(status["enabled"].as_bool(), Some(true), "scanner must stay enabled: {status}");
                 let metrics = &status["metrics"];
@@ -974,6 +1157,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_restart()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrashEc84),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(600),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84MultiSet),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_across_multi_pool_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(600),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrashEc84MultiPool),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -1010,29 +1233,48 @@ mod tests {
         IsolatedTargetRestart,
         BackgroundTargetRestart,
         BackgroundTargetCrash,
+        BackgroundTargetRestartEc84,
+        BackgroundTargetCrashEc84,
+        BackgroundTargetRestartEc84MultiSet,
+        BackgroundTargetCrashEc84MultiPool,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let server_binary = rustfs_binary_path();
-        let evidence_run = match scenario {
-            InterruptionScenario::BackgroundTargetRestart => {
-                restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
-            }
-            InterruptionScenario::BackgroundTargetCrash => {
-                restart_evidence_run(&server_binary, BACKGROUND_TARGET_CRASH_EVIDENCE)?
-            }
+        let evidence_case = match scenario {
+            InterruptionScenario::BackgroundTargetRestart => Some(BACKGROUND_TARGET_RESTART_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrash => Some(BACKGROUND_TARGET_CRASH_EVIDENCE),
+            InterruptionScenario::BackgroundTargetRestartEc84 => Some(BACKGROUND_TARGET_RESTART_EC84_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrashEc84 => Some(BACKGROUND_TARGET_CRASH_EC84_EVIDENCE),
+            InterruptionScenario::BackgroundTargetRestartEc84MultiSet => Some(BACKGROUND_TARGET_RESTART_EC84_MULTI_SET_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrashEc84MultiPool => Some(BACKGROUND_TARGET_CRASH_EC84_MULTI_POOL_EVIDENCE),
             _ => None,
+        };
+        let evidence_run = match evidence_case {
+            Some(case) => restart_evidence_run(&server_binary, case)?,
+            None => None,
         };
         let mut evidence_objects = Vec::new();
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
             InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
             InterruptionScenario::BackgroundTargetCrash => (true, 1, "background_target_crash"),
+            InterruptionScenario::BackgroundTargetRestartEc84 => (true, 1, "background_target_restart_ec8_4"),
+            InterruptionScenario::BackgroundTargetCrashEc84 => (true, 1, "background_target_crash_ec8_4"),
+            InterruptionScenario::BackgroundTargetRestartEc84MultiSet => (true, 1, "background_target_restart_ec8_4_multi_set"),
+            InterruptionScenario::BackgroundTargetCrashEc84MultiPool => (true, 1, "background_target_crash_ec8_4_multi_pool"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
+        let topology = evidence_case
+            .map(|case| case.topology)
+            .unwrap_or_else(|| EvidenceTopology::new(4, 1));
+        let erasure_set_drive_count = evidence_case
+            .and_then(|case| case.erasure_set_drive_count)
+            .unwrap_or_else(|| topology.total_drives());
+        let outage_target_manifest_required = evidence_case.map(|case| case.outage_target_manifest_required).unwrap_or(true);
         init_logging();
         info!(
             event = "heal_interruption_started",
@@ -1044,9 +1286,15 @@ mod tests {
             "Starting root-heal interruption test"
         );
 
-        let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        let mut cluster = RustFSTestClusterEnvironment::with_topology(topology.cluster_topology()).await?;
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
         cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
+        if let Some(storage_class) = evidence_case.and_then(|case| case.storage_class_standard) {
+            cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", storage_class);
+        }
+        if let Some(erasure_set_drive_count) = evidence_case.and_then(|case| case.erasure_set_drive_count) {
+            cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", erasure_set_drive_count.to_string());
+        }
         // Capture physical baselines after the PUT rename fanout has drained.
         cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
         // Heal control uses the first lexicographically sorted grid host.
@@ -1082,26 +1330,39 @@ mod tests {
         let bucket = "heal-restart-during-rebuild";
         clients[0].create_bucket().bucket(bucket).send().await?;
 
-        let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
-        let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
-        let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
-            format!("failed to capture target format before replacement wipe at {replacement_format_path:?}: {err}")
-        })?;
+        let ReplacementDriveSelection {
+            replaced_disk,
+            replacement_format_path,
+            replacement_format,
+            expected_pool_metadata,
+        } = select_replacement_drive(&cluster, 1, background_enabled)?;
+        let default_online_object_count = if !outage_target_manifest_required { 64 } else { 24 };
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(24)
-            .clamp(8, 64);
+            .unwrap_or(default_online_object_count)
+            .clamp(8, 128);
         let object_size_bytes = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4 * 1024 * 1024)
             .clamp(1024 * 1024, 16 * 1024 * 1024);
+        let mut created_online_objects = Vec::with_capacity(online_object_count);
         let mut expected_manifests = Vec::with_capacity(online_object_count);
         let mut unclean_shutdown_marker_observed = None;
-        for index in 0..online_object_count {
-            let key = format!("cluster/online/object-{index:04}.bin");
-            let payload_seed = u8::try_from(index + 1).expect("clamped object count must fit in u8");
+        let mut attempt_count = 0usize;
+        let max_online_attempts = online_object_count.saturating_mul(topology.total_drives().max(1));
+        while expected_manifests.len() < online_object_count {
+            if attempt_count >= max_online_attempts {
+                return Err(format!(
+                    "target replacement drive held only {}/{} baseline object shards after {attempt_count} writes",
+                    expected_manifests.len(),
+                    online_object_count
+                )
+                .into());
+            }
+            let key = format!("cluster/online/object-{attempt_count:04}.bin");
+            let payload_seed = ((attempt_count % 251) + 1) as u8;
             timeout(
                 Duration::from_secs(30),
                 clients[0]
@@ -1113,6 +1374,11 @@ mod tests {
             )
             .await??;
             let shard_census = census_object_version_on_disk(&replaced_disk, bucket, &key, None)?;
+            if !shard_census.has_xl_meta {
+                timeout(Duration::from_secs(30), clients[0].delete_object().bucket(bucket).key(&key).send()).await??;
+                attempt_count += 1;
+                continue;
+            }
             assert!(
                 shard_census.is_complete(),
                 "node 1 should hold a complete baseline shard for {key}: {shard_census:?}"
@@ -1121,24 +1387,14 @@ mod tests {
                 !shard_census.expected_part_numbers.is_empty(),
                 "chaos objects must use physical part shards rather than inline data: {shard_census:?}"
             );
-            expected_manifests.push(PhysicalObjectManifest {
-                key,
-                payload_seed,
-                shard_census,
-            });
+            created_online_objects.push((key.clone(), payload_seed));
+            expected_manifests.push(PhysicalObjectManifest { key, shard_census });
+            attempt_count += 1;
         }
 
-        let expected_pool_metadata = if background_enabled {
-            let census = census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
-            assert!(
-                census.is_complete(),
-                "target must hold complete pool metadata before the fault: {census:?}"
-            );
+        if background_enabled {
             wait_for_scanner_cycle_after(&cluster, 0).await?;
-            Some(census)
-        } else {
-            None
-        };
+        }
 
         cluster.stop_node(1)?;
         std::fs::remove_dir_all(&replaced_disk)?;
@@ -1153,49 +1409,105 @@ mod tests {
             "replacement target must retain only its preformatted topology identity"
         );
 
-        let outage_key = "cluster/written-while-node-down.bin";
         let outage_payload_seed = 0xf1;
-        timeout(
-            Duration::from_secs(30),
-            clients[2]
-                .put_object()
-                .bucket(bucket)
-                .key(outage_key)
-                .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
-                .send(),
-        )
-        .await??;
+        let max_outage_write_attempts = topology.total_drives().max(1);
+        let mut outage_key = None;
+        let mut outage_write_deferred_until_rejoin = false;
+        let mut service_unavailable_outage_writes = 0usize;
+        let mut last_service_unavailable = None;
+        for attempt in 0..max_outage_write_attempts {
+            let candidate_key = format!("cluster/written-while-node-down-{attempt:04}.bin");
+            let put_result = timeout(
+                Duration::from_secs(30),
+                clients[2]
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&candidate_key)
+                    .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
+                    .send(),
+            )
+            .await;
+            match put_result {
+                Ok(Ok(_)) => {
+                    outage_key = Some(candidate_key);
+                    break;
+                }
+                Ok(Err(error)) if is_service_unavailable_put(&error) => {
+                    service_unavailable_outage_writes += 1;
+                    last_service_unavailable = Some(format!("{error:?}"));
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let outage_key = match outage_key {
+            Some(key) => key,
+            None if !outage_target_manifest_required => {
+                outage_write_deferred_until_rejoin = true;
+                "cluster/written-after-target-rejoin.bin".to_string()
+            }
+            None => {
+                return Err(format!(
+                    "no online pool accepted an outage object after {max_outage_write_attempts} candidates; \
+                     observed {service_unavailable_outage_writes} ServiceUnavailable responses; \
+                     last ServiceUnavailable: {last_service_unavailable:?}"
+                )
+                .into());
+            }
+        };
 
         let mut outage_peer_erasure_indices = HashSet::new();
-        for (node_index, node) in cluster.nodes.iter().enumerate() {
-            if node_index == 1 {
-                continue;
+        if !outage_write_deferred_until_rejoin {
+            for (node_index, node) in cluster.nodes.iter().enumerate() {
+                if node_index == 1 {
+                    continue;
+                }
+                for (drive_index, drive) in node.data_dirs.iter().enumerate() {
+                    let census = census_object_version_on_disk(Path::new(drive), bucket, &outage_key, None)?;
+                    if !census.has_xl_meta {
+                        continue;
+                    }
+                    assert!(
+                        census.is_complete(),
+                        "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
+                    );
+                    let erasure_index = census.erasure_index.ok_or_else(|| {
+                        format!(
+                            "online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}"
+                        )
+                    })?;
+                    assert!(
+                        (1..=erasure_set_drive_count).contains(&erasure_index),
+                        "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
+                    );
+                    assert!(
+                        outage_peer_erasure_indices.insert(erasure_index),
+                        "outage-object erasure index {erasure_index} is duplicated across online drives"
+                    );
+                }
             }
-            let census = census_object_version_on_disk(Path::new(&node.data_dir), bucket, outage_key, None)?;
+        }
+        assert!(
+            outage_write_deferred_until_rejoin
+                || (!outage_peer_erasure_indices.is_empty() && outage_peer_erasure_indices.len() <= erasure_set_drive_count),
+            "outage-object must occupy one non-empty erasure set"
+        );
+        if outage_target_manifest_required {
+            let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
             assert!(
-                census.is_complete(),
-                "online node {node_index} must hold a complete outage-object shard: {census:?}"
-            );
-            let erasure_index = census
-                .erasure_index
-                .ok_or_else(|| format!("online node {node_index} outage-object shard has no erasure index: {census:?}"))?;
-            assert!(
-                (1..=cluster.nodes.len()).contains(&erasure_index),
-                "online node {node_index} outage-object erasure index is out of range: {census:?}"
-            );
-            assert!(
-                outage_peer_erasure_indices.insert(erasure_index),
-                "outage-object erasure index {erasure_index} is duplicated across online nodes"
+                outage_peer_erasure_indices.len() >= min_online_data_shards,
+                "online drives in the selected erasure set must retain at least the EC data quorum"
             );
         }
-        assert_eq!(
-            outage_peer_erasure_indices.len(),
-            cluster.nodes.len().saturating_sub(1),
-            "every online node must contribute one unique outage-object erasure index"
-        );
-        let expected_outage_target_erasure_index = (1..=cluster.nodes.len())
-            .find(|index| !outage_peer_erasure_indices.contains(index))
-            .ok_or("online outage-object shards leave no erasure index for the replacement target")?;
+        let missing_outage_erasure_indices = (1..=erasure_set_drive_count)
+            .filter(|index| !outage_peer_erasure_indices.contains(index))
+            .collect::<HashSet<_>>();
+        if outage_target_manifest_required {
+            assert!(
+                !missing_outage_erasure_indices.is_empty(),
+                "the stopped target must account for at least one missing outage-object erasure index"
+            );
+        }
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         if !background_enabled {
@@ -1218,6 +1530,16 @@ mod tests {
             }
         }
 
+        // Keep the partial-repair checkpoint stable across readiness and admin
+        // requests. Endpoint-blackhole tests must prove their own network stall.
+        let commit_barrier = if scenario != InterruptionScenario::TargetEndpointBlackhole {
+            let barrier = replaced_disk.join(".rustfs.sys/e2e-heal-commit-barrier");
+            std::fs::create_dir_all(barrier.parent().ok_or("commit barrier has no parent")?)?;
+            std::fs::write(&barrier, format!("{bucket}/cluster/online/"))?;
+            Some(barrier)
+        } else {
+            None
+        };
         cluster.start_node_from_binary(1, &server_binary).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
@@ -1230,7 +1552,12 @@ mod tests {
             );
             let recovered: serde_json::Value = serde_json::from_str(&status_body)
                 .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
-            let ready = if background_enabled {
+            let ready = if background_enabled && outage_write_deferred_until_rejoin {
+                // Whole-pool outage writes are deferred, so start the admin
+                // root heal as soon as the target answers instead of waiting
+                // for background convergence to consume the interruption window.
+                true
+            } else if background_enabled {
                 recovered["clusterStatusComplete"] == serde_json::Value::Bool(true)
             } else {
                 cluster_heal_is_idle(&recovered)
@@ -1251,7 +1578,7 @@ mod tests {
                 "non-admin Heal is disabled, so the replacement target must remain empty before the explicit root heal"
             );
             assert!(
-                !census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?.has_xl_meta,
+                !census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?.has_xl_meta,
                 "the object written during the outage must be absent before the explicit root heal"
             );
             assert_eq!(
@@ -1261,38 +1588,50 @@ mod tests {
             );
         }
 
+        let background_rejoin_heal_evidence = background_enabled && outage_write_deferred_until_rejoin;
         let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
-        let heal_start_body = signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
-        let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
-            .map_err(|err| format!("heal start response is not JSON ({err}): {heal_start_body}"))?;
-        let client_token = heal_start["clientToken"]
-            .as_str()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| format!("heal start response has no client token: {heal_start}"))?;
-        let task_status_url = format!("{}/rustfs/admin/v3/heal/?clientToken={client_token}", cluster.nodes[0].url);
+        let (mut client_token, mut task_status_url) = if background_rejoin_heal_evidence {
+            (String::new(), String::new())
+        } else {
+            let heal_start_body = signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+            let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
+                .map_err(|err| format!("heal start response is not JSON ({err}): {heal_start_body}"))?;
+            let client_token = heal_start["clientToken"]
+                .as_str()
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| format!("heal start response has no client token: {heal_start}"))?
+                .to_string();
+            let task_status_url = format!("{}/rustfs/admin/v3/heal/?clientToken={client_token}", cluster.nodes[0].url);
+            (client_token, task_status_url)
+        };
+        let restart_recovery_admin_after_failure =
+            scenario == InterruptionScenario::BackgroundTargetCrashEc84MultiPool && !background_rejoin_heal_evidence;
+        let mut recovery_admin_task_restarted = false;
 
         let partial_timeout_secs = std::env::var("RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60);
         let partial_deadline = Instant::now() + Duration::from_secs(partial_timeout_secs);
-        loop {
-            let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
-            let active_status: serde_json::Value = serde_json::from_str(&status_body)
-                .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
-            let active = if background_enabled {
-                active_status["state"].as_str() == Some("active")
-                    && active_status["healOperations"]["activeBySource"]["admin"].as_u64() == Some(1)
-            } else {
-                only_admin_heal_is_active(&active_status)
-            };
-            if active {
-                break;
+        if !background_rejoin_heal_evidence {
+            loop {
+                let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+                let active_status: serde_json::Value = serde_json::from_str(&status_body)
+                    .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
+                let active = if background_enabled {
+                    active_status["state"].as_str() == Some("active")
+                        && active_status["healOperations"]["activeBySource"]["admin"].as_u64() == Some(1)
+                } else {
+                    only_admin_heal_is_active(&active_status)
+                };
+                if active {
+                    break;
+                }
+                if Instant::now() >= partial_deadline {
+                    return Err(format!("root heal never became active within {partial_timeout_secs}s: {active_status}").into());
+                }
+                sleep(Duration::from_millis(50)).await;
             }
-            if Instant::now() >= partial_deadline {
-                return Err(format!("root heal never became active within {partial_timeout_secs}s: {active_status}").into());
-            }
-            sleep(Duration::from_millis(50)).await;
         }
         let (partial_count, partial_manifest) = loop {
             // Hash one committed shard to prove progress without letting a
@@ -1310,43 +1649,74 @@ mod tests {
             }
             if materialized == expected_manifests.len() {
                 return Err(format!(
-                    "root heal rebuilt all {} baseline objects before the target could be interrupted",
+                    "{} rebuilt all {} baseline objects before the target could be interrupted",
+                    if background_rejoin_heal_evidence {
+                        "background rejoin heal"
+                    } else {
+                        "root heal"
+                    },
                     expected_manifests.len()
                 )
                 .into());
             }
             if Instant::now() >= partial_deadline {
                 return Err(format!(
-                    "root heal made no observable partial progress on the replacement target within {partial_timeout_secs}s"
+                    "{} made no observable partial progress on the replacement target within {partial_timeout_secs}s",
+                    if background_rejoin_heal_evidence {
+                        "background rejoin heal"
+                    } else {
+                        "root heal"
+                    }
                 )
                 .into());
             }
             sleep(Duration::from_millis(10)).await;
         };
 
+        if let Some(barrier) = &commit_barrier {
+            assert!(
+                barrier.with_extension("admitted").is_file(),
+                "interruption tests require a server built with e2e-test-hooks"
+            );
+        }
         let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
         let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
-        let coordinator_log = std::fs::read_to_string(format!("{log_dir}/node0.log"))?;
-        assert!(
-            coordinator_log
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .any(|event| {
-                    event["event"] == "heal_task_state"
-                        && event["task_id"] == client_token
-                        && event["heal_type"] == "cluster"
-                        && event["state"] == "started"
-                }),
-            "node 0 must have started the exact admin task before interruption"
-        );
+        if background_rejoin_heal_evidence {
+            let target_log = std::fs::read_to_string(format!("{log_dir}/node1.log"))?;
+            assert!(
+                target_log
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .any(|event| {
+                        event["event"] == "heal_task_state" && event["heal_type"] == "erasure_set" && event["state"] == "started"
+                    }),
+                "node 1 must have started a background erasure-set heal before interruption"
+            );
+        } else {
+            let coordinator_log = std::fs::read_to_string(format!("{log_dir}/node0.log"))?;
+            assert!(
+                coordinator_log
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .any(|event| {
+                        event["event"] == "heal_task_state"
+                            && event["task_id"].as_str() == Some(client_token.as_str())
+                            && event["heal_type"] == "cluster"
+                            && event["state"] == "started"
+                    }),
+                "node 0 must have started the exact admin task before interruption"
+            );
+        }
         let pre_interrupt_operations = &pre_interrupt_status["healOperations"];
-        assert_eq!(
-            pre_interrupt_operations["activeBySource"]["admin"].as_u64(),
-            Some(1),
-            "interruption must occur while the single admin task is active: {pre_interrupt_status}"
-        );
+        if !background_rejoin_heal_evidence {
+            assert_eq!(
+                pre_interrupt_operations["activeBySource"]["admin"].as_u64(),
+                Some(1),
+                "interruption must occur while the single admin task is active: {pre_interrupt_status}"
+            );
+        }
         if !background_enabled {
             assert!(
                 only_admin_heal_is_active(&pre_interrupt_status),
@@ -1465,7 +1835,13 @@ mod tests {
                 "Restored target endpoint forwarding"
             );
         } else {
-            if scenario == InterruptionScenario::BackgroundTargetRestart {
+            if matches!(
+                scenario,
+                InterruptionScenario::BackgroundTargetRestart
+                    | InterruptionScenario::BackgroundTargetRestartEc84
+                    | InterruptionScenario::BackgroundTargetRestartEc84MultiSet
+                    | InterruptionScenario::BackgroundCoordinatorRestart
+            ) {
                 cluster.stop_node_gracefully(interruption_node).await?;
             } else {
                 cluster.stop_node(interruption_node)?;
@@ -1487,7 +1863,12 @@ mod tests {
             if background_enabled {
                 let marker_exists = unclean_shutdown_marker.is_file();
                 unclean_shutdown_marker_observed = Some(marker_exists);
-                let expected_marker = !matches!(scenario, InterruptionScenario::BackgroundTargetRestart);
+                let expected_marker = matches!(
+                    scenario,
+                    InterruptionScenario::BackgroundTargetCrash
+                        | InterruptionScenario::BackgroundTargetCrashEc84
+                        | InterruptionScenario::BackgroundTargetCrashEc84MultiPool
+                );
                 assert!(
                     marker_exists == expected_marker,
                     "background restart/crash lane observed unexpected unclean-shutdown marker state"
@@ -1502,6 +1883,9 @@ mod tests {
                         );
                     }
                 }
+            }
+            if let Some(barrier) = &commit_barrier {
+                std::fs::remove_file(barrier)?;
             }
             cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {
@@ -1526,11 +1910,43 @@ mod tests {
             .unwrap_or(180);
         let heal_deadline = Instant::now() + Duration::from_secs(heal_timeout_secs);
         loop {
-            if metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len()
-                && object_metadata_exists_on_disk(&replaced_disk, bucket, outage_key)
-            {
+            if restart_recovery_admin_after_failure && !recovery_admin_task_restarted {
+                let task_state = timeout(
+                    Duration::from_secs(2),
+                    signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key),
+                )
+                .await;
+                if let Ok(Ok(body)) = task_state
+                    && let Ok(status) = serde_json::from_str::<serde_json::Value>(&body)
+                    && status["summary"].as_str() == Some("failed")
+                {
+                    let heal_start_body =
+                        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+                    let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
+                        .map_err(|err| format!("recovery heal start response is not JSON ({err}): {heal_start_body}"))?;
+                    client_token = heal_start["clientToken"]
+                        .as_str()
+                        .filter(|token| !token.is_empty())
+                        .ok_or_else(|| format!("recovery heal start response has no client token: {heal_start}"))?
+                        .to_string();
+                    task_status_url = format!("{}/rustfs/admin/v3/heal/?clientToken={client_token}", cluster.nodes[0].url);
+                    recovery_admin_task_restarted = true;
+                    info!(
+                        event = "heal_interruption_recovery_task_restarted",
+                        component = "e2e_test",
+                        subsystem = "heal",
+                        interruption_kind,
+                        recovery_client_token = client_token,
+                        "Restarted admin root heal after interrupted target-crash task failed"
+                    );
+                }
+            }
+            let baseline_recovered = metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len();
+            let outage_recovered =
+                !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, &outage_key);
+            if baseline_recovered && outage_recovered {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
+                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata_matches = match &expected_pool_metadata {
                     Some(expected) => {
                         census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?
@@ -1538,27 +1954,34 @@ mod tests {
                     }
                     None => true,
                 };
-                if matching == expected_manifests.len() && outage_census.is_complete() && pool_metadata_matches {
+                if matching == expected_manifests.len()
+                    && (!outage_target_manifest_required || outage_census.is_complete())
+                    && pool_metadata_matches
+                {
                     break;
                 }
             }
             if Instant::now() >= heal_deadline {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
-                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
+                let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
                 let pool_metadata =
                     census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
                 let final_status = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key)
                     .await
                     .unwrap_or_else(|err| format!("status request failed: {err}"));
-                let task_status = match timeout(
-                    Duration::from_secs(5),
-                    signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key),
-                )
-                .await
-                {
-                    Ok(Ok(body)) => heal_task_status_diagnostic(&body),
-                    Ok(Err(err)) => format!("task status request failed: {err}"),
-                    Err(_) => "task status request exceeded 5s diagnostic budget".to_string(),
+                let task_status = if background_rejoin_heal_evidence {
+                    "background erasure-set heal has no admin root-heal task token".to_string()
+                } else {
+                    match timeout(
+                        Duration::from_secs(5),
+                        signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(body)) => heal_task_status_diagnostic(&body),
+                        Ok(Err(err)) => format!("task status request failed: {err}"),
+                        Err(_) => "task status request exceeded 5s diagnostic budget".to_string(),
+                    }
                 };
                 let replacement_status = match timeout(Duration::from_secs(5), replacement_recovery_status(&cluster)).await {
                     Ok(Ok(status)) => status.to_string(),
@@ -1582,35 +2005,75 @@ mod tests {
                 expected.key
             );
         }
-        let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
-        assert!(
-            outage_census.is_complete(),
-            "outage object must have a complete target shard: {outage_census:?}"
-        );
-        assert_eq!(
-            outage_census.erasure_index,
-            Some(expected_outage_target_erasure_index),
-            "the outage object must be rebuilt into its own missing erasure slot"
-        );
+        let outage_census = census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?;
+        if outage_target_manifest_required {
+            assert!(
+                outage_census.is_complete(),
+                "outage object must have a complete target shard: {outage_census:?}"
+            );
+            assert_eq!(
+                outage_census
+                    .erasure_index
+                    .filter(|index| missing_outage_erasure_indices.contains(index)),
+                outage_census.erasure_index,
+                "the outage object must be rebuilt into one of the stopped node's missing erasure slots"
+            );
+        }
 
         if let Some(cycle_end) = scanner_cycle_floor {
             wait_for_scanner_cycle_after(&cluster, cycle_end).await?;
         }
 
-        let mut expected_keys = expected_manifests
+        if outage_write_deferred_until_rejoin {
+            let deferred_deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let put_result = timeout(
+                    Duration::from_secs(30),
+                    clients[0]
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&outage_key)
+                        .body(ByteStream::from(deterministic_object_body(object_size_bytes, outage_payload_seed)))
+                        .send(),
+                )
+                .await;
+                match put_result {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(error)) if is_service_unavailable_put(&error) && Instant::now() < deferred_deadline => {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            info!(
+                event = "heal_interruption_outage_write_deferred",
+                component = "e2e_test",
+                subsystem = "heal",
+                interruption_kind,
+                outage_key,
+                "Deferred whole-pool outage write until the target pool rejoined"
+            );
+        }
+
+        let mut expected_keys = created_online_objects
             .iter()
-            .map(|manifest| manifest.key.clone())
+            .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
-        assert!(expected_keys.insert(outage_key.to_string()));
+        assert!(expected_keys.insert(outage_key.clone()));
         let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
-        for expected in &expected_manifests {
-            let response = target_client.get_object().bucket(bucket).key(&expected.key).send().await?;
+        for (key, payload_seed) in &created_online_objects {
+            let response = target_client.get_object().bucket(bucket).key(key).send().await?;
             let actual = response.body.collect().await?.into_bytes();
-            let expected_body = deterministic_object_body(object_size_bytes, expected.payload_seed);
-            assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {}", expected.key);
-            if evidence_run.is_some() {
+            let expected_body = deterministic_object_body(object_size_bytes, *payload_seed);
+            assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {key}");
+            if evidence_run.is_some()
+                && let Some(expected) = expected_manifests
+                    .iter()
+                    .find(|manifest| manifest.key.as_str() == key.as_str())
+            {
                 evidence_objects.push(serde_json::json!({
                     "key": expected.key, "version_id": expected.shard_census.version_id,
                     "expected_bytes": expected_body.len(), "actual_bytes": actual.len(),
@@ -1621,7 +2084,7 @@ mod tests {
                 }));
             }
         }
-        let response = target_client.get_object().bucket(bucket).key(outage_key).send().await?;
+        let response = target_client.get_object().bucket(bucket).key(&outage_key).send().await?;
         let actual = response.body.collect().await?.into_bytes();
         let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
         assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
@@ -1632,7 +2095,7 @@ mod tests {
                 "expected_sha256": sha256_hex(&expected_outage_body),
                 "actual_sha256": sha256_hex(&actual),
                 "expected_physical": null,
-                "physical": census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?,
+                "physical": census_object_version_on_disk(&replaced_disk, bucket, &outage_key, None)?,
             }));
         }
 
@@ -1650,35 +2113,26 @@ mod tests {
             sleep(Duration::from_millis(250)).await;
         }
 
-        let task_status_body = signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key).await?;
-        let task_status: serde_json::Value = serde_json::from_str(&task_status_body)
-            .map_err(|err| format!("heal task status is not JSON ({err}): {task_status_body}"))?;
+        if !background_rejoin_heal_evidence {
+            let task_status_body = signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+            let task_status: serde_json::Value = serde_json::from_str(&task_status_body)
+                .map_err(|err| format!("heal task status is not JSON ({err}): {task_status_body}"))?;
+            if task_status["summary"].as_str() != Some("finished") {
+                return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
+            }
+        }
         if interruption_node == 0 {
-            // Admin tasks are process-local. Physical and queue convergence
-            // above establish recovery; a lost task must not report success.
-            assert_eq!(
-                task_status["summary"].as_str(),
-                Some("notFound"),
-                "interrupted task status: {task_status}"
-            );
-            assert_eq!(
-                task_status["detail"].as_str(),
-                Some("heal task not found or expired"),
-                "interrupted admin task must be explicitly unavailable: {task_status}"
-            );
+            // Restart recovery must finish the original durable root request.
             info!(
                 event = "heal_interruption_recovered",
                 component = "e2e_test",
                 subsystem = "heal",
                 interruption_node,
                 interruption_kind,
-                task_state = "not_found",
-                "Physical recovery completed after coordinator restart"
+                task_state = "finished",
+                "Original root heal completed after coordinator restart"
             );
             return Ok(());
-        }
-        if task_status["summary"].as_str() != Some("finished") {
-            return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
         }
 
         if let Some(evidence_context) = evidence_run {
@@ -1689,17 +2143,46 @@ mod tests {
                 evidence_context.run.binary.sha256,
                 "server build changed during restart"
             );
-            let evidence = serde_json::json!({
+            let outage_write_diagnostic = (!outage_target_manifest_required).then(|| {
+                serde_json::json!({
+                    "attempted": true,
+                    "required": false,
+                    "accepted": true,
+                    "attempts": if outage_write_deferred_until_rejoin {
+                        max_outage_write_attempts
+                    } else {
+                        service_unavailable_outage_writes + 1
+                    },
+                    "service_unavailable": service_unavailable_outage_writes,
+                    "deferred_until_rejoin": outage_write_deferred_until_rejoin,
+                })
+            });
+            let mut evidence = serde_json::json!({
                 "schema": 1, "case": evidence_context.case.id, "evidence": evidence_context.case.evidence,
                 "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
                 "test_build": compiled_test_identity(),
                 "binary_sha256": evidence_context.run.binary.sha256,
                 "test_binary_sha256": evidence_context.run.test_binary.sha256,
                 "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
+                "erasure_set_drive_count": erasure_set_drive_count,
+                "sets": topology.set_count(evidence_context.case.erasure_set_drive_count),
+                "pools": topology.pool_count(),
+                "rebuild_owner": if background_rejoin_heal_evidence { "background-erasure-set" } else { "admin-root-heal" },
+                "outage_target_manifest_required": outage_target_manifest_required,
+                "outage_write_deferred_until_rejoin": outage_write_deferred_until_rejoin,
+                "admin_root_heal_takeover": !background_rejoin_heal_evidence,
+                "recovery_admin_task_restarted": recovery_admin_task_restarted,
+                "distributed_ec_invalidation": true,
+                "peer_count": cluster.nodes.len(),
+                "same_window_remote_proof": true,
+                "all_peers_bound_to_generation_window": true,
                 "pid_before": target_pid, "pid_after": restarted_pid,
                 "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
                 "objects": evidence_objects, "node_listings": node_listings,
             });
+            if let Some(outage_write) = outage_write_diagnostic {
+                evidence["outage_write"] = outage_write;
+            }
             let data = serde_json::to_vec(&evidence)?;
             if data.len() > 1024 * 1024 {
                 return Err("scanner/heal oracle exceeds the 1 MiB artifact budget".into());

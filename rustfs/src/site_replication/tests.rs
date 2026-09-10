@@ -845,7 +845,8 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
     record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 2);
 
-    // A legacy entry (created without recording) is never stamped.
+    // A legacy entry (persisted by a binary that predates recording, so it
+    // deserialized with the `false` default) is never stamped.
     let legacy = PeerInfo {
         deployment_id: "legacy-dep".to_string(),
         ..peer("legacy", "https://legacy.example.com")
@@ -859,6 +860,12 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
         None,
     )
     .expect("upsert retry event");
+    state
+        .retry_queue
+        .iter_mut()
+        .find(|event| event.peer_deployment_id == legacy.deployment_id)
+        .expect("legacy entry")
+        .deletions_recorded = false;
     record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline").expect("record failure");
     let legacy_event = state
         .retry_queue
@@ -869,6 +876,43 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
         !legacy_event.deletions_recorded,
         "an entry that predates recording may hide an unrecorded deletion"
     );
+}
+
+/// backlog#2367 A-3: an entry first created by a non-deletion failure — the
+/// add bootstrap's snapshot send, or the drain's own replay — hides no
+/// unrecorded deletion, so a deletion recorded later plus a stable snapshot
+/// resend must settle it instead of escalating it to the permanent marker
+/// that only `replicate repair` clears.
+#[test]
+fn test_bootstrap_created_iam_entry_settles_after_deletion_replay() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let mut state = deletion_replay_state(&target);
+    upsert_site_replication_retry_event(
+        &mut state.retry_queue,
+        &target,
+        SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH,
+        "peer request to https://remote.example.com failed (connect): connection refused",
+        None,
+    )
+    .expect("bootstrap send failure");
+    assert!(state.retry_queue[0].deletions_recorded, "a fresh entry carries no unrecorded deletion");
+
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
+    assert_eq!(state.retry_queue.len(), 1, "the hook failure collapses into the bootstrap entry");
+    assert!(state.retry_queue[0].deletions_recorded);
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+
+    let observed = state.retry_queue[0].clone();
+    let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
+    assert!(
+        settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed),
+        "the replayed deletion plus the snapshot resend settle the entry"
+    );
+    assert!(state.retry_queue.is_empty(), "no escalation marker may remain: {:?}", state.retry_queue);
+    assert!(state.iam_deletion_replays.is_empty());
 }
 
 /// Overflowing the per-peer record cap degrades the entry back to the
@@ -1624,6 +1668,74 @@ fn test_deferred_retry_events_do_not_probe_fresh_application_failures() {
         "reachable peers that reject an operation must keep the base replay backoff"
     );
     assert!(actionable_site_replication_retry_events(&state, now).is_empty());
+}
+
+/// backlog#2367 A-1: the lightweight pass replays bucket ops only, but
+/// probes every backed-off class so a recovered peer's IAM snapshot is
+/// promoted within 30 seconds instead of waiting for the heavyweight tick
+/// to notice it.
+#[test]
+fn test_lightweight_partition_probes_snapshot_entries_but_replays_bucket_ops_only() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    let mut iam_unreachable = drain_event(
+        "remote",
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+        3,
+        Some(now - time::Duration::seconds(30)),
+    );
+    iam_unreachable.peer_unreachable = true;
+    let mut bucket_unreachable = drain_event("remote", bucket_make, 3, Some(now - time::Duration::seconds(30)));
+    bucket_unreachable.peer_unreachable = true;
+    state.retry_queue = vec![
+        iam_unreachable,
+        bucket_unreachable,
+        // Already promoted (or never stamped): due now.
+        drain_event("remote", SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH, 1, None),
+        drain_event("remote", bucket_make, 1, None),
+    ];
+
+    let (actionable, deferred) = lightweight_retry_drain_partition(&state, now);
+    let deferred_paths: Vec<&str> = deferred.iter().map(|event| event.path.as_str()).collect();
+    assert!(
+        deferred_paths.contains(&SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH),
+        "the backed-off IAM snapshot must be probed by the lightweight pass: {deferred_paths:?}"
+    );
+    assert!(deferred_paths.contains(&bucket_make));
+    assert_eq!(
+        actionable.iter().map(|event| event.path.as_str()).collect::<Vec<_>>(),
+        vec![bucket_make],
+        "only the bounded bucket op is replayed by the lightweight pass"
+    );
+}
+
+/// backlog#2367 A-1: the heavyweight tick evaluates backoff halfway to its
+/// next tick. A first failure stamped one second after a tick is 599 s old
+/// at the next tick; without the horizon it slipped to the tick after.
+#[test]
+fn test_heavyweight_horizon_absorbs_tick_phase() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let horizon = heavyweight_retry_drain_horizon(now);
+    assert_eq!(horizon - now, time::Duration::seconds(300));
+
+    let elapsed_at_horizon = |secs_ago: i64| {
+        site_replication_retry_backoff_elapsed(
+            &drain_event("remote", "/p", 1, Some(now - time::Duration::seconds(secs_ago))),
+            horizon,
+        )
+    };
+    // Stamped just after the previous tick: due at this tick, not the next.
+    assert!(elapsed_at_horizon(599));
+    // Due before the next tick's midpoint: drained now rather than a whole
+    // interval late.
+    assert!(elapsed_at_horizon(301));
+    // Due after the midpoint: waits for the next tick.
+    assert!(!elapsed_at_horizon(299));
 }
 
 /// The drain settles a peer-edit success under a freshly allocated

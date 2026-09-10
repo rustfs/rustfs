@@ -1515,7 +1515,7 @@ impl DefaultObjectUsecase {
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
             server_side_encryption,
             ssekms_key_id,
-            false,
+            sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some(),
         );
         debug!(
             target: "rustfs::app::object_usecase",
@@ -2054,7 +2054,11 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, dsc).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                );
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
                 let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -3518,6 +3522,104 @@ mod tests {
             resolve_put_object_authoritative_size(&headers, Some(87)).expect("zero-length decoded is valid"),
             0
         );
+    }
+
+    async fn install_bucket_default_sse_for_test(bucket: &str, algorithm: &'static str, kms_key_id: Option<&str>) {
+        use crate::app::storage_api::test::bucket::utils::serialize;
+        use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+
+        let sys = get_global_bucket_metadata_sys().expect("bucket metadata system");
+        let metadata = {
+            let sys = sys.read().await;
+            sys.get(bucket).await.expect("bucket metadata cached")
+        };
+        let mut metadata = (*metadata).clone();
+        let config = ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from_static(algorithm),
+                    kms_master_key_id: kms_key_id.map(|id| id.to_string()),
+                }),
+                blocked_encryption_types: None,
+                bucket_key_enabled: None,
+            }],
+        };
+        metadata.encryption_config_xml = serialize(&config).expect("sse config serializes");
+        metadata.sse_config = Some(config);
+        set_bucket_metadata(bucket.to_string(), metadata)
+            .await
+            .expect("install bucket default SSE");
+    }
+
+    /// backlog#2368 B1: an SSE-C request suppresses the bucket default, the way
+    /// COPY already did. PUT passed a hard-coded `has_explicit_ssec = false`,
+    /// so the default filled in a managed algorithm and the request then failed
+    /// its own mutual-exclusion check — every bucket with default encryption
+    /// refused SSE-C outright.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sse_c_put_is_accepted_on_a_bucket_with_default_encryption() {
+        use md5::{Digest as _, Md5};
+
+        for (algorithm, kms_key_id, prefix) in [
+            (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
+            (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
+        ] {
+            let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket(prefix, 1 << 20).await;
+            install_bucket_default_sse_for_test(&bucket, algorithm, kms_key_id).await;
+
+            let customer_key = [0x2a_u8; 32];
+            let key_md5 = {
+                let mut hasher = Md5::new();
+                hasher.update(customer_key);
+                base64_simd::STANDARD.encode_to_string(hasher.finalize())
+            };
+            let payload = Bytes::from_static(b"customer-key protected payload");
+            let input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+                .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(base64_simd::STANDARD.encode_to_string(customer_key)))
+                .sse_customer_key_md5(Some(key_md5))
+                .build()
+                .expect("SSE-C PUT input must build");
+
+            DefaultObjectUsecase::from_global()
+                .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+                .await
+                .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
+
+            let stored = store
+                .get_object_info(&bucket, "ledger.csv", &ObjectOptions::default())
+                .await
+                .expect("the SSE-C object should be readable");
+            assert!(
+                stored
+                    .user_defined
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-amz-server-side-encryption-customer-algorithm")),
+                "the object must be stored as SSE-C: {:?}",
+                stored.user_defined
+            );
+            assert!(
+                !stored
+                    .user_defined
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-amz-server-side-encryption-aws-kms-key-id")),
+                "the bucket default must not attach a KMS key to an SSE-C object: {:?}",
+                stored.user_defined
+            );
+            assert!(
+                !stored
+                    .user_defined
+                    .values()
+                    .any(|value| value == ServerSideEncryption::AWS_KMS),
+                "the bucket default must not claim managed encryption on an SSE-C object: {:?}",
+                stored.user_defined
+            );
+        }
     }
 
     #[tokio::test]

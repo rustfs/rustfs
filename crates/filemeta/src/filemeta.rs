@@ -50,6 +50,9 @@ use tracing::{error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
+mod transition_reconcile;
+pub use transition_reconcile::TransitionStateReconcileTarget;
+
 // XL header specifies the format
 pub static XL_FILE_HEADER: [u8; 4] = *b"XL2 ";
 // pub static XL_FILE_VERSION_CURRENT: [u8; 4] = [0; 4];
@@ -391,6 +394,16 @@ impl FileMeta {
 
                     if ver_vid == fi_vid {
                         let mut ver = FileMetaVersion::try_from(version.meta.as_slice())?;
+                        let previous = ver
+                            .object
+                            .as_ref()
+                            .is_some_and(|object| {
+                                rustfs_utils::http::contains_key_bytes(
+                                    &object.meta_sys,
+                                    rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                                )
+                            })
+                            .then(|| ver.clone());
 
                         if let Some(ref mut obj) = ver.object {
                             if replace_user_metadata {
@@ -447,6 +460,9 @@ impl FileMeta {
                             }
                         }
 
+                        if let Some(previous) = previous {
+                            transition_reconcile::preserve_reconciled_transition(&previous, &mut ver)?;
+                        }
                         // Update
                         version.header = ver.header();
                         version.meta = ver.marshal_msg()?;
@@ -492,7 +508,7 @@ impl FileMeta {
         Ok(())
     }
 
-    pub fn add_version_filemata(&mut self, version: FileMetaVersion) -> Result<()> {
+    pub fn add_version_filemata(&mut self, mut version: FileMetaVersion) -> Result<()> {
         if !version.valid() {
             return Err(Error::other("file meta version invalid"));
         }
@@ -512,6 +528,7 @@ impl FileMeta {
             if existing.free_version() != version.free_version() {
                 return Err(Error::other("cannot replace a free version with a non-free version"));
             }
+            transition_reconcile::preserve_reconciled_transition(&existing, &mut version)?;
             return self.set_idx(fidx, version);
         }
 

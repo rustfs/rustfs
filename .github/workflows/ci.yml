@@ -16,7 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -36,7 +36,7 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    branches: [ main, release ]
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -259,9 +259,6 @@ jobs:
           } > artifacts/test-and-lint/doctest-diagnostics.txt
           exit "${status}"
 
-      - name: Check offline enrollment E2E root boundary
-        run: ./scripts/check_offline_enrollment_e2e.sh
-
       - name: Upload test reports and diagnostics
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -295,6 +292,36 @@ jobs:
       # quarantined so they gain nothing from the ci profile's retry overrides.
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
+
+  # The root boundary requires fresh CLI and integration-test builds. Give it
+  # its own time budget instead of sharing the workspace lint/test budget.
+  offline-enrollment-root-boundary:
+    name: Offline Enrollment Root Boundary
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
+      - name: Check offline enrollment E2E root boundary
+        run: ./scripts/check_offline_enrollment_e2e.sh
 
   # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
   # drive the object layer through process-global singletons (the GLOBAL_ENV
@@ -840,13 +867,14 @@ jobs:
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main pushes, the merge queue, and manual
+    # every PR, so it is gated to main/release pushes, the merge queue, and manual
     # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
     # owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release'))
     needs: [ build-rustfs-debug-binary ]
     runs-on: sm-standard-2
     timeout-minutes: 55
@@ -969,6 +997,7 @@ jobs:
       # debug binary; each test spawns its own rustfs server on a random port.
       - name: Run e2e full suite
         env:
+          CARGO_BIN_EXE_rustfs: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
@@ -1188,6 +1217,7 @@ jobs:
       - typos
       - quick-checks
       - test-and-lint
+      - offline-enrollment-root-boundary
       - test-ilm-integration-serial
       - test-and-lint-rio-v2
       - connect-short-credential-boundary
@@ -1221,6 +1251,7 @@ jobs:
       - typos
       - quick-checks
       - test-and-lint
+      - offline-enrollment-root-boundary
       - test-ilm-integration-serial
       - test-and-lint-rio-v2
       - test-and-lint-protocols

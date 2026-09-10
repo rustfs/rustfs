@@ -55,8 +55,34 @@ their issue closes.
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
+| `check_test_wiring.py` | dev-tool | Validates test wiring and assembles one or more measured Scanner/Heal release descriptors into a single release evidence bundle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --self-test` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
+| `run_scanner_heal_authority_evidence.py` | dev-tool | Assembles measured Scanner/Heal G01 root/quota authority release descriptors from operator-collected authority artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_authority_evidence.sh` |
+| `run_scanner_heal_checkpoint_crash_evidence.py` | dev-tool | Assembles measured Scanner/Heal G02/R-E checkpoint and restart release descriptors from scanner restart diagnostic reports | `diagnose_scanner_enumeration_restart.py`; `test_scanner_heal_checkpoint_crash_evidence.sh` |
+| `run_scanner_heal_g14_multiset_evidence.py` | dev-tool | Assembles measured Scanner/Heal G14 same-window EC8+4 multi-set/multi-pool release descriptors from e2e case directories or an operator-collected proof | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_g14_multiset_evidence.sh` |
+| `run_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Runs the G09 mixed-version and rollback upgrade E2E lanes against a pinned previous release and verifies the raw evidence artifacts | `docs/testing/ci-gates.md`; `.github/workflows/e2e-upgrade.yml`; `test_scanner_heal_g09_upgrade_evidence.sh` |
+| `run_scanner_heal_linux_evidence_plan.py` | dev-tool | Writes the unified Scanner/Heal Linux release-evidence execution manifest and can run lightweight preflight checks without producing measured evidence | `docs/testing/ci-gates.md`; `test_scanner_heal_linux_evidence_plan.sh` |
+| `run_scanner_heal_scoped_ack_evidence.py` | dev-tool | Assembles measured Scanner/Heal G03 scoped ACK publication and mixed-peer fallback release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_scoped_ack_evidence.sh` |
+| `run_scanner_heal_legacy_rollback_evidence.py` | dev-tool | Assembles measured Scanner/Heal R-L legacy source-conflict, migration-gap, and source-retirement release descriptors | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_legacy_rollback_evidence.sh` |
+| `run_scanner_heal_mrf_evidence.py` | dev-tool | Assembles measured Scanner/Heal G07/G08/P4 MRF release descriptors from W13 raw artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_w13_mrf_evidence.sh` |
+| `run_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Assembles measured Scanner/Heal G10/P1/P3 scheduler-pressure release descriptors from a completed measured ABBA run, recovery-window proof, and profile artifacts | `docs/operations/scanner-benchmark-runbook.md`; `test_scanner_heal_scheduler_pressure_evidence.sh` |
+| `run_scanner_heal_status_outcome_probe.py` | dev-tool | Normalizes live Scanner/Heal status/outcome observations into the measured G05/G06/R-D raw artifacts consumed by the descriptor producer | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_status_outcome_evidence.sh` |
+| `run_scanner_heal_status_outcome_evidence.py` | dev-tool | Assembles measured Scanner/Heal G05/G06/R-D status-and-outcome release descriptors from same-run status, compatibility, and disposition artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_status_outcome_evidence.sh` |
+| `run_scanner_heal_maintenance_evidence.py` | dev-tool | Assembles measured Scanner/Heal G11/G13 maintenance-producer release descriptors from operator-collected proof JSON | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_maintenance_evidence.sh` |
+| `run_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Runs the W13 durable MRF replay lanes and writes G07/G08/P4 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w13_mrf_evidence.sh` |
+| `run_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Runs the W16 recovery-intent and quota authority lanes and writes G04/G12 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w16_recovery_evidence.sh` |
 | `test_scanner_validation_harness.sh` | dev-tool | Self-test for the scanner validation harness | — |
+| `test_scanner_heal_checkpoint_crash_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal checkpoint/crash evidence assembler | — |
+| `test_scanner_heal_authority_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G01 authority evidence assembler | — |
+| `test_scanner_heal_scoped_ack_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G03 scoped ACK evidence assembler | — |
+| `test_scanner_heal_legacy_rollback_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal R-L legacy rollback evidence assembler | — |
+| `test_scanner_heal_g14_multiset_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G14 multi-set/multi-pool evidence assembler | — |
+| `test_scanner_heal_scheduler_pressure_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal scheduler-pressure evidence assembler | — |
+| `test_scanner_heal_status_outcome_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal status-and-outcome evidence assembler | — |
+| `test_scanner_heal_maintenance_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G11/G13 maintenance evidence assembler | — |
+| `test_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G09 upgrade evidence runner | — |
+| `test_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W16 recovery evidence runner | — |
+| `test_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W13 MRF evidence runner | — |
 | `scanner_abba.py` | dev-tool | Scanner/heal ABBA orchestration and evidence gates via `run_scanner_validation_harness.sh --abba` | `docs/operations/scanner-benchmark-runbook.md` |
 | `test_scanner_abba.py` | dev-tool | Synthetic ABBA adapter and failure-path tests | `test_scanner_validation_harness.sh` |
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |

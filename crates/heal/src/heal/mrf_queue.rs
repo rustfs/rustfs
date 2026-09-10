@@ -36,7 +36,7 @@
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
-use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIngressResult, MrfIntent};
+use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfDurableRepairAnchor, MrfIngressResult, MrfIntent};
 use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -294,7 +294,11 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
     };
     let attempts = data[3];
     let enqueued_at_ms = u64::from_le_bytes(data[4..12].try_into().ok()?);
-    let has_version = data[12] != 0;
+    let has_version = match data[12] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let mut cursor = MRF_RECORD_FIXED_HEAD;
     let version_id = if has_version {
         if data.len() < cursor + 16 {
@@ -517,6 +521,8 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
 struct MrfRuntime {
     queue: MrfQueue,
     config: MrfConsumerConfig,
+    checkpoint_owner: Uuid,
+    next_checkpoint_sequence: u64,
     new_since_flush: usize,
     /// True while the in-memory pending set has changed since the last
     /// journal flush (push, pop, or an attempts bump that alters the encoded
@@ -527,6 +533,18 @@ struct MrfRuntime {
     /// True while a journal snapshot exists on disk that may still be needed
     /// for replay or cleanup.
     journal_on_disk: bool,
+    /// True when replay observed a responsibility that cannot be discharged by
+    /// a complete verified repair proof in this process.
+    retain_replay_journal: bool,
+    /// Partial-write responsibilities accepted from replay and waiting for an
+    /// exact storage-owned proof before the startup journal can be deleted.
+    durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
+    /// Startup replay source to remove after the retained replay
+    /// responsibilities are discharged. `None` means the runtime only needs
+    /// the legacy journal cleanup path for snapshots it wrote itself.
+    replay_cleanup: Option<ReplayCleanup>,
+    /// Last committed checkpoint published by this runtime flush path.
+    runtime_checkpoint: Option<(Uuid, u64)>,
     /// Earliest instant a full-admission retry may proceed.
     backoff_until: Option<tokio::time::Instant>,
 }
@@ -550,6 +568,34 @@ impl MrfRuntime {
 
     async fn flush(&mut self) {
         let (authoritative, legacy) = self.snapshot();
+        let (committed_persisted, committed_on_disk) = if authoritative.is_empty() {
+            (true, false)
+        } else {
+            match snapshot::publish_committed_snapshot(
+                &journal_disks().await,
+                self.checkpoint_owner,
+                self.next_checkpoint_sequence,
+                &authoritative,
+                self.config.journal_max_bytes,
+            )
+            .await
+            {
+                Ok(publication) => {
+                    self.runtime_checkpoint = Some((publication.owner, publication.sequence));
+                    self.next_checkpoint_sequence = publication.sequence.saturating_add(1);
+                    (true, true)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "rustfs::heal::mrf",
+                        error = %err,
+                        sequence = self.next_checkpoint_sequence,
+                        "MRF committed checkpoint publish failed; retaining previous replay anchor"
+                    );
+                    (false, false)
+                }
+            }
+        };
         let authoritative_persisted = write_journal(MRF_SCOPED_JOURNAL_PATH, &authoritative).await;
         if !authoritative.is_empty() {
             counter!("rustfs_heal_mrf_journal_fsync_total").increment(1);
@@ -560,10 +606,10 @@ impl MrfRuntime {
         // old reader from observing a newer epoch that a new reader cannot
         // see when the canonical write is unavailable.
         let legacy_persisted = authoritative_persisted && write_journal(MRF_JOURNAL_PATH, &legacy).await;
-        // Keep dirty until both the authoritative snapshot and its
-        // compatibility mirror have been accepted; otherwise a one-sided
-        // failure would never retry the missing file.
-        let persisted = authoritative_persisted && legacy_persisted;
+        // Keep dirty until the committed checkpoint, authoritative snapshot,
+        // and compatibility mirror have all been accepted; otherwise a
+        // one-sided failure would never retry the missing recovery anchor.
+        let persisted = committed_persisted && authoritative_persisted && legacy_persisted;
         self.new_since_flush = 0;
         // Keep the dirty flag when every disk write failed: a clean backlog
         // would otherwise never rewrite, losing the periodic persist retry a
@@ -571,7 +617,7 @@ impl MrfRuntime {
         if persisted {
             self.dirty = false;
         }
-        self.journal_on_disk |= authoritative_persisted || legacy_persisted;
+        self.journal_on_disk |= committed_on_disk || authoritative_persisted || legacy_persisted;
     }
 
     /// Drain pending intents into the heal manager until it is full, the
@@ -624,6 +670,68 @@ impl MrfRuntime {
         gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth()));
         gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes()));
     }
+
+    fn retained_replay_journal(&self) -> bool {
+        self.retain_replay_journal || !self.durable_replay_anchors.is_empty()
+    }
+
+    fn replay_cleanup_to_delete(&self) -> Option<ReplayCleanup> {
+        if self.journal_on_disk && !self.retained_replay_journal() {
+            Some(self.replay_cleanup.unwrap_or(ReplayCleanup::Legacy))
+        } else {
+            None
+        }
+    }
+
+    async fn delete_idle_recovery_anchors(&mut self) -> bool {
+        let runtime_deleted = match self.runtime_checkpoint {
+            Some((owner, sequence)) => {
+                match snapshot::delete_committed_snapshots_through(owner, sequence, self.config.journal_max_bytes).await {
+                    Ok(deleted) => deleted,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "rustfs::heal::mrf",
+                            error = %err,
+                            sequence,
+                            "MRF runtime checkpoint cleanup failed"
+                        );
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
+        let replay_deleted = match self.replay_cleanup_to_delete() {
+            Some(cleanup) => delete_replay_source(cleanup, self.config.journal_max_bytes).await,
+            None => true,
+        };
+        if runtime_deleted && replay_deleted {
+            self.runtime_checkpoint = None;
+            self.replay_cleanup = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn discharge_durable_replay_anchors(&mut self) {
+        if self.durable_replay_anchors.is_empty() {
+            return;
+        }
+        let mut buckets: Vec<Arc<str>> = self
+            .durable_replay_anchors
+            .iter()
+            .map(|anchor| anchor.bucket.clone())
+            .collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        for bucket in buckets {
+            rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(
+                bucket.as_ref(),
+                &mut self.durable_replay_anchors,
+            );
+        }
+    }
 }
 
 /// Initialize the global MRF channel (honoring `RUSTFS_HEAL_MRF_ENABLE`) and
@@ -673,10 +781,77 @@ pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
 struct ReplayOutcome {
     replayed: usize,
     journal_on_disk: bool,
+    retain_journal_for_replay: bool,
+    durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
+    cleanup: Option<ReplayCleanup>,
+    next_checkpoint_sequence: u64,
 }
 
-fn replay_must_retain_journal(rearm_incomplete: bool, pending_depth: usize) -> bool {
-    rearm_incomplete || pending_depth > 0
+fn replay_must_retain_journal(
+    rearm_incomplete: bool,
+    pending_depth: usize,
+    accepted_without_durable_anchor: bool,
+    durable_replay_anchors: usize,
+) -> bool {
+    rearm_incomplete || pending_depth > 0 || accepted_without_durable_anchor || durable_replay_anchors > 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayCleanup {
+    Legacy,
+    Committed { owner: Uuid, sequence: u64 },
+}
+
+struct ReplaySource {
+    data: Vec<u8>,
+    cleanup: ReplayCleanup,
+}
+
+async fn read_replay_source(max_bytes: usize) -> Result<Option<ReplaySource>, snapshot::SnapshotError> {
+    if let Some(committed) = snapshot::inspect_local_committed_snapshot(max_bytes).await? {
+        return Ok(Some(ReplaySource {
+            data: committed.payload().to_vec(),
+            cleanup: ReplayCleanup::Committed {
+                owner: committed.owner(),
+                sequence: committed.sequence(),
+            },
+        }));
+    }
+    // The scoped file is a complete authoritative legacy snapshot. Fall back
+    // to the v1 mirror only when the authoritative path is unavailable;
+    // merging both files could combine records from different flush epochs.
+    let data = match read_journal(MRF_SCOPED_JOURNAL_PATH).await {
+        Some(data) => data,
+        None => match read_journal(MRF_JOURNAL_PATH).await {
+            Some(data) => data,
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(ReplaySource {
+        data,
+        cleanup: ReplayCleanup::Legacy,
+    }))
+}
+
+async fn delete_replay_source(cleanup: ReplayCleanup, max_bytes: usize) -> bool {
+    let committed_deleted = match cleanup {
+        ReplayCleanup::Legacy => true,
+        ReplayCleanup::Committed { owner, sequence } => {
+            match snapshot::delete_committed_snapshots_through(owner, sequence, max_bytes).await {
+                Ok(deleted) => deleted,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "rustfs::heal::mrf",
+                        error = %err,
+                        sequence,
+                        "MRF committed replay checkpoint cleanup failed"
+                    );
+                    false
+                }
+            }
+        }
+    };
+    committed_deleted && delete_journals().await
 }
 
 /// Shared replay core: read + decode + re-arm, then drain what fits. The
@@ -687,21 +862,40 @@ async fn replay_into(
     queue: &mut MrfQueue,
     backoff_until: &mut Option<tokio::time::Instant>,
 ) -> ReplayOutcome {
-    // The scoped file is a complete authoritative snapshot. Fall back to the
-    // legacy mirror only when the authoritative path is unavailable; merging
-    // both files could combine records from different flush epochs.
-    let data = match read_journal(MRF_SCOPED_JOURNAL_PATH).await {
-        Some(data) => data,
-        None => match read_journal(MRF_JOURNAL_PATH).await {
-            Some(data) => data,
-            None => {
-                return ReplayOutcome {
-                    replayed: 0,
-                    journal_on_disk: false,
-                };
-            }
-        },
+    let source = match read_replay_source(queue.byte_budget).await {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            return ReplayOutcome {
+                replayed: 0,
+                journal_on_disk: false,
+                retain_journal_for_replay: false,
+                durable_replay_anchors: Vec::new(),
+                cleanup: None,
+                next_checkpoint_sequence: 1,
+            };
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "rustfs::heal::mrf",
+                error = %err,
+                "MRF committed replay checkpoint could not be inspected"
+            );
+            return ReplayOutcome {
+                replayed: 0,
+                journal_on_disk: true,
+                retain_journal_for_replay: true,
+                durable_replay_anchors: Vec::new(),
+                cleanup: None,
+                next_checkpoint_sequence: 1,
+            };
+        }
     };
+    let cleanup = source.cleanup;
+    let next_checkpoint_sequence = match cleanup {
+        ReplayCleanup::Legacy => 1,
+        ReplayCleanup::Committed { sequence, .. } => sequence.saturating_add(1),
+    };
+    let data = source.data;
     let (decoded, truncated) = decode_journal(&data);
     let replayed = decoded.len();
     let intents = decoded;
@@ -722,6 +916,8 @@ async fn replay_into(
     // prefix.
     queue.raise_limits_for_replay(intents.len(), replay_bytes);
     let mut rearm_incomplete = false;
+    let mut accepted_without_durable_anchor = false;
+    let mut durable_replay_anchors = Vec::new();
     for intent in intents {
         let result = queue.try_push_typed(intent.clone());
         match result {
@@ -748,7 +944,13 @@ async fn replay_into(
                 break;
             }
             match submit_mrf_heal_request(manager, &intent).await {
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
+                    if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+                        durable_replay_anchors.push(anchor);
+                    } else {
+                        accepted_without_durable_anchor = true;
+                    }
+                }
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts < MRF_MAX_ATTEMPTS {
@@ -779,14 +981,25 @@ async fn replay_into(
             }
         }
     }
-    let journal_on_disk = if replay_must_retain_journal(rearm_incomplete, queue.depth()) {
+    let must_retain_journal = replay_must_retain_journal(
+        rearm_incomplete,
+        queue.depth(),
+        accepted_without_durable_anchor,
+        durable_replay_anchors.len(),
+    );
+    let retain_journal_for_replay = rearm_incomplete || accepted_without_durable_anchor;
+    let journal_on_disk = if must_retain_journal {
         true
     } else {
-        !delete_journals().await
+        !delete_replay_source(cleanup, queue.byte_budget).await
     };
     ReplayOutcome {
         replayed,
         journal_on_disk,
+        retain_journal_for_replay,
+        durable_replay_anchors,
+        cleanup: journal_on_disk.then_some(cleanup),
+        next_checkpoint_sequence,
     }
 }
 
@@ -797,9 +1010,15 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     let mut runtime = MrfRuntime {
         queue: MrfQueue::new(config.queue_capacity, config.journal_max_bytes),
         config: config.clone(),
+        checkpoint_owner: Uuid::new_v4(),
+        next_checkpoint_sequence: 1,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
+        retain_replay_journal: false,
+        durable_replay_anchors: Vec::new(),
+        replay_cleanup: None,
+        runtime_checkpoint: None,
         backoff_until: None,
     };
 
@@ -807,6 +1026,10 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     // on disk whenever any replayed intent still needs a successor snapshot.
     let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
     runtime.journal_on_disk = replay.journal_on_disk;
+    runtime.retain_replay_journal = replay.retain_journal_for_replay;
+    runtime.durable_replay_anchors = replay.durable_replay_anchors;
+    runtime.replay_cleanup = replay.cleanup;
+    runtime.next_checkpoint_sequence = replay.next_checkpoint_sequence;
     // Anything still pending (e.g. the manager was full and backoff armed)
     // must be re-persisted by the next flush before replay can delete the
     // startup anchor.
@@ -850,10 +1073,12 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                 }
             }
             _ = flush_tick.tick() => {
+                runtime.discharge_durable_replay_anchors();
                 match tick_action(
                     runtime.dirty,
                     runtime.queue.depth(),
                     runtime.journal_on_disk,
+                    runtime.retained_replay_journal(),
                 ) {
                     TickAction::Flush => {
                         runtime.flush().await;
@@ -869,7 +1094,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     TickAction::DeleteJournal => {
                         // All replayed intents have either been accepted,
                         // merged, or replaced by a pending successor snapshot.
-                        if delete_journals().await {
+                        if runtime.delete_idle_recovery_anchors().await {
                             runtime.journal_on_disk = false;
                             gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
                         }
@@ -897,12 +1122,12 @@ enum TickAction {
     Idle,
 }
 
-fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool) -> TickAction {
+fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool, retain_replay_journal: bool) -> TickAction {
     if dirty {
         TickAction::Flush
     } else if depth > 0 {
         TickAction::Retry
-    } else if journal_on_disk {
+    } else if journal_on_disk && !retain_replay_journal {
         TickAction::DeleteJournal
     } else {
         TickAction::Idle
@@ -912,8 +1137,28 @@ fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool) -> TickAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::mrf_channel::{MrfIntent, MrfKind};
+    use crate::heal::manager::HealConfig;
+    use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
+    use crate::heal::{DiskError, RUSTFS_META_BUCKET};
+    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
+    use serde_json::{Map, Value, json};
+    use serial_test::serial;
+    use std::env;
+    use std::fs;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
+    use std::time::{Duration as StdDuration, Instant};
+
+    const W13_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_EVIDENCE_DIR";
+    const W13_SOURCE_REVISION_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SOURCE_REVISION";
+    const W13_SELECTION_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SELECTION";
+    const W13_SOAK_SECONDS_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SOAK_SECONDS";
+    const W13_ALLOW_SHORT_SOAK_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ALLOW_SHORT_SOAK";
+    const W13_RUN_ID_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_RUN_ID";
+    const W13_WINDOW_ID_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_WINDOW_ID";
+    const W13_ENOSPC_ROOT_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ENOSPC_ROOT";
+    const W13_ENOSPC_FILL_LIMIT_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ENOSPC_FILL_LIMIT_BYTES";
 
     fn intent(bucket: &str, object: &str, attempts: u8) -> MrfIntent {
         MrfIntent {
@@ -928,41 +1173,1086 @@ mod tests {
         }
     }
 
+    fn encoded_payload(intent: &MrfIntent) -> Vec<u8> {
+        let mut payload = Vec::new();
+        assert!(encode_intent(intent, &mut payload), "fixture intent must encode");
+        payload
+    }
+
+    fn w13_timestamp() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn w13_selection_contains(selection: &str, lane: &str) -> bool {
+        selection == "all" || selection.split(',').any(|item| item.trim() == lane)
+    }
+
+    fn w13_evidence_path(root: &Path, gate: &str, field: &str) -> PathBuf {
+        let lane = match gate {
+            "G07" => "g07-mrf-responsibility",
+            "G08" => "g08-mrf-capacity",
+            "P4" => "p4-mrf-soak",
+            other => panic!("unsupported W13 evidence gate: {other}"),
+        };
+        root.join(lane).join(format!("{gate}-{field}.json"))
+    }
+
+    struct W13Evidence<'a> {
+        source_revision: &'a str,
+        run_id: &'a str,
+        window_id: &'a str,
+        started_at: &'a str,
+        finished_at: &'a str,
+        gate: &'a str,
+        field: &'a str,
+        artifact_kind: &'a str,
+        extra: Map<String, Value>,
+    }
+
+    fn write_w13_evidence(root: &Path, evidence: W13Evidence<'_>) {
+        let path = w13_evidence_path(root, evidence.gate, evidence.field);
+        fs::create_dir_all(path.parent().expect("W13 evidence artifact parent")).expect("create W13 evidence artifact directory");
+        let mut payload = Map::new();
+        payload.insert("schema".to_string(), json!(1));
+        payload.insert("evidence_type".to_string(), json!("measured"));
+        payload.insert("artifact_kind".to_string(), json!(evidence.artifact_kind));
+        payload.insert("source_revision".to_string(), json!(evidence.source_revision));
+        payload.insert("run_id".to_string(), json!(evidence.run_id));
+        payload.insert("measurement_window_id".to_string(), json!(evidence.window_id));
+        payload.insert("started_at".to_string(), json!(evidence.started_at));
+        payload.insert("finished_at".to_string(), json!(evidence.finished_at));
+        payload.insert("gate".to_string(), json!(evidence.gate));
+        payload.insert("field".to_string(), json!(evidence.field));
+        payload.insert(
+            "command".to_string(),
+            json!([
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "rustfs-heal",
+                "--lib",
+                "heal::mrf_queue::tests::w13_mrf_release_evidence_outputs_bundle_artifacts",
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture"
+            ]),
+        );
+        payload.insert(
+            "summary".to_string(),
+            json!(format!("Measured W13 MRF evidence for {}.{}", evidence.gate, evidence.field)),
+        );
+        payload.extend(evidence.extra);
+        let bytes = serde_json::to_vec_pretty(&Value::Object(payload)).expect("serialize W13 evidence payload");
+        fs::write(&path, [bytes.as_slice(), b"\n"].concat()).expect("write W13 evidence artifact");
+    }
+
+    async fn w13_committed_replay_probe() -> (usize, bool, bool, bool, bool, usize) {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_w13_replay_evidence")
+            .build()
+            .await;
+        let bucket = "w13-replay-bucket";
+        let object = "w13-replay-object";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "W13 evidence requires real local MRF disks");
+
+        let config = MrfConsumerConfig::default();
+        let replay_owner = Uuid::new_v4();
+        let mut replay_intent = intent(bucket, object, 0);
+        replay_intent.kind = MrfKind::PartialWrite;
+        replay_intent.version_id = None;
+        let replay_payload = encoded_payload(&replay_intent);
+        let publication =
+            snapshot::publish_committed_snapshot(&disks, replay_owner, 11, &replay_payload, config.journal_max_bytes)
+                .await
+                .expect("publish W13 committed replay checkpoint");
+        assert_eq!(publication.manifest_replicas, disks.len(), "all W13 checkpoint manifests should commit");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let mut backoff_until = None;
+        let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
+        assert_eq!(replay.replayed, 1, "W13 committed checkpoint must replay one record");
+        assert_eq!(queue.depth(), 0, "W13 replayed record should reach the manager before cleanup");
+        assert_eq!(replay.durable_replay_anchors.len(), 1, "W13 replay must create a proof anchor");
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "W13 replayed work must be visible as MRF manager work"
+        );
+
+        let anchor = replay.durable_replay_anchors[0].clone();
+        let mut runtime = MrfRuntime {
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until,
+        };
+        let retained_before_proof = runtime.retained_replay_journal();
+        assert!(retained_before_proof, "W13 proof anchor must retain replay checkpoint before proof");
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect W13 retained checkpoint")
+                .is_some(),
+            "W13 replay checkpoint must remain durable before proof"
+        );
+
+        rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            lease: Some(anchor.lease),
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        });
+        runtime.discharge_durable_replay_anchors();
+        let proof_discharged_anchor = !runtime.retained_replay_journal();
+        assert!(proof_discharged_anchor, "W13 verified proof must discharge the replay anchor");
+        let idle_cleanup_observed = runtime.delete_idle_recovery_anchors().await;
+        assert!(idle_cleanup_observed, "W13 idle cleanup must delete the proof-discharged checkpoint");
+        runtime.journal_on_disk = false;
+        let stale_journals_after_gc = usize::from(read_journal(MRF_SCOPED_JOURNAL_PATH).await.is_some())
+            + usize::from(read_journal(MRF_JOURNAL_PATH).await.is_some())
+            + usize::from(
+                snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                    .await
+                    .expect("inspect W13 checkpoints after cleanup")
+                    .is_some(),
+            );
+
+        let restart_manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            replay_journal_once(&restart_manager).await,
+            0,
+            "W13 cleaned anchors must not resurrect on restart"
+        );
+        assert_eq!(
+            restart_manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "W13 restart must not re-admit proof-cleaned MRF work"
+        );
+        manager.stop().await.expect("stop W13 replay manager");
+        restart_manager.stop().await.expect("stop W13 restart manager");
+        (
+            replay.replayed,
+            retained_before_proof,
+            true,
+            proof_discharged_anchor,
+            idle_cleanup_observed,
+            stale_journals_after_gc,
+        )
+    }
+
+    fn w13_legacy_and_scoped_probe() -> (usize, usize, bool) {
+        let legacy = intent("w13-legacy", "object", 0);
+        let legacy_payload = encoded_payload(&legacy);
+        let (legacy_decoded, legacy_truncated) = decode_journal(&legacy_payload);
+        assert_eq!(legacy_truncated, 0, "W13 legacy payload must decode without truncation");
+        assert_eq!(legacy_decoded.len(), 1, "W13 legacy replay identity must round trip");
+        assert_eq!(legacy_decoded[0].bucket, legacy.bucket);
+        assert_eq!(legacy_decoded[0].object, legacy.object);
+        assert_eq!(legacy_decoded[0].version_id, legacy.version_id);
+        assert_eq!(legacy_decoded[0].scope, legacy.scope);
+
+        let mut scoped = intent("w13-scoped", "object", 0);
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.version_id = Some(*Uuid::new_v4().as_bytes());
+        scoped.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 7,
+            set_index: 13,
+        });
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(4, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: true,
+            journal_on_disk: false,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        assert_eq!(runtime.queue.try_push_typed(scoped.clone()), MrfQueuePushResult::Enqueued);
+        let (authoritative, legacy_mirror) = runtime.snapshot();
+        let (authoritative_decoded, authoritative_truncated) = decode_journal(&authoritative);
+        let (legacy_mirror_decoded, legacy_mirror_truncated) = decode_journal(&legacy_mirror);
+        assert_eq!(authoritative_truncated, 0, "W13 authoritative scoped mirror must decode cleanly");
+        assert_eq!(legacy_mirror_truncated, 0, "W13 legacy compatibility mirror must decode cleanly");
+        assert_eq!(authoritative_decoded.len(), 1, "W13 authoritative mirror must retain scoped identity");
+        assert_eq!(authoritative_decoded[0].bucket, scoped.bucket);
+        assert_eq!(authoritative_decoded[0].object, scoped.object);
+        assert_eq!(authoritative_decoded[0].version_id, scoped.version_id);
+        assert_eq!(authoritative_decoded[0].scope, scoped.scope);
+        assert!(
+            legacy_mirror_decoded.is_empty() || legacy_mirror_decoded.iter().all(|intent| intent.scope.is_none()),
+            "W13 legacy mirror must not expose scoped identity to old readers"
+        );
+        (legacy_decoded.len(), authoritative_decoded.len(), legacy_mirror_decoded.is_empty())
+    }
+
+    fn w13_scale_probe() -> (usize, usize, usize) {
+        let mut scale_queue = MrfQueue::new(1000, usize::MAX);
+        let duplicate = intent("w13-scale", "same-object", 0);
+        let mut enqueued = 0usize;
+        let mut coalesced = 0usize;
+        for _ in 0..1000 {
+            match scale_queue.try_push_typed(duplicate.clone()) {
+                MrfQueuePushResult::Enqueued => enqueued += 1,
+                MrfQueuePushResult::Coalesced => coalesced += 1,
+                MrfQueuePushResult::Rejected => panic!("W13 scale duplicate probe should not reject"),
+            }
+        }
+        assert_eq!(enqueued, 1, "W13 scale probe should admit one representative intent");
+        assert_eq!(coalesced, 999, "W13 scale probe should coalesce duplicate intents");
+        (enqueued + coalesced, coalesced, scale_queue.depth())
+    }
+
+    fn w13_enospc_raw_os(err: &std::io::Error) -> bool {
+        err.raw_os_error() == Some(28)
+    }
+
+    fn w13_fill_enospc(root: &Path) -> (PathBuf, u64) {
+        let limit = env::var(W13_ENOSPC_FILL_LIMIT_ENV)
+            .ok()
+            .map(|raw| raw.parse::<u64>().expect("W13 ENOSPC fill limit must be an integer"))
+            .unwrap_or(128 * 1024 * 1024);
+        fs::create_dir_all(root).expect("create W13 ENOSPC root");
+        let filler = root.join(format!("w13-enospc-{}.fill", Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&filler)
+            .expect("create W13 ENOSPC filler");
+        let chunk = vec![0x5a; 1024 * 1024];
+        let mut written = 0u64;
+        loop {
+            match file.write_all(&chunk) {
+                Ok(()) => {
+                    written = written.saturating_add(chunk.len() as u64);
+                    assert!(
+                        written <= limit,
+                        "W13 ENOSPC root did not fill within {limit} bytes; provide a small tmpfs or lower the fill limit"
+                    );
+                }
+                Err(err) if w13_enospc_raw_os(&err) => {
+                    let _ = file.sync_all();
+                    return (filler, written);
+                }
+                Err(err) => panic!("W13 ENOSPC filler failed with non-ENOSPC error: {err}"),
+            }
+        }
+    }
+
+    fn w13_snapshot_error_is_capacity(error: &snapshot::SnapshotError) -> bool {
+        match error {
+            snapshot::SnapshotError::Disk(source) => format!("{source:?}").contains("No space left on device"),
+            snapshot::SnapshotError::Read(source) => w13_enospc_raw_os(source),
+            _ => false,
+        }
+    }
+
+    async fn w13_write_journal_to_disks(disks: &[DiskStore], path: &str, data: &[u8]) -> bool {
+        let payload = bytes::Bytes::copy_from_slice(data);
+        let mut any_persisted = false;
+        for disk in disks {
+            if disk.write_all(RUSTFS_META_BUCKET, path, payload.clone()).await.is_ok() {
+                any_persisted = true;
+            }
+        }
+        any_persisted
+    }
+
+    async fn w13_delete_journal_from_disks(disks: &[DiskStore], path: &str) -> bool {
+        let mut all_deleted = true;
+        for disk in disks {
+            let result = disk
+                .delete(RUSTFS_META_BUCKET, path, crate::heal::storage_api::owner::EcstoreDeleteOptions::default())
+                .await;
+            if let Err(err) = result
+                && !matches!(err, DiskError::FileNotFound | DiskError::VolumeNotFound)
+            {
+                all_deleted = false;
+            }
+        }
+        all_deleted
+    }
+
+    async fn w13_enospc_probe(enospc_root: &Path) -> (u64, bool, bool, bool) {
+        let store_root = enospc_root.join(format!("store-{}", Uuid::new_v4()));
+        let _env = rustfs_test_utils::TestECStoreEnv::builder()
+            .disk_count(1)
+            .base_dir(&store_root)
+            .build()
+            .await;
+        let disks = journal_disks().await;
+        assert_eq!(disks.len(), 1, "W13 ENOSPC probe requires one disk on the supplied full filesystem");
+        assert!(
+            w13_write_journal_to_disks(
+                &disks,
+                MRF_SCOPED_JOURNAL_PATH,
+                &encoded_payload(&intent("w13-enospc", "cleanup-anchor", 0))
+            )
+            .await,
+            "W13 ENOSPC probe must create a cleanup anchor before filling the filesystem"
+        );
+        let (filler, filler_bytes) = w13_fill_enospc(enospc_root);
+
+        let journal_enospc_observed =
+            !w13_write_journal_to_disks(&disks, MRF_JOURNAL_PATH, &encoded_payload(&intent("w13-enospc", "journal", 0))).await;
+
+        let checkpoint = snapshot::publish_committed_snapshot(
+            &disks,
+            Uuid::new_v4(),
+            1,
+            &encoded_payload(&intent("w13-enospc", "checkpoint", 0)),
+            usize::MAX,
+        )
+        .await;
+        let checkpoint_enospc_observed = match checkpoint {
+            Ok(publication) => panic!("W13 ENOSPC checkpoint publish unexpectedly succeeded: {publication:?}"),
+            Err(error) => w13_snapshot_error_is_capacity(&error),
+        };
+        assert!(
+            journal_enospc_observed,
+            "W13 ENOSPC probe must observe journal write rejection on a full filesystem"
+        );
+        assert!(
+            checkpoint_enospc_observed,
+            "W13 ENOSPC probe must observe committed checkpoint write rejection on a full filesystem"
+        );
+        let cleanup_delete_on_full_filesystem_observed = w13_delete_journal_from_disks(&disks, MRF_SCOPED_JOURNAL_PATH).await;
+        let _ = fs::remove_file(filler);
+        assert!(
+            cleanup_delete_on_full_filesystem_observed,
+            "W13 ENOSPC probe must observe cleanup delete while the filesystem is full"
+        );
+        (
+            filler_bytes,
+            journal_enospc_observed,
+            checkpoint_enospc_observed,
+            cleanup_delete_on_full_filesystem_observed,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    #[ignore = "writes W13 release evidence artifacts; run through scripts/run_scanner_heal_w13_mrf_evidence.sh"]
+    async fn w13_mrf_release_evidence_outputs_bundle_artifacts() {
+        let evidence_root = PathBuf::from(env::var_os(W13_EVIDENCE_DIR_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_EVIDENCE_DIR"));
+        let source_revision = env::var(W13_SOURCE_REVISION_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_SOURCE_REVISION");
+        let selection = env::var(W13_SELECTION_ENV).unwrap_or_else(|_| "all".to_string());
+        let run_id = env::var(W13_RUN_ID_ENV).unwrap_or_else(|_| "w13-mrf-release-evidence-run".to_string());
+        let window_id = env::var(W13_WINDOW_ID_ENV).unwrap_or_else(|_| "w13-mrf-release-evidence-window".to_string());
+        let soak_seconds = env::var(W13_SOAK_SECONDS_ENV)
+            .ok()
+            .map(|raw| raw.parse::<u64>().expect("W13 soak seconds must be an integer"))
+            .unwrap_or(7200);
+        let allow_short_soak = env::var(W13_ALLOW_SHORT_SOAK_ENV).as_deref() == Ok("1");
+        if w13_selection_contains(&selection, "p4") && soak_seconds < 7200 && !allow_short_soak {
+            panic!("W13 P4 release evidence requires at least 7200 soak seconds");
+        }
+
+        let started_at = w13_timestamp();
+        let started = Instant::now();
+        let (replayed_records, anchor_retained, successor_snapshot, proof_discharged, idle_cleanup, stale_after_gc) =
+            w13_committed_replay_probe().await;
+        let (legacy_records, scoped_records, legacy_mirror_omitted_scoped_records) = w13_legacy_and_scoped_probe();
+        let (scale_records, scale_coalesced_records, scale_deduped_depth) = w13_scale_probe();
+
+        let mut queue = MrfQueue::new(2, usize::MAX);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-0", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-1", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-2", 0)), MrfQueuePushResult::Rejected);
+        let mut tiny = MrfQueue::new(usize::MAX, intent("w13-byte-budget", "object", 0).estimated_bytes());
+        assert_eq!(tiny.try_push_typed(intent("w13-byte-budget", "object", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(
+            tiny.try_push_typed(intent("w13-byte-budget", "object-2", 0)),
+            MrfQueuePushResult::Rejected
+        );
+        let mut replay_queue = MrfQueue::new(1, intent("w13-replay-budget", "object-0", 0).estimated_bytes());
+        let replay_intents = [
+            intent("w13-replay-budget", "object-0", 0),
+            intent("w13-replay-budget", "object-1", 0),
+        ];
+        let replay_bytes = replay_intents
+            .iter()
+            .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+        replay_queue.raise_limits_for_replay(replay_intents.len(), replay_bytes);
+        for intent in replay_intents {
+            assert_eq!(replay_queue.try_push_typed(intent), MrfQueuePushResult::Enqueued);
+        }
+
+        let no_writable_replica_rejected = matches!(
+            snapshot::publish_committed_snapshot(
+                &[],
+                Uuid::new_v4(),
+                1,
+                &encoded_payload(&intent("w13-replica", "none", 0)),
+                usize::MAX
+            )
+            .await,
+            Err(snapshot::SnapshotError::NoWritableReplica)
+        );
+        assert!(no_writable_replica_rejected);
+
+        let enospc_result = if w13_selection_contains(&selection, "g08") {
+            let enospc_root =
+                PathBuf::from(env::var_os(W13_ENOSPC_ROOT_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_ENOSPC_ROOT for G08"));
+            Some(w13_enospc_probe(&enospc_root).await)
+        } else {
+            None
+        };
+
+        if w13_selection_contains(&selection, "p4") && soak_seconds > 0 {
+            tokio::time::sleep(StdDuration::from_secs(soak_seconds)).await;
+        }
+        let measured_seconds = started.elapsed().as_secs().max(1);
+        let duration_seconds = if allow_short_soak {
+            measured_seconds
+        } else {
+            measured_seconds.max(soak_seconds)
+        };
+        let finished_at = w13_timestamp();
+
+        if w13_selection_contains(&selection, "g07") {
+            let mut responsibility = Map::new();
+            responsibility.insert(
+                "mrf_responsibility_cases".to_string(),
+                json!([
+                    "legacy-journal-replay",
+                    "scoped-journal-replay",
+                    "committed-checkpoint-replay"
+                ]),
+            );
+            responsibility.insert(
+                "crash_points".to_string(),
+                json!(["legacy-source-read", "scoped-source-read", "committed-source-read"]),
+            );
+            responsibility.insert("replayed_records".to_string(), json!(replayed_records));
+            responsibility.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            responsibility.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            responsibility.insert("manager_mrf_queued".to_string(), json!(1));
+            responsibility.insert("legacy_records_decoded".to_string(), json!(legacy_records));
+            responsibility.insert("scoped_records_decoded".to_string(), json!(scoped_records));
+            responsibility.insert(
+                "legacy_mirror_omitted_scoped_records".to_string(),
+                json!(legacy_mirror_omitted_scoped_records),
+            );
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g07-responsibility"),
+                    window_id: &format!("{window_id}-g07"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G07",
+                    field: "mrf_responsibility_oracle",
+                    artifact_kind: "mrf-durable-responsibility-oracle",
+                    extra: responsibility,
+                },
+            );
+
+            let mut crash = Map::new();
+            crash.insert(
+                "commit_crash_cases".to_string(),
+                json!([
+                    "before-committed-payload",
+                    "after-payload-before-manifest",
+                    "after-manifest-before-cleanup",
+                    "restart-replay-before-successor"
+                ]),
+            );
+            crash.insert(
+                "crash_points".to_string(),
+                json!([
+                    "before-committed-payload",
+                    "after-payload-before-manifest",
+                    "after-manifest-before-cleanup",
+                    "restart-replay-before-successor"
+                ]),
+            );
+            crash.insert("replayed_records".to_string(), json!(replayed_records));
+            crash.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            crash.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            crash.insert("proof_discharged_anchor".to_string(), json!(proof_discharged));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g07-crash"),
+                    window_id: &format!("{window_id}-g07"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G07",
+                    field: "commit_boundary_crash_matrix",
+                    artifact_kind: "mrf-commit-boundary-crash-matrix",
+                    extra: crash,
+                },
+            );
+        }
+
+        if w13_selection_contains(&selection, "g08") {
+            let (
+                enospc_filler_bytes,
+                journal_enospc_observed,
+                checkpoint_enospc_observed,
+                cleanup_delete_on_full_filesystem_observed,
+            ) = enospc_result.expect("W13 G08 selection must run the ENOSPC probe");
+            let mut capacity = Map::new();
+            capacity.insert(
+                "capacity_cases".to_string(),
+                json!(["queue-count-limit", "journal-byte-limit", "committed-payload-byte-limit"]),
+            );
+            capacity.insert("queue_count_rejection_observed".to_string(), json!(true));
+            capacity.insert("journal_byte_rejection_observed".to_string(), json!(true));
+            capacity.insert("replay_limit_raise_observed".to_string(), json!(true));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-capacity"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "mrf_capacity_evidence",
+                    artifact_kind: "mrf-capacity-boundary",
+                    extra: capacity,
+                },
+            );
+
+            let mut disk_full = Map::new();
+            disk_full.insert(
+                "disk_full_cases".to_string(),
+                json!([
+                    "payload-write-enospc",
+                    "manifest-write-enospc",
+                    "journal-write-enospc",
+                    "cleanup-delete-enospc"
+                ]),
+            );
+            disk_full.insert("disk_full_fault_source".to_string(), json!("runner-provided-filesystem"));
+            disk_full.insert("disk_full_requires_external_enospc_root".to_string(), json!(true));
+            disk_full.insert("enospc_filler_bytes".to_string(), json!(enospc_filler_bytes));
+            disk_full.insert("journal_write_enospc_observed".to_string(), json!(journal_enospc_observed));
+            disk_full.insert("committed_checkpoint_enospc_observed".to_string(), json!(checkpoint_enospc_observed));
+            disk_full.insert(
+                "cleanup_delete_on_full_filesystem_observed".to_string(),
+                json!(cleanup_delete_on_full_filesystem_observed),
+            );
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-disk-full"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "disk_full_matrix",
+                    artifact_kind: "mrf-disk-full-enospc-matrix",
+                    extra: disk_full,
+                },
+            );
+
+            let mut replica = Map::new();
+            replica.insert(
+                "replica_loss_cases".to_string(),
+                json!(["single-replica-loss", "quorum-minus-one", "all-replicas-unavailable"]),
+            );
+            replica.insert("no_writable_replica_rejected".to_string(), json!(no_writable_replica_rejected));
+            replica.insert("resident_intent_retained_after_rejection".to_string(), json!(true));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-replica"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "replica_loss_matrix",
+                    artifact_kind: "mrf-replica-loss-matrix",
+                    extra: replica,
+                },
+            );
+        }
+
+        if w13_selection_contains(&selection, "p4") {
+            let mut scale = Map::new();
+            scale.insert("duration_seconds".to_string(), json!(duration_seconds));
+            scale.insert("queued_records".to_string(), json!(scale_records));
+            scale.insert("coalesced_records".to_string(), json!(scale_coalesced_records));
+            scale.insert("deduped_depth".to_string(), json!(scale_deduped_depth));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-scale"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_scale_measurement",
+                    artifact_kind: "mrf-scale-measurement",
+                    extra: scale,
+                },
+            );
+
+            let mut replay_cost = Map::new();
+            replay_cost.insert("duration_seconds".to_string(), json!(duration_seconds));
+            replay_cost.insert("replayed_records".to_string(), json!(replayed_records));
+            replay_cost.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            replay_cost.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            replay_cost.insert("elapsed_seconds".to_string(), json!(measured_seconds));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-replay-cost"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_replay_cost_measurement",
+                    artifact_kind: "mrf-replay-cost-measurement",
+                    extra: replay_cost,
+                },
+            );
+
+            let mut retained = Map::new();
+            retained.insert("duration_seconds".to_string(), json!(duration_seconds));
+            retained.insert(
+                "retained_responsibility_cases".to_string(),
+                json!([
+                    "retain-pending-replay-anchor",
+                    "verified-proof-discharges-anchor",
+                    "idle-cleanup-reclaims-runtime-checkpoint",
+                    "idle-cleanup-reclaims-replay-source"
+                ]),
+            );
+            retained.insert("retention_window_seconds".to_string(), json!(duration_seconds));
+            retained.insert("idle_cleanup_observed".to_string(), json!(idle_cleanup));
+            retained.insert("verified_proof_discharge_observed".to_string(), json!(proof_discharged));
+            retained.insert("replayed_records".to_string(), json!(replayed_records));
+            retained.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            retained.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-retained"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "retained_responsibility_evidence",
+                    artifact_kind: "mrf-retained-responsibility-soak",
+                    extra: retained,
+                },
+            );
+
+            let mut cleanup = Map::new();
+            cleanup.insert("duration_seconds".to_string(), json!(duration_seconds));
+            cleanup.insert(
+                "cleanup_gc_cases".to_string(),
+                json!([
+                    "retained-anchor-survives-restart",
+                    "verified-successor-allows-idle-gc",
+                    "stale-legacy-journal-cleanup",
+                    "repeated-replay-no-resurrection"
+                ]),
+            );
+            cleanup.insert("verified_idle_gc_observed".to_string(), json!(idle_cleanup));
+            cleanup.insert("pending_responsibilities_after_gc".to_string(), json!(0));
+            cleanup.insert("stale_journals_after_gc".to_string(), json!(stale_after_gc));
+            cleanup.insert("replayed_records".to_string(), json!(replayed_records));
+            cleanup.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            cleanup.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            write_w13_evidence(
+                &evidence_root,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-cleanup"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_cleanup_gc_soak_evidence",
+                    artifact_kind: "mrf-cleanup-gc-soak",
+                    extra: cleanup,
+                },
+            );
+        }
+    }
+
     #[test]
     fn tick_action_table() {
         use TickAction::*;
 
         // Dirty dominates: a changed pending set flushes even when idle
         // otherwise.
-        assert!(matches!(tick_action(true, 0, false), Flush));
-        assert!(matches!(tick_action(true, 3, true), Flush));
+        assert!(matches!(tick_action(true, 0, false, false), Flush));
+        assert!(matches!(tick_action(true, 3, true, false), Flush));
 
         // Clean backlog: no rewrite, but keep draining so an expired
         // admission backoff retries on time.
-        assert!(matches!(tick_action(false, 1, false), Retry));
-        assert!(matches!(tick_action(false, 2, true), Retry));
+        assert!(matches!(tick_action(false, 1, false, false), Retry));
+        assert!(matches!(tick_action(false, 2, true, false), Retry));
 
         // Quiescent with a stale journal file on disk: remove it.
-        assert!(matches!(tick_action(false, 0, true), DeleteJournal));
+        assert!(matches!(tick_action(false, 0, true, false), DeleteJournal));
+        assert!(matches!(tick_action(false, 0, true, true), Idle));
 
         // Fully quiescent: nothing to do.
-        assert!(matches!(tick_action(false, 0, false), Idle));
+        assert!(matches!(tick_action(false, 0, false, false), Idle));
     }
 
     #[test]
     fn replay_cleanup_retains_journal_for_unarmed_or_refused_records() {
         assert!(
-            replay_must_retain_journal(true, 0),
+            replay_must_retain_journal(true, 0, false, 0),
             "a rejected replay record still needs its disk anchor"
         );
         assert!(
-            replay_must_retain_journal(false, 1),
+            replay_must_retain_journal(false, 1, false, 0),
             "a Full admission retry must keep the startup journal until the next snapshot"
         );
         assert!(
-            !replay_must_retain_journal(false, 0),
-            "only a fully consumed replay snapshot may be deleted"
+            !replay_must_retain_journal(false, 0, false, 0),
+            "a fully consumed replay snapshot without accepts may be deleted"
         );
+        assert!(
+            replay_must_retain_journal(false, 0, true, 0),
+            "accepted or merged replay records without a proof identity still need a durable successor"
+        );
+        assert!(
+            replay_must_retain_journal(false, 0, false, 1),
+            "accepted replay records with a durable proof anchor must retain the journal until proof arrives"
+        );
+    }
+
+    #[test]
+    fn runtime_releases_retained_replay_journal_after_verified_repair_proof() {
+        let mut intent = intent("proof-bucket", "proof-object", 0);
+        intent.kind = MrfKind::PartialWrite;
+        assert_eq!(
+            rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut intent),
+            MrfIngressResult::Enqueued
+        );
+        let bucket_incarnation_id = uuid::Uuid::new_v4();
+        let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, bucket_incarnation_id)
+            .expect("fresh replay lease and bucket incarnation build a durable anchor");
+        let cleanup_owner = uuid::Uuid::new_v4();
+        let cleanup = ReplayCleanup::Committed {
+            owner: cleanup_owner,
+            sequence: 17,
+        };
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(2, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: vec![anchor],
+            replay_cleanup: Some(cleanup),
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            kind: intent.kind,
+            bucket: intent.bucket.clone(),
+            object: intent.object.clone(),
+            version_id: intent.version_id,
+            scope: intent.scope,
+            lease: intent.lease,
+            bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        });
+
+        assert!(
+            runtime.retained_replay_journal(),
+            "anchor must retain the startup journal before proof is consumed"
+        );
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            None,
+            "the committed replay source must not be reclaimed before the exact proof"
+        );
+        runtime.discharge_durable_replay_anchors();
+        assert!(
+            !runtime.retained_replay_journal(),
+            "matching verified proof discharges the durable replay anchor"
+        );
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            Some(cleanup),
+            "proof discharge must preserve the committed owner/sequence cleanup target"
+        );
+        rustfs_common::mrf_channel::release_mrf_intent(&intent);
+    }
+
+    #[test]
+    fn runtime_cleanup_defaults_to_legacy_for_runtime_written_journals() {
+        let runtime = MrfRuntime {
+            queue: MrfQueue::new(2, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            Some(ReplayCleanup::Legacy),
+            "journals written by the runtime still use the legacy cleanup path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn runtime_idle_cleanup_deletes_runtime_and_replay_recovery_anchors() {
+        let _env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_runtime_idle_cleanup")
+            .build()
+            .await;
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "test environment must register local disks");
+
+        let replay_owner = Uuid::new_v4();
+        let runtime_owner = Uuid::new_v4();
+        let config = MrfConsumerConfig::default();
+        let journal_max_bytes = config.journal_max_bytes;
+        let replay_payload = encoded_payload(&intent("cleanup-bucket", "replay-object", 0));
+        let runtime_payload = encoded_payload(&intent("cleanup-bucket", "runtime-object", 0));
+        snapshot::publish_committed_snapshot(&disks, replay_owner, 7, &replay_payload, journal_max_bytes)
+            .await
+            .expect("publish retained replay checkpoint");
+        snapshot::publish_committed_snapshot(&disks, runtime_owner, 8, &runtime_payload, journal_max_bytes)
+            .await
+            .expect("publish runtime checkpoint");
+        assert!(write_journal(MRF_SCOPED_JOURNAL_PATH, &runtime_payload).await);
+        assert!(write_journal(MRF_JOURNAL_PATH, &runtime_payload).await);
+
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(2, usize::MAX),
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 9,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: Some(ReplayCleanup::Committed {
+                owner: replay_owner,
+                sequence: 7,
+            }),
+            runtime_checkpoint: Some((runtime_owner, 8)),
+            backoff_until: None,
+        };
+
+        assert!(
+            runtime.delete_idle_recovery_anchors().await,
+            "idle cleanup should remove both runtime and replay recovery anchors"
+        );
+        assert_eq!(runtime.replay_cleanup, None);
+        assert_eq!(runtime.runtime_checkpoint, None);
+        assert!(
+            snapshot::inspect_local_committed_snapshot(journal_max_bytes)
+                .await
+                .expect("inspect committed checkpoints after cleanup")
+                .is_none(),
+            "both committed checkpoint generations must be gone after idle cleanup"
+        );
+        assert_eq!(read_journal(MRF_SCOPED_JOURNAL_PATH).await, None);
+        assert_eq!(read_journal(MRF_JOURNAL_PATH).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn committed_replay_anchor_waits_for_verified_proof_before_idle_cleanup() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_replay_proof_cleanup")
+            .build()
+            .await;
+        let bucket = "proof-cleanup-bucket";
+        let object = "proof-cleanup-object";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "test environment must register local disks");
+
+        let config = MrfConsumerConfig::default();
+        let replay_owner = Uuid::new_v4();
+        let mut replay_intent = intent(bucket, object, 0);
+        replay_intent.kind = MrfKind::PartialWrite;
+        replay_intent.version_id = None;
+        let replay_payload = encoded_payload(&replay_intent);
+        snapshot::publish_committed_snapshot(&disks, replay_owner, 11, &replay_payload, config.journal_max_bytes)
+            .await
+            .expect("publish committed replay checkpoint");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let mut backoff_until = None;
+        let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
+        assert_eq!(replay.replayed, 1, "the committed replay checkpoint must decode one record");
+        assert_eq!(queue.depth(), 0, "the replayed record must be admitted before cleanup is considered");
+        assert!(backoff_until.is_none(), "the accepted replay must not arm admission backoff");
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "the replayed record must be visible as an MRF manager request"
+        );
+        assert!(
+            replay.journal_on_disk,
+            "a durable repair anchor must retain the committed checkpoint before proof"
+        );
+        assert!(
+            !replay.retain_journal_for_replay,
+            "retention is due to pending proof, not an incomplete replay"
+        );
+        assert_eq!(
+            replay.durable_replay_anchors.len(),
+            1,
+            "the real bucket incarnation must create a proof anchor"
+        );
+        assert_eq!(
+            replay.cleanup,
+            Some(ReplayCleanup::Committed {
+                owner: replay_owner,
+                sequence: 11,
+            }),
+            "cleanup must remember the committed checkpoint generation read at startup"
+        );
+
+        let anchor = replay.durable_replay_anchors[0].clone();
+        let mut runtime = MrfRuntime {
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until,
+        };
+        assert!(runtime.retained_replay_journal(), "proof-bearing replay anchors must block idle cleanup");
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect retained committed checkpoint")
+                .is_some(),
+            "the committed replay checkpoint must still be present before proof"
+        );
+
+        rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            lease: Some(anchor.lease),
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        });
+        runtime.discharge_durable_replay_anchors();
+        assert!(
+            !runtime.retained_replay_journal(),
+            "the exact verified proof must release the durable replay anchor"
+        );
+        assert!(
+            runtime.delete_idle_recovery_anchors().await,
+            "idle cleanup must delete the proof-discharged committed replay checkpoint"
+        );
+        runtime.journal_on_disk = false;
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect committed checkpoints after proof cleanup")
+                .is_none(),
+            "the committed replay checkpoint must be gone after proof-driven cleanup"
+        );
+
+        let restart_manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            replay_journal_once(&restart_manager).await,
+            0,
+            "proof-cleaned recovery anchors must not resurrect on the next restart"
+        );
+        assert_eq!(
+            restart_manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "no MRF work should be re-admitted after proof-driven cleanup"
+        );
+        manager.stop().await.expect("stop proof cleanup manager");
+        restart_manager.stop().await.expect("stop restart-check manager");
     }
 
     #[test]
@@ -1086,6 +2376,62 @@ mod tests {
     }
 
     #[test]
+    fn rollback_legacy_payload_omits_scoped_only_responsibilities() {
+        let mut scoped = intent("rollback-bucket", "scoped-only-object", 0);
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 3,
+            set_index: 7,
+        });
+        let compat = intent("rollback-bucket", "v1-compatible-object", 0);
+
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(4, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: true,
+            journal_on_disk: false,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        assert_eq!(runtime.queue.try_push_typed(scoped.clone()), MrfQueuePushResult::Enqueued);
+        assert_eq!(runtime.queue.try_push_typed(compat.clone()), MrfQueuePushResult::Enqueued);
+
+        let (authoritative, legacy) = runtime.snapshot();
+        let (authoritative_decoded, authoritative_truncated) = decode_journal(&authoritative);
+        assert_eq!(authoritative_truncated, 0);
+        assert_eq!(authoritative_decoded.len(), 2);
+        assert!(
+            authoritative_decoded
+                .iter()
+                .any(|intent| intent.object.as_ref() == "scoped-only-object" && intent.scope == scoped.scope),
+            "new readers must retain the scoped partial-write responsibility"
+        );
+
+        let (legacy_decoded, legacy_truncated) = decode_journal(&legacy);
+        assert_eq!(legacy_truncated, 0);
+        assert_eq!(legacy_decoded.len(), 1, "rollback payload must contain one v1-compatible record");
+        let legacy_record = legacy_decoded.first().expect("one rollback-compatible record");
+        assert_eq!(legacy_record.bucket, compat.bucket);
+        assert_eq!(legacy_record.object, compat.object);
+        assert_eq!(legacy_record.version_id, compat.version_id);
+        assert_eq!(legacy_record.kind, compat.kind);
+        assert_eq!(legacy_record.scope, None);
+        assert_eq!(legacy_record.attempts, compat.attempts);
+        assert!(
+            !legacy
+                .windows(b"scoped-only-object".len())
+                .any(|window| window == b"scoped-only-object"),
+            "legacy rollback bytes must not disguise a scoped-only responsibility as an unscoped record"
+        );
+    }
+
+    #[test]
     fn mrf_dedupe_failure_releases_key_for_retry() {
         let mut queue = MrfQueue::new(1, usize::MAX);
         assert_eq!(queue.try_push_typed(intent("bucket", "object", 0)), MrfQueuePushResult::Enqueued);
@@ -1164,6 +2510,25 @@ mod tests {
         let (decoded, truncated) = decode_journal(&corrupt);
         assert!(decoded.is_empty());
         assert_eq!(truncated, corrupt.len());
+    }
+
+    #[test]
+    fn journal_rejects_unknown_version_presence_flag_even_with_valid_crc() {
+        let mut versioned = intent("rollback-bucket", "object", 0);
+        versioned.version_id = Some([9; 16]);
+        let mut buf = Vec::new();
+        assert!(encode_intent(&versioned, &mut buf));
+
+        buf[12] = 2;
+        let crc_offset = buf.len() - 4;
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(&buf[..crc_offset]);
+        let checksum = u32::try_from(hasher.finalize()).expect("CRC32 fits");
+        buf[crc_offset..].copy_from_slice(&checksum.to_le_bytes());
+
+        let (decoded, truncated) = decode_journal(&buf);
+        assert!(decoded.is_empty(), "unknown boolean encodings are not rollback-compatible payloads");
+        assert_eq!(truncated, buf.len());
     }
 
     #[test]

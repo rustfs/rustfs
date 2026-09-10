@@ -819,7 +819,9 @@ impl KmsBackend for AwsKmsBackend {
             .with_rotate(true)
             .with_enable_disable(true)
             .with_schedule_deletion(true)
-            .with_versioning(true)
+            // AWS KMS exposes rotation state but does not enumerate key
+            // versions through this backend's API contract.
+            .with_versioning(false)
             .with_physical_delete(false)
             .with_production_supported(true)
     }

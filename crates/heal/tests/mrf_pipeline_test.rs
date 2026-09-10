@@ -22,13 +22,14 @@
 //! Under `cargo nextest` each test runs in its own process, which keeps the
 //! process-global MRF channel singleton safe.
 
-use rustfs_common::mrf_channel::{self, MrfKind};
+use rustfs_common::mrf_channel::{self, MrfIngressResult, MrfKind, MrfScope};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     mrf_queue,
     storage::{ECStoreHealStorage, HealStorageAPI},
 };
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::{
     fs::{File, OpenOptions},
@@ -48,6 +49,12 @@ use storage_api::endpoint_index::{Endpoint, EndpointServerPools, Endpoints, Pool
 const META_BUCKET: &str = ".rustfs.sys";
 const JOURNAL_REL: &str = "buckets/.heal/mrf/journal.bin";
 const SCOPED_JOURNAL_REL: &str = "buckets/.heal/mrf/journal-scoped.bin";
+const COMMITTED_PAYLOAD_REL: &str = ".heal-mrf-snapshot.0.bin";
+const COMMITTED_MANIFEST_REL: &str = ".heal-mrf-commit.0.bin";
+const COMMITTED_PAYLOAD_RELS: [&str; 2] = [".heal-mrf-snapshot.0.bin", ".heal-mrf-snapshot.1.bin"];
+const COMMITTED_MANIFEST_RELS: [&str; 2] = [".heal-mrf-commit.0.bin", ".heal-mrf-commit.1.bin"];
+const COMMITTED_MAGIC: &[u8; 8] = b"RFMRFC01";
+const COMMITTED_MANIFEST_LEN: usize = 8 + 1 + 16 + 8 + 8 + 32 + 32;
 
 async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     heal_env_at(None).await
@@ -195,6 +202,29 @@ fn write_journal_to_disks(disk_paths: &[std::path::PathBuf], data: &[u8]) {
     write_journal_path_to_disks(disk_paths, JOURNAL_REL, data);
 }
 
+fn committed_manifest(owner: uuid::Uuid, sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let mut manifest = Vec::with_capacity(COMMITTED_MANIFEST_LEN);
+    manifest.extend_from_slice(COMMITTED_MAGIC);
+    manifest.push(1);
+    manifest.extend_from_slice(owner.as_bytes());
+    manifest.extend_from_slice(&sequence.to_le_bytes());
+    manifest.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("fixture payload length fits")
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(&Sha256::digest(payload));
+    manifest.extend_from_slice(&Sha256::digest(&manifest));
+    assert_eq!(manifest.len(), COMMITTED_MANIFEST_LEN, "committed fixture manifest length");
+    manifest
+}
+
+fn write_committed_snapshot_to_disks(disk_paths: &[std::path::PathBuf], sequence: u64, payload: &[u8]) {
+    let manifest = committed_manifest(uuid::Uuid::new_v4(), sequence, payload);
+    write_journal_path_to_disks(disk_paths, COMMITTED_PAYLOAD_REL, payload);
+    write_journal_path_to_disks(disk_paths, COMMITTED_MANIFEST_REL, &manifest);
+}
+
 fn journal_exists_on_all_disks(disk_paths: &[std::path::PathBuf], relative_path: &str) -> bool {
     disk_paths
         .iter()
@@ -205,6 +235,71 @@ fn journal_matches_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, exp
     disk_paths
         .iter()
         .all(|path| std::fs::read(path.join(META_BUCKET).join(relative_path)).is_ok_and(|actual| actual == expected))
+}
+
+fn journal_contains_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, needle: &[u8]) -> bool {
+    disk_paths.iter().all(|path| {
+        std::fs::read(path.join(META_BUCKET).join(relative_path))
+            .is_ok_and(|actual| actual.windows(needle.len()).any(|window| window == needle))
+    })
+}
+
+fn journal_contains_on_any_disk(disk_paths: &[PathBuf], relative_path: &str, needle: &[u8]) -> bool {
+    disk_paths.iter().any(|path| {
+        std::fs::read(path.join(META_BUCKET).join(relative_path))
+            .is_ok_and(|actual| actual.windows(needle.len()).any(|window| window == needle))
+    })
+}
+
+fn committed_payload_contains_on_all_disks(disk_paths: &[PathBuf], needles: &[&[u8]]) -> bool {
+    disk_paths.iter().all(|path| {
+        let root = path.join(META_BUCKET);
+        COMMITTED_PAYLOAD_RELS.into_iter().any(|payload_rel| {
+            std::fs::read(root.join(payload_rel)).is_ok_and(|payload| {
+                needles
+                    .iter()
+                    .all(|needle| payload.windows(needle.len()).any(|window| window == *needle))
+            })
+        })
+    })
+}
+
+fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u64, expected_payload: &[u8]) -> bool {
+    disk_paths.iter().all(|path| {
+        let root = path.join(META_BUCKET);
+        COMMITTED_PAYLOAD_RELS
+            .into_iter()
+            .zip(COMMITTED_MANIFEST_RELS)
+            .any(|(payload_rel, manifest_rel)| {
+                let Ok(payload) = std::fs::read(root.join(payload_rel)) else {
+                    return false;
+                };
+                if payload != expected_payload {
+                    return false;
+                }
+                let Ok(manifest) = std::fs::read(root.join(manifest_rel)) else {
+                    return false;
+                };
+                if manifest.len() != COMMITTED_MANIFEST_LEN || &manifest[..8] != COMMITTED_MAGIC || manifest[8] != 1 {
+                    return false;
+                }
+                let Ok(recorded_sequence) = <[u8; 8]>::try_from(&manifest[25..33]).map(u64::from_le_bytes) else {
+                    return false;
+                };
+                let Ok(recorded_len) = <[u8; 8]>::try_from(&manifest[33..41]).map(u64::from_le_bytes) else {
+                    return false;
+                };
+                let Ok(expected_len) = u64::try_from(expected_payload.len()) else {
+                    return false;
+                };
+                if recorded_sequence != sequence || recorded_len != expected_len {
+                    return false;
+                }
+                let payload_digest: [u8; 32] = Sha256::digest(expected_payload).into();
+                let manifest_digest: [u8; 32] = Sha256::digest(&manifest[..COMMITTED_MANIFEST_LEN - 32]).into();
+                payload_digest.as_slice() == &manifest[41..73] && manifest_digest.as_slice() == &manifest[73..]
+            })
+    })
 }
 
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
@@ -255,11 +350,12 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
 }
 
 /// A journal left behind by a previous process must be replayed into the
-/// manager queue and then removed, and a torn tail must not block replay of
-/// the intact records.
+/// manager queue, and a torn tail must not block replay of the intact records.
+/// The partial-write record keeps the legacy journal as the durable anchor
+/// until an exact verified repair proof can discharge it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn journal_replay_arms_intents_and_deletes_the_file() {
+async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor() {
     let (disk_paths, storage) = heal_env().await;
 
     // The journal reader resolves disks through the process-local disk map;
@@ -285,19 +381,89 @@ async fn journal_replay_arms_intents_and_deletes_the_file() {
     assert!(
         disk_paths
             .iter()
-            .all(|path| !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()),
-        "the journal file must be removed after a successful replay"
+            .all(|path| Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()),
+        "partial-write replay must retain the legacy journal until durable proof"
     );
     assert!(
         disk_paths
             .iter()
             .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
-        "the authoritative journal file must also be removed after replay"
+        "missing authoritative journal remains absent"
     );
 
     let snapshot = manager.operations_snapshot().await;
     assert_eq!(snapshot.queued_by_priority.urgent, 1, "the decode-failure record must replay as Urgent");
     assert!(snapshot.queued_by_priority.normal >= 1, "the partial-write record must replay as Normal");
+}
+
+/// A committed checkpoint published by the new two-slot writer is the
+/// authoritative startup snapshot. Legacy mirrors are fallback-only and must
+/// not be merged with or preferred over the committed epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-committed-replay-test").await;
+
+    let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
+    let stale_legacy = journal_record(1, "legacy-bucket", "legacy-object", None, 0);
+    write_committed_snapshot_to_disks(&disk_paths, 7, &committed);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 1, "only the committed snapshot epoch may replay");
+
+    let snapshot = manager.operations_snapshot().await;
+    assert_eq!(snapshot.queued_by_source.mrf, 1);
+    assert_eq!(
+        snapshot.queued_by_priority.normal, 1,
+        "the committed partial-write record must replay instead of the stale legacy decode-failure"
+    );
+    assert_eq!(
+        snapshot.queued_by_priority.urgent, 0,
+        "stale legacy decode-failure records must not be mixed into committed replay"
+    );
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, COMMITTED_MANIFEST_REL),
+        "the committed checkpoint remains until the accepted partial-write has proof"
+    );
+}
+
+/// A damaged committed checkpoint is ambiguous: replay must not fall back to
+/// older legacy bytes or delete any recovery anchor until another process can
+/// publish a valid successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn damaged_committed_snapshot_blocks_legacy_fallback_and_retains_anchors() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-damaged-committed-replay-test").await;
+
+    let committed = scoped_journal_record(3, "damaged-committed-bucket", "committed-object", Some([8u8; 16]), 0, 0, 0);
+    let stale_legacy = journal_record(1, "damaged-legacy-bucket", "legacy-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, COMMITTED_PAYLOAD_REL, &committed);
+    let mut manifest = committed_manifest(uuid::Uuid::new_v4(), 9, &committed);
+    manifest[25] ^= 1;
+    write_journal_path_to_disks(&disk_paths, COMMITTED_MANIFEST_REL, &manifest);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 0, "damaged committed state must fail closed");
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        0,
+        "stale legacy bytes must not be replayed when committed state is ambiguous"
+    );
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, COMMITTED_MANIFEST_REL)
+            && journal_exists_on_all_disks(&disk_paths, COMMITTED_PAYLOAD_REL)
+            && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy)
+            && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &stale_legacy),
+        "all recovery anchors must remain after a fail-closed committed read"
+    );
 }
 
 /// A canonical snapshot and its compatibility mirror may differ after a
@@ -322,21 +488,24 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     assert_eq!(snapshot.queued_by_source.mrf, 1);
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "replay cleanup must remove both journal paths"
+        "accepted replay responsibilities remain anchored until a verified repair proof"
     );
 
     // A scoped-only snapshot is valid during a rollout where no legacy
     // compatibility mirror was written. Missing legacy files must not leave
     // the runtime in a permanent cleanup-retry state.
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-scoped-authoritative-test").await;
+    let manager = make_manager(storage);
     let scoped_only = journal_record(1, "scoped-only-bucket", "scoped-only-object", None, 0);
     write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &scoped_only);
     assert_eq!(mrf_queue::replay_journal_once(&manager).await, 1);
     assert!(disk_paths.iter().all(|path| {
         !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
 
     let scoped_v2 = scoped_journal_record(1, "scoped-v2-bucket", "scoped-v2-object", None, 0, 3, 7);
@@ -350,12 +519,12 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     );
     assert_eq!(
         manager.operations_snapshot().await.queued_by_source.mrf,
-        3,
-        "only the three authoritative/scoped-only epochs should have reached the manager"
+        2,
+        "only the scoped-only and scoped-v2 authoritative epochs should have reached the manager"
     );
     assert!(disk_paths.iter().all(|path| {
-        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+            && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
 }
 
@@ -400,10 +569,13 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
         snapshot.queued_by_priority.urgent, 1,
         "decode-failure repair must not merge with object repair responsibility"
     );
-    assert!(disk_paths.iter().all(|path| {
-        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
-    }));
+    assert!(
+        disk_paths.iter().all(|path| {
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "partial-write responsibilities keep both replay anchors until proof"
+    );
 }
 
 /// If replay reaches a full heal-manager queue, the old journal remains the
@@ -470,6 +642,73 @@ async fn journal_replay_retains_file_when_manager_is_full() {
     );
 }
 
+/// Rollback mirrors are for v1 readers only: the committed and scoped
+/// snapshots remain authoritative, while the legacy journal omits scoped-only
+/// records that an older binary cannot represent safely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn rollback_legacy_mirror_persists_only_v1_compatible_records() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-rollback-mirror-test").await;
+
+    let manager = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 0,
+            heal_interval: Duration::from_secs(3600),
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    ));
+    mrf_queue::spawn_mrf_consumer(manager.clone());
+
+    let scoped_only = b"rollback-scoped-only-object";
+    let v1_compatible = b"rollback-v1-compatible-object";
+    assert_eq!(
+        mrf_channel::try_send_mrf_intent_typed(
+            MrfKind::PartialWrite,
+            "rollback-bucket",
+            std::str::from_utf8(scoped_only).expect("fixture object is UTF-8"),
+            None,
+            Some(MrfScope {
+                pool_index: 3,
+                set_index: 7,
+            }),
+        ),
+        MrfIngressResult::Enqueued,
+        "scoped-only intent should be accepted by the live consumer"
+    );
+    assert_eq!(
+        mrf_channel::try_send_mrf_intent_typed(
+            MrfKind::PartialWrite,
+            "rollback-bucket",
+            std::str::from_utf8(v1_compatible).expect("fixture object is UTF-8"),
+            None,
+            None,
+        ),
+        MrfIngressResult::Enqueued,
+        "v1-compatible intent should be accepted by the live consumer"
+    );
+
+    let flushed = wait_until(Duration::from_secs(10), || async {
+        committed_payload_contains_on_all_disks(&disk_paths, &[scoped_only, v1_compatible])
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, scoped_only)
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, v1_compatible)
+            && journal_contains_on_all_disks(&disk_paths, JOURNAL_REL, v1_compatible)
+            && !journal_contains_on_any_disk(&disk_paths, JOURNAL_REL, scoped_only)
+    })
+    .await;
+    assert!(
+        flushed,
+        "runtime flush must persist rollback-safe mirrors without leaking scoped-only records into the legacy journal"
+    );
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        0,
+        "zero-capacity manager keeps both intents in the MRF runtime so the persisted snapshot is observable"
+    );
+}
+
 #[test]
 fn mrf_journal_child_process_fixture() {
     let Ok(root) = std::env::var("RUSTFS_MRF_REPLAY_CHILD_ROOT") else {
@@ -524,13 +763,14 @@ fn mrf_successor_flush_child_process_fixture() {
         let expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && committed_checkpoint_matches_on_all_disks(&disk_paths, 2, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
         })
         .await;
         assert!(
             flushed,
-            "child process must publish the pending successor snapshot before the delete phase"
+            "child process must publish the committed pending successor before the delete phase"
         );
     });
     std::process::exit(78);
@@ -571,13 +811,14 @@ fn mrf_successor_flush_waiting_child_process_fixture() {
         let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && committed_checkpoint_matches_on_all_disks(&disk_paths, 2, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
                 && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
         })
         .await;
         assert!(
             flushed,
-            "child process must publish the pending successor snapshot before it can be killed"
+            "child process must publish the committed pending successor before it can be killed"
         );
         std::fs::write(&ready_path, b"ready").expect("write ready marker");
         loop {
@@ -698,10 +939,10 @@ async fn journal_replay_survives_successor_flush_before_delete() {
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed successor snapshot may be deleted after restart replay"
+        "the accepted successor remains anchored until a verified repair proof"
     );
 }
 
@@ -751,10 +992,10 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed successor snapshot may be deleted after service-kill restart replay"
+        "the accepted successor remains anchored until a verified repair proof after service-kill restart"
     );
 }
 
@@ -814,9 +1055,9 @@ async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_bef
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed authoritative successor may clean both epochs after restart replay"
+        "the accepted authoritative successor remains anchored until a verified repair proof"
     );
 }

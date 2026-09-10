@@ -49,12 +49,15 @@ def fake_adapter():
         if fault == "measure-exit":
             return 42
         result = {key: request[key] for key in ("evidence", "fixed", "build", "data_dir", "background")}
+        if request["evidence"] == "measured":
+            result["release_evidence"] = copy.deepcopy(request["release_evidence"])
         result.update({"sample_count": 10, "elapsed_seconds": request["duration_seconds"],
                        "metrics": dict.fromkeys(harness.METRICS, 10)})
         baseline = request["comparison"] == "build" and request["leg"].startswith("A")
         result["metrics"].update(p99_ms=10, throughput_ops=100, errors=0, requests=100,
                                  walk_objects=100 if baseline else 20, cold_walk_objects=100 if baseline else 0,
-                                 healed_objects=request["expected_healed_objects"])
+                                 healed_objects=request["expected_healed_objects"],
+                                 heal_duplicate_task_count=0)
         result["convergence"] = {"writes_stopped": True, "last_mutation_observed": True,
                                  "first_complete_publication": True, "last_mutation_time": 1,
                                  "last_mutation_observed_time": 2,
@@ -104,9 +107,17 @@ def fake_adapter():
             result["metrics"]["foreground_pressure_high_samples"] = result["metrics"]["foreground_pressure_samples"] + 1
         elif fault == "attempt-accounting":
             result["metrics"]["heal_attempt_failures"] = result["metrics"]["heal_attempts"] + 1
+        elif fault == "duplicate-heal-task":
+            result["metrics"]["heal_duplicate_task_count"] = 1
+        elif fault == "missing-start-p95":
+            result["metrics"]["heal_start_p95_ms"] = 0
         elif fault == "pacing-benefit" and request["scenario"] == "running-heal" \
                 and request["comparison"] == "build" and request["leg"].startswith("B"):
             result["metrics"].update(p99_ms=9, heal_mainline_throttle_delayed=5)
+        elif fault == "w11-benefit" and request["scenario"] == "running-heal" \
+                and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"].update(p99_ms=9, throughput_ops=102, rss_bytes=10,
+                                     heal_lock_wait_p99_ms=5)
         elif fault == "pacing-pending" and request["scenario"] == "running-heal" \
                 and request["comparison"] == "build" and request["leg"].startswith("B"):
             result["metrics"]["heal_mainline_throttle_delayed"] = 0
@@ -162,6 +173,78 @@ class ScannerAbbaTest(unittest.TestCase):
         }
         build = {"binary": str(self.binary), "sha256": harness.digest(self.binary), "revision": "a" * 40}
         self.manifest.update(baseline=build.copy(), candidate=build.copy())
+
+    def measured_manifest(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest.update(evidence="measured", duration_seconds=harness.MIN_MEASURED_RELEASE_DURATION_SECONDS)
+        candidate_binary = self.root / "candidate-python"
+        candidate_binary.write_bytes(self.binary.read_bytes() + b"\n")
+        candidate_binary.chmod(0o755)
+        manifest["candidate"] = {
+            "binary": str(candidate_binary),
+            "sha256": harness.digest(candidate_binary),
+            "revision": "b" * 40,
+        }
+        manifest["release_evidence"] = {
+            "topology": {
+                "nodes": 3,
+                "drives_per_node": 4,
+                "pools": 2,
+                "sets_total": 2,
+                "sampled_pools": 2,
+                "sampled_sets": 2,
+                "erasure_set_size": 12,
+                "erasure_data_blocks": 8,
+                "erasure_parity_blocks": 4,
+            },
+            "distributed": {
+                "metrics_endpoints": ["https://node-1:9000", "https://node-2:9000", "https://node-3:9000"],
+                "failure_domain": "three-node-localhost-lab",
+                "same_window_sampling": True,
+            },
+            "scheduler": {
+                "bounds": ["admission-retry-idempotency", "deadline-budget", "lock-hold-bound", "minimum-progress"],
+                "max_deferred_items": 10,
+                "max_deferred_bytes": 1048576,
+                "max_retry_age_seconds": 7200,
+                "duplicate_task_bound_observed": True,
+            },
+            "crash_restart": {
+                "fault_modes": ["process-restart", "process-crash-restart"],
+                "unclean_shutdown_marker": True,
+            },
+            "mixed_version": {
+                "participating_revisions": ["a" * 40, "b" * 40],
+                "reader": True,
+                "writer": True,
+                "rollback_payload": True,
+            },
+            "profile": {
+                "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
+                "collector_config_sha256": "4" * 64,
+                "profiler_config_sha256": "5" * 64,
+                "measurements": {
+                    "resolved_samples": 120,
+                    "allocation_bytes": 4096,
+                    "rss_peak_bytes": 10485760,
+                    "save_operations": 64,
+                    "saved_bytes": 8192,
+                },
+            },
+            "heal_capacity": {
+                "objects": 96,
+                "versions": 96,
+                "bytes": 12582912,
+                "completed_objects": 96,
+            },
+            "recovery_window": {
+                "pressure_recovery_window_seconds": 45,
+                "heal_lock_wait_p99_ms": 8,
+                "recovery_p95_ms": 1500,
+                "recovery_p99_ms": 2200,
+            },
+        }
+        return manifest
 
     def run_harness(self, fault=""):
         with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": fault}), contextlib.redirect_stdout(io.StringIO()):
@@ -317,12 +400,26 @@ class ScannerAbbaTest(unittest.TestCase):
             expected_attempt_cost = [None, 1.0, 1.0, None] if comparison["comparison"] == "background" else [1.0, 1.0, 1.0, 1.0]
             self.assertEqual(w10_w11["attempt_cost_per_healed_object"], expected_attempt_cost)
             self.assertEqual(w10_w11["candidate_attempt_cost_per_healed_object"], 1.0)
+            self.assertEqual(
+                comparison["w09"],
+                {
+                    "heal_start_p95_ms": [10, 10, 10, 10],
+                    "heal_duplicate_task_count": [0, 0, 0, 0],
+                    "heal_lock_hold_p95_ms": [10, 10, 10, 10],
+                },
+            )
+            if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build":
+                self.assertEqual(comparison["w11"]["status"], "no_measured_benefit")
+                self.assertTrue(comparison["w11"]["rss_within_limit"])
+                self.assertFalse(comparison["w11"]["healthy_page_latency_observed"])
+            else:
+                self.assertEqual(comparison["w11"], {"status": "not_applicable"})
 
     def test_fail_closed_adapter_and_data_errors(self):
         for fault in ("measure-exit", "oracle-exit", "missing-oracle", "oracle-mismatch", "zero-samples",
                       "zero-requests", "request-errors", "load-drift", "missing-metric", "incomplete-repair",
                       "zero-pressure-samples", "pressure-sample-order", "attempt-accounting",
-                      "missing-pacing-metric"):
+                      "missing-pacing-metric", "duplicate-heal-task", "missing-start-p95"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.root = Path(directory)
                 with self.assertRaises((ValueError, OSError, subprocess.SubprocessError)):
@@ -365,6 +462,16 @@ class ScannerAbbaTest(unittest.TestCase):
                 comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
                 build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
                 self.assertEqual(build["w10"]["status"], expected)
+
+    def test_running_heal_w11_status_requires_latency_lock_and_bounded_rss(self):
+        with patch.object(harness, "SCENARIOS", ("running-heal",)):
+            self.assertEqual(self.run_harness("w11-benefit"), 0)
+        comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
+        build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
+        self.assertEqual(build["w11"]["status"], "observed")
+        self.assertLess(build["w11"]["foreground_p99_change"], 0)
+        self.assertLess(build["w11"]["heal_lock_wait_p99_change"], 0)
+        self.assertTrue(build["w11"]["rss_within_limit"])
 
     def test_missing_first_publication_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
@@ -440,6 +547,34 @@ class ScannerAbbaTest(unittest.TestCase):
 
                 process.finish.assert_called_once_with(terminate=True)
 
+    def test_live_collector_binds_release_evidence_metrics_endpoints(self):
+        telemetry = self.root / "telemetry"
+        for name in ("status", "heal", "metrics"):
+            (telemetry / name).mkdir(parents=True)
+        (telemetry / "scanner-summary.csv").write_text("timestamp\n")
+        for index in range(16):
+            harness.write_json(telemetry / f"status/scanner-status.{index}.json", {"metrics": {"objects": 10}})
+            for node in ("node-a", "node-b"):
+                harness.write_json(telemetry / f"heal/background-heal-status.{node}.{index}.json",
+                                   {"healOperations": {"queueLength": 0}})
+                harness.write_json(telemetry / f"metrics/admin-metrics.{node}.{index}.ndjson",
+                                   {"errors": [], "final": True,
+                                    "by_host": {f"{node}:9000": {"scanner": {"objects": 10}}}})
+        prepared = {"collector": {"alias": "test", "endpoint": "http://node-a:9000",
+                                  "metrics_endpoints": "http://node-a:9000,http://node-b:9000"}}
+        request = {
+            "duration_seconds": 900,
+            "evidence": "measured",
+            "release_evidence": self.measured_manifest()["release_evidence"],
+        }
+        process = Mock(pid=123, wait=Mock(return_value=0))
+        with patch.object(harness, "OwnedCommand", return_value=process), \
+                patch.object(harness, "invoke", return_value={"sample_count": 10}), \
+                patch.object(harness.time, "monotonic", side_effect=(0, 900)):
+            with self.assertRaisesRegex(ValueError, "collector metrics endpoints"):
+                harness.collect_live(prepared, request, self.root / "request.json", self.adapter)
+        process.finish.assert_called_once_with(terminate=True)
+
     def test_unstable_p1_work_control_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
             self.assertEqual(self.run_harness("unstable-p1-control"), 3)
@@ -458,10 +593,107 @@ class ScannerAbbaTest(unittest.TestCase):
         self.manifest["evidence"] = "measured"
         with self.assertRaisesRegex(ValueError, "duration_seconds"):
             harness.validate_manifest(self.manifest)
-        self.manifest["duration_seconds"] = 900
+        self.manifest["duration_seconds"] = harness.MIN_MEASURED_RELEASE_DURATION_SECONDS
         self.manifest["rounds"] = 2
         with self.assertRaisesRegex(ValueError, "rounds"):
             harness.validate_manifest(self.manifest)
+
+    def test_measured_manifest_requires_release_evidence_contract(self):
+        harness.validate_manifest(self.measured_manifest())
+        faults = {
+            "missing root": lambda manifest: manifest.pop("release_evidence"),
+            "single-set": lambda manifest: manifest["release_evidence"]["topology"].update(sets_total=1),
+            "unsampled-set": lambda manifest: manifest["release_evidence"]["topology"].update(sampled_sets=1),
+            "wrong geometry": lambda manifest: manifest["release_evidence"]["topology"].update(erasure_set_size=11),
+            "duplicate endpoint": lambda manifest: manifest["release_evidence"]["distributed"].update(
+                metrics_endpoints=["https://node-1:9000", "https://node-1:9000", "https://node-3:9000"],
+            ),
+            "split sampling": lambda manifest: manifest["release_evidence"]["distributed"].update(
+                same_window_sampling=False,
+            ),
+            "missing crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart"],
+            ),
+            "unknown crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-crash-restart", "kernel-panic"],
+            ),
+            "duplicate crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-restart", "process-crash-restart"],
+            ),
+            "clean crash marker": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                unclean_shutdown_marker=False,
+            ),
+            "mixed version false": lambda manifest: manifest["release_evidence"]["mixed_version"].update(writer=False),
+            "missing candidate": lambda manifest: manifest["release_evidence"]["mixed_version"].update(
+                participating_revisions=["a" * 40, "c" * 40],
+            ),
+            "same mixed revision": lambda manifest: manifest["candidate"].update(
+                revision=manifest["baseline"]["revision"],
+            ),
+            "same mixed binary": lambda manifest: manifest["candidate"].update(
+                binary=manifest["baseline"]["binary"],
+                sha256=manifest["baseline"]["sha256"],
+            ),
+            "missing profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples"],
+            ),
+            "unknown profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples", "save-frequency", "heapdump"],
+            ),
+            "duplicate profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=[
+                    "allocation-profile", "flamegraph", "rss-samples", "save-frequency", "flamegraph",
+                ],
+            ),
+            "bad profile hash": lambda manifest: manifest["release_evidence"]["profile"].update(
+                profiler_config_sha256="not-a-sha",
+            ),
+        }
+        for name, mutate in faults.items():
+            with self.subTest(fault=name):
+                manifest = self.measured_manifest()
+                mutate(manifest)
+                with self.assertRaisesRegex(ValueError, "release_evidence"):
+                    harness.validate_manifest(manifest)
+
+    def test_measured_result_must_echo_release_evidence(self):
+        manifest = self.measured_manifest()
+        request = {
+            "schema": 1,
+            "scenario": "cold-hot",
+            "comparison": "build",
+            "round": 1,
+            "leg": "B1",
+            "background": "on",
+            "build": manifest["candidate"],
+            "evidence": manifest["evidence"],
+            "fixed": manifest["fixed"],
+            "release_evidence": manifest["release_evidence"],
+            "duration_seconds": manifest["duration_seconds"],
+            "data_dir": str(self.root / "data"),
+            "expected_healed_objects": manifest["expected_healed_objects"]["cold-hot"],
+        }
+        metrics = dict.fromkeys(harness.METRICS, 10)
+        metrics.update(p99_ms=10, throughput_ops=100, errors=0, requests=100,
+                       walk_objects=100, cold_walk_objects=20, healed_objects=10,
+                       heal_duplicate_task_count=0)
+        result = {
+            "evidence": request["evidence"],
+            "fixed": request["fixed"],
+            "build": request["build"],
+            "data_dir": request["data_dir"],
+            "background": request["background"],
+            "release_evidence": request["release_evidence"],
+            "sample_count": 10,
+            "elapsed_seconds": request["duration_seconds"],
+            "metrics": metrics,
+            "oracle": manifest["oracles"]["cold-hot"],
+        }
+        harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+        result["release_evidence"] = copy.deepcopy(result["release_evidence"])
+        result["release_evidence"]["profile"]["required_artifacts"].remove("flamegraph")
+        with self.assertRaisesRegex(ValueError, "release evidence provenance mismatch"):
+            harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
 
     def test_existing_data_preserved(self):
         (self.root / "data").mkdir()
