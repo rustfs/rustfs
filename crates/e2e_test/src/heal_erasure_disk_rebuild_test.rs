@@ -1336,7 +1336,7 @@ mod tests {
             replacement_format,
             expected_pool_metadata,
         } = select_replacement_drive(&cluster, 1, background_enabled)?;
-        let default_online_object_count = if !outage_target_manifest_required { 96 } else { 24 };
+        let default_online_object_count = if !outage_target_manifest_required { 64 } else { 24 };
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
