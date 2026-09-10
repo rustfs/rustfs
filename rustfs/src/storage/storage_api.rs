@@ -955,7 +955,10 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
 
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
-    let journal_writer = durable_dirty_usage_journal.clone();
+    let mutation_journal = durable_dirty_usage_journal.clone();
+    rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+        mutation_journal.record_committed_mutation(bucket, object, producer);
+    })));
     ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
         let producer = match source {
             ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
@@ -966,7 +969,6 @@ pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
             }
         };
         rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
-        journal_writer.record_committed_mutation(bucket, object, producer);
     })));
     rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
         durable_dirty_usage_journal.clear_confirmed_buckets(cleared);

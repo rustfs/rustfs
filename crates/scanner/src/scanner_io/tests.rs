@@ -37,7 +37,7 @@ use rustfs_concurrency::{
 };
 use rustfs_filemeta::FileInfo;
 use serial_test::serial;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use temp_env::with_var;
 use time::OffsetDateTime;
@@ -285,6 +285,7 @@ fn scanner_durable_segment_invalidation_evidence_requires_matching_complete_set_
 
     assert!(durable_evidence.producer_identity_coverage_complete);
     assert!(durable_evidence.durable_producer_identity);
+    assert!(!durable_evidence.durable_dirty_producer_journal);
     assert!(durable_evidence.restart_gap_absent);
 
     let mut stale_epoch = results.clone();
@@ -297,12 +298,14 @@ fn scanner_durable_segment_invalidation_evidence_requires_matching_complete_set_
     let stale_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &stale_epoch, &expected_sources);
     assert!(stale_evidence.producer_identity_coverage_complete);
     assert!(!stale_evidence.durable_producer_identity);
+    assert!(!stale_evidence.durable_dirty_producer_journal);
     assert!(!stale_evidence.restart_gap_absent);
 
     record_dirty_usage_bucket("videos");
     let changed_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources);
     assert!(!changed_evidence.producer_identity_coverage_complete);
     assert!(!changed_evidence.durable_producer_identity);
+    assert!(!changed_evidence.durable_dirty_producer_journal);
     assert!(!changed_evidence.restart_gap_absent);
     clear_dirty_usage_buckets_for_tests();
 }
@@ -316,6 +319,19 @@ fn scanner_segment_reuse_activation_replays_cold_durable_baseline() {
     for producer in SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION {
         record_dirty_usage_object_from_producer("photos", "2026/object", producer);
     }
+    let replay_generation = dirty_usage_generation();
+    replay_durable_dirty_usage_producer_record(
+        &encode_durable_dirty_usage_producer_replay_record(vec![ScannerDurableDirtyUsageReplayEntry {
+            bucket: "photos".to_string(),
+            generation: replay_generation,
+            scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                entries: BTreeSet::from(["2026".to_string()]),
+            },
+            producers: SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION.into_iter().collect(),
+        }])
+        .expect("durable producer replay should encode"),
+    )
+    .expect("durable producer replay should restore restart authority");
     let dirty_usage_snapshot =
         snapshot_dirty_usage_buckets(&[bucket_info("photos"), bucket_info("archive")], dirty_usage_generation());
     let mut segment_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot)
@@ -413,8 +429,11 @@ fn scanner_segment_reuse_activation_replays_cold_durable_baseline() {
             scan_plan_digest,
         },
     );
-    assert!(preflight.scanner_segment_reuse_activated);
-    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        vec!["missing_durable_journal_replay"]
+    );
 
     record_dirty_usage_bucket("photos");
     let unidentified_snapshot =
@@ -473,6 +492,7 @@ fn complete_process_local_producer_evidence() -> DirtyUsageProducerEvidence {
     DirtyUsageProducerEvidence {
         producer_identity_coverage_complete: true,
         durable_producer_identity: false,
+        durable_dirty_producer_journal: false,
         restart_gap_absent: false,
         generation_window_bound: true,
         generation_start: 7,
@@ -1468,6 +1488,7 @@ fn dirty_usage_producer_evidence_tracks_process_local_coverage_without_durable_r
     assert!(evidence.generation_window_bound);
     assert!(evidence.producer_identity_coverage_complete);
     assert!(!evidence.durable_producer_identity);
+    assert!(!evidence.durable_dirty_producer_journal);
     assert!(!evidence.restart_gap_absent);
     assert_eq!(evidence.generation_start, snapshot.buckets["photos"]);
     assert_eq!(evidence.generation_end, snapshot.buckets["photos"]);
@@ -1858,6 +1879,44 @@ fn complete_usage_baseline(
     bytes::Bytes::from(serde_json::to_vec(&baseline).expect("test baseline should encode"))
 }
 
+fn complete_segment_reuse_baseline(
+    source: DataUsageCacheSource,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    scanner_cycle: u64,
+    scanner_epoch: u64,
+    evidence: DirtyUsageProducerEvidence,
+    buckets: &[&str],
+) -> bytes::Bytes {
+    let mut proof = evidence
+        .segment_invalidation_proof()
+        .expect("durable producer evidence should produce segment proof");
+    proof.cold_zero_walk_oracle = true;
+    let baseline = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        scanner_cycle: Some(scanner_cycle),
+        scanner_epoch: Some(scanner_epoch),
+        buckets_count: u64::try_from(buckets.len()).expect("test bucket count should fit"),
+        buckets_usage: buckets
+            .iter()
+            .map(|bucket| ((*bucket).to_string(), Default::default()))
+            .collect(),
+        usage_snapshot_complete: true,
+        usage_snapshot_converged: Some(true),
+        usage_snapshot_set_states: vec![DataUsageSnapshotSetState {
+            pool_index: u64::try_from(source.pool_index).expect("test pool index should fit"),
+            set_index: u64::try_from(source.set_index).expect("test set index should fit"),
+            scanner_cycle: Some(scanner_cycle),
+            scanner_epoch: Some(scanner_epoch),
+            scan_plan_digest: Some(scan_plan_digest.0),
+            complete: true,
+            tombstone: false,
+            segment_invalidation_proof: Some(proof),
+        }],
+        ..Default::default()
+    };
+    bytes::Bytes::from(serde_json::to_vec(&baseline).expect("test baseline should encode"))
+}
+
 #[test]
 fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance() {
     let source = DataUsageCacheSource::new(1, 2);
@@ -2183,6 +2242,12 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
         "photos".to_string(),
         DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["2026".to_string()])),
     )]);
+    let dirty_usage_snapshot = DirtyUsageSnapshot {
+        buckets: Arc::new(HashMap::from([("photos".to_string(), 7)])),
+        scopes: Arc::new(dirty_scopes.clone()),
+        generation: 7,
+        covers_all_pending: true,
+    };
     let locally_scoped = scoped_scan_scope_from_dirty_buckets(
         ScannerBucketScanScope::default(),
         HashSet::from(["photos".to_string()]),
@@ -2206,7 +2271,7 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
 
     let distributed = resolve_remote_dirty_usage_scope(
         ScannerBucketScanScope::default(),
-        HashSet::from(["photos".to_string()]),
+        &dirty_usage_snapshot,
         remote_dirty_usage,
         &[bucket_info("photos")],
         ScannerCacheBaselineProof {
@@ -2244,6 +2309,82 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
     assert!(evidence.distributed_ec_invalidation);
     assert!(evidence.same_window_remote_proof);
     assert!(evidence.all_peers_bound_to_generation_window);
+}
+
+#[test]
+#[serial]
+fn distributed_segment_reuse_activation_keeps_remote_dirty_buckets_at_bucket_scope() {
+    clear_dirty_usage_buckets_for_tests();
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([9; 32]);
+    let entries = BTreeSet::from(["2026".to_string()]);
+    let bytes = encode_durable_dirty_usage_producer_replay_record(vec![ScannerDurableDirtyUsageReplayEntry {
+        bucket: "photos".to_string(),
+        generation: 7,
+        scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries { entries },
+        producers: crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+            .iter()
+            .copied()
+            .collect(),
+    }])
+    .expect("durable dirty usage replay record should encode");
+    replay_durable_dirty_usage_producer_record(&bytes).expect("durable dirty usage replay should restore producer proof");
+    let dirty_usage_snapshot =
+        snapshot_dirty_usage_buckets(&[bucket_info("photos"), bucket_info("archive")], dirty_usage_generation());
+    let evidence = dirty_usage_producer_evidence(&dirty_usage_snapshot);
+    let baseline = complete_segment_reuse_baseline(source, scan_plan_digest, 7, 11, evidence, &["photos", "archive"]);
+    let expected_peers = HashMap::from([(
+        "node-a:9000".to_string(),
+        ScannerPeerDirtyUsageExpectation {
+            instance_id: "instance-a".to_string(),
+            generation: 3,
+            pending: true,
+        },
+    )]);
+    let remote_dirty_usage = verified_remote_dirty_usage(
+        &expected_peers,
+        vec![(
+            "node-a:9000".to_string(),
+            peer_dirty_usage_snapshot("instance-a", 3, true, &[("archive", 3)]),
+        )],
+    )
+    .expect("fixture remote dirty usage should verify at bucket granularity");
+
+    let result = resolve_remote_dirty_usage_scope(
+        ScannerBucketScanScope::default(),
+        &dirty_usage_snapshot,
+        remote_dirty_usage,
+        &[bucket_info("photos"), bucket_info("archive")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+
+    assert_eq!(
+        result
+            .scope
+            .selected_buckets
+            .as_deref()
+            .expect("distributed reuse still selects both dirty buckets"),
+        &HashSet::from(["photos".to_string(), "archive".to_string()])
+    );
+    assert!(
+        result.scope.prefix_scope_for("photos").is_some(),
+        "durable local producer proof may activate local segment reuse after distributed ACK capability evidence"
+    );
+    assert!(
+        result.scope.prefix_scope_for("archive").is_none(),
+        "remote dirty usage has only bucket-granularity evidence and must not be narrowed to a local prefix"
+    );
+    assert_eq!(result.remote_dirty_usage_acknowledgements.len(), 1);
+    assert!(result.distributed_segment_invalidation_evidence.is_some());
+    clear_dirty_usage_buckets_for_tests();
 }
 
 fn peer_dirty_usage_snapshot(
@@ -2419,7 +2560,12 @@ fn remote_dirty_usage_scope_resolution_falls_back_when_ack_batch_exceeds_thresho
 
     let result = resolve_remote_dirty_usage_scope(
         ScannerBucketScanScope::default(),
-        HashSet::new(),
+        &DirtyUsageSnapshot {
+            buckets: Arc::new(HashMap::new()),
+            scopes: Arc::new(HashMap::new()),
+            generation: 7,
+            covers_all_pending: true,
+        },
         remote_dirty_usage,
         &all_buckets,
         ScannerCacheBaselineProof {

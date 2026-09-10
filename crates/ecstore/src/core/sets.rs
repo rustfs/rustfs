@@ -55,7 +55,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
@@ -308,10 +308,9 @@ impl Sets {
             ctx: instance_ctx,
         });
 
-        let asets = sets.clone();
-
         let rx1 = rx.resubscribe();
-        tokio::spawn(async move { asets.monitor_and_connect_endpoints(rx1).await });
+        let weak_sets = Arc::downgrade(&sets);
+        tokio::spawn(async move { Self::monitor_and_connect_endpoints_task(weak_sets, rx1).await });
 
         Ok(sets)
     }
@@ -326,12 +325,26 @@ impl Sets {
         &self.ctx
     }
 
-    pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    async fn monitor_and_connect_endpoints_task(sets: Weak<Sets>, mut rx: Receiver<()>) {
+        let startup_delay = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(startup_delay);
+
+        tokio::select! {
+            _ = &mut startup_delay => {}
+            _ = rx.recv() => {
+                warn!("monitor_and_connect_endpoints ctx cancelled");
+                return;
+            }
+        }
 
         info!("start monitor_and_connect_endpoints");
 
-        self.connect_disks().await;
+        let Some(current) = sets.upgrade() else {
+            warn!("monitor_and_connect_endpoints exit");
+            return;
+        };
+        current.connect_disks().await;
+        drop(current);
 
         // TODO(backlog): make monitor_and_connect interval configurable instead of hardcoded 15s
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -339,7 +352,10 @@ impl Sets {
             tokio::select! {
                _= interval.tick()=>{
                 // debug!("tick...");
-                self.connect_disks().await;
+                let Some(current) = sets.upgrade() else {
+                    break;
+                };
+                current.connect_disks().await;
 
                 interval.reset();
                },

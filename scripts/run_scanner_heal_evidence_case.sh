@@ -297,6 +297,7 @@ export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-default}"
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$DEBUG_DIR/rustfs" "$TEST_BINARY"
 cp "$LISTING_TMP" "$RUN_DIR/listing.json"
 export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/e2e-logs}"
+export RUSTFS_HEAL_CHAOS_LOG_DIR="${RUSTFS_HEAL_CHAOS_LOG_DIR:-$RUSTFS_E2E_LOG_DIR}"
 mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
 JUNIT_PATH="$TARGET_DIR/nextest/$PROFILE/junit.xml"

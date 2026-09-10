@@ -59,7 +59,7 @@ def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
     expected.update({job: "success" if mode == "full" else "skipped" for job in CODE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in ("refs/heads/main", "refs/heads/release")))
     expected["e2e-full"] = "success" if full else "skipped"
     return expected
 
@@ -218,6 +218,27 @@ class SelfTests(unittest.TestCase):
             for selection in ({}, {"mode": ""}, {"mode": True}, []):
                 bad = {**good, "classify-changes": {"result": "success", "outputs": selection}}
                 self.assertTrue(verify_results(bad, event, "refs/heads/main"))
+
+    def test_full_e2e_gate_preserves_workflow_branch_and_event_scope(self):
+        for event, ref, required in (
+            ("push", "refs/heads/main", "success"),
+            ("push", "refs/heads/release", "success"),
+            ("push", "refs/heads/feature", "skipped"),
+            ("push", "refs/heads/release-candidate", "skipped"),
+            ("push", "refs/tags/release", "skipped"),
+            ("pull_request", "refs/pull/1/merge", "skipped"),
+            ("schedule", "refs/heads/release", "skipped"),
+            ("workflow_dispatch", "refs/heads/feature", "success"),
+            ("merge_group", "refs/heads/gh-readonly-queue/release/pr-1", "success"),
+        ):
+            with self.subTest(event=event, ref=ref):
+                expected = expected_results("full", event, ref)
+                self.assertEqual(expected["e2e-full"], required)
+                needs = {job: {"result": result} for job, result in expected.items()}
+                needs["classify-changes"]["outputs"] = {"mode": "full"}
+                for result in ("success", "skipped", "failure", "cancelled"):
+                    needs["e2e-full"]["result"] = result
+                    self.assertEqual(verify_results(needs, event, ref) == [], result == required)
 
     def test_repository_wiring_and_missing_dependency_regression(self):
         self.assertEqual(check_workflow(ROOT), [])

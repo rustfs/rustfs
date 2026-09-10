@@ -15661,25 +15661,24 @@ mod tests {
         assert!(deleted[0].found, "the aggregate error must retain the committed pool result");
         drop(injection);
 
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let mut metadata_absent = true;
-                for pool in &store.pools {
-                    metadata_absent &= pool
-                        .get_disks_by_key(object)
-                        .load_file_info_versions_exact(bucket, object)
-                        .await
-                        .expect("aggregate-error cleanup metadata should remain readable")
-                        .is_none();
-                }
-                if metadata_absent && backend.remove_count().await == 1 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("aggregate failure must not suppress committed receipt dispatch");
+        // Exact reads can see subquorum metadata while workers remove each
+        // disk's free version. Inspect the final state after cleanup drains.
+        wait_for_expiry_workers_idle(&store).await;
+        for pool in &store.pools {
+            assert!(
+                pool.get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("aggregate-error cleanup metadata should remain readable")
+                    .is_none(),
+                "aggregate failure must not suppress committed receipt cleanup"
+            );
+        }
+        assert_eq!(
+            backend.remove_count().await,
+            1,
+            "committed receipts must remove the shared remote object once"
+        );
         assert_eq!(backend.object_count().await, 0, "the shared remote object should be removed exactly once");
         store
             .delete_bucket(bucket, &DeleteBucketOptions::default())

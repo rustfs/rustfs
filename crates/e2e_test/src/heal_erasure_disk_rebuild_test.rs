@@ -43,6 +43,13 @@ mod tests {
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
 
+    struct ReplacementDriveSelection {
+        replaced_disk: PathBuf,
+        replacement_format_path: PathBuf,
+        replacement_format: Vec<u8>,
+        expected_pool_metadata: Option<VersionShardCensus>,
+    }
+
     #[derive(serde::Deserialize)]
     struct EvidenceBuild {
         sha256: String,
@@ -592,6 +599,50 @@ mod tests {
 
     fn is_service_unavailable_put(error: &SdkError<PutObjectError>) -> bool {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
+    }
+
+    fn select_replacement_drive(
+        cluster: &RustFSTestClusterEnvironment,
+        node_index: usize,
+        require_pool_metadata: bool,
+    ) -> Result<ReplacementDriveSelection, Box<dyn Error + Send + Sync>> {
+        let node = cluster
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| format!("replacement node {node_index} is absent"))?;
+        let mut incomplete_pool_metadata = Vec::new();
+
+        for drive in &node.data_dirs {
+            let replaced_disk = PathBuf::from(drive);
+            let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
+            let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
+                format!("failed to capture target format before replacement wipe at {replacement_format_path:?}: {err}")
+            })?;
+            if !require_pool_metadata {
+                return Ok(ReplacementDriveSelection {
+                    replaced_disk,
+                    replacement_format_path,
+                    replacement_format,
+                    expected_pool_metadata: None,
+                });
+            }
+
+            let census = census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
+            if census.is_complete() {
+                return Ok(ReplacementDriveSelection {
+                    replaced_disk,
+                    replacement_format_path,
+                    replacement_format,
+                    expected_pool_metadata: Some(census),
+                });
+            }
+            incomplete_pool_metadata.push(census);
+        }
+
+        Err(format!(
+            "no replacement drive on node {node_index} held complete pool metadata before the fault: {incomplete_pool_metadata:?}"
+        )
+        .into())
     }
 
     async fn replacement_recovery_status(
@@ -1279,11 +1330,12 @@ mod tests {
         let bucket = "heal-restart-during-rebuild";
         clients[0].create_bucket().bucket(bucket).send().await?;
 
-        let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
-        let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
-        let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
-            format!("failed to capture target format before replacement wipe at {replacement_format_path:?}: {err}")
-        })?;
+        let ReplacementDriveSelection {
+            replaced_disk,
+            replacement_format_path,
+            replacement_format,
+            expected_pool_metadata,
+        } = select_replacement_drive(&cluster, 1, background_enabled)?;
         let default_online_object_count = if !outage_target_manifest_required { 96 } else { 24 };
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
             .ok()
@@ -1340,17 +1392,9 @@ mod tests {
             attempt_count += 1;
         }
 
-        let expected_pool_metadata = if background_enabled {
-            let census = census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
-            assert!(
-                census.is_complete(),
-                "target must hold complete pool metadata before the fault: {census:?}"
-            );
+        if background_enabled {
             wait_for_scanner_cycle_after(&cluster, 0).await?;
-            Some(census)
-        } else {
-            None
-        };
+        }
 
         cluster.stop_node(1)?;
         std::fs::remove_dir_all(&replaced_disk)?;
@@ -1366,19 +1410,13 @@ mod tests {
         );
 
         let outage_payload_seed = 0xf1;
-        let max_outage_write_attempts = if outage_target_manifest_required {
-            1
-        } else {
-            topology.total_drives().max(1)
-        };
+        let max_outage_write_attempts = topology.total_drives().max(1);
         let mut outage_key = None;
         let mut outage_write_deferred_until_rejoin = false;
+        let mut service_unavailable_outage_writes = 0usize;
+        let mut last_service_unavailable = None;
         for attempt in 0..max_outage_write_attempts {
-            let candidate_key = if max_outage_write_attempts == 1 {
-                "cluster/written-while-node-down.bin".to_string()
-            } else {
-                format!("cluster/written-while-node-down-{attempt:04}.bin")
-            };
+            let candidate_key = format!("cluster/written-while-node-down-{attempt:04}.bin");
             let put_result = timeout(
                 Duration::from_secs(30),
                 clients[2]
@@ -1394,7 +1432,10 @@ mod tests {
                     outage_key = Some(candidate_key);
                     break;
                 }
-                Ok(Err(error)) if !outage_target_manifest_required && is_service_unavailable_put(&error) => {}
+                Ok(Err(error)) if is_service_unavailable_put(&error) => {
+                    service_unavailable_outage_writes += 1;
+                    last_service_unavailable = Some(format!("{error:?}"));
+                }
                 Ok(Err(error)) => return Err(error.into()),
                 Err(error) => return Err(error.into()),
             }
@@ -1406,9 +1447,12 @@ mod tests {
                 "cluster/written-after-target-rejoin.bin".to_string()
             }
             None => {
-                return Err(
-                    format!("no online pool accepted an outage object after {max_outage_write_attempts} candidates").into(),
-                );
+                return Err(format!(
+                    "no online pool accepted an outage object after {max_outage_write_attempts} candidates; \
+                     observed {service_unavailable_outage_writes} ServiceUnavailable responses; \
+                     last ServiceUnavailable: {last_service_unavailable:?}"
+                )
+                .into());
             }
         };
 

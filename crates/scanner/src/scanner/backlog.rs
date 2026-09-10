@@ -1798,6 +1798,8 @@ pub(super) fn scanner_pause_backlog_now() -> u64 {
 mod tests {
     use super::*;
 
+    const NATIVE_RETIREMENT_DRIVES_PER_SET: usize = 2;
+
     fn run_native_retirement_test<C, F>(case: C)
     where
         C: FnOnce() -> F + Send + 'static,
@@ -1825,8 +1827,27 @@ mod tests {
     async fn native_retirement_store() -> (tempfile::TempDir, Arc<ECStore>) {
         register_scanner_pause_backlog_retirement();
         let root = tempfile::tempdir().expect("native retirement fixture directory");
-        let store = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, 3, 2).await;
+        let store = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+            root.path(),
+            false,
+            3,
+            2,
+            NATIVE_RETIREMENT_DRIVES_PER_SET,
+            false,
+        )
+        .await;
         (root, store)
+    }
+
+    async fn shutdown_native_retirement_store(store: Arc<ECStore>) {
+        if let Some(token) = store.background_cancel_token() {
+            token.cancel();
+        }
+        drop(store);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     async fn native_replica_bytes(set: &SetDisks) -> (Vec<u8>, String) {
@@ -1871,7 +1892,15 @@ mod tests {
 
         register_scanner_pause_backlog_retirement();
         let root = tempfile::tempdir().unwrap();
-        let old = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, old_pool_count, 2).await;
+        let old = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+            root.path(),
+            false,
+            old_pool_count,
+            2,
+            NATIVE_RETIREMENT_DRIVES_PER_SET,
+            false,
+        )
+        .await;
         let fault = unstable_source
             .then(|| NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&old.pools[0].disk_set[0]), "publish", 2));
         let now = unix_now();
@@ -1889,10 +1918,14 @@ mod tests {
         } else {
             controller.observe(observation(now + 1, true, 4)).await;
             controller.observe(observation(now + 2, false, 4)).await;
-            assert!(matches!(
-                controller.begin_attempt(now + 2).await,
-                ScannerPauseBacklogAttemptDecision::Tracked(_)
-            ));
+            let decision = controller.begin_attempt(now + 2).await;
+            assert!(
+                matches!(decision, ScannerPauseBacklogAttemptDecision::Tracked(_)),
+                "expected tracked native expansion setup attempt, got {decision:?}; ledger={:?}; persistence_disabled={}; runtime_error={:?}",
+                controller.loaded.ledger,
+                controller.persistence_disabled,
+                runtime_error()
+            );
             assert!(controller.loaded.ledger.has_unfinished_attempt());
         }
         let original = controller.loaded.ledger.clone();
@@ -1902,9 +1935,16 @@ mod tests {
         old.pool_meta_write_status()
             .await
             .expect("healthy pool metadata keeps the background recovery loop read-only");
-        old.background_cancel_token().expect("old store shutdown token").cancel();
-        drop(old);
-        let expanded = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, 3, 2).await;
+        shutdown_native_retirement_store(old).await;
+        let expanded = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+            root.path(),
+            false,
+            3,
+            2,
+            NATIVE_RETIREMENT_DRIVES_PER_SET,
+            false,
+        )
+        .await;
         for pool in expanded.pools.iter().skip(old_pool_count) {
             for set in &pool.disk_set {
                 let replica = read_scanner_pause_backlog_replica(Arc::clone(set)).await;
@@ -1999,12 +2039,16 @@ mod tests {
         }
 
         store.pool_meta_write_status().await.expect("healthy metadata before restart");
-        store
-            .background_cancel_token()
-            .expect("expanded store shutdown token")
-            .cancel();
-        drop(store);
-        let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, 3, 2).await;
+        shutdown_native_retirement_store(store).await;
+        let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+            root.path(),
+            false,
+            3,
+            2,
+            NATIVE_RETIREMENT_DRIVES_PER_SET,
+            false,
+        )
+        .await;
         let reloaded = load_scanner_pause_backlog(Arc::clone(&restarted))
             .await
             .expect("a new store must recover from disk without the failed controller");
@@ -2021,6 +2065,8 @@ mod tests {
         assert_eq!(retry_ledger.current_attempt_serial, original.current_attempt_serial);
         assert_eq!(retry_ledger.last_finished_attempt_serial, original.current_attempt_serial);
         assert_eq!(retry_ledger.consecutive_failures, original.consecutive_failures + 1);
+        drop(retried);
+        shutdown_native_retirement_store(restarted).await;
     }
 
     async fn assert_current_native_writer_ledger(store: &Arc<ECStore>, expected: &ScannerPauseBacklogLedger) {
@@ -2124,6 +2170,8 @@ mod tests {
                 .await
                 .expect("retry must seed, commit and stabilize the stale member");
             assert_current_native_writer_ledger(&store, &expected).await;
+            drop(target);
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2175,6 +2223,8 @@ mod tests {
                 .await
                 .expect("a fresh caller may finish the seeded membership transition");
             assert_current_native_writer_ledger(&store, &expected).await;
+            drop(pool_meta_lock);
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2235,6 +2285,7 @@ mod tests {
                 .await
                 .expect("retry must seed the newly visible members before committing");
             assert_current_native_writer_ledger(&store, &expected).await;
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2292,6 +2343,7 @@ mod tests {
                     assert_current_native_ledger(&store, &original).await;
                 }
                 assert!(original.has_unfinished_attempt());
+                shutdown_native_retirement_store(store).await;
             }
         });
     }
@@ -2337,14 +2389,22 @@ mod tests {
                     .pool_meta_write_status()
                     .await
                     .expect("healthy pool metadata keeps the background recovery loop read-only");
-                store.background_cancel_token().expect("old store shutdown token").cancel();
-                drop(store);
-                let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, 3, 2).await;
+                shutdown_native_retirement_store(store).await;
+                let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+                    root.path(),
+                    false,
+                    3,
+                    2,
+                    NATIVE_RETIREMENT_DRIVES_PER_SET,
+                    false,
+                )
+                .await;
                 for set_index in 0..2 {
                     restarted.retire_scanner_pause_backlog_for_test(0, set_index).await.unwrap();
                     assert_native_source_missing(&restarted, set_index).await;
                 }
                 assert_current_native_ledger(&restarted, &original).await;
+                shutdown_native_retirement_store(restarted).await;
             }
         });
     }
@@ -2384,9 +2444,16 @@ mod tests {
                 .pool_meta_write_status()
                 .await
                 .expect("healthy pool metadata keeps the background recovery loop read-only");
-            store.background_cancel_token().expect("old store shutdown token").cancel();
-            drop(store);
-            let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_sets(root.path(), false, 3, 2).await;
+            shutdown_native_retirement_store(store).await;
+            let restarted = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+                root.path(),
+                false,
+                3,
+                2,
+                NATIVE_RETIREMENT_DRIVES_PER_SET,
+                false,
+            )
+            .await;
             for set_index in 0..2 {
                 restarted.retire_scanner_pause_backlog_for_test(0, set_index).await.unwrap();
                 assert_native_source_missing(&restarted, set_index).await;
@@ -2396,6 +2463,7 @@ mod tests {
             assert_eq!(bootstrapped.ledger.generation, 1);
             assert!(bootstrapped.ledger.last_updated_at_unix_secs < future_now);
             assert_current_native_ledger(&restarted, &bootstrapped.ledger).await;
+            shutdown_native_retirement_store(restarted).await;
         });
     }
 
@@ -2441,6 +2509,8 @@ mod tests {
             assert_current_native_ledger(&store, &original).await;
             store.retire_scanner_pause_backlog_for_test(0, 1).await.unwrap();
             assert_native_source_missing(&store, 1).await;
+            drop(pool_meta_lock);
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2536,6 +2606,9 @@ mod tests {
                     "retirement never copied a stale source record"
                 );
             }
+            drop(pool_meta_lock);
+            drop(barrier);
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2669,11 +2742,12 @@ mod tests {
                 .retire_scanner_pause_backlog_for_test(0, 1)
                 .await
                 .expect("the remaining source set follows the same native proof");
-            let after = load_scanner_pause_backlog(store)
+            let after = load_scanner_pause_backlog(Arc::clone(&store))
                 .await
                 .expect("native restart selection after handoff");
             assert_eq!(after.ledger, new_ledger);
             assert!(after.durable && after.stable_matches_ledger);
+            shutdown_native_retirement_store(store).await;
         });
     }
 
@@ -2745,6 +2819,7 @@ mod tests {
                 .expect("retained target intent snapshot")
             };
             assert_eq!(after, before, "native cleanup never clears or estimates a target mutation intent");
+            shutdown_native_retirement_store(store).await;
         });
     }
 

@@ -226,6 +226,34 @@ fn record_segment_dirty_usage(bucket: &str) {
     }
 }
 
+fn replay_segment_dirty_usage(bucket: &str) {
+    replay_dirty_usage(
+        bucket,
+        ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+            entries: BTreeSet::from(["hot-segment".to_string()]),
+        },
+    );
+}
+
+fn replay_whole_bucket_dirty_usage(bucket: &str) {
+    replay_dirty_usage(bucket, ScannerDurableDirtyUsageReplayScope::WholeBucket);
+}
+
+fn replay_dirty_usage(bucket: &str, scope: ScannerDurableDirtyUsageReplayScope) {
+    replay_durable_dirty_usage_producer_record(
+        &encode_durable_dirty_usage_producer_replay_record(vec![ScannerDurableDirtyUsageReplayEntry {
+            bucket: bucket.to_string(),
+            generation: dirty_usage_generation(),
+            scope,
+            producers: crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+                .into_iter()
+                .collect(),
+        }])
+        .expect("durable segment replay should encode"),
+    )
+    .expect("durable segment replay should restore producer authority");
+}
+
 // The scoped fallback fixture keeps two EC pools and several scan futures live
 // at once. Run the async cases on a dedicated stack so Linux libtest defaults
 // exercise the assertions instead of aborting before the oracle finishes.
@@ -267,6 +295,7 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_
     create_bucket(&store, &hot).await;
     create_bucket(&store, &cold).await;
     record_segment_dirty_usage(&hot);
+    replay_segment_dirty_usage(&hot);
     let baseline = run_entry(&store, 1, None, true, false, false).await;
     persist_baseline(&store, &baseline).await;
 
@@ -283,6 +312,7 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_
         "hot-segment/object",
         crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
     );
+    replay_segment_dirty_usage(&hot);
     let usage = run_entry(&store, 3, Some(&hot), true, true, true).await;
     assert_eq!(usage.buckets_usage[&hot].objects_count, 2);
     assert_eq!(usage.buckets_usage[&cold].objects_count, 1);
@@ -298,6 +328,7 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_
             crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
         );
     }
+    replay_whole_bucket_dirty_usage(&hot);
     let usage = run_entry(&store, 4, Some(&hot), true, true, false).await;
     assert_eq!(usage.objects_total_count, 3);
 

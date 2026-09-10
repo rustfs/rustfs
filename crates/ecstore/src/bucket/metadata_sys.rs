@@ -248,10 +248,9 @@ fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -
 }
 
 pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
-    // The metadata system is inherently per-store (it holds the store handle
-    // and that store's bucket cache), so it lives on the store's own instance
-    // context (backlog#1052 S3) — a second instance initializes its own cell
-    // instead of panicking on the process-global one.
+    // The metadata system is inherently per-store, so it lives on the store's
+    // own instance context (backlog#1052 S3). It resolves the store through a
+    // weak handle so the context cache cannot keep the store and disks alive.
     let instance_ctx = api.ctx.clone();
     let is_dist_erasure = instance_ctx.is_dist_erasure().await;
 
@@ -317,18 +316,22 @@ fn start_refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>) {
         warn!("bucket metadata refresh loop skipped because background cancellation token is not initialized");
         return;
     };
+    let sys = Arc::downgrade(&sys);
 
     tokio::spawn(async move {
         refresh_buckets_metadata_loop(sys, cancel_token).await;
     });
 }
 
-async fn refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>, cancel_token: CancellationToken) {
+async fn refresh_buckets_metadata_loop(sys: Weak<RwLock<BucketMetadataSys>>, cancel_token: CancellationToken) {
     loop {
         if !wait_refresh_interval_or_cancel(&cancel_token, BUCKET_METADATA_REFRESH_INTERVAL).await {
             break;
         }
-        refresh_buckets_metadata_once(sys.clone()).await;
+        let Some(sys) = sys.upgrade() else {
+            break;
+        };
+        refresh_buckets_metadata_once(sys).await;
     }
 }
 
@@ -455,7 +458,7 @@ pub(crate) async fn object_store_in(ctx: &crate::runtime::instance::InstanceCont
 
 pub(crate) async fn object_store_if_initialized_in(ctx: &crate::runtime::instance::InstanceContext) -> Option<Arc<ECStore>> {
     let sys = ctx.bucket_metadata_sys().or_else(get_global_bucket_metadata_sys)?;
-    Some(sys.read().await.api.clone())
+    sys.read().await.object_store_if_live()
 }
 
 pub(crate) async fn get_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -475,7 +478,7 @@ pub(crate) async fn get_config_from_disk_with_presence_in(
     bucket: &str,
 ) -> Result<(BucketMetadata, bool)> {
     let sys = bucket_metadata_sys_of(ctx)?;
-    let api = sys.read().await.api.clone();
+    let api = sys.read().await.object_store();
     load_bucket_metadata_parse_with_presence(api, bucket, true).await
 }
 
@@ -738,7 +741,7 @@ pub async fn acquire_scanner_bucket_incarnation_fence(
 ) -> Result<BucketMetadataMutationGuard> {
     super::utils::check_valid_bucket_name(bucket)?;
     let sys = get_bucket_metadata_sys()?;
-    if expected_owner_id.is_nil() || sys.read().await.api.id != expected_owner_id || expected_incarnation_id.is_nil() {
+    if expected_owner_id.is_nil() || sys.read().await.object_store().id != expected_owner_id || expected_incarnation_id.is_nil() {
         return Err(Error::other("scanner bucket incarnation owner does not match"));
     }
     acquire_config_write_guard_with_migration(sys, bucket, Some(expected_incarnation_id), false).await
@@ -751,7 +754,7 @@ async fn acquire_config_write_guard_with_migration(
     migrate: bool,
 ) -> Result<BucketMetadataMutationGuard> {
     let metadata_sys = sys.read().await.clone();
-    let lifecycle_guard = metadata_sys.api.acquire_bucket_lifecycle_read_lock(bucket).await?;
+    let lifecycle_guard = metadata_sys.object_store().acquire_bucket_lifecycle_read_lock(bucket).await?;
 
     // Legacy buckets are migrated while the lifecycle fence prevents a
     // same-name replacement. The second read under the write transaction is
@@ -782,7 +785,7 @@ async fn acquire_config_write_guard_with_migration(
             "bucket config existence transaction validation",
             async {
                 match metadata_sys
-                    .api
+                    .object_store()
                     .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
                 {
@@ -802,7 +805,7 @@ async fn acquire_config_write_guard_with_migration(
             Some(&transaction_guard),
             bucket,
             "bucket config incarnation transaction validation",
-            load_bucket_incarnation(metadata_sys.api.clone(), bucket),
+            load_bucket_incarnation(metadata_sys.object_store(), bucket),
         ),
     )
     .await?
@@ -1461,7 +1464,7 @@ pub struct BucketMetadataSys {
     /// Physically missing names are TTL-bounded to limit memory under bogus
     /// name floods while avoiding repeated namespace and erasure reads.
     missing_buckets: moka::future::Cache<String, ()>,
-    api: Arc<ECStore>,
+    api: Weak<ECStore>,
 }
 
 impl BucketMetadataSys {
@@ -1489,12 +1492,17 @@ impl BucketMetadataSys {
                 .max_capacity(MISSING_BUCKET_MAX_ENTRIES)
                 .time_to_live(MISSING_BUCKET_TTL)
                 .build(),
-            api,
+            api: Arc::downgrade(&api),
         }
     }
 
     pub(crate) fn object_store(&self) -> Arc<ECStore> {
-        self.api.clone()
+        self.object_store_if_live()
+            .expect("bucket metadata object store should still be live")
+    }
+
+    fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
+        self.api.upgrade()
     }
 
     fn metadata_publish_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
@@ -1549,7 +1557,7 @@ impl BucketMetadataSys {
     ) -> Result<bool> {
         await_bucket_namespace_operation(Some(namespace_guard), bucket, operation, async {
             match self
-                .api
+                .object_store()
                 .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                 .await
             {
@@ -1566,7 +1574,7 @@ impl BucketMetadataSys {
     }
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
         let count = self
-            .api
+            .object_store()
             .pools
             .iter()
             .map(|pool| pool.disk_set.len())
@@ -1598,7 +1606,7 @@ impl BucketMetadataSys {
         let mut futures = Vec::new();
 
         for bucket in buckets.iter() {
-            let api = self.api.clone();
+            let api = self.object_store();
             let bucket = bucket.clone();
             futures.push(async move {
                 sleep(Duration::from_millis(30)).await;
@@ -1644,7 +1652,9 @@ impl BucketMetadataSys {
             let bucket = bucket.clone();
             futures.push(async move {
                 sleep(Duration::from_millis(30)).await;
-                let api = sys.read().await.api.clone();
+                let Some(api) = sys.read().await.object_store_if_live() else {
+                    return Ok(());
+                };
                 let namespace_lock = api.new_ns_lock(&bucket, &bucket).await?;
                 let namespace_guard = namespace_lock
                     .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
@@ -1685,7 +1695,7 @@ impl BucketMetadataSys {
             Some(namespace_guard),
             bucket,
             "bucket metadata heal existence check",
-            self.api.bucket_exists_for_heal(bucket),
+            self.object_store().bucket_exists_for_heal(bucket),
         )
         .await?
         {
@@ -1709,7 +1719,7 @@ impl BucketMetadataSys {
             Some(namespace_guard),
             bucket,
             "bucket metadata heal",
-            self.api.heal_bucket(
+            self.object_store().heal_bucket(
                 bucket,
                 &HealOpts {
                     recreate: true,
@@ -1723,7 +1733,7 @@ impl BucketMetadataSys {
             Some(namespace_guard),
             bucket,
             "bucket metadata load",
-            load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true),
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
         match mode {
@@ -1903,7 +1913,7 @@ impl BucketMetadataSys {
         // (backlog#1052 S7). Reading from the ambient handle instead made the
         // read and the write of a single read-modify-write able to target
         // different instances.
-        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.api.clone(), bucket, parse)).await?;
+        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.object_store(), bucket, parse)).await?;
         if !bm.bucket_incarnation_sidecar || bm.bucket_incarnation_id != expected_incarnation_id {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
@@ -1942,7 +1952,7 @@ impl BucketMetadataSys {
     where
         F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
     {
-        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.api.clone(), bucket, true)).await?;
+        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.object_store(), bucket, true)).await?;
         if !bm.bucket_incarnation_sidecar || bm.bucket_incarnation_id != expected_incarnation_id {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
@@ -1993,7 +2003,7 @@ impl BucketMetadataSys {
     /// server's metadata never leaks into the ambient (first) instance.
     pub(crate) async fn persist_and_set(&self, bm: BucketMetadata) -> Result<()> {
         let mut bm = bm;
-        bm.save_with_store(self.api.clone()).await?;
+        bm.save_with_store(self.object_store()).await?;
 
         self.set(bm.name.clone(), Arc::new(bm)).await;
 
@@ -2001,8 +2011,8 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
-        bm.save_with_store(self.api.clone()).await?;
-        save_bucket_incarnation(self.api.clone(), &bm.name, bm.bucket_incarnation_id).await?;
+        bm.save_with_store(self.object_store()).await?;
+        save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
         self.set(bm.name.clone(), Arc::new(bm)).await;
         Ok(())
@@ -2019,7 +2029,7 @@ impl BucketMetadataSys {
             return Err(Error::other("errInvalidArgument"));
         }
 
-        load_bucket_metadata(self.api.clone(), bucket).await
+        load_bucket_metadata(self.object_store(), bucket).await
     }
 
     /// Reload persisted metadata under the bucket namespace generation fence.
@@ -2033,7 +2043,7 @@ impl BucketMetadataSys {
             return Err(Error::other("errInvalidArgument"));
         }
 
-        let namespace_lock = self.api.new_ns_lock(bucket, bucket).await?;
+        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
         let namespace_guard = namespace_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
@@ -2056,7 +2066,7 @@ impl BucketMetadataSys {
             Some(namespace_guard),
             bucket,
             "peer bucket metadata load",
-            load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true),
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
         if !persisted {
@@ -2101,11 +2111,11 @@ impl BucketMetadataSys {
             #[cfg(test)]
             self.lazy_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let lock = self.api.new_ns_lock(bucket, bucket).await?;
+            let lock = self.object_store().new_ns_lock(bucket, bucket).await?;
             let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
             #[cfg(test)]
             if self.lazy_load_lock_probe.load(std::sync::atomic::Ordering::Relaxed) {
-                let competing = self.api.new_ns_lock(bucket, bucket).await?;
+                let competing = self.object_store().new_ns_lock(bucket, bucket).await?;
                 assert!(
                     competing.get_write_lock(Duration::from_millis(20)).await.is_err(),
                     "lazy metadata IO must start while the bucket namespace read lock is held"
@@ -2115,7 +2125,7 @@ impl BucketMetadataSys {
                 Some(&guard),
                 bucket,
                 "lazy bucket metadata load",
-                Box::pin(load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true)),
+                Box::pin(load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true)),
             )
             .await?;
 
@@ -2127,7 +2137,7 @@ impl BucketMetadataSys {
                     bucket,
                     "lazy bucket metadata existence check",
                     Box::pin(async {
-                        self.api
+                        self.object_store()
                             .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                             .await
                             .map(|_| ())
@@ -2334,13 +2344,13 @@ impl BucketMetadataSys {
 
     async fn get_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
         let transaction_lock = self
-            .api
+            .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
             .await?;
         let _transaction_guard = transaction_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
-        let incarnation_id = load_bucket_incarnation(self.api.clone(), bucket).await?;
+        let incarnation_id = load_bucket_incarnation(self.object_store(), bucket).await?;
         if _transaction_guard.is_lock_lost() {
             return Err(Error::other(format!("bucket incarnation metadata transaction lock was lost: {bucket}")));
         }
@@ -2376,7 +2386,7 @@ impl BucketMetadataSys {
 
     async fn migrate_legacy_metadata(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
         let transaction_lock = self
-            .api
+            .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
             .await?;
         let _transaction_guard = transaction_lock
@@ -2401,7 +2411,7 @@ impl BucketMetadataSys {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));
         }
 
-        let namespace_lock = self.api.new_ns_lock(bucket, bucket).await?;
+        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
         let namespace_guard = namespace_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
@@ -2411,7 +2421,7 @@ impl BucketMetadataSys {
             bucket,
             "legacy bucket metadata existence check",
             async {
-                self.api
+                self.object_store()
                     .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
             },
@@ -2435,7 +2445,7 @@ impl BucketMetadataSys {
             Some(&namespace_guard),
             bucket,
             "legacy bucket metadata confirmation",
-            load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true),
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
         if persisted && !metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() {
@@ -2457,20 +2467,20 @@ impl BucketMetadataSys {
             }
             #[cfg(test)]
             if self.legacy_migration_lock_probe.load(std::sync::atomic::Ordering::Relaxed) {
-                let competing = self.api.new_ns_lock(bucket, bucket).await?;
+                let competing = self.object_store().new_ns_lock(bucket, bucket).await?;
                 assert!(
                     competing.get_write_lock(Duration::from_millis(20)).await.is_err(),
                     "bucket delete/recreate must not cross the legacy metadata migration fence"
                 );
             }
-            save_bucket_incarnation(self.api.clone(), bucket, metadata.bucket_incarnation_id).await?;
+            save_bucket_incarnation(self.object_store(), bucket, metadata.bucket_incarnation_id).await?;
             metadata.bucket_incarnation_sidecar = true;
             if !persisted {
                 await_bucket_namespace_operation(
                     Some(&namespace_guard),
                     bucket,
                     "legacy bucket metadata migration",
-                    metadata.save_with_store(self.api.clone()),
+                    metadata.save_with_store(self.object_store()),
                 )
                 .await?;
             }
@@ -2506,7 +2516,7 @@ impl BucketMetadataSys {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));
         }
 
-        let namespace_lock = self.api.new_ns_lock(bucket, bucket).await?;
+        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
         let namespace_guard = namespace_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
@@ -2515,7 +2525,7 @@ impl BucketMetadataSys {
             bucket,
             "bucket metadata snapshot existence check",
             async {
-                self.api
+                self.object_store()
                     .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
             },
@@ -2531,7 +2541,7 @@ impl BucketMetadataSys {
             Some(&namespace_guard),
             bucket,
             "bucket metadata authoritative snapshot",
-            load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true),
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
         if persisted {
@@ -3695,7 +3705,7 @@ mod tests {
         let mut stale = BucketMetadata::new("recreated-bucket");
         stale.policy_config_json = b"old-generation".to_vec();
         let namespace_lock = sys
-            .api
+            .object_store()
             .new_ns_lock("recreated-bucket", "recreated-bucket")
             .await
             .expect("namespace lock should be created");

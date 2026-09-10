@@ -1321,6 +1321,38 @@ mod tests {
         .expect("token auth must map to a source");
     }
 
+    /// A pending acquisition cannot take the returned-error fallback: the
+    /// outer login policy must cut it off before publishing a client.
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_initial_login_is_bounded_by_the_attempt_timeout() {
+        let state = Arc::new(ScriptedState::default());
+        let source = ScriptedSource {
+            state: state.clone(),
+            ttl: Duration::ZERO,
+            renewable: false,
+            login_delay: Duration::from_secs(60),
+        };
+        let policy = test_policy(Duration::from_secs(10), Duration::from_secs(5));
+        let attempt_timeout = policy.retry.attempt_timeout;
+        let started = Instant::now();
+        let result = VaultCredentialProvider::new(test_settings(), Box::new(source), policy).await;
+        assert!(
+            matches!(&result, Err(KmsError::OperationTimedOut { message }) if message.starts_with("vault_login attempt 1 timed out")),
+            "a stalled login must return its typed timeout without publishing a client"
+        );
+        assert_eq!(
+            started.elapsed(),
+            attempt_timeout,
+            "login must consume exactly one virtual attempt budget"
+        );
+        assert_eq!(state.login_calls.load(Ordering::SeqCst), 0, "the acquisition must not complete");
+        assert_eq!(
+            state.renew_calls.load(Ordering::SeqCst),
+            0,
+            "failed initialization must not start renewal"
+        );
+    }
+
     /// backlog#2369 P3: `vault token create` defaults to a 768-hour TTL, so
     /// hard-coding "no lease" for token auth left the renewal task unstarted
     /// and turned a healthy cluster into one that answers 403 a month later.
