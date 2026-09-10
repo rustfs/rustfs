@@ -213,6 +213,11 @@ pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
 /// Environment variable for console server address.
 pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
 
+/// URL path prefix for the embedded console, read once at server startup.
+pub const ENV_RUSTFS_CONSOLE_PREFIX: &str = "RUSTFS_CONSOLE_PREFIX";
+/// Default embedded console URL path prefix.
+pub const DEFAULT_CONSOLE_PREFIX: &str = "/rustfs/console";
+
 /// Public browser entrypoint used to build OIDC callback and console redirects.
 ///
 /// This should be the externally reachable scheme and authority, without a path.

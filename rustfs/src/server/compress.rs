@@ -418,7 +418,7 @@ impl PathCategory {
             PathCategory::InternodeRpc
         } else if path.starts_with("/rustfs/admin/") || path.starts_with("/minio/admin/") {
             PathCategory::AdminApi
-        } else if path.starts_with("/rustfs/console") {
+        } else if crate::server::has_path_prefix(path, crate::server::console_prefix()) {
             PathCategory::Console
         } else if path == "/health"
             || path.starts_with("/health/")
