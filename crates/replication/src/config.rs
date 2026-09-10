@@ -730,12 +730,16 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
         }
 
+        // Highest priority first, like MinIO's `FilterActionableRules`. The
+        // tie-breakers make this a total order: a comparator that only
+        // orders same-destination pairs is not transitive, and the standard
+        // library sort panics on such inputs past its insertion-sort
+        // threshold (backlog#2367 C-1).
         rules.sort_by(|a, b| {
-            if a.destination == b.destination {
-                b.priority.cmp(&a.priority)
-            } else {
-                std::cmp::Ordering::Equal
-            }
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.destination.bucket.cmp(&b.destination.bucket))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         rules
@@ -813,23 +817,18 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             return vec![role.to_string()];
         }
 
-        let mut arns = Vec::new();
-        let mut targets_map: HashSet<String> = HashSet::new();
-        let rules = self.filter_actionable_rules(obj);
-
-        for rule in rules {
+        // Rule order (priority descending) is the ARN order: callers that
+        // iterate targets see the highest-priority destination first.
+        let mut arns: Vec<String> = Vec::new();
+        for rule in self.filter_actionable_rules(obj) {
             if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
                 continue;
             }
 
             let arn = rule.destination.bucket.trim();
-            if !arn.is_empty() && !targets_map.contains(arn) {
-                targets_map.insert(arn.to_string());
+            if !arn.is_empty() && !arns.iter().any(|seen| seen == arn) {
+                arns.push(arn.to_string());
             }
-        }
-
-        for arn in targets_map {
-            arns.push(arn);
         }
         arns
     }
@@ -1906,6 +1905,84 @@ mod tests {
         });
 
         assert_eq!(decisions, vec![(target_a.to_string(), false), (target_b.to_string(), true)]);
+    }
+
+    // backlog#2367 C-1: the actionable-rule sort must be a total order. A
+    // comparator that answers `Equal` for different destinations but orders
+    // same-destination rules by priority is not transitive, and the standard
+    // library sort panics on such inputs once the slice is past the
+    // insertion-sort threshold (> 20 rules).
+    #[test]
+    fn actionable_rule_sort_is_a_total_order_across_destinations() {
+        let targets = ["arn:target:a", "arn:target:b", "arn:target:c"];
+        let mut seed: u64 = 0x2367;
+        for _ in 0..200 {
+            let rule_count = 21 + (seed % 200) as usize;
+            let rules = (0..rule_count)
+                .map(|index| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let target = targets[(seed >> 33) as usize % targets.len()];
+                    delete_marker_rule(&format!("r{index}"), target, "", index as i32, true)
+                })
+                .collect();
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules,
+            };
+            let ordered = config.filter_actionable_rules(&ObjectOpts {
+                name: "logs/app.log".to_string(),
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            });
+            assert_eq!(ordered.len(), rule_count);
+            assert!(
+                ordered.windows(2).all(|pair| pair[0].priority >= pair[1].priority),
+                "actionable rules must be ordered by descending priority"
+            );
+        }
+    }
+
+    // backlog#2367 C-2: a V1 rule carries its prefix at the top level (no
+    // <Filter>). Ignoring it made `<Prefix>logs/</Prefix>` match every object.
+    #[test]
+    fn top_level_rule_prefix_scopes_matching_without_a_filter() {
+        let arn = "arn:target:a";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![delete_marker_rule("v1-prefix", arn, "logs/", 1, true)],
+        };
+        assert_eq!(config.rules[0].prefix(), "logs/");
+
+        let matching = config.filter_actionable_rules(&ObjectOpts {
+            name: "logs/app.log".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+        assert_eq!(matching.len(), 1);
+
+        let outside = config.filter_actionable_rules(&ObjectOpts {
+            name: "data/app.log".to_string(),
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        });
+        assert!(outside.is_empty(), "an object outside the V1 prefix must not match: {outside:?}");
+        assert!(
+            config
+                .filter_target_arns(&ObjectOpts {
+                    name: "data/app.log".to_string(),
+                    op_type: ReplicationType::Object,
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+
+        // A <Filter> still wins over the deprecated top-level element.
+        let mut filtered = delete_marker_rule("filtered", arn, "logs/", 1, true);
+        filtered.filter = Some(s3s::dto::ReplicationRuleFilter {
+            prefix: Some("photos/".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(filtered.prefix(), "photos/");
     }
 
     #[test]
