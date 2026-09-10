@@ -58,8 +58,10 @@ cd "$(dirname "$0")/.."
 # 1589 -> 1588 on 2026-09-08: the GA blocker set (rustfs/backlog#2366) added
 # three invocation lines to the endpoint-refresh paths and folded the five
 # copies of the concurrent-change error into one constructor, netting -1.
+# 1588 -> 1586 on 2026-09-10: the release merge no longer introduces direct
+# s3_error! constructors for heal percent-decoding or tagging not-found errors.
 S3S_IMPORT_FILES_BASELINE=213
-S3_ERROR_LINES_BASELINE=1588
+S3_ERROR_LINES_BASELINE=1586
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;
