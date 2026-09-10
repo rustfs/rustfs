@@ -265,7 +265,9 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-scanner-heal-evidence.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-}"
-cargo clean -p rustfs
+if [[ "${RUSTFS_SCANNER_HEAL_SKIP_CLEAN:-false}" != "true" ]]; then
+    cargo clean -p rustfs
+fi
 if [[ -n "$BUILD_FEATURES" ]]; then
     cargo build --locked -p rustfs --bins --features "$BUILD_FEATURES"
 else
