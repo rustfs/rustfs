@@ -24,7 +24,7 @@ use crate::admin::storage_api::config::{
     read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_server_config_snapshot,
 };
 use crate::admin::utils::json_response;
-use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX};
+use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -824,7 +824,8 @@ fn build_console_redirect(
     let fragment =
         build_console_callback_fragment(access_key, secret_key, session_token, expiration, redirect_after, logout_token);
 
-    let callback_path = format!("{CONSOLE_PREFIX}{CONSOLE_OIDC_CALLBACK_SUFFIX}");
+    let console_prefix = console_prefix();
+    let callback_path = format!("{console_prefix}{CONSOLE_OIDC_CALLBACK_SUFFIX}");
     if let Some(base_url) = browser_redirect_url(&callback_path)? {
         return Ok(format!("{base_url}#{fragment}"));
     }
@@ -836,7 +837,8 @@ fn build_console_redirect(
 }
 
 fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
-    let login_path = format!("{CONSOLE_PREFIX}{CONSOLE_LOGIN_SUFFIX}");
+    let console_prefix = console_prefix();
+    let login_path = format!("{console_prefix}{CONSOLE_LOGIN_SUFFIX}");
     if let Some(url) = browser_redirect_url(&login_path)? {
         return Ok(url);
     }
@@ -1673,6 +1675,26 @@ mod tests {
     }
 
     #[test]
+    fn console_prefix_process_case_oidc() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = console_prefix();
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/callback/default", Some("internal:9000"), None);
+        assert_eq!(
+            build_console_login_redirect(&req).expect("login URL"),
+            format!("https://console.example.com{prefix}/auth/login")
+        );
+        let redirect = build_console_redirect(&req, "access", "secret", "token", None, None, None).expect("console callback URL");
+        assert!(redirect.starts_with(&format!("https://console.example.com{prefix}/auth/oidc-callback/#")));
+        assert_eq!(
+            derive_callback_uri(&req, "default").expect("admin callback URL"),
+            "https://console.example.com/rustfs/admin/v3/oidc/callback/default"
+        );
+    }
+
+    #[test]
     fn test_build_console_redirect_uses_browser_redirect_url() {
         let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/callback/default", Some("internal:9000"), None);
 
@@ -1681,7 +1703,7 @@ mod tests {
                 .expect("console redirect should use browser redirect URL")
         });
 
-        assert!(redirect.starts_with(&format!("https://console.example.com{CONSOLE_PREFIX}/auth/oidc-callback/#")));
+        assert!(redirect.starts_with(&format!("https://console.example.com{}/auth/oidc-callback/#", console_prefix())));
         assert!(redirect.contains("redirect=%2Fbuckets"));
         assert!(redirect.contains("logoutToken=logout-token"));
     }
@@ -1694,7 +1716,7 @@ mod tests {
             build_console_login_redirect(&req).expect("login redirect should use browser redirect URL")
         });
 
-        assert_eq!(redirect, format!("https://console.example.com{CONSOLE_PREFIX}/auth/login"));
+        assert_eq!(redirect, format!("https://console.example.com{}/auth/login", console_prefix()));
     }
 
     #[test]

@@ -418,7 +418,7 @@ impl PathCategory {
             PathCategory::InternodeRpc
         } else if path.starts_with("/rustfs/admin/") || path.starts_with("/minio/admin/") {
             PathCategory::AdminApi
-        } else if crate::server::has_path_prefix(path, crate::server::CONSOLE_PREFIX) {
+        } else if crate::server::has_path_prefix(path, crate::server::console_prefix()) {
             PathCategory::Console
         } else if path == "/health"
             || path.starts_with("/health/")
@@ -766,15 +766,10 @@ mod tests {
 
     #[test]
     fn test_path_category_classify_console() {
-        assert_eq!(
-            PathCategory::classify(&format!("{}/index.html", crate::server::CONSOLE_PREFIX)),
-            PathCategory::Console
-        );
-        assert_eq!(PathCategory::classify(crate::server::CONSOLE_PREFIX), PathCategory::Console);
-        assert_eq!(
-            PathCategory::classify(&format!("{}-other/index.html", crate::server::CONSOLE_PREFIX)),
-            PathCategory::S3DataPlane
-        );
+        let prefix = crate::server::console_prefix();
+        assert_eq!(PathCategory::classify(&format!("{prefix}/index.html")), PathCategory::Console);
+        assert_eq!(PathCategory::classify(prefix), PathCategory::Console);
+        assert_eq!(PathCategory::classify(&format!("{prefix}-other/index.html")), PathCategory::S3DataPlane);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    CONSOLE_PREFIX, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
+    ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
@@ -965,6 +965,7 @@ pub async fn start_http_server(
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<(ShutdownHandle, SocketAddr)> {
+    crate::server::init_console_prefix()?;
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
 
     // The listening address and port are obtained from the parameters
@@ -1212,6 +1213,7 @@ pub async fn start_http_server(
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
         admin::console::init_console_cfg(local_ip, local_port);
+        let console_prefix = crate::server::console_prefix();
 
         info!(
             target: "rustfs::console::startup",
@@ -1219,7 +1221,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console",
-            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}{CONSOLE_PREFIX}/index.html"),
+            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}{console_prefix}/index.html"),
             "Startup endpoint available"
         );
         info!(
@@ -1228,7 +1230,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console_localhost",
-            endpoint = %format!("{protocol}://127.0.0.1:{local_port}{CONSOLE_PREFIX}/index.html"),
+            endpoint = %format!("{protocol}://127.0.0.1:{local_port}{console_prefix}/index.html"),
             "Startup endpoint available"
         );
     } else {
