@@ -13227,6 +13227,33 @@ mod transition_commit_failure_tests {
         metadata
     }
 
+    async fn rewrite_current_file_info_on_disks(
+        disks: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        mut rewrite: impl FnMut(&mut FileInfo),
+    ) {
+        for disk in disks {
+            let mut file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("current fixture metadata should be readable");
+            rewrite(&mut file_info);
+
+            let mut file_meta = FileMeta::new();
+            file_meta
+                .add_version(file_info)
+                .expect("rewritten fixture metadata should encode");
+            disk.write_all(
+                bucket,
+                &format!("{object}/{}", crate::disk::STORAGE_FORMAT_FILE),
+                Bytes::from(file_meta.marshal_msg().expect("rewritten fixture metadata should serialize")),
+            )
+            .await
+            .expect("rewritten fixture metadata should be persisted");
+        }
+    }
+
     #[test]
     fn restore_tier_mutation_retry_backoff_is_bounded() {
         assert_eq!(restore_tier_mutation_retry_delay(0), Duration::from_millis(250));
@@ -13842,31 +13869,15 @@ mod transition_commit_failure_tests {
             .expect("source object should transition before restore");
 
         let operation_id = Uuid::new_v4();
-        let (mut source_fi, _, online_disks) = set_disks
-            .get_object_fileinfo(
-                bucket,
-                object,
-                &ObjectOptions {
-                    no_lock: true,
-                    metadata_cache_safe: false,
-                    ..Default::default()
-                },
-                true,
-                false,
-            )
-            .await
-            .expect("transitioned metadata should be readable")
-            .into_owned();
-        source_fi.metadata.extend(restore_metadata(operation_id, true));
-        rustfs_utils::http::insert_str(
-            &mut source_fi.metadata,
-            rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-            "invalid".to_string(),
-        );
-        set_disks
-            .update_object_meta(bucket, object, source_fi, &online_disks)
-            .await
-            .expect("invalid backend identity fixture should be persisted");
+        rewrite_current_file_info_on_disks(&disk_stores, bucket, object, |file_info| {
+            file_info.metadata.extend(restore_metadata(operation_id, true));
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut file_info.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                "f".repeat(64),
+            );
+        })
+        .await;
         set_disks.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let mut opts = ObjectOptions::default();
@@ -13876,11 +13887,9 @@ mod transition_commit_failure_tests {
             .clone()
             .restore_transitioned_object(bucket, object, &opts)
             .await
-            .expect_err("invalid backend identity must fail before the tier read");
+            .expect_err("stale backend identity must fail before the tier read");
         assert!(
-            error
-                .to_string()
-                .contains("transition tier backend identity has an invalid length"),
+            error.to_string().contains("Remote tier backend identity no longer matches"),
             "cleanup must preserve the primary validation error: {error}"
         );
 

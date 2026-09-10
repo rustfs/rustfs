@@ -19088,36 +19088,7 @@ mod tests {
                         .bucket_incarnation_id_from_disk(bucket)
                         .await
                         .expect("bucket incarnation should be available");
-                    for disk_index in 0..4 {
-                        let metadata_path = temp_dir
-                            .path()
-                            .join(format!("pool0/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
-                        let encoded = tokio::fs::read(&metadata_path)
-                            .await
-                            .expect("transition metadata should be readable");
-                        let mut metadata = FileMeta::load(&encoded).expect("transition metadata should decode");
-                        let mut transitioned = metadata
-                            .get_all_file_info_versions(bucket, object, true)
-                            .expect("transitioned versions should decode")
-                            .versions
-                            .into_iter()
-                            .find(|version| version.version_id == history.version_id)
-                            .expect("transitioned history should exist");
-                        transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-                        rustfs_utils::http::metadata_compat::remove_str(
-                            &mut transitioned.metadata,
-                            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
-                        );
-                        metadata
-                            .add_version(transitioned)
-                            .expect("unknown state should replace the transitioned version");
-                        tokio::fs::write(
-                            &metadata_path,
-                            metadata.marshal_msg().expect("unknown transition metadata should encode"),
-                        )
-                        .await
-                        .expect("unknown transition metadata should be written");
-                    }
+                    rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, false).await;
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
                         action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                         rule_id: "delete-all-versions".to_string(),
