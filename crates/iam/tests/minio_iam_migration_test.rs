@@ -119,7 +119,12 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         let error = try_migrate_iam_config(env.ecstore.clone(), None)
             .await
             .expect_err("empty or incompatible supported IAM metadata must prevent startup readiness");
-        assert!(error.to_string().contains(format_path), "failure must identify the supported record");
+        let io_error = std::io::Error::from(error);
+        let detail = io_error
+            .get_ref()
+            .and_then(|context| context.source())
+            .expect("failure must retain the supported record in its source");
+        assert!(detail.to_string().contains(format_path), "failure must identify the supported record");
     }
     seed_legacy_iam_object(&env, format_path, &json!({"version": 1})).await;
 

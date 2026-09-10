@@ -53,6 +53,25 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
+#[derive(Debug, thiserror::Error)]
+enum MigrationMetadataError {
+    #[error("empty legacy metadata: {0}")]
+    Empty(String),
+    #[error("incompatible legacy metadata: {0}")]
+    Incompatible(String),
+}
+
+impl From<MigrationMetadataError> for Error {
+    fn from(error: MigrationMetadataError) -> Self {
+        let message = match &error {
+            MigrationMetadataError::Empty(_) => "empty legacy metadata",
+            MigrationMetadataError::Incompatible(_) => "incompatible legacy metadata",
+        };
+        // Keep the record path in the typed source, not in the quorum grouping key.
+        Self::other_with_context(message, error)
+    }
+}
+
 /// Callback used to decrypt an at-rest config blob during MinIO -> RustFS migration.
 ///
 /// MinIO encrypts IAM identity/service-account files and the server config at rest
@@ -305,10 +324,10 @@ where
 
     let data = rd.read_all().await?;
     if data.is_empty() {
-        return Err(Error::other(format!("empty legacy {label}")));
+        return Err(MigrationMetadataError::Empty(path.to_owned()).into());
     }
     let data = normalize_bucket_meta_blob(path, &data)
-        .map_err(|_| Error::other(format!("incompatible legacy {label}")))?
+        .map_err(|_| MigrationMetadataError::Incompatible(path.to_owned()))?
         .unwrap_or(data);
 
     let mut put_data = PutObjReader::from_vec(data);
@@ -389,7 +408,7 @@ where
                 .await?;
             let data = rd.read_all().await?;
             if data.is_empty() {
-                return Err(Error::other(format!("empty legacy IAM config: {path}")));
+                return Err(MigrationMetadataError::Empty(path.to_owned()).into());
             }
             // MinIO encrypts IAM identity/service-account files at rest. Decrypt
             // before normalizing; fall back to the raw bytes when no key applies
@@ -405,7 +424,7 @@ where
                     continue;
                 }
                 // Parser errors may contain credential data. Report only the path.
-                Err(_) => return Err(Error::other(format!("incompatible legacy IAM config: {path}"))),
+                Err(_) => return Err(MigrationMetadataError::Incompatible(path.to_owned()).into()),
             };
             let mut put_data = PutObjReader::from_vec(data);
             store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts).await?;
@@ -438,6 +457,31 @@ fn next_iam_migration_page(truncated: bool, previous: Option<String>, next: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migration_errors_group_by_cause_and_retain_typed_record_context() {
+        use super::{Error, MigrationMetadataError};
+
+        for make_error in [MigrationMetadataError::Empty, MigrationMetadataError::Incompatible] {
+            let first: Error = make_error("buckets/first/.metadata.bin".into()).into();
+            let second: Error = make_error("buckets/second/.metadata.bin".into()).into();
+            assert_eq!(first, second, "record paths must not fragment error grouping");
+            assert_eq!(first.clone(), second, "cloning must preserve error grouping");
+
+            let io_error = std::io::Error::from(first);
+            let detail = io_error
+                .get_ref()
+                .and_then(|context| context.source())
+                .expect("record context must remain in the error source");
+            assert!(detail.downcast_ref::<MigrationMetadataError>().is_some());
+            assert!(detail.to_string().contains("buckets/first/.metadata.bin"));
+        }
+        assert_ne!(
+            Error::from(MigrationMetadataError::Empty("record".into())),
+            Error::from(MigrationMetadataError::Incompatible("record".into())),
+            "different migration failures must remain distinguishable"
+        );
+    }
+
     #[test]
     fn truncated_iam_listing_cannot_report_completed_migration() {
         use super::next_iam_migration_page;
