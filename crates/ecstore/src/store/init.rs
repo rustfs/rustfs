@@ -2835,6 +2835,224 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
+    async fn tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners() {
+        use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
+        use crate::bucket::lifecycle::tier_free_version_recovery::recover_tier_free_versions;
+        use rustfs_filemeta::TransitionVersionState::{Exact, KnownDisabled, SuspendedNull};
+        use rustfs_s3_client::transition_api::ReaderImpl;
+        use rustfs_utils::http::{
+            SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, insert_str,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("create tier overwrite store");
+        let (mut ctx, mut store, mut shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-overwrite", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let tier = "OVERWRITE-TIER";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier)
+            .await
+            .expect("tier identity");
+        let identity = rustfs_utils::crypto::hex(lease.backend_identity());
+        drop(lease);
+
+        for state in [Exact, KnownDisabled, SuspendedNull] {
+            for suspended in [false, true] {
+                for self_copy in [false, true] {
+                    let bucket = format!("tier-overwrite-{}", Uuid::new_v4());
+                    let object = "object";
+                    let remote = format!("remote/{bucket}");
+                    let version = match state {
+                        Exact => "opaque-overwrite-version",
+                        SuspendedNull => "null",
+                        _ => "",
+                    };
+                    let payload = vec![0x5b; if suspended { 512 * 1024 } else { 257 }];
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create bucket");
+                    backend.set_put_remote_version(Some(version.to_string())).await;
+                    let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier)
+                        .await
+                        .expect("seed tier lease");
+                    lease
+                        .put(
+                            &remote,
+                            ReaderImpl::Body(bytes::Bytes::from(payload.clone())),
+                            payload.len().try_into().expect("payload size"),
+                        )
+                        .await
+                        .expect("seed remote bytes");
+                    drop(lease);
+                    let mut metadata = HashMap::from([
+                        ("content-type".to_string(), "application/octet-stream".to_string()),
+                        (
+                            "x-amz-restore".to_string(),
+                            "ongoing-request=\"false\", expiry-date=\"2099-01-01T00:00:00Z\"".to_string(),
+                        ),
+                    ]);
+                    for (suffix, value) in [
+                        (SUFFIX_TRANSITION_STATUS, "complete"),
+                        (SUFFIX_TRANSITION_TIER, tier),
+                        (SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity.as_str()),
+                        (SUFFIX_TRANSITIONED_OBJECTNAME, remote.as_str()),
+                        (SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str()),
+                    ] {
+                        insert_str(&mut metadata, suffix, value.to_string());
+                    }
+                    if !version.is_empty() {
+                        insert_str(&mut metadata, SUFFIX_TRANSITIONED_VERSION_ID, version.to_string());
+                    }
+                    let options = ObjectOptions {
+                        version_suspended: suspended,
+                        ..Default::default()
+                    };
+                    store
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(payload.clone()),
+                            &ObjectOptions {
+                                user_defined: metadata,
+                                ..options.clone()
+                            },
+                        )
+                        .await
+                        .expect("seed transitioned source with locally restored bytes");
+                    let expected = if self_copy {
+                        payload.clone()
+                    } else {
+                        vec![0x73; payload.len()]
+                    };
+                    let new_metadata = HashMap::from([
+                        ("content-type".to_string(), "text/plain".to_string()),
+                        ("x-amz-meta-replacement".to_string(), "kept".to_string()),
+                    ]);
+                    if self_copy {
+                        let mut source = store
+                            .get_object_info(&bucket, object, &options)
+                            .await
+                            .expect("self-copy source");
+                        source.metadata_only = false;
+                        source.user_defined = Arc::new(new_metadata);
+                        source.put_object_reader = Some(PutObjReader::from_vec(expected.clone()));
+                        store
+                            .copy_object(&bucket, object, &bucket, object, &mut source, &options, &options)
+                            .await
+                            .expect("materialized self-copy");
+                    } else {
+                        store
+                            .put_object(
+                                &bucket,
+                                object,
+                                &mut PutObjReader::from_vec(expected.clone()),
+                                &ObjectOptions {
+                                    user_defined: new_metadata,
+                                    ..options.clone()
+                                },
+                            )
+                            .await
+                            .expect("overwrite transitioned null version");
+                    }
+
+                    let set = store.pools[0].get_disks_by_key(object);
+                    let versions = set
+                        .load_file_info_versions_exact(&bucket, object)
+                        .await
+                        .expect("read committed disk metadata")
+                        .expect("replacement metadata exists");
+                    let free: Vec<_> = versions
+                        .versions
+                        .iter()
+                        .chain(versions.free_versions.iter())
+                        .filter(|fi| fi.tier_free_version())
+                        .collect();
+                    assert_eq!(free.len(), 1, "{state:?}, suspended={suspended}, copy={self_copy}");
+                    assert_eq!(free[0].transitioned_objname, remote);
+                    assert_eq!(free[0].transition_version_state, state);
+                    assert!(backend.contains(&remote).await, "commit must not delete remote bytes before cleanup");
+                    let removed_before = backend.remove_count().await;
+
+                    // Restart before queue delivery. The new runtime must
+                    // reconstruct ownership solely from the committed xl.meta.
+                    let tier_config = ctx
+                        .tier_config_mgr()
+                        .read()
+                        .await
+                        .tiers
+                        .get(tier)
+                        .expect("tier configuration survives restart")
+                        .clone_with_credentials();
+                    drop(set);
+                    shutdown.cancel();
+                    drop(store);
+                    drop(ctx);
+                    (ctx, store, shutdown) =
+                        without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-overwrite-restart", &[4]))
+                            .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                    {
+                        let manager = ctx.tier_config_mgr();
+                        let mut manager = manager.write().await;
+                        manager.tiers.insert(tier.to_string(), tier_config);
+                        manager
+                            .install_test_driver(tier, Box::new(backend.clone()))
+                            .expect("rebind the same remote destination after restart");
+                    }
+                    let set = store.pools[0].get_disks_by_key(object);
+                    ExpiryState::resize_workers(1, Arc::clone(&store)).await;
+                    let recovered = recover_tier_free_versions(Arc::clone(&store), 100, None, None)
+                        .await
+                        .expect("recover persisted cleanup owner");
+                    assert!(recovered.enqueued >= 1);
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        loop {
+                            let versions = set
+                                .load_file_info_versions_exact(&bucket, object)
+                                .await
+                                .expect("read cleanup progress")
+                                .expect("new object must survive cleanup");
+                            if versions
+                                .versions
+                                .iter()
+                                .chain(versions.free_versions.iter())
+                                .all(|fi| !fi.tier_free_version())
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("cleanup must converge");
+                    assert!(!backend.contains(&remote).await);
+                    assert_eq!(backend.remove_count().await, removed_before + 1, "one remote DELETE per owner");
+                    assert_eq!(backend.remove_versions().await.last(), Some(&(remote.clone(), version.to_string())));
+                    let mut reader = store
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &options)
+                        .await
+                        .expect("replacement remains readable");
+                    let mut actual = Vec::new();
+                    reader.stream.read_to_end(&mut actual).await.expect("read replacement bytes");
+                    assert_eq!(actual, expected);
+                    let current = store
+                        .get_object_info(&bucket, object, &options)
+                        .await
+                        .expect("replacement metadata");
+                    assert_eq!(current.user_defined.get("content-type").map(String::as_str), Some("text/plain"));
+                    assert_eq!(current.user_defined.get("x-amz-meta-replacement").map(String::as_str), Some("kept"));
+                    assert!(current.transitioned_object.status.is_empty());
+                }
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
     async fn copy_object_immediately_reads_small_completed_multipart_source() {
         let temp_dir = tempfile::tempdir().expect("create small multipart copy store dir");
         let (_ctx, store, shutdown) =
