@@ -1684,6 +1684,25 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             expected_outage_target_required = requirement.get("outage_target_manifest_required", True)
             require(oracle.get("outage_target_manifest_required", True) is expected_outage_target_required,
                     "oracle outage target-manifest contract mismatch")
+            outage_write = oracle.get("outage_write")
+            outage_write_deferred = oracle.get("outage_write_deferred_until_rejoin", False)
+            require(type(outage_write_deferred) is bool, "invalid outage-write deferred flag")
+            if not expected_outage_target_required and outage_write is not None:
+                require(isinstance(outage_write, dict), "invalid optional outage-write diagnostic")
+                require(outage_write.get("attempted") is True, "optional outage-write diagnostic was not attempted")
+                require(outage_write.get("required") is False, "optional outage-write diagnostic required flag mismatch")
+                require(outage_write.get("accepted") is True, "optional outage-write final S3 body was not accepted")
+                outage_write_attempts = evidence_integer(outage_write.get("attempts"), "optional outage-write attempts", 1, 1024)
+                outage_write_service_unavailable = evidence_integer(
+                    outage_write.get("service_unavailable"), "optional outage-write ServiceUnavailable count", 0, 1024
+                )
+                if outage_write_deferred:
+                    require(
+                        outage_write_service_unavailable == outage_write_attempts,
+                        "deferred outage write must account for every down-window attempt",
+                    )
+            else:
+                require(outage_write_deferred is False, "outage-write deferred flag requires optional outage-write diagnostic")
             if requirement.get("sets", 1) > 1 or requirement.get("pools", 1) > 1:
                 require(oracle.get("distributed_ec_invalidation") is True,
                         "oracle missing distributed EC invalidation proof")
@@ -1710,8 +1729,8 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(isinstance(objects, list) and requirement["min_objects"] <= len(objects) <= requirement["max_objects"],
                     "incomplete/oversized object oracle")
             require(len({obj["key"] for obj in objects}) == len(objects), "duplicate object identity")
-            require(sum(obj["expected_physical"] is None for obj in objects) == 1,
-                    "only the outage object may lack a pre-fault target manifest")
+            outage_object_count = sum(obj["expected_physical"] is None for obj in objects)
+            require(outage_object_count == 1, "only the outage object may lack a pre-fault target manifest")
             for obj in objects:
                 require(isinstance(obj["key"], str) and 0 < len(obj["key"].encode()) <= 1024, "invalid object identity")
                 require(obj["version_id"] is None, "this case only covers unversioned objects")
@@ -5167,6 +5186,35 @@ class SelfTests(unittest.TestCase):
             errors = check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4")
             self.assertTrue(
                 any("EC data/parity geometry differs from the required case" in error for error in errors),
+                errors,
+            )
+
+    def test_scanner_heal_multipool_case_accepts_deferred_optional_outage_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            path = run_dir / "background-target-crash-ec8-4-multi-pool.json"
+            oracle = read_json(path)
+            oracle["outage_write_deferred_until_rejoin"] = True
+            oracle["outage_write"] = {
+                "attempted": True,
+                "required": False,
+                "accepted": True,
+                "attempts": 36,
+                "service_unavailable": 36,
+            }
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4-multi-pool"), [])
+
+            oracle["outage_write"]["accepted"] = False
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+            errors = check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4-multi-pool")
+            self.assertTrue(
+                any("optional outage-write final S3 body was not accepted" in error for error in errors),
                 errors,
             )
 

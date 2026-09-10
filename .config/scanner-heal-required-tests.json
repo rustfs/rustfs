@@ -114,7 +114,7 @@
       "sets": 3,
       "pools": 3,
       "outage_target_manifest_required": false,
-      "scope": "Target process crash during partial background rebuild on three single-node EC8+4 pools; exact baseline S3 bodies and replacement-drive shards, with outage object verified through S3 but not forced onto the replaced target drive."
+      "scope": "Target process crash during partial background rebuild on three single-node EC8+4 pools; exact baseline S3 bodies and replacement-drive shards, with down-window outage PUT refusal recorded and a deferred post-rejoin outage object verified through S3 when the full target pool was offline."
     }
   },
   "release_lanes": {
