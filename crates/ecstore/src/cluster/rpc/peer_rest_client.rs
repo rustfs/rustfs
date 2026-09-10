@@ -303,8 +303,16 @@ fn scanner_scoped_dirty_usage_ack_response_matches(
         && cleared_within_request
 }
 
-fn scanner_scoped_dirty_usage_ack_reconciled(activity: &ScannerPeerActivity, expected_instance_id: &str) -> bool {
-    activity.instance_id == expected_instance_id && activity.dirty_usage_pending == Some(false)
+fn scanner_scoped_dirty_usage_ack_reconciled(
+    activity: &ScannerPeerActivity,
+    expected_instance_id: &str,
+    expected_generation: u64,
+) -> bool {
+    activity.instance_id == expected_instance_id
+        && activity.dirty_usage_pending == Some(false)
+        && activity
+            .dirty_usage_generation
+            .is_some_and(|generation| generation >= expected_generation)
 }
 
 fn scanner_instance_id_is_valid(instance_id: &str) -> bool {
@@ -2290,6 +2298,7 @@ impl PeerRestClient {
         entries: Vec<ScannerScopedDirtyUsageAckEntry>,
     ) -> Result<ScannerPeerActivity> {
         use rustfs_protos::scoped_dirty_usage::*;
+        let expected_generation = entries.iter().map(|entry| entry.generation).max().unwrap_or(0);
         let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id.clone(), false, entries)?;
         let ack_attempt = async {
             let mut client = super::client::scanner_control_time_out_client(
@@ -2337,7 +2346,9 @@ impl PeerRestClient {
                         .await;
                 }
                 match self.scanner_scoped_dirty_usage_activity_confirmation().await {
-                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id) => Ok(activity),
+                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id, expected_generation) => {
+                        Ok(activity)
+                    }
                     _ => Err(err),
                 }
             }
@@ -3176,30 +3187,48 @@ mod tests {
 
     #[test]
     fn scanner_scoped_dirty_usage_ack_reconciliation_requires_same_clean_instance() {
-        let activity = |instance_id: &str, pending| ScannerPeerActivity {
+        let activity = |instance_id: &str, generation, pending| ScannerPeerActivity {
             instance_id: instance_id.to_string(),
             namespace_generation: 1,
             maintenance_generation: 1,
             protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
             topology_digest: Some([1; 32]),
             data_movement_active: Some(false),
-            dirty_usage_generation: Some(9),
+            dirty_usage_generation: generation,
             dirty_usage_pending: pending,
             movement_generation: Some(1),
             publication_blocked: Some(false),
         };
 
         assert!(scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("0123456789abcdef0123456789abcdef", Some(false)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(10), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
         assert!(!scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("0123456789abcdef0123456789abcdef", Some(true)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", Some(8), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
         assert!(!scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("fedcba9876543210fedcba9876543210", Some(false)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", None, Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(true)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("fedcba9876543210fedcba9876543210", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
     }
 
