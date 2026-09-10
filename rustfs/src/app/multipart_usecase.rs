@@ -69,7 +69,7 @@ use super::storage_api::multipart_usecase::{
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout,
+    put_object_body_read_timeout, reject_oversize_single_upload,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -1161,6 +1161,9 @@ impl DefaultMultipartUsecase {
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let mut size = resolve_upload_part_size(&req.headers, content_length)?;
+        if let Some(size) = size {
+            reject_oversize_single_upload(size)?;
+        }
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
