@@ -17,6 +17,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
@@ -75,11 +76,11 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     let mut hip = HealInitParams {
         bucket: percent_decode_str(params.get("bucket").unwrap_or_default())
             .decode_utf8()
-            .map_err(|_| s3_error!(InvalidRequest, "invalid bucket name encoding"))?
+            .map_err(|_| ApiError::invalid_request("invalid bucket name encoding"))?
             .into_owned(),
         obj_prefix: percent_decode_str(params.get("prefix").unwrap_or_default())
             .decode_utf8()
-            .map_err(|_| s3_error!(InvalidRequest, "invalid object name encoding"))?
+            .map_err(|_| ApiError::invalid_request("invalid object name encoding"))?
             .into_owned(),
         ..Default::default()
     };
