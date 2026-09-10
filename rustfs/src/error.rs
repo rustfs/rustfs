@@ -478,6 +478,57 @@ fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) ->
     None
 }
 
+/// Walk an error chain (including `io::Error` custom payloads) and return
+/// whether any link satisfies `pred`.
+fn error_chain_any(err: &(dyn std::error::Error + 'static), pred: &dyn Fn(&(dyn std::error::Error + 'static)) -> bool) -> bool {
+    if pred(err) {
+        return true;
+    }
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_err.get_ref()
+        && error_chain_any(inner, pred)
+    {
+        return true;
+    }
+    let mut current = err.source();
+    while let Some(err) = current {
+        if error_chain_any(err, pred) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+/// s3s raises `BodySizeLimitExceeded` when the streaming-body budget
+/// (`put_object_max_size`) runs out mid-stream. The type lives in s3s's
+/// private `http` module, so it is recognised by its `Display` form
+/// (`body size {size} exceeds limit {limit}`), like the other s3s body-stream
+/// errors above. Switch to a typed downcast once s3s re-exports the type.
+fn is_body_size_limit_exceeded_display(err: &(dyn std::error::Error + 'static)) -> bool {
+    let text = err.to_string();
+    text.starts_with("body size ") && text.contains(" exceeds limit ")
+}
+
+fn error_chain_has_body_size_limit_exceeded(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_any(err, &is_body_size_limit_exceeded_display)
+}
+
+/// hyper reports a request body whose connection hit EOF before
+/// `Content-Length` bytes arrived as a `Kind::Body` error carrying an
+/// `UnexpectedEof` `io::Error` (its `IncompleteBody` marker is private).
+/// That is a client-side short body, not a server fault.
+fn is_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<hyper::Error>()
+        .and_then(|hyper_err| std::error::Error::source(hyper_err))
+        .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_any(err, &is_hyper_body_eof)
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
@@ -531,6 +582,22 @@ impl From<StorageError> for ApiError {
                 return ApiError {
                     code: S3ErrorCode::ServiceUnavailable,
                     message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_body_size_limit_exceeded(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_hyper_body_eof(inner) {
+                return ApiError {
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
                     source: Some(Box::new(err)),
                 };
             }
@@ -678,6 +745,22 @@ impl From<std::io::Error> for ApiError {
                     source: Some(Box::new(err)),
                 };
             }
+            if error_chain_has_body_size_limit_exceeded(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_hyper_body_eof(inner) {
+                return ApiError {
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
+                    source: Some(Box::new(err)),
+                };
+            }
+
             if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
                 return ApiError {
                     code: S3ErrorCode::IncompleteBody,
@@ -948,6 +1031,117 @@ mod tests {
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
+    }
+
+    #[test]
+    fn body_size_limit_exceeded_maps_to_entity_too_large_across_io_boundaries() {
+        // Shape observed in production (issue #7596):
+        // Custom { UnexpectedEof, Custom { Other, BodySizeLimitExceeded { size, limit } } }
+        let nested = || {
+            IoError::new(
+                ErrorKind::UnexpectedEof,
+                IoError::other(MockS3sBodyStreamError("body size 16384 exceeds limit 6389")),
+            )
+        };
+
+        let direct: ApiError = nested().into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(direct.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
+
+        let storage: ApiError = StorageError::Io(nested()).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert!(storage.source.is_some());
+
+        // An unrelated message that merely mentions a limit stays internal.
+        let other: ApiError = IoError::other(MockS3sBodyStreamError("limit exceeded for something else")).into();
+        assert_eq!(other.code, S3ErrorCode::InternalError);
+    }
+
+    /// Trip s3s's real streaming-body budget with a tiny limit so the
+    /// display-based matcher is checked against the pinned dependency's
+    /// actual error, not only the mocked string.
+    #[tokio::test]
+    async fn real_s3s_body_size_limit_error_maps_to_entity_too_large() {
+        use futures::StreamExt;
+
+        let real_error = || async {
+            let mut body = s3s::Body::from(bytes::Bytes::from_static(b"hello"));
+            body.set_limit(Some(4));
+            body.next()
+                .await
+                .expect("one frame")
+                .expect_err("five bytes must exceed a four-byte budget")
+        };
+
+        let err = real_error().await;
+        assert!(is_body_size_limit_exceeded_display(err.as_ref()), "unexpected display: {err}");
+
+        let err = real_error().await;
+        let storage: ApiError = StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, IoError::other(err))).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
+
+        let err = real_error().await;
+        let direct: ApiError = IoError::other(err).into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+    }
+
+    /// Drive a real hyper HTTP/1 server so the test sees hyper's own body EOF
+    /// error (`hyper::Error(Body, UnexpectedEof, IncompleteBody)`), which has no
+    /// public constructor.
+    async fn capture_hyper_body_eof_error() -> hyper::Error {
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let captured: Arc<Mutex<Option<hyper::Error>>> = Arc::new(Mutex::new(None));
+        let server_slot = Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let slot = server_slot;
+            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let slot = Arc::clone(&slot);
+                async move {
+                    let err = req.into_body().collect().await.expect_err("short body must fail");
+                    *slot.lock().expect("slot") = Some(err);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(String::new()))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nabc")
+            .await
+            .expect("write partial body");
+        client.shutdown().await.expect("shutdown write side");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+        let captured = captured.lock().expect("slot").take();
+        captured.expect("hyper body error captured")
+    }
+
+    #[tokio::test]
+    async fn hyper_body_eof_maps_to_incomplete_body_across_io_boundaries() {
+        let hyper_err = capture_hyper_body_eof_error().await;
+        assert!(is_hyper_body_eof(&hyper_err), "unexpected hyper error shape: {hyper_err:?}");
+
+        // Shape observed in production (issue #7596):
+        // Custom { UnexpectedEof, Custom { Other, hyper::Error(Body, UnexpectedEof, IncompleteBody) } }
+        let nested = IoError::new(ErrorKind::UnexpectedEof, IoError::other(hyper_err));
+        let storage: ApiError = StorageError::Io(nested).into();
+        assert_eq!(storage.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+
+        let hyper_err = capture_hyper_body_eof_error().await;
+        let direct: ApiError = IoError::other(hyper_err).into();
+        assert_eq!(direct.code, S3ErrorCode::IncompleteBody);
     }
 
     #[test]
