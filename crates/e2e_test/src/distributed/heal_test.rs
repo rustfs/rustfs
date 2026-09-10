@@ -32,6 +32,7 @@ const EC84_NODE_COUNT: usize = 3;
 const EC84_DRIVES_PER_NODE: usize = 4;
 const EC84_DATA_BLOCKS: usize = 8;
 const EC84_PARITY_BLOCKS: usize = 4;
+const EC84_ERASURE_SET_DRIVE_COUNT: usize = EC84_DATA_BLOCKS + EC84_PARITY_BLOCKS;
 const EC84_TARGET_DRIVE_RESTART_CASE: &str = "ec84-target-drive-restart";
 const EC84_TARGET_DRIVE_RESTART_ORACLE: &str = "ec84-target-drive-restart.json";
 const EC84_HEAL_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -185,6 +186,7 @@ async fn write_scanner_heal_evidence(context: ScannerHealEvidenceContext, payloa
         "binary_sha256": string_field(&context.run, "binary.sha256")?,
         "test_binary_sha256": string_field(&context.run, "test_binary.sha256")?,
         "topology": {"nodes": EC84_NODE_COUNT, "drives_per_node": EC84_DRIVES_PER_NODE},
+        "erasure_set_drive_count": EC84_ERASURE_SET_DRIVE_COUNT,
         "pid_before": payload.pid_before,
         "pid_after": payload.pid_after,
         "unclean_shutdown_marker": false,
@@ -409,5 +411,17 @@ mod tests {
         let wrong_status: Box<dyn std::error::Error + Send + Sync> =
             "admin POST failed: 503 Service Unavailable cluster heal coordination unavailable".into();
         assert!(!is_cluster_heal_coordination_unavailable(wrong_status.as_ref()));
+    }
+
+    #[test]
+    fn ec84_drive_restart_evidence_shape_matches_registry() {
+        assert_eq!(EC84_ERASURE_SET_DRIVE_COUNT, EC84_NODE_COUNT * EC84_DRIVES_PER_NODE);
+
+        let registry: Value = serde_json::from_str(include_str!("../../../../.config/scanner-heal-required-tests.json"))
+            .expect("scanner/heal registry is valid JSON");
+        let case = &registry["cases"][EC84_TARGET_DRIVE_RESTART_CASE];
+        assert_eq!(case["erasure_set_drive_count"], EC84_ERASURE_SET_DRIVE_COUNT);
+        assert_eq!(case["topology"]["nodes"], EC84_NODE_COUNT);
+        assert_eq!(case["topology"]["drives_per_node"], EC84_DRIVES_PER_NODE);
     }
 }
