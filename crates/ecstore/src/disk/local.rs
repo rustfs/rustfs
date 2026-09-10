@@ -6414,6 +6414,10 @@ impl LocalDisk {
                 // A missing or still-populated directory is benign here; see
                 // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
                 // convention, rustfs/rustfs#4978).
+                if is_dir_not_empty_error(&err) {
+                    // A populated directory keeps its ancestors populated; no further pruning is needed.
+                    return Ok(());
+                }
                 if !is_benign_object_rmdir_error(&err) {
                     warn!(
                         event = EVENT_DISK_LOCAL_DELETE_FAILED,
@@ -11025,6 +11029,170 @@ mod test {
                 Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
             let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
             (disk, dir)
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_stops_at_live_metadata_below_a_guarded_ancestor() {
+            let (disk, _dir) = new_disk().await;
+            let base = disk.get_bucket_path(RUSTFS_META_BUCKET).expect("resolve metadata volume");
+            let shared = base.join("buckets");
+            let guard = Arc::new(
+                os::mkdir_all_below_existing_base_std(&shared, &base, &disk.publication_root)
+                    .expect("retain the shared publication directory"),
+            );
+
+            for owned in [false, true] {
+                for missing_backup in [false, true] {
+                    let transaction = Uuid::new_v4();
+                    let object = shared.join(".bloomcycle.bin");
+                    let rollback = object.join(transaction.to_string());
+                    let metadata = object.join(STORAGE_FORMAT_FILE);
+                    let backup = rollback.join(STORAGE_FORMAT_FILE_BACKUP);
+                    fs::create_dir_all(&rollback).await.expect("create rollback directory");
+                    fs::write(&metadata, b"committed metadata")
+                        .await
+                        .expect("write live metadata");
+                    if !missing_backup {
+                        fs::write(&backup, b"old metadata").await.expect("write rollback backup");
+                    }
+                    let owner: Option<Arc<dyn Send + Sync>> = if owned { Some(guard.clone()) } else { None };
+                    let result = disk
+                        .delete_with_namespace_owner(
+                            RUSTFS_META_BUCKET,
+                            &format!("buckets/.bloomcycle.bin/{transaction}/{STORAGE_FORMAT_FILE_BACKUP}"),
+                            DeleteOptions::default(),
+                            owner,
+                        )
+                        .await;
+
+                    assert!(!backup.exists(), "backup must be absent, owned={owned}, missing={missing_backup}");
+                    assert!(!rollback.exists(), "empty rollback directory must be pruned");
+                    assert_eq!(fs::read(&metadata).await.expect("read committed metadata"), b"committed metadata");
+                    result.expect("a nonempty object must stop pruning before the guarded ancestor");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_removes_empty_and_missing_ancestors_but_keeps_the_volume() {
+            let (disk, _dir) = new_disk().await;
+            ensure_test_volume(&disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+
+            for missing in [false, true] {
+                let parent = base.join("parent");
+                let rollback = parent.join("object/transaction");
+                fs::create_dir_all(&rollback).await.expect("create empty ancestor chain");
+                let path = if missing {
+                    "parent/object/transaction/missing/xl.meta.bkp"
+                } else {
+                    fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), b"backup")
+                        .await
+                        .expect("create backup");
+                    "parent/object/transaction/xl.meta.bkp"
+                };
+
+                disk.delete("pruning", path, DeleteOptions::default())
+                    .await
+                    .expect("empty and missing ancestors should be pruned");
+                assert!(!parent.exists(), "the whole empty chain should be removed");
+                assert!(base.is_dir(), "pruning must stop at the volume boundary");
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_does_not_remove_the_base_or_an_outside_path() {
+            let (disk, dir) = new_disk().await;
+            let base = dir.path().join("base");
+            let outside = dir.path().join("outside");
+            fs::create_dir(&base).await.expect("create base");
+            fs::write(&outside, b"outside data").await.expect("create outside file");
+
+            disk.delete_file(&base, &base, false, false)
+                .await
+                .expect("base path is protected");
+            disk.delete_file(&base, &outside, false, false)
+                .await
+                .expect("outside path is protected");
+            assert!(base.is_dir(), "the base must not be removed even when empty");
+            assert_eq!(fs::read(&outside).await.expect("read outside file"), b"outside data");
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_backup_error() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
+
+            let (disk, _dir) = new_disk().await;
+            ensure_test_volume(&disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let backup = base.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&backup)
+                .expect("hold the backup without delete sharing");
+
+            let err = disk
+                .delete("pruning", STORAGE_FORMAT_FILE_BACKUP, DeleteOptions::default())
+                .await
+                .expect_err("a genuine target-file deletion failure must propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve the failing path and original OS error");
+            assert_eq!(context.path, backup);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert_eq!(fs::read(&backup).await.expect("backup remains readable"), b"backup");
+            drop(guard);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_empty_parent_error() {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+            let (disk, _dir) = new_disk().await;
+            ensure_test_volume(&disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let parent = base.join("parent");
+            let guard = os::mkdir_all_below_existing_base_std(&parent, &base, &disk.publication_root)
+                .expect("retain an empty parent without delete sharing");
+            let backup = parent.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+
+            let err = disk
+                .delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect_err("a real parent failure without a nonempty boundary must still propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve parent failure context");
+            assert_eq!(context.path, parent);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert!(!backup.exists(), "the target was removed before the parent error");
+            assert!(parent.is_dir(), "the guarded parent remains");
+            drop(guard);
+            disk.delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect("pruning should succeed once the actual guard is released");
+            assert!(!parent.exists());
+            assert!(base.is_dir());
         }
 
         // #948: a genuinely missing source is benign and must still return Ok.
