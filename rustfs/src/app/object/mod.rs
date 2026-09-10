@@ -223,6 +223,8 @@ pub(crate) use self::extract::*;
 pub(crate) use self::get::*;
 pub(crate) use self::internal_put::*;
 pub(crate) use self::on_demand_migration_put::*;
+#[cfg(test)]
+pub(crate) use self::put::PollCountingBody;
 use self::put::*;
 pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout, reject_oversize_single_upload};
 #[cfg(test)]

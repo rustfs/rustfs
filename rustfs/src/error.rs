@@ -994,6 +994,35 @@ mod tests {
         assert_eq!(other.code, S3ErrorCode::InternalError);
     }
 
+    /// Trip s3s's real streaming-body budget with a tiny limit so the
+    /// display-based matcher is checked against the pinned dependency's
+    /// actual error, not only the mocked string.
+    #[tokio::test]
+    async fn real_s3s_body_size_limit_error_maps_to_entity_too_large() {
+        use futures::StreamExt;
+
+        let real_error = || async {
+            let mut body = s3s::Body::from(bytes::Bytes::from_static(b"hello"));
+            body.set_limit(Some(4));
+            body.next()
+                .await
+                .expect("one frame")
+                .expect_err("five bytes must exceed a four-byte budget")
+        };
+
+        let err = real_error().await;
+        assert!(is_body_size_limit_exceeded_display(err.as_ref()), "unexpected display: {err}");
+
+        let err = real_error().await;
+        let storage: ApiError = StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, IoError::other(err))).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
+
+        let err = real_error().await;
+        let direct: ApiError = IoError::other(err).into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+    }
+
     /// Drive a real hyper HTTP/1 server so the test sees hyper's own body EOF
     /// error (`hyper::Error(Body, UnexpectedEof, IncompleteBody)`), which has no
     /// public constructor.

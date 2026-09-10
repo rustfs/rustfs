@@ -3337,14 +3337,15 @@ mod tests {
 
     /// issue #7596: a single PUT whose declared length exceeds the 5 GiB
     /// ceiling must be rejected from the headers, before any body byte is
-    /// consumed. The one-byte body would otherwise surface as IncompleteBody.
+    /// requested.
     #[tokio::test]
     async fn execute_put_object_rejects_oversize_content_length_before_reading_the_body() {
         let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+        let (body, polls) = PollCountingBody::streaming_blob();
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
             .key("huge.bin".to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"x")))))
+            .body(Some(body))
             .content_length(Some(ceiling + 1))
             .build()
             .unwrap();
@@ -3355,6 +3356,54 @@ mod tests {
 
         let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+    }
+
+    /// Admission uses the logical object size, not the wire length: a signed
+    /// aws-chunked request whose framed `Content-Length` exceeds the cap but
+    /// whose decoded length is within it must not be rejected as oversize,
+    /// while a decoded length above the cap must be.
+    #[tokio::test]
+    async fn execute_put_object_oversize_admission_uses_decoded_length_for_aws_chunked() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+        let framing_overhead = 1_000_000;
+
+        for (decoded, expect_too_large) in [(ceiling, false), (ceiling + 1, true)] {
+            let (body, polls) = PollCountingBody::streaming_blob();
+            let input = PutObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("huge.bin".to_string())
+                .body(Some(body))
+                .content_length(Some(decoded + framing_overhead))
+                .build()
+                .unwrap();
+
+            let mut req = build_request(input, Method::PUT);
+            req.headers
+                .insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+            req.headers.insert(
+                HeaderName::from_static("x-amz-content-sha256"),
+                HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            );
+            req.headers.insert(
+                HeaderName::from_static("x-amz-decoded-content-length"),
+                HeaderValue::from_str(&decoded.to_string()).unwrap(),
+            );
+            let usecase = DefaultObjectUsecase::without_context();
+            let fs = FS::new();
+
+            let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+            if expect_too_large {
+                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "decoded {decoded}");
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+            } else {
+                assert_ne!(
+                    err.code(),
+                    &S3ErrorCode::EntityTooLarge,
+                    "framed wire length above the cap must not reject a decoded length at the cap"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4125,6 +4174,37 @@ mod tests {
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
     }
 }
+
+/// Test-only request body that records how often it is polled, so admission
+/// tests can prove a rejection happened before any body byte was requested.
+#[cfg(test)]
+pub(crate) struct PollCountingBody {
+    pub(crate) polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl PollCountingBody {
+    pub(crate) fn streaming_blob() -> (StreamingBlob, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = StreamingBlob::new(Self {
+            polls: std::sync::Arc::clone(&polls),
+        });
+        (body, polls)
+    }
+}
+
+#[cfg(test)]
+impl Stream for PollCountingBody {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
+    }
+}
+
+#[cfg(test)]
+impl ByteStream for PollCountingBody {}
 
 #[cfg(test)]
 mod oversize_single_upload_tests {

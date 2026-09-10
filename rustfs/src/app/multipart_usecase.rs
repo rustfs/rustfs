@@ -3204,6 +3204,36 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
     }
 
+    /// issue #7596: a part whose declared length exceeds the 5 GiB
+    /// single-request ceiling is rejected before the body is polled or the
+    /// store is consulted. Exact-cap and zero-length parts pass admission.
+    #[tokio::test]
+    async fn execute_upload_part_rejects_oversize_declared_part_before_reading_the_body() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+
+        for (declared, expect_too_large) in [(ceiling + 1, true), (ceiling, false), (0, false)] {
+            let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
+            let input = UploadPartInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .body(Some(body))
+                .content_length(Some(declared))
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::PUT);
+
+            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            if expect_too_large {
+                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared}");
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+            } else {
+                assert_ne!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared} must pass admission");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn execute_upload_part_rejects_invalid_part_number_before_body_lookup() {
         for part_number in [-1, 0, 10001] {
