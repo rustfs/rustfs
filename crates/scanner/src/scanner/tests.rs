@@ -7680,6 +7680,25 @@ async fn scanner_cycle_confirms_lost_remote_ack_from_activity_snapshot() {
         "a new peer instance cannot confirm whether the old ACK reached durable dirty state"
     );
 
+    let mut stale_activity = scanner_node_activity("epoch-a", 7, 3);
+    stale_activity.dirty_usage_generation = 4;
+    let stale_clean_activity = BTreeMap::from([("node-2".to_string(), stale_activity)]);
+    let stale_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "response lost before newer generation was observed",
+        ))),
+        || async { Ok(stale_clean_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, stale_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a clean peer snapshot from before the acknowledged generation cannot prove the ACK reached durable dirty state"
+    );
+
     let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
     written_activity.dirty_usage_generation = 6;
     written_activity.dirty_usage_pending = true;
@@ -7751,6 +7770,47 @@ async fn scanner_cycle_confirms_lost_scoped_ack_only_after_same_instance_clean_a
         scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, peer_restarted),
         ScannerCycleOutcome::CompletedWithPendingMaintenance,
         "a restarted peer cannot prove the scoped ACK reached the old scanner instance"
+    );
+
+    let mut stale_activity = scanner_node_activity("epoch-a", 7, 3);
+    stale_activity.dirty_usage_generation = 4;
+    let stale_clean_activity = BTreeMap::from([("node-2".to_string(), stale_activity)]);
+    let stale_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "scoped ACK transport failed before the requested generation was observed",
+        ))),
+        || async { Ok(stale_clean_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, stale_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a clean peer snapshot from before the scoped ACK generation cannot prove the ACK reached durable dirty state"
+    );
+
+    let empty_scoped_ack = ScannerDirtyUsageAcknowledgement {
+        host: "node-2".to_string(),
+        instance_id: "epoch-a".to_string(),
+        kind: ScannerDirtyUsageAcknowledgementKind::Scoped {
+            owner_id: Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+            entries: Vec::new(),
+        },
+    };
+    let empty_scoped_clean = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        &[empty_scoped_ack],
+        std::future::ready(Err::<bool, _>(std::io::Error::other("empty scoped ACK failed before peer delivery"))),
+        || async { Ok(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))])) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, empty_scoped_clean),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "an empty scoped ACK has no durable generation to reconcile after response loss"
     );
 
     let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
