@@ -44,7 +44,8 @@ use crate::admin::utils::{empty_response, json_response, read_compatible_admin_b
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::identity::{
-    canonical_endpoint, is_https_endpoint, mark_unknown_peer_sync_enabled, same_identity_endpoint, site_identity_key,
+    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, mark_unknown_peer_sync_enabled, same_identity_endpoint,
+    site_identity_key,
 };
 use crate::storage::storage_api::{lock_bucket_targets_metadata, with_config_object_write_lock};
 use base64_simd::URL_SAFE_NO_PAD;
@@ -2940,6 +2941,7 @@ fn merge_add_sites(
     mut state: SiteReplicationState,
     local_peer: PeerInfo,
     sites: Vec<PeerSite>,
+    preflight_infos: &[SiteReplicationAddPreflightInfo],
     service_account_access_key: String,
     service_account_parent: String,
     replicate_ilm_expiry: bool,
@@ -2949,11 +2951,36 @@ fn merge_add_sites(
     state.service_account_parent = service_account_parent;
     state.updated_at = Some(OffsetDateTime::now_utc());
     state.peers = build_join_peers(&state, &local_peer, sites, replicate_ilm_expiry);
+    // Every join must carry the verified identities, including peers that
+    // have not joined yet. Fixing only the coordinator after each reply
+    // leaves the other sites holding endpoint-derived placeholders.
+    for info in preflight_infos {
+        if let Some(mut peer) = existing_peer_for_endpoint(&state, &info.endpoint) {
+            peer.deployment_id = info.deployment_id.clone();
+            state = reconcile_peer_with_actual_identity(state, peer);
+        }
+    }
     state
 }
 
 fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_override: Option<bool>) -> SiteReplicationState {
     let mut peer = normalize_peer_info(incoming);
+    // An older sender may still hold a placeholder after this site has
+    // learned the real ID. Do not let that delivery downgrade the identity.
+    if peer.deployment_id == deployment_id_for_endpoint(&peer.endpoint)
+        && let Some(existing) = state.peers.values().find(|existing| {
+            same_identity_endpoint(&existing.endpoint, &peer.endpoint)
+                && existing.deployment_id != deployment_id_for_endpoint(&existing.endpoint)
+        })
+    {
+        peer.deployment_id = existing.deployment_id.clone();
+    }
+    // Remove the placeholder before persistence normalizes duplicate
+    // endpoints; otherwise map ordering can discard the real identity.
+    state.peers.retain(|_, existing| {
+        !same_identity_endpoint(&existing.endpoint, &peer.endpoint)
+            || existing.deployment_id != deployment_id_for_endpoint(&existing.endpoint)
+    });
     if let Some(enabled) = ilm_expiry_override {
         peer.replicate_ilm_expiry = enabled;
     }
@@ -3539,6 +3566,13 @@ fn align_peer_edit_deployment_id(state: &SiteReplicationState, incoming: &mut Pe
         return;
     };
     if matches.next().is_none() {
+        if same_identity_endpoint(&peer.endpoint, &incoming.endpoint)
+            && peer.deployment_id == deployment_id_for_endpoint(&peer.endpoint)
+            && !incoming.deployment_id.is_empty()
+            && incoming.deployment_id != deployment_id_for_endpoint(&incoming.endpoint)
+        {
+            return;
+        }
         incoming.deployment_id = peer.deployment_id.clone();
     }
 }
@@ -6801,6 +6835,7 @@ impl Operation for SiteReplicationAddHandler {
                     current_state,
                     local_peer.clone(),
                     sites.clone(),
+                    &preflight_infos,
                     service_account_access_key.clone(),
                     admin_access_key,
                     replicate_ilm_expiry,
@@ -8482,7 +8517,6 @@ impl Operation for SRRotateServiceAccountHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::site_replication::identity::deployment_id_for_endpoint;
     use rustfs_madmin::SRSessionPolicy;
 
     /// A peer the status probe could not reach must render as offline.
@@ -10916,6 +10950,7 @@ mod tests {
                 secret_key: "remote-sk".to_string(),
                 ..PeerSite::default()
             }],
+            &[],
             "svc-ak".to_string(),
             "root".to_string(),
             true,
@@ -10949,6 +10984,7 @@ mod tests {
                     ..PeerSite::default()
                 },
             ],
+            &[],
             "svc-ak".to_string(),
             "root".to_string(),
             true,
@@ -12153,6 +12189,173 @@ mod tests {
         assert!(normalized.contains_key("real-local"));
         assert!(!normalized.contains_key("hash-local"));
         assert!(normalized.contains_key("hash-remote"));
+    }
+
+    #[test]
+    fn test_peer_identity_join_snapshot_uses_verified_ids() {
+        let actual = ["site-a", "site-b", "site-c"].map(|name| PeerInfo {
+            deployment_id: format!("{name}-deployment"),
+            ..peer(name, &format!("https://{name}.example.com:9000"))
+        });
+        let preflight = actual
+            .iter()
+            .map(|peer| preflight_site("reported-name", &peer.endpoint, &peer.deployment_id, 0))
+            .collect::<Vec<_>>();
+        let sites = actual
+            .iter()
+            .map(|peer| PeerSite {
+                name: peer.name.clone(),
+                endpoint: peer.endpoint.clone(),
+                skip_tls_verify: true,
+                ca_cert_pem: "requested-ca".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let state = merge_add_sites(
+            SiteReplicationState::default(),
+            actual[0].clone(),
+            sites,
+            &preflight,
+            "svc-ak".to_string(),
+            "root".to_string(),
+            false,
+        );
+        assert_eq!(state.peers.len(), actual.len());
+        for expected in &actual {
+            let stored = state
+                .peers
+                .get(&expected.deployment_id)
+                .expect("verified ID in initial join map");
+            assert_eq!(stored.name, expected.name);
+            assert_eq!(stored.endpoint, expected.endpoint);
+            assert!(stored.skip_tls_verify);
+            assert_eq!(stored.ca_cert_pem, "requested-ca");
+        }
+        for local in &actual[1..] {
+            let mut joined = SiteReplicationState::default();
+            apply_peer_join(
+                &mut joined,
+                local,
+                SRPeerJoinReq {
+                    peers: state.peers.clone(),
+                    ..Default::default()
+                },
+                true,
+            );
+            assert_eq!(joined.peers.keys().collect::<Vec<_>>(), state.peers.keys().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn test_peer_identity_legacy_edit_does_not_restore_placeholder() {
+        let actual = PeerInfo {
+            deployment_id: "actual-remote".to_string(),
+            ..peer("remote", "http://remote.example.com:9000")
+        };
+        for name in ["remote", ""] {
+            let state = SiteReplicationState {
+                peers: BTreeMap::from([(actual.deployment_id.clone(), actual.clone())]),
+                ..Default::default()
+            };
+            let mut incoming = PeerInfo {
+                deployment_id: deployment_id_for_endpoint("https://REMOTE.example.com:9000/"),
+                sync_state: SyncStatus::Enable,
+                ..peer(name, "https://REMOTE.example.com:9000/")
+            };
+            align_peer_edit_deployment_id(&state, &mut incoming);
+            let state = update_peer(state, incoming, None);
+            assert_eq!(state.peers.len(), 1);
+            assert_eq!(state.peers[&actual.deployment_id].sync_state, SyncStatus::Enable);
+        }
+    }
+
+    #[test]
+    fn test_peer_identity_finalization_repairs_legacy_three_site_join() {
+        let actual = ["site-a", "site-b", "site-c"].map(|name| PeerInfo {
+            deployment_id: format!("{name}-deployment"),
+            ..peer(name, &format!("http://{name}.example.com:9000"))
+        });
+        let sites = actual
+            .iter()
+            .map(|peer| PeerSite {
+                name: peer.name.clone(),
+                endpoint: peer.endpoint.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let mut coordinator = merge_add_sites(
+            SiteReplicationState::default(),
+            actual[0].clone(),
+            sites,
+            &[],
+            "svc-ak".to_string(),
+            "root".to_string(),
+            true,
+        );
+        let join = SRPeerJoinReq {
+            peers: coordinator.peers.clone(),
+            ..Default::default()
+        };
+        for remote in &actual[1..] {
+            coordinator = reconcile_peer_with_actual_identity(coordinator, remote.clone());
+        }
+        mark_unknown_peer_sync_enabled(&mut coordinator.peers);
+
+        for local in &actual[1..] {
+            let mut state = SiteReplicationState::default();
+            apply_peer_join(&mut state, local, join.clone(), true);
+            for mut incoming in coordinator.peers.values().cloned() {
+                align_peer_edit_deployment_id(&state, &mut incoming);
+                state = apply_internal_peer_edit(state, local, incoming, None).expect("finalize peer identity");
+            }
+            assert_eq!(state.peers.len(), actual.len(), "finalization must not retain placeholder peers");
+            for expected in &actual {
+                let stored = existing_peer_for_endpoint(&state, &expected.endpoint).expect("peer remains configured");
+                assert_eq!(stored.deployment_id, expected.deployment_id, "observer: {}", local.name);
+                assert_eq!(stored.sync_state, SyncStatus::Enable);
+            }
+        }
+    }
+
+    #[test]
+    fn test_peer_identity_edit_replaces_placeholder_for_canonical_endpoint() {
+        let local = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com:9000")
+        };
+        let endpoint = "http://remote.example.com:9000";
+        let placeholder = PeerInfo {
+            deployment_id: deployment_id_for_endpoint(endpoint),
+            ..peer("remote", endpoint)
+        };
+        for deployment_id in ["00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-bfff-ffffffffffff"] {
+            for name in ["remote", ""] {
+                for already_present in [false, true] {
+                    let mut incoming = PeerInfo {
+                        deployment_id: deployment_id.to_string(),
+                        sync_state: SyncStatus::Enable,
+                        ..peer(name, "https://REMOTE.example.com:9000/")
+                    };
+                    let mut state = SiteReplicationState {
+                        peers: BTreeMap::from([
+                            (local.deployment_id.clone(), local.clone()),
+                            (placeholder.deployment_id.clone(), placeholder.clone()),
+                        ]),
+                        ..Default::default()
+                    };
+                    if already_present {
+                        state.peers.insert(incoming.deployment_id.clone(), incoming.clone());
+                    }
+                    align_peer_edit_deployment_id(&state, &mut incoming);
+                    let state = apply_internal_peer_edit(state, &local, incoming, None).expect("repair peer identity");
+                    assert_eq!(state.peers.len(), 2, "repair must replace, not duplicate, the placeholder");
+                    assert!(!state.peers.contains_key(&placeholder.deployment_id));
+                    assert!(state.peers.contains_key(deployment_id));
+                    let normalized = normalize_peer_map_by_identity(state.peers);
+                    assert!(normalized.contains_key(deployment_id), "normalization must retain the actual ID");
+                }
+            }
+        }
     }
 
     #[test]
