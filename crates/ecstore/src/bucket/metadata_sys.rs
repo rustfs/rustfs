@@ -2526,7 +2526,10 @@ impl BucketMetadataSys {
             "bucket metadata snapshot existence check",
             async {
                 self.object_store()
-                    .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                    .get_bucket_info_from_sets_at_read_quorum(
+                        bucket,
+                        &crate::storage_api_contracts::bucket::BucketOptions::default(),
+                    )
                     .await
             },
         )
