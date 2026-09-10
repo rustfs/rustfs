@@ -1823,6 +1823,7 @@ mod tests {
                 scenario,
                 InterruptionScenario::BackgroundTargetRestart
                     | InterruptionScenario::BackgroundTargetRestartEc84
+                    | InterruptionScenario::BackgroundTargetRestartEc84MultiSet
                     | InterruptionScenario::BackgroundCoordinatorRestart
             ) {
                 cluster.stop_node_gracefully(interruption_node).await?;
