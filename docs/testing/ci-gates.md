@@ -364,6 +364,18 @@ scripts/python_bin.sh scripts/check_test_wiring.py \
   --check-scanner-heal-release-bundle /path/to/release-evidence.json
 ```
 
+For a single Linux handoff checklist that keeps the measured runners in a
+stable order, generate the Scanner/Heal Linux evidence plan:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
+  --write-plan --out-dir /path/to/plan-dir
+```
+
+The plan is only an execution manifest. Its `evidence_type` is `plan_only`, and
+it cannot satisfy any Gxx/Wxx/Rxx gate. Use `--run-preflight` only for the
+lightweight registry and runner self-tests before starting a long Linux run.
+
 Lane descriptors can be assembled into that bundle with:
 
 ```bash
