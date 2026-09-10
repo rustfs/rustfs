@@ -1187,11 +1187,11 @@ impl S3 for FS {
                         error = %e,
                         "Object tags not found"
                     );
-                    return Err(if opts.version_id.is_some() {
-                        s3_error!(NoSuchVersion)
+                    return Err(S3Error::new(if opts.version_id.is_some() {
+                        S3ErrorCode::NoSuchVersion
                     } else {
-                        s3_error!(NoSuchKey)
-                    });
+                        S3ErrorCode::NoSuchKey
+                    }));
                 }
                 error!(
                     component = LOG_COMPONENT_STORAGE,
