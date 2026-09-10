@@ -377,6 +377,10 @@ impl FS {
 
 pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
     if let Some(vid) = version_id {
+        if vid == "null" {
+            // A nil UUID selects the stored null version; None selects latest.
+            return Ok(Some(Uuid::nil()));
+        }
         let uuid = Uuid::parse_str(&vid).map_err(|e| {
             error!("Invalid version ID: {}", e);
             s3_error!(InvalidArgument, "Invalid version ID")
@@ -1183,7 +1187,11 @@ impl S3 for FS {
                         error = %e,
                         "Object tags not found"
                     );
-                    return Err(s3_error!(NoSuchKey));
+                    return Err(if opts.version_id.is_some() {
+                        s3_error!(NoSuchVersion)
+                    } else {
+                        s3_error!(NoSuchKey)
+                    });
                 }
                 error!(
                     component = LOG_COMPONENT_STORAGE,

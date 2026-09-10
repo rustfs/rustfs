@@ -28,6 +28,7 @@ use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_heal::heal::utils::format_set_disk_id;
 use rustfs_heal_contracts::heal_channel::{
@@ -35,13 +36,11 @@ use rustfs_heal_contracts::heal_channel::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
-use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::{Duration, timeout};
@@ -71,9 +70,17 @@ struct HealInitParams {
 }
 
 fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
+    // matchit captures the original URI bytes. Decode once before validation
+    // so literal %2F keys remain distinct from actual path separators.
     let mut hip = HealInitParams {
-        bucket: params.get("bucket").map(|s| s.to_string()).unwrap_or_default(),
-        obj_prefix: params.get("prefix").map(|s| s.to_string()).unwrap_or_default(),
+        bucket: percent_decode_str(params.get("bucket").unwrap_or_default())
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidRequest, "invalid bucket name encoding"))?
+            .into_owned(),
+        obj_prefix: percent_decode_str(params.get("prefix").unwrap_or_default())
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidRequest, "invalid object name encoding"))?
+            .into_owned(),
         ..Default::default()
     };
     validate_heal_target(&hip.bucket, &hip.obj_prefix)?;
@@ -164,13 +171,13 @@ fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
 }
 
 fn encode_heal_control_path(bucket: &str, obj_prefix: &str) -> String {
-    if bucket.is_empty() && obj_prefix.is_empty() {
-        return String::new();
+    if obj_prefix.is_empty() {
+        return bucket.to_owned();
     }
 
-    path_join(&[PathBuf::from(bucket), PathBuf::from(obj_prefix)])
-        .to_string_lossy()
-        .into_owned()
+    // This identifies an S3 target, not a filesystem path. In particular,
+    // a leading slash in the object must not alias the sibling without it.
+    format!("{bucket}/{obj_prefix}")
 }
 
 fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
@@ -200,7 +207,7 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
 
     r.insert(
         Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{*prefix}").as_str(),
         AdminOperation(&HealHandler {}),
     )?;
 
@@ -1615,6 +1622,135 @@ mod tests {
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;
+
+    fn parse_registered_heal_request(uri: &Uri) -> s3s::S3Result<HealInitParams> {
+        let mut registered = super::S3Router::new(false);
+        super::register_heal_route(&mut registered).expect("register production Heal routes");
+        let mut router = Router::new();
+        for route in registered.registered_routes() {
+            router.insert(route.clone(), ()).expect("replay production route");
+        }
+        let path = format!("POST|{}", uri.path());
+        let matched = router.at(&path).expect("request must match a production Heal route");
+        let body = Bytes::from_static(
+            br#"{"recursive":false,"dryRun":true,"remove":false,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false,"readRepair":false,"pool":0,"set":0}"#,
+        );
+        extract_heal_init_params(&body, uri, matched.params)
+    }
+
+    #[test]
+    fn test_heal_routes_accept_nested_and_encoded_object_paths() {
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            for target in [
+                "",
+                "test-bucket",
+                "test-bucket/object.bin",
+                "test-bucket/dir/sub/object.bin",
+                "test-bucket/dir%2Fobject.bin",
+            ] {
+                let path = format!("{prefix}/v3/heal/{target}");
+                assert!(router.contains_compatible_route(http::Method::POST, &path), "{path}");
+                assert!(!router.contains_compatible_route(http::Method::GET, &path), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_heal_target_decodes_once_and_keeps_start_status_stop_identity() {
+        for (wire, object) in [
+            ("object.bin", "object.bin"),
+            ("dir/sub/object.bin", "dir/sub/object.bin"),
+            ("dir%2Fsub%2Fobject.bin", "dir/sub/object.bin"),
+            ("dir%2fsub/object.bin", "dir/sub/object.bin"),
+            ("%2Fobject.bin", "/object.bin"),
+            ("dir/", "dir/"),
+            ("dir%2F", "dir/"),
+            ("literal%252Fslash", "literal%2Fslash"),
+            ("space%20key%2Bplus", "space key+plus"),
+            ("literal+plus", "literal+plus"),
+            ("%E4%B8%AD%E6%96%87%2F%E6%96%87%E4%BB%B6", "中文/文件"),
+            ("query%3Fhash%23percent%25", "query?hash#percent%"),
+        ] {
+            for query in ["", "?clientToken=task", "?clientToken=task&forceStop=true"] {
+                let uri = format!("/rustfs/admin/v3/heal/test%2Dbucket/{wire}{query}")
+                    .parse()
+                    .expect("valid encoded URI");
+                let parsed = parse_registered_heal_request(&uri).expect("valid Heal target");
+                assert_eq!(parsed.bucket, "test-bucket");
+                assert_eq!(parsed.obj_prefix, object, "wire target: {wire}");
+                assert_eq!(
+                    encode_heal_control_path(&parsed.bucket, &parsed.obj_prefix),
+                    format!("test-bucket/{object}")
+                );
+                assert_eq!(parsed.client_token, if query.is_empty() { "" } else { "task" });
+                assert_eq!(parsed.force_stop, query.ends_with("forceStop=true"));
+                if query.is_empty() {
+                    let request = build_heal_channel_request(&parsed);
+                    assert_eq!(request.bucket, "test-bucket");
+                    assert_eq!(request.object_prefix.as_deref(), Some(object));
+                    assert_eq!(request.pool_index, Some(0));
+                    assert_eq!(request.set_index, Some(0));
+                    assert_eq!(request.dry_run, Some(true));
+                    assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_heal_target_validates_decoded_paths_before_admission() {
+        for target in [
+            "test%2Fbucket/object",
+            "test%00bucket/object",
+            "test%FFbucket/object",
+            "test-bucket/dir%2F..%2Fobject",
+            "test-bucket/dir/%2e/object",
+            "test-bucket/dir%5C..%5Cobject",
+            "test-bucket/dir%2F%2Fobject",
+            "test-bucket/object%00",
+            "test-bucket/object%FF",
+        ] {
+            let uri = format!("/rustfs/admin/v3/heal/{target}").parse().expect("encoded URI");
+            let err = parse_registered_heal_request(&uri).expect_err("decoded invalid target must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "target: {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_heal_routes_still_require_authentication() {
+        use s3s::route::S3Route;
+
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            for object in ["dir/object.bin", "dir%2Fobject.bin", "literal%252Fslash"] {
+                let mut req = s3s::S3Request {
+                    input: s3s::Body::empty(),
+                    method: http::Method::POST,
+                    uri: format!("{prefix}/v3/heal/test-bucket/{object}").parse().expect("Heal URI"),
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                let err = router
+                    .check_access(&mut req)
+                    .await
+                    .expect_err("router must require a signature");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                let err = router
+                    .call(req)
+                    .await
+                    .expect_err("handler must independently require authentication");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert!(err.to_string().contains("authentication required"));
+            }
+        }
+    }
 
     fn replacement_record(task_id: &str) -> rustfs_heal::ReplacementRecoveryRecord {
         rustfs_heal::ReplacementRecoveryRecord {
