@@ -198,7 +198,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/rebalance/stop"),
         admin_route(Method::POST, "/v3/heal/"),
         admin_route_sample(Method::POST, "/v3/heal/{bucket}", "/v3/heal/test-bucket"),
-        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{prefix}", "/v3/heal/test-bucket/prefix"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{*prefix}", "/v3/heal/test-bucket/prefix"),
         admin_route(Method::POST, "/v3/background-heal/status"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),

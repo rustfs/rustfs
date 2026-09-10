@@ -27,7 +27,9 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
+    use aws_sdk_s3::types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, VersioningConfiguration,
+    };
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -81,6 +83,156 @@ mod tests {
 
         info!("✅ Versioning suspended for bucket {}", bucket);
         Ok(())
+    }
+
+    async fn assert_version_tags(client: &Client, bucket: &str, key: &str, version: Option<&str>, value: Option<&str>) {
+        let tags = client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(version.map(str::to_owned))
+            .send()
+            .await
+            .expect("GetObjectTagging must accept the exact version selector");
+        let expected = value
+            .map(|value| vec![Tag::builder().key("generation").value(value).build().expect("valid tag")])
+            .unwrap_or_default();
+        assert_eq!(tags.tag_set(), expected, "version selector: {version:?}");
+    }
+
+    async fn assert_null_tagging_across_versioning_changes(client: &Client, bucket: &str, key: &str) {
+        assert_version_tags(client, bucket, key, None, None).await;
+        assert_version_tags(client, bucket, key, Some("null"), None).await;
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("generation")
+                            .value("original-null")
+                            .build()
+                            .expect("valid tag"),
+                    )
+                    .build()
+                    .expect("valid tagging"),
+            )
+            .send()
+            .await
+            .expect("tag the original null version");
+
+        enable_versioning(client, bucket)
+            .await
+            .expect("enable versioning over a null version");
+        let versioned = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=versioned")
+            .body(ByteStream::from_static(b"new version"))
+            .send()
+            .await
+            .expect("write a newer UUID version");
+        let version = versioned.version_id().expect("versioned PUT must return a UUID");
+        assert_ne!(version, "null");
+        assert_version_tags(client, bucket, key, None, Some("versioned")).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+        assert_version_tags(client, bucket, key, Some("null"), Some("original-null")).await;
+
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("generation")
+                            .value("updated-null")
+                            .build()
+                            .expect("valid tag"),
+                    )
+                    .build()
+                    .expect("valid tagging"),
+            )
+            .send()
+            .await
+            .expect("update tags on the noncurrent null version");
+        assert_version_tags(client, bucket, key, Some("null"), Some("updated-null")).await;
+        assert_version_tags(client, bucket, key, None, Some("versioned")).await;
+        client
+            .delete_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await
+            .expect("delete only the noncurrent null version tags");
+        assert_version_tags(client, bucket, key, Some("null"), None).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+
+        suspend_versioning(client, bucket).await.expect("suspend versioning");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=suspended-null")
+            .body(ByteStream::from_static(b"replacement null version"))
+            .send()
+            .await
+            .expect("replace the null version while suspended");
+        assert_version_tags(client, bucket, key, None, Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, Some("null"), Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+
+        enable_versioning(client, bucket).await.expect("re-enable versioning");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=latest")
+            .body(ByteStream::from_static(b"latest version"))
+            .send()
+            .await
+            .expect("write a new latest version");
+        assert_version_tags(client, bucket, key, Some("null"), Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await
+            .expect("remove only the null version");
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
+        let absent_version = uuid::Uuid::new_v4().to_string();
+        for (missing_key, selector, expected_code) in [
+            (key, Some("null"), "NoSuchVersion"),
+            (key, Some(absent_version.as_str()), "NoSuchVersion"),
+            ("never-created", None, "NoSuchKey"),
+            ("never-created", Some("null"), "NoSuchVersion"),
+            ("never-created", Some(absent_version.as_str()), "NoSuchVersion"),
+        ] {
+            let missing = client
+                .get_object_tagging()
+                .bucket(bucket)
+                .key(missing_key)
+                .set_version_id(selector.map(str::to_owned))
+                .send()
+                .await
+                .expect_err("a missing version must not fall back to latest");
+            assert_eq!(
+                missing.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some(expected_code),
+                "key: {missing_key}, version selector: {selector:?}"
+            );
+        }
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
     }
 
     /// Test 1: PutObject should return version_id when versioning is enabled
@@ -262,7 +414,9 @@ mod tests {
         info!("🧪 TEST: PutObject behavior without versioning (no regression)");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+        env.start_rustfs_server_without_cleanup(vec![])
+            .await
+            .expect("Failed to start isolated RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-no-versioning";
@@ -290,6 +444,9 @@ mod tests {
             output.version_id().is_none() || output.version_id() == Some("null"),
             "non-versioned PUT must omit version ID or return the S3 null version"
         );
+        // Reuse this unversioned fixture to prove explicit null never becomes
+        // an implicit latest-version read after enable/suspend transitions.
+        assert_null_tagging_across_versioning_changes(&client, bucket, key).await;
         info!("✅ PASSED: PutObject works correctly without versioning");
     }
 
