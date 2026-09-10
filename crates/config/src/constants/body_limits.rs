@@ -64,6 +64,14 @@ pub const MAX_HEAL_REQUEST_SIZE: usize = 1024 * 1024; // 1 MB
 /// memory exhaustion from malicious or misconfigured remote services.
 pub const MAX_S3_CLIENT_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
+/// Maximum body size accepted by a single `PutObject` or `UploadPart` request (5 GiB).
+/// Used for: the s3s streaming-body limit and the request-header admission check.
+/// Rationale: matches the AWS S3 single-PUT / single-part ceiling. Larger objects
+/// must use multipart upload. The header check rejects an oversize
+/// `Content-Length` before any body byte is read so the client gets
+/// `EntityTooLarge` immediately instead of streaming 5 GiB into a mid-stream failure.
+pub const MAX_SINGLE_PUT_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+
 /// Maximum size for OIDC provider response bodies (1 MB)
 /// Used for: discovery documents, JWKS documents and token endpoint responses
 /// Rationale: a hostile or compromised identity provider must not be able to exhaust
