@@ -2322,6 +2322,14 @@ struct SharedWarmBackendProxy(SharedWarmBackend);
 
 #[async_trait::async_trait]
 impl WarmBackend for SharedWarmBackendProxy {
+    async fn probe_legacy_metadata(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> io::Result<crate::services::tier::warm_backend::LegacyTransitionStateProbe> {
+        self.0.probe_legacy_metadata(object, remote_version).await
+    }
+
     async fn validate(&self) -> io::Result<()> {
         self.0.validate().await
     }
@@ -2488,6 +2496,27 @@ impl TierOperationLease {
     ) -> io::Result<TransitionCandidateProbe> {
         self.validate_remote_version_id(remote_version_id)?;
         self.inner.driver.probe_transition_version(object, remote_version_id).await
+    }
+
+    pub(crate) async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> io::Result<crate::services::tier::warm_backend::LegacyTransitionStateProbe> {
+        let Some(reconciler) = self
+            .inner
+            .reconciler
+            .get_or_try_init(|| async {
+                crate::services::tier::warm_backend::new_transition_candidate_reconciler(&self.inner.tier_config)
+                    .await
+                    .map(|reconciler| reconciler.map(Arc::from))
+            })
+            .await
+            .map_err(|err| io::Error::other(err.message))?
+        else {
+            return self.inner.driver.probe_legacy_metadata(object, remote_version).await;
+        };
+        reconciler.probe_legacy_transition_state(object, remote_version).await
     }
 
     pub(crate) fn is_current_generation(&self) -> bool {
@@ -6014,6 +6043,19 @@ impl TierConfigMgr {
     }
 
     #[cfg(any(test, feature = "test-util"))]
+    pub(crate) async fn install_test_driver_in(
+        handle: &Arc<RwLock<Self>>,
+        tier_name: &str,
+        driver: WarmBackendImpl,
+    ) -> std::result::Result<(), AdminError> {
+        let mut manager = handle.write().await;
+        // Register the generation runtime before installing the mock so its
+        // explicit lack of a network reconciler survives the first lease.
+        tier_driver_runtime(handle, &manager);
+        manager.install_test_driver(tier_name, driver)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn install_test_driver(
         &mut self,
         tier_name: &str,
@@ -6391,9 +6433,48 @@ impl TierConfigMgr {
     }
 
     pub(crate) async fn refresh_tier_config_handle(handle: Arc<RwLock<Self>>, api: Arc<ECStore>) {
-        Self::refresh_tier_config_handle_with(handle, api).await;
+        Self::refresh_tier_config_handle_with_weak(handle, Arc::downgrade(&api)).await;
     }
 
+    async fn refresh_tier_config_handle_with_weak(handle: Arc<RwLock<Self>>, api: Weak<ECStore>) {
+        // The periodic refresh remains the recovery fallback; committed mutations
+        // notify this worker so a successful peer commit converges immediately.
+        let mutation_refresh = Self::mutation_refresh_notifier(&handle).await;
+        let r = rand::rng().random_range(0.0..1.0);
+        let rand_interval = || Duration::from_secs((r * 60_f64).round() as u64);
+
+        let refresh_interval = TIER_CFG_REFRESH + rand_interval();
+        let mut t = delayed_tier_refresh_interval(refresh_interval);
+        loop {
+            select! {
+                _ = t.tick() => {
+                    let Some(api) = Weak::upgrade(&api) else {
+                        return;
+                    };
+                    if let Err(err) = Self::reload_handle_with(&handle, api).await {
+                        warn!(
+                            event = EVENT_TIER_CONFIG_REFRESH,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_TIER,
+                            trigger = "periodic",
+                            result = "failed",
+                            error = ?err,
+                            "tier configuration refresh"
+                        );
+                    }
+                }
+                _ = mutation_refresh.notified() => {
+                    let Some(api) = Weak::upgrade(&api) else {
+                        return;
+                    };
+                    Self::reload_after_committed_mutation(&handle, api).await;
+                }
+            }
+            t.reset();
+        }
+    }
+
+    #[allow(dead_code, reason = "used by focused tier refresh tests and non-ECStore generic harnesses")]
     pub(crate) async fn refresh_tier_config_handle_with<S>(handle: Arc<RwLock<Self>>, api: Arc<S>)
     where
         S: EcstoreObjectIO
@@ -17498,6 +17579,66 @@ mod tests {
         assert!(current.tiers.contains_key("COLD-B"));
     }
 
+    async fn wait_for_reference_proof_barrier(
+        barrier: &TierDriverBuildBarrier,
+        update: &mut tokio::task::JoinHandle<std::result::Result<(), TierConfigUpdateError>>,
+    ) -> std::result::Result<(), String> {
+        tokio::select! {
+            biased;
+            result = &mut *update => Err(format!("tier update exited before the reference proof barrier: {result:?}")),
+            () = barrier.arrived.notified() => Ok(()),
+            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                // Aborting the caller does not stop its owned mutation task.
+                // Let a late arrival pass the test-only barrier.
+                barrier.release.add_permits(1);
+                update.abort();
+                Err("timed out waiting for the reference proof barrier".to_string())
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reference_proof_barrier_reports_update_failure_before_arrival() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("early update failure fixture should persist");
+        let barrier = tier_reference_proof_test_barrier();
+        let scoped_barrier = barrier.clone();
+        let factory: TierDriverTestFactory =
+            Arc::new(|_| Err(AdminError::msg("injected driver initialization failure before reference proof")));
+        let mut update = tokio::spawn(async move {
+            TIER_REFERENCE_PROOF_TEST_BARRIER
+                .scope(
+                    scoped_barrier,
+                    TIER_DRIVER_TEST_FACTORY.scope(
+                        factory,
+                        TIER_MUTATION_TEST_PEERS.scope(
+                            Vec::new(),
+                            TierConfigMgr::update_candidate_with_config_lock(
+                                &manager,
+                                store,
+                                TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                            ),
+                        ),
+                    ),
+                )
+                .await
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(5), wait_for_reference_proof_barrier(&barrier, &mut update))
+            .await
+            .expect("an early update failure should be observed without waiting for the barrier deadline")
+            .expect_err("a failed update cannot reach the reference proof barrier");
+        assert!(err.contains("Mutation"), "{err}");
+        assert!(err.contains("injected driver initialization failure before reference proof"), "{err}");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn reference_proof_rejects_a_changed_prepared_fence_revision_before_publish() {
@@ -17518,7 +17659,7 @@ mod tests {
         let scoped_barrier = barrier.clone();
         let update_manager = manager.clone();
         let update_store = store.clone();
-        let update = tokio::spawn(async move {
+        let mut update = tokio::spawn(async move {
             TIER_REFERENCE_PROOF_TEST_BARRIER
                 .scope(
                     scoped_barrier,
@@ -17533,7 +17674,9 @@ mod tests {
                 )
                 .await
         });
-        barrier.arrived.notified().await;
+        wait_for_reference_proof_barrier(&barrier, &mut update)
+            .await
+            .expect("tier update should reach the reference proof barrier");
 
         let unrelated = prepared_remove_intent("COLD-B", uuid::Uuid::from_u128(0x2237));
         TierConfigMgr::apply_prepared_mutation_intent_block(&manager, &unrelated)
@@ -17541,8 +17684,9 @@ mod tests {
             .expect("an unrelated prepared fence should advance the runtime revision");
         barrier.release.add_permits(1);
 
-        let err = update
+        let err = tokio::time::timeout(Duration::from_secs(30), update)
             .await
+            .expect("tier update should finish after the reference proof barrier releases")
             .expect("tier update task should join")
             .expect_err("a reference proof cannot authorize publication across a fence revision change");
         let TierConfigUpdateError::Publish(err) = err else {

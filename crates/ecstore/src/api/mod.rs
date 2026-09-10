@@ -38,6 +38,16 @@ pub mod bucket {
     }
 
     pub mod lifecycle {
+        pub mod legacy_transition_state_reconcile {
+            pub use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
+                LegacyTransitionStateCopyRepresentation, LegacyTransitionStateMetadataAlias, LegacyTransitionStateReconcileError,
+                LegacyTransitionStateReconcileOutcome, LegacyTransitionStateReconcileReadiness,
+                LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse,
+                LegacyTransitionStateReconcileSelector, LegacyTransitionStateSetRepresentation, LegacyTransitionStateSource,
+                LegacyTransitionStateTarget,
+            };
+        }
+
         pub mod bucket_lifecycle_audit {
             pub use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
         }
@@ -260,18 +270,19 @@ pub mod bucket {
             ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
             ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
             ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
-            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
-            VersionPurgeStatusType, XferStats, assign_site_replication_rule_priorities, commit_force_delete_intent,
-            complete_force_delete_intent, delete_replication_state_from_config, delete_replication_version_id,
-            get_global_replication_pool, get_global_replication_stats, get_proxy_targets, init_background_replication,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, ScannerDirtyUsageMutationObserver,
+            ScannerDirtyUsageMutationSource, TargetReplicationResyncStatus, VersionPurgeStatusType, XferStats,
+            assign_site_replication_rule_priorities, commit_force_delete_intent, complete_force_delete_intent,
+            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
+            get_global_replication_stats, get_proxy_targets, init_background_replication,
             invalid_replication_config_status_field, is_site_replication_role, is_site_replication_rule,
             merge_incoming_replication_config, merge_user_replication_config, persist_force_delete_intent,
             read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
             replication_target_arn_deployment_id, replication_target_arns, resync_start_conflict_id,
-            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
-            should_use_existing_delete_replication_source, site_replication_rule_deployment_id,
-            unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
-            version_purge_status_to_filemeta,
+            set_scanner_dirty_usage_mutation_observer, should_remove_replication_target, should_schedule_delete_replication,
+            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            site_replication_rule_deployment_id, unsupported_replication_config_field, validate_replication_config_structure,
+            validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 
@@ -366,6 +377,14 @@ pub mod config {
 }
 
 pub mod data_usage {
+    #[cfg(feature = "test-util")]
+    pub use crate::data_movement::SourceCleanupDeleteBarrier;
+    #[cfg(feature = "test-util")]
+    pub use crate::data_movement::scanner_backlog::test_util::NativeScannerPauseBacklogWriteFault;
+    pub use crate::data_movement::scanner_backlog::{
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementPlanner,
+        ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
+    };
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
@@ -563,7 +582,7 @@ pub mod store_list {
 }
 
 pub mod storage {
-    pub use crate::core::pools::HealLifecycleExpiryContext;
+    pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,

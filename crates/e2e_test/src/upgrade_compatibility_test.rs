@@ -32,8 +32,10 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use http::{Method, StatusCode};
+use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
@@ -41,6 +43,7 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const SOURCE_BINARY_ENV: &str = "RUSTFS_UPGRADE_SOURCE_BINARY";
+const G09_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR";
 const RC5_COMMIT: &str = "40a2470feb567201165a5b809b7598bb4b1f68f5";
 const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
@@ -81,6 +84,14 @@ const QUOTA_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 // of treating it as an upgrade failure.
 const QUOTA_ADMISSION_WARMUP_TIMEOUT: Duration = Duration::from_secs(90);
 
+struct G09EvidenceContext {
+    directory: PathBuf,
+    current_revision: String,
+    previous_revision: String,
+    run_id: String,
+    measurement_window_id: String,
+}
+
 fn source_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let path = std::env::var_os(SOURCE_BINARY_ENV)
         .map(PathBuf::from)
@@ -89,6 +100,155 @@ fn source_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> 
         return Err(format!("upgrade source binary does not exist: {}", path.display()).into());
     }
     Ok(path)
+}
+
+fn is_lower_hex_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn current_source_revision() -> Result<String, BoxError> {
+    let revision = env!("RUSTFS_E2E_BUILD_COMMIT");
+    if !is_lower_hex_revision(revision) {
+        return Err(format!("current test binary has invalid source revision {revision}").into());
+    }
+    Ok(revision.to_string())
+}
+
+async fn binary_source_revision(binary: &Path) -> Result<String, BoxError> {
+    let output = tokio::process::Command::new(binary).arg("--version").output().await?;
+    if !output.status.success() {
+        return Err(format!("{} --version failed with {}", binary.display(), output.status).into());
+    }
+    let version = String::from_utf8(output.stdout)?;
+    source_revision_from_version_output(&version, binary)
+}
+
+fn source_revision_from_version_output(version: &str, binary: &Path) -> Result<String, BoxError> {
+    version
+        .split(|ch: char| !ch.is_ascii_hexdigit())
+        .find(|token| is_lower_hex_revision(token))
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} --version did not expose a 40-byte source revision", binary.display()).into())
+}
+
+async fn g09_evidence_context(previous_binary: &Path) -> Result<Option<G09EvidenceContext>, BoxError> {
+    let Some(directory) = std::env::var_os(G09_EVIDENCE_DIR_ENV) else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(directory);
+    std::fs::create_dir_all(&directory)?;
+    let current_revision = current_source_revision()?;
+    let previous_revision = binary_source_revision(previous_binary).await?;
+    if current_revision == previous_revision {
+        return Err("G09 mixed-version evidence requires distinct current and previous source revisions".into());
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(Some(G09EvidenceContext {
+        directory,
+        current_revision,
+        previous_revision,
+        run_id: format!("g09-upgrade-{}-{now}", std::process::id()),
+        measurement_window_id: format!("g09-mixed-version-window-{now}"),
+    }))
+}
+
+fn write_g09_evidence(
+    context: &G09EvidenceContext,
+    field: &str,
+    role: &str,
+    cases: &[&str],
+    test: &str,
+    details: Value,
+) -> TestResult {
+    let path = context.directory.join(format!("G09-{field}.json"));
+    let mut evidence = serde_json::json!({
+        "schema": 1,
+        "evidence_type": "measured",
+        "artifact_kind": "upgrade-compatibility-e2e",
+        "source_revision": context.current_revision,
+        "run_id": context.run_id,
+        "measurement_window_id": context.measurement_window_id,
+        "gate": "G09",
+        "field": field,
+        "versions": [context.previous_revision, context.current_revision],
+        "current_revision": context.current_revision,
+        "previous_revision": context.previous_revision,
+        "mixed_version_role": role,
+        "mixed_version_cases": cases,
+        "test": test,
+        "details": details,
+    });
+    if field == "rollback_payload_evidence" {
+        evidence["rollback_payload_replayed"] = Value::Bool(true);
+    }
+    let data = serde_json::to_vec_pretty(&evidence)?;
+    if data.len() > 1024 * 1024 {
+        return Err("G09 mixed-version evidence exceeds the 1 MiB artifact budget".into());
+    }
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    output.write_all(&data)?;
+    output.write_all(b"\n")?;
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod g09_evidence_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn source_revision_parser_requires_lowercase_forty_byte_sha() -> TestResult {
+        let binary = Path::new("rustfs");
+        assert_eq!(
+            source_revision_from_version_output("rustfs 1.0.0 abcdef0123456789abcdef0123456789abcdef01 clean", binary)?,
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
+        assert!(source_revision_from_version_output("rustfs ABCDEF0123456789ABCDEF0123456789ABCDEF01", binary).is_err());
+        assert!(source_revision_from_version_output("rustfs abcdef", binary).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn g09_evidence_writer_records_measured_role_and_refuses_overwrite() -> TestResult {
+        let directory = TempDir::new()?;
+        let context = G09EvidenceContext {
+            directory: directory.path().to_path_buf(),
+            current_revision: "b".repeat(40),
+            previous_revision: "a".repeat(40),
+            run_id: "g09-upgrade-test-run".to_string(),
+            measurement_window_id: "g09-upgrade-test-window".to_string(),
+        };
+        write_g09_evidence(
+            &context,
+            "mixed_version_reader_evidence",
+            "mixed-version-reader",
+            &["old-writer-new-reader", "new-writer-old-reader"],
+            "unit",
+            serde_json::json!({"assertions": ["reader evidence"]}),
+        )?;
+        let path = directory.path().join("G09-mixed_version_reader_evidence.json");
+        let evidence: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(evidence["evidence_type"], "measured");
+        assert_eq!(evidence["gate"], "G09");
+        assert_eq!(evidence["field"], "mixed_version_reader_evidence");
+        assert_eq!(evidence["mixed_version_role"], "mixed-version-reader");
+        assert_eq!(evidence["versions"], serde_json::json!(["a".repeat(40), "b".repeat(40)]));
+
+        let overwrite = write_g09_evidence(
+            &context,
+            "mixed_version_reader_evidence",
+            "mixed-version-reader",
+            &["old-writer-new-reader", "new-writer-old-reader"],
+            "unit",
+            serde_json::json!({}),
+        );
+        assert!(overwrite.is_err(), "G09 evidence must not overwrite an existing artifact");
+        Ok(())
+    }
 }
 
 async fn enable_versioning(client: &Client, bucket: &str) -> TestResult {
@@ -523,6 +683,7 @@ async fn direct_upgrade_from_rc2_preserves_object_contracts() -> TestResult {
 async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
+    let evidence_context = g09_evidence_context(&previous_binary).await?;
     let current_binary = rustfs_binary_path();
     let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
     cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
@@ -553,6 +714,45 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
             )
             .await?;
         }
+    }
+
+    if let Some(context) = evidence_context.as_ref() {
+        let phases = ["one-current-node", "one-previous-node"];
+        let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
+        write_g09_evidence(
+            context,
+            "mixed_version_reader_evidence",
+            "mixed-version-reader",
+            &["old-writer-new-reader", "new-writer-old-reader"],
+            "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "assertions": [
+                    "current node reads objects written through previous-release client",
+                    "previous-release node reads objects written through current client",
+                    "all nodes list every mixed-version object after homogeneous-current convergence"
+                ],
+            }),
+        )?;
+        write_g09_evidence(
+            context,
+            "mixed_version_writer_evidence",
+            "mixed-version-writer",
+            &["old-reader-new-writer", "new-reader-old-writer"],
+            "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "assertions": [
+                    "current writer publishes objects readable by previous-release node",
+                    "previous-release writer publishes objects readable by current node",
+                    "multipart writers continue under one-current-node and one-previous-node layouts"
+                ],
+            }),
+        )?;
     }
 
     Ok(())
@@ -1136,6 +1336,7 @@ async fn direct_upgrade_from_previous_release_preserves_bucket_configuration() -
 async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
+    let evidence_context = g09_evidence_context(&previous_binary).await?;
 
     let replication_target = FakeS3Target::start().await?;
     replication_target.create_bucket(ROLLBACK_REPLICA_BUCKET);
@@ -1203,6 +1404,54 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
         "the rolled-back release lost the bucket default encryption"
     );
     assert_eq!(body, post_rollback_bytes);
+
+    env.restart_server_preserving_data(vec![], &server_env).await?;
+    let current_again = env.create_s3_client();
+    assert_versioning_enabled(&current_again, ROLLBACK_BUCKET, "after rolling forward again").await?;
+    assert_default_sse_s3_encryption(&current_again, ROLLBACK_BUCKET, "after rolling forward again").await?;
+    assert_bucket_tag(&current_again, ROLLBACK_BUCKET, "after rolling forward again").await?;
+    assert_remote_target_preserved(&env, ROLLBACK_BUCKET, &target_arn, "after rolling forward again").await?;
+    assert_eq!(
+        read_object(&current_again, ROLLBACK_BUCKET, single_key, Some(&single_version))
+            .await?
+            .1,
+        single_bytes
+    );
+    assert_eq!(
+        read_object(&current_again, ROLLBACK_BUCKET, multipart_key, None).await?.1,
+        multipart_bytes
+    );
+    assert_eq!(
+        read_object(&current_again, ROLLBACK_BUCKET, post_rollback_key, None).await?.1,
+        post_rollback_bytes
+    );
+
+    if let Some(context) = evidence_context.as_ref() {
+        write_g09_evidence(
+            context,
+            "rollback_payload_evidence",
+            "rollback-payload",
+            &["rollback-to-old", "rollback-to-new", "unknown-field-retained"],
+            "upgrade_compatibility_test::rollback_to_previous_release_reads_current_bucket_metadata",
+            serde_json::json!({
+                "bucket": ROLLBACK_BUCKET,
+                "cases": {
+                    "rollback-to-old": [
+                        "previous-release binary reads current-build versioning, SSE-S3, tags, replication target and objects",
+                        "previous-release writer honors the decoded current-build encryption configuration"
+                    ],
+                    "rollback-to-new": [
+                        "current build reads the object written by the rolled-back previous release",
+                        "current build reads the current-build single-part and multipart objects after rolling forward again"
+                    ],
+                    "unknown-field-retained": [
+                        "previous release skips current-build bucket metadata extension fields without dropping known bucket configuration",
+                        "current build reads the retained bucket configuration after the previous-release round trip"
+                    ]
+                },
+            }),
+        )?;
+    }
 
     replication_target.shutdown().await;
     Ok(())

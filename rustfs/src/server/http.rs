@@ -28,6 +28,7 @@ use crate::server::{
         StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
+    ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
         TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
@@ -1846,6 +1847,11 @@ fn process_connection(
             request_body_idle_timeout,
         } = context;
 
+        // Whether this listener terminated TLS for this connection; the SSE-C
+        // transport policy needs the connection's own answer, not a
+        // deployment-wide setting.
+        let connection_is_tls = tls_acceptor.is_some();
+
         // Build the hybrid service per-connection.
         // Note: NodeService is not Clone (holds LocalPeerS3Client), and the SwiftService
         // type is feature-gated, so we cannot pre-build the full hybrid service.
@@ -1964,6 +1970,14 @@ fn process_connection(
                 // a spoof-proof client IP. Absent (None) unless enabled via
                 // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
                 .option_layer(rate_limit_layer.clone())
+                // backlog#2369 P7.2: an SSE-C request carries the customer key
+                // in a header, so a plaintext hop leaks it permanently. Sits
+                // beside the rate limiter: after the trusted-proxy layer, which
+                // is what makes a forwarded `https` protocol trustworthy, and
+                // after the request context so a rejection can echo the request
+                // id. Reports by default; refuses only under
+                // RUSTFS_SSE_C_REQUIRE_TLS.
+                .layer(SsecTransportLayer::new(connection_is_tls))
                 // CRITICAL: Insert ReadinessGateLayer before business logic
                 // This stops requests from hitting IAMAuth or Storage if they are not ready.
                 .layer(ReadinessGateLayer::new(readiness.clone()))

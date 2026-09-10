@@ -4,6 +4,8 @@ import unittest
 
 from diagnose_scanner_enumeration_restart import (
     converged,
+    final_complete_recheck_after_full_retention,
+    fully_retained,
     replays_raw_window,
     validate_recoverable_quantum,
     validate_report,
@@ -29,6 +31,7 @@ class ReportTests(unittest.TestCase):
         report = self.report()
         self.validate(report)
         self.assertTrue(converged(report, 4))
+        self.assertTrue(fully_retained(report, 4))
 
     def test_incomplete_or_inexact_coverage_cannot_pass(self):
         for key, value in (("snapshot_complete", False), ("objects_retained", 3),
@@ -132,6 +135,9 @@ class ReportTests(unittest.TestCase):
         previous["versions_retained"] = 0
         previous["bytes_retained"] = 0
         previous["objects_processed"] = 0
+        previous["raw_page_index_committed_entries"] = 1
+        previous["raw_page_index_indexed_entries"] = 1
+        previous["raw_page_index_complete"] = False
         previous["snapshot_complete"] = False
         previous["outcome"] = "cancelled_without_cache"
         current = dict(previous, round=1, pid=124, objects_before=0)
@@ -140,12 +146,45 @@ class ReportTests(unittest.TestCase):
         advanced = dict(current, objects_retained=1)
         self.assertFalse(replays_raw_window(previous, advanced))
 
+        indexed = dict(current, raw_page_index_committed_entries=2,
+                       raw_page_index_indexed_entries=2)
+        self.assertFalse(replays_raw_window(previous, indexed))
+
     def test_recoverable_quantum_rejects_replayed_raw_window(self):
         previous = self.report()
         previous.update(objects_retained=0, versions_retained=0, bytes_retained=0,
                         objects_processed=0, snapshot_complete=False, outcome="partial")
         current = dict(previous, round=1, pid=124, objects_before=0)
 
+        with self.assertRaisesRegex(ValueError, "raw enumeration window replayed"):
+            validate_recoverable_quantum([previous, current], objects=4, budget=16, require_converged=False)
+
+    def test_recoverable_quantum_allows_final_complete_round_after_full_retention(self):
+        previous = self.report()
+        previous.update(raw_entries=8, raw_page_index_committed_entries=4,
+                        raw_page_index_indexed_entries=4, objects_before=2,
+                        objects_processed=2, objects_retained=4,
+                        versions_retained=4, bytes_retained=4,
+                        snapshot_complete=False, outcome="partial")
+        current = dict(previous, round=1, pid=124, objects_before=4,
+                       snapshot_complete=True, outcome="complete")
+
+        self.assertTrue(replays_raw_window(previous, current))
+        self.assertTrue(final_complete_recheck_after_full_retention(previous, current, 4))
+        validate_recoverable_quantum([previous, current], objects=4, budget=16, require_converged=True)
+
+    def test_recoverable_quantum_rejects_partial_replay_after_full_retention(self):
+        previous = self.report()
+        previous.update(raw_entries=8, raw_page_index_committed_entries=4,
+                        raw_page_index_indexed_entries=4, objects_before=2,
+                        objects_processed=2, objects_retained=4,
+                        versions_retained=4, bytes_retained=4,
+                        snapshot_complete=False, outcome="partial")
+        current = dict(previous, round=1, pid=124, objects_before=4,
+                       snapshot_complete=False, outcome="partial")
+
+        self.assertTrue(replays_raw_window(previous, current))
+        self.assertFalse(final_complete_recheck_after_full_retention(previous, current, 4))
         with self.assertRaisesRegex(ValueError, "raw enumeration window replayed"):
             validate_recoverable_quantum([previous, current], objects=4, budget=16, require_converged=False)
 

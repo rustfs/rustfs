@@ -18,6 +18,7 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
+use crate::metrics::collectors::cluster_drive::ClusterDriveStats;
 use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
@@ -487,13 +488,51 @@ pub struct ProcessMetricBundle {
     pub disk_write_bytes: u64,
 }
 
+pub(crate) struct ClusterStorageSnapshot {
+    pub cluster: ClusterStats,
+    pub health: ClusterHealthStats,
+    pub drives: Vec<ClusterDriveStats>,
+    pub erasure_sets: Vec<ErasureSetStats>,
+}
+
+fn cluster_drive_stats_from_storage(storage: &ObsStorageInfo, local_server: &str) -> Vec<ClusterDriveStats> {
+    storage
+        .disks
+        .iter()
+        .map(|disk| {
+            let (capacity_state, capacity_age_seconds) = disk_capacity_observation_state(
+                disk.capacity_observation_source.as_deref(),
+                disk.capacity_observation_age_seconds,
+            );
+            ClusterDriveStats {
+                server: drive_server_label(&disk.endpoint, local_server),
+                drive: disk.drive_path.clone(),
+                pool_index: disk_topology_label(disk.pool_index).unwrap_or_default(),
+                set_index: disk_topology_label(disk.set_index).unwrap_or_default(),
+                drive_index: disk_topology_label(disk.disk_index).unwrap_or_default(),
+                disk_id: non_empty_disk_id(&disk.uuid).unwrap_or_default(),
+                runtime_state: disk.runtime_state.as_deref().unwrap_or("unknown").to_ascii_lowercase(),
+                offline_duration_seconds: disk.offline_duration_seconds,
+                capacity_state,
+                capacity_age_seconds,
+                total_bytes: disk.total_space,
+                used_bytes: disk.used_space,
+                free_bytes: disk.available_space,
+            }
+        })
+        .collect()
+}
+
 /// Collect cluster and cluster-health statistics from a single storage snapshot.
-pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return (ClusterStats::default(), ClusterHealthStats::default());
-    };
+pub(crate) async fn collect_cluster_storage_snapshot() -> Option<ClusterStorageSnapshot> {
+    let store = resolve_obs_object_store_handle()?;
 
     let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    if storage_info.disks.is_empty() && storage_info.backend.drives_per_set.is_empty() {
+        return None;
+    }
+    let drives = cluster_drive_stats_from_storage(&storage_info, &current_local_node_identity());
+    let erasure_sets = erasure_set_stats_from_backend(&storage_info, &storage_info.backend);
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
     let usable_capacity = obs_total_usable_capacity_bytes(&storage_info);
     let free = obs_total_usable_capacity_free_bytes(&storage_info);
@@ -536,8 +575,8 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         }
     }
 
-    (
-        ClusterStats {
+    Some(ClusterStorageSnapshot {
+        cluster: ClusterStats {
             raw_capacity_bytes: raw_capacity,
             usable_capacity_bytes: usable_capacity,
             used_bytes: used,
@@ -547,12 +586,22 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
             objects_count,
             buckets_count,
         },
-        ClusterHealthStats {
+        health: ClusterHealthStats {
             drives_offline_count: offline,
             drives_online_count: online,
             drives_count: storage_info.disks.len() as u64,
         },
-    )
+        drives,
+        erasure_sets,
+    })
+}
+
+/// Collect cluster statistics using the same observer snapshot as topology and health.
+pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
+    collect_cluster_storage_snapshot()
+        .await
+        .map(|snapshot| (snapshot.cluster, snapshot.health))
+        .unwrap_or_default()
 }
 
 /// Collect cluster statistics from the storage layer.
@@ -763,23 +812,31 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
-    let (disk_stats, drive_stats, drive_count_stats) = collect_disk_and_system_drive_runtime_stats().await;
+    let (disk_stats, drive_stats, drive_count_stats) = collect_disk_and_system_drive_runtime_stats().await.unwrap_or_default();
     (disk_stats, drive_stats.into_iter().map(|stat| stat.stats).collect(), drive_count_stats)
 }
 
 pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
--> (Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats) {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return (Vec::new(), Vec::new(), DriveCountStats::default());
-    };
+-> Option<(Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats)> {
+    let store = resolve_obs_object_store_handle()?;
+    let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
+    Some(local_drive_stats_from_storage(&storage_info, &current_local_node_identity()))
+}
 
-    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-    let local_server = current_local_node_identity();
+fn local_drive_stats_from_storage(
+    storage_info: &ObsStorageInfo,
+    local_server: &str,
+) -> (Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats) {
     let disk_stats = storage_info
         .disks
         .iter()
+        .filter(|disk| disk.local)
+        .filter(|disk| {
+            disk_capacity_observation_state(disk.capacity_observation_source.as_deref(), disk.capacity_observation_age_seconds).0
+                != CAPACITY_OBSERVATION_MISSING
+        })
         .map(|disk| DiskStats {
-            server: drive_server_label(&disk.endpoint, &local_server),
+            server: drive_server_label(&disk.endpoint, local_server),
             drive: disk.drive_path.clone(),
             total_bytes: disk.total_space,
             used_bytes: disk.used_space,
@@ -792,6 +849,7 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
     let drive_stats = storage_info
         .disks
         .iter()
+        .filter(|disk| disk.local)
         .map(|disk| {
             let is_online = disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref());
             let (capacity_observation_state, capacity_observation_age_seconds) = disk_capacity_observation_state(
@@ -832,7 +890,7 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
                     })
                     .unwrap_or_default(),
                 stats: DriveDetailedStats {
-                    server: drive_server_label(&disk.endpoint, &local_server),
+                    server: drive_server_label(&disk.endpoint, local_server),
                     drive: disk.drive_path.clone(),
                     total_bytes: disk.total_space,
                     used_bytes: disk.used_space,
@@ -1712,6 +1770,43 @@ mod tests {
         disk.state = DRIVE_STATE_OK.to_string();
         disk.runtime_state = Some(DRIVE_STATE_ONLINE.to_string());
         info
+    }
+
+    #[test]
+    fn local_details_exclude_remote_copies_but_keep_offline_configured_slots() {
+        let mut info = storage_info_with_one_online_disk();
+        info.disks[0].local = true;
+        info.disks[0].endpoint = "http://owner:9000/data".into();
+        info.disks[0].drive_path = "/data".into();
+        info.disks[0].uuid = "disk-old".into();
+        info.disks[0].capacity_observation_source = Some("live_probe".into());
+        let mut remote = info.disks[0].clone();
+        remote.local = false;
+        remote.endpoint = "http://peer:9000/data".into();
+        remote.pool_index = 1;
+        remote.uuid = "peer-disk".into();
+        info.disks.push(remote);
+        let (disks, local, counts) = local_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(disks.len(), 1);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].stats.server, "owner:9000");
+        assert_eq!(local[0].disk_id.as_deref(), Some("disk-old"));
+        assert_eq!(counts.total_count, 1);
+        let global = cluster_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(global.len(), 2);
+        assert_eq!(global[1].server, "peer:9000");
+        assert_eq!(global[1].pool_index, "1");
+        // A disconnected configured local slot has no disk ID, but is not removed.
+        info.disks[0].uuid.clear();
+        info.disks[0].state = "offline".into();
+        info.disks[0].runtime_state = Some("offline".into());
+        info.disks[0].capacity_observation_source = None;
+        let (_, local, counts) = local_drive_stats_from_storage(&info, "owner:9000");
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].disk_id, None);
+        assert_eq!(local[0].stats.capacity_observation_state, "missing");
+        assert_eq!(counts.offline_count, 1);
+        assert_eq!(counts.total_count, 1);
     }
 
     #[test]

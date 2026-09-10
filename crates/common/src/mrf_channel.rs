@@ -145,6 +145,38 @@ pub fn consume_verified_mrf_repair_events(anchors: &mut Vec<MrfDurableRepairAnch
     before.saturating_sub(anchors.len())
 }
 
+/// Consume recorded verified repairs for one bucket without draining
+/// unrelated or still-unmatched proofs. If the caller crashes before
+/// persisting the retained anchor set, the proof may be replayed by repair
+/// instead of silently deleting the old responsibility.
+pub fn consume_recorded_verified_mrf_repair_events_for(bucket: &str, anchors: &mut Vec<MrfDurableRepairAnchor>) -> usize {
+    let Some(registry) = MRF_VERIFIED_REPAIR_EVENTS.get() else {
+        return 0;
+    };
+    let Ok(mut events) = registry.lock() else {
+        return 0;
+    };
+    let before = anchors.len();
+    let mut retained = std::collections::VecDeque::with_capacity(events.len());
+    while let Some(event) = events.pop_front() {
+        if event.bucket.as_ref() != bucket {
+            retained.push_back(event);
+            continue;
+        }
+        let mut matched = false;
+        anchors.retain(|anchor| {
+            let proven = anchor.is_proven_by(&event);
+            matched |= proven;
+            !proven
+        });
+        if !matched {
+            retained.push_back(event);
+        }
+    }
+    *events = retained;
+    before.saturating_sub(anchors.len())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MrfScope {
     pub pool_index: u32,
@@ -819,6 +851,71 @@ mod tests {
         let mut retained = vec![anchor];
         assert_eq!(consume_verified_mrf_repair_events(&mut retained, &[event]), 1);
         assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn recorded_verified_repair_consumer_retains_unmatched_proofs() {
+        let bucket = Arc::<str>::from(format!("recorded-proof-{}", Uuid::new_v4()));
+        let other_bucket = Arc::<str>::from(format!("recorded-proof-other-{}", Uuid::new_v4()));
+        let incarnation = Uuid::new_v4();
+        let lease = MrfIngressLease::new(21);
+        let retained_anchor = MrfDurableRepairAnchor {
+            kind: MrfKind::PartialWrite,
+            bucket: bucket.clone(),
+            object: Arc::from("retained"),
+            version_id: Some([7; 16]),
+            scope: Some(MrfScope {
+                pool_index: 1,
+                set_index: 2,
+            }),
+            lease,
+            bucket_incarnation_id: incarnation,
+        };
+        let waiting_anchor = MrfDurableRepairAnchor {
+            object: Arc::from("waiting"),
+            lease: MrfIngressLease::new(22),
+            ..retained_anchor.clone()
+        };
+        let matched_event = MrfVerifiedRepairEvent {
+            kind: retained_anchor.kind,
+            bucket: bucket.clone(),
+            object: retained_anchor.object.clone(),
+            version_id: retained_anchor.version_id,
+            scope: retained_anchor.scope,
+            lease: Some(retained_anchor.lease),
+            bucket_incarnation_id: retained_anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        let same_bucket_unmatched = MrfVerifiedRepairEvent {
+            object: Arc::from("future"),
+            lease: Some(MrfIngressLease::new(23)),
+            ..matched_event.clone()
+        };
+        let other_bucket_event = MrfVerifiedRepairEvent {
+            bucket: other_bucket.clone(),
+            ..matched_event.clone()
+        };
+
+        note_mrf_verified_repair(matched_event);
+        note_mrf_verified_repair(same_bucket_unmatched.clone());
+        note_mrf_verified_repair(other_bucket_event.clone());
+
+        let mut anchors = vec![retained_anchor, waiting_anchor.clone()];
+        assert_eq!(consume_recorded_verified_mrf_repair_events_for(&bucket, &mut anchors), 1);
+        assert_eq!(anchors, vec![waiting_anchor]);
+
+        let remaining_bucket_events = take_mrf_verified_repair_events_for(&bucket);
+        assert_eq!(
+            remaining_bucket_events,
+            vec![same_bucket_unmatched],
+            "same-bucket proofs without a retained anchor must remain available"
+        );
+        let remaining_other_events = take_mrf_verified_repair_events_for(&other_bucket);
+        assert_eq!(
+            remaining_other_events,
+            vec![other_bucket_event],
+            "proofs for other buckets must not be drained by this consumer"
+        );
     }
 
     #[tokio::test]

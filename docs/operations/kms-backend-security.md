@@ -15,6 +15,16 @@ RustFS ships several KMS backends. They differ not only in deployment effort but
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 | AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments rooted in AWS IAM — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
 
+## No KMS configured: the SSE-S3 local master key
+
+A deployment that never configures a KMS can still serve **SSE-S3** by setting `RUSTFS_SSE_S3_MASTER_KEY` to a base64-encoded 32-byte key. Data keys are then wrapped with that key using AES-256-GCM, on the node that serves the write. Understand three consequences before relying on it:
+
+- **The key is the whole confidentiality boundary.** It lives in the process environment of every node, with no ACL, no audit trail and no policy engine in front of it.
+- **Objects written this way can never be rotated.** There is no key record to rotate and no rewrap path; changing the value makes every object written under the old one unreadable. Migrating to a KMS later means rewriting those objects (for example with CopyObject), not reconfiguring.
+- **It does not serve SSE-KMS.** A request for `x-amz-server-side-encryption: aws:kms` on a node with no running KMS is refused — `400 InvalidRequest` when KMS was never configured, `503` when a configured service is not running. Earlier releases silently wrapped the data key with the local master key while still stamping `aws:kms` and the requested key id into the object metadata; that metadata claimed a KMS protection the object never had. If a deployment depended on that, either configure a KMS or ask for `AES256`.
+
+The value is unset by default, and a deployment that neither configures a KMS nor sets it simply cannot serve SSE-S3 (the write is refused, never silently downgraded to plaintext).
+
 ## Migrating from MinIO: encrypted objects do not carry over
 
 > **Warning: default RustFS builds fail closed on objects that MinIO encrypted.** This applies to SSE-S3, SSE-KMS, and SSE-C, whichever KMS backend you configure; configuring `Static` with MinIO's key material does not make them readable. Such objects list and HEAD normally (their `xl.meta` parses), and only the payload read fails — with S3 `InvalidObjectState`, never plaintext. Read a sample of encrypted objects, not just their listings, before decommissioning the MinIO deployment.
@@ -116,6 +126,37 @@ Decryption loads exactly the version recorded in the envelope and fails closed w
 ### Upgrade before first rotation (hard constraint)
 
 Do not rotate any key until **every** RustFS node runs a build that understands the `master_key_version` envelope field. Older binaries ignore the field and always decrypt with the current material: harmless while nothing has been rotated, but after a rotation they fail to decrypt every object wrapped by an earlier key version. Complete the rolling upgrade of the entire cluster first, then rotate. The rest of this constraint class is collected in [Mixed-version clusters during a rolling upgrade](#mixed-version-clusters-during-a-rolling-upgrade).
+
+## SSE-C requires a secure transport
+
+An SSE-C request carries the customer's AES key in a request header, so AWS S3 and MinIO both refuse one that did not arrive over TLS. A plaintext hop hands that key to anyone on the path, and because the object cannot be read without the same key, the exposure lasts as long as the object does.
+
+This release reports rather than refuses, because flipping straight to a rejection would break every plaintext staging and test deployment inside a release window:
+
+- Every SSE-C request on a plaintext transport increments `rustfs_ssec_plaintext_requests_total` and logs one `ssec_request_without_tls` warning per process.
+- `RUSTFS_SSE_C_REQUIRE_TLS=true` (default `false`) refuses those requests now, with the same `400 InvalidRequest` wording AWS uses. Confirm the counter reads zero before enabling it.
+- The default is expected to flip in a later release.
+
+The verdict is per connection: a listener that terminates TLS satisfies it, and so does an `https` protocol forwarded by a proxy the trusted-proxy configuration accepts. A direct plaintext client asserts nothing, and a forwarded protocol from an untrusted peer is not consulted.
+
+## Object ciphertext format: what the v1 frame layout does and does not authenticate
+
+Every object RustFS writes today uses the **v1** frame layout (the v2 layout exists and is read automatically, but its write switch `RUSTFS_ENCRYPTION_FRAME_V2` is off by default). Each frame is authenticated with AES-256-GCM under a nonce derived from the object's base nonce and the frame's index. Three properties do **not** follow from that, and an operator's threat model has to account for them:
+
+- **No frame-index binding.** A frame's index is not part of its associated data. Authentication proves a frame was produced under this object's key; it does not by itself prove the frame belongs at the position it occupies.
+- **No final-frame authentication.** Nothing in a v1 stream marks the last frame, so a stream that has been cut short is not distinguishable from a shorter object by cryptographic means.
+- **Truncation is not detected server-side.** A full GET is cut off by the length gate mid-stream and surfaces as `IncompleteBody` — after the response headers have already gone out. A ranged GET that ends early looks like an ordinary EOF and is not reported at all. A client that needs a truncation signal must compare the delivered length against `Content-Length` itself.
+
+These matter only to an attacker who can already rewrite the underlying shards. Shard integrity uses a keyed-hash-free checksum (HighwayHash), which such an attacker can recompute, so it is not a barrier.
+
+Two historical shapes additionally reuse a GCM nonce and cannot be repaired by any read-side change:
+
+| Shape | Written by | Consequence | Migration |
+| --- | --- | --- | --- |
+| Multipart objects written before `1.0.0-alpha.91` | The pre-alpha.91 writer reused a segment's part nonce for every block in it | The whole segment shares one nonce; a frame from index zero authenticates anywhere in that segment | Rewrite in place with CopyObject; then set `RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK=false` |
+| SSE-C objects written before `1.0.0-beta.9` that carry no stored IV | The nonce was derived deterministically from bucket and key | Historical versions of the same key share a nonce, which affects confidentiality as well as forgeability | Rewrite in place with CopyObject |
+
+The decrypt reader locks each segment to whichever nonce layout decoded its first non-zero-index frame, so a replayed frame is rejected as soon as any later frame disagrees. A stream that is nothing but repeats of frame zero has no later frame to disagree, so a deployment that holds no pre-alpha.91 objects should set `RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK=false` (default `true`) to drop that layout entirely. Turning it off refuses to decrypt pre-alpha.91 objects, so migrate first.
 
 ## Mixed-version clusters during a rolling upgrade
 
@@ -237,6 +278,7 @@ The Local backend stores one JSON record per key (`<key_id>.key`) plus an Argon2
 - `Local` is the default backend (`kms_backend` defaults to `local`) and is a development, testing and demo backend; it is not supported for production. Activating a backend whose capabilities report `production_supported: false` logs a `kms_backend_positioning` warning on every start, restart and reconfigure, and the `kms/status` capability matrix carries the same flag. The positioning is a warning, not a gate.
 - Configuration validation enforces stricter rules outside explicit development mode: a master key is required and `key_dir` must not live under the process temp directory.
 - The RustFS Kubernetes operator places the key directory on a PersistentVolumeClaim, so keys survive pod rescheduling.
+- **A multi-node deployment cannot share it.** Key material lives on each node's own disk and the Argon2id salt is generated per node, so two nodes derive different keys from the same `master_key`. An object encrypted on node A cannot be decrypted on node B; behind a load balancer that appears as intermittent 500s on reads that succeeded a moment earlier. Configuring `Local` while the deployment is distributed logs `kms_node_local_backend_in_distributed_deployment` and appends the same warning to the `kms/configure` response. This stays a warning, not a gate.
 - Production multi-node deployments should use the Vault Transit backend.
 
 ### Deployment support matrix

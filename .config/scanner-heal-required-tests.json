@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "cases": {
     "background-target-restart": {
       "gate": "G14",
@@ -13,6 +13,7 @@
       "min_objects": 9,
       "max_objects": 65,
       "topology": {"nodes": 4, "drives_per_node": 1},
+      "erasure": {"data_blocks": 2, "parity_blocks": 2},
       "scope": "Target process restart, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
     },
     "background-target-crash": {
@@ -27,30 +28,422 @@
       "min_objects": 9,
       "max_objects": 65,
       "topology": {"nodes": 4, "drives_per_node": 1},
+      "erasure": {"data_blocks": 2, "parity_blocks": 2},
       "scope": "Target process killed during partial background rebuild, real unclean-shutdown marker, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
+    },
+    "ec84-target-drive-restart": {
+      "gate": "G14",
+      "task": "W20/W21",
+      "lane": "e2e-distributed",
+      "suite": "e2e_test",
+      "name": "distributed::heal_test::three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_restart",
+      "oracle": "ec84-target-drive-restart.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
+      "min_objects": 5,
+      "max_objects": 5,
+      "topology": {"nodes": 3, "drives_per_node": 4},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "scope": "3-node x 4-drive single-set EC8+4, graceful target restart, preformatted replacement drive, exact unversioned S3 bodies and physical target shards; not mixed-version, multi-pool or long-window ABBA."
+    },
+    "background-target-restart-ec8-4": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_after_background_target_restart",
+      "oracle": "background-target-restart-ec8-4.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 4},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "scope": "Target process restart during partial background rebuild on a single 3x4 EC8+4 set; exact unversioned S3 bodies and replacement-drive shards; not power loss, multi-set, or multi-pool."
+    },
+    "background-target-crash-ec8-4": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_after_background_target_crash",
+      "oracle": "background-target-crash-ec8-4.json",
+      "evidence": "process-crash-restart",
+      "unclean_shutdown_marker": true,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 4},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "scope": "Target process killed during partial background rebuild on a single 3x4 EC8+4 set; real unclean-shutdown marker, exact unversioned S3 bodies and replacement-drive shards; not power loss, multi-set, or multi-pool."
+    },
+    "background-target-restart-ec8-4-multi-set": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart",
+      "oracle": "background-target-restart-ec8-4-multi-set.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 8},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "sets": 2,
+      "pools": 1,
+      "scope": "Target process restart during partial background rebuild on a 3x8 EC8+4 layout with two erasure sets in one pool; exact unversioned S3 bodies and replacement-drive shards; not power loss or multi-pool."
+    },
+    "background-target-crash-ec8-4-multi-pool": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_pool_after_background_target_crash",
+      "oracle": "background-target-crash-ec8-4-multi-pool.json",
+      "evidence": "process-crash-restart",
+      "unclean_shutdown_marker": true,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 12},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "sets": 3,
+      "pools": 3,
+      "outage_target_manifest_required": false,
+      "scope": "Target process crash during partial background rebuild on three single-node EC8+4 pools; exact baseline S3 bodies and replacement-drive shards, with down-window outage PUT refusal recorded and a deferred post-rejoin outage object verified through S3 when the full target pool was offline."
     }
   },
-  "release_pending": {
-    "G01": "W02/W04 complete root and quota authority coverage",
-    "G02": "W03 bounded checkpoint progress and independent version inventory",
-    "G03": "W17/W18 exact scoped ACK with durable publication and mixed peers",
-    "G04": "W03/W15/W16 crash at every cache/root/floor/intent boundary",
-    "G05": "W06/W07 per-object outcomes and bounded terminal retention",
-    "G06": "W06/W08/W23 concurrent status, legacy clients and truncation",
-    "G07": "W12/W13/W14 durable MRF responsibility at every commit boundary",
-    "G08": "W12/W13/W14 MRF capacity, disk-full and replica-loss matrix",
-    "G09": "W13/W18/W23 actual mixed-version reader/writer and rollback payloads",
-    "G10": "W05/W09/W10/W11 bounded scheduling and pressure recovery",
-    "G11": "W04/W19/W24 maintenance and complete producer coverage",
-    "G12": "W02/W15/W16 both quota paths during reset and settlement",
-    "G13": "W07/W14 quorum-minus-one, unknown disks, remount, Object Lock, dry-run, grace and commit tail",
-    "G14": "W20/W21 same-window field evidence; 3x4 EC8+4 and multi-set/pool coverage",
-    "P1": "W20 measured cold-walk share and foreground latency/throughput",
-    "P2": "W20/W24 measured post-stop convergence and cold segment reuse",
-    "P3": "W20 measured two-hour pressure/heal capacity and recovery window",
-    "P4": "W20 measured MRF scale and replay cost with retained responsibility",
-    "R-E": "W03/W05 fixed-budget real process restart through enumeration and classification",
-    "R-D": "W07/W14 manager-to-event-to-ledger exact disposition, including grace",
-    "R-L": "W13/W14 legacy source conflicts, migration gaps and crash-safe source retirement"
-  }
+  "release_lanes": {
+    "single-set-restart": {
+      "status": "implemented",
+      "cases": ["background-target-restart", "background-target-crash"],
+      "covers": ["four-node one-drive topology", "unversioned objects", "target restart/crash"]
+    },
+    "authority-coverage": {
+      "status": "pending",
+      "gates": ["G01", "G12"],
+      "requires": ["root authority coverage", "quota authority coverage"]
+    },
+    "checkpoint-and-crash": {
+      "status": "pending",
+      "gates": ["G02", "G04", "R-E"],
+      "requires": ["bounded checkpoint progress", "boundary crash matrix", "fixed-budget restart evidence"]
+    },
+    "status-and-outcome": {
+      "status": "pending",
+      "gates": ["G05", "G06", "R-D"],
+      "requires": ["per-object outcomes", "legacy status clients", "manager/event/ledger disposition"]
+    },
+    "mrf-responsibility": {
+      "status": "pending",
+      "gates": ["G07", "G08", "P4"],
+      "requires": ["durable MRF responsibility", "disk-full and replica-loss matrix", "MRF replay cost"]
+    },
+    "mixed-version-rollback": {
+      "status": "pending",
+      "gates": ["G03", "G09", "R-L"],
+      "requires": ["mixed-version peers", "rollback payloads", "crash-safe source retirement"]
+    },
+    "scheduler-pressure": {
+      "status": "pending",
+      "gates": ["G10", "P1", "P2", "P3"],
+      "requires": ["bounded scheduling", "foreground latency and throughput", "two-hour pressure evidence"]
+    },
+    "maintenance-producers": {
+      "status": "pending",
+      "gates": ["G11", "G13"],
+      "requires": ["complete producer coverage", "quorum-minus-one and remount matrix"]
+    },
+    "ec8-4-multiset": {
+      "status": "pending",
+      "gates": ["G14"],
+      "requires": ["3x4 EC8+4 topology", "multi-set coverage", "multi-pool coverage"]
+    }
+  },
+  "release_requirements": [
+    {
+      "gate": "G01",
+      "task": "W02/W04",
+      "lane": "authority-coverage",
+      "status": "pending",
+      "description": "Complete root and quota authority coverage",
+      "requires": ["root authority evidence", "quota authority evidence"],
+      "evidence_fields": [
+        "root_authority_evidence",
+        "quota_authority_evidence"
+      ]
+    },
+    {
+      "gate": "G02",
+      "task": "W03",
+      "lane": "checkpoint-and-crash",
+      "status": "pending",
+      "description": "Bounded checkpoint progress and independent version inventory",
+      "requires": ["bounded checkpoint oracle", "independent version inventory"],
+      "evidence_fields": [
+        "bounded_checkpoint_oracle",
+        "independent_version_inventory"
+      ]
+    },
+    {
+      "gate": "G03",
+      "task": "W17/W18",
+      "lane": "mixed-version-rollback",
+      "status": "pending",
+      "description": "Exact scoped ACK with durable publication and mixed peers",
+      "requires": ["durable scoped ACK publication", "mixed-peer evidence"],
+      "evidence_fields": [
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle"
+      ]
+    },
+    {
+      "gate": "G04",
+      "task": "W03/W15/W16",
+      "lane": "checkpoint-and-crash",
+      "status": "pending",
+      "description": "Crash at every cache, root, floor and intent boundary",
+      "requires": ["cache boundary crash evidence", "root/floor/intent crash evidence"],
+      "evidence_fields": [
+        "cache_boundary_crash_evidence",
+        "root_floor_intent_crash_evidence"
+      ]
+    },
+    {
+      "gate": "G05",
+      "task": "W06/W07",
+      "lane": "status-and-outcome",
+      "status": "pending",
+      "description": "Per-object outcomes and bounded terminal retention",
+      "requires": ["per-object outcome oracle", "terminal retention bounds"],
+      "evidence_fields": [
+        "per_object_outcome_oracle",
+        "terminal_retention_bounds"
+      ]
+    },
+    {
+      "gate": "G06",
+      "task": "W06/W08/W23",
+      "lane": "status-and-outcome",
+      "status": "pending",
+      "description": "Concurrent status, legacy clients and truncation",
+      "requires": ["concurrent status evidence", "legacy client compatibility", "truncation behavior"],
+      "evidence_fields": [
+        "concurrent_status_evidence",
+        "legacy_client_compatibility",
+        "truncation_behavior"
+      ]
+    },
+    {
+      "gate": "G07",
+      "task": "W12/W13/W14",
+      "lane": "mrf-responsibility",
+      "status": "pending",
+      "description": "Durable MRF responsibility at every commit boundary",
+      "requires": ["MRF responsibility oracle", "commit-boundary crash matrix"],
+      "evidence_fields": [
+        "mrf_responsibility_oracle",
+        "commit_boundary_crash_matrix"
+      ]
+    },
+    {
+      "gate": "G08",
+      "task": "W12/W13/W14",
+      "lane": "mrf-responsibility",
+      "status": "pending",
+      "description": "MRF capacity, disk-full and replica-loss matrix",
+      "requires": ["MRF capacity evidence", "disk-full matrix", "replica-loss matrix"],
+      "evidence_fields": [
+        "mrf_capacity_evidence",
+        "disk_full_matrix",
+        "replica_loss_matrix"
+      ]
+    },
+    {
+      "gate": "G09",
+      "task": "W13/W18/W23",
+      "lane": "mixed-version-rollback",
+      "status": "pending",
+      "description": "Actual mixed-version reader/writer and rollback payloads",
+      "requires": ["mixed-version reader evidence", "mixed-version writer evidence", "rollback payload evidence"],
+      "evidence_fields": [
+        "mixed_version_reader_evidence",
+        "mixed_version_writer_evidence",
+        "rollback_payload_evidence"
+      ]
+    },
+    {
+      "gate": "G10",
+      "task": "W05/W09/W10/W11",
+      "lane": "scheduler-pressure",
+      "status": "pending",
+      "description": "Bounded scheduling and pressure recovery",
+      "requires": ["scheduler bound evidence", "pressure recovery evidence"],
+      "evidence_fields": [
+        "scheduler_bound_evidence",
+        "pressure_recovery_evidence"
+      ]
+    },
+    {
+      "gate": "G11",
+      "task": "W04/W19/W24",
+      "lane": "maintenance-producers",
+      "status": "pending",
+      "description": "Maintenance and complete producer coverage",
+      "requires": [
+        "maintenance producer matrix",
+        "complete producer inventory",
+        "segment activation preflight"
+      ],
+      "evidence_fields": [
+        "maintenance_producer_matrix",
+        "complete_producer_inventory",
+        "segment_activation_preflight"
+      ]
+    },
+    {
+      "gate": "G12",
+      "task": "W02/W15/W16",
+      "lane": "authority-coverage",
+      "status": "pending",
+      "description": "Both quota paths during reset and settlement",
+      "requires": ["reset quota-path evidence", "settlement quota-path evidence"],
+      "evidence_fields": [
+        "reset_quota_path_evidence",
+        "settlement_quota_path_evidence"
+      ]
+    },
+    {
+      "gate": "G13",
+      "task": "W07/W14",
+      "lane": "maintenance-producers",
+      "status": "pending",
+      "description": "Quorum-minus-one, unknown disks, remount, Object Lock, dry-run, grace and commit tail",
+      "requires": ["quorum-minus-one matrix", "unknown-disk/remount matrix", "Object Lock dry-run grace evidence"],
+      "evidence_fields": [
+        "quorum_minus_one_matrix",
+        "unknown_disk_remount_matrix",
+        "object_lock_dry_run_grace_evidence"
+      ]
+    },
+    {
+      "gate": "G14",
+      "task": "W20/W21",
+      "lane": "ec8-4-multiset",
+      "status": "pending",
+      "description": "Same-window field evidence with 3x4 EC8+4 and multi-set/pool coverage",
+      "requires": [
+        "same-window field evidence",
+        "3x4 EC8+4 evidence",
+        "multi-set evidence",
+        "multi-pool evidence",
+        "distributed segment invalidation evidence"
+      ],
+      "evidence_fields": [
+        "same_window_field_evidence",
+        "ec8_4_evidence",
+        "multi_set_evidence",
+        "multi_pool_evidence",
+        "distributed_segment_invalidation_evidence"
+      ]
+    },
+    {
+      "gate": "P1",
+      "task": "W20",
+      "lane": "scheduler-pressure",
+      "status": "pending",
+      "description": "Measured cold-walk share and foreground latency/throughput",
+      "requires": ["cold-walk share measurement", "foreground latency/throughput measurement"],
+      "evidence_fields": [
+        "cold_walk_share_measurement",
+        "foreground_latency_throughput_measurement",
+        "profile_evidence"
+      ]
+    },
+    {
+      "gate": "P2",
+      "task": "W20/W24",
+      "lane": "scheduler-pressure",
+      "status": "pending",
+      "description": "Measured post-stop convergence and cold segment reuse",
+      "requires": ["post-stop convergence measurement", "cold segment reuse measurement"],
+      "evidence_fields": [
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement"
+      ]
+    },
+    {
+      "gate": "P3",
+      "task": "W20",
+      "lane": "scheduler-pressure",
+      "status": "pending",
+      "description": "Measured two-hour pressure/heal capacity and recovery window",
+      "requires": ["two-hour pressure measurement", "heal capacity measurement", "recovery-window measurement"],
+      "evidence_fields": [
+        "two_hour_pressure_measurement",
+        "heal_capacity_measurement",
+        "recovery_window_measurement"
+      ]
+    },
+    {
+      "gate": "P4",
+      "task": "W20",
+      "lane": "mrf-responsibility",
+      "status": "pending",
+      "description": "Measured MRF scale and replay cost with retained responsibility",
+      "requires": ["MRF scale measurement", "MRF replay-cost measurement", "retained responsibility evidence", "cleanup/GC soak evidence"],
+      "evidence_fields": [
+        "mrf_scale_measurement",
+        "mrf_replay_cost_measurement",
+        "retained_responsibility_evidence",
+        "mrf_cleanup_gc_soak_evidence"
+      ]
+    },
+    {
+      "gate": "R-E",
+      "task": "W03/W05",
+      "lane": "checkpoint-and-crash",
+      "status": "pending",
+      "description": "Fixed-budget real process restart through enumeration and classification",
+      "requires": ["fixed-budget restart evidence", "enumeration evidence", "classification evidence"],
+      "evidence_fields": [
+        "fixed_budget_restart_evidence",
+        "enumeration_evidence",
+        "classification_evidence"
+      ]
+    },
+    {
+      "gate": "R-D",
+      "task": "W07/W14",
+      "lane": "status-and-outcome",
+      "status": "pending",
+      "description": "Manager-to-event-to-ledger exact disposition, including grace",
+      "requires": ["manager disposition evidence", "event disposition evidence", "ledger disposition evidence", "grace handling"],
+      "evidence_fields": [
+        "manager_disposition_evidence",
+        "event_disposition_evidence",
+        "ledger_disposition_evidence",
+        "grace_handling"
+      ]
+    },
+    {
+      "gate": "R-L",
+      "task": "W13/W14",
+      "lane": "mixed-version-rollback",
+      "status": "pending",
+      "description": "Legacy source conflicts, migration gaps and crash-safe source retirement",
+      "requires": ["legacy source-conflict evidence", "migration-gap evidence", "crash-safe source retirement evidence"],
+      "evidence_fields": [
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence"
+      ]
+    }
+  ]
 }

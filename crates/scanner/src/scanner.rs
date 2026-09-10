@@ -964,9 +964,10 @@ async fn run_scanner_usage_recovery_intents_for_startup(
     Ok(attempted)
 }
 
-/// Start normal scanning when enabled, or one resume-only cleanup attempt.
+/// Start normal scanning when enabled, or one bounded recovery attempt.
 /// The disabled branch returns a finite task for the startup owner to join;
-/// it never enables ordinary namespace scanning or accepts a new reset intent.
+/// it never enables ordinary namespace scanning while it replays durable reset
+/// intents and cleanup markers.
 pub async fn init_scanner_with_recovery(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
@@ -988,6 +989,17 @@ pub async fn init_scanner_with_recovery(
         return None;
     }
     Some(tokio::spawn(async move {
+        if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "recovery_intent_startup_discovery_failed",
+                error = %error,
+                "Scanner recovery intent startup discovery failed"
+            );
+        }
         if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
             warn!(
                 target: "rustfs::scanner",
@@ -1983,10 +1995,22 @@ where
                             if let Some((notification_system, grants)) = remote_lease_probe.as_ref()
                                 && notification_system.validate_scanner_publication_leases(grants).await.is_err()
                             {
-                                // A remote restart or movement flip invalidates
-                                // the token proof; usage_store interprets this
-                                // as a publication barrier and performs no PUT.
-                                return Some(ScannerCycleDeferReason::DataMovement);
+                                let remote_lease_targets = grants
+                                    .iter()
+                                    .map(|grant| {
+                                        (
+                                            grant.host.clone(),
+                                            grant.lease.session_id.clone(),
+                                            grant.lease.movement_generation,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let remote_leases_valid = grants.iter().all(|grant| grant.lease.is_valid());
+                                return Some(scanner_remote_publication_lease_failure_defer_reason(
+                                    &remote_lease_targets,
+                                    remote_leases_valid,
+                                    probe_scanner_activity(storeapi.as_ref(), true).await,
+                                ));
                             }
                             scanner_local_publication_defer_reason(storeapi.as_ref()).await
                         }
@@ -3401,6 +3425,61 @@ fn scanner_post_lease_activity_defer_reason(
     }
 }
 
+fn scanner_remote_publication_lease_failure_defer_reason(
+    remote_lease_targets: &[(String, String, u64)],
+    remote_leases_valid: bool,
+    activity_after_failure: Result<ScannerActivitySnapshot, String>,
+) -> ScannerCycleDeferReason {
+    if !remote_leases_valid {
+        return ScannerCycleDeferReason::DataMovement;
+    }
+    let Ok(snapshot) = activity_after_failure else {
+        return ScannerCycleDeferReason::ActivityBaselineUnavailable;
+    };
+    if !scanner_activity_allows_usage_publication(&snapshot) {
+        return ScannerCycleDeferReason::DataMovement;
+    }
+    if scanner_publication_lease_targets_match_activity(remote_lease_targets, &snapshot) {
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    } else {
+        ScannerCycleDeferReason::DataMovement
+    }
+}
+
+fn scanner_publication_lease_targets_match_activity(
+    remote_lease_targets: &[(String, String, u64)],
+    activity: &ScannerActivitySnapshot,
+) -> bool {
+    let mut expected = BTreeMap::new();
+    for (host, instance_id, movement_generation) in remote_lease_targets {
+        if host.is_empty()
+            || expected
+                .insert(host.as_str(), (instance_id.as_str(), *movement_generation))
+                .is_some()
+        {
+            return false;
+        }
+    }
+
+    let mut observed_remote_targets = 0usize;
+    for (host, node_activity) in activity {
+        if host == LOCAL_SCANNER_ACTIVITY_NODE {
+            continue;
+        }
+        observed_remote_targets = observed_remote_targets.saturating_add(1);
+        let Some((expected_instance_id, expected_movement_generation)) = expected.get(host.as_str()) else {
+            return false;
+        };
+        if node_activity.instance_id != *expected_instance_id
+            || node_activity.movement_generation != *expected_movement_generation
+        {
+            return false;
+        }
+    }
+
+    observed_remote_targets == remote_lease_targets.len()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCyclePreCommitOutcome {
     RecoverCacheCycle(u64),
@@ -3616,7 +3695,7 @@ pub(crate) use activity::{
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{
     ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds,
-    scanner_pause_backlog_status,
+    register_scanner_pause_backlog_retirement, scanner_pause_backlog_status,
 };
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;

@@ -3,7 +3,8 @@
 use super::*;
 use crate::segment_invalidation::{
     MAX_SEGMENT_INVALIDATION_BYTES, MAX_SEGMENT_INVALIDATION_ENTRIES, SegmentInvalidationDomain, SegmentInvalidationEnvelope,
-    SegmentInvalidationError, SegmentInvalidationProducer, SegmentInvalidationProof, admit_segment_invalidation,
+    SegmentInvalidationError, SegmentInvalidationProducer, SegmentInvalidationProducerIdentity, SegmentInvalidationProof,
+    admit_segment_invalidation, complete_segment_invalidation_producers,
 };
 use std::collections::BTreeSet;
 
@@ -11,7 +12,8 @@ const MAX_WALK_SAMPLES: usize = 32;
 const MAX_WALK_BYTES: usize = 1024;
 
 fn segment_producers() -> BTreeSet<SegmentInvalidationProducer> {
-    SegmentInvalidationProducer::REQUIRED.into_iter().collect()
+    complete_segment_invalidation_producers(SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION)
+        .expect("fixture should enumerate the complete production producer matrix")
 }
 
 fn segment_envelope() -> SegmentInvalidationEnvelope {

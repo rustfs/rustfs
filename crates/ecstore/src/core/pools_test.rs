@@ -5256,16 +5256,35 @@ mod decommission_lock_order_tests {
 
     #[test]
     #[serial_test::serial]
-    fn scanner_backlog_native_replica_reconciles_capacity_and_cleans_source() {
-        run_large_stack_current_thread_async_test("scanner-backlog-reconcile", async || {
+    fn data_movement_existing_replica_reconciles_capacity_and_cleans_source() {
+        data_movement_existing_replica_reconciles_capacity_case(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn data_movement_existing_replica_outside_reservation_uses_reserved_target() {
+        data_movement_existing_replica_reconciles_capacity_case(true);
+    }
+
+    fn data_movement_existing_replica_reconciles_capacity_case(existing_outside_reservation: bool) {
+        run_large_stack_current_thread_async_test("reserved-replica-reconcile", async move || {
             let (_temp_dirs, store, other_store) =
                 test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
-            let object = "buckets/.scanner-pause-backlog.json";
+            let object = "buckets/reserved-replica-routing.json";
             let body = br#"{"schemaVersion":1,"generation":2}"#.to_vec();
             let old_body = br#"{"schemaVersion":1,"generation":1}"#.to_vec();
             let source_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
-            let target_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
-            for (pool_index, payload, mod_time) in [(0, body.clone(), source_time), (2, old_body, target_time)] {
+            let target_time = source_time;
+            let target_pool_index = if existing_outside_reservation { 1 } else { 2 };
+            let mut replicas = vec![(0, body.clone(), source_time), (target_pool_index, old_body, target_time)];
+            if existing_outside_reservation {
+                replicas.push((
+                    2,
+                    br#"{"schemaVersion":1,"generation":3}"#.to_vec(),
+                    source_time + time::Duration::seconds(10),
+                ));
+            }
+            for (pool_index, payload, mod_time) in replicas.iter().cloned() {
                 store.pools[pool_index]
                     .put_object(
                         RUSTFS_META_BUCKET,
@@ -5278,13 +5297,19 @@ mod decommission_lock_order_tests {
                         },
                     )
                     .await
-                    .expect("seed native scanner replicas with independent write times");
+                    .expect("seed existing replicas with independent write times");
             }
             let layout = DecommissionErasureLayout { data: 1, parity: 0 };
             let target_total = body.len() * 8;
             let capacities = vec![
                 DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len() * 2, body.len() * 2),
-                DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                DecommissionPoolCapacityInfo::for_test(
+                    1,
+                    layout,
+                    if existing_outside_reservation { target_total } else { 0 },
+                    target_total,
+                    if existing_outside_reservation { 0 } else { target_total },
+                ),
                 DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
             ];
             set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities.clone()]);
@@ -5293,6 +5318,17 @@ mod decommission_lock_order_tests {
                 .await
                 .expect("activate the source reservation");
             let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+            let reserved_snapshot = store.pool_meta.read().await.clone();
+            let reservation = reserved_snapshot.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("active source reservation");
+            assert_eq!(
+                reservation.targets.iter().map(|target| target.pool_index).collect::<Vec<_>>(),
+                vec![target_pool_index],
+                "the fixture must reserve exactly one target"
+            );
             let source_reader = store.pools[0]
                 .get_object_reader(
                     RUSTFS_META_BUCKET,
@@ -5314,12 +5350,91 @@ mod decommission_lock_order_tests {
                 RUSTFS_META_BUCKET.to_string(),
                 source_reader,
                 None,
-                "scanner_backlog_conflict",
+                "reserved_replica_conflict",
                 Some(owner),
             )
             .await
-            .expect_err("a different older native ledger must retain its source and capacity intent");
+            .expect_err("a different older existing record must retain its source and capacity intent");
             assert!(conflict.to_string().contains("Precondition failed"), "unexpected conflict: {conflict}");
+            let reserved_snapshot = store.pool_meta.read().await.clone();
+            let mut selection_opts = ObjectOptions {
+                data_movement: true,
+                src_pool_idx: 0,
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .select_data_movement_pool_idx(RUSTFS_META_BUCKET, object, body.len() as i64, &selection_opts, true)
+                    .await
+                    .expect("selection without a capacity owner retains existing-replica routing"),
+                2
+            );
+            owner.apply_to(&mut selection_opts);
+            for stale_owner in [
+                DecommissionCapacityOwner {
+                    owner_nonce: uuid::Uuid::new_v4(),
+                    ..owner
+                },
+                DecommissionCapacityOwner {
+                    generation: owner.generation + 1,
+                    ..owner
+                },
+            ] {
+                let mut stale_opts = selection_opts.clone();
+                stale_owner.apply_to(&mut stale_opts);
+                assert!(
+                    matches!(
+                        store
+                            .select_data_movement_pool_idx(RUSTFS_META_BUCKET, object, body.len() as i64, &stale_opts, true)
+                            .await,
+                        Err(crate::error::Error::DecommissionCapacityBlocked { .. })
+                    ),
+                    "a stale owner must not fall back to another target"
+                );
+            }
+            {
+                let mut meta = store.pool_meta.write().await;
+                meta.pools[0]
+                    .decommission
+                    .as_mut()
+                    .unwrap()
+                    .capacity_reservation
+                    .as_mut()
+                    .unwrap()
+                    .expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+            }
+            assert!(
+                matches!(
+                    store
+                        .select_data_movement_pool_idx(RUSTFS_META_BUCKET, object, body.len() as i64, &selection_opts, true)
+                        .await,
+                    Err(crate::error::Error::DecommissionCapacityBlocked { .. })
+                ),
+                "an expired owner must not fall back to another target"
+            );
+            *store.pool_meta.write().await = reserved_snapshot.clone();
+            if !existing_outside_reservation {
+                {
+                    let mut meta = store.pool_meta.write().await;
+                    let target = &mut meta.pools[0]
+                        .decommission
+                        .as_mut()
+                        .unwrap()
+                        .capacity_reservation
+                        .as_mut()
+                        .unwrap()
+                        .targets[0];
+                    target.consumed_physical_bytes = target.reserved_physical_bytes;
+                }
+                assert_eq!(
+                    store
+                        .select_data_movement_pool_idx(RUSTFS_META_BUCKET, object, body.len() as i64, &selection_opts, true)
+                        .await
+                        .expect("an existing reserved replica can still be selected after capacity was consumed"),
+                    target_pool_index
+                );
+                *store.pool_meta.write().await = reserved_snapshot;
+            }
             let mut persisted = crate::core::pools::PoolMeta::default();
             persisted
                 .load_no_lock_from_replicas(store.pools.clone())
@@ -5336,11 +5451,24 @@ mod decommission_lock_order_tests {
                     .pending_target_physical_bytes,
                 body.len()
             );
-            let previous = store.pools[2]
+            for (pool_index, payload, mod_time) in &replicas {
+                let mut reader = store.pools[*pool_index]
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("a refused existing record replacement must preserve every replica");
+                assert_eq!(reader.object_info.mod_time, Some(*mod_time));
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the unchanged existing record");
+                assert_eq!(&actual, payload);
+            }
+            let previous = store.pools[target_pool_index]
                 .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
                 .await
-                .expect("read the native writer's CAS revision");
-            let replacement = store.pools[2]
+                .expect("read the existing writer's CAS revision");
+            let replacement = store.pools[target_pool_index]
                 .put_object(
                     RUSTFS_META_BUCKET,
                     object,
@@ -5356,7 +5484,7 @@ mod decommission_lock_order_tests {
                     },
                 )
                 .await
-                .expect("native scanner CAS converges the payload without a migration marker");
+                .expect("existing CAS converges the payload without a migration marker");
             assert!(!data_movement::is_owned_data_movement_target(&replacement));
             *other_store.pool_meta.write().await = persisted;
             set_decommission_capacity_info_overrides_for_test(other_store.id, vec![capacities]);
@@ -5374,7 +5502,7 @@ mod decommission_lock_order_tests {
             )
             .await
             .expect("replica conflict recovery must be bounded")
-            .expect("identical native replica should finish migration on the reloaded node");
+            .expect("identical existing replica should finish migration on the reloaded node");
             let mut reconciled = crate::core::pools::PoolMeta::default();
             reconciled
                 .load_no_lock_from_replicas(other_store.pools.clone())
@@ -5404,14 +5532,14 @@ mod decommission_lock_order_tests {
                 .await
                 .expect_err("the source should be cleaned only after equivalent-target capacity reconciliation");
             assert!(crate::error::is_err_object_not_found(&missing));
-            let mut target_reader = other_store.pools[2]
+            let mut target_reader = other_store.pools[target_pool_index]
                 .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
                 .await
                 .expect("the surviving replica should remain readable");
             assert_eq!(
                 target_reader.object_info.mod_time,
                 Some(target_time),
-                "recovery must not overwrite the native target"
+                "recovery must not overwrite the existing target"
             );
             let mut actual = Vec::new();
             target_reader
@@ -5419,6 +5547,20 @@ mod decommission_lock_order_tests {
                 .await
                 .expect("read surviving ledger bytes");
             assert_eq!(actual, body);
+            if existing_outside_reservation {
+                let (_, outside_body, outside_time) = replicas.last().expect("unreserved existing replica");
+                let mut outside = other_store.pools[2]
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("migration must leave the unreserved existing replica intact");
+                assert_eq!(outside.object_info.mod_time, Some(*outside_time));
+                let mut actual = Vec::new();
+                outside
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the untouched unreserved replica");
+                assert_eq!(&actual, outside_body);
+            }
         });
     }
 

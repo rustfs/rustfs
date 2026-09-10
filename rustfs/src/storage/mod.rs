@@ -38,6 +38,7 @@ mod minio_generated_read_test;
 #[cfg(test)]
 mod multi_factor_scheduler_integration_test;
 pub(crate) mod runtime_sources;
+pub(crate) mod scanner_dirty_journal;
 #[cfg(test)]
 mod sse_test;
 pub(crate) mod storage_api;

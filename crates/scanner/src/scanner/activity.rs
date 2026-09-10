@@ -105,8 +105,14 @@ pub(super) fn remote_dirty_usage_acknowledgement_loss_reconciled(
         if !acknowledged_hosts.insert(acknowledgement.host.as_str()) {
             return false;
         }
-        scanner_activity_dirty_usage_state_for_host(&activity_after_error, &acknowledgement.host)
-            .is_some_and(|(instance_id, _generation, pending)| instance_id == acknowledgement.instance_id && !pending)
+        let Some(expected_generation) = acknowledgement.expected_dirty_usage_generation() else {
+            return false;
+        };
+        scanner_activity_dirty_usage_state_for_host(&activity_after_error, &acknowledgement.host).is_some_and(
+            |(instance_id, generation, pending)| {
+                instance_id == acknowledgement.instance_id && generation >= expected_generation && !pending
+            },
+        )
     })
 }
 
@@ -507,6 +513,15 @@ pub(crate) enum ScannerDirtyUsageAcknowledgementKind {
         owner_id: String,
         entries: Vec<crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry>,
     },
+}
+
+impl ScannerDirtyUsageAcknowledgement {
+    fn expected_dirty_usage_generation(&self) -> Option<u64> {
+        match &self.kind {
+            ScannerDirtyUsageAcknowledgementKind::Generation(generation) => Some(*generation),
+            ScannerDirtyUsageAcknowledgementKind::Scoped { entries, .. } => entries.iter().map(|entry| entry.generation).max(),
+        }
+    }
 }
 
 impl From<ScannerDirtyUsageAcknowledgement> for crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement {
