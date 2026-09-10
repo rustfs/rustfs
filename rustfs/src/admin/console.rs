@@ -125,7 +125,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
     use std::borrow::Cow;
 
-    if prefix == rustfs_config::DEFAULT_CONSOLE_PREFIX
+    if prefix == crate::server::CONSOLE_PREFIX
         || !matches!(
             path.rsplit('.').next(),
             Some("html" | "js" | "css" | "json" | "txt" | "webmanifest" | "svg")
@@ -137,10 +137,10 @@ fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefi
         return data;
     };
     let mut rewritten = Cow::Borrowed(text);
-    let escaped_default = rustfs_config::DEFAULT_CONSOLE_PREFIX.replace('/', "\\/");
+    let escaped_default = crate::server::CONSOLE_PREFIX.replace('/', "\\/");
     let escaped_prefix = prefix.replace('/', "\\/");
     for (source, target) in [
-        (rustfs_config::DEFAULT_CONSOLE_PREFIX, prefix),
+        (crate::server::CONSOLE_PREFIX, prefix),
         (escaped_default.as_str(), escaped_prefix.as_str()),
     ] {
         let mut output = String::new();
@@ -842,11 +842,11 @@ pub(crate) fn make_console_server() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::CONSOLE_PREFIX;
     use axum::body::Body;
     use axum::routing::get;
     use http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use rustfs_config::DEFAULT_CONSOLE_PREFIX as CONSOLE_PREFIX;
     use serial_test::serial;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
@@ -924,9 +924,14 @@ mod tests {
     async fn console_config_handler_serializes_admin_discovery_paths() {
         init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
 
-        let response = config_handler(Uri::from_static("http://127.0.0.1:9001/rustfs/console/api/v1/config"), HeaderMap::new())
-            .await
-            .into_response();
+        let response = config_handler(
+            format!("http://127.0.0.1:9001{CONSOLE_PREFIX}/api/v1/config")
+                .parse()
+                .expect("console URI"),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body();
@@ -946,7 +951,8 @@ mod tests {
 
     #[test]
     fn external_admin_paths_are_not_console_paths() {
-        assert!(is_console_path("/rustfs/console/"));
+        assert!(is_console_path(&format!("{CONSOLE_PREFIX}/")));
+        assert!(!is_console_path(&format!("{CONSOLE_PREFIX}-other/index.html")));
         assert!(is_console_path("/apple-touch-icon.png"));
         assert!(is_console_path("/apple-touch-icon-precomposed.png"));
         assert!(!is_console_path("/minio/admin/v3/info"));
@@ -1334,6 +1340,7 @@ mod tests {
 #[cfg(test)]
 mod console_asset_prefix_tests {
     use super::rewrite_console_asset;
+    use crate::server::CONSOLE_PREFIX;
     use std::borrow::Cow;
 
     #[test]
@@ -1364,6 +1371,9 @@ mod console_asset_prefix_tests {
             ),
         ];
         for (path, input, expected) in fixtures {
+            let input = input
+                .replace("/rustfs/console", CONSOLE_PREFIX)
+                .replace("\\/rustfs\\/console", &CONSOLE_PREFIX.replace('/', "\\/"));
             assert_eq!(
                 rewrite_console_asset(path, Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
                 expected.as_bytes(),
@@ -1373,21 +1383,35 @@ mod console_asset_prefix_tests {
     }
 
     #[test]
+    fn restores_the_standard_path_from_an_oem_build() {
+        let input = format!(r#"<script src="{CONSOLE_PREFIX}/_next/app.js"></script>"#);
+        let output = rewrite_console_asset("index.html", Cow::Borrowed(input.as_bytes()), rustfs_config::DEFAULT_CONSOLE_PREFIX);
+        assert_eq!(output.as_ref(), br#"<script src="/rustfs/console/_next/app.js"></script>"#);
+    }
+
+    #[test]
     fn preserves_unrelated_urls_paths_and_default_bytes() {
-        let input = br#"["https://github.com/rustfs/console","/other/rustfs/console","/rustfs/console-extra","/rustfs/console/index.html"]"#;
-        let expected =
-            br#"["https://github.com/rustfs/console","/other/rustfs/console","/rustfs/console-extra","/console/index.html"]"#;
-        assert_eq!(rewrite_console_asset("app.js", Cow::Borrowed(input), "/console").as_ref(), expected);
-        let unchanged = rewrite_console_asset("app.js", Cow::Borrowed(input), rustfs_config::DEFAULT_CONSOLE_PREFIX);
+        let input = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","{CONSOLE_PREFIX}/index.html"]"#
+        );
+        let expected = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","/console/index.html"]"#
+        );
+        assert_eq!(
+            rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
+            expected.as_bytes()
+        );
+        let unchanged = rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), CONSOLE_PREFIX);
         assert!(matches!(unchanged, Cow::Borrowed(_)));
-        assert_eq!(unchanged.as_ref(), input);
+        assert_eq!(unchanged.as_ref(), input.as_bytes());
     }
 
     #[test]
     fn preserves_binary_invalid_utf8_and_text_without_paths() {
+        let invalid_utf8 = [b"\xff".as_slice(), CONSOLE_PREFIX.as_bytes()].concat();
         for (path, bytes) in [
-            ("image.png", b"/rustfs/console".as_slice()),
-            ("app.js", b"\xff/rustfs/console".as_slice()),
+            ("image.png", CONSOLE_PREFIX.as_bytes()),
+            ("app.js", invalid_utf8.as_slice()),
             ("app.js", b"https://github.com/rustfs/console".as_slice()),
         ] {
             let output = rewrite_console_asset(path, Cow::Borrowed(bytes), "/console");

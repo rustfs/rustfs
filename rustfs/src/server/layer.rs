@@ -2309,6 +2309,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::server::CONSOLE_PREFIX;
     use crate::server::compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer};
     use crate::server::{FAVICON_PATH, LICENSE, RemoteAddr, VERSION};
     use futures::future::{Ready, ready};
@@ -2318,7 +2319,6 @@ mod tests {
     use http_body_util::Full;
     use opentelemetry::global;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
-    use rustfs_config::DEFAULT_CONSOLE_PREFIX as CONSOLE_PREFIX;
     use serial_test::serial;
     use std::convert::Infallible;
     use std::io::{self, Write};
@@ -2400,7 +2400,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/metrics",
             "/minio/admin/v3/storageinfo",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             "/rustfs/rpc/test",
             "/health/ready",
             "/_iceberg/v1/config",
@@ -2691,7 +2691,7 @@ mod tests {
         for path in [
             "/rustfs/admin/v3/info",
             "/minio/admin/v3/info",
-            "/rustfs/console/",
+            CONSOLE_PREFIX,
             HEALTH_PREFIX,
             "/iceberg/v1/config",
             "/rustfs/rpc/v1/read-file",
@@ -4050,7 +4050,7 @@ mod tests {
             "/minio/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/admin/v3/pools/cancel?versionId=unused",
             "/rustfs/rpc/read_file_stream?versionId=unused",
-            "/rustfs/console/index.html?versionId=unused",
+            &format!("{CONSOLE_PREFIX}/index.html?versionId=unused"),
             "/health?versionId=unused",
             "/health/ready?versionId=unused",
             "/profile/cpu?versionId=unused",

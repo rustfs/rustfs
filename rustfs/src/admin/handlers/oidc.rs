@@ -1703,7 +1703,7 @@ mod tests {
                 .expect("console redirect should use browser redirect URL")
         });
 
-        assert!(redirect.starts_with("https://console.example.com/rustfs/console/auth/oidc-callback/#"));
+        assert!(redirect.starts_with(&format!("https://console.example.com{}/auth/oidc-callback/#", console_prefix())));
         assert!(redirect.contains("redirect=%2Fbuckets"));
         assert!(redirect.contains("logoutToken=logout-token"));
     }
@@ -1716,7 +1716,7 @@ mod tests {
             build_console_login_redirect(&req).expect("login redirect should use browser redirect URL")
         });
 
-        assert_eq!(redirect, "https://console.example.com/rustfs/console/auth/login");
+        assert_eq!(redirect, format!("https://console.example.com{}/auth/login", console_prefix()));
     }
 
     #[test]

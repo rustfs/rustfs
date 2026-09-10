@@ -792,7 +792,7 @@ mod tests {
             "/favicon.ico",
             "/rustfs/rpc/anything",
             "/node_service.NodeService/Ping",
-            "/rustfs/console/index.html",
+            &format!("{}/index.html", console_prefix()),
         ] {
             assert!(is_rate_limit_exempt_path(path), "{path} must be exempt");
         }

@@ -83,10 +83,12 @@ pub(crate) const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 /// MinIO-compatible admin API prefix accepted by RustFS.
 pub(crate) const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 
-/// Predefined console prefix for RustFS server routes.
-/// This prefix is used for endpoints that handle console-related tasks
-/// such as user interface and management.
-pub(crate) const CONSOLE_PREFIX: &str = rustfs_config::DEFAULT_CONSOLE_PREFIX;
+/// Console asset base path embedded at build time and used as the startup default.
+/// It must match NEXT_PUBLIC_BASE_PATH when building the bundled frontend.
+pub(crate) const CONSOLE_PREFIX: &str = match option_env!("RUSTFS_CONSOLE_BASE_PATH") {
+    Some(path) if !path.is_empty() => path,
+    _ => rustfs_config::DEFAULT_CONSOLE_PREFIX,
+};
 
 static CONFIGURED_CONSOLE_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -243,6 +245,7 @@ mod console_prefix_tests {
             command
                 .args(["console_prefix_process_case", "--test-threads=1"])
                 .env("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS", "1")
+                .env("RUSTFS_CONSOLE_BASE_PATH", "/runtime-ignored/console")
                 .env("RUSTFS_BROWSER_REDIRECT_URL", "https://console.example.com")
                 .env("RUSTFS_HEALTH_ENDPOINT_ENABLE", "true")
                 .env("RUSTFS_CONSOLE_RATE_LIMIT_ENABLE", "false");

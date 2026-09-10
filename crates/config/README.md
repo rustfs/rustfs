@@ -78,9 +78,20 @@ Choose a prefix that does not collide with S3 bucket paths.
 The console routes, embedded frontend asset URLs, browser redirects, and OIDC
 console redirects use this prefix. Admin API paths and the identity provider's
 `/rustfs/admin/v3/oidc/callback/...` URL remain unchanged. `RUSTFS_CONSOLE_ADDRESS`
-continues to control only the listening address and port. Bundled console assets
-must be built with the default `/rustfs/console` base path; the server adapts their
-text references when serving a custom prefix.
+continues to control only the listening address and port. The server adapts bundled
+console asset references from their build-time base path to the runtime prefix.
+
+OEM builds can set `RUSTFS_CONSOLE_BASE_PATH` when compiling RustFS to embed a
+different default, such as `/nuofans/console`. Build the bundled console with the
+same `NEXT_PUBLIC_BASE_PATH`. An unset or empty build variable retains
+`/rustfs/console`. The build path must satisfy the validation rules above and must
+not have a trailing slash.
+
+At startup, `RUSTFS_CONSOLE_PREFIX` takes precedence over the compiled default.
+Changing `RUSTFS_CONSOLE_BASE_PATH` when starting an existing binary has no effect;
+rebuild both components to change the embedded default. If a runtime prefix is
+configured, asset adaptation uses the compiled base path as its source, including
+when restoring `/rustfs/console` for a custom OEM build.
 
 ## Browser redirect environment variables
 

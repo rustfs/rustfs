@@ -766,8 +766,10 @@ mod tests {
 
     #[test]
     fn test_path_category_classify_console() {
-        assert_eq!(PathCategory::classify("/rustfs/console/index.html"), PathCategory::Console);
-        assert_eq!(PathCategory::classify("/rustfs/console"), PathCategory::Console);
+        let prefix = crate::server::console_prefix();
+        assert_eq!(PathCategory::classify(&format!("{prefix}/index.html")), PathCategory::Console);
+        assert_eq!(PathCategory::classify(prefix), PathCategory::Console);
+        assert_eq!(PathCategory::classify(&format!("{prefix}-other/index.html")), PathCategory::S3DataPlane);
     }
 
     #[test]
