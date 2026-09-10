@@ -2124,7 +2124,21 @@ mod tests {
                 evidence_context.run.binary.sha256,
                 "server build changed during restart"
             );
-            let evidence = serde_json::json!({
+            let outage_write_diagnostic = (!outage_target_manifest_required).then(|| {
+                serde_json::json!({
+                    "attempted": true,
+                    "required": false,
+                    "accepted": true,
+                    "attempts": if outage_write_deferred_until_rejoin {
+                        max_outage_write_attempts
+                    } else {
+                        service_unavailable_outage_writes + 1
+                    },
+                    "service_unavailable": service_unavailable_outage_writes,
+                    "deferred_until_rejoin": outage_write_deferred_until_rejoin,
+                })
+            });
+            let mut evidence = serde_json::json!({
                 "schema": 1, "case": evidence_context.case.id, "evidence": evidence_context.case.evidence,
                 "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
                 "test_build": compiled_test_identity(),
@@ -2147,6 +2161,9 @@ mod tests {
                 "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
                 "objects": evidence_objects, "node_listings": node_listings,
             });
+            if let Some(outage_write) = outage_write_diagnostic {
+                evidence["outage_write"] = outage_write;
+            }
             let data = serde_json::to_vec(&evidence)?;
             if data.len() > 1024 * 1024 {
                 return Err("scanner/heal oracle exceeds the 1 MiB artifact budget".into());
