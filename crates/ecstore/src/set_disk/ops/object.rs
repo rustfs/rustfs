@@ -13227,33 +13227,6 @@ mod transition_commit_failure_tests {
         metadata
     }
 
-    async fn rewrite_current_file_info_on_disks(
-        disks: &[DiskStore],
-        bucket: &str,
-        object: &str,
-        mut rewrite: impl FnMut(&mut FileInfo),
-    ) {
-        for disk in disks {
-            let mut file_info = disk
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .expect("current fixture metadata should be readable");
-            rewrite(&mut file_info);
-
-            let mut file_meta = FileMeta::new();
-            file_meta
-                .add_version(file_info)
-                .expect("rewritten fixture metadata should encode");
-            disk.write_all(
-                bucket,
-                &format!("{object}/{}", crate::disk::STORAGE_FORMAT_FILE),
-                Bytes::from(file_meta.marshal_msg().expect("rewritten fixture metadata should serialize")),
-            )
-            .await
-            .expect("rewritten fixture metadata should be persisted");
-        }
-    }
-
     #[test]
     fn restore_tier_mutation_retry_backoff_is_bounded() {
         assert_eq!(restore_tier_mutation_retry_delay(0), Duration::from_millis(250));
@@ -13834,7 +13807,17 @@ mod transition_commit_failure_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn restore_failure_after_snapshot_cleans_exact_generation_and_returns_primary_error() {
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        assert_restore_failure_cleanup_boundary(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_failure_after_snapshot_preserves_corrupt_known_transition_metadata() {
+        assert_restore_failure_cleanup_boundary(false).await;
+    }
+
+    async fn assert_restore_failure_cleanup_boundary(legacy_unknown: bool) {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "restore-post-snapshot-cleanup-bucket";
         let object = "object.bin";
         for disk in &disk_stores {
@@ -13843,7 +13826,15 @@ mod transition_commit_failure_tests {
 
         let mut reader = PutObjReader::from_vec(b"post-snapshot cleanup source".repeat(1024));
         let original = set_disks
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("source object should be written");
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -13869,15 +13860,85 @@ mod transition_commit_failure_tests {
             .expect("source object should transition before restore");
 
         let operation_id = Uuid::new_v4();
-        rewrite_current_file_info_on_disks(&disk_stores, bucket, object, |file_info| {
-            file_info.metadata.extend(restore_metadata(operation_id, true));
-            rustfs_utils::http::metadata_compat::insert_str(
-                &mut file_info.metadata,
-                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-                "f".repeat(64),
+        let (mut source_fi, _, online_disks) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("transitioned metadata should be readable")
+            .into_owned();
+        let known_state = source_fi.transition_version_state;
+        assert_ne!(known_state, rustfs_filemeta::TransitionVersionState::Unknown);
+        source_fi.metadata.extend(restore_metadata(operation_id, true));
+        set_disks
+            .update_object_meta(bucket, object, source_fi, &online_disks)
+            .await
+            .expect("restore markers should be persisted");
+
+        // Normal writes reject damage to a reconciled binding. Model on-disk
+        // corruption directly, with and without the legacy missing-state field.
+        let mut corrupted_metadata = Vec::new();
+        for temp_dir in &temp_dirs {
+            let metadata_path = temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let encoded = tokio::fs::read(&metadata_path)
+                .await
+                .expect("transition metadata should be readable");
+            let mut metadata = FileMeta::load(&encoded).expect("transition metadata should decode");
+            let (version_index, mut version) = metadata
+                .find_version(original.version_id)
+                .expect("transitioned version should exist");
+            let object_meta = version.object.as_mut().expect("transitioned version should be an object");
+            rustfs_utils::http::insert_bytes(
+                &mut object_meta.meta_sys,
+                rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                b"invalid".to_vec(),
             );
-        })
-        .await;
+            if legacy_unknown {
+                rustfs_utils::http::remove_bytes(
+                    &mut object_meta.meta_sys,
+                    rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+                );
+            }
+            metadata.versions[version_index] =
+                rustfs_filemeta::FileMetaShallowVersion::try_from(version).expect("corrupt fixture should re-encode");
+            tokio::fs::write(&metadata_path, metadata.marshal_msg().expect("corrupt fixture should encode"))
+                .await
+                .expect("corrupt fixture should be written");
+            let persisted = tokio::fs::read(&metadata_path)
+                .await
+                .expect("corrupt fixture should be readable");
+            let fixture = FileMeta::load(&persisted)
+                .expect("corrupt fixture should decode")
+                .find_version(original.version_id)
+                .expect("corrupt version should exist")
+                .1
+                .into_fileinfo(bucket, object, true)
+                .expect("corrupt version should decode");
+            assert_eq!(
+                fixture.transition_version_state,
+                if legacy_unknown {
+                    rustfs_filemeta::TransitionVersionState::Unknown
+                } else {
+                    known_state
+                }
+            );
+            assert_eq!(
+                rustfs_utils::http::get_str(&fixture.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID),
+                Some("invalid".to_string())
+            );
+            for (key, value) in restore_metadata(operation_id, true) {
+                assert_eq!(fixture.metadata.get(&key), Some(&value), "fixture must retain restore marker {key}");
+            }
+            corrupted_metadata.push((metadata_path, persisted));
+        }
         set_disks.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let mut opts = ObjectOptions::default();
@@ -13887,9 +13948,11 @@ mod transition_commit_failure_tests {
             .clone()
             .restore_transitioned_object(bucket, object, &opts)
             .await
-            .expect_err("stale backend identity must fail before the tier read");
+            .expect_err("invalid backend identity must fail before the tier read");
         assert!(
-            error.to_string().contains("Remote tier backend identity no longer matches"),
+            error
+                .to_string()
+                .contains("transition tier backend identity has an invalid length"),
             "cleanup must preserve the primary validation error: {error}"
         );
 
@@ -13898,6 +13961,23 @@ mod transition_commit_failure_tests {
             .await
             .expect("cleanup should leave the transitioned object readable");
         assert_eq!(cleaned.transitioned_object.status, TRANSITION_COMPLETE);
+        if !legacy_unknown {
+            // Known bindings with corrupt identities must be repaired before
+            // cleanup; rejection must preserve both the binding and markers.
+            for (key, value) in restore_metadata(operation_id, true) {
+                assert_eq!(cleaned.user_defined.get(&key), Some(&value), "cleanup must preserve restore marker {key}");
+            }
+            for (metadata_path, before) in corrupted_metadata {
+                assert_eq!(
+                    tokio::fs::read(metadata_path)
+                        .await
+                        .expect("rejected cleanup metadata should remain readable"),
+                    before,
+                    "rejected cleanup must leave corrupt known metadata unchanged"
+                );
+            }
+            return;
+        }
         assert!(!cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()));
         assert!(
             rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID,)

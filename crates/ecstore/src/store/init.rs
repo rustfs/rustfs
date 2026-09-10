@@ -22,9 +22,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use rustfs_config::server_config::KVS;
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
-#[cfg(test)]
 use std::future::Future;
-use std::sync::Weak;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -242,7 +240,6 @@ where
     Ok(committed)
 }
 
-#[cfg(test)]
 async fn run_local_decommission_watchdog<F, Fut>(rx: CancellationToken, mut reconcile: F)
 where
     F: FnMut() -> Fut,
@@ -297,45 +294,16 @@ async fn reconcile_local_decommission_after_init(store: &Arc<ECStore>, rx: Cance
     store.spawn_missing_local_decommission_routines_with_token(rx).await
 }
 
-async fn supervise_local_decommission_after_init(store: Weak<ECStore>, rx: CancellationToken) {
-    let mut consecutive_failures = 0u32;
-    loop {
-        if rx.is_cancelled() {
-            return;
-        }
-
-        let Some(store) = store.upgrade() else {
-            return;
-        };
-        let delay = match reconcile_local_decommission_after_init(&store, rx.clone()).await {
-            Ok(()) => {
-                consecutive_failures = 0;
-                LOCAL_DECOMMISSION_WATCHDOG_INTERVAL
-            }
-            Err(err) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let retry_delay = local_decommission_watchdog_retry_delay(consecutive_failures);
-                warn!(
-                    event = EVENT_DECOMMISSION_RESUME_RETRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
-                    consecutive_failures,
-                    retry_delay_secs = retry_delay.as_secs(),
-                    error = %err,
-                    "Retrying decommission worker recovery"
-                );
-                retry_delay
-            }
-        };
-        drop(store);
-
-        if !wait_for_local_decommission_resume_delay(&rx, delay).await {
-            return;
-        }
-    }
+async fn supervise_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken) {
+    run_local_decommission_watchdog(rx.clone(), || {
+        let store = store.clone();
+        let worker_rx = rx.clone();
+        async move { reconcile_local_decommission_after_init(&store, worker_rx).await }
+    })
+    .await;
 }
 
-async fn resume_rebalance_after_init(store: Weak<ECStore>, rx: CancellationToken) {
+async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken) {
     if !wait_for_rebalance_resume_delay(&rx, REBALANCE_INITIAL_RESUME_DELAY).await {
         return;
     }
@@ -345,9 +313,6 @@ async fn resume_rebalance_after_init(store: Weak<ECStore>, rx: CancellationToken
             return;
         }
 
-        let Some(store) = store.upgrade() else {
-            return;
-        };
         let resume_required = store
             .rebalance_meta
             .read()
@@ -362,7 +327,6 @@ async fn resume_rebalance_after_init(store: Weak<ECStore>, rx: CancellationToken
             store.ctx.is_dist_erasure().await,
             crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_some(),
         ) {
-            drop(store);
             if !wait_for_rebalance_resume_retry(&rx).await {
                 return;
             }
@@ -827,10 +791,10 @@ impl ECStore {
         if has_local_decommission_leadership {
             // The watchdog checks recovery safety and retries transient failures.
             // Resume persisted work without an unconditional cold-start delay.
-            tokio::spawn(supervise_local_decommission_after_init(Arc::downgrade(self), rx.clone()));
+            tokio::spawn(supervise_local_decommission_after_init(self.clone(), rx.clone()));
         }
 
-        let recovery_store = Arc::downgrade(self);
+        let recovery_store = self.clone();
         let recovery_rx = rx.clone();
         tokio::spawn(async move {
             let mut delay = std::time::Duration::from_secs(5);
@@ -839,12 +803,9 @@ impl ECStore {
                     _ = recovery_rx.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
                 }
-                let Some(store) = recovery_store.upgrade() else {
-                    return;
-                };
                 let result = tokio::select! {
                     _ = recovery_rx.cancelled() => return,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(30), store.recover_pool_meta_transaction()) => result,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(30), recovery_store.recover_pool_meta_transaction()) => result,
                 };
                 delay = match result {
                     Ok(Ok(_)) => std::time::Duration::from_secs(5),
@@ -853,7 +814,7 @@ impl ECStore {
                             Ok(Err(error)) => error,
                             _ => Error::Timeout,
                         };
-                        store.record_pool_meta_recovery_failure(error);
+                        recovery_store.record_pool_meta_recovery_failure(error);
                         (delay * 2).min(std::time::Duration::from_secs(60))
                     }
                 };
@@ -874,7 +835,7 @@ impl ECStore {
         }
 
         if rebalance_auto_start_deferred {
-            let store = Arc::downgrade(self);
+            let store = self.clone();
             tokio::spawn(resume_rebalance_after_init(store, rx));
         }
 
@@ -19088,7 +19049,43 @@ mod tests {
                         .bucket_incarnation_id_from_disk(bucket)
                         .await
                         .expect("bucket incarnation should be available");
-                    rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, false).await;
+                    for disk_index in 0..4 {
+                        let metadata_path = temp_dir
+                            .path()
+                            .join(format!("pool0/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+                        let encoded = tokio::fs::read(&metadata_path)
+                            .await
+                            .expect("transition metadata should be readable");
+                        let mut metadata = FileMeta::load(&encoded).expect("transition metadata should decode");
+                        let (version_index, mut transitioned) = metadata
+                            .find_version(history.version_id)
+                            .expect("transitioned history should exist");
+                        // Rewrite the serialized record to model legacy metadata;
+                        // ordinary writes preserve an already reconciled state.
+                        rustfs_utils::http::metadata_compat::remove_bytes(
+                            &mut transitioned.object.as_mut().expect("history should be an object").meta_sys,
+                            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+                        );
+                        metadata.versions[version_index] = rustfs_filemeta::FileMetaShallowVersion::try_from(transitioned)
+                            .expect("legacy history should re-encode");
+                        tokio::fs::write(
+                            &metadata_path,
+                            metadata.marshal_msg().expect("unknown transition metadata should encode"),
+                        )
+                        .await
+                        .expect("unknown transition metadata should be written");
+                        let encoded = tokio::fs::read(&metadata_path)
+                            .await
+                            .expect("legacy transition metadata should be readable");
+                        let legacy = FileMeta::load(&encoded)
+                            .expect("legacy transition metadata should decode")
+                            .find_version(history.version_id)
+                            .expect("legacy history should exist")
+                            .1
+                            .into_fileinfo(bucket, object, true)
+                            .expect("legacy history should decode");
+                        assert_eq!(legacy.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+                    }
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
                         action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                         rule_id: "delete-all-versions".to_string(),

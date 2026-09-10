@@ -5940,8 +5940,10 @@ mod tests {
         .await
         .expect_err("mismatched kms context should fail");
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
-        assert!(err.message.contains("Encryption context mismatch"));
-        assert!(err.message.contains("tenant"));
+        assert_eq!(
+            err.message,
+            "Encryption context mismatch: Context mismatch for key 'tenant': expected 'alpha', got 'beta'"
+        );
         assert_eq!(super::kms_data_plane_error_class(&err), "context_mismatch");
 
         manager.stop().await.expect("kms service should stop cleanly");
