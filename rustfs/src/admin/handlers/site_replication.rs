@@ -2793,6 +2793,19 @@ fn prune_in_sync_status_details(status: &mut SRStatusInfo, opts: &SRStatusOption
     }
 }
 
+fn peer_states_from_infos(
+    site_infos: BTreeMap<String, SRInfo>,
+    reachable_peers: &HashSet<String>,
+) -> BTreeMap<String, SRStateInfo> {
+    // Failed metainfo fetches leave default entries in site_infos for comparison;
+    // they must not become fabricated peer state. PeerErrors describes the failure.
+    site_infos
+        .into_iter()
+        .filter(|(deployment_id, _)| reachable_peers.contains(deployment_id))
+        .map(|(deployment_id, info)| (deployment_id, info.state))
+        .collect()
+}
+
 async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, uri: &Uri) -> S3Result<SRStatusInfo> {
     let opts = sr_status_options(uri);
     let mut local_info = Some(filter_sr_info(build_sr_info(state, local_peer).await?, &opts));
@@ -2921,17 +2934,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     }
 
     if opts.peer_state {
-        for (deployment_id, peer) in &state.peers {
-            status.peer_states.insert(
-                deployment_id.clone(),
-                SRStateInfo {
-                    name: peer.name.clone(),
-                    peers: state.peers.clone(),
-                    updated_at: state.updated_at,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                },
-            );
-        }
+        status.peer_states = peer_states_from_infos(site_infos, &reachable_peers);
     }
 
     Ok(status)
@@ -8518,6 +8521,90 @@ impl Operation for SRRotateServiceAccountHandler {
 mod tests {
     use super::*;
     use rustfs_madmin::SRSessionPolicy;
+
+    #[test]
+    fn peer_states_preserve_each_sites_actual_membership_and_metadata() {
+        let local = SRStateInfo {
+            name: "local".to_string(),
+            peers: BTreeMap::from([(
+                "actual-remote".to_string(),
+                PeerInfo {
+                    deployment_id: "actual-remote".to_string(),
+                    endpoint: "http://remote:9000".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            api_version: Some("1".to_string()),
+        };
+        let remote = SRStateInfo {
+            name: "remote-reported-name".to_string(),
+            peers: BTreeMap::from([(
+                "legacy-placeholder".to_string(),
+                PeerInfo {
+                    deployment_id: "legacy-placeholder".to_string(),
+                    endpoint: "http://local:9000".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10)),
+            api_version: None,
+        };
+        let infos = BTreeMap::from([
+            (
+                "local".to_string(),
+                SRInfo {
+                    state: local.clone(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "remote".to_string(),
+                SRInfo {
+                    state: remote.clone(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let states = peer_states_from_infos(infos, &HashSet::from(["local".to_string(), "remote".to_string()]));
+        assert_eq!(states.len(), 2);
+        assert_eq!(serde_json::to_value(&states["local"]).unwrap(), serde_json::to_value(local).unwrap());
+        assert_eq!(serde_json::to_value(&states["remote"]).unwrap(), serde_json::to_value(remote).unwrap());
+    }
+
+    #[test]
+    fn peer_states_omit_unreachable_peers_instead_of_defaulting_them() {
+        let infos = BTreeMap::from([
+            ("local".to_string(), SRInfo::default()),
+            ("offline".to_string(), SRInfo::default()),
+        ]);
+        let states = peer_states_from_infos(infos, &HashSet::from(["local".to_string()]));
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key("local"));
+        assert!(!states.contains_key("offline"));
+    }
+
+    #[test]
+    fn peer_states_preserve_a_reachable_peers_empty_membership() {
+        let states = peer_states_from_infos(
+            BTreeMap::from([(
+                "remote".to_string(),
+                SRInfo {
+                    enabled: false,
+                    state: SRStateInfo {
+                        name: "remote".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            &HashSet::from(["remote".to_string()]),
+        );
+        assert_eq!(states["remote"].name, "remote");
+        assert!(states["remote"].peers.is_empty());
+        assert!(states["remote"].updated_at.is_none());
+        assert!(states["remote"].api_version.is_none());
+    }
 
     /// A peer the status probe could not reach must render as offline.
     ///
