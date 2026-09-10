@@ -416,12 +416,14 @@ sample, or save-frequency cost counters. Missing, synthetic, stale, tampered,
 undersized, cross-run, or topology-mismatched evidence returns a compact blocked
 or invalid JSON result and a nonzero exit.
 
-The status-and-outcome descriptor producer consumes three measured raw JSON
-artifacts for G05, G06, and R-D. Those inputs must all carry schema 1, measured
-evidence, matching `source_revision`, a shared `run_id`, a shared
+The status-and-outcome raw collector normalizes live observations into the three
+measured raw JSON artifacts for G05, G06, and R-D. The descriptor producer then
+consumes those artifacts. The inputs must all carry schema 1, measured evidence,
+matching `source_revision`, a shared `run_id`, a shared
 `measurement_window_id`, matching `started_at`/`finished_at` timestamps, and
-non-empty command provenance. The producer rejects command-line run/window/time
-overrides that would relabel raw artifacts from another status-and-outcome run.
+non-empty command provenance. The collector and producer reject synthetic input,
+missing required cases, and command-line run/window/time overrides that would
+relabel raw artifacts from another status-and-outcome run.
 
 The scheduler-pressure lane must also carry the numbers needed to close W09,
 W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks,
