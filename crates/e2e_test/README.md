@@ -38,6 +38,13 @@ All commands assume repo root. `cargo test` triggers an on-demand build of the
 `rustfs` binary from [`src/common.rs`](src/common.rs) (`rustfs_binary_path`) on
 first use — the first invocation is slow, later ones reuse the binary.
 
+Root-heal interruption scenarios use a test-only commit barrier. Prebuild with `e2e-test-hooks` and pin that binary so concurrent cases do not replace it through on-demand builds:
+
+```bash
+cargo build -p rustfs --bin rustfs --features e2e-test-hooks
+CARGO_BIN_EXE_rustfs="$PWD/target/debug/rustfs" cargo nextest run -p e2e_test -E 'test(heal_erasure_disk_rebuild_test)'
+```
+
 ```bash
 # Whole crate (default = ignored tests skipped)
 cargo nextest run -p e2e_test

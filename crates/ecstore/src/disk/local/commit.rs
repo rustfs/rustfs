@@ -47,6 +47,43 @@ use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Hold later repair publications after admitting one baseline object. The
+/// fixture arms this on one replacement disk before rejoining the cluster.
+#[cfg(feature = "e2e-test-hooks")]
+async fn wait_for_heal_commit_test_barrier(root: &Path, bucket: &str, object: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let barrier = root.join(".rustfs.sys/e2e-heal-commit-barrier");
+    let prefix = match fs::read_to_string(&barrier).await {
+        Ok(prefix) => prefix,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let key = format!("{bucket}/{object}");
+    if prefix.is_empty() || !key.starts_with(&prefix) {
+        return Ok(());
+    }
+    let admitted = barrier.with_extension("admitted");
+    match fs::OpenOptions::new().write(true).create_new(true).open(&admitted).await {
+        Ok(mut file) => {
+            file.write_all(key.as_bytes()).await?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if !fs::try_exists(&barrier).await? || fs::read_to_string(&admitted).await? == key {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "heal commit test barrier was not released").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 fn rollback_committed_rename_std(
     dst_file_path: &Path,
     new_data_path: Option<&Path>,
@@ -253,6 +290,10 @@ impl LocalDisk {
         state: &mut RenameDataState,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
+        #[cfg(feature = "e2e-test-hooks")]
+        if fi.is_healing() {
+            wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
+        }
         let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains

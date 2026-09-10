@@ -1530,6 +1530,16 @@ mod tests {
             }
         }
 
+        // Keep the partial-repair checkpoint stable across readiness and admin
+        // requests. Endpoint-blackhole tests must prove their own network stall.
+        let commit_barrier = if scenario != InterruptionScenario::TargetEndpointBlackhole {
+            let barrier = replaced_disk.join(".rustfs.sys/e2e-heal-commit-barrier");
+            std::fs::create_dir_all(barrier.parent().ok_or("commit barrier has no parent")?)?;
+            std::fs::write(&barrier, format!("{bucket}/cluster/online/"))?;
+            Some(barrier)
+        } else {
+            None
+        };
         cluster.start_node_from_binary(1, &server_binary).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
@@ -1663,6 +1673,12 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         };
 
+        if let Some(barrier) = &commit_barrier {
+            assert!(
+                barrier.with_extension("admitted").is_file(),
+                "interruption tests require a server built with e2e-test-hooks"
+            );
+        }
         let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
@@ -1867,6 +1883,9 @@ mod tests {
                         );
                     }
                 }
+            }
+            if let Some(barrier) = &commit_barrier {
+                std::fs::remove_file(barrier)?;
             }
             cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {

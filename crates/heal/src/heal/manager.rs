@@ -548,7 +548,10 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch
     }
 
     let error = err.to_string();
-    if !err.is_recoverable_heal() {
+    // Batch aggregation preserves the typed classification in its counters,
+    // while the returned task error retains only the first error's display text.
+    let retryable_batch_result = retryable_batch_failure && matches!(err, Error::TaskExecutionFailed { .. });
+    if !retryable_batch_result && !err.is_recoverable_heal() {
         return None;
     }
 

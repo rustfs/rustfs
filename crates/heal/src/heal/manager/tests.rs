@@ -2614,27 +2614,62 @@ fn test_retry_request_for_recoverable_error_stops_at_limit() {
 
 #[tokio::test]
 async fn test_retry_request_rescans_batch_when_all_exhausted_objects_are_retryable() {
-    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
-    let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
-    let result = Err(task
-        .record_batch_failure(BatchHealFailure {
-            scope: "bucket:bucket".to_string(),
-            failed: 1,
-            retryable: 1,
-            permanent: 0,
-            first_object: "object".to_string(),
-            first_error: "Lock acquisition timeout".to_string(),
-        })
-        .await);
+    for source_error in [
+        Error::Disk(DiskError::FaultyDisk),
+        Error::Disk(DiskError::FaultyRemoteDisk),
+        Error::Storage(EcstoreError::SlowDown),
+        Error::TaskExecutionFailed {
+            message: "Lock acquisition timeout".to_string(),
+        },
+    ] {
+        assert!(source_error.is_recoverable_heal());
+        let first_error = source_error.to_string();
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
+        let result = Err(task
+            .record_batch_failure(BatchHealFailure {
+                scope: "bucket:bucket".to_string(),
+                failed: 1,
+                retryable: 1,
+                permanent: 0,
+                first_object: "object".to_string(),
+                first_error: first_error.clone(),
+            })
+            .await);
 
-    let (retry_request, retry_delay, error) = retry_request_for_result_with_budget(&task, &result)
-        .await
-        .expect("all-retryable batch failure should rescan within the manager retry budget");
+        let (retry_request, retry_delay, error) = retry_request_for_result_with_budget(&task, &result)
+            .await
+            .expect("all-retryable batch failure should rescan within the manager retry budget");
 
-    assert_eq!(retry_request.id, task.id);
-    assert_eq!(retry_request.retry_attempts, 1);
-    assert!(retry_delay > Duration::ZERO);
-    assert!(error.contains("Lock acquisition timeout"));
+        assert_eq!(retry_request.id, task.id);
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert!(retry_delay > Duration::ZERO);
+        assert!(error.contains(&first_error));
+    }
+}
+
+#[tokio::test]
+async fn test_retry_request_does_not_rescan_cancelled_or_timed_out_retryable_batch() {
+    for terminal_error in [Error::TaskCancelled, Error::TaskTimeout] {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
+        let _ = task
+            .record_batch_failure(BatchHealFailure {
+                scope: "bucket:bucket".to_string(),
+                failed: 1,
+                retryable: 1,
+                permanent: 0,
+                first_object: "object".to_string(),
+                first_error: Error::Disk(DiskError::FaultyDisk).to_string(),
+            })
+            .await;
+
+        assert!(
+            retry_request_for_result_with_budget(&task, &Err(terminal_error))
+                .await
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]
