@@ -152,6 +152,7 @@ pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
 const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
 const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v2";
@@ -9624,6 +9625,10 @@ struct DecommissionCapacityLockOrderBarrierState {
     cancel_before_start_entered: tokio::sync::Notify,
     cancel_before_start_release: tokio::sync::Notify,
     cancel_before_start_paused: AtomicBool,
+    cancel_target_timeout_entered: tokio::sync::Notify,
+    cancel_target_timeout_release: tokio::sync::Notify,
+    cancel_target_timeout_paused: AtomicBool,
+    cancel_target_timeouts: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -9663,6 +9668,10 @@ impl DecommissionCapacityLockOrderBarrier {
             cancel_before_start_entered: tokio::sync::Notify::new(),
             cancel_before_start_release: tokio::sync::Notify::new(),
             cancel_before_start_paused: AtomicBool::new(false),
+            cancel_target_timeout_entered: tokio::sync::Notify::new(),
+            cancel_target_timeout_release: tokio::sync::Notify::new(),
+            cancel_target_timeout_paused: AtomicBool::new(false),
+            cancel_target_timeouts: AtomicUsize::new(0),
         });
         let mut slot = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -9784,6 +9793,21 @@ impl DecommissionCapacityLockOrderBarrier {
         self.state.cancel_before_start_release.notify_one();
     }
 
+    fn pause_cancel_target_timeout(&self) {
+        self.state.cancel_target_timeout_paused.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_cancel_target_timeout(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.cancel_target_timeout_entered.notified())
+            .await
+            .expect("cancel should observe contention on its target capacity fence");
+    }
+
+    fn release_cancel_target_timeout(&self) {
+        self.state.cancel_target_timeout_paused.store(false, Ordering::Release);
+        self.state.cancel_target_timeout_release.notify_one();
+    }
+
     #[cfg(feature = "test-util")]
     pub(crate) fn release_owner(&self) {
         self.state.owner_release.notify_one();
@@ -9826,6 +9850,7 @@ impl Drop for DecommissionCapacityLockOrderBarrier {
         self.state.external_object_capacity_probe_release.notify_one();
         self.state.external_object_commit_phase_release.notify_one();
         self.state.cancel_before_start_release.notify_one();
+        self.state.cancel_target_timeout_release.notify_one();
         let mut slot = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
@@ -9881,6 +9906,24 @@ async fn pause_decommission_cancel_before_start_gate(store_id: uuid::Uuid) {
     if let Some(barrier) = barrier {
         barrier.cancel_before_start_entered.notify_one();
         barrier.cancel_before_start_release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_decommission_cancel_target_timeout(store_id: uuid::Uuid) {
+    let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission capacity lock-order barrier should not be poisoned")
+        .as_ref()
+        .filter(|state| state.owner_store_id == store_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.cancel_target_timeouts.fetch_add(1, Ordering::AcqRel);
+        barrier.cancel_target_timeout_entered.notify_one();
+        if barrier.cancel_target_timeout_paused.load(Ordering::Acquire) {
+            barrier.cancel_target_timeout_release.notified().await;
+        }
     }
 }
 
@@ -10521,6 +10564,7 @@ impl ECStore {
 
     async fn acquire_decommission_capacity_terminal_guards(
         &self,
+        source_pool_index: usize,
         plan: Option<&DecommissionCapacityTerminalFencePlan>,
     ) -> Result<Vec<rustfs_lock::NamespaceLockGuard>> {
         let Some(plan) = plan else {
@@ -10544,26 +10588,69 @@ impl ECStore {
                 "no storage pools available".to_string(),
             )
         })?;
-        let mut guards = Vec::with_capacity(plan.target_pool_indices.len());
-        for &target_pool_index in &plan.target_pool_indices {
-            let object = format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/{target_pool_index}");
-            let target_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
-            let guard = target_lock
-                .get_write_lock(get_lock_acquire_timeout())
-                .await
-                .map_err(|err| match err {
-                    rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
-                        mode: "write",
-                        bucket: RUSTFS_META_BUCKET.to_string(),
-                        object,
-                        required,
-                        achieved,
-                    },
-                    other => Error::Lock(other),
-                })?;
-            guards.push(guard);
+        // Retry only target acquisition, never persistence. Keep the original
+        // owner/cohort pinned so a remote Clear/start cannot retarget a cancel.
+        let mut attempt = 1;
+        'acquire_targets: loop {
+            let mut guards = Vec::with_capacity(plan.target_pool_indices.len());
+            for &target_pool_index in &plan.target_pool_indices {
+                let object = format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/{target_pool_index}");
+                let target_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+                let started = std::time::Instant::now();
+                match target_lock.get_write_lock(get_lock_acquire_timeout()).await {
+                    Ok(guard) => guards.push(guard),
+                    Err(err @ rustfs_lock::LockError::Timeout { .. }) => {
+                        // Release the entire partial cohort before backoff or
+                        // metadata reads; workers need these gates to settle I/O.
+                        drop(guards);
+                        #[cfg(test)]
+                        pause_decommission_cancel_target_timeout(self.id).await;
+                        if attempt >= DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS {
+                            return Err(Error::Lock(err));
+                        }
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "cancel_target_fence_retry",
+                            pool_index = source_pool_index,
+                            target_pool_index,
+                            operation_id = %plan.operation_id,
+                            generation = plan.generation,
+                            owner_nonce = %plan.owner_nonce,
+                            attempt,
+                            max_attempts = DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS,
+                            wait_ms = %started.elapsed().as_millis(),
+                            error = %err,
+                            "Decommission cancel will retry target capacity fencing"
+                        );
+                        tokio::time::sleep(DECOMMISSION_TERMINAL_RETRY_DELAY).await;
+                        let save_guard = self.pool_meta_save_gate.lock().await;
+                        let (_read_guard, snapshot) = self
+                            .acquire_pool_meta_read_guard(&save_guard, "decommission cancel fence retry failed")
+                            .await?;
+                        if decommission_capacity_terminal_fence_plan(&snapshot, source_pool_index)?.as_ref() != Some(plan) {
+                            return Err(decommission_capacity_blocked_error(
+                                "decommission capacity owner or target cohort changed while retrying terminal fences",
+                            ));
+                        }
+                        attempt += 1;
+                        continue 'acquire_targets;
+                    }
+                    Err(rustfs_lock::LockError::QuorumNotReached { required, achieved }) => {
+                        return Err(Error::NamespaceLockQuorumUnavailable {
+                            mode: "write",
+                            bucket: RUSTFS_META_BUCKET.to_string(),
+                            object,
+                            required,
+                            achieved,
+                        });
+                    }
+                    Err(err) => return Err(Error::Lock(err)),
+                }
+            }
+            return Ok(guards);
         }
-        Ok(guards)
     }
 
     pub(crate) async fn acquire_external_decommission_capacity_fence(
@@ -12493,7 +12580,7 @@ impl ECStore {
             None
         };
         let _capacity_target_guards = if acquire_runtime_fence {
-            self.acquire_decommission_capacity_terminal_guards(terminal_fence_plan.as_ref())
+            self.acquire_decommission_capacity_terminal_guards(idx, terminal_fence_plan.as_ref())
                 .await?
         } else {
             Vec::new()
@@ -18734,6 +18821,429 @@ mod tests {
         assert!(!reservation.active());
         assert_eq!(reservation.pending_target_physical_bytes, 0);
         assert_eq!(reservation.inflight_target_physical_bytes, 0);
+    }
+
+    async fn start_target_fenced_cancel_test(
+        store: &Arc<ECStore>,
+        first_target_free: usize,
+    ) -> (DecommissionCapacityTerminalFencePlan, DecommissionCanceler) {
+        crate::services::rebalance::promote_test_pool_meta_to_v2(store).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 10, 10),
+                DecommissionPoolCapacityInfo::for_test(1, layout, first_target_free, 10, 10 - first_target_free),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 40, 40, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("persist an active target-fenced decommission");
+        let plan = decommission_capacity_terminal_fence_plan(&*store.pool_meta.read().await, 0)
+            .expect("active decommission should have a valid fence plan")
+            .expect("active decommission should retain its reservation");
+        assert_eq!(plan.model_version, DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION);
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        *store.decommission_cancelers.write().await = vec![Some(canceler.clone()), None, None];
+        (plan, canceler)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_waits_for_target_contention_past_one_lock_timeout() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("5"))], async {
+            let (_temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (plan, canceler) = start_target_fenced_cancel_test(&store, 0).await;
+            assert_eq!(plan.target_pool_indices, vec![2]);
+            let target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
+                .await
+                .expect("create the active migration target gate");
+            let target_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("hold the target gate across the first cancel acquisition timeout");
+            let movement_gate = store.ctx.data_movement_operation_gate();
+            let movement_guard = movement_gate.read().await;
+            let cancel_store = Arc::clone(&store);
+            let mut cancel = tokio::spawn(async move { cancel_store.decommission_cancel(0).await });
+
+            tokio::time::timeout(get_lock_acquire_timeout() + std::time::Duration::from_secs(1), &mut cancel)
+                .await
+                .expect_err("one target-lock timeout must not end a legitimate cancel while its retry budget remains");
+            assert!(!canceler.is_cancelled(), "cancel must not signal its worker before durable fencing");
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("the active reservation must remain readable while cancel waits");
+            assert_eq!(
+                decommission_capacity_terminal_fence_plan(&durable, 0).expect("read the durable active plan"),
+                Some(plan),
+                "a failed target acquisition must not release or replace the durable reservation"
+            );
+            assert!(!durable.pools[0].decommission.as_ref().expect("active decommission").canceled);
+
+            drop(target_guard);
+            tokio::time::timeout(std::time::Duration::from_secs(30), canceler.token().cancelled())
+                .await
+                .expect("cancel should persist and signal its worker after target contention is released");
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload the committed cancellation from native replicas");
+            let info = durable.pools[0]
+                .decommission
+                .as_ref()
+                .expect("canceled state must remain durable");
+            assert!(info.canceled);
+            assert!(!info.complete && !info.failed);
+            let reservation = info
+                .capacity_reservation
+                .as_ref()
+                .expect("terminal capacity accounting must remain inspectable");
+            assert!(!reservation.active());
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.inflight_target_physical_bytes, 0);
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut cancel)
+                .await
+                .expect_err("the runtime-fenced cancel must wait for in-flight movement after signaling");
+            drop(movement_guard);
+            tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
+                .await
+                .expect("cancel should return after in-flight movement quiesces")
+                .expect("cancel task should not panic")
+                .expect("the same cancel request should finish its durable terminal transition");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_target_contention_exhausts_bounded_attempts_without_committing() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let (_temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (plan, canceler) = start_target_fenced_cancel_test(&store, 0).await;
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            let target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
+                .await
+                .expect("create the persistently contended target gate");
+            let target_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("hold the target gate for every cancel attempt");
+
+            let err = tokio::time::timeout(std::time::Duration::from_secs(30), store.decommission_cancel(0))
+                .await
+                .expect("target contention must not retry indefinitely")
+                .expect_err("exhausting the acquisition budget must not report cancellation success");
+            match err {
+                Error::Lock(rustfs_lock::LockError::Timeout { resource, timeout }) => {
+                    assert_eq!(resource, ".rustfs.sys/decommission/capacity-target/2@latest");
+                    assert_eq!(timeout, std::time::Duration::from_secs(1));
+                }
+                other => panic!("expected the final typed target-lock timeout, got {other:?}"),
+            }
+            assert_eq!(barrier.state.cancel_target_timeouts.load(Ordering::Acquire), 3);
+            assert!(!canceler.is_cancelled());
+            assert!(canceler.is_active());
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload the reservation after the canceled request exhausted its budget");
+            assert_eq!(
+                decommission_capacity_terminal_fence_plan(&durable, 0).expect("the active plan should remain valid"),
+                Some(plan)
+            );
+            assert!(!durable.pools[0].decommission.as_ref().expect("active decommission").canceled);
+            drop(target_guard);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_target_retry_releases_partial_cohort_and_rejects_remote_replacement() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let (_temp_dirs, store, other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (plan, _old_canceler) = start_target_fenced_cancel_test(&store, 8).await;
+            assert_eq!(plan.target_pool_indices, vec![1, 2]);
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            barrier.pause_cancel_target_timeout();
+            let target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
+                .await
+                .expect("create the second target gate");
+            let target_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("block cancellation after it acquires the first target");
+            let cancel_store = Arc::clone(&store);
+            let cancel = tokio::spawn(async move { cancel_store.decommission_cancel(0).await });
+            barrier.wait_until_cancel_target_timeout().await;
+
+            let first_target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/1"))
+                .await
+                .expect("create the partial-cohort release probe");
+            let first_target_guard = first_target_lock
+                .get_write_lock(std::time::Duration::from_secs(1))
+                .await
+                .expect("cancel must release its first target before retrying the blocked second target");
+            drop(first_target_guard);
+            drop(target_guard);
+
+            other_store
+                .reload_pool_meta()
+                .await
+                .expect("load the active generation on the remote node");
+            other_store
+                .decommission_cancel(0)
+                .await
+                .expect("the remote node should cancel the old generation");
+            other_store
+                .clear_decommission(0)
+                .await
+                .expect("the remote node should clear the old generation");
+            let (replacement_plan, replacement_canceler) = start_target_fenced_cancel_test(&other_store, 8).await;
+            assert_ne!(replacement_plan.operation_id, plan.operation_id);
+
+            barrier.release_cancel_target_timeout();
+            let err = tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
+                .await
+                .expect("the stale request must finish without retrying a replacement operation")
+                .expect("the stale cancel task should not panic")
+                .expect_err("the original request must not cancel a remotely replaced generation");
+            assert!(err.to_string().contains("changed while retrying terminal fences"));
+            assert_eq!(barrier.state.cancel_target_timeouts.load(Ordering::Acquire), 1);
+            assert!(!replacement_canceler.is_cancelled());
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload the replacement after the stale cancel returns");
+            assert_eq!(
+                decommission_capacity_terminal_fence_plan(&durable, 0).expect("the replacement must retain its valid plan"),
+                Some(replacement_plan)
+            );
+            assert!(
+                !durable.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("replacement decommission")
+                    .canceled
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_target_retry_survives_caller_abort_and_settles_inflight_mutation() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let (_temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (plan, canceler) = start_target_fenced_cancel_test(&store, 0).await;
+            let owner = DecommissionCapacityOwner {
+                source_pool_index: 0,
+                operation_id: plan.operation_id,
+                generation: plan.generation,
+                owner_nonce: plan.owner_nonce,
+                mutation_id: Some(uuid::Uuid::new_v4()),
+            };
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mutation_store = Arc::clone(&store);
+            let mutation = tokio::spawn(async move {
+                mutation_store
+                    .run_decommission_capacity_admitted_mutation(2, Some(owner), Some(1), || async {
+                        entered_tx
+                            .send(())
+                            .expect("the test should observe the admitted target mutation");
+                        release_rx.await.expect("the test should release the in-flight mutation");
+                        Ok(())
+                    })
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+                .await
+                .expect("target mutation should reach its controlled I/O phase")
+                .expect("target admission should succeed before cancel starts");
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            let cancel_store = Arc::clone(&store);
+            let cancel = tokio::spawn(async move { cancel_store.decommission_cancel(0).await });
+            barrier.wait_until_cancel_target_timeout().await;
+            assert!(!canceler.is_cancelled(), "in-flight capacity settlement must precede the cancel signal");
+            cancel.abort();
+            assert!(cancel.await.expect_err("the RPC waiter should be aborted").is_cancelled());
+
+            release_tx
+                .send(())
+                .expect("the mutation must still be alive after the caller disconnects");
+            tokio::time::timeout(std::time::Duration::from_secs(30), mutation)
+                .await
+                .expect("the in-flight mutation must be able to settle without a metadata lock cycle")
+                .expect("the mutation task should not panic")
+                .expect("the admitted mutation must settle before the target gate is released");
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if store.pool_meta.read().await.pools[0]
+                        .decommission
+                        .as_ref()
+                        .is_some_and(|info| info.canceled)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the detached cancel transaction must finish after target contention clears");
+            assert!(canceler.is_cancelled());
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload cancellation after the RPC waiter was dropped");
+            let info = durable.pools[0].decommission.as_ref().expect("durable canceled decommission");
+            assert!(info.canceled && !info.failed && !info.complete);
+            let reservation = info
+                .capacity_reservation
+                .as_ref()
+                .expect("inspect settled capacity accounting");
+            assert!(!reservation.active());
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.inflight_target_physical_bytes, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_target_retry_does_not_replay_a_failed_durable_save() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let (_temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (plan, canceler) = start_target_fenced_cancel_test(&store, 0).await;
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            barrier.pause_cancel_target_timeout();
+            let target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
+                .await
+                .expect("create the target gate preceding the failed save");
+            let target_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("force one target acquisition retry before persistence");
+            let save_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&save_calls);
+            let cancel_store = Arc::clone(&store);
+            let owner = canceler.clone();
+            let cancel = tokio::spawn(async move {
+                cancel_store
+                    .decommission_cancel_transaction(0, Some(owner), true, move |_, _| async move {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        Err(Error::Timeout)
+                    })
+                    .await
+            });
+            barrier.wait_until_cancel_target_timeout().await;
+            assert_eq!(save_calls.load(Ordering::Acquire), 0, "persistence must wait for every target fence");
+            drop(target_guard);
+            barrier.release_cancel_target_timeout();
+            let err = tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
+                .await
+                .expect("a persistence failure must end the cancellation transaction")
+                .expect("the failed-save task should not panic")
+                .expect_err("the injected durable-save failure must reach the caller");
+            assert!(matches!(err, Error::Timeout));
+            assert_eq!(save_calls.load(Ordering::Acquire), 1);
+            assert_eq!(barrier.state.cancel_target_timeouts.load(Ordering::Acquire), 1);
+            assert!(!canceler.is_cancelled());
+            assert!(canceler.is_active());
+            store
+                .ensure_pool_meta_side_effects_safe("verify ambiguous cancellation save blocks further writes")
+                .await
+                .expect_err("a failed durable save must retain the existing recovery gate");
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("the original reservation should remain readable after the injected save failure");
+            assert_eq!(
+                decommission_capacity_terminal_fence_plan(&durable, 0).expect("the old reservation should remain valid"),
+                Some(plan)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cancel_target_retry_converges_after_successive_contenders() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let (_temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let (_plan, canceler) = start_target_fenced_cancel_test(&store, 0).await;
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            barrier.pause_cancel_target_timeout();
+            let target_lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
+                .await
+                .expect("create the repeatedly contended target gate");
+            let first_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("the first contender should own the target gate");
+            let cancel_store = Arc::clone(&store);
+            let cancel = tokio::spawn(async move { cancel_store.decommission_cancel(0).await });
+            barrier.wait_until_cancel_target_timeout().await;
+            assert_eq!(barrier.state.cancel_target_timeouts.load(Ordering::Acquire), 1);
+            drop(first_guard);
+            let second_guard = target_lock
+                .get_write_lock(std::time::Duration::from_secs(30))
+                .await
+                .expect("a second contender should be able to acquire between cancel attempts");
+            barrier.release_cancel_target_timeout();
+            barrier.pause_cancel_target_timeout();
+            barrier.wait_until_cancel_target_timeout().await;
+            assert_eq!(barrier.state.cancel_target_timeouts.load(Ordering::Acquire), 2);
+            assert!(!canceler.is_cancelled());
+            drop(second_guard);
+            barrier.release_cancel_target_timeout();
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), cancel)
+                .await
+                .expect("cancel should converge after the repeated contention ends")
+                .expect("the cancel task should not panic")
+                .expect("the third target acquisition should permit a durable cancellation");
+            assert!(canceler.is_cancelled());
+            let mut durable = PoolMeta::default();
+            durable
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("the successful retried cancellation must survive a native metadata reload");
+            assert!(
+                durable.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("canceled decommission")
+                    .canceled
+            );
+            assert!(
+                decommission_capacity_terminal_fence_plan(&durable, 0)
+                    .expect("valid terminal metadata")
+                    .is_none()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
