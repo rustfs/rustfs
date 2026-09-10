@@ -19,7 +19,7 @@ mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
-        init_logging, rustfs_binary_path,
+        init_logging, requested_rustfs_build_features, rustfs_binary_path_with_features,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::{
@@ -1242,7 +1242,8 @@ mod tests {
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let server_binary = rustfs_binary_path();
+        let features = format!("{},e2e-test-hooks", requested_rustfs_build_features().unwrap_or_default());
+        let server_binary = rustfs_binary_path_with_features(Some(&features));
         let evidence_case = match scenario {
             InterruptionScenario::BackgroundTargetRestart => Some(BACKGROUND_TARGET_RESTART_EVIDENCE),
             InterruptionScenario::BackgroundTargetCrash => Some(BACKGROUND_TARGET_CRASH_EVIDENCE),
@@ -1530,6 +1531,16 @@ mod tests {
             }
         }
 
+        // Keep the partial-repair checkpoint stable across readiness and admin
+        // requests. Endpoint-blackhole tests must prove their own network stall.
+        let commit_barrier = if scenario != InterruptionScenario::TargetEndpointBlackhole {
+            let barrier = replaced_disk.join(".rustfs.sys/e2e-heal-commit-barrier");
+            std::fs::create_dir_all(barrier.parent().ok_or("commit barrier has no parent")?)?;
+            std::fs::write(&barrier, format!("{bucket}/cluster/online/"))?;
+            Some(barrier)
+        } else {
+            None
+        };
         cluster.start_node_from_binary(1, &server_binary).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
@@ -1663,6 +1674,12 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         };
 
+        if let Some(barrier) = &commit_barrier {
+            assert!(
+                barrier.with_extension("admitted").is_file(),
+                "interruption tests require a server built with e2e-test-hooks"
+            );
+        }
         let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
@@ -1867,6 +1884,9 @@ mod tests {
                         );
                     }
                 }
+            }
+            if let Some(barrier) = &commit_barrier {
+                std::fs::remove_file(barrier)?;
             }
             cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {
