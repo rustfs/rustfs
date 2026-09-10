@@ -970,6 +970,7 @@ jobs:
       # debug binary; each test spawns its own rustfs server on a random port.
       - name: Run e2e full suite
         env:
+          CARGO_BIN_EXE_rustfs: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence

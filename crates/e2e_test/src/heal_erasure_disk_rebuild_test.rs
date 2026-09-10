@@ -19,7 +19,7 @@ mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
-        init_logging, requested_rustfs_build_features, rustfs_binary_path_with_features,
+        init_logging, rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::{
@@ -1242,8 +1242,7 @@ mod tests {
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let features = format!("{},e2e-test-hooks", requested_rustfs_build_features().unwrap_or_default());
-        let server_binary = rustfs_binary_path_with_features(Some(&features));
+        let server_binary = rustfs_binary_path();
         let evidence_case = match scenario {
             InterruptionScenario::BackgroundTargetRestart => Some(BACKGROUND_TARGET_RESTART_EVIDENCE),
             InterruptionScenario::BackgroundTargetCrash => Some(BACKGROUND_TARGET_CRASH_EVIDENCE),
