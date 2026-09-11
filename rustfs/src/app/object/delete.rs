@@ -66,7 +66,10 @@ async fn authorize_recursive_delete<T>(
                 return Ok(());
             }
             if page.next_marker.is_none() || (marker == page.next_marker && version_marker == page.next_version_idmarker) {
-                return Err(s3_error!(InternalError, "Recursive delete listing did not advance"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Recursive delete listing did not advance",
+                ));
             }
             marker = page.next_marker;
             version_marker = page.next_version_idmarker;
