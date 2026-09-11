@@ -57,7 +57,9 @@ fn minio_bucket_metadata() -> Vec<u8> {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             u8::from_str_radix(std::str::from_utf8(pair).expect("fixture hex is UTF-8"), 16).expect("valid MinIO fixture hex")
         })
