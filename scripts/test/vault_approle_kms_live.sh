@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start an ephemeral Vault, issue a least-privilege AppRole, and run the two
+# Start an ephemeral Vault, issue a least-privilege AppRole, and run the
 # ignored RustFS KMS checks without ever exposing the generated credentials.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +77,7 @@ if [[ "$ready" != 1 ]]; then
 fi
 
 vault_cli secrets enable -path=transit transit >/dev/null
+vault_cli secrets enable -path=kms-test/metadata kv-v2 >/dev/null
 vault_cli auth enable approle >/dev/null
 
 POLICY_NAME="rustfs-kms-live-$$"
@@ -103,6 +104,11 @@ path "secret/metadata/rustfs/kms/transit-metadata/*" {
 }
 path "secret/metadata/rustfs/kms/transit-metadata" {
   capabilities = ["list"]
+}
+
+# Non-default Transit metadata mount and prefix, both containing slashes.
+path "kms-test/metadata/data/custom/transit-metadata/*" {
+  capabilities = ["create", "read", "update"]
 }
 
 # Transit key lifecycle and data-path operations.
@@ -135,6 +141,8 @@ SECRET_ID="$(vault_cli write -f -field=secret_id "auth/approle/role/${ROLE_NAME}
 run_live_test() {
   local backend="$1"
   local test_name="$2"
+  local metadata_mount="${3:-secret}"
+  local metadata_prefix="${4:-rustfs/kms/transit-metadata}"
 
   local -a backend_env=(
     -u RUSTFS_KMS_BACKEND
@@ -179,8 +187,8 @@ run_live_test() {
   else
     backend_env+=(
       RUSTFS_KMS_VAULT_MOUNT_PATH=transit
-      RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT=secret
-      RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX=rustfs/kms/transit-metadata
+      RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT="$metadata_mount"
+      RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX="$metadata_prefix"
     )
   fi
 
@@ -193,4 +201,8 @@ run_live_test() {
 cd "$PROJECT_ROOT"
 run_live_test vault vault_kv2_approle_auth_live
 run_live_test vault-transit vault_transit_approle_auth_live
+# Remove the dev mount so a fallback to secret cannot pass.
+vault_cli secrets disable secret >/dev/null
+run_live_test vault-transit vault_transit_approle_custom_metadata_location_live \
+  kms-test/metadata custom/transit-metadata
 echo "Vault AppRole KV2 and Transit live checks passed"

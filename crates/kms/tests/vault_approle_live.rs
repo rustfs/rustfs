@@ -29,6 +29,8 @@ use rustfs_kms::{
 };
 use std::collections::HashMap;
 
+const LIVE_KEY_DESCRIPTION: &str = "AppRole live metadata";
+
 fn assert_approle_config(config: &KmsConfig, expected_backend: KmsBackend) {
     assert_eq!(config.backend, expected_backend);
     let auth_method = match &config.backend_config {
@@ -42,12 +44,13 @@ fn assert_approle_config(config: &KmsConfig, expected_backend: KmsBackend) {
     );
 }
 
-async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: &str) -> rustfs_kms::Result<()> {
+async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: &str) -> rustfs_kms::Result<String> {
     let key_id = format!("{key_prefix}-{}", uuid::Uuid::new_v4());
     let created = backend
         .create_key(CreateKeyRequest {
             key_name: Some(key_id.clone()),
             key_usage: KeyUsage::EncryptDecrypt,
+            description: Some(LIVE_KEY_DESCRIPTION.to_string()),
             ..Default::default()
         })
         .await?;
@@ -57,6 +60,7 @@ async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: 
         .describe_key(rustfs_kms::DescribeKeyRequest { key_id: key_id.clone() })
         .await?;
     assert_eq!(described.key_metadata.key_id, key_id);
+    assert_eq!(described.key_metadata.description.as_deref(), Some(LIVE_KEY_DESCRIPTION));
 
     let listed = backend
         .list_keys(ListKeysRequest {
@@ -88,7 +92,7 @@ async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: 
         })
         .await?;
     assert_eq!(unwrapped.plaintext, generated.plaintext_key);
-    Ok(())
+    Ok(key_id)
 }
 
 #[tokio::test]
@@ -97,7 +101,7 @@ async fn vault_kv2_approle_auth_live() -> rustfs_kms::Result<()> {
     let config = KmsConfig::from_env()?;
     assert_approle_config(&config, KmsBackend::VaultKv2);
     let backend = VaultKmsBackend::new(config).await?;
-    exercise_backend(&backend, "rustfs-approle-kv2").await
+    exercise_backend(&backend, "rustfs-approle-kv2").await.map(|_| ())
 }
 
 #[tokio::test]
@@ -113,5 +117,28 @@ async fn vault_transit_approle_auth_live() -> rustfs_kms::Result<()> {
     assert_eq!(transit.metadata_key_prefix, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX);
 
     let backend = VaultTransitKmsBackend::new(config).await?;
-    exercise_backend(&backend, "rustfs-approle-transit").await
+    exercise_backend(&backend, "rustfs-approle-transit").await.map(|_| ())
+}
+
+#[tokio::test]
+#[ignore = "requires a real Vault AppRole; run scripts/test/vault_approle_kms_live.sh"]
+async fn vault_transit_approle_custom_metadata_location_live() -> rustfs_kms::Result<()> {
+    let config = KmsConfig::from_env()?;
+    assert_approle_config(&config, KmsBackend::VaultTransit);
+    let BackendConfig::VaultTransit(transit) = &config.backend_config else {
+        panic!("expected Vault Transit configuration");
+    };
+    assert_eq!(transit.metadata_kv_mount, "kms-test/metadata");
+    assert_eq!(transit.metadata_key_prefix, "custom/transit-metadata");
+
+    let backend = VaultTransitKmsBackend::new(config.clone()).await?;
+    let key_id = exercise_backend(&backend, "rustfs-approle-custom-transit").await?;
+    drop(backend);
+
+    // A fresh backend must read the stored record, not synthesize Enabled
+    // metadata or reuse a record cached during key creation.
+    let restarted = VaultTransitKmsBackend::new(config).await?;
+    let described = restarted.describe_key(rustfs_kms::DescribeKeyRequest { key_id }).await?;
+    assert_eq!(described.key_metadata.description.as_deref(), Some(LIVE_KEY_DESCRIPTION));
+    Ok(())
 }
