@@ -239,6 +239,22 @@ struct ActiveNamespaceEvidence {
     explicit_entry: Option<NamespaceEntry>,
 }
 
+pub(in crate::table_catalog) fn bounded_table_entry_objects_for_data_plane_scan(
+    objects: Vec<String>,
+    is_truncated: bool,
+    max_catalog_objects: usize,
+) -> TableCatalogStoreResult<Vec<String>> {
+    if is_truncated || objects.len() > max_catalog_objects {
+        return Err(TableCatalogStoreError::Unavailable(format!(
+            "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
+        )));
+    }
+    Ok(objects
+        .into_iter()
+        .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+        .collect())
+}
+
 #[derive(Clone)]
 pub(crate) struct ObjectTableCatalogStore<B> {
     pub(in crate::table_catalog) backend: B,
@@ -1609,11 +1625,60 @@ where
         Ok(matched)
     }
 
+    async fn scan_table_data_plane_resource_for_index_miss(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        let mut matched: Option<TableDataPlaneResource> = None;
+        for table in self
+            .list_all_table_entries_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS))
+            .await?
+        {
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
+            let warehouse_object_prefix = table_warehouse_object_prefix(&table)?;
+            if !object.starts_with(&warehouse_object_prefix) {
+                continue;
+            }
+            if let Some(current) = matched.as_ref() {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "object {object} matches overlapping active table warehouse prefixes {} and {warehouse_object_prefix}",
+                    current.warehouse_object_prefix
+                )));
+            }
+            matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
+        }
+        if let Some(resource) = matched.as_ref() {
+            self.backfill_active_table_warehouse_index_with_prefix_check(
+                &resource.table_bucket,
+                &resource.namespace,
+                &resource.table,
+                true,
+            )
+            .await?;
+        }
+        Ok(matched)
+    }
+
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn backfill_active_table_warehouse_index(
         &self,
         table_bucket: &str,
         namespace: &str,
         table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        self.backfill_active_table_warehouse_index_with_prefix_check(table_bucket, namespace, table, false)
+            .await
+    }
+
+    async fn backfill_active_table_warehouse_index_with_prefix_check(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        prefix_already_checked: bool,
     ) -> TableCatalogStoreResult<()> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
@@ -1625,12 +1690,24 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Ok(());
         }
-        self.reserve_table_warehouse_index(&current, false).await.map(|_| ())
+        self.reserve_table_warehouse_index(&current, prefix_already_checked)
+            .await
+            .map(|_| ())
     }
 
-    pub(in crate::table_catalog) async fn backfill_table_warehouse_index(
+    pub(crate) async fn backfill_table_warehouse_index(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.backfill_table_warehouse_index_with_limit(table_bucket, None).await
+    }
+
+    async fn backfill_table_warehouse_index_for_data_plane(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.backfill_table_warehouse_index_with_limit(table_bucket, Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS))
+            .await
+    }
+
+    async fn backfill_table_warehouse_index_with_limit(
         &self,
         table_bucket: &str,
+        max_catalog_objects: Option<usize>,
     ) -> TableCatalogStoreResult<()> {
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
         let state_object = self.paths.warehouse_index_state_path(table_bucket);
@@ -1639,7 +1716,7 @@ where
             return Ok(());
         }
         let tables = self
-            .list_all_table_entries(table_bucket)
+            .list_all_table_entries_with_limit(table_bucket, max_catalog_objects)
             .await?
             .into_iter()
             .filter(|table| table.state == TableCatalogEntryState::Active)
@@ -1666,8 +1743,13 @@ where
             )));
         }
         for table in tables {
-            self.backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
-                .await?;
+            self.backfill_active_table_warehouse_index_with_prefix_check(
+                &table.table_bucket,
+                &table.namespace,
+                &table.table,
+                true,
+            )
+            .await?;
         }
         self.write_warehouse_index_state_unlocked(table_bucket).await
     }
@@ -1714,15 +1796,70 @@ where
     }
 
     async fn list_all_table_entries(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        let mut entries = Vec::new();
-        for object in self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
-            .await?
-        {
-            if !object.ends_with(TABLE_ENTRY_FILE) {
-                continue;
+        self.list_all_table_entries_with_limit(table_bucket, None).await
+    }
+
+    async fn list_table_entry_objects_for_data_plane_scan(
+        &self,
+        table_bucket: &str,
+        max_catalog_objects: usize,
+    ) -> TableCatalogStoreResult<Vec<String>> {
+        let mut objects = Vec::new();
+        let mut cursor = None;
+        loop {
+            let remaining = max_catalog_objects.saturating_sub(objects.len());
+            let page_size = remaining.min(TABLE_CATALOG_LIST_MAX_KEYS);
+            let limit = NonZeroUsize::new(page_size).ok_or_else(|| {
+                TableCatalogStoreError::Unavailable(format!(
+                    "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
+                ))
+            })?;
+            let page = self
+                .backend
+                .list_objects_page(
+                    self.catalog_bucket(),
+                    &self.paths.namespace_entries_prefix(table_bucket),
+                    cursor.as_deref(),
+                    limit,
+                )
+                .await?;
+            let next_cursor = page.objects.last().cloned();
+            objects.extend(page.objects);
+            if !page.is_truncated {
+                return bounded_table_entry_objects_for_data_plane_scan(objects, false, max_catalog_objects);
             }
+            if objects.len() >= max_catalog_objects {
+                return bounded_table_entry_objects_for_data_plane_scan(objects, true, max_catalog_objects);
+            }
+            if next_cursor.is_none() || next_cursor == cursor {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog object pagination did not advance during table data-plane index-miss scan".to_string(),
+                ));
+            }
+            cursor = next_cursor;
+        }
+    }
+
+    async fn list_all_table_entries_with_limit(
+        &self,
+        table_bucket: &str,
+        max_catalog_objects: Option<usize>,
+    ) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        let mut entries = Vec::new();
+        let table_objects = match max_catalog_objects {
+            Some(max_catalog_objects) => {
+                self.list_table_entry_objects_for_data_plane_scan(table_bucket, max_catalog_objects)
+                    .await?
+            }
+            None => self
+                .backend
+                .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
+                .await?
+                .into_iter()
+                .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+                .collect(),
+        };
+        for object in table_objects {
             let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
                 continue;
             };
@@ -5119,16 +5256,16 @@ where
                 .await?
             {
                 Some(resource) => Ok(Some(resource)),
-                None => scan_table_data_plane_resource_for_object(self, table_bucket, object).await,
+                None => self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await,
             }
         } else {
-            match self.backfill_table_warehouse_index(table_bucket).await {
+            match self.backfill_table_warehouse_index_for_data_plane(table_bucket).await {
                 Ok(()) => match self
                     .resolve_table_data_plane_resource_from_index(table_bucket, object)
                     .await?
                 {
                     Some(resource) => Ok(Some(resource)),
-                    None => scan_table_data_plane_resource_for_object(self, table_bucket, object).await,
+                    None => self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await,
                 },
                 Err(err @ TableCatalogStoreError::Internal(_)) => {
                     tracing::warn!(
@@ -5136,7 +5273,7 @@ where
                         error = %err,
                         "failed to backfill table warehouse index; falling back to catalog scan"
                     );
-                    scan_table_data_plane_resource_for_object(self, table_bucket, object).await
+                    self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await
                 }
                 Err(err) => Err(err),
             }
