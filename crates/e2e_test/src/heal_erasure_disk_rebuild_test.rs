@@ -24,7 +24,7 @@ mod tests {
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::{
         error::{ProvideErrorMetadata, SdkError},
-        operation::put_object::PutObjectError,
+        operation::{delete_object::DeleteObjectError, put_object::PutObjectError},
         primitives::ByteStream,
     };
     use http::Method;
@@ -45,6 +45,7 @@ mod tests {
 
     struct ReplacementDriveSelection {
         replaced_disk: PathBuf,
+        drive_index: usize,
         replacement_format_path: PathBuf,
         replacement_format: Vec<u8>,
         expected_pool_metadata: Option<VersionShardCensus>,
@@ -461,6 +462,12 @@ mod tests {
         shard_census: VersionShardCensus,
     }
 
+    #[derive(Debug, Default)]
+    struct OutagePeerManifest {
+        erasure_indices: HashSet<usize>,
+        erasure_distribution: Option<Vec<usize>>,
+    }
+
     fn deterministic_object_body(len: usize, seed: u8) -> Vec<u8> {
         let mut value = seed;
         std::iter::repeat_with(|| {
@@ -484,6 +491,81 @@ mod tests {
             }
         }
         Ok(matching)
+    }
+
+    fn collect_outage_peer_manifest(
+        cluster: &RustFSTestClusterEnvironment,
+        offline_node_index: usize,
+        bucket: &str,
+        key: &str,
+        erasure_set_drive_count: usize,
+    ) -> Result<OutagePeerManifest, Box<dyn Error + Send + Sync>> {
+        let mut manifest = OutagePeerManifest::default();
+        for (node_index, node) in cluster.nodes.iter().enumerate() {
+            if node_index == offline_node_index {
+                continue;
+            }
+            for (drive_index, drive) in node.data_dirs.iter().enumerate() {
+                let census = census_object_version_on_disk(Path::new(drive), bucket, key, None)?;
+                if !census.has_xl_meta {
+                    continue;
+                }
+                assert!(
+                    census.is_complete(),
+                    "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
+                );
+                let erasure_index = census.erasure_index.ok_or_else(|| {
+                    format!("online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}")
+                })?;
+                assert!(
+                    (1..=erasure_set_drive_count).contains(&erasure_index),
+                    "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
+                );
+                let distribution = census.erasure_distribution.as_ref().ok_or_else(|| {
+                    format!(
+                        "online node {node_index} drive {drive_index} outage-object shard has no erasure distribution: {census:?}"
+                    )
+                })?;
+                assert_eq!(
+                    distribution.len(),
+                    erasure_set_drive_count,
+                    "online node {node_index} drive {drive_index} outage-object distribution must match the erasure set: {census:?}"
+                );
+                match &manifest.erasure_distribution {
+                    Some(existing) => {
+                        assert_eq!(existing, distribution, "outage-object shards must agree on one erasure distribution")
+                    }
+                    None => manifest.erasure_distribution = Some(distribution.clone()),
+                }
+                assert!(
+                    manifest.erasure_indices.insert(erasure_index),
+                    "outage-object erasure index {erasure_index} is duplicated across online drives"
+                );
+            }
+        }
+        Ok(manifest)
+    }
+
+    fn outage_candidate_replacement_erasure_index(
+        peer_manifest: &OutagePeerManifest,
+        erasure_set_drive_count: usize,
+        replacement_set_slot: usize,
+    ) -> Option<usize> {
+        let distribution = peer_manifest.erasure_distribution.as_ref()?;
+        distribution.get(replacement_set_slot).copied().filter(|replacement_index| {
+            (1..=erasure_set_drive_count).contains(replacement_index)
+                && !peer_manifest.erasure_indices.contains(replacement_index)
+        })
+    }
+
+    fn outage_candidate_targets_replacement(
+        peer_manifest: &OutagePeerManifest,
+        erasure_set_drive_count: usize,
+        replacement_set_slot: usize,
+    ) -> bool {
+        let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
+        peer_manifest.erasure_indices.len() >= min_online_data_shards
+            && outage_candidate_replacement_erasure_index(peer_manifest, erasure_set_drive_count, replacement_set_slot).is_some()
     }
 
     fn metadata_count(disk: &Path, bucket: &str, expected_manifests: &[PhysicalObjectManifest]) -> usize {
@@ -601,6 +683,10 @@ mod tests {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
     }
 
+    fn is_service_unavailable_delete(error: &SdkError<DeleteObjectError>) -> bool {
+        error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
+    }
+
     fn select_replacement_drive(
         cluster: &RustFSTestClusterEnvironment,
         node_index: usize,
@@ -612,7 +698,7 @@ mod tests {
             .ok_or_else(|| format!("replacement node {node_index} is absent"))?;
         let mut incomplete_pool_metadata = Vec::new();
 
-        for drive in &node.data_dirs {
+        for (drive_index, drive) in node.data_dirs.iter().enumerate() {
             let replaced_disk = PathBuf::from(drive);
             let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
             let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
@@ -621,6 +707,7 @@ mod tests {
             if !require_pool_metadata {
                 return Ok(ReplacementDriveSelection {
                     replaced_disk,
+                    drive_index,
                     replacement_format_path,
                     replacement_format,
                     expected_pool_metadata: None,
@@ -631,6 +718,7 @@ mod tests {
             if census.is_complete() {
                 return Ok(ReplacementDriveSelection {
                     replaced_disk,
+                    drive_index,
                     replacement_format_path,
                     replacement_format,
                     expected_pool_metadata: Some(census),
@@ -1180,7 +1268,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         timeout(
-            Duration::from_secs(600),
+            Duration::from_secs(900),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84MultiSet),
         )
         .await?
@@ -1332,10 +1420,13 @@ mod tests {
 
         let ReplacementDriveSelection {
             replaced_disk,
+            drive_index: replacement_drive_index,
             replacement_format_path,
             replacement_format,
             expected_pool_metadata,
         } = select_replacement_drive(&cluster, 1, background_enabled)?;
+        let replacement_global_drive_index = topology.drives_per_node + replacement_drive_index;
+        let replacement_set_slot = replacement_global_drive_index % erasure_set_drive_count;
         let default_online_object_count = if !outage_target_manifest_required { 64 } else { 24 };
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
             .ok()
@@ -1391,6 +1482,23 @@ mod tests {
             expected_manifests.push(PhysicalObjectManifest { key, shard_census });
             attempt_count += 1;
         }
+        for manifest in &expected_manifests {
+            let distribution = manifest
+                .shard_census
+                .erasure_distribution
+                .as_ref()
+                .ok_or_else(|| format!("replacement baseline manifest has no erasure distribution: {manifest:?}"))?;
+            assert_eq!(
+                distribution.len(),
+                erasure_set_drive_count,
+                "replacement baseline distribution must match the erasure set: {manifest:?}"
+            );
+            assert_eq!(
+                manifest.shard_census.erasure_index,
+                distribution.get(replacement_set_slot).copied(),
+                "replacement baseline shard must match the selected drive's erasure-set slot"
+            );
+        }
 
         if background_enabled {
             wait_for_scanner_cycle_after(&cluster, 0).await?;
@@ -1415,6 +1523,9 @@ mod tests {
         let mut outage_write_deferred_until_rejoin = false;
         let mut service_unavailable_outage_writes = 0usize;
         let mut last_service_unavailable = None;
+        let mut outage_peer_manifest = OutagePeerManifest::default();
+        let mut replacement_outage_erasure_index = None;
+        let mut rejected_outage_keys = Vec::new();
         for attempt in 0..max_outage_write_attempts {
             let candidate_key = format!("cluster/written-while-node-down-{attempt:04}.bin");
             let put_result = timeout(
@@ -1429,6 +1540,24 @@ mod tests {
             .await;
             match put_result {
                 Ok(Ok(_)) => {
+                    if outage_target_manifest_required {
+                        let candidate_peer_manifest =
+                            collect_outage_peer_manifest(&cluster, 1, bucket, &candidate_key, erasure_set_drive_count)?;
+                        if !outage_candidate_targets_replacement(
+                            &candidate_peer_manifest,
+                            erasure_set_drive_count,
+                            replacement_set_slot,
+                        ) {
+                            rejected_outage_keys.push(candidate_key);
+                            continue;
+                        }
+                        replacement_outage_erasure_index = outage_candidate_replacement_erasure_index(
+                            &candidate_peer_manifest,
+                            erasure_set_drive_count,
+                            replacement_set_slot,
+                        );
+                        outage_peer_manifest = candidate_peer_manifest;
+                    }
                     outage_key = Some(candidate_key);
                     break;
                 }
@@ -1456,56 +1585,36 @@ mod tests {
             }
         };
 
-        let mut outage_peer_erasure_indices = HashSet::new();
-        if !outage_write_deferred_until_rejoin {
-            for (node_index, node) in cluster.nodes.iter().enumerate() {
-                if node_index == 1 {
-                    continue;
-                }
-                for (drive_index, drive) in node.data_dirs.iter().enumerate() {
-                    let census = census_object_version_on_disk(Path::new(drive), bucket, &outage_key, None)?;
-                    if !census.has_xl_meta {
-                        continue;
-                    }
-                    assert!(
-                        census.is_complete(),
-                        "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
-                    );
-                    let erasure_index = census.erasure_index.ok_or_else(|| {
-                        format!(
-                            "online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}"
-                        )
-                    })?;
-                    assert!(
-                        (1..=erasure_set_drive_count).contains(&erasure_index),
-                        "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
-                    );
-                    assert!(
-                        outage_peer_erasure_indices.insert(erasure_index),
-                        "outage-object erasure index {erasure_index} is duplicated across online drives"
-                    );
-                }
-            }
+        if !outage_write_deferred_until_rejoin && outage_peer_manifest.erasure_indices.is_empty() {
+            outage_peer_manifest = collect_outage_peer_manifest(&cluster, 1, bucket, &outage_key, erasure_set_drive_count)?;
+            replacement_outage_erasure_index =
+                outage_candidate_replacement_erasure_index(&outage_peer_manifest, erasure_set_drive_count, replacement_set_slot);
         }
         assert!(
             outage_write_deferred_until_rejoin
-                || (!outage_peer_erasure_indices.is_empty() && outage_peer_erasure_indices.len() <= erasure_set_drive_count),
+                || (!outage_peer_manifest.erasure_indices.is_empty()
+                    && outage_peer_manifest.erasure_indices.len() <= erasure_set_drive_count),
             "outage-object must occupy one non-empty erasure set"
         );
         if outage_target_manifest_required {
             let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
             assert!(
-                outage_peer_erasure_indices.len() >= min_online_data_shards,
+                outage_peer_manifest.erasure_indices.len() >= min_online_data_shards,
                 "online drives in the selected erasure set must retain at least the EC data quorum"
             );
         }
         let missing_outage_erasure_indices = (1..=erasure_set_drive_count)
-            .filter(|index| !outage_peer_erasure_indices.contains(index))
+            .filter(|index| !outage_peer_manifest.erasure_indices.contains(index))
             .collect::<HashSet<_>>();
         if outage_target_manifest_required {
             assert!(
                 !missing_outage_erasure_indices.is_empty(),
                 "the stopped target must account for at least one missing outage-object erasure index"
+            );
+            assert_eq!(
+                replacement_outage_erasure_index.filter(|index| missing_outage_erasure_indices.contains(index)),
+                replacement_outage_erasure_index,
+                "the outage object must target the selected replacement drive's erasure-set slot"
             );
         }
 
@@ -1531,6 +1640,24 @@ mod tests {
         }
 
         cluster.start_node_from_binary(1, &server_binary).await?;
+        for rejected_key in rejected_outage_keys {
+            let delete_deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let delete_result = timeout(
+                    Duration::from_secs(30),
+                    clients[0].delete_object().bucket(bucket).key(&rejected_key).send(),
+                )
+                .await;
+                match delete_result {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(error)) if is_service_unavailable_delete(&error) && Instant::now() < delete_deadline => {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
         let recovery_deadline = Instant::now() + Duration::from_secs(60);
@@ -1995,9 +2122,9 @@ mod tests {
             assert_eq!(
                 outage_census
                     .erasure_index
-                    .filter(|index| missing_outage_erasure_indices.contains(index)),
+                    .filter(|index| replacement_outage_erasure_index == Some(*index)),
                 outage_census.erasure_index,
-                "the outage object must be rebuilt into one of the stopped node's missing erasure slots"
+                "the outage object must be rebuilt into the selected replacement drive's erasure-set slot"
             );
         }
 
@@ -2276,5 +2403,29 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn outage_candidate_must_target_replacement_erasure_index() {
+        let distribution = vec![4, 7, 10, 1, 5, 8, 11, 2, 6, 9, 12, 3];
+        let replacement_set_slot = 8;
+        let replacement_index = distribution[replacement_set_slot];
+        let peers_missing_replacement = OutagePeerManifest {
+            erasure_indices: (1..=12).filter(|index| *index != replacement_index).collect(),
+            erasure_distribution: Some(distribution.clone()),
+        };
+        assert!(outage_candidate_targets_replacement(&peers_missing_replacement, 12, replacement_set_slot));
+
+        let peers_missing_other_slot = OutagePeerManifest {
+            erasure_indices: (1..=12).filter(|index| *index != 9).collect(),
+            erasure_distribution: Some(distribution),
+        };
+        assert!(!outage_candidate_targets_replacement(&peers_missing_other_slot, 12, replacement_set_slot));
+
+        let insufficient_peer_shards = OutagePeerManifest {
+            erasure_indices: [1, 3, 4, 5, 6, 7, 8].into_iter().collect(),
+            erasure_distribution: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+        };
+        assert!(!outage_candidate_targets_replacement(&insufficient_peer_shards, 12, replacement_set_slot));
     }
 }

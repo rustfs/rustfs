@@ -83,8 +83,11 @@ runtime_profile_for() {
         background-target-crash|background-target-restart)
             echo "background-4x1"
             ;;
-        background-target-crash-ec8-4|background-target-restart-ec8-4|background-target-restart-ec8-4-multi-set)
+        background-target-crash-ec8-4|background-target-restart-ec8-4)
             echo "background-ec8-4"
+            ;;
+        background-target-restart-ec8-4-multi-set)
+            echo "background-ec8-4-multi-set"
             ;;
         background-target-crash-ec8-4-multi-pool)
             echo "background-ec8-4-multi-pool"
@@ -110,6 +113,11 @@ apply_runtime_profile() {
             export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-32}"
             export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-8388608}"
             export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-180}"
+            ;;
+        background-ec8-4-multi-set)
+            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
+            export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-16777216}"
+            export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-240}"
             ;;
         background-ec8-4-multi-pool)
             export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
@@ -319,9 +327,25 @@ if [[ "$NOFILE_SOFT" =~ ^[0-9]+$ && "$NOFILE_HARD" =~ ^[0-9]+$ && "$NOFILE_SOFT"
         ulimit -n "$NOFILE_HARD" || true
     fi
 fi
-mkdir -p "$(dirname "$RUN_DIR")"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-scanner-heal-evidence.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+RUN_PARENT="$(dirname "$RUN_DIR")"
+mkdir -p "$RUN_PARENT"
+RUN_TMP_ROOT_CREATED=0
+if [[ -z "${TMPDIR:-}" ]]; then
+    RUN_TMP_ROOT="$RUN_PARENT/.tmp-$(basename "$RUN_DIR")"
+    mkdir -p "$RUN_TMP_ROOT"
+    export TMPDIR="$RUN_TMP_ROOT"
+    RUN_TMP_ROOT_CREATED=1
+else
+    RUN_TMP_ROOT=""
+fi
+TMP_DIR="$(mktemp -d "${TMPDIR%/}/rustfs-scanner-heal-evidence.XXXXXX")"
+cleanup_tmp() {
+    rm -rf "$TMP_DIR"
+    if [[ "$RUN_TMP_ROOT_CREATED" == 1 ]]; then
+        rm -rf "$RUN_TMP_ROOT"
+    fi
+}
+trap cleanup_tmp EXIT
 
 BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"

@@ -61,6 +61,7 @@ pub(crate) struct VersionShardCensus {
     pub has_xl_meta: bool,
     pub data_dir: Option<String>,
     pub erasure_index: Option<usize>,
+    pub erasure_distribution: Option<Vec<usize>>,
     pub data_blocks: Option<usize>,
     pub parity_blocks: Option<usize>,
     pub expected_part_numbers: BTreeSet<usize>,
@@ -90,6 +91,7 @@ impl VersionShardCensus {
             && manifest.is_complete()
             && self.data_dir == manifest.data_dir
             && self.erasure_index == manifest.erasure_index
+            && self.erasure_distribution == manifest.erasure_distribution
             && self.data_blocks == manifest.data_blocks
             && self.parity_blocks == manifest.parity_blocks
             && self.expected_part_numbers == manifest.expected_part_numbers
@@ -317,6 +319,7 @@ pub(crate) fn census_object_version_on_disk(
             has_xl_meta: false,
             data_dir: None,
             erasure_index: None,
+            erasure_distribution: None,
             data_blocks: None,
             parity_blocks: None,
             expected_part_numbers: BTreeSet::new(),
@@ -334,6 +337,7 @@ pub(crate) fn census_object_version_on_disk(
     };
     let data_dir = file_info.data_dir.map(|id| id.to_string());
     let erasure_index = Some(file_info.erasure.index);
+    let erasure_distribution = Some(file_info.erasure.distribution.clone());
     let inline_data_fingerprint = file_info.data.as_deref().map(shard_fingerprint).transpose()?;
     let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
     let present_part_fingerprints = match std::fs::read_dir(&part_dir) {
@@ -366,6 +370,7 @@ pub(crate) fn census_object_version_on_disk(
         has_xl_meta: true,
         data_dir,
         erasure_index,
+        erasure_distribution,
         data_blocks: Some(file_info.erasure.data_blocks),
         parity_blocks: Some(file_info.erasure.parity_blocks),
         expected_part_numbers,
@@ -421,6 +426,7 @@ mod tests {
             has_xl_meta: true,
             data_dir: Some("data-dir".to_string()),
             erasure_index: Some(3),
+            erasure_distribution: Some(vec![1, 2, 3, 4]),
             data_blocks: Some(2),
             parity_blocks: Some(2),
             expected_part_numbers: BTreeSet::from([1]),

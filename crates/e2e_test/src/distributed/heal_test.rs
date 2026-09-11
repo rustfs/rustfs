@@ -253,6 +253,7 @@ async fn put_large_inventory(client: &Client, bucket: &str) -> TestResult<Vec<Ex
                 has_xl_meta: false,
                 data_dir: None,
                 erasure_index: None,
+                erasure_distribution: None,
                 data_blocks: None,
                 parity_blocks: None,
                 expected_part_numbers: Default::default(),
