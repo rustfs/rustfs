@@ -25,6 +25,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | `/iceberg/v1` | Supported | Canonical REST Catalog prefix; default REST signing name `s3`. |
 | `/_iceberg/v1` | Supported compatibility alias | MinIO AIStor-style alias; smoke profile defaults to signing name `s3tables`. |
 | S3 object data plane | Supported | Data, metadata, manifest, and delete files are ordinary S3 objects with table-aware policy checks on warehouse paths. |
+| S3 table-bucket listings | Supported | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, metadata-list extensions, and multipart-upload listings omit warehouse objects unless the caller has `admin:GetTableMetadata` for that table, and always omit internal `.rustfs-table` keys. Protected cursors are encrypted with a key derived from the cluster root credentials, so rotating those credentials invalidates cursors already issued. |
 | Table bucket enablement | Supported | A regular bucket is enabled for catalog use and addressed as the REST catalog warehouse. |
 | Catalog-vended table credentials | Automated when enabled | Disabled by default. LoadTable vends credentials only when `X-Iceberg-Access-Delegation` contains the exact `vended-credentials` token; the dedicated credentials endpoint uses the same issuer path. |
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and warehouse ARN shape for migration docs. API parity not claimed. |

@@ -19,7 +19,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    TableDataPlaneListAccess, authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
     prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
@@ -71,6 +71,7 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
     current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
@@ -2780,6 +2781,7 @@ impl DefaultBucketUsecase {
         let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
 
         // The on-demand migration envelope is decoded whether or not this
         // bucket still merges: a token handed out under `list_through` must keep
@@ -2788,55 +2790,87 @@ impl DefaultBucketUsecase {
             prepare_odm_read_generation(&store, &mut req, &bucket).await;
         }
         let (merged_token, source_state) = if allow_list_through {
-            (
-                list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
-                list_through::list_through_state(&store, &bucket, &req, &params).await?,
-            )
+            let source_state = list_through::list_through_state(&store, &bucket, &req, &params).await?;
+            if table_list_access.is_some() {
+                if source_state.is_some() {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ServiceUnavailable,
+                        "protected table listings are unavailable while on-demand migration list-through is active".to_string(),
+                    ));
+                }
+                (None, None)
+            } else {
+                (
+                    list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
+                    source_state,
+                )
+            }
         } else {
             (None, None)
         };
-        let (object_infos, degraded) = match (source_state, merged_token.as_ref()) {
-            (None, Some(token)) if params.max_keys == 0 => {
-                // No source was consulted, so retain every unconsumed side and
-                // the original wire format without spending its progress budget.
-                let is_truncated = !token.local_done || !token.source_done;
-                (
-                    StorageListObjectsV2Info {
-                        is_truncated,
-                        next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
-                        ..Default::default()
-                    },
-                    false,
-                )
-            }
-            (None, None) => {
-                let infos = store
-                    .list_objects_v2(
-                        &bucket,
-                        &params.prefix,
-                        params.decoded_continuation_token.clone(),
-                        params.delimiter.clone(),
-                        params.max_keys,
-                        fetch_owner.unwrap_or_default(),
-                        params.start_after_for_query.clone(),
+        let (object_infos, degraded) = if let Some(access) = table_list_access.as_ref() {
+            (
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
                         incl_deleted,
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                (infos, false)
-            }
-            (state, token) => {
-                let outcome = list_through::merged_list_objects_v2(
-                    &store,
-                    state.as_ref(),
-                    &bucket,
-                    &params,
-                    fetch_owner.unwrap_or_default(),
-                    incl_deleted,
-                    token,
+                        opaque_cursor_supported: allow_list_through,
+                    },
                 )
-                .await?;
-                (outcome.info, outcome.degraded)
+                .await?,
+                false,
+            )
+        } else {
+            match (source_state, merged_token.as_ref()) {
+                (None, Some(token)) if params.max_keys == 0 => {
+                    // No source was consulted, so retain every unconsumed side and
+                    // the original wire format without spending its progress budget.
+                    let is_truncated = !token.local_done || !token.source_done;
+                    (
+                        StorageListObjectsV2Info {
+                            is_truncated,
+                            next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                }
+                (None, None) => {
+                    let infos = store
+                        .list_objects_v2(
+                            &bucket,
+                            &params.prefix,
+                            params.decoded_continuation_token.clone(),
+                            params.delimiter.clone(),
+                            params.max_keys,
+                            fetch_owner.unwrap_or_default(),
+                            params.start_after_for_query.clone(),
+                            incl_deleted,
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                    (infos, false)
+                }
+                (state, token) => {
+                    let outcome = list_through::merged_list_objects_v2(
+                        &store,
+                        state.as_ref(),
+                        &bucket,
+                        &params,
+                        fetch_owner.unwrap_or_default(),
+                        incl_deleted,
+                        token,
+                    )
+                    .await?;
+                    (outcome.info, outcome.degraded)
+                }
             }
         };
 
@@ -2885,19 +2919,38 @@ impl DefaultBucketUsecase {
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
-        let object_infos = store
-            .list_objects_v2(
-                &bucket,
-                &params.prefix,
-                params.decoded_continuation_token.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-                fetch_owner.unwrap_or_default(),
-                params.start_after_for_query.clone(),
-                incl_deleted,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
+                        incl_deleted,
+                        opaque_cursor_supported: true,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_objects_v2(
+                    &bucket,
+                    &params.prefix,
+                    params.decoded_continuation_token.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                    fetch_owner.unwrap_or_default(),
+                    params.start_after_for_query.clone(),
+                    incl_deleted,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output = build_list_objects_v2_metadata_output(
@@ -2916,6 +2969,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -2931,17 +2985,34 @@ impl DefaultBucketUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match table_list_access.as_ref() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
@@ -2967,17 +3038,34 @@ impl DefaultBucketUsecase {
         let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output =
@@ -2989,9 +3077,13 @@ impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let request_marker = req.input.marker.clone();
+        let protected_table_list = req.extensions.get::<TableDataPlaneListAccess>().is_some();
         // V1 markers are object keys, so they cannot carry the opaque merged
         // pagination state used by V2 list-through.
-        let v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        let mut v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        if protected_table_list {
+            v2_resp.output.next_continuation_token = None;
+        }
 
         Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }

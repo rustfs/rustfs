@@ -16,8 +16,8 @@
 
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
-    apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, has_bypass_governance_header,
-    replication_request_authorized,
+    TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+    has_bypass_governance_header, replication_request_authorized,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -82,6 +82,7 @@ use crate::app::object_usecase::{
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::app::table_list_isolation;
 use crate::auth::{
     VerifiedPresignedRequest, VerifiedSigV4Request, parse_presigned_multipart_max_total_object_size,
     reject_presigned_multipart_max_total_object_size_for_other_operation,
@@ -1468,6 +1469,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1508,18 +1510,36 @@ impl DefaultMultipartUsecase {
             None => store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?,
         };
 
-        let result = store
-            .list_multipart_uploads_for_bucket_incarnation(
-                &bucket,
-                &prefix,
-                key_marker,
-                upload_id_marker,
-                delimiter,
-                max_uploads,
-                expected_incarnation_id,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let result = match table_list_access.as_ref() {
+            Some(access) => {
+                table_list_isolation::list_multipart_uploads(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListMultipartUploadsRequest {
+                        bucket: &bucket,
+                        prefix: &prefix,
+                        key_marker: key_marker.as_deref(),
+                        upload_id_marker: upload_id_marker.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        max_uploads,
+                        expected_incarnation_id,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_multipart_uploads_for_bucket_incarnation(
+                    &bucket,
+                    &prefix,
+                    key_marker,
+                    upload_id_marker,
+                    delimiter,
+                    max_uploads,
+                    expected_incarnation_id,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
     }
