@@ -41,6 +41,14 @@ struct DanglingDeleteGraceError {
     grace_secs: i64,
 }
 
+/// Marks a conditional-file write that failed before its publication rename.
+/// Callers may choose another owner only while this marker is preserved; every
+/// unmarked error remains commit-ambiguous and must fail closed.
+#[derive(Debug)]
+struct ConditionalFileNotCommittedError {
+    source: io::Error,
+}
+
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
@@ -220,6 +228,18 @@ impl std::fmt::Display for DanglingDeleteGraceError {
 
 impl StdError for DanglingDeleteGraceError {}
 
+impl std::fmt::Display for ConditionalFileNotCommittedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for ConditionalFileNotCommittedError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
     if error.is_remote_file_not_found() {
         return Some(DiskError::FileNotFound);
@@ -291,6 +311,22 @@ impl DiskError {
             retry_after_secs,
             grace_secs,
         })
+    }
+
+    pub(crate) fn conditional_file_not_committed(source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), ConditionalFileNotCommittedError { source })
+    }
+
+    /// Whether a local conditional-file replacement failed before the target
+    /// publication rename and therefore cannot have committed new owner bytes.
+    pub fn is_conditional_file_not_committed(&self) -> bool {
+        matches!(
+            self,
+            DiskError::Io(io_error)
+                if io_error
+                    .get_ref()
+                    .is_some_and(|source| source.downcast_ref::<ConditionalFileNotCommittedError>().is_some())
+        )
     }
 
     pub fn is_dangling_delete_grace(&self) -> bool {
@@ -627,6 +663,9 @@ impl From<tokio::task::JoinError> for DiskError {
 impl Clone for DiskError {
     fn clone(&self) -> Self {
         match self {
+            DiskError::Io(io_error) if self.is_conditional_file_not_committed() => DiskError::Io(
+                DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
+            ),
             DiskError::Io(io_error) => DiskError::Io(
                 rustfs_rio::clone_internode_http_io_error(io_error)
                     .and_then(std::io::Error::into_inner)
@@ -819,6 +858,21 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn conditional_file_not_committed_marker_is_explicit_and_clone_safe() {
+        let marked = DiskError::from(DiskError::conditional_file_not_committed(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "staging rejected",
+        )));
+        assert!(marked.is_conditional_file_not_committed());
+        assert!(marked.clone().is_conditional_file_not_committed());
+        assert!(!DiskError::Timeout.is_conditional_file_not_committed());
+        assert!(
+            !DiskError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "rename rejected"))
+                .is_conditional_file_not_committed()
+        );
+    }
 
     #[test]
     fn terminal_read_error_preserves_kind_and_disk_classification() {

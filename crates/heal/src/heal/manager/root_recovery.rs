@@ -520,32 +520,50 @@ impl RootHealRecovery {
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let existing = Self::find(&disks, &request.id).await?;
-        let (disk, expected) = match existing {
-            Some((disk, bytes)) => (disk, Some(bytes)),
-            None => {
-                let disk = disks
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| Error::Other("No local disk available for root heal shutdown recovery".to_string()))?;
-                (disk, None)
-            }
-        };
         if request.options.no_lock {
             return Err(Error::Other("Administrator root heal cannot skip namespace locking".to_string()));
         }
         let bytes = serde_json::to_vec(&RootHealIntent::from_request(request))
             .map_err(|error| Error::Other(format!("Serialize root heal recovery record: {error}")))?;
-        match EcstoreDiskAPI::compare_and_update_file(
-            disk.as_ref(),
-            RUSTFS_META_BUCKET,
-            &intent_path(&request.id)?,
-            expected,
-            Some(bytes.into()),
-        )
-        .await?
-        {
-            EcstoreConditionalFileUpdate::Updated => Ok(()),
-            _ => Err(Error::Other(format!("Root heal recovery record changed for {}", request.id))),
+        let path = intent_path(&request.id)?;
+        if let Some((disk, expected)) = existing {
+            return match EcstoreDiskAPI::compare_and_update_file(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                &path,
+                Some(expected),
+                Some(bytes.into()),
+            )
+            .await?
+            {
+                EcstoreConditionalFileUpdate::Updated => Ok(()),
+                _ => Err(Error::Other(format!("Root heal recovery record changed for {}", request.id))),
+            };
+        }
+
+        if disks.is_empty() {
+            return Err(Error::Other("No local disk available for root heal shutdown recovery".to_string()));
+        }
+        let mut last_not_committed = None;
+        for disk in &disks {
+            match EcstoreDiskAPI::compare_and_update_file(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                &path,
+                None,
+                Some(bytes.clone().into()),
+            )
+            .await
+            {
+                Ok(EcstoreConditionalFileUpdate::Updated) => return Ok(()),
+                Ok(_) => return Err(Error::Other(format!("Root heal recovery record changed for {}", request.id))),
+                Err(error) if error.is_conditional_file_not_committed() => last_not_committed = Some(error),
+                Err(error) => return Err(Error::Disk(error)),
+            }
+        }
+        match last_not_committed {
+            Some(error) => Err(Error::Disk(error)),
+            None => Err(Error::Other("No local disk accepted the root heal recovery record".to_string())),
         }
     }
 
