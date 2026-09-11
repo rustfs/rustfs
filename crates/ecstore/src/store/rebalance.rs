@@ -677,6 +677,34 @@ impl ECStore {
             }
         }
 
+        if require_all_pool_reads {
+            let suspended_pools = {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            };
+            let candidates = ress
+                .iter()
+                .map(|pinfo| LatestObjectInfoCandidate {
+                    info: pinfo.err.is_none().then(|| pinfo.object_info.clone()),
+                    idx: pinfo.index,
+                    err: pinfo.err.clone(),
+                })
+                .collect();
+            let (object_info, index) =
+                resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+            let pools_with_object = self.pools_with_object(&ress, opts).await;
+            return Ok((
+                PoolObjInfo {
+                    index,
+                    object_info,
+                    err: None,
+                },
+                pools_with_object,
+            ));
+        }
+
         ress.sort_by(|a, b| {
             let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
             let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);

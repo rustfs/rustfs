@@ -779,7 +779,7 @@ fn free_version_physical_topology_generation(api: &ECStore) -> String {
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+pub(crate) fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
     if candidate.transitioned_object.tier != expected.transitioned_object.tier
         || candidate.transitioned_object.name != expected.transitioned_object.name
     {

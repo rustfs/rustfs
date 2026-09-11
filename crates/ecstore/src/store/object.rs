@@ -4965,6 +4965,17 @@ impl ECStore {
             }
         };
 
+        if creates_latest_marker && self.is_suspended(pinfo.index).await {
+            let has_active_reservation = self
+                .pool_meta
+                .read()
+                .await
+                .has_active_decommission_capacity_reservation(pinfo.index);
+            if has_active_reservation {
+                pinfo.index = self.get_pool_idx_no_lock(bucket, object, 0).await?;
+            }
+        }
+
         if pinfo.object_info.delete_marker && opts.version_id.is_none() && !creates_latest_marker {
             pinfo.object_info.name = decode_dir_object(object);
             return Ok(pinfo.object_info);

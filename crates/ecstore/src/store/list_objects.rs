@@ -20,6 +20,7 @@ fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
     err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
 }
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_matches;
 use crate::bucket::metadata_sys::{
     get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
 };
@@ -5118,6 +5119,30 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
             }
         }
     }
+    let mut live_remote_references = HashMap::<String, HashMap<String, Vec<ObjectInfo>>>::new();
+    for (_, info) in versions.values() {
+        if !info.transitioned_object.free_version && info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE {
+            live_remote_references
+                .entry(info.transitioned_object.tier.clone())
+                .or_default()
+                .entry(info.transitioned_object.name.clone())
+                .or_default()
+                .push(info.clone());
+        }
+    }
+    // Keep cleanup durable in its source xl.meta, but do not expose it to a
+    // merged recovery walk while another physical pool still owns the tuple.
+    versions.retain(|_, (_, info)| {
+        !info.transitioned_object.free_version
+            || !live_remote_references
+                .get(info.transitioned_object.tier.as_str())
+                .and_then(|by_name| by_name.get(info.transitioned_object.name.as_str()))
+                .is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|live| free_version_remote_tuple_matches(info, live).unwrap_or(false))
+                })
+    });
     let mut merged = FileMeta::new();
     merged.versions = versions.into_values().map(|(version, _)| version).collect();
     merged.versions.sort_by(|a, b| {
@@ -7429,6 +7454,47 @@ mod test {
 
         MetaCacheEntry {
             name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_transitioned_meta_entry(name: &str, remote_object: &str, delete_source: bool) -> MetaCacheEntry {
+        let mut source = FileInfo::new(name, 2, 2);
+        source.volume = "bucket".to_string();
+        source.name = name.to_string();
+        source.version_id = Some(Uuid::from_u128(1));
+        source.versioned = true;
+        source.size = 1;
+        source.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        source.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        source.transition_tier = "WARM".to_string();
+        source.transitioned_objname = remote_object.to_string();
+        source.transition_version = Some("remote-version".to_string());
+        source.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "00".repeat(32),
+        );
+
+        let mut meta = FileMeta::new();
+        meta.add_version(source.clone())
+            .expect("test metadata should accept transitioned source");
+        if delete_source {
+            let mut delete = FileInfo {
+                name: name.to_string(),
+                version_id: source.version_id,
+                ..Default::default()
+            };
+            delete.set_tier_free_version_id(&Uuid::from_u128(2).to_string());
+            meta.delete_version(&delete)
+                .expect("transitioned delete should create a free-version owner");
+        }
+        let metadata = meta.marshal_msg().expect("test transitioned metadata should marshal");
+        MetaCacheEntry {
+            name: name.to_string(),
             metadata,
             cached: Some(meta),
             reusable: false,
@@ -10636,6 +10702,32 @@ mod test {
         let versions = forward.file_info_versions("bucket").expect("merged metadata should decode");
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].metadata.get("etag").map(String::as_str), Some("same-etag"));
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_defers_free_version_while_same_remote_source_is_live() {
+        let live = test_transitioned_meta_entry("key", "remote/shared", false);
+        let free = test_transitioned_meta_entry("key", "remote/shared", true);
+        for inputs in [vec![live.clone(), free.clone()], vec![free.clone(), live.clone()]] {
+            let merged = merge_test_object_entries(inputs)
+                .await
+                .expect("same remote source and cleanup owner should merge");
+            let versions = merged
+                .file_info_versions_with_free_versions("bucket")
+                .expect("merged transition history should decode");
+            assert_eq!(versions.versions.len(), 1);
+            assert!(versions.free_versions.is_empty(), "a live remote reference must defer cleanup discovery");
+        }
+
+        let unrelated = test_transitioned_meta_entry("key", "remote/other", false);
+        let merged = merge_test_object_entries(vec![free, unrelated])
+            .await
+            .expect("unrelated remote references should merge");
+        let versions = merged
+            .file_info_versions_with_free_versions("bucket")
+            .expect("merged transition history should decode");
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.free_versions.len(), 1, "an unrelated source must not suppress cleanup");
     }
 
     #[tokio::test]
