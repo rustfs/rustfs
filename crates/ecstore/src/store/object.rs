@@ -8656,8 +8656,10 @@ mod tests {
         assert_eq!(err, StorageError::SlowDown);
         *store.pool_meta.write().await = PoolMeta::default();
 
-        let mut rebalancing = crate::services::rebalance::RebalanceStats::default();
-        rebalancing.participating = true;
+        let mut rebalancing = crate::services::rebalance::RebalanceStats {
+            participating: true,
+            ..Default::default()
+        };
         rebalancing.info.status = crate::services::rebalance::RebalStatus::Started;
         *store.rebalance_meta.write().await = Some(crate::services::rebalance::RebalanceMeta {
             pool_stats: vec![crate::services::rebalance::RebalanceStats::default(), rebalancing],
