@@ -2013,7 +2013,7 @@ fn effective_object_actual_size(info: &ObjectInfo) -> Option<i64> {
     info.get_actual_size().ok()
 }
 
-fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+pub(super) fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &ObjectInfo) -> bool {
     is_data_movement_delete_marker(source)
         && is_data_movement_delete_marker(target)
         && source.version_id == target.version_id
@@ -4791,7 +4791,13 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let gopts = delete_pool_lookup_opts(&opts, true);
+        let creates_latest_marker = should_create_delete_marker_for_missing_object(&opts);
+        let mut gopts = delete_pool_lookup_opts(&opts, true);
+        if creates_latest_marker {
+            // An unwritable source still owns its current version. Hiding it
+            // during lookup would turn a rejected write into a new-pool marker.
+            gopts.skip_rebalancing = false;
+        }
 
         if opts.data_movement {
             let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
@@ -4917,7 +4923,12 @@ impl ECStore {
         }
 
         // Determine which pool contains it
-        let (mut pinfo, errs) = match self.get_pool_info_existing_with_opts(bucket, object, &gopts).await {
+        let existing_pool_info = if creates_latest_marker {
+            self.get_pool_info_for_delete_marker(bucket, object, &gopts).await
+        } else {
+            self.get_pool_info_existing_with_opts(bucket, object, &gopts).await
+        };
+        let (mut pinfo, errs) = match existing_pool_info {
             Ok(res) => res,
             Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
             Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
@@ -4954,7 +4965,18 @@ impl ECStore {
             }
         };
 
-        if pinfo.object_info.delete_marker && opts.version_id.is_none() {
+        if creates_latest_marker && self.is_suspended(pinfo.index).await {
+            let has_active_reservation = self
+                .pool_meta
+                .read()
+                .await
+                .has_active_decommission_capacity_reservation(pinfo.index);
+            if has_active_reservation {
+                pinfo.index = self.get_pool_idx_no_lock(bucket, object, 0).await?;
+            }
+        }
+
+        if pinfo.object_info.delete_marker && opts.version_id.is_none() && !creates_latest_marker {
             pinfo.object_info.name = decode_dir_object(object);
             return Ok(pinfo.object_info);
         }
@@ -4976,7 +4998,13 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
+            if creates_latest_marker && pool.pool_idx != pinfo.index {
+                continue;
+            }
             if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+                if creates_latest_marker {
+                    return Err(StorageError::SlowDown);
+                }
                 continue;
             }
 
@@ -5001,7 +5029,7 @@ impl ECStore {
                     return Ok(obj);
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    if creates_latest_marker || (!is_err_object_not_found(&err) && !is_err_version_not_found(&err)) {
                         return Err(err);
                     }
                 }
@@ -8289,6 +8317,546 @@ mod tests {
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    async fn multipool_version_test_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (mut dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        dirs.extend(second_dirs);
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first_set, second_set], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        store
+            .handle_make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket in both pools");
+        (dirs, store)
+    }
+
+    #[tokio::test]
+    async fn multipool_delete_marker_stays_with_existing_versions() {
+        let bucket = "multipool-marker-routing";
+        let object = "history.bin";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+
+        let mut expected_versions = Vec::new();
+        for value in 1..=3_u8 {
+            let written = store.pools[1]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![value; 4097]),
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: HashMap::from([
+                            (rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), format!("generation={value}")),
+                            ("x-amz-meta-generation".to_string(), value.to_string()),
+                        ]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write a historical version deterministically to pool 1");
+            expected_versions.push(written.version_id.expect("versioned PUT must acknowledge a UUID"));
+        }
+        let marker = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete the current version");
+        assert!(marker.delete_marker);
+        let marker_id = marker.version_id.expect("DELETE must acknowledge a marker UUID");
+        assert!(!expected_versions.contains(&marker_id));
+
+        let local = store.pools[1]
+            .clone()
+            .inner_list_object_versions(bucket, object, None, None, None, 10)
+            .await
+            .expect("list the object-owning pool");
+        assert_eq!(local.objects.len(), 4, "the marker must be committed beside the three existing versions");
+        assert_eq!(local.objects[0].version_id, Some(marker_id));
+        assert!(local.objects[0].delete_marker && local.objects[0].is_latest);
+        let versions = store
+            .clone()
+            .inner_list_object_versions(bucket, object, None, None, None, 10)
+            .await
+            .expect("list all pools");
+        assert_eq!(versions.objects.len(), 4);
+        assert_eq!(versions.objects.iter().filter(|version| version.is_latest).count(), 1);
+        for (index, version_id) in expected_versions.iter().copied().enumerate() {
+            assert!(
+                versions
+                    .objects
+                    .iter()
+                    .any(|version| version.version_id == Some(version_id) && !version.is_latest)
+            );
+            let mut reader = store
+                .handle_get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("historical version should remain readable");
+            let mut payload = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut payload)
+                .await
+                .expect("read all historical bytes");
+            let value = u8::try_from(index + 1).expect("fixture generation fits u8");
+            assert_eq!(payload, vec![value; 4097]);
+            let listed = versions
+                .objects
+                .iter()
+                .find(|version| version.version_id == Some(version_id))
+                .expect("listed historical version");
+            assert_eq!(listed.user_tags.as_str(), format!("generation={value}"));
+            assert_eq!(listed.user_defined.get("x-amz-meta-generation"), Some(&value.to_string()));
+        }
+
+        let repeated = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("repeat simple DELETE");
+        assert!(repeated.delete_marker);
+        assert_ne!(
+            repeated.version_id,
+            Some(marker_id),
+            "each enabled-versioning DELETE creates a new marker"
+        );
+        store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: repeated.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove the newest marker by identity");
+        store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(marker_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove the original marker by identity");
+        let current = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("previous version becomes current");
+        assert_eq!(current.version_id, expected_versions.last().copied());
+        assert!(!current.delete_marker);
+    }
+
+    #[tokio::test]
+    async fn multipool_existing_split_history_lists_and_paginates_without_metadata_writes() {
+        for marker_pool in 0..2 {
+            let bucket = format!("multipool-split-history-{marker_pool}");
+            let object = "history.bin";
+            let (dirs, store) = multipool_version_test_store(&bucket).await;
+            let mut expected = Vec::new();
+            for value in 1..=3_u8 {
+                let version = store.pools[1 - marker_pool]
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![value; 4097]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed history through the owning pool's normal write path");
+                expected.push(version.version_id);
+            }
+            let marker = store.pools[marker_pool]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("reproduce the previously committed split marker with a normal pool DELETE");
+            assert!(marker.delete_marker);
+            expected.push(marker.version_id);
+            expected.reverse();
+            let mut before = Vec::new();
+            for dir in &dirs {
+                before.push(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join("xl.meta"))
+                        .await
+                        .expect("snapshot persisted version metadata"),
+                );
+            }
+            for max_keys in [1, 2, 4, 10] {
+                let mut key_marker = None;
+                let mut version_marker = None;
+                let mut listed = Vec::new();
+                let mut completed = false;
+                for _ in 0..6 {
+                    let page = store
+                        .clone()
+                        .inner_list_object_versions(&bucket, object, key_marker.clone(), version_marker.clone(), None, max_keys)
+                        .await
+                        .expect("read a complete merged version page");
+                    listed.extend(page.objects);
+                    if !page.is_truncated {
+                        completed = true;
+                        break;
+                    }
+                    assert_ne!(
+                        (&page.next_marker, &page.next_version_idmarker),
+                        (&key_marker, &version_marker),
+                        "version cursor must advance"
+                    );
+                    key_marker = page.next_marker;
+                    version_marker = page.next_version_idmarker;
+                }
+                assert!(completed, "pagination must terminate");
+                assert_eq!(listed.iter().map(|version| version.version_id).collect::<Vec<_>>(), expected);
+                assert!(listed[0].delete_marker && listed[0].is_latest);
+                assert!(listed[1..].iter().all(|version| !version.delete_marker && !version.is_latest));
+            }
+            let visible = store
+                .clone()
+                .list_objects_generic(&bucket, "", None, None, 10, false)
+                .await
+                .expect("list current objects");
+            assert!(visible.objects.is_empty(), "the global current marker hides the object");
+            for (dir, before) in dirs.iter().zip(before) {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join("xl.meta"))
+                        .await
+                        .expect("read unchanged metadata"),
+                    before
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipool_conflicting_version_metadata_fails_the_listing_request() {
+        let bucket = "multipool-version-conflict";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        store.pools[0]
+            .put_object(
+                bucket,
+                "a.bin",
+                &mut PutObjReader::from_vec(b"preceding result".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed an entry before the conflict");
+        let version_id = Uuid::new_v4();
+        let mod_time = OffsetDateTime::now_utc();
+        let mut etags = Vec::new();
+        for (pool_idx, value) in [(0, 1), (1, 2)] {
+            let written = store.pools[pool_idx]
+                .put_object(
+                    bucket,
+                    "z.bin",
+                    &mut PutObjReader::from_vec(vec![value; 4097]),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        mod_time: Some(mod_time),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("persist independent conflicting copies");
+            assert_eq!(written.version_id, Some(version_id));
+            etags.push(written.etag);
+        }
+        assert_ne!(etags[0], etags[1], "fixture must contain a semantic conflict");
+        let err = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 10)
+            .await
+            .expect_err("partial output must not hide the merge error");
+        assert_eq!(err, StorageError::FileCorrupt);
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let walk = store
+            .clone()
+            .walk(cancellation.clone(), bucket, "", sender, WalkOptions::default());
+        let drain = async { while receiver.recv().await.is_some() {} };
+        let (walk_result, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(walk, drain) })
+            .await
+            .expect("bounded walk output must drain and terminate on a merge error");
+        assert_eq!(
+            walk_result.expect_err("walk must report the same metadata conflict"),
+            StorageError::FileCorrupt
+        );
+        assert!(!cancellation.is_cancelled(), "worker failure must not cancel the caller's request");
+    }
+
+    #[tokio::test]
+    async fn multipool_marker_rejects_unwritable_owner_without_falling_back() {
+        let bucket = "multipool-unwritable-owner";
+        let object = "history.bin";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        store.pools[1]
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![1; 4097]),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed the nonzero owner");
+        *store.pool_meta.write().await = PoolMeta {
+            pools: vec![prepared_pool_test_status(0, false), prepared_pool_test_status(1, true)],
+            ..Default::default()
+        };
+        let err = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("suspended owner must reject marker creation");
+        assert_eq!(err, StorageError::SlowDown);
+        *store.pool_meta.write().await = PoolMeta::default();
+
+        let mut rebalancing = crate::services::rebalance::RebalanceStats {
+            participating: true,
+            ..Default::default()
+        };
+        rebalancing.info.status = crate::services::rebalance::RebalStatus::Started;
+        *store.rebalance_meta.write().await = Some(crate::services::rebalance::RebalanceMeta {
+            pool_stats: vec![crate::services::rebalance::RebalanceStats::default(), rebalancing],
+            ..Default::default()
+        });
+        let error = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        *store.rebalance_meta.write().await = None;
+        assert_eq!(
+            error.expect_err("rebalance must not hide the owner during marker lookup"),
+            StorageError::SlowDown
+        );
+
+        // Isolate object quorum from the bucket metadata preflight: disabling
+        // a whole pool can otherwise fail before object ownership is looked up.
+        let quorum_bucket = RUSTFS_META_BUCKET;
+        store.pools[1]
+            .put_object(
+                quorum_bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![1; 4097]),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed the object-quorum fixture");
+        for pool in &store.pools {
+            pool.put_object(
+                quorum_bucket,
+                "split.bin",
+                &mut PutObjReader::from_vec(vec![2; 4097]),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed another key with history in both pools");
+        }
+
+        let owner = &store.pools[1].disk_set[0];
+        let healthy = owner.disks.read().await.clone();
+        for disk in owner.disks.write().await.iter_mut().skip(1) {
+            *disk = None;
+        }
+        let error = store
+            .delete_object(
+                quorum_bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let split_error = store
+            .delete_object(
+                quorum_bucket,
+                "split.bin",
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        *owner.disks.write().await = healthy;
+        assert_eq!(
+            error.expect_err("subquorum owner must not become a new-pool marker"),
+            StorageError::ErasureWriteQuorum
+        );
+        assert_eq!(
+            split_error.expect_err("a readable older pool does not prove the global current version"),
+            StorageError::ErasureWriteQuorum
+        );
+        let split = store.pools[0]
+            .clone()
+            .inner_list_object_versions(quorum_bucket, "split.bin", None, None, None, 10)
+            .await
+            .expect("inspect the readable older pool");
+        assert_eq!(split.objects.len(), 1);
+        assert!(!split.objects[0].delete_marker);
+        let other = store.pools[0]
+            .clone()
+            .inner_list_object_versions(quorum_bucket, object, None, None, None, 10)
+            .await
+            .expect("inspect the other pool");
+        assert!(other.objects.is_empty());
+        let history = store.pools[1]
+            .clone()
+            .inner_list_object_versions(quorum_bucket, object, None, None, None, 10)
+            .await
+            .expect("inspect the restored owner");
+        assert_eq!(history.objects.len(), 1);
+        assert!(!history.objects[0].delete_marker);
+    }
+
+    #[tokio::test]
+    async fn multipool_suspended_and_batch_markers_keep_the_null_slot_on_the_owner() {
+        let bucket = "multipool-suspended-markers";
+        let object = "history.bin";
+        let (_dirs, store) = multipool_version_test_store(bucket).await;
+        let original = store.pools[1]
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![1; 4097]),
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed the UUID history in pool 1");
+        store
+            .update_bucket_metadata_config(
+                bucket,
+                crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("persist suspended bucket versioning");
+        let null = store
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![2; 4097]),
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the null version beside the history");
+        assert!(null.version_id.is_none_or(|id| id.is_nil()));
+        for _ in 0..2 {
+            let marker = store
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        version_suspended: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("replace the null slot with a marker");
+            assert!(marker.delete_marker);
+            assert!(marker.version_id.is_none_or(|id| id.is_nil()));
+        }
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "batch DELETE should succeed: {errors:?}");
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].delete_marker);
+        let versions = store.pools[1]
+            .clone()
+            .inner_list_object_versions(bucket, object, None, None, None, 10)
+            .await
+            .expect("inspect the owner after batch DELETE");
+        assert_eq!(versions.objects.len(), 2, "only one null marker and the UUID history remain");
+        assert!(versions.objects[0].delete_marker && versions.objects[0].is_latest);
+        assert_eq!(versions.objects[1].version_id, original.version_id);
+        let other = store.pools[0]
+            .clone()
+            .inner_list_object_versions(bucket, object, None, None, None, 10)
+            .await
+            .expect("inspect the unused pool");
+        assert!(other.objects.is_empty());
     }
 
     async fn assert_prepared_reader_blocks_writer(store: &ECStore, bucket: &str, object: &str) {

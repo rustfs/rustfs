@@ -7470,6 +7470,20 @@ impl PoolMeta {
             .is_some_and(is_decommission_suspended)
     }
 
+    pub(crate) fn has_active_decommission_capacity_reservation(&self, idx: usize) -> bool {
+        self.pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| {
+                info.has_decommission_state()
+                    && is_decommission_active(info.complete, info.failed, info.canceled)
+                    && info
+                        .capacity_reservation
+                        .as_ref()
+                        .is_some_and(DecommissionCapacityReservation::active)
+            })
+    }
+
     pub(crate) fn scanner_pause_backlog_pool_writable(&self, idx: usize) -> bool {
         self.pools.get(idx).is_some_and(|pool| {
             !pool
