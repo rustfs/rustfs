@@ -113,6 +113,7 @@ async fn vault_transit_approle_auth_live() -> rustfs_kms::Result<()> {
         BackendConfig::VaultTransit(vault) => vault,
         _ => panic!("expected Vault Transit configuration"),
     };
+    assert_eq!(transit.mount_path, "transit");
     assert_eq!(transit.metadata_kv_mount, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT);
     assert_eq!(transit.metadata_key_prefix, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX);
 
@@ -122,12 +123,13 @@ async fn vault_transit_approle_auth_live() -> rustfs_kms::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a real Vault AppRole; run scripts/test/vault_approle_kms_live.sh"]
-async fn vault_transit_approle_custom_metadata_location_live() -> rustfs_kms::Result<()> {
+async fn vault_transit_approle_custom_paths_live() -> rustfs_kms::Result<()> {
     let config = KmsConfig::from_env()?;
     assert_approle_config(&config, KmsBackend::VaultTransit);
     let BackendConfig::VaultTransit(transit) = &config.backend_config else {
         panic!("expected Vault Transit configuration");
     };
+    assert_eq!(transit.mount_path, "kms-test/transit");
     assert_eq!(transit.metadata_kv_mount, "kms-test/metadata");
     assert_eq!(transit.metadata_key_prefix, "custom/transit-metadata");
 
