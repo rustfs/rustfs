@@ -15587,12 +15587,17 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
+                let metadata_absent = match store.pools[0]
                     .get_disks_by_key(versioned_causal)
                     .load_file_info_versions_exact(bucket, versioned_causal)
                     .await
-                    .expect("versioned causal batch cleanup metadata should remain readable")
-                    .is_none();
+                {
+                    Ok(metadata) => metadata.is_none(),
+                    // The cleanup worker removes the per-disk copies concurrently,
+                    // so an unlocked poll may briefly see fewer than a read quorum.
+                    Err(StorageError::InsufficientReadQuorum(_, _)) => false,
+                    Err(error) => panic!("versioned causal batch cleanup metadata should remain readable: {error:?}"),
+                };
                 if metadata_absent && backend.remove_versions().await.len() == 3 {
                     return;
                 }
