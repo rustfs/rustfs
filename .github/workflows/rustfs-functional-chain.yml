@@ -14,7 +14,7 @@
 
 # Functional chain driver: runs the ten functional suites in a fixed order
 # (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security ->
-# replication -> performance). Each suite attempts the next handoff even
+# replication -> fault-tolerance -> performance). Each suite attempts the next handoff even
 # when its tests fail.
 #
 # Each suite workflow can still be dispatched standalone (workflow_dispatch);

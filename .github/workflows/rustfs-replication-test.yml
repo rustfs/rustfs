@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       rustfs_version:
-        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
+        description: 'RustFS release tag to test. Leave empty for nightly.'
         required: false
-        default: '1.0.0-rc.4-preview.1'
+        default: ''
       package_url:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
@@ -329,7 +329,7 @@ jobs:
             '
           done
 
-      - name: "Continue functional chain (next: Performance)"
+      - name: "Continue functional chain (next: Fault tolerance)"
         if: ${{ always() && github.event_name == 'repository_dispatch' }}
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
@@ -342,9 +342,9 @@ jobs:
           DISPATCHED=0
           for attempt in 1 2 3; do
             if gh api --method POST repos/rustfs/rustfs/dispatches \
-              -f event_type='rustfs-chain-performance' \
+              -f event_type='rustfs-chain-fault-tolerance' \
               -F 'client_payload[from_suite]=replication'; then
-              echo "dispatched next suite Performance (attempt ${attempt})"
+              echo "dispatched next suite Fault tolerance (attempt ${attempt})"
               DISPATCHED=1
               break
             fi
@@ -352,19 +352,19 @@ jobs:
             sleep "${attempt}0"
           done
           if [ "${DISPATCHED:-0}" -ne 1 ]; then
-            echo "ERROR: functional chain stalled: could not dispatch Performance after 3 attempts" >&2
+            echo "ERROR: functional chain stalled: could not dispatch Fault tolerance after 3 attempts" >&2
             TITLE="[functional][chain] stalled after replication (run ${GITHUB_RUN_ID})"
             BODY_FILE="$(mktemp)"
             trap 'rm -f "${BODY_FILE}"' EXIT
             {
-              echo "The functional chain could not hand off from **replication** to **Performance** after 3 attempts."
+              echo "The functional chain could not hand off from **replication** to **Fault tolerance** after 3 attempts."
               echo ""
               echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-              echo "- Expected next event: 'rustfs-chain-performance'"
+              echo "- Expected next event: 'rustfs-chain-fault-tolerance'"
               echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
               echo "- Recovery: re-dispatch manually with"
               FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-performance'"
+              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-fault-tolerance'"
               FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
             } > "${BODY_FILE}"
             gh issue create -R rustfs/backlog --title "${TITLE}" \
