@@ -804,6 +804,20 @@ where
         Ok(Some((entry, etag)))
     }
 
+    async fn table_data_plane_read_version(&self, table_bucket: &str) -> TableCatalogStoreResult<String> {
+        let Some((entry, etag)) = self.table_rename_read_snapshot(table_bucket).await? else {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "object-backed catalog has no entry for table-enabled bucket {table_bucket}"
+            )));
+        };
+        if entry.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table-enabled bucket {table_bucket} has an inactive object-backed catalog entry"
+            )));
+        }
+        Ok(etag)
+    }
+
     async fn finish_table_rename_read(&self, table_bucket: &str, expected_version: Option<&str>) -> TableCatalogStoreResult<()> {
         let object = self.paths.table_bucket_entry_path(table_bucket);
         let current_version =
@@ -5102,16 +5116,7 @@ where
         if table_bucket.is_empty() || object.is_empty() {
             return Ok(None);
         }
-        let Some((table_bucket_entry, read_version)) = self.table_rename_read_snapshot(table_bucket).await? else {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "object-backed catalog has no entry for table-enabled bucket {table_bucket}"
-            )));
-        };
-        if table_bucket_entry.state != TableCatalogEntryState::Active {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "table-enabled bucket {table_bucket} has an inactive object-backed catalog entry"
-            )));
-        }
+        let read_version = self.table_data_plane_read_version(table_bucket).await?;
 
         let resource = if self.warehouse_index_ready(table_bucket).await? {
             match self
@@ -5141,6 +5146,21 @@ where
                 Err(err) => Err(err),
             }
         }?;
+        self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
+        Ok(resource)
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+        let read_version = self.table_data_plane_read_version(table_bucket).await?;
+        let entries = self.list_all_table_entries(table_bucket).await?;
+        let resource = table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)?;
         self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
         Ok(resource)
     }

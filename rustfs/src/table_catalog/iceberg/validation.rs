@@ -281,6 +281,54 @@ where
     store.resolve_table_data_plane_resource(bucket, object).await
 }
 
+fn table_entry_owns_current_metadata_object(entry: &TableEntry, object: &str) -> bool {
+    entry.state == TableCatalogEntryState::Active
+        && table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location).as_deref() == Some(object)
+}
+
+pub(crate) fn table_metadata_data_plane_resource_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a TableEntry>,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+    if bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+        return Ok(None);
+    }
+
+    let mut matched = None;
+    for entry in entries {
+        if entry.table_bucket != bucket {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "metadata ownership scan for {bucket} returned a table from {}",
+                entry.table_bucket
+            )));
+        }
+        if !table_entry_owns_current_metadata_object(entry, object) {
+            continue;
+        }
+        let warehouse_object_prefix = table_warehouse_object_prefix(entry)?;
+        let resource = table_data_plane_resource_from_entry(entry.clone(), warehouse_object_prefix);
+        if matched.is_some() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "reserved metadata object {object} is owned by multiple active tables"
+            )));
+        }
+        matched = Some(resource);
+    }
+    Ok(matched)
+}
+
+pub(crate) async fn table_metadata_data_plane_resource_for_object<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>>
+where
+    S: TableCatalogStore + ?Sized,
+{
+    store.resolve_table_metadata_data_plane_resource(bucket, object).await
+}
+
 pub(crate) async fn scan_table_data_plane_resource_for_object<S>(
     store: &S,
     bucket: &str,
