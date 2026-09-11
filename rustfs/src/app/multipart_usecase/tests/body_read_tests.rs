@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::app::object::request_body::{BodyReadControl, ObservedBody};
+use crate::app::storage_api::s3::Body as S3Body;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::ObjectIO;
 use http_body::Frame;
@@ -59,7 +60,7 @@ fn observed_request(
     });
     let control = BodyReadControl::default();
     let body = ObservedBody::new(http_body_util::StreamBody::new(stream), control.clone());
-    let mut request = part_request(bucket, upload, StreamingBlob::from(s3s::Body::http_body_unsync(body)), size as i64);
+    let mut request = part_request(bucket, upload, StreamingBlob::from(S3Body::http_body_unsync(body)), size as i64);
     request.extensions.insert(control);
     (request, sender, waiting, polls)
 }

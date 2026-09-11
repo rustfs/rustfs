@@ -28,9 +28,9 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
-    pub(crate) use s3s::S3Response;
+    pub(crate) use s3s::auth::SimpleAuth;
     #[cfg(test)]
-    pub(crate) use s3s::dto::ListObjectsInput;
+    pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
@@ -39,7 +39,13 @@ pub(crate) mod s3 {
         ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
     #[cfg(test)]
+    pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    #[cfg(test)]
+    pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
+    #[cfg(test)]
+    pub(crate) use s3s::{Body, S3, S3Response};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
 }
 

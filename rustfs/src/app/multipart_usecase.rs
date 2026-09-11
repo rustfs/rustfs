@@ -394,7 +394,7 @@ fn require_upload_part_size(size: Option<i64>, capped: bool) -> S3Result<i64> {
         Some(size) if size >= 0 => Ok(size),
         Some(_) => Err(s3_error!(UnexpectedContent)),
         None if capped => Err(s3_error!(UnexpectedContent)),
-        None => Err(s3_error!(MissingContentLength)),
+        None => Err(S3Error::new(S3ErrorCode::MissingContentLength)),
     }
 }
 

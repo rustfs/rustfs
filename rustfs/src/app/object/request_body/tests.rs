@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use crate::app::storage_api::s3::{Body as S3Body, S3Error, S3ErrorCode, StreamingBlob};
 use crate::error::ApiError;
 use futures::{StreamExt, poll};
 use http_body_util::StreamBody;
-use s3s::S3ErrorCode;
-use s3s::dto::StreamingBlob;
 use std::io;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -33,7 +32,7 @@ fn raw_reader(timeout: Duration) -> (FrameSender, DynReader, BodyReadControl) {
     let control = BodyReadControl::default();
     control.activate(timeout, "bucket", "object", "request", 65536);
     let body = ObservedBody::new(StreamBody::new(UnboundedReceiverStream::new(receiver)), control.clone());
-    let stream = StreamingBlob::from(s3s::Body::http_body_unsync(body));
+    let stream = StreamingBlob::from(S3Body::http_body_unsync(body));
     let reader = rustfs_rio::wrap_reader(StreamReader::new(stream.map(|item| item.map_err(io::Error::other))));
     (sender, reader, control)
 }
@@ -51,7 +50,7 @@ async fn body_stall_survives_s3s_and_io_wrapping() {
     let error = read.await.expect_err("a body that remains open must time out");
     let api = ApiError::from(error);
     assert_eq!(api.code, S3ErrorCode::RequestTimeout);
-    let s3_error = s3s::S3Error::from(api);
+    let s3_error = S3Error::from(api);
     assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
 }
 

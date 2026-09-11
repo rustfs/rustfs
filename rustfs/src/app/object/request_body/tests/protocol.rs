@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use super::*;
+use crate::app::storage_api::s3::{
+    Body as S3Body, S3, S3Config, S3Error, S3Request, S3Response, S3Result, S3Service, S3ServiceBuilder, SimpleAuth,
+    StaticConfigProvider, UploadPartInput, UploadPartOutput,
+};
 use http_body_util::BodyExt;
-use s3s::config::{S3Config, StaticConfigProvider};
-use s3s::dto::{UploadPartInput, UploadPartOutput};
-use s3s::service::{S3Service, S3ServiceBuilder};
-use s3s::{S3, S3Request, S3Response, S3Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Default)]
@@ -50,7 +50,7 @@ impl S3 for Consumer {
             let count = reader
                 .read(&mut buffer)
                 .await
-                .map_err(|error| s3s::S3Error::from(ApiError::from(error)))?;
+                .map_err(|error| S3Error::from(ApiError::from(error)))?;
             if count == 0 {
                 break;
             }
@@ -68,7 +68,7 @@ impl S3 for Consumer {
 
 fn service(consumer: Consumer) -> S3Service {
     let mut builder = S3ServiceBuilder::new(consumer);
-    builder.set_auth(s3s::auth::SimpleAuth::from_single("test-access", "test-secret"));
+    builder.set_auth(SimpleAuth::from_single("test-access", "test-secret"));
     let mut config = S3Config::default();
     config.presigned_url_max_skew_time_secs = u32::MAX;
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
@@ -76,7 +76,7 @@ fn service(consumer: Consumer) -> S3Service {
 }
 
 struct SignedRequest {
-    request: http::Request<s3s::Body>,
+    request: http::Request<S3Body>,
     sender: FrameSender,
     prefix: Bytes,
     suffix: Bytes,
@@ -147,7 +147,7 @@ fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
     if unsigned_trailer {
         builder = builder.header("x-amz-trailer", "x-amz-checksum-crc32");
     }
-    let mut request = builder.body(s3s::Body::http_body_unsync(body)).expect("signed request");
+    let mut request = builder.body(S3Body::http_body_unsync(body)).expect("signed request");
     request.extensions_mut().insert(control);
     SignedRequest {
         request,
