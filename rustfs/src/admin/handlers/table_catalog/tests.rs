@@ -696,6 +696,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
     for handler in [
         "MaterializeTableCatalogMigrationHandler",
         "CancelTableCatalogMigrationHandler",
+        "BackfillTableWarehouseIndexHandler",
     ] {
         let block = operation_block(&src, handler);
         assert!(
@@ -848,6 +849,7 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
         "GetTableCatalogMigrationHandler",
         "MaterializeTableCatalogMigrationHandler",
         "CancelTableCatalogMigrationHandler",
+        "BackfillTableWarehouseIndexHandler",
         "RestListNamespacesHandler",
         "RestCreateNamespaceHandler",
         "RestGetNamespaceHandler",
