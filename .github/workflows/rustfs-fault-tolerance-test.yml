@@ -1,0 +1,276 @@
+# RustFS Fault-Tolerance (degradation) Test
+#
+# Scenario suite for the 2026-09 degradation report: verifies read/write
+# behavior under drive and node loss against the erasure-coding contract and
+# snapshots health-endpoint responses at every tier.
+#
+#   A  single-node 4 drives (SNMD): hide 1/2/3 drives, restore
+#   B  multi-node 4x1 (one drive per node): stop 1/2/3 nodes, restore
+#   C  multi-node 4x4 (16 drives, EC:4): stop 1 node (read-quorum boundary),
+#      stop 2 nodes, restore
+#   C2 multi-node 4x4 with EC:8: 2 nodes down puts 8 drives online -- reads
+#      satisfy the EC read quorum while the lock majority is broken (the
+#      reported divergence window: reads 503 with lock_quorum_unavailable)
+#
+# Expectations come from product source (default_parity_count, erasure set
+# sizing). By default a "reads refused although the read quorum is met"
+# observation is reported as known-divergence without failing the suite; the
+# strict input turns those into failures once the product behavior changes.
+
+name: RustFS Fault-Tolerance Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: 'Direct .deb URL. Required unless the nightly default is wanted.'
+        required: false
+        type: string
+      strict:
+        description: 'Fail the suite when reads are refused despite a met read quorum'
+        type: boolean
+        default: false
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+  repository_dispatch:
+    # Chain handoff: dispatched when the replication suite finishes, ahead of
+    # the performance suite.
+    types: [rustfs-chain-fault-tolerance]
+
+permissions:
+  contents: read
+
+# The suite stops services and hides drive dirs on the shared fleet; only one
+# functional suite may touch the environment at a time.
+concurrency:
+  group: rustfs-shared-functional-tests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+
+jobs:
+  fault-tolerance-test:
+    runs-on: smoke-testing
+    timeout-minutes: 480
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    steps:
+      - name: Initialize functional evidence
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          FUNCTIONAL_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-ft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${FUNCTIONAL_ARTIFACTS_DIR}" "${FUNCTIONAL_ARTIFACTS_DIR}/evidence"
+          {
+            printf 'FUNCTIONAL_ARTIFACTS_DIR=%s\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'LOG_FILE=%s/suite.log\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'REPORT_FILE=%s/report.md\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'EVIDENCE_DIR=%s/evidence\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+          } >> "${GITHUB_ENV}"
+
+      # auto-testing is private: clone it with the dedicated PF token (not
+      # GITHUB_TOKEN) and retry transient GitHub/network failures.
+      - name: Checkout auto-testing scripts (with retry)
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf auto-testing
+          for attempt in 1 2 3 4 5; do
+            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
+              echo "auto-testing cloned (attempt ${attempt})"
+              exit 0
+            fi
+            rm -rf auto-testing
+            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
+          exit 1
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          aws --version
+          df -h /data | tail -1
+
+      - name: Cleanup environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}"
+
+      - name: Run fault-tolerance scenarios (A, B, C, C2)
+        id: test
+        run: |
+          ARGS=(--all -y --package-url "${{ inputs.package_url || env.RUSTFS_NIGHTLY_PACKAGE_URL }}" --log-file "${LOG_FILE}")
+          if [ "${{ inputs.strict }}" = "true" ]; then
+            ARGS+=(--strict)
+          fi
+          ./auto-testing/rustfs-fault-tolerance-test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# RustFS fault-tolerance test report"
+            echo ""
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Package: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+            echo "- Strict mode: ${{ inputs.strict || 'false' }}"
+            echo ""
+            echo "## Per-probe results"
+            echo ""
+            echo '```'
+            grep -E '^FT-(CASE|SUMMARY|REPORT)' "${LOG_FILE}" || echo "(no FT-CASE lines found)"
+            echo '```'
+            echo ""
+            echo "## Health snapshots"
+            echo ""
+            for f in "${FUNCTIONAL_ARTIFACTS_DIR}"/evidence/*.code; do
+              [ -e "${f}" ] || continue
+              printf '%s -> %s\n' "$(basename "${f}" .code)" "$(cat "${f}")"
+            done
+          } > "${REPORT_FILE}"
+
+      - name: File failure issue in rustfs/backlog
+        if: ${{ failure() && steps.evidence.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          SUITE: fault-tolerance
+          SUITE_LABEL: Fault-Tolerance
+        run: |
+          set -euo pipefail
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          EXISTING="$(gh issue list -R rustfs/backlog \
+            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
+            --json number --jq '.[].number' || true)"
+          if [ -n "${EXISTING}" ]; then
+            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+            exit 0
+          fi
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+          BODY_FILE="$(mktemp)"
+          {
+            echo "The **${SUITE_LABEL}** functional suite failed."
+            echo ""
+            echo "- Suite: \`${SUITE}\`"
+            echo "- Run: ${RUN_URL}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Date: $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "## Report (errors and symptoms)"
+            echo ""
+            if [ -s "${REPORT_FILE:-}" ]; then
+              redact < "${REPORT_FILE}"
+            elif [ -s "${LOG_FILE:-}" ]; then
+              echo "(report file missing; log tail below)"
+              echo ""
+              tail -n 200 "${LOG_FILE}" | redact
+            else
+              echo "(no report or log file was produced)"
+            fi
+          } | head -c 55000 > "${BODY_FILE}"
+          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
+          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test; then
+            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          fi
+          echo "filed backlog issue for suite ${SUITE}"
+
+      - name: Upload test logs & evidence
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/report.md
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/suite.log
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/evidence/
+          if-no-files-found: warn
+
+      - name: Cleanup environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}" || true
+
+      - name: "Continue functional chain (next: Performance)"
+        # Only chain-triggered runs forward to the next suite; standalone
+        # workflow_dispatch runs stop after their own cleanup. A failed
+        # handoff retries, then files an alert issue in rustfs/backlog.
+        if: ${{ always() && github.event_name == 'repository_dispatch' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
+            exit 1
+          fi
+          DISPATCHED=0
+          for attempt in 1 2 3; do
+            if gh api --method POST repos/rustfs/rustfs/dispatches \
+              -f event_type='rustfs-chain-performance' \
+              -F 'client_payload[from_suite]=fault-tolerance'; then
+              echo "dispatched next suite Performance (attempt ${attempt})"
+              DISPATCHED=1
+              break
+            fi
+            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
+            sleep "${attempt}0"
+          done
+          if [ "${DISPATCHED:-0}" -ne 1 ]; then
+            echo "ERROR: functional chain stalled: could not dispatch Performance after 3 attempts" >&2
+            TITLE="[functional][chain] stalled after fault-tolerance (run ${GITHUB_RUN_ID})"
+            BODY_FILE="$(mktemp)"
+            {
+              echo "The functional chain could not hand off from **fault-tolerance** to **Performance** after 3 attempts."
+              echo ""
+              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo "- Expected next event: 'rustfs-chain-performance'"
+              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
+              echo "- Recovery: re-dispatch manually with"
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
+              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-performance'"
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
+            } > "${BODY_FILE}"
+            gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test \
+              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
+              || echo "could not file the stall alert issue either; check the token" >&2
+            exit 1
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS fault-tolerance test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact and FT-CASE lines for details."
