@@ -539,6 +539,13 @@ path = "junit.xml"
 filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'
 
+# The EC8+4 multi-set heal proof deliberately uploads a larger workload so the
+# background root-heal pass can be interrupted after targeting the replacement
+# drive's erasure slots. Keep the extended budget scoped to this proof case.
+[[profile.e2e-nightly.overrides]]
+filter = 'package(e2e_test) & test(=heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart)'
+slow-timeout = { period = "120s", terminate-after = 12, grace-period = "10s" }
+
 # ---------------------------------------------------------------------------
 # e2e-distributed profile — 4-node 4-disk Actions suite
 # ---------------------------------------------------------------------------
