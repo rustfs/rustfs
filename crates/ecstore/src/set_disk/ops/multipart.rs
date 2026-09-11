@@ -5768,6 +5768,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capped_staging_queue_does_not_poll_the_part_reader() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-staging-body-demand";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut options = ObjectOptions::default();
+        insert_str(&mut options.user_defined, "max-total-object-size", "1024".to_owned());
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &options)
+            .await
+            .expect("capped upload");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        let semaphore = capped_multipart_staging_semaphore(&upload_path);
+        let held = Arc::clone(&semaphore).acquire_owned().await.expect("hold staging permit");
+        let owners = Arc::strong_count(&semaphore);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = Arc::clone(&polls);
+        let stream = futures::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(vec![7; 512]))]).inspect(move |_| {
+            body_polls.fetch_add(1, Ordering::Relaxed);
+        });
+        let input = tokio_util::io::StreamReader::new(stream);
+        let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let task = tokio::spawn(async move {
+            set_disks
+                .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&semaphore) == owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("part must reach the actual staging semaphore");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::resume();
+        assert_eq!(polls.load(Ordering::Relaxed), 0, "staging admission must not create read demand");
+        assert!(!task.is_finished());
+        drop(held);
+        let part = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("staging permit released")
+            .expect("part task")
+            .expect("queued part");
+        assert_eq!(part.size, 512);
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        drop(semaphore);
+        remove_capped_multipart_staging_semaphore(&upload_path);
+    }
+
+    #[tokio::test]
     async fn put_object_part_recovers_transaction_with_one_faulty_disk_at_write_quorum() {
         use tokio::io::AsyncReadExt as _;
 
