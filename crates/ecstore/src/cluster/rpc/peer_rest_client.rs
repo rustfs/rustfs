@@ -577,6 +577,26 @@ fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealControlRetryAction {
+    Reconnect,
+    RefreshReplayScope,
+}
+
+fn heal_control_retry_action(
+    err: &Error,
+    reconnect_attempted: bool,
+    replay_scope_refresh_attempted: bool,
+) -> Option<HealControlRetryAction> {
+    if !replay_scope_refresh_attempted && heal_control_auth_may_need_replay_scope_refresh(err) {
+        return Some(HealControlRetryAction::RefreshReplayScope);
+    }
+    if !reconnect_attempted && PeerRestClient::is_network_like_error(err) {
+        return Some(HealControlRetryAction::Reconnect);
+    }
+    None
+}
+
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
     let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(result).map_err(Error::other)?;
     if topology_member != expected_member {
@@ -1753,34 +1773,41 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        let result = self
-            .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-            .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(heal_control_auth_may_need_replay_scope_refresh)
-        {
-            self.prepare_heal_control_auth_retry().await;
-            return self
-                .finalize_result(
-                    self.heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-                        .await,
-                )
+        let mut reconnect_attempted = false;
+        let mut replay_scope_refresh_attempted = false;
+        loop {
+            let result = self
+                .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
                 .await;
+            let Some(action) = result
+                .as_ref()
+                .err()
+                .and_then(|err| heal_control_retry_action(err, reconnect_attempted, replay_scope_refresh_attempted))
+            else {
+                return self.finalize_result(result).await;
+            };
+            match action {
+                HealControlRetryAction::Reconnect => reconnect_attempted = true,
+                HealControlRetryAction::RefreshReplayScope => replay_scope_refresh_attempted = true,
+            }
+            self.prepare_heal_control_retry(action).await;
         }
-        self.finalize_result(result).await
     }
 
-    async fn prepare_heal_control_auth_retry(&self) {
-        if let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host) {
+    async fn prepare_heal_control_retry(&self, action: HealControlRetryAction) {
+        if action == HealControlRetryAction::RefreshReplayScope
+            && let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host)
+        {
             debug!(
                 peer = %self.grid_host,
                 error = %err,
                 "could not clear heal control replay state before retry"
             );
         }
-        self.evict_connection().await;
+        // A restart can leave both the local offline gate and the peer replay
+        // epoch stale. Clear the gate on either recovery step so the next
+        // bounded attempt reaches a fresh channel instead of fast-failing.
+        self.prepare_retry().await;
     }
 
     async fn heal_control_once(
@@ -3865,6 +3892,51 @@ mod tests {
         assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::other(
             "Io error: code: 'Unauthenticated', message: \"No valid auth token\""
         )));
+    }
+
+    #[test]
+    fn heal_control_retry_plan_allows_one_reconnect_and_one_epoch_refresh() {
+        let offline = Error::RemoteClientUnavailable("peer http://127.0.0.1:9000 is temporarily offline".to_string());
+        let stale_epoch = Error::from(tonic::Status::unauthenticated("No valid auth token"));
+
+        assert_eq!(heal_control_retry_action(&offline, false, false), Some(HealControlRetryAction::Reconnect));
+        assert_eq!(heal_control_retry_action(&offline, true, false), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, true, false),
+            Some(HealControlRetryAction::RefreshReplayScope),
+            "a reconnect may expose the restarted peer's stale replay epoch"
+        );
+        assert_eq!(heal_control_retry_action(&stale_epoch, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, false, false),
+            Some(HealControlRetryAction::RefreshReplayScope)
+        );
+        assert_eq!(
+            heal_control_retry_action(&offline, false, true),
+            Some(HealControlRetryAction::Reconnect),
+            "an epoch refresh may be followed by one bounded reconnect"
+        );
+        assert_eq!(heal_control_retry_action(&offline, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&Error::from(tonic::Status::permission_denied("bad signature")), false, false),
+            None,
+            "authorization failures must never be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_control_epoch_refresh_clears_offline_gate() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        client
+            .prepare_heal_control_retry(HealControlRetryAction::RefreshReplayScope)
+            .await;
+
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "epoch refresh must not leave the following attempt behind the offline gate"
+        );
     }
 
     #[test]
