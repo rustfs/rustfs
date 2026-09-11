@@ -70,7 +70,7 @@ use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
@@ -4331,6 +4331,7 @@ impl ECStore {
             "store list_merged started"
         );
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
 
         let mut inputs = Vec::new();
@@ -4346,16 +4347,10 @@ impl ECStore {
             }
         }
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, sender);
 
         let results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
 
         let mut all_at_eof = true;
 
@@ -4422,6 +4417,7 @@ impl ECStore {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -4783,17 +4779,11 @@ impl ECStore {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
@@ -5068,6 +5058,106 @@ async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEn
     }
 }
 
+/// Each input has already been resolved inside its own erasure set. This is a
+/// union of version histories, never a quorum vote between unrelated pools.
+fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
+    let name = first.name.clone();
+    let mut versions: HashMap<(Option<Uuid>, bool), (FileMetaShallowVersion, ObjectInfo)> = HashMap::new();
+    for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
+        let meta = match entry.cached.take() {
+            Some(meta) => meta,
+            None => FileMeta::load(&entry.metadata).map_err(|_| Error::FileCorrupt)?,
+        };
+        if meta.versions.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+        for version in meta.versions {
+            let parsed = version.parse_version_meta().map_err(|_| Error::FileCorrupt)?;
+            if !parsed.valid() || parsed.version_type != version.header.version_type {
+                return Err(Error::FileCorrupt);
+            }
+            let fi = parsed.into_fileinfo("", &name, true).map_err(|_| Error::FileCorrupt)?;
+            let version_id = fi.version_id.filter(|id| !id.is_nil());
+            if version_id != version.header.version_id.filter(|id| !id.is_nil())
+                || fi.mod_time != version.header.mod_time
+                || fi.tier_free_version() != version.header.free_version()
+            {
+                return Err(Error::FileCorrupt);
+            }
+            let info = ObjectInfo::from_file_info(&fi, "", &name, true);
+            let identity = (version_id, version.header.free_version());
+            match versions.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((version, info));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let (previous, previous_info) = slot.get();
+                    // Suspended and unversioned writes replace the one null
+                    // slot. Distinct UUID versions never supersede each other.
+                    if version_id.is_none() && info.mod_time != previous_info.mod_time {
+                        if info.mod_time > previous_info.mod_time {
+                            slot.insert((version, info));
+                        }
+                        continue;
+                    }
+                    let equivalent = if info.delete_marker && previous_info.delete_marker {
+                        super::object::is_equivalent_data_movement_delete_marker(&info, previous_info)
+                    } else {
+                        crate::data_movement::is_equivalent_data_movement_object_identity(&info, previous_info, true, true)
+                    };
+                    if !equivalent {
+                        return Err(Error::FileCorrupt);
+                    }
+                    // Equivalent migrated copies can have different coding or
+                    // data directories. Choose a stable representation without
+                    // making input order part of the S3 version order.
+                    if version.meta < previous.meta {
+                        slot.insert((version, info));
+                    }
+                }
+            }
+        }
+    }
+    let mut merged = FileMeta::new();
+    merged.versions = versions.into_values().map(|(version, _)| version).collect();
+    merged.versions.sort_by(|a, b| {
+        if a.header.sorts_before(&b.header) {
+            std::cmp::Ordering::Less
+        } else if b.header.sorts_before(&a.header) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let metadata = merged.marshal_msg()?;
+    *first = MetaCacheEntry {
+        name,
+        metadata,
+        cached: Some(merged),
+        reusable: true,
+    };
+    Ok(())
+}
+
+/// `rx` is private to the producers. Cancelling it on a merge error must not
+/// cancel the request token, which would suppress that error at the API edge.
+fn spawn_listing_merge(
+    rx: CancellationToken,
+    inputs: Vec<Receiver<MetaCacheEntry>>,
+    sender: Sender<MetaCacheEntry>,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(
+        async move {
+            let result = merge_entry_channels(rx.clone(), inputs, sender, 1).await;
+            if result.is_err() {
+                rx.cancel();
+            }
+            result
+        }
+        .instrument(tracing::Span::current()),
+    )
+}
+
 async fn merge_entry_channels(
     rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
@@ -5133,6 +5223,7 @@ async fn merge_entry_channels(
     // after anything greater has been emitted).
     let mut last_emitted = String::new();
     let mut group: Vec<Box<MergeHead>> = Vec::new();
+    let mut object_entries: Vec<MetaCacheEntry> = Vec::new();
     let mut refill: Vec<usize> = Vec::with_capacity(in_channels.len());
 
     while let Some(Reverse(first)) = heap.pop() {
@@ -5150,7 +5241,7 @@ async fn merge_entry_channels(
         // Resolve the same-name group to one winner (heads arrive in ascending
         // channel order):
         //  - prefix dir vs prefix dir: the first (lowest channel) wins;
-        //  - object vs object: the later channel wins (legacy authority rule);
+        //  - object vs object: merge the independently resolved version stacks;
         //  - object vs prefix dir: same-name means both end with the separator,
         //    i.e. the object is an explicit "directory marker" for the same S3
         //    key — it shadows the prefix dir so the key does not surface as
@@ -5168,9 +5259,25 @@ async fn merge_entry_channels(
                 if dir_winner.is_none() {
                     dir_winner = Some(head);
                 }
+            } else if let Some(winner) = object_winner.as_ref() {
+                // Key-only candidates carry no version metadata and cannot
+                // replace a resolved stack or contribute a quorum vote.
+                if head.entry.is_object() {
+                    if winner.entry.is_object() {
+                        object_entries.push(head.entry);
+                    } else {
+                        object_winner = Some(head);
+                    }
+                }
             } else {
                 object_winner = Some(head);
             }
+        }
+
+        if !object_entries.is_empty()
+            && let Some(winner) = object_winner.as_mut()
+        {
+            merge_object_entry_versions(&mut winner.entry, object_entries.drain(..))?;
         }
 
         if let Some(head) = object_winner.or(dir_winner)
@@ -5605,6 +5712,7 @@ impl Sets {
             "sets list_merged started"
         );
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -5617,16 +5725,10 @@ impl Sets {
             futures.push(async move { set.list_path(rx_clone, opts, send).await });
         }
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                    error!("merge_entry_channels err {:?}", err);
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, sender);
 
         let results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut all_at_eof = true;
         let mut errs = Vec::new();
         for result in results {
@@ -5677,6 +5779,7 @@ impl Sets {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -6007,17 +6110,11 @@ impl Sets {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
@@ -7016,7 +7113,7 @@ mod test {
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
-    use crate::error::StorageError;
+    use crate::error::{Result, StorageError};
     use crate::object_api::ObjectInfo;
     use rustfs_filemeta::{
         FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
@@ -10399,7 +10496,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn merge_entry_channels_documents_candidate_metadata_authority_risk() {
+    async fn merge_entry_channels_preserves_cross_pool_delete_marker_versions() {
         let (tx_a, rx_a) = mpsc::channel(4);
         let (tx_b, rx_b) = mpsc::channel(4);
         let (tx_c, rx_c) = mpsc::channel(4);
@@ -10428,9 +10525,13 @@ mod test {
             .expect("merged entry should be present");
         assert_eq!(merged.name, "obj-a");
         assert!(
-            !merged.is_latest_delete_marker(),
-            "current merge consumes candidate metadata bytes; future index-backed strong modes must live-verify metadata instead"
+            merged.is_latest_delete_marker(),
+            "a newer marker must remain current across independently resolved pools"
         );
+        let versions = merged.file_info_versions("bucket").expect("merged versions should decode");
+        assert_eq!(versions.versions.len(), 2, "retain the historical object and deduplicate the marker");
+        assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+        assert!(!versions.versions[1].deleted && !versions.versions[1].is_latest);
         assert!(
             matches!(timeout(Duration::from_secs(1), out_rx.recv()).await, Ok(None)),
             "merge should not emit a duplicate entry for the same key"
@@ -10440,6 +10541,250 @@ mod test {
             .await
             .expect("merge task should not panic")
             .expect("merge task should succeed");
+    }
+
+    fn rewrite_test_version(mut entry: MetaCacheEntry, change: impl FnOnce(&mut FileMetaVersion)) -> MetaCacheEntry {
+        let meta = entry.cached.as_mut().expect("test metadata should be decoded");
+        assert_eq!(meta.versions.len(), 1);
+        let mut version = meta.versions[0].parse_version_meta().expect("test version should decode");
+        change(&mut version);
+        meta.versions[0] = version.try_into().expect("test version should encode");
+        entry.metadata = meta.marshal_msg().expect("test metadata should encode");
+        entry
+    }
+
+    async fn merge_test_object_entries(entries: Vec<MetaCacheEntry>) -> Result<MetaCacheEntry> {
+        let mut inputs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (sender, receiver) = mpsc::channel(1);
+            sender.send(entry).await.expect("fixture entry should queue");
+            inputs.push(receiver);
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task = tokio::spawn(merge_entry_channels(CancellationToken::new(), inputs, sender, 1));
+        let entry = receiver.recv().await;
+        task.await.expect("merge must not panic")?;
+        Ok(entry.expect("a valid same-key group must produce an entry"))
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_orders_complete_histories_independently_of_pool_order() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let first = test_object_meta_entry_with_erasure_versions("key", &[(time, "first", 4, 2)]);
+        let second = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "second", 4, 2)]),
+            |version| version.object.as_mut().expect("object version").version_id = Some(Uuid::from_u128(2)),
+        );
+        let marker = test_delete_marker_meta_entry("key", time + time::Duration::seconds(1));
+        let inputs = [first, second, marker];
+        let mut expected = None;
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let entry = merge_test_object_entries(order.map(|index| inputs[index].clone()).to_vec())
+                .await
+                .expect("disjoint version chains should merge");
+            let versions = entry.file_info_versions("bucket").expect("merged versions should decode");
+            assert_eq!(versions.versions.len(), 3);
+            assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+            assert!(
+                versions.versions[1..]
+                    .iter()
+                    .all(|version| !version.deleted && !version.is_latest)
+            );
+            assert!(versions.versions.iter().all(|version| version.num_versions == 3));
+            let identities = versions.versions.iter().map(|version| version.version_id).collect::<Vec<_>>();
+            assert!(identities.contains(&Some(Uuid::from_u128(1))));
+            assert!(identities.contains(&Some(Uuid::from_u128(2))));
+            if let Some(expected) = &expected {
+                assert_eq!(&identities, expected, "equal-time versions must have stable pagination order");
+            } else {
+                expected = Some(identities);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_key_only_candidates_do_not_override_version_metadata() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let marker = test_delete_marker_meta_entry("key", time);
+        for entries in [
+            vec![test_meta_entry("key"), marker.clone()],
+            vec![marker.clone(), test_meta_entry("key")],
+        ] {
+            let mut merged = merge_test_object_entries(entries)
+                .await
+                .expect("merge a name with resolved metadata");
+            assert!(merged.is_latest_delete_marker());
+            assert_eq!(merged.file_info_versions("bucket").expect("decode marker").versions.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_accepts_equivalent_migrated_coding_and_data_dirs() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let first = test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 4, 2)]);
+        let second = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 6, 2)]),
+            |version| version.object.as_mut().expect("object version").data_dir = Some(Uuid::from_u128(42)),
+        );
+        let forward = merge_test_object_entries(vec![first.clone(), second.clone()])
+            .await
+            .expect("valid migration copies");
+        let reverse = merge_test_object_entries(vec![second, first])
+            .await
+            .expect("reversed migration copies");
+        assert_eq!(forward.metadata, reverse.metadata, "representation must not depend on channel order");
+        let versions = forward.file_info_versions("bucket").expect("merged metadata should decode");
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].metadata.get("etag").map(String::as_str), Some("same-etag"));
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_rejects_conflicting_version_identity_and_metadata() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let original = test_object_meta_entry_with_erasure_versions("key", &[(time, "original", 4, 2)]);
+        for key in [
+            "etag",
+            "x-amz-tagging",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+        ] {
+            let changed = rewrite_test_version(original.clone(), |version| {
+                version
+                    .object
+                    .as_mut()
+                    .expect("object version")
+                    .meta_user
+                    .insert(key.to_string(), "changed".to_string());
+            });
+            for pair in [[original.clone(), changed.clone()], [changed, original.clone()]] {
+                let err = merge_test_object_entries(pair.to_vec())
+                    .await
+                    .expect_err("conflicting copies must fail");
+                assert_eq!(err, StorageError::FileCorrupt, "conflict in {key} must not become arbitrary metadata");
+            }
+        }
+        let marker = rewrite_test_version(test_delete_marker_meta_entry("key", time), |version| {
+            version.delete_marker.as_mut().expect("delete marker").version_id = Some(Uuid::from_u128(1));
+        });
+        assert_eq!(
+            merge_test_object_entries(vec![original, marker])
+                .await
+                .expect_err("UUID type conflict"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_reconciles_null_overwrite_without_losing_uuid_history() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let history = test_object_meta_entry_with_erasure_versions("key", &[(time, "history", 4, 2)]);
+        let old_null = rewrite_test_version(history.clone(), |version| {
+            version.object.as_mut().expect("null object").version_id = None;
+        });
+        let marker = rewrite_test_version(test_delete_marker_meta_entry("key", time + time::Duration::seconds(1)), |version| {
+            version.delete_marker.as_mut().expect("null marker").version_id = Some(Uuid::nil());
+        });
+        for inputs in [
+            vec![old_null.clone(), marker.clone(), history.clone()],
+            vec![history, marker, old_null],
+        ] {
+            let entry = merge_test_object_entries(inputs)
+                .await
+                .expect("new null slot should replace old null slot");
+            let versions = entry.file_info_versions("bucket").expect("null versions should decode");
+            assert_eq!(versions.versions.len(), 2);
+            assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+            assert!(versions.versions[0].version_id.is_none_or(|id| id.is_nil()));
+            assert_eq!(versions.versions[1].version_id, Some(Uuid::from_u128(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_rejects_corrupt_version_headers_and_empty_stacks() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let original = test_object_meta_entry_with_erasure_versions("key", &[(time, "etag", 4, 2)]);
+        for empty in [false, true] {
+            let mut corrupt = original.clone();
+            let meta = corrupt.cached.as_mut().expect("fixture metadata");
+            if empty {
+                meta.versions.clear();
+            } else {
+                meta.versions[0].header.version_id = Some(Uuid::from_u128(99));
+            }
+            corrupt.metadata = meta.marshal_msg().expect("encode corrupt fixture");
+            assert_eq!(
+                merge_test_object_entries(vec![original.clone(), corrupt])
+                    .await
+                    .expect_err("corrupt candidate must fail"),
+                StorageError::FileCorrupt
+            );
+        }
+        let mut malformed = original.clone();
+        malformed.cached = None;
+        malformed.metadata = vec![0xff];
+        assert_eq!(
+            merge_test_object_entries(vec![original, malformed])
+                .await
+                .expect_err("malformed metadata must fail"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_does_not_combine_subquorum_markers_across_erasure_sets() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let old = test_object_meta_entry_with_erasure_versions("key", &[(time, "history", 4, 2)]);
+        let marked = test_object_with_delete_marker_meta_entry("key", time, time + time::Duration::seconds(1));
+        let mut inputs = Vec::new();
+        for marker_copies in [1, 2] {
+            let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 3, true, 0);
+            let copies = (0..3)
+                .map(|index| Some(if index < marker_copies { marked.clone() } else { old.clone() }))
+                .collect();
+            let entry = resolve_listing_entries(MetaCacheEntries(copies), resolver, false)
+                .expect("each set independently retains its quorum-backed history");
+            inputs.push(entry);
+        }
+        let merged = merge_test_object_entries(inputs).await.expect("merge resolved histories");
+        let versions = merged.file_info_versions("bucket").expect("decode merged history");
+        assert_eq!(
+            versions.versions.len(),
+            1,
+            "three marker copies across two EC domains do not form a quorum"
+        );
+        assert!(!versions.versions[0].deleted);
+    }
+
+    #[tokio::test]
+    async fn listing_merge_preserves_error_after_partial_output_without_cancelling_request() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let (first_tx, first_rx) = mpsc::channel(2);
+        let (second_tx, second_rx) = mpsc::channel(1);
+        first_tx.send(test_meta_entry("a/")).await.expect("queue preceding prefix");
+        first_tx
+            .send(test_object_meta_entry_with_erasure_versions("b", &[(time, "one", 4, 2)]))
+            .await
+            .expect("queue first copy");
+        second_tx
+            .send(test_object_meta_entry_with_erasure_versions("b", &[(time, "two", 4, 2)]))
+            .await
+            .expect("queue conflicting copy");
+        drop(first_tx);
+        drop(second_tx);
+        let request = CancellationToken::new();
+        let workers = request.child_token();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task = super::spawn_listing_merge(workers.clone(), vec![first_rx, second_rx], sender);
+        assert_eq!(receiver.recv().await.expect("preceding result should arrive").name, "a/");
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(
+            task.await
+                .expect("merge task must not panic")
+                .expect_err("conflict must propagate"),
+            StorageError::FileCorrupt
+        );
+        assert!(workers.is_cancelled(), "failed merge must stop the disk producers");
+        assert!(!request.is_cancelled(), "the API must still observe the merge error");
     }
 
     #[tokio::test]
