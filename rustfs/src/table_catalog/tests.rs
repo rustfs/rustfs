@@ -5579,6 +5579,30 @@ async fn object_table_catalog_store_rejects_invalid_table_warehouse_location() {
     ));
 }
 
+#[test]
+fn warehouse_locations_reject_the_reserved_catalog_prefix() {
+    for location in [
+        "s3://analytics/.rustfs-table",
+        "s3://analytics/.rustfs-table/",
+        "s3://analytics/.rustfs-table/warehouses/default",
+    ] {
+        let table_error = validate_table_warehouse_location("analytics", location).unwrap_err();
+        assert!(matches!(
+            table_error,
+            TableCatalogStoreError::Invalid(message) if message.contains("reserved table catalog prefix")
+        ));
+
+        let view_error = validate_view_warehouse_location("analytics", location).unwrap_err();
+        assert!(matches!(
+            view_error,
+            TableCatalogStoreError::Invalid(message) if message.contains("reserved table catalog prefix")
+        ));
+    }
+
+    assert!(validate_table_warehouse_location("analytics", "s3://analytics/.rustfs-table-other/table-id").is_ok());
+    assert!(validate_table_warehouse_location("analytics", "s3://analytics/user/.rustfs-table/table-id").is_ok());
+}
+
 #[tokio::test]
 async fn object_table_catalog_store_rejects_deep_table_warehouse_location() {
     let backend = TestCatalogObjectBackend::default();

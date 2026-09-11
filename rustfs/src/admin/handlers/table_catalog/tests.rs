@@ -10619,6 +10619,10 @@ fn table_credential_scope_rejects_cross_bucket_or_unsafe_prefix() {
     assert!(table_credential_scope(&entry).is_err());
 
     let mut entry = table_entry_for_credentials();
+    entry.warehouse_location = "s3://warehouse/.rustfs-table".to_string();
+    assert!(table_credential_scope(&entry).is_err());
+
+    let mut entry = table_entry_for_credentials();
     entry.metadata_location = "s3://other/.rustfs-table/metadata/00001.metadata.json".to_string();
     assert!(table_credential_scope(&entry).is_err());
 
