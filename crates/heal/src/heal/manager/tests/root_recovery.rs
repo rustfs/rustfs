@@ -17,6 +17,44 @@ use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
 use std::collections::HashSet;
 
+#[cfg(unix)]
+struct RestoreDirectoryMode {
+    path: std::path::PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestoreDirectoryMode {
+    fn read_only(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata directory mode")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).expect("make metadata directory read-only");
+        Self { path, mode }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreDirectoryMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[cfg(unix)]
+fn ordered_recovery_disks(first: DiskStore, second: DiskStore) -> (DiskStore, DiskStore) {
+    if first.endpoint().to_string() <= second.endpoint().to_string() {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 async fn recovery_disk() -> (TempDir, DiskStore) {
     let temp = TempDir::new().expect("temporary root recovery disk");
     let endpoint = Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("disk endpoint");
@@ -76,6 +114,94 @@ fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> Com
         next_seq: 0,
         min_seq: 0,
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_recovery_new_intent_skips_prepublication_read_only_owner() {
+    let (first_temp, first_disk) = recovery_disk().await;
+    let (second_temp, second_disk) = recovery_disk().await;
+    let first_endpoint = first_disk.endpoint().to_string();
+    let (read_only_disk, writable_disk) = ordered_recovery_disks(first_disk, second_disk);
+    let read_only_root = if read_only_disk.endpoint().to_string() == first_endpoint {
+        first_temp.path()
+    } else {
+        second_temp.path()
+    };
+    let _restore = RestoreDirectoryMode::read_only(read_only_root.join(RUSTFS_META_BUCKET));
+    let manager = recovery_manager(vec![read_only_disk.clone(), writable_disk.clone()]);
+    let mut request = admin_request(HealType::Object {
+        bucket: "bucket".to_string(),
+        object: "object".to_string(),
+        version_id: None,
+    });
+
+    let receipt = manager
+        .submit_heal_request_with_receipt(request.clone())
+        .await
+        .expect("a writable local disk should own the admin heal intent");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    let path = format!("root-heal-{}.json", request.id);
+    assert!(matches!(
+        read_only_disk.read_all(RUSTFS_META_BUCKET, &path).await,
+        Err(DiskError::FileNotFound)
+    ));
+    assert!(writable_disk.read_all(RUSTFS_META_BUCKET, &path).await.is_ok());
+
+    request.retry_attempts = 1;
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("an existing fallback owner should remain updateable");
+    let pending = manager.root_recovery.pending().await.expect("read the single durable owner");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, request.id);
+    assert_eq!(pending[0].retry_attempts, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_recovery_existing_owner_never_migrates_after_write_rejection() {
+    let (first_temp, first_disk) = recovery_disk().await;
+    let (second_temp, second_disk) = recovery_disk().await;
+    let first_endpoint = first_disk.endpoint().to_string();
+    let (owner_disk, alternate_disk) = ordered_recovery_disks(first_disk, second_disk);
+    let owner_root = if owner_disk.endpoint().to_string() == first_endpoint {
+        first_temp.path()
+    } else {
+        second_temp.path()
+    };
+    let manager = recovery_manager(vec![owner_disk.clone(), alternate_disk.clone()]);
+    let mut request = root_request();
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("create the canonical owner");
+    let path = format!("root-heal-{}.json", request.id);
+    let committed = owner_disk
+        .read_all(RUSTFS_META_BUCKET, &path)
+        .await
+        .expect("canonical owner bytes");
+    let _restore = RestoreDirectoryMode::read_only(owner_root.join(RUSTFS_META_BUCKET));
+
+    request.retry_attempts = 1;
+    assert!(
+        manager.root_recovery.persist(&request).await.is_err(),
+        "an existing owner write rejection must fail closed"
+    );
+    assert_eq!(
+        owner_disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("original owner remains"),
+        committed
+    );
+    assert!(matches!(
+        alternate_disk.read_all(RUSTFS_META_BUCKET, &path).await,
+        Err(DiskError::FileNotFound)
+    ));
 }
 
 async fn active_root(manager: &HealManager, request: HealRequest) -> Arc<HealTask> {

@@ -8957,7 +8957,8 @@ impl DiskAPI for LocalDisk {
                     .truncate(false)
                     .read(true)
                     .write(true)
-                    .open(&lock_path)?;
+                    .open(&lock_path)
+                    .map_err(DiskError::conditional_file_not_committed)?;
                 flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)?;
                 let result = (|| {
                     let current = match std::fs::read(&file_path) {
@@ -9012,10 +9013,15 @@ impl DiskAPI for LocalDisk {
                                 .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?;
                             let temporary = parent.join(format!(".{}.{}.tmp", path.replace('/', "_"), Uuid::new_v4()));
                             let write_result = (|| -> std::io::Result<()> {
-                                let mut staged = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
-                                staged.write_all(&replacement)?;
+                                let not_committed = DiskError::conditional_file_not_committed;
+                                let mut staged = std::fs::OpenOptions::new()
+                                    .create_new(true)
+                                    .write(true)
+                                    .open(&temporary)
+                                    .map_err(not_committed)?;
+                                staged.write_all(&replacement).map_err(not_committed)?;
                                 if sync_metadata {
-                                    staged.sync_all()?;
+                                    staged.sync_all().map_err(not_committed)?;
                                 }
                                 std::fs::rename(&temporary, &file_path)?;
                                 Ok(())
@@ -22650,6 +22656,10 @@ mod test {
             .await
             .expect_err("directory fsync failure must fail the CAS update");
         assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert!(
+            !err.is_conditional_file_not_committed(),
+            "an error after publication rename must remain commit-ambiguous"
+        );
         assert_eq!(
             disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
                 .await
