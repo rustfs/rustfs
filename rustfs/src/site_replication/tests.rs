@@ -98,9 +98,44 @@ async fn spawn_test_tls_server_with_response(response: &'static [u8]) -> (String
                 break;
             }
         }
-        stream.write_all(response).await.is_ok()
+        // Flush buffered TLS records and send close_notify before dropping the socket.
+        stream.write_all(response).await.is_ok() && stream.shutdown().await.is_ok()
     });
     (endpoint, ca_pem, task)
+}
+
+#[tokio::test]
+async fn tls_test_server_delivers_response_and_closes_cleanly() {
+    use rustls_pki_types::pem::PemObject;
+
+    let (endpoint, ca_pem, server) = spawn_test_tls_server().await;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from_pem_slice(ca_pem.as_bytes()).expect("parse test CA"))
+        .expect("trust test CA");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let socket = tokio::net::TcpStream::connect(endpoint.strip_prefix("https://").expect("TLS endpoint"))
+        .await
+        .expect("connect to TLS test server");
+    let mut stream = connector
+        .connect(rustls_pki_types::ServerName::try_from("127.0.0.1").expect("test server name"), socket)
+        .await
+        .expect("trust TLS test server");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write test request");
+    stream.flush().await.expect("flush test request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("TLS response must finish")
+        .expect("TLS test server must send close_notify before closing");
+    assert!(response.ends_with(b"\r\n\r\nok"));
+    assert!(server.await.expect("TLS test server task"));
 }
 
 #[test]
