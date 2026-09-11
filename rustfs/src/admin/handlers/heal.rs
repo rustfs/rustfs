@@ -17,6 +17,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
@@ -37,7 +38,7 @@ use rustfs_heal_contracts::heal_channel::{
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -75,11 +76,11 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     let mut hip = HealInitParams {
         bucket: percent_decode_str(params.get("bucket").unwrap_or_default())
             .decode_utf8()
-            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "invalid bucket name encoding"))?
+            .map_err(|_| ApiError::invalid_request("invalid bucket name encoding"))?
             .into_owned(),
         obj_prefix: percent_decode_str(params.get("prefix").unwrap_or_default())
             .decode_utf8()
-            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "invalid object name encoding"))?
+            .map_err(|_| ApiError::invalid_request("invalid object name encoding"))?
             .into_owned(),
         ..Default::default()
     };

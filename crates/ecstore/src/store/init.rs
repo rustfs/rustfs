@@ -15721,12 +15721,20 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
-                    .get_disks_by_key(causal)
-                    .load_file_info_versions_exact(bucket, causal)
-                    .await
-                    .expect("causal batch cleanup metadata should remain readable")
-                    .is_none();
+                let metadata_absent = {
+                    // Synchronize with cleanup so the snapshot cannot span per-disk marker removal.
+                    let mut read_opts = ObjectOptions::default();
+                    let _guards = store
+                        .acquire_all_physical_object_read_locks("batch_transitioned_delete_test", bucket, causal, &mut read_opts)
+                        .await
+                        .expect("causal batch cleanup observation should acquire object read locks");
+                    store.pools[0]
+                        .get_disks_by_key(causal)
+                        .load_file_info_versions_exact(bucket, causal)
+                        .await
+                        .expect("causal batch cleanup metadata should remain readable")
+                        .is_none()
+                };
                 if metadata_absent && backend.remove_versions().await.len() >= 2 {
                     return;
                 }
@@ -15805,12 +15813,24 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
-                    .get_disks_by_key(versioned_causal)
-                    .load_file_info_versions_exact(bucket, versioned_causal)
-                    .await
-                    .expect("versioned causal batch cleanup metadata should remain readable")
-                    .is_none();
+                let metadata_absent = {
+                    let mut read_opts = ObjectOptions::default();
+                    let _guards = store
+                        .acquire_all_physical_object_read_locks(
+                            "batch_transitioned_delete_test",
+                            bucket,
+                            versioned_causal,
+                            &mut read_opts,
+                        )
+                        .await
+                        .expect("versioned causal batch cleanup observation should acquire object read locks");
+                    store.pools[0]
+                        .get_disks_by_key(versioned_causal)
+                        .load_file_info_versions_exact(bucket, versioned_causal)
+                        .await
+                        .expect("versioned causal batch cleanup metadata should remain readable")
+                        .is_none()
+                };
                 if metadata_absent && backend.remove_versions().await.len() == 3 {
                     return;
                 }
