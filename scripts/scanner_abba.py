@@ -654,9 +654,12 @@ def collect_live(prepared, request, request_path, adapter):
     if request.get("evidence") == "measured":
         expected_metrics_endpoints = request["release_evidence"]["distributed"]["metrics_endpoints"]
     output = request_path.parent / "telemetry"
+    interval_seconds = 60
+    sample_count = request["duration_seconds"] // interval_seconds + 1
+    collector_timeout_seconds = (sample_count - 1) * interval_seconds + 300
     args = ["bash", str(collector), "--alias", connection["alias"], "--endpoint", connection["endpoint"],
             "--metrics-endpoints", connection["metrics_endpoints"], "--deployment", "distributed",
-            "--samples", str(request["duration_seconds"] // 60 + 1), "--interval-secs", "60",
+            "--samples", str(sample_count), "--interval-secs", str(interval_seconds),
             "--out-dir", str(output)]
     with (request_path.parent / "collector.log").open("wb") as log:
         process = OwnedCommand(args, log)
@@ -664,10 +667,11 @@ def collect_live(prepared, request, request_path, adapter):
             started = time.monotonic()
             result = invoke(adapter, "measure", request_path, request["duration_seconds"] + 300)
             require(time.monotonic() - started >= request["duration_seconds"], "measurement ended before required window")
-            require(process.wait(120) == 0, "scanner collector failed")
+            require(process.wait(collector_timeout_seconds) == 0,
+                    f"scanner collector failed within {collector_timeout_seconds}s timeout")
             require(output.joinpath("scanner-summary.csv").stat().st_size > 0, "missing collector samples")
             samples = list((output / "status").glob("scanner-status.*.json"))
-            require(len(samples) == request["duration_seconds"] // 60 + 1, "missing scanner samples")
+            require(len(samples) == sample_count, "missing scanner samples")
             for sample in samples:
                 status = read_json(sample)
                 require(isinstance(status.get("metrics"), dict) and status["metrics"], "invalid scanner status response")
