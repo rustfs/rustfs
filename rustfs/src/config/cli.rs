@@ -135,6 +135,74 @@ pub enum ConnectCommands {
     Logs(ConnectLogsOpts),
     /// Record, forward, or replay consent-bound telemetry
     Telemetry(ConnectTelemetryOpts),
+    /// Capture a consent-bound local top snapshot
+    Top(ConnectTopOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTopOpts {
+    #[command(subcommand)]
+    pub command: ConnectTopCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectTopCommands {
+    /// Capture API activity when an approved typed source is available
+    Api(ConnectTopCaptureOpts),
+    /// Capture process disk I/O on supported platforms
+    Disk(ConnectTopCaptureOpts),
+    /// Capture lock activity when an approved typed source is available
+    Locks(ConnectTopCaptureOpts),
+    /// Capture internode network traffic
+    Net(ConnectTopCaptureOpts),
+    /// Capture RPC activity when an approved typed source is available
+    Rpc(ConnectTopCaptureOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTopCaptureOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this capture
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Diagnostic run expiry as UTC Unix seconds
+    #[arg(long = "run-expires-at")]
+    pub run_expires_at_unix: i64,
+    /// Monotonic sampling window in milliseconds
+    #[arg(long = "window-millis", default_value_t = 1_000)]
+    pub window_millis: u64,
+    /// Signed export validity in seconds
+    #[arg(long = "export-validity-seconds", default_value_t = 300)]
+    pub export_validity_seconds: u64,
+    /// Confirm this explicit local L3 diagnostic operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
 }
 
 #[derive(Args, Clone)]
@@ -890,6 +958,8 @@ pub enum CommandResult {
     ConnectLogs(ConnectLogsOpts),
     /// Consent-bound local Connect telemetry operation
     ConnectTelemetry(ConnectTelemetryCommands),
+    /// Consent-bound local Connect top operation
+    ConnectTop(ConnectTopCommands),
 }
 
 /// Create default ServerOpts from environment variables

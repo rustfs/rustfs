@@ -59,6 +59,7 @@ pub use cli::{
     ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
     ConnectTelemetryReplayOpts,
 };
+pub use cli::{ConnectTopCaptureOpts, ConnectTopCommands};
 pub use cli::{DiagnoseFormat, DiagnoseOpts};
 pub use cli::{InspectBucketMetaOpts, InspectCommands, InspectOpts};
 pub use cli::{TlsCommands, TlsInspectOpts, TlsOpts};

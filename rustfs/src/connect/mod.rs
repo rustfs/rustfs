@@ -67,6 +67,13 @@ pub use diagnostics::{
     run_local_environment_once, save_signed_drive_export, save_signed_log_export, save_signed_profile_export,
     save_signed_telemetry_export, sign_drive_export, spawn_environment_schedule, validate_drive_limits,
 };
+pub use diagnostics::{
+    LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, NetworkCounterSnapshot, SavedTopExport, SignedTopExport,
+    TOP_CLASSIFICATION, TOP_SCHEMA_VERSION, TopApiData, TopApiOperation, TopCaptureError, TopCaptureLimits, TopCaptureRequest,
+    TopCaptureScope, TopCoverage, TopDiskData, TopLocksData, TopNetData, TopOutcome, TopProvenance, TopReasonCode, TopResult,
+    TopRpcData, capture_top_api, capture_top_disk, capture_top_locks, capture_top_net, capture_top_rpc, evaluate_disk_window,
+    evaluate_network_window, save_signed_top_export, sign_top_export,
+};
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
     EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, collect_environment,
