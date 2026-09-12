@@ -9643,7 +9643,13 @@ mod tests {
         com::save_config(store.pools[1].clone(), &manual_task_path, manual_task_bytes.clone())
             .await
             .expect("target task rewrite should invalidate cached metadata before the quorum check");
-        let target_task_set = store.pools[1].get_disks_by_key(&manual_task_path);
+        let manual_task_record =
+            validate_durable_ilm_record(&manual_task_path, &manual_task_bytes).expect("manual task should validate");
+        let manual_task_receipt_path = store
+            .decommission_durable_ilm_receipt_path_for_test(0, &manual_task_path, &manual_task_record)
+            .await
+            .expect("manual task receipt path should resolve");
+        let target_task_set = store.pools[1].get_disks_by_key(&manual_task_receipt_path);
         let original_target_task_disks = {
             let mut disks = target_task_set.disks.write().await;
             let original = disks.clone();
