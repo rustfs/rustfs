@@ -12,50 +12,165 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Functional chain driver: runs the ten functional suites in a fixed order
-# (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security ->
-# replication -> performance). Each suite attempts the next handoff even
-# when its tests fail.
-#
-# Each suite workflow can still be dispatched standalone (workflow_dispatch);
-# only chain-triggered runs forward to the next suite via repository_dispatch,
-# so a standalone run never drags the rest of the chain behind it.
-#
-# Why not workflow_run chaining: GitHub does not guarantee delivery of
-# workflow_run events (they are fire-and-forget), and the head-SHA filter made
-# newly added suites (storage) unable to trigger at all. Explicit
-# repository_dispatch handoffs are verifiable and re-drivable.
-
+# Reusable workflows run from this driver's commit in one Actions run. Each
+# suite still runs after an earlier suite fails; the final job requires all ten.
 name: RustFS Functional Chain
 
 on:
   workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful nightly build run on main
+        type: string
+        required: true
+      build_run_attempt:
+        description: Exact successful build attempt
+        type: string
+        required: true
   workflow_run:
-    # Entry point: start the chain after the nightly build completes. The
-    # build's own conclusion does not gate the chain; each suite reports its
-    # own result to rustfs/backlog and the dashboard.
     workflows: ["Nightly GNU Build"]
     types: [completed]
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  group: rustfs-functional-chain-runs
+  cancel-in-progress: false
 
 jobs:
-  start-chain:
-    name: Start functional chain (upgrade first)
+  prepare:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') }}
+    outputs:
+      manifest: ${{ steps.candidate.outputs.manifest }}
     steps:
-      - name: Dispatch first suite (upgrade)
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve published candidate
+        id: candidate
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot start the functional chain" >&2
-            exit 1
-          fi
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-upgrade' \
-            -F 'client_payload[from_suite]=nightly-build'
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          CHAIN_OUTPUT: ${{ runner.temp }}/chain-candidate.json
+        run: python3 scripts/resolve_functional_candidate.py
+      - name: Retain candidate identity
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-candidate.json
+          if-no-files-found: error
+
+  upgrade:
+    needs: [prepare]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-upgrade-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  s3:
+    needs: [prepare, upgrade]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-s3-compat-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  kms:
+    needs: [prepare, s3]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-kms-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  tier:
+    needs: [prepare, kms]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-tier-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  storage:
+    needs: [prepare, tier]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-storage-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  heal:
+    needs: [prepare, storage]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-heal-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  pool:
+    needs: [prepare, heal]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-pool-expand-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  security:
+    needs: [prepare, pool]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-security-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  replication:
+    needs: [prepare, security]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-replication-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  performance:
+    needs: [prepare, replication]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-performance-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  complete-chain:
+    needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, performance]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Download suite evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: functional-chain-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-evidence
+          merge-multiple: true
+      - name: Verify every required suite
+        env:
+          CHAIN_MANIFEST: ${{ needs.prepare.outputs.manifest }}
+          CHAIN_NEEDS: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py aggregate
+          --directory "${RUNNER_TEMP}/chain-evidence"
+          --output "${RUNNER_TEMP}/chain-complete.json"
+      - name: Upload complete-chain evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-complete-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-complete.json
+          if-no-files-found: error

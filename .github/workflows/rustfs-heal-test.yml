@@ -1,6 +1,12 @@
 name: RustFS Heal Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       package_url:
@@ -57,8 +63,13 @@ jobs:
     timeout-minutes: 480
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout chain tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
       - name: Initialize functional evidence
         id: evidence
         run: |
@@ -74,25 +85,21 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      # auto-testing is private: clone it with the dedicated PF token (not
-      # GITHUB_TOKEN) and retry transient GitHub/network failures.
-      - name: Checkout auto-testing scripts (with retry)
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -152,6 +159,7 @@ jobs:
             --log-file "${LOG_FILE}"
 
       - name: Generate report
+        id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -426,3 +434,24 @@ jobs:
           echo "RustFS heal test failed"
           echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
           echo "See the uploaded log artifact for details."
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite heal
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/steps.md"
+          --output "${RUNNER_TEMP}/chain-heal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/heal.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-heal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-heal-${{ github.run_id }}-${{ github.run_attempt }}/heal.json
+          if-no-files-found: error

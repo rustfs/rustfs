@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from check_test_wiring import yaml_block
+from resolve_functional_candidate import validate_manifest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +173,7 @@ SH
         self.assertEqual(self.manifest()["source_sha"], self.sha)
         self.assertEqual(self.manifest()["workflow_sha"], "f" * 40)
         self.assertEqual(self.manifest()["source_ref"], "release")
+        validate_manifest(self.manifest(), {"id": 12345, "run_attempt": 1, "head_sha": "f" * 40})
 
     def test_every_lane_uses_the_same_resolved_source(self):
         lines = WORKFLOW.read_text().splitlines()

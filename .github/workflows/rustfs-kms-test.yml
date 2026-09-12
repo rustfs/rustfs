@@ -1,6 +1,12 @@
 name: RustFS KMS Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       rustfs_version:
@@ -50,7 +56,7 @@ jobs:
   kms-test:
     runs-on: smoke-testing
     timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -71,25 +77,21 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      # auto-testing is private: clone it with the dedicated PF token (not
-      # GITHUB_TOKEN) and retry transient GitHub/network failures.
-      - name: Checkout auto-testing scripts (with retry)
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -156,6 +158,7 @@ jobs:
           ./auto-testing/rustfs-kms-test.sh "${ARGS[@]}"
 
       - name: Generate report
+        id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -375,3 +378,24 @@ jobs:
         run: |
           echo "RustFS KMS suite failed"
           echo "See the uploaded report and log artifacts for details."
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite kms
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
+          --output "${RUNNER_TEMP}/chain-kms-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/kms.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-kms-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-kms-${{ github.run_id }}-${{ github.run_attempt }}/kms.json
+          if-no-files-found: error
