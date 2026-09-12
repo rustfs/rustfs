@@ -56,6 +56,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use url::{Url, form_urlencoded};
 
+const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
+const LOG_COMPONENT_ACCESS: &str = "storage_access";
+const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
+
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
     pub cred: Option<rustfs_credentials::Credentials>,
@@ -102,9 +106,13 @@ async fn authorize_replication_only_put_headers<T>(req: &mut S3Request<T>) -> S3
     Ok(())
 }
 
-pub(crate) fn recursive_force_delete_is_authorized(headers: &HeaderMap, is_owner: bool, replica_request: bool) -> bool {
+pub(crate) fn recursive_force_delete_has_authenticated_caller(
+    headers: &HeaderMap,
+    authenticated: bool,
+    replica_request: bool,
+) -> bool {
     !get_header(headers, SUFFIX_FORCE_DELETE).is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || is_owner
+        || authenticated
         || replica_request
 }
 
@@ -833,15 +841,12 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Res
     Ok(())
 }
 
-/// Extra action that may be evaluated in the same authorization flow and can
-/// independently require `ExistingObjectTag` conditions.
-fn secondary_tag_hint_action(action: Action, version_id: Option<&str>) -> Option<Action> {
-    match action {
-        Action::S3Action(S3Action::DeleteObjectAction) if version_id.is_some() => {
-            Some(Action::S3Action(S3Action::DeleteObjectVersionAction))
-        }
-        _ => None,
-    }
+pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action {
+    Action::S3Action(if version_id.is_some() {
+        S3Action::DeleteObjectVersionAction
+    } else {
+        S3Action::DeleteObjectAction
+    })
 }
 
 /// GHSA-3ppv: select the IAM action for an object read by whether the request
@@ -1015,14 +1020,14 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             deny_only: false,
         };
         let prepared = iam_store.prepare_auth(&action_args).await;
-        let mut needs_tag_from_iam = prepared.needs_existing_object_tag;
+        let needs_tag_from_iam = prepared.needs_existing_object_tag;
 
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
             Some(load_bucket_policy_existing_object_tag_hint(store.as_ref(), bucket.as_str(), action).await)
         } else {
             None
         };
-        let mut needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
+        let needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
             let bucket_args = BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action,
@@ -1037,44 +1042,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             false
         };
 
-        let secondary_action = secondary_tag_hint_action(action, version_id.as_deref());
-        if let Some(extra_action) = secondary_action {
-            let extra_args = Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: extra_action,
-                bucket: bucket.as_str(),
-                conditions: &conditions,
-                is_owner,
-                object: object.as_str(),
-                claims,
-                deny_only: false,
-            };
-            needs_tag_from_iam |= prepared.needs_existing_object_tag_for_args(&extra_args).await;
-
-            if let Some(hint) = bucket_tag_hint.as_ref() {
-                let extra_bucket_args = BucketPolicyArgs {
-                    bucket: bucket.as_str(),
-                    action: extra_action,
-                    is_owner,
-                    account: cred.access_key.as_str(),
-                    groups: &cred.groups,
-                    conditions: &conditions,
-                    object: object.as_str(),
-                };
-                needs_tag_from_bucket |= bucket_policy_needs_existing_object_tag_from_hint(hint, &extra_bucket_args).await;
-            }
-        }
-
         let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
         if needs_tag {
             tracing::debug!(
+                event = EVENT_OBJECT_TAG_AUTHORIZATION,
+                component = LOG_COMPONENT_ACCESS,
+                subsystem = LOG_SUBSYSTEM_AUTHORIZATION,
+                anonymous = false,
                 bucket = %bucket,
                 ?action,
-                ?secondary_action,
                 needs_tag_from_iam,
                 needs_tag_from_bucket,
-                "authorize_request ExistingObjectTag hint requires tag conditions"
+                "Object tag authorization conditions required"
             );
         }
         maybe_merge_object_tag_conditions(
@@ -1116,41 +1095,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Err(denial.deny("bucket_policy_explicit_deny", action));
         }
 
-        if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
-            let delete_version_args = Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::S3Action(S3Action::DeleteObjectVersionAction),
-                bucket: bucket.as_str(),
-                conditions: &conditions,
-                is_owner,
-                object: object.as_str(),
-                claims,
-                deny_only: false,
-            };
-            let delete_version_allowed = iam_store.eval_prepared(&prepared, &delete_version_args).await;
-            if !delete_version_allowed
-                && !PolicySys::try_is_allowed_for_store(
-                    store.as_ref(),
-                    &BucketPolicyArgs {
-                        bucket: bucket.as_str(),
-                        action: Action::S3Action(S3Action::DeleteObjectVersionAction),
-                        is_owner,
-                        account: &cred.access_key,
-                        groups: &cred.groups,
-                        conditions: &conditions,
-                        object: object.as_str(),
-                    },
-                )
-                .await
-                .map_err(ApiError::from)?
-            {
-                return Err(denial.deny("delete_object_version_denied", Action::S3Action(S3Action::DeleteObjectVersionAction)));
-            }
-        }
-
         let iam_allowed = {
-            let final_args = Args {
+            let mut final_args = Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
                 action,
@@ -1161,7 +1107,28 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 claims,
                 deny_only: false,
             };
-            iam_store.eval_prepared(&prepared, &final_args).await
+            let allowed = iam_store.eval_prepared(&prepared, &final_args).await;
+            if !allowed
+                && matches!(
+                    action,
+                    Action::S3Action(
+                        S3Action::DeleteObjectAction
+                            | S3Action::DeleteObjectVersionAction
+                            | S3Action::ListBucketVersionsAction
+                            | S3Action::BypassGovernanceRetentionAction
+                            | S3Action::ReplicateDeleteAction
+                    )
+                )
+                && prepared.combined_policy_for_view().is_some()
+            {
+                // Bucket policy Allow may supplement an implicit IAM denial,
+                // but must not override an explicit deletion-policy Deny.
+                final_args.deny_only = true;
+                if !iam_store.eval_prepared(&prepared, &final_args).await {
+                    return Err(denial.deny("iam_explicit_deny", action));
+                }
+            }
+            allowed
         };
 
         if iam_allowed {
@@ -1199,42 +1166,6 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             }
             return Ok(());
         }
-
-        if action == Action::S3Action(S3Action::ListBucketVersionsAction) {
-            let list_bucket_args = Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::S3Action(S3Action::ListBucketAction),
-                bucket: bucket.as_str(),
-                conditions: &conditions,
-                is_owner,
-                object: object.as_str(),
-                claims,
-                deny_only: false,
-            };
-            let list_bucket_allowed = iam_store.eval_prepared(&prepared, &list_bucket_args).await;
-            if list_bucket_allowed {
-                return Ok(());
-            }
-
-            if PolicySys::try_is_allowed_for_store(
-                store.as_ref(),
-                &BucketPolicyArgs {
-                    bucket: bucket.as_str(),
-                    action: Action::S3Action(S3Action::ListBucketAction),
-                    is_owner,
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    conditions: &conditions,
-                    object: object.as_str(),
-                },
-            )
-            .await
-            .map_err(ApiError::from)?
-            {
-                return Ok(());
-            }
-        }
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
         let client_info = req.extensions.get::<ClientInfo>();
@@ -1254,7 +1185,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         } else {
             None
         };
-        let mut needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
+        let needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
             let bucket_args = BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action,
@@ -1268,27 +1199,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         } else {
             false
         };
-        let secondary_action = secondary_tag_hint_action(action, version_id.as_deref());
-        if let Some(extra_action) = secondary_action
-            && let Some(hint) = bucket_tag_hint.as_ref()
-        {
-            let extra_bucket_args = BucketPolicyArgs {
-                bucket: bucket.as_str(),
-                action: extra_action,
-                is_owner: false,
-                account: "",
-                groups: &no_groups,
-                conditions: &conditions,
-                object: object.as_str(),
-            };
-            needs_tag_from_bucket |= bucket_policy_needs_existing_object_tag_from_hint(hint, &extra_bucket_args).await;
-        }
         if needs_tag_from_bucket {
             tracing::debug!(
+                event = EVENT_OBJECT_TAG_AUTHORIZATION,
+                component = LOG_COMPONENT_ACCESS,
+                subsystem = LOG_SUBSYSTEM_AUTHORIZATION,
+                anonymous = true,
                 bucket = %bucket,
                 ?action,
-                ?secondary_action,
-                "anonymous authorize_request ExistingObjectTag hint requires tag conditions"
+                "Object tag authorization conditions required"
             );
         }
         maybe_merge_object_tag_conditions(
@@ -1324,28 +1243,6 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
-            if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
-                let delete_version_allowed = PolicySys::try_is_allowed_for_store(
-                    store.as_ref(),
-                    &BucketPolicyArgs {
-                        bucket: bucket.as_str(),
-                        action: Action::S3Action(S3Action::DeleteObjectVersionAction),
-                        is_owner: false,
-                        account: "",
-                        groups: &None,
-                        conditions: &conditions,
-                        object: object.as_str(),
-                    },
-                )
-                .await
-                .map_err(ApiError::from)?;
-                if !delete_version_allowed {
-                    return Err(
-                        denial.deny("delete_object_version_denied", Action::S3Action(S3Action::DeleteObjectVersionAction))
-                    );
-                }
-            }
-
             let policy_allowed = PolicySys::try_is_allowed_for_store(
                 store.as_ref(),
                 &BucketPolicyArgs {
@@ -1361,10 +1258,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?;
 
-            // A bucket policy granting s3:ListBucket also covers listing versions. This
-            // fallback has to feed the same post-authorization gates as the direct grant
-            // below, otherwise a public bucket keeps serving anonymous
-            // ListObjectVersions after RestrictPublicBuckets is turned on.
+            // A bucket policy granting s3:ListBucket also covers listing versions.
+            // Keep this compatibility fallback inside the same public-access gate.
             let policy_allowed = policy_allowed
                 || (action == Action::S3Action(S3Action::ListBucketVersionsAction)
                     && PolicySys::try_is_allowed_for_store(
@@ -2173,20 +2068,18 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
-        let is_owner = req_info.is_owner;
+        let authenticated = req_info.is_owner || req_info.cred.is_some();
+        let action = delete_object_authorize_action(req_info.version_id.as_deref());
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+        authorize_request(req, action).await?;
 
         let replica_request = req
             .headers
             .get(AMZ_BUCKET_REPLICATION_STATUS)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
-        if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica_request) {
-            return Err(s3_error!(
-                AccessDenied,
-                "Recursive force-delete is restricted to internal or administrative requests"
-            ));
+        if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
+            return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
         }
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -3108,12 +3001,12 @@ mod tests {
         PostObjectRequestMarker, ReqInfo, S3Access, StorageError, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
         apply_copy_source_bucket_generation_guard, authorization_conditions, bucket_policy_needs_existing_object_tag_from_hint,
         bucket_website_config_authorize_action, classify_bucket_policy_raw_load_error,
-        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
-        install_restore_authorization_test_hook, legal_hold_write_requested, list_parts_authorize_action,
-        load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions,
-        merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
-        put_bucket_policy_authorize_action, request_context_from_req, request_object_store, retention_write_requested,
-        secondary_tag_hint_action, table_data_plane_admin_action, table_data_plane_content_mutation,
+        complete_multipart_upload_authorize_action, delete_object_authorize_action, get_bucket_policy_authorize_action,
+        has_write_offset_bytes_header, install_restore_authorization_test_hook, legal_hold_write_requested,
+        list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions,
+        merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
+        post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, request_object_store,
+        retention_write_requested, table_data_plane_admin_action, table_data_plane_content_mutation,
         table_data_plane_resource_for_request, table_publication_guard_error, validate_post_object_success_controls,
         versioned_read_action,
     };
@@ -3946,20 +3839,18 @@ mod tests {
     }
 
     #[test]
-    fn test_secondary_tag_hint_action_for_delete_object_version() {
-        assert_eq!(
-            secondary_tag_hint_action(Action::S3Action(S3Action::DeleteObjectAction), Some("v1")),
-            Some(Action::S3Action(S3Action::DeleteObjectVersionAction))
-        );
-        assert_eq!(secondary_tag_hint_action(Action::S3Action(S3Action::DeleteObjectAction), None), None);
-        assert_eq!(
-            secondary_tag_hint_action(Action::S3Action(S3Action::ListBucketVersionsAction), None),
-            None
-        );
+    fn delete_authorization_selects_the_addressed_version() {
+        assert_eq!(delete_object_authorize_action(None), Action::S3Action(S3Action::DeleteObjectAction));
+        for version_id in ["null", "8f418ad0-f9f4-4458-83b2-cc72bc6f1b70"] {
+            assert_eq!(
+                delete_object_authorize_action(Some(version_id)),
+                Action::S3Action(S3Action::DeleteObjectVersionAction)
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_anonymous_delete_object_with_version_requires_secondary_policy_and_tag_hint() {
+    async fn test_anonymous_version_delete_uses_version_policy_and_tag_hint() {
         let policy: BucketPolicy = serde_json::from_str(
             r#"{
   "Version":"2012-10-17",
@@ -4013,16 +3904,16 @@ mod tests {
             "DeleteObjectVersion should still be denied without matching ExistingObjectTag conditions"
         );
 
-        let needs_tag_main = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete).await;
-        let needs_tag_secondary = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete_version).await;
-        assert!(!needs_tag_main, "DeleteObject statement itself does not require ExistingObjectTag");
+        let needs_tag_current = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete).await;
+        let needs_tag_version = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete_version).await;
+        assert!(!needs_tag_current, "DeleteObject statement itself does not require ExistingObjectTag");
         assert!(
-            needs_tag_secondary,
+            needs_tag_version,
             "DeleteObjectVersion statement requires ExistingObjectTag when version delete is evaluated"
         );
         assert!(
-            needs_tag_main || needs_tag_secondary,
-            "combined primary+secondary check must require tag fetch for DeleteObject(versionId)"
+            needs_tag_version,
+            "the selected version action must require tag fetch for DeleteObject(versionId)"
         );
     }
 

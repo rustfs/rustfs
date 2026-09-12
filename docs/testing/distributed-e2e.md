@@ -23,7 +23,7 @@ The expansion fixture is an all-current-binary fleet, so it initializes pool met
 
 ## What this lane covers
 
-`cargo nextest run --profile e2e-distributed -p e2e_test` selects `distributed::*`:
+`python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test` selects `distributed::*`:
 
 - S3 put / get / head / list / copy / rename / delete / presign, range and conditional reads, special keys, metadata, tags, pagination, empty objects, multipart complete and abort
 - Object Lock COMPLIANCE, GOVERNANCE and bypass, legal hold, bucket default retention, and non-lock bucket rejection
@@ -56,7 +56,7 @@ Hardware power-loss, physical NIC pull, authenticated inter-node partition, firm
 ## Run
 
 ```bash
-cargo build -p rustfs --bins
+python3 scripts/e2e_binary.py build --bins
 # Expansion/decommission/rebalance cases require four paths on distinct filesystems.
 # If you do not already have four disks, sized tmpfs is enough:
 #   for p in 0 1 2 3; do
@@ -66,13 +66,13 @@ cargo build -p rustfs --bins
 export RUSTFS_E2E_POOL_ROOTS=/mnt/rustfs-pool-0:/mnt/rustfs-pool-1:/mnt/rustfs-pool-2:/mnt/rustfs-pool-3
 # Upgrade cases require the pinned previous binary (CI downloads it).
 export RUSTFS_UPGRADE_SOURCE_BINARY=/path/to/rustfs-1.0.0-rc.2
-cargo nextest run --profile e2e-distributed -p e2e_test
+python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test
 ```
 
 Without `RUSTFS_UPGRADE_SOURCE_BINARY` the two `distributed::upgrade_test::*` cases fail closed. Without four distinct `RUSTFS_E2E_POOL_ROOTS`, the expansion and data-movement cases fail closed. Filter upgrades out for a local run that is not checking upgrade:
 
 ```bash
-cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distributed::upgrade_test::/)'
+python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distributed::upgrade_test::/)'
 ```
 
 The upgrade topology is `ClusterTopology::single_pool(4)` (4 nodes × 1 drive). That matches the proven mixed-version fixture in `upgrade_compatibility_test`; 4×4 localhost drives are rejected by the previous release's same-device disk check.

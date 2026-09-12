@@ -17,15 +17,13 @@ Use the canonical CI-equivalent protocol command in the parent
 For targeted debugging of the core suite only:
 
 ```bash
-RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
+python3 scripts/e2e_binary.py build --features ftps,webdav,sftp
+python3 scripts/e2e_binary.py run --features ftps,webdav,sftp -- cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
 This targeted command does not cover the full `e2e-protocols` profile.
 
-`RUSTFS_BUILD_FEATURES` controls which features the test rustfs binary is
-built with. When this variable is set, the protocol test runner schedules
-only entries whose protocol is present in the requested feature list. Leave
-it unset to run every protocol entry.
+`e2e_binary.py` supplies `RUSTFS_BUILD_FEATURES` from the verified server's resolved Cargo features. The protocol runner schedules only entries present in that feature list; helpers check that their required features are available without rebuilding the server.
 `--test-threads=1` is required because every entry spawns a rustfs server
 on fixed bind ports.
 

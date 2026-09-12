@@ -859,7 +859,76 @@ async fn delete_recursive_prefix_with_tier_delete_journal(
             }
         }
     }
+    // A trailing slash selects a directory, not the object at its parent key.
+    // Raw filesystem recursion would also remove that object's metadata and
+    // data. Preserve it by purging the selected keys individually when they
+    // share this physical directory. The bucket write lock covers both scans.
+    if object.ends_with('/') && !is_meta_bucketname(bucket) {
+        let parent = object.strip_suffix('/').unwrap_or(object);
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(bucket, parent, None, None, 1)
+                    .await?;
+                if page.objects.iter().any(|info| info.name == parent) {
+                    return delete_directory_keys_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await;
+                }
+            }
+        }
+    }
     delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
+}
+
+async fn delete_directory_keys_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    prefix: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    for pool in &store.pools {
+        for set in &pool.disk_set {
+            let mut previous_keys = std::collections::BTreeSet::new();
+            loop {
+                // Restart after each bounded batch: its version markers have
+                // been deleted, and the bucket write lock excludes new keys.
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(
+                        bucket,
+                        prefix,
+                        None,
+                        None,
+                        RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                    )
+                    .await?;
+                let keys = page
+                    .objects
+                    .into_iter()
+                    .map(|info| info.name)
+                    .filter(|key| key.starts_with(prefix))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if keys.is_empty() {
+                    break;
+                }
+                if keys == previous_keys {
+                    return Err(Error::other("directory deletion did not advance"));
+                }
+                for key in &keys {
+                    let encoded_key = encode_dir_object(key);
+                    let mut exact_opts = opts.clone();
+                    exact_opts.delete_prefix_object = true;
+                    let _guard = store
+                        .acquire_object_write_lock_if_needed("delete_object", bucket, &encoded_key, &mut exact_opts)
+                        .await?;
+                    delete_prefix_with_tier_delete_journal(store, bucket, &encoded_key, &exact_opts, tier_journal_api).await?;
+                }
+                previous_keys = keys;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A GET whose object identity has been resolved while its namespace read lock
@@ -4682,13 +4751,14 @@ impl ECStore {
             return Err(Error::other("lifecycle delete-all requires namespace locking"));
         }
 
-        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else if opts.delete_prefix {
-            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-        };
+        let _bucket_lifecycle_guard =
+            if is_meta_bucketname(bucket) || (opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some()) {
+                None
+            } else if opts.delete_prefix {
+                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+            } else {
+                Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+            };
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
         } else {

@@ -126,13 +126,15 @@ promtool test rules storage-rules.test.yml
 The native pipeline test in
 `crates/e2e_test/src/storage_metric_ownership_test.rs` requires pinned Collector,
 Prometheus, previous-release RustFS, and current RustFS executables. Set
-`RUSTFS_OTELCOL_BINARY`, `RUSTFS_PROMETHEUS_BINARY`,
-`RUSTFS_METRICS_BASELINE_BINARY`, and `CARGO_BIN_EXE_rustfs` to those files.
+`RUSTFS_OTELCOL_BINARY`, `RUSTFS_PROMETHEUS_BINARY`, and
+`RUSTFS_METRICS_BASELINE_BINARY` to those files; `scripts/e2e_binary.py run`
+supplies the current RustFS as `CARGO_BIN_EXE_rustfs`.
 Optionally set `RUSTFS_METRICS_E2E_ARTIFACTS` to retain logs and Prometheus data.
 Run only this external-tool test:
 
 ```bash
-cargo test --locked -p e2e_test storage_metric_ownership_pipeline -- --ignored --nocapture
+python3 scripts/e2e_binary.py build
+python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test storage_metric_ownership_pipeline -- --ignored --nocapture
 ```
 
 The test first reproduces duplicated global details with the previous release,

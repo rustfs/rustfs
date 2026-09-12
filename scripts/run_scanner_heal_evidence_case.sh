@@ -277,12 +277,7 @@ DEBUG_DIR="$TARGET_DIR/debug"
 if [[ "${RUSTFS_SCANNER_HEAL_SKIP_CLEAN:-0}" != "1" ]]; then
     cargo clean -p rustfs
 fi
-if [[ -n "$BUILD_FEATURES" ]]; then
-    cargo build --locked -p rustfs --bins --features "$BUILD_FEATURES"
-else
-    cargo build --locked -p rustfs --bins
-fi
-printf '%s' "$BUILD_FEATURES" >"$DEBUG_DIR/rustfs.features"
+"$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" build --bins --features "$BUILD_FEATURES"
 
 LISTING_TMP="$TMP_DIR/listing.json"
 NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
@@ -307,7 +302,8 @@ NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
 HTTP_PROXY= \
 HTTPS_PROXY= \
 RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR" \
-cargo nextest run --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --no-tests=fail
+"$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" run --features "$BUILD_FEATURES" -- \
+    cargo nextest run --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --no-tests=fail
 STATUS=$?
 set -e
 

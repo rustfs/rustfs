@@ -24,7 +24,8 @@ The tests cover the following AWS policy variable scenarios:
 
 ```bash
 # From the project root directory
-cargo test -p e2e_test policy:: -- --nocapture
+python3 scripts/e2e_binary.py build
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test policy:: -- --nocapture
 ```
 
 Each test starts an isolated RustFS server on a dynamically allocated local port and cleans it up afterward.

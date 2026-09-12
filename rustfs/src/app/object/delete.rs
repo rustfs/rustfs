@@ -16,6 +16,70 @@
 
 use super::*;
 
+async fn authorize_recursive_delete<T>(
+    req: &mut S3Request<T>,
+    store: &Arc<ECStore>,
+    bucket: &str,
+    prefix: &str,
+    versioned: bool,
+    replica: bool,
+) -> S3Result<()> {
+    let original_info = req_info_ref(req)?.clone();
+    let descendant_prefix = if prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    let result = async {
+        let mut marker = None;
+        let mut version_marker = None;
+        loop {
+            let page = store
+                .clone()
+                .list_object_versions(bucket, prefix, marker.clone(), version_marker.clone(), None, 1000)
+                .await
+                .map_err(ApiError::from)?;
+            for object in page.objects {
+                // Disk prefix deletion follows path boundaries, while S3's
+                // string-prefix listing can also return unrelated siblings.
+                if object.name != prefix && !object.name.starts_with(&descendant_prefix) {
+                    continue;
+                }
+                let object_version = object.version_id.filter(|version| !version.is_nil());
+                let version_id = (versioned || object_version.is_some())
+                    .then(|| object_version.map_or_else(|| "null".to_owned(), |id| id.to_string()));
+                let info = req_info_mut(req)?;
+                info.object = Some(object.name.clone());
+                info.version_id = version_id.clone();
+                let action = if replica {
+                    Action::S3Action(S3Action::ReplicateDeleteAction)
+                } else {
+                    delete_object_authorize_action(version_id.as_deref())
+                };
+                authorize_request(req, action).await?;
+                if has_bypass_governance_header(&req.headers) {
+                    authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+                }
+                validate_table_catalog_object_mutation(bucket, &object.name).await?;
+            }
+            if !page.is_truncated {
+                return Ok(());
+            }
+            if page.next_marker.is_none() || (marker == page.next_marker && version_marker == page.next_version_idmarker) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Recursive delete listing did not advance",
+                ));
+            }
+            marker = page.next_marker;
+            version_marker = page.next_version_idmarker;
+        }
+    }
+    .await;
+    req.extensions.insert(original_info);
+    result
+}
+
 fn successful_delete_audit_objects(
     delete: &s3s::dto::Delete,
     successful_results: impl IntoIterator<Item = bool>,
@@ -411,14 +475,6 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
-        if !recursive_force_delete_is_authorized(&req.headers, is_owner, false) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::AccessDenied,
-                "Recursive force-delete is restricted to administrative requests",
-            ));
-        }
-
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -474,7 +530,7 @@ impl DefaultObjectUsecase {
                 req_info.version_id = version_id.clone();
             }
 
-            let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
+            let auth_res = authorize_request(&mut req, delete_object_authorize_action(version_id.as_deref())).await;
             if auth_res.is_err() {
                 if !bulk_denial_logged {
                     bulk_denial_logged = true;
@@ -882,11 +938,11 @@ impl DefaultObjectUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
         }
 
-        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
-        if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica) {
+        let authenticated = req_info_ref(&req).is_ok_and(|info| info.is_owner || info.cred.is_some());
+        if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica) {
             return Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
-                "Recursive force-delete is restricted to internal or administrative requests",
+                "Recursive force-delete requires an authenticated caller",
             ));
         }
         validate_table_catalog_object_mutation(&bucket, &key).await?;
@@ -900,6 +956,22 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         validate_bucket_exists(&store, &bucket).await?;
+
+        // Lock order is bucket lifecycle, then object/commit locks in storage.
+        // Keep this guard alive through the physical delete: a preflight without
+        // writer exclusion could authorize one subtree and delete a newer one.
+        let recursive_delete_guard = if rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_FORCE_DELETE)
+            .is_some_and(|value| value == "true")
+        {
+            Some(
+                store
+                    .lock_bucket_for_recursive_delete(&bucket)
+                    .await
+                    .map_err(ApiError::from)?,
+            )
+        } else {
+            None
+        };
 
         let metadata = extract_metadata(&req.headers);
         // Clone version_id before it's moved
@@ -923,6 +995,12 @@ impl DefaultObjectUsecase {
         });
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         let force_delete = opts.delete_prefix;
+
+        if let Some(guard) = &recursive_delete_guard {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+            authorize_recursive_delete(&mut req, &store, &bucket, &key, opts.versioned || opts.version_suspended, replica)
+                .await?;
+        }
 
         // let mut vid = opts.version_id.clone();
 
@@ -1026,6 +1104,7 @@ impl DefaultObjectUsecase {
                 }
             }
         };
+        drop(recursive_delete_guard);
 
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
@@ -2212,14 +2291,122 @@ mod tests {
     }
 
     #[test]
-    fn recursive_force_delete_requires_administrative_or_replica_context() {
+    #[serial_test::serial]
+    fn recursive_delete_holds_writer_exclusion_after_authorization() {
+        crate::app::gating_test_env::run_large_stack_test("recursive-delete-writer-exclusion", || async {
+            use crate::app::storage_api::test::contract::bucket::{
+                BucketOperations as _, DeleteBucketOptions, MakeBucketOptions,
+            };
+            use std::time::Duration;
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            }
+            let context = current_app_context().expect("recursive delete test requires an AppContext");
+            let bucket = format!("recursive-delete-writer-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create test bucket");
+            let mut reader = PutObjReader::from_vec(b"old".to_vec());
+            store
+                .put_object(&bucket, "folder/old", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("seed old object");
+
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+                .await
+                .expect("load test metadata"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse test policy"));
+            metadata.policy_config_json = policy_json.into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("publish test policy");
+
+            let input = DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("folder/".to_owned())
+                .build()
+                .expect("build force delete");
+            let mut req = build_request(input, Method::DELETE);
+            req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+            req.extensions.insert(crate::storage::access::ReqInfo {
+                is_owner: true,
+                bucket: Some(bucket.clone()),
+                object: Some("folder/".to_owned()),
+                ..Default::default()
+            });
+            let loaded = Arc::new(tokio::sync::Barrier::new(2));
+            let resume = Arc::new(tokio::sync::Barrier::new(2));
+            install_delete_source_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
+            let usecase = DefaultObjectUsecase::with_context(Some(context));
+            let delete = tokio::spawn(async move { usecase.execute_delete_object(req).await });
+            tokio::time::timeout(Duration::from_secs(30), loaded.wait())
+                .await
+                .expect("force delete reaches authorized pre-commit pause");
+
+            let writer_store = Arc::clone(&store);
+            let writer_bucket = bucket.clone();
+            let mut writer = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(b"new".to_vec());
+                writer_store
+                    .put_object(&writer_bucket, "folder/new", &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            let before_delete = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+            resume.wait().await;
+            tokio::time::timeout(Duration::from_secs(30), delete)
+                .await
+                .expect("force delete completes without lock recursion")
+                .expect("delete task joins")
+                .expect("force delete succeeds");
+            assert!(
+                before_delete.is_err(),
+                "a writer must not enter the authorized subtree before deletion commits"
+            );
+            tokio::time::timeout(Duration::from_secs(30), writer)
+                .await
+                .expect("writer resumes after deletion")
+                .expect("writer task joins")
+                .expect("writer succeeds");
+            store
+                .get_object_info(&bucket, "folder/new", &ObjectOptions::default())
+                .await
+                .expect("post-delete writer's object survives");
+            assert!(
+                store
+                    .get_object_info(&bucket, "folder/old", &ObjectOptions::default())
+                    .await
+                    .is_err(),
+                "authorized old object is removed"
+            );
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove test bucket");
+        });
+    }
+
+    #[test]
+    fn recursive_force_delete_requires_authenticated_or_replica_context() {
         let mut headers = HeaderMap::new();
         headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
 
-        assert!(!recursive_force_delete_is_authorized(&headers, false, false));
-        assert!(recursive_force_delete_is_authorized(&headers, true, false));
-        assert!(recursive_force_delete_is_authorized(&headers, false, true));
-        assert!(recursive_force_delete_is_authorized(&HeaderMap::new(), false, false));
+        assert!(!recursive_force_delete_has_authenticated_caller(&headers, false, false));
+        assert!(recursive_force_delete_has_authenticated_caller(&headers, true, false));
+        assert!(recursive_force_delete_has_authenticated_caller(&headers, false, true));
+        assert!(recursive_force_delete_has_authenticated_caller(&HeaderMap::new(), false, false));
     }
 
     #[tokio::test]
@@ -2235,31 +2422,6 @@ mod tests {
 
         let err = DefaultObjectUsecase::without_context()
             .execute_delete_object(req)
-            .await
-            .expect_err("untrusted force-delete must be rejected before storage lookup");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
-    }
-
-    #[tokio::test]
-    async fn execute_delete_objects_rejects_untrusted_force_delete_before_store_access() {
-        let input = DeleteObjectsInput::builder()
-            .bucket("test-bucket".to_string())
-            .delete(Delete {
-                objects: vec![ObjectIdentifier {
-                    key: "prefix/object".to_string(),
-                    version_id: None,
-                    ..Default::default()
-                }],
-                quiet: None,
-            })
-            .build()
-            .unwrap();
-        let mut req = build_request(input, Method::POST);
-        req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
-
-        let err = DefaultObjectUsecase::without_context()
-            .execute_delete_objects(req)
             .await
             .expect_err("untrusted force-delete must be rejected before storage lookup");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);

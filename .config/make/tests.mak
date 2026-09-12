@@ -49,6 +49,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_python_bin.sh
 	./scripts/check_embedded_secrets.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
@@ -56,6 +57,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
