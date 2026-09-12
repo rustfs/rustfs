@@ -367,7 +367,7 @@ async fn scheduled_deletion_carries_a_deadline_and_can_be_cancelled() {
         .expect("a cancelled key must accept new cryptographic work");
 
     // Cancelling a key that is not pending deletion is a state error.
-    assert_unsupported_capability(
+    assert_invalid_operation(
         manager
             .cancel_key_deletion(CancelKeyDeletionRequest { key_id: key_id.clone() })
             .await,

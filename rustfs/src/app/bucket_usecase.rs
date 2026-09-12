@@ -5130,9 +5130,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        // A well-formed rule, so the request reaches the store lookup instead
+        // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(ServerSideEncryptionConfiguration::default())
+            .server_side_encryption_configuration(sse_config(vec![sse_rule("AES256", None)]))
             .build()
             .unwrap();
 
