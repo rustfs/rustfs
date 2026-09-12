@@ -107,6 +107,12 @@ fn stats(bytes: u64, count: u64) -> String {
     )
 }
 
+fn nested_string_stats(bytes: u64, count: u64) -> String {
+    format!(
+        r#"{{"process":{{"malloc_normal":{{"total":"{bytes}"}},"malloc_huge":{{"total":"0"}},"malloc_normal_count":{{"total":"{count}"}},"malloc_huge_count":{{"total":"0"}}}}}}"#
+    )
+}
+
 fn archive_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
     let mut entry = archive.by_name(name).expect("archive entry");
     let mut bytes = Vec::new();
@@ -207,6 +213,23 @@ async fn memory_profile_uses_only_bounded_allocator_aggregates() {
 
     let oversized = format!("{}{}", stats(1, 1), " ".repeat(262_145));
     assert!(matches!(parse_allocator_stats(&oversized), Err(ProfileError::SourceUnavailable)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_profile_accepts_nested_string_mimalloc_totals() {
+    let _guard = profile_test_lock();
+    let first = Box::leak(nested_string_stats(1_000, 20).into_boxed_str());
+    let second = Box::leak(nested_string_stats(1_250, 24).into_boxed_str());
+    let source = SequenceSource::new(first, second);
+    let key = connect::DeviceIdentity::generate();
+    let export = export_memory_profile_from(&request(), &key, &CancellationToken::new(), &source)
+        .await
+        .expect("nested aggregate export");
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes)).expect("profile archive");
+    let result: serde_json::Value = serde_json::from_slice(&archive_entry(&mut archive, "result.json")).expect("result JSON");
+
+    assert_eq!(result["data"]["allocatedBytes"], 250);
+    assert_eq!(result["data"]["allocationCount"], 4);
 }
 
 #[tokio::test]
