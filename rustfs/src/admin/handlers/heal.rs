@@ -242,6 +242,40 @@ struct HealStartSuccess {
     start_time: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct HealStatusSettings {
+    recursive: bool,
+    dry_run: bool,
+    remove: bool,
+    recreate: bool,
+    scan_mode: HealScanMode,
+    update_parity: bool,
+    #[serde(rename = "nolock")]
+    no_lock: bool,
+    #[serde(rename = "readRepair")]
+    read_repair: bool,
+    pool: Option<usize>,
+    set: Option<usize>,
+}
+
+impl From<HealOpts> for HealStatusSettings {
+    fn from(settings: HealOpts) -> Self {
+        Self {
+            recursive: settings.recursive,
+            dry_run: settings.dry_run,
+            remove: settings.remove,
+            recreate: settings.recreate,
+            scan_mode: settings.scan_mode,
+            update_parity: settings.update_parity,
+            no_lock: settings.no_lock,
+            read_repair: settings.read_repair,
+            pool: settings.pool,
+            set: settings.set,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealTaskStatus {
@@ -251,7 +285,7 @@ struct HealTaskStatus {
     failure_detail: String,
     start_time: String,
     #[serde(rename = "settings")]
-    heal_settings: HealOpts,
+    heal_settings: HealStatusSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -1077,7 +1111,7 @@ struct HealTaskStatusPayload {
     #[serde(skip)]
     adapted_detail: Option<String>,
     #[serde(default, rename = "settings", skip_serializing)]
-    heal_settings: Option<HealOpts>,
+    heal_settings: Option<HealStatusSettings>,
     summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
@@ -1135,7 +1169,7 @@ fn encode_heal_task_status(
     fallback_heal_settings: HealOpts,
 ) -> S3Result<Vec<u8>> {
     let failure_detail = payload.adapted_detail.take().unwrap_or(failure_detail);
-    let heal_settings = payload.heal_settings.take().unwrap_or(fallback_heal_settings);
+    let heal_settings = payload.heal_settings.take().unwrap_or_else(|| fallback_heal_settings.into());
     encode_json(&HealTaskStatus {
         payload,
         failure_detail,
