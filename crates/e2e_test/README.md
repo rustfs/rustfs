@@ -36,13 +36,6 @@ The external-tool `storage_metric_ownership_test` validates the OTLP/Collector/P
 
 All commands assume repo root and Python 3.9 or newer on Linux or macOS. Build the server once through the provenance entry point, then run the test command through the same script:
 
-Root-heal interruption scenarios use a test-only commit barrier. Prebuild with `e2e-test-hooks` and pin that binary so concurrent cases do not replace it through on-demand builds:
-
-```bash
-cargo build -p rustfs --bin rustfs --features e2e-test-hooks
-CARGO_BIN_EXE_rustfs="$PWD/target/debug/rustfs" cargo nextest run -p e2e_test -E 'test(heal_erasure_disk_rebuild_test)'
-```
-
 ```bash
 python3 scripts/e2e_binary.py build --features e2e-test-hooks
 
@@ -54,6 +47,13 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run
 
 # PR smoke subset
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test
+```
+
+Root-heal interruption scenarios use a test-only commit barrier, so build and run them with `e2e-test-hooks`:
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run -p e2e_test -E 'test(heal_erasure_disk_rebuild_test)'
 ```
 
 `build` records the source contents, HEAD, resolved Cargo features, profile, toolchain, and binary SHA-256 beside the executable in `rustfs.e2e.json`. `run` validates that identity before and after the command, preserves command failures, and removes its temporary run receipt on completion. The Rust harness checks that receipt before starting each server; it never compiles a server inside a test process. Source or binary changes during a run invalidate the result, even when the test command succeeds. Use an isolated worktree and keep it unchanged until the command finishes.
