@@ -27,4 +27,4 @@ follow.
 
 ## Suggested Validation
 
-- `cargo test --package e2e_test`
+- `python3 scripts/e2e_binary.py build --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo test --package e2e_test` (running `cargo test -p e2e_test` directly fails with a missing E2E run receipt; see [`README.md`](README.md#how-to-run))

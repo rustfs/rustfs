@@ -28,9 +28,9 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
-    pub(crate) use s3s::S3Response;
+    pub(crate) use s3s::auth::SimpleAuth;
     #[cfg(test)]
-    pub(crate) use s3s::dto::ListObjectsInput;
+    pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
@@ -39,7 +39,13 @@ pub(crate) mod s3 {
         ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
     #[cfg(test)]
+    pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    #[cfg(test)]
+    pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
+    #[cfg(test)]
+    pub(crate) use s3s::{Body, S3, S3Response};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
 }
 
@@ -266,10 +272,10 @@ pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
-        bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
-        prepare_odm_read_generation, recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut,
-        req_info_ref,
+        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
+        replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
@@ -1196,7 +1202,7 @@ pub(crate) mod object_usecase {
         }
 
         pub(crate) mod object {
-            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+            pub(crate) use super::super::super::storage_contracts::{ListOperations, ObjectIO, ObjectOperations};
         }
 
         pub(crate) mod range {

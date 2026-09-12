@@ -1626,6 +1626,72 @@ mod tests {
         aborting_full_queue_settles_pending_send().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn delayed_reader_error_keeps_source_and_drops_every_encode_path() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("injected request body inactivity")]
+        struct BodyInactivity;
+
+        #[derive(Debug)]
+        struct StalledReader {
+            data: Cursor<Vec<u8>>,
+            timer: Option<Pin<Box<tokio::time::Sleep>>>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl AsyncRead for StalledReader {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.data.position() < self.data.get_ref().len() as u64 {
+                    return Pin::new(&mut self.data).poll_read(cx, buf);
+                }
+                let timer = self
+                    .timer
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_secs(300))));
+                std::task::ready!(timer.as_mut().poll(cx));
+                Poll::Ready(Err(std::io::Error::other(BodyInactivity)))
+            }
+        }
+
+        impl Drop for StalledReader {
+            fn drop(&mut self) {
+                self.dropped.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        // Explicit entry points select the paths; environment caches and input
+        // size heuristics cannot silently turn this into repeated Vec coverage.
+        for path in ["direct", "vec", "bytesmut", "batched"] {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = StalledReader {
+                data: Cursor::new(vec![7; 64]),
+                timer: None,
+                dropped: Arc::clone(&dropped),
+            };
+            let committed = Arc::new(Mutex::new(Vec::new()));
+            let mut writers = (0..4)
+                .map(|_| Some(bitrot_writer(DeferredCommitWriter::new(Arc::clone(&committed)), 32)))
+                .collect::<Vec<_>>();
+            let erasure = Arc::new(Erasure::new(2, 2, 64));
+            let result = match path {
+                "direct" => erasure.encode_single_block_non_inline(reader, &mut writers, 2).await,
+                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false).await,
+                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true).await,
+                "batched" => erasure.encode_batched(reader, &mut writers, 2).await,
+                _ => unreachable!(),
+            };
+            let error = result.expect_err("stalled input must fail before shard commit");
+            assert!(error.get_ref().is_some_and(|source| source.is::<BodyInactivity>()), "{path}: {error:?}");
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::Acquire),
+                "{path} must release its reader/producer before returning"
+            );
+            assert!(
+                committed.lock().expect("committed bytes").is_empty(),
+                "{path} must not commit partial shards"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn helper_writers_cover_flush_and_shutdown_paths() {
         let mut failing_write = FailingWriteWriter;

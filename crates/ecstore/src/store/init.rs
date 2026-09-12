@@ -12330,6 +12330,23 @@ mod tests {
         .expect("tier free-version recovery should complete");
     }
 
+    /// Unlocked poll for exact metadata absence while asynchronous free-version
+    /// cleanup removes the per-disk copies. Mid-cleanup, fewer than a read
+    /// quorum of disks may still hold the record, so that transient result
+    /// means "not converged yet"; every other error still fails the test.
+    #[cfg(feature = "test-util")]
+    async fn exact_metadata_absent_during_cleanup(store: &crate::store::ECStore, bucket: &str, object: &str) -> bool {
+        match store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+        {
+            Ok(metadata) => metadata.is_none(),
+            Err(StorageError::InsufficientReadQuorum(_, _)) => false,
+            Err(error) => panic!("{object} cleanup metadata should remain readable: {error:?}"),
+        }
+    }
+
     #[cfg(feature = "test-util")]
     async fn wait_for_expiry_workers_idle(store: &crate::store::ECStore) {
         let expiry_state = store.ctx.expiry_state();
@@ -15503,12 +15520,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
-                    .get_disks_by_key(causal)
-                    .load_file_info_versions_exact(bucket, causal)
-                    .await
-                    .expect("causal batch cleanup metadata should remain readable")
-                    .is_none();
+                let metadata_absent = exact_metadata_absent_during_cleanup(&store, bucket, causal).await;
                 if metadata_absent && backend.remove_versions().await.len() >= 2 {
                     return;
                 }
@@ -15587,12 +15599,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = store.pools[0]
-                    .get_disks_by_key(versioned_causal)
-                    .load_file_info_versions_exact(bucket, versioned_causal)
-                    .await
-                    .expect("versioned causal batch cleanup metadata should remain readable")
-                    .is_none();
+                let metadata_absent = exact_metadata_absent_during_cleanup(&store, bucket, versioned_causal).await;
                 if metadata_absent && backend.remove_versions().await.len() == 3 {
                     return;
                 }
