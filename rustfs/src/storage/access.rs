@@ -1258,6 +1258,25 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?;
 
+            // A bucket policy granting s3:ListBucket also covers listing versions.
+            // Keep this compatibility fallback inside the same public-access gate.
+            let policy_allowed = policy_allowed
+                || (action == Action::S3Action(S3Action::ListBucketVersionsAction)
+                    && PolicySys::try_is_allowed_for_store(
+                        store.as_ref(),
+                        &BucketPolicyArgs {
+                            bucket: bucket.as_str(),
+                            action: Action::S3Action(S3Action::ListBucketAction),
+                            is_owner: false,
+                            account: "",
+                            groups: &None,
+                            conditions: &conditions,
+                            object: "",
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::from)?);
+
             if policy_allowed {
                 deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
