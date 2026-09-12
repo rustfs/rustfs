@@ -1277,6 +1277,25 @@ pub struct CheckPartsResp {
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
     pub replace_user_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reconcile: Option<Box<TransitionStateReconcileCondition>>,
+}
+
+/// An exact-copy precondition for the single-version tier repair protocol.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionStateReconcileCondition {
+    pub expected_metadata_digest: String,
+    pub unchanged_metadata_digest: String,
+    pub target: rustfs_filemeta::TransitionStateReconcileTarget,
+    pub tier: String,
+    pub topology_generation: String,
+    pub verify_only: bool,
+    /// Local ownership is never accepted from the wire. A remote disk acquires
+    /// its own fleet and backend leases before entering the mutation domain.
+    #[serde(skip)]
+    pub(crate) authority:
+        Option<Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>>,
 }
 
 pub struct DiskLocation {

@@ -90,6 +90,7 @@ s3s = { workspace = true, features = ["minio"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }

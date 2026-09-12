@@ -1538,6 +1538,14 @@ fn table_catalog_store_for_data_plane<T>(
         .map_err(|err| s3_error!(InternalError, "failed to configure table catalog backing: {}", err))
 }
 
+fn table_publication_guard_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    let code = match &err {
+        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
+        _ => S3ErrorCode::InternalError,
+    };
+    S3Error::with_message(code, format!("failed to acquire table publication guard: {err}"))
+}
+
 async fn retain_table_data_plane_publication_guard<T>(
     req: &mut S3Request<T>,
     table_bucket: &str,
@@ -1556,7 +1564,7 @@ async fn retain_table_data_plane_publication_guard<T>(
     let backend = table_catalog_backend_for_data_plane(req)?;
     let guard = crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, table_bucket, lock_object)
         .await
-        .map_err(|err| s3_error!(InternalError, "failed to acquire table publication guard: {}", err))?;
+        .map_err(table_publication_guard_error)?;
     let mut state = retained.state.lock();
     state.keys.insert(key);
     state.guards.push(Box::new(guard));
@@ -3106,7 +3114,8 @@ mod tests {
         merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
         put_bucket_policy_authorize_action, request_context_from_req, request_object_store, retention_write_requested,
         secondary_tag_hint_action, table_data_plane_admin_action, table_data_plane_content_mutation,
-        table_data_plane_resource_for_request, validate_post_object_success_controls, versioned_read_action,
+        table_data_plane_resource_for_request, table_publication_guard_error, validate_post_object_success_controls,
+        versioned_read_action,
     };
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -3266,6 +3275,155 @@ mod tests {
         ] {
             assert!(!table_data_plane_content_mutation(Action::S3Action(action)));
         }
+    }
+
+    #[test]
+    fn table_publication_guard_unavailable_errors_are_retryable() {
+        use crate::table_catalog::TableCatalogStoreError;
+
+        for message in [
+            "failed to acquire catalog migration lock: Quorum not reached: required 2, achieved 1",
+            "failed to acquire catalog migration lock: lock acquisition timed out after 5s",
+            "peer unavailable",
+            "",
+        ] {
+            let error = TableCatalogStoreError::Unavailable(message.to_string());
+            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let err = table_publication_guard_error(error);
+            assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{message}");
+            assert_eq!(
+                err.status_code().or_else(|| err.code().status_code()),
+                Some(http::StatusCode::SERVICE_UNAVAILABLE)
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+        }
+    }
+
+    #[test]
+    fn table_publication_guard_non_retryable_errors_stay_internal() {
+        use crate::table_catalog::TableCatalogStoreError;
+
+        let message = "temporarily unavailable: timeout: quorum not reached".to_string();
+        for error in [
+            TableCatalogStoreError::Internal(message.clone()),
+            TableCatalogStoreError::Invalid(message.clone()),
+            TableCatalogStoreError::Unsupported(message.clone()),
+            TableCatalogStoreError::NotFound(message.clone()),
+            TableCatalogStoreError::NamespaceNotFound(message.clone()),
+            TableCatalogStoreError::TableNotFound(message.clone()),
+            TableCatalogStoreError::AlreadyExists(message.clone()),
+            TableCatalogStoreError::Conflict(message),
+        ] {
+            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let err = table_publication_guard_error(error);
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+            assert_eq!(
+                err.status_code().or_else(|| err.code().status_code()),
+                Some(http::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn table_publication_guard_timeout_blocks_put_and_multipart_authorization() {
+        use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+        use std::time::Duration;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+        let bucket = format!("publication-timeout-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("test bucket should be created");
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("test bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("test policy should be published");
+        let lock_object = crate::table_catalog::default_table_bucket_publication_lock_path();
+        let lock = store
+            .new_ns_lock(&bucket, &lock_object)
+            .await
+            .expect("publication lock should be created");
+        let mut writer = lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("publication writer should hold the fence");
+        let mut put_req = build_request(
+            PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .build()
+                .expect("PUT input should build"),
+            Method::PUT,
+        );
+        let mut multipart_req = build_request(
+            CreateMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key("multipart-object".to_string())
+                .build()
+                .expect("multipart input should build"),
+            Method::POST,
+        );
+        ensure_req_info(&mut put_req);
+        ensure_req_info(&mut multipart_req);
+        put_req.extensions.insert(fs.server_ctx().clone());
+        multipart_req.extensions.insert(fs.server_ctx().clone());
+
+        for (operation, err) in [
+            (
+                "PutObject",
+                fs.put_object(&mut put_req)
+                    .await
+                    .expect_err("PUT must wait for the publication writer"),
+            ),
+            (
+                "CreateMultipartUpload",
+                fs.create_multipart_upload(&mut multipart_req)
+                    .await
+                    .expect_err("multipart initialization must wait for the publication writer"),
+            ),
+        ] {
+            assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{operation}: {err}");
+        }
+        for extensions in [&put_req.extensions, &multipart_req.extensions] {
+            assert!(extensions.get::<TableDataPlanePublicationGuards>().is_none());
+        }
+
+        assert!(writer.release());
+        for _ in 0..2 {
+            fs.put_object(&mut put_req)
+                .await
+                .expect("PUT may retry after publication finishes");
+            fs.create_multipart_upload(&mut multipart_req)
+                .await
+                .expect("multipart initialization may retry after publication finishes");
+            for extensions in [&put_req.extensions, &multipart_req.extensions] {
+                let retained = extensions
+                    .get::<TableDataPlanePublicationGuards>()
+                    .expect("successful admission retains the guard");
+                let state = retained.state.lock();
+                assert!(state.keys.contains(&(bucket.clone(), lock_object.clone())));
+                assert_eq!(state.guards.len(), 1, "repeated admission must reuse its retained guard");
+            }
+        }
+        drop(put_req);
+        drop(multipart_req);
+        lock.get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("dropping the request must release its publication guard");
     }
 
     #[test]

@@ -52,7 +52,11 @@ pub(crate) struct SiteReplicationRetryEvent {
     /// deletion body (if it was a deletion) recorded in
     /// [`SiteReplicationState::iam_deletion_replays`]. Only then may a
     /// successful deletion replay plus a stable snapshot resend settle the
-    /// entry; a legacy entry (or one degraded by record overflow) keeps the
+    /// entry. Every entry this binary creates starts recorded: the IAM
+    /// change hook records deletion bodies, and the other creators (the add
+    /// bootstrap's snapshot send, the drain's own replay) never carry a
+    /// deletion. A legacy entry persisted by a binary that predates recording
+    /// (serde default `false`), or one degraded by record overflow, keeps the
     /// escalation semantics because an unrecorded deletion may hide in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) deletions_recorded: bool,
@@ -308,7 +312,12 @@ fn push_site_replication_retry_event(
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: generation,
         peer_unreachable,
-        deletions_recorded: false,
+        // See the field doc: only a row persisted by an older binary is
+        // unrecorded. Stamping at creation is what lets an entry first
+        // created by the bootstrap snapshot send settle after a later
+        // deletion is replayed, instead of escalating forever
+        // (backlog#2367 A-3).
+        deletions_recorded: true,
     });
     Ok(evicted)
 }
@@ -598,22 +607,7 @@ pub(crate) fn record_failed_iam_delivery(
     item: &SRIAMItem,
     error: &str,
 ) -> S3Result<()> {
-    let existed = state
-        .retry_queue
-        .iter()
-        .any(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH));
     upsert_site_replication_retry_event(&mut state.retry_queue, peer, SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH, error, None)?;
-    if !existed
-        && let Some(event) = state
-            .retry_queue
-            .iter_mut()
-            .find(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH))
-    {
-        // Fresh entry: every failure it will ever collapse goes through this
-        // recording path, so a deletion replay plus a stable snapshot resend
-        // can later settle it instead of escalating.
-        event.deletions_recorded = true;
-    }
 
     let Some(entity) = iam_item_deletion_entity(item) else {
         return Ok(());
@@ -1418,6 +1412,33 @@ pub(crate) fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetr
     now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= delay
 }
 
+/// Backoff evaluation time for the heavyweight tick: halfway to the next
+/// tick. Backoffs are multiples of the tick interval, so an entry stamped δ
+/// seconds after a tick is `600 − δ` old at the next one and slipped a whole
+/// extra interval for every δ > 0 — a first replay landed at T+1200 rather
+/// than T+600 (backlog#2367 A-1). Evaluating at the midpoint bounds the slip
+/// to half an interval either way; timestamps written back stay real time.
+pub(crate) fn heavyweight_retry_drain_horizon(now: OffsetDateTime) -> OffsetDateTime {
+    let half_interval = crate::site_replication_reconcile::RECONCILE_INTERVAL / 2;
+    now + time::Duration::seconds(i64::try_from(half_interval.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// What the lightweight 30-second pass may act on. It replays bounded bucket
+/// ops only, but probes every backed-off class: promotion is a state flip
+/// the heavyweight tick then replays, so an IAM or bucket-metadata snapshot
+/// owed to a peer that came back is resent at the next tick instead of
+/// after its own backoff has fully elapsed (backlog#2367 A-1).
+pub(crate) fn lightweight_retry_drain_partition(
+    state: &SiteReplicationState,
+    now: OffsetDateTime,
+) -> (Vec<SiteReplicationRetryEvent>, Vec<SiteReplicationRetryEvent>) {
+    let mut actionable = actionable_site_replication_retry_events(state, now);
+    actionable.retain(|event| {
+        classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
+    });
+    (actionable, deferred_site_replication_retry_events(state, now))
+}
+
 /// The subset of the retry queue the background drain is allowed to touch.
 pub(crate) fn actionable_site_replication_retry_events(
     state: &SiteReplicationState,
@@ -1666,14 +1687,7 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
-    let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
-    let mut deferred = deferred_site_replication_retry_events(&runtime.state, now);
-    actionable.retain(|event| {
-        classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
-    });
-    deferred.retain(|event| {
-        classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
-    });
+    let (actionable, deferred) = lightweight_retry_drain_partition(&runtime.state, now);
     if actionable.is_empty() && deferred.is_empty() {
         return Ok(());
     }
@@ -1697,10 +1711,7 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
             return Ok(());
         }
         let now = OffsetDateTime::now_utc();
-        let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
-        actionable.retain(|event| {
-            classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
-        });
+        let (actionable, _) = lightweight_retry_drain_partition(&runtime.state, now);
         if actionable.is_empty() {
             return Ok(());
         }
@@ -1717,9 +1728,9 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     // The alert must fire even when nothing is drainable this tick —
     // escalated markers are exactly the entries the drain skips.
     log_site_replication_retry_liabilities(&runtime.state);
-    let now = OffsetDateTime::now_utc();
-    let actionable = actionable_site_replication_retry_events(&runtime.state, now);
-    let deferred = deferred_site_replication_retry_events(&runtime.state, now);
+    let horizon = heavyweight_retry_drain_horizon(OffsetDateTime::now_utc());
+    let actionable = actionable_site_replication_retry_events(&runtime.state, horizon);
+    let deferred = deferred_site_replication_retry_events(&runtime.state, horizon);
     if actionable.is_empty() && deferred.is_empty() {
         return Ok(());
     }
@@ -1764,8 +1775,8 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         {
             return Ok(());
         }
-        let now = OffsetDateTime::now_utc();
-        let actionable = actionable_site_replication_retry_events(&runtime.state, now);
+        let horizon = heavyweight_retry_drain_horizon(OffsetDateTime::now_utc());
+        let actionable = actionable_site_replication_retry_events(&runtime.state, horizon);
         if actionable.is_empty() {
             return Ok(());
         }

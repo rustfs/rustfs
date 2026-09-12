@@ -865,6 +865,7 @@ pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, ren
 mod ctx;
 mod metadata;
 mod ops;
+pub(crate) use ops::bucket::BucketInfoQuorum;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;
@@ -3851,7 +3852,7 @@ pub struct SetDisks {
     pub default_parity_count: usize,
     pub set_index: usize,
     pub pool_index: usize,
-    /// Stable namespace shared by every object lock created for this set.
+    /// Stable namespace shared by every object lock created for this pool.
     set_lock_namespace: Arc<str>,
     pub format: FormatV3,
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -3886,6 +3887,33 @@ pub struct SetDisks {
     rename_tail_heal_capture: Arc<
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_heal_contracts::heal_channel::HealChannelRequest>>>,
     >,
+}
+
+/// Read every physical copy before selecting a version quorum. A minority
+/// legacy record is still evidence and must not disappear behind a majority
+/// not-found result. Only an explicit file/volume absence produces `None`;
+/// an unreadable disk cannot prove that no conflicting copy exists.
+pub(crate) async fn read_legacy_transition_state_metadata_copies(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+) -> std::result::Result<Vec<Option<Vec<u8>>>, DiskError> {
+    let disk_object = rustfs_utils::path::encode_dir_object(object);
+    let disks = set.get_disks_internal().await;
+    if disks.is_empty() {
+        return Err(DiskError::DiskNotFound);
+    }
+
+    // Include inline bytes in the generation: a conditional repair preserves
+    // the entire xl.meta, including payloads belonging to other versions.
+    let (copies, errs) = SetDisks::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), true).await;
+    for err in errs.into_iter().flatten() {
+        if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) {
+            return Err(err);
+        }
+    }
+
+    Ok(copies.into_iter().map(|copy| copy.map(|copy| copy.buf)).collect())
 }
 
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
@@ -4236,7 +4264,7 @@ impl SetDisks {
         self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
     }
 
-    async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
+    pub(crate) async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
         let hash = self.get_object_metadata_cache_hash(bucket, object);
         let hash_bytes = hash.to_le_bytes();
         let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
@@ -4463,7 +4491,7 @@ impl SetDisks {
         instance_ctx: Arc<InstanceContext>,
     ) -> Arc<Self> {
         let ctx = instance_ctx;
-        let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
+        let set_lock_namespace: Arc<str> = format!("pool-{pool_index}").into();
         let shared_lockers = Arc::from(lockers.to_vec());
         Arc::new(SetDisks {
             locker_owner,
@@ -4577,7 +4605,9 @@ impl SetDisks {
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
             (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
-            (true, true) => same_distributed_lock_domain(&self.lockers, &other.lockers),
+            (true, true) => {
+                self.set_lock_namespace == other.set_lock_namespace && same_distributed_lock_domain(&self.lockers, &other.lockers)
+            }
             _ => false,
         }
     }
@@ -7095,7 +7125,7 @@ mod tests {
         ctx.update_erasure_type(SetupType::Erasure).await;
         let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
 
-        assert_eq!(&*set.set_lock_namespace, "set-0-0");
+        assert_eq!(&*set.set_lock_namespace, "pool-0");
         let before = Arc::strong_count(&set.set_lock_namespace);
         let lock = set
             .new_ns_lock("bucket", "object")
@@ -8317,6 +8347,78 @@ mod tests {
         assert!(
             err_str.contains("quorum") || err_str.contains("not reached"),
             "expected quorum error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_new_ns_lock_distributed_write_succeeds_with_three_lockers_one_offline() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager_a = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager_b = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_a));
+        let healthy_b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_b));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_a, failing_client, healthy_b]).await;
+
+        let guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect("two healthy lockers should satisfy the three-locker write quorum");
+
+        match guard {
+            NamespaceLockGuard::Standard(_) => {}
+            NamespaceLockGuard::Fast(_) => panic!("Expected distributed guard for dist-erasure"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn namespace_lock_domain_includes_pool_namespace() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let first: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let second: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let lockers = vec![first, second];
+        let same_pool_first_set = make_test_set_disks_with_ctx(lockers.clone(), bootstrap_ctx()).await;
+        let same_pool_second_set = SetDisks::new_with_instance_ctx(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None, None])),
+            2,
+            1,
+            1,
+            0,
+            same_pool_first_set.set_endpoints.clone(),
+            FormatV3::new(2, 2),
+            lockers.clone(),
+            bootstrap_ctx(),
+        )
+        .await;
+        let other_pool_set = SetDisks::new_with_instance_ctx(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None, None])),
+            2,
+            1,
+            0,
+            1,
+            same_pool_first_set.set_endpoints.clone(),
+            FormatV3::new(1, 2),
+            lockers,
+            bootstrap_ctx(),
+        )
+        .await;
+
+        assert!(
+            same_pool_first_set.shares_namespace_lock_domain(&same_pool_second_set).await,
+            "sets in the same pool share the object namespace lock domain"
+        );
+        assert!(
+            !same_pool_first_set.shares_namespace_lock_domain(&other_pool_set).await,
+            "different pool namespaces must not be deduplicated solely by identical clients"
         );
     }
 

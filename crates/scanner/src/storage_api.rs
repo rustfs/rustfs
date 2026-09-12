@@ -28,6 +28,13 @@ pub(crate) use s3s::dto::{
 #[cfg(test)]
 pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
 
+pub(crate) use rustfs_ecstore::api::data_usage::{
+    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
+    register_scanner_pause_backlog_retirement_planner,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::data_usage::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
+
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
@@ -135,6 +142,13 @@ use rustfs_storage_api as storage_contracts;
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    pub(crate) use super::{
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
+        register_scanner_pause_backlog_retirement_planner,
+    };
+    #[cfg(test)]
+    pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
+
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
 

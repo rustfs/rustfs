@@ -464,6 +464,7 @@ pub(super) fn completed_usage_candidate(
                 scan_plan_digest: Some(result.info.scan_plan_digest?.0),
                 complete: true,
                 tombstone: false,
+                segment_invalidation_proof: result.info.segment_invalidation_proof.clone(),
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -642,13 +643,14 @@ pub(super) fn observational_data_usage_info(
         let current_snapshot = current.is_some();
         let selected = current.or(lkg);
         if let Some(selected) = selected {
-            let (cycle, epoch, digest, last_update, complete) = if current_snapshot {
+            let (cycle, epoch, digest, last_update, complete, segment_invalidation_proof) = if current_snapshot {
                 (
                     Some(selected.info.next_cycle),
                     Some(selected.info.leader_epoch),
                     selected.info.scan_plan_digest.map(|digest| digest.0),
                     selected.info.last_update,
                     true,
+                    selected.info.segment_invalidation_proof.clone(),
                 )
             } else {
                 (
@@ -657,6 +659,7 @@ pub(super) fn observational_data_usage_info(
                     selected.info.lkg_scan_plan_digest.map(|digest| digest.0),
                     selected.info.lkg_last_update,
                     false,
+                    None,
                 )
             };
             set_states.push(DataUsageSnapshotSetState {
@@ -667,6 +670,7 @@ pub(super) fn observational_data_usage_info(
                 scan_plan_digest: digest,
                 complete,
                 tombstone: false,
+                segment_invalidation_proof,
             });
             usable.push((selected, last_update));
         } else {
@@ -678,6 +682,7 @@ pub(super) fn observational_data_usage_info(
                 scan_plan_digest: Some(expected_plan_digest.0),
                 complete: false,
                 tombstone: false,
+                segment_invalidation_proof: None,
             });
         }
     }

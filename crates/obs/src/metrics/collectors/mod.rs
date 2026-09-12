@@ -17,6 +17,7 @@ pub mod bucket;
 pub mod bucket_replication;
 pub mod cluster;
 pub mod cluster_config;
+pub(crate) mod cluster_drive;
 pub mod cluster_erasure_set;
 pub mod cluster_health;
 pub mod cluster_iam;

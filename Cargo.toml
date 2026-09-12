@@ -73,7 +73,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.98.0"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
@@ -90,62 +90,62 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rustfs = { path = "./rustfs", version = "1.0.0-rc.5" }
-rustfs-heal = { path = "crates/heal", version = "1.0.0-rc.5" }
-rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.0-rc.5" }
-rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.0-rc.5" }
-rustfs-audit = { path = "crates/audit", version = "1.0.0-rc.5" }
-rustfs-checksums = { path = "crates/checksums", version = "1.0.0-rc.5" }
-rustfs-common = { path = "crates/common", version = "1.0.0-rc.5" }
-rustfs-data-usage = { path = "crates/data-usage", version = "1.0.0-rc.5" }
-rustfs-config = { path = "./crates/config", version = "1.0.0-rc.5" }
-rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-rc.5" }
-rustfs-credentials = { path = "crates/credentials", version = "1.0.0-rc.5" }
-rustfs-crypto = { path = "crates/crypto", version = "1.0.0-rc.5" }
-rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-rc.5" }
-rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-rc.5" }
-rustfs-iam = { path = "crates/iam", version = "1.0.0-rc.5" }
-rustfs-keystone = { path = "crates/keystone", version = "1.0.0-rc.5" }
-rustfs-license = { path = "crates/license", version = "1.0.0-rc.5" }
-rustfs-lifecycle = { path = "crates/lifecycle", version = "1.0.0-rc.5" }
-rustfs-kms = { path = "crates/kms", version = "1.0.0-rc.5" }
-rustfs-lock = { path = "crates/lock", version = "1.0.0-rc.5" }
-rustfs-madmin = { path = "crates/madmin", version = "1.0.0-rc.5" }
-rustfs-notify = { path = "crates/notify", version = "1.0.0-rc.5" }
-rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-rc.5" }
-rustfs-io-core = { path = "crates/io-core", version = "1.0.0-rc.5" }
-rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-rc.5" }
-rustfs-object-data-cache = { path = "crates/object-data-cache", version = "1.0.0-rc.5", default-features = false }
-rustfs-log-analyzer = { path = "crates/log-analyzer", version = "1.0.0-rc.5" }
-rustfs-obs = { path = "crates/obs", version = "1.0.0-rc.5" }
-rustfs-policy = { path = "crates/policy", version = "1.0.0-rc.5" }
-rustfs-protos = { path = "crates/protos", version = "1.0.0-rc.5" }
-rustfs-protocols = { path = "crates/protocols", version = "1.0.0-rc.5" }
-rustfs-replication = { path = "crates/replication", version = "1.0.0-rc.5" }
-rustfs-rio = { path = "crates/rio", version = "1.0.0-rc.5" }
-rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-rc.5" }
-rustfs-s3-client = { path = "crates/s3-client", version = "1.0.0-rc.5" }
-rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-rc.5" }
-rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-rc.5" }
-rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-rc.5" }
-rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-rc.5" }
-rustfs-scanner = { path = "crates/scanner", version = "1.0.0-rc.5" }
-rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-rc.5" }
-rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.0-rc.5" }
-rustfs-signer = { path = "crates/signer", version = "1.0.0-rc.5" }
-rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-rc.5" }
-rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-rc.5" }
-rustfs-targets = { path = "crates/targets", version = "1.0.0-rc.5" }
-rustfs-test-utils = { path = "crates/test-utils", version = "1.0.0-rc.5" }
-rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-rc.5" }
-rustfs-utils = { path = "crates/utils", version = "1.0.0-rc.5" }
-rustfs-zip = { path = "./crates/zip", version = "1.0.0-rc.5" }
+rustfs = { path = "./rustfs", version = "1.0.0-rc.6" }
+rustfs-heal = { path = "crates/heal", version = "1.0.0-rc.6" }
+rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.0-rc.6" }
+rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.0-rc.6" }
+rustfs-audit = { path = "crates/audit", version = "1.0.0-rc.6" }
+rustfs-checksums = { path = "crates/checksums", version = "1.0.0-rc.6" }
+rustfs-common = { path = "crates/common", version = "1.0.0-rc.6" }
+rustfs-data-usage = { path = "crates/data-usage", version = "1.0.0-rc.6" }
+rustfs-config = { path = "./crates/config", version = "1.0.0-rc.6" }
+rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-rc.6" }
+rustfs-credentials = { path = "crates/credentials", version = "1.0.0-rc.6" }
+rustfs-crypto = { path = "crates/crypto", version = "1.0.0-rc.6" }
+rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-rc.6" }
+rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-rc.6" }
+rustfs-iam = { path = "crates/iam", version = "1.0.0-rc.6" }
+rustfs-keystone = { path = "crates/keystone", version = "1.0.0-rc.6" }
+rustfs-license = { path = "crates/license", version = "1.0.0-rc.6" }
+rustfs-lifecycle = { path = "crates/lifecycle", version = "1.0.0-rc.6" }
+rustfs-kms = { path = "crates/kms", version = "1.0.0-rc.6" }
+rustfs-lock = { path = "crates/lock", version = "1.0.0-rc.6" }
+rustfs-madmin = { path = "crates/madmin", version = "1.0.0-rc.6" }
+rustfs-notify = { path = "crates/notify", version = "1.0.0-rc.6" }
+rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-rc.6" }
+rustfs-io-core = { path = "crates/io-core", version = "1.0.0-rc.6" }
+rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-rc.6" }
+rustfs-object-data-cache = { path = "crates/object-data-cache", version = "1.0.0-rc.6", default-features = false }
+rustfs-log-analyzer = { path = "crates/log-analyzer", version = "1.0.0-rc.6" }
+rustfs-obs = { path = "crates/obs", version = "1.0.0-rc.6" }
+rustfs-policy = { path = "crates/policy", version = "1.0.0-rc.6" }
+rustfs-protos = { path = "crates/protos", version = "1.0.0-rc.6" }
+rustfs-protocols = { path = "crates/protocols", version = "1.0.0-rc.6" }
+rustfs-replication = { path = "crates/replication", version = "1.0.0-rc.6" }
+rustfs-rio = { path = "crates/rio", version = "1.0.0-rc.6" }
+rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-rc.6" }
+rustfs-s3-client = { path = "crates/s3-client", version = "1.0.0-rc.6" }
+rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-rc.6" }
+rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-rc.6" }
+rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-rc.6" }
+rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-rc.6" }
+rustfs-scanner = { path = "crates/scanner", version = "1.0.0-rc.6" }
+rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-rc.6" }
+rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.0-rc.6" }
+rustfs-signer = { path = "crates/signer", version = "1.0.0-rc.6" }
+rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-rc.6" }
+rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-rc.6" }
+rustfs-targets = { path = "crates/targets", version = "1.0.0-rc.6" }
+rustfs-test-utils = { path = "crates/test-utils", version = "1.0.0-rc.6" }
+rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-rc.6" }
+rustfs-utils = { path = "crates/utils", version = "1.0.0-rc.6" }
+rustfs-zip = { path = "./crates/zip", version = "1.0.0-rc.6" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
-async-compression = { version = "0.4.44" }
+async-compression = { version = "0.4.46" }
 async-recursion = "1.1.1"
 async-trait = "0.1.92"
 async-nats = { version = "0.50.0", default-features = false }
@@ -156,7 +156,7 @@ futures-lite = "2.6.1"
 futures-util = "0.3.34"
 pollster = "1.0.1"
 pulsar = { default-features = false, version = "6.9.0" }
-lapin = { default-features = false, version = "4.10.0" }
+lapin = { default-features = false, version = "4.11.0" }
 hyper = { version = "1.11.1" }
 hyper-rustls = { default-features = false, version = "0.27.9" }
 hyper-util = { version = "0.1.20" }
@@ -164,7 +164,7 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 minlz = "1.2.3"
-reqwest = "0.13.4"
+reqwest = "0.13.5"
 rustfs-kafka-async = { version = "1.3.1" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.1" }
@@ -211,7 +211,7 @@ openidconnect = { default-features = false, version = "4.0" }
 pbkdf2 = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "=0.10.0-rc.18" }
-rustls = { default-features = false, version = "0.23.43" }
+rustls = { default-features = false, version = "0.23.44" }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.15.1"
 x509-parser = "0.18.1"
@@ -245,7 +245,7 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.12.0" }
 aws-credential-types = { version = "1.3.0" }
 aws-sdk-kms = { default-features = false, version = "1.118.0" }
-aws-sdk-s3 = { default-features = false, version = "1.145.0" }
+aws-sdk-s3 = { default-features = false, version = "1.146.0" }
 aws-sdk-sts = { default-features = false, version = "1.114.0" }
 aws-smithy-async = { version = "1.3.0" }
 aws-smithy-http-client = { default-features = false, version = "1.4.0" }
@@ -297,7 +297,7 @@ percent-encoding = "2.3.2"
 # Server-side QR rendering for TOTP enrollment, so neither the console nor the
 # CLI needs its own QR encoder. No default features: the image/render backends
 # pull in an image stack this only needs SVG and text output from.
-qrcode-rs = { version = "2.0.0", default-features = false, features = ["std", "svg"] }
+qrcode-rs = { version = "2.1.0", default-features = false, features = ["std", "svg"] }
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.2" }
@@ -335,7 +335,7 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.26.0" }
+uuid = { version = "1.26.1" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
@@ -362,10 +362,10 @@ pyroscope = { version = "2.1.1" }
 # FTP and SFTP
 libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
-suppaftp = { version = "11.0.0" }
+suppaftp = { version = "12.0.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.63.2" }
-russh-sftp = "2.4.0"
+russh = { version = "0.63.3" }
+russh-sftp = "3.0.0"
 
 # WebDAV
 dav-server = "0.11.0"
@@ -373,7 +373,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.3" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "=0.25.0", default-features = false }
+hotpath = { version = "0.25.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 

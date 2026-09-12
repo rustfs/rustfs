@@ -7,13 +7,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -23,10 +24,484 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha, write_json
+from scanner_abba import (
+    MAX_JSON_BYTES,
+    RELEASE_PROFILE_ARTIFACTS,
+    SCENARIOS,
+    digest,
+    number,
+    read_json,
+    require,
+    sha,
+    write_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCANNER_HEAL_REGISTRY_SCHEMA_MAX = 2
+SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
+    "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13", "G14",
+    "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
+)
+SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G01": (
+        "root_authority_evidence",
+        "quota_authority_evidence",
+    ),
+    "G02": (
+        "bounded_checkpoint_oracle",
+        "independent_version_inventory",
+    ),
+    "G03": (
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle",
+    ),
+    "G04": (
+        "cache_boundary_crash_evidence",
+        "root_floor_intent_crash_evidence",
+    ),
+    "G05": (
+        "per_object_outcome_oracle",
+        "terminal_retention_bounds",
+    ),
+    "G06": (
+        "concurrent_status_evidence",
+        "legacy_client_compatibility",
+        "truncation_behavior",
+    ),
+    "G07": (
+        "mrf_responsibility_oracle",
+        "commit_boundary_crash_matrix",
+    ),
+    "G08": (
+        "mrf_capacity_evidence",
+        "disk_full_matrix",
+        "replica_loss_matrix",
+    ),
+    "G09": (
+        "mixed_version_reader_evidence",
+        "mixed_version_writer_evidence",
+        "rollback_payload_evidence",
+    ),
+    "G10": (
+        "scheduler_bound_evidence",
+        "pressure_recovery_evidence",
+    ),
+    "G11": (
+        "maintenance_producer_matrix",
+        "complete_producer_inventory",
+        "segment_activation_preflight",
+    ),
+    "G12": (
+        "reset_quota_path_evidence",
+        "settlement_quota_path_evidence",
+    ),
+    "G13": (
+        "quorum_minus_one_matrix",
+        "unknown_disk_remount_matrix",
+        "object_lock_dry_run_grace_evidence",
+    ),
+    "G14": (
+        "same_window_field_evidence",
+        "ec8_4_evidence",
+        "multi_set_evidence",
+        "multi_pool_evidence",
+        "distributed_segment_invalidation_evidence",
+    ),
+    "P1": (
+        "cold_walk_share_measurement",
+        "foreground_latency_throughput_measurement",
+        "profile_evidence",
+    ),
+    "P2": (
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement",
+    ),
+    "P3": (
+        "two_hour_pressure_measurement",
+        "heal_capacity_measurement",
+        "recovery_window_measurement",
+    ),
+    "P4": (
+        "mrf_scale_measurement",
+        "mrf_replay_cost_measurement",
+        "retained_responsibility_evidence",
+        "mrf_cleanup_gc_soak_evidence",
+    ),
+    "R-E": (
+        "fixed_budget_restart_evidence",
+        "enumeration_evidence",
+        "classification_evidence",
+    ),
+    "R-D": (
+        "manager_disposition_evidence",
+        "event_disposition_evidence",
+        "ledger_disposition_evidence",
+        "grace_handling",
+    ),
+    "R-L": (
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence",
+    ),
+}
+SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
+    "G01": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G01"],
+    "G02": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G02"],
+    "G03": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G03"],
+    "G04": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G04"],
+    "G05": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G05"],
+    "G06": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G06"],
+    "G07": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G07"],
+    "G08": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G08"],
+    "G09": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G09"],
+    "G10": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G10"],
+    "G11": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G11"],
+    "G12": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G12"],
+    "G13": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G13"],
+    "G14": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G14"],
+    "P1": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P1"],
+    "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
+    "P3": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P3"],
+    "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
+    "R-E": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-E"],
+    "R-D": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-D"],
+    "R-L": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-L"],
+}
+SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
+    ("G03", "durable_root_publication_proof"): "durable-root-publication",
+    ("G03", "scoped_ack_request_identity"): "scoped-ack-request",
+    ("G03", "participating_peer_capability_snapshot"): "peer-capability-snapshot",
+    ("G03", "mixed_peer_ack_fallback_oracle"): "mixed-peer-ack-fallback",
+    ("G09", "mixed_version_reader_evidence"): "mixed-version-reader",
+    ("G09", "mixed_version_writer_evidence"): "mixed-version-writer",
+    ("G09", "rollback_payload_evidence"): "rollback-payload",
+    ("R-L", "legacy_source_conflict_evidence"): "legacy-source-conflict",
+    ("R-L", "migration_gap_evidence"): "migration-gap",
+    ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
+}
+SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES = (
+    "root-cas-success",
+    "root-readback-success",
+    "incomplete-root-rejected",
+    "stale-root-rejected",
+)
+SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES = (
+    "quota-floor-readback",
+    "quota-over-limit-rejected",
+    "rejected-object-invisible",
+    "quota-fails-closed-without-authority",
+)
+SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
+    ("G07", "mrf_responsibility_oracle"),
+    ("G07", "commit_boundary_crash_matrix"),
+    ("P4", "mrf_replay_cost_measurement"),
+    ("P4", "retained_responsibility_evidence"),
+    ("P4", "mrf_cleanup_gc_soak_evidence"),
+}
+SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS = {
+    ("G07", "mrf_responsibility_oracle"): "mrf-durable-responsibility-oracle",
+    ("G07", "commit_boundary_crash_matrix"): "mrf-commit-boundary-crash-matrix",
+    ("G08", "mrf_capacity_evidence"): "mrf-capacity-boundary",
+    ("G08", "disk_full_matrix"): "mrf-disk-full-enospc-matrix",
+    ("G08", "replica_loss_matrix"): "mrf-replica-loss-matrix",
+    ("P4", "mrf_scale_measurement"): "mrf-scale-measurement",
+    ("P4", "mrf_replay_cost_measurement"): "mrf-replay-cost-measurement",
+    ("P4", "retained_responsibility_evidence"): "mrf-retained-responsibility-soak",
+    ("P4", "mrf_cleanup_gc_soak_evidence"): "mrf-cleanup-gc-soak",
+}
+SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS = (
+    "missing_producer_identity",
+    "missing_durable_journal_replay",
+    "restart_gap",
+    "generation_gap",
+    "overflow",
+    "stale_ack_generation",
+    "missing_cold_zero_walk_oracle",
+    "distributed_without_peer_invalidation",
+)
+SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS = (
+    "source",
+    "bucket_incarnation",
+    "key_format",
+    "baseline_scan_plan_digest",
+    "process_epoch",
+    "generation_window",
+    "producer_identities",
+    "durable_dirty_producer_journal",
+    "ack_generation_guard",
+)
+SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES = (
+    "put_object",
+    "delete_object",
+    "delete_marker",
+    "complete_multipart_upload",
+    "abort_multipart_upload",
+    "object_metadata",
+    "bucket_metadata",
+    "replication",
+    "tier_transition",
+    "tier_expiration",
+    "directory_object",
+)
+SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES = (
+    "put",
+    "delete",
+    "delete_marker",
+    "multipart",
+    "replication",
+    "tier",
+    "directory_object",
+)
+SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES = (
+    "corrupt-record",
+    "mixed-version-producer",
+    "oversized-record",
+    "unsupported-producer",
+    "invalid-generation",
+)
+SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES = {
+    "maintenance_producer_matrix": (
+        "object-mutation-producers",
+        "metadata-mutation-producers",
+        "replication-tier-producers",
+        "directory-object-producer",
+    ),
+    "complete_producer_inventory": SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+}
+SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES = {
+    "quorum_minus_one_matrix": (
+        "read-quorum-minus-one",
+        "write-quorum-minus-one",
+        "heal-quorum-minus-one",
+        "restart-quorum-minus-one",
+    ),
+    "unknown_disk_remount_matrix": (
+        "unknown-disk-excluded-from-quorum",
+        "known-disk-remount-rejoins",
+        "stale-disk-remount-rejected",
+    ),
+    "object_lock_dry_run_grace_evidence": (
+        "object-lock-delete-denied",
+        "dry-run-does-not-mutate",
+        "grace-window-retains-terminal-outcome",
+    ),
+}
+SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES = {
+    "mrf_responsibility_oracle": (
+        "legacy-journal-replay",
+        "scoped-journal-replay",
+        "committed-checkpoint-replay",
+    ),
+    "commit_boundary_crash_matrix": (
+        "before-committed-payload",
+        "after-payload-before-manifest",
+        "after-manifest-before-cleanup",
+        "restart-replay-before-successor",
+    ),
+}
+SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
+    "mrf_capacity_evidence": (
+        "queue-count-limit",
+        "journal-byte-limit",
+        "committed-payload-byte-limit",
+    ),
+    "disk_full_matrix": (
+        "payload-write-enospc",
+        "manifest-write-enospc",
+        "journal-write-enospc",
+        "cleanup-delete-enospc",
+    ),
+    "replica_loss_matrix": (
+        "single-replica-loss",
+        "quorum-minus-one",
+        "all-replicas-unavailable",
+    ),
+}
+SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES = (
+    "retained-anchor-survives-restart",
+    "verified-successor-allows-idle-gc",
+    "stale-legacy-journal-cleanup",
+    "repeated-replay-no-resurrection",
+)
+SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
+    ("G04", "root_floor_intent_crash_evidence"): (
+        "persist-failure-no-202",
+        "same-key-retry-reuses-intent",
+        "different-params-conflict",
+        "process-restart-replay",
+    ),
+}
+SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES = {
+    "reset_quota_path_evidence": (
+        "storage-owner-reconstruction",
+        "future-reservation-protocol-fail-closed",
+        "reservation-ledger-retained",
+    ),
+    "settlement_quota_path_evidence": (
+        "distributed-hard-quota-admission",
+        "quota-stats-current-usage-observed",
+        "oversized-put-rejected",
+        "rejected-object-not-visible",
+    ),
+}
+SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES = (
+    "object-repaired",
+    "object-already-healthy",
+    "object-skipped-by-policy",
+    "object-failed-and-retained",
+)
+SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES = (
+    "finished-retained-until-window",
+    "failed-retained-until-window",
+    "canceled-retained-until-window",
+    "expired-terminal-pruned-after-window",
+)
+SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES = (
+    "status-during-admin-heal",
+    "status-during-background-heal",
+    "status-while-peer-down",
+    "status-after-peer-rejoin",
+)
+SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES = (
+    "rustfs-admin-v3-background-heal-status",
+    "minio-admin-v3-background-heal-status",
+    "heal-client-token-empty-body",
+    "node-heal-status-v1-wire",
+)
+SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES = (
+    "oversize-node-status-reject",
+    "truncated-node-status-reject",
+    "trailing-data-node-status-reject",
+)
+SCANNER_HEAL_RELEASE_RD_MANAGER_CASES = (
+    "accepted",
+    "coalesced-duplicate",
+    "rejected-policy",
+    "terminal-retained",
+)
+SCANNER_HEAL_RELEASE_RD_EVENT_CASES = (
+    "event-repaired",
+    "event-failed",
+    "event-skipped",
+    "event-grace-retained",
+)
+SCANNER_HEAL_RELEASE_RD_LEDGER_CASES = (
+    "ledger-recorded",
+    "ledger-replayed",
+    "ledger-discharged",
+    "ledger-pruned-after-grace",
+)
+SCANNER_HEAL_RELEASE_RD_GRACE_CASES = (
+    "grace-open-retains-disposition",
+    "grace-expired-prunes-terminal",
+    "restart-preserves-grace-clock",
+)
+SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES = {
+    "legacy_source_conflict_evidence": (
+        "data-movement-owned-target-equivalence",
+        "newer-target-conflict-rejected",
+        "legacy-part-checksum-gap-rejected",
+    ),
+    "migration_gap_evidence": (
+        "encrypted-iam-decrypt-before-normalize",
+        "empty-legacy-source-inherits-prior-responsibilities",
+        "missing-corrupt-empty-sources-fail-closed",
+    ),
+    "crash_safe_source_retirement_evidence": (
+        "source-change-capacity-failure-keeps-old-commit",
+        "torn-inactive-payload-keeps-previous-anchor",
+        "commit-boundary-lost-response-idempotent",
+        "successor-retry-validates-orphan",
+    ),
+}
+SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
+    "durable_root_publication_proof": (
+        "root-cas-success",
+        "root-readback-success",
+        "dirty-fallback-on-missing-proof",
+    ),
+    "scoped_ack_request_identity": (
+        "bucket-incarnation",
+        "exact-generation",
+        "scanner-instance",
+        "participating-peer-set",
+        "cleared-count-bound",
+    ),
+    "participating_peer_capability_snapshot": (
+        "supports-scoped-ack",
+        "probe-only-fallback",
+        "missing-capability-dirty",
+    ),
+    "mixed_peer_ack_fallback_oracle": (
+        "legacy-peer-fallback",
+        "truncated-token-reject",
+        "restarted-peer-reject",
+    ),
+}
+SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS = {
+    "durable_root_publication_proof": (
+        "root_cas_observed",
+        "root_readback_observed",
+        "dirty_fallback_on_missing_proof_observed",
+    ),
+    "scoped_ack_request_identity": (
+        "bucket_incarnation_observed",
+        "exact_generation_observed",
+        "scanner_instance_observed",
+        "participating_peer_set_observed",
+        "whole_cycle_fallback_observed",
+        "cleared_count_bound_observed",
+    ),
+    "participating_peer_capability_snapshot": (
+        "capability_probe_observed",
+        "scoped_ack_capability_observed",
+        "probe_only_fallback_observed",
+        "missing_capability_kept_dirty",
+    ),
+    "mixed_peer_ack_fallback_oracle": (
+        "legacy_peer_fallback_observed",
+        "truncated_token_rejected",
+        "restarted_peer_rejected",
+    ),
+}
+SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES = {
+    "mixed_version_reader_evidence": (
+        "old-writer-new-reader",
+        "new-writer-old-reader",
+    ),
+    "mixed_version_writer_evidence": (
+        "old-reader-new-writer",
+        "new-reader-old-writer",
+    ),
+    "rollback_payload_evidence": (
+        "rollback-to-old",
+        "rollback-to-new",
+        "unknown-field-retained",
+    ),
+}
+SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES = (
+    "retain-pending-replay-anchor",
+    "verified-proof-discharges-anchor",
+    "idle-cleanup-reclaims-runtime-checkpoint",
+    "idle-cleanup-reclaims-replay-source",
+)
+SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS = (
+    "admission-retry-idempotency",
+    "deadline-budget",
+    "lock-hold-bound",
+    "minimum-progress",
+)
+SCANNER_HEAL_RELEASE_PRESSURE_METRICS = (
+    "foreground_p95_ms",
+    "foreground_p99_ms",
+    "throughput_ops",
+    "error_rate",
+    "heal_lock_wait_p99_ms",
+    "attempt_cost_samples",
+)
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -886,14 +1361,57 @@ def evidence_integer(value: object, name: str, minimum: int, maximum: int) -> in
     return value
 
 
+def evidence_string(value: object, name: str, pattern: str | None = None) -> str:
+    require(isinstance(value, str) and value.strip(), f"invalid string {name}")
+    if pattern is not None:
+        require(re.fullmatch(pattern, value) is not None, f"invalid string {name}")
+    return value
+
+
+def evidence_timestamp(value: object, name: str) -> datetime:
+    text = evidence_string(value, name)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"invalid timestamp {name}") from error
+    require(parsed.tzinfo is not None, f"{name} must include timezone")
+    return parsed
+
+
+def evidence_string_list(value: object, name: str) -> list[str]:
+    require(
+        isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value),
+        f"{name} must be a non-empty string list",
+    )
+    return value
+
+
+def evidence_exact_strings(value: object, expected: tuple[str, ...], name: str) -> list[str]:
+    strings = evidence_string_list(value, name)
+    observed = set(strings)
+    require(len(observed) == len(strings), f"duplicate {name}")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"missing {name}: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"unknown {name}: {', '.join(unknown)}")
+    return strings
+
+
+def scanner_heal_registry_schema(registry: dict[str, object]) -> int:
+    return evidence_integer(registry.get("schema"), "registry schema", 1, SCANNER_HEAL_REGISTRY_SCHEMA_MAX)
+
+
 def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
-    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    scanner_heal_registry_schema(registry)
     cases = registry.get("cases")
     require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
     names = set()
     for case_id, requirement in cases.items():
         require(isinstance(case_id, str) and case_id, "invalid scanner/heal case identity")
+        lane = requirement.get("lane")
+        require(isinstance(lane, str) and re.fullmatch(r"[a-z0-9-]+", lane) is not None,
+                f"invalid nextest profile lane for {case_id}")
         oracle = requirement.get("oracle")
         require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
         path = Path(oracle)
@@ -902,8 +1420,111 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
                 f"invalid evidence for {case_id}")
         require(type(requirement.get("unclean_shutdown_marker")) is bool,
                 f"invalid unclean-shutdown marker expectation for {case_id}")
+        if "erasure" in requirement:
+            erasure = requirement["erasure"]
+            require(isinstance(erasure, dict), f"invalid erasure expectation for {case_id}")
+            data_blocks = evidence_integer(erasure.get("data_blocks"), f"{case_id} data_blocks", 1, 16)
+            parity_blocks = evidence_integer(erasure.get("parity_blocks"), f"{case_id} parity_blocks", 1, 16)
+            require(data_blocks >= parity_blocks, f"invalid erasure geometry for {case_id}")
+            expected_set_drives = requirement.get(
+                "erasure_set_drive_count",
+                requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+            )
+            require(data_blocks + parity_blocks == expected_set_drives,
+                    f"erasure geometry differs from topology for {case_id}")
+        if "erasure_set_drive_count" in requirement:
+            erasure_set_drive_count = evidence_integer(requirement.get("erasure_set_drive_count"),
+                                                       f"{case_id} erasure_set_drive_count", 1, 64)
+            total_drives = requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"]
+            require(total_drives % erasure_set_drive_count == 0,
+                    f"erasure set drive count does not divide topology for {case_id}")
+            if "sets" in requirement:
+                require(evidence_integer(requirement.get("sets"), f"{case_id} sets", 1, 1024)
+                        == total_drives // erasure_set_drive_count, f"set count differs from topology for {case_id}")
+        if "pools" in requirement:
+            evidence_integer(requirement.get("pools"), f"{case_id} pools", 1, 1024)
         names.add(oracle)
     return tuple(sorted(names))
+
+
+def scanner_heal_release_requirements(registry: dict[str, object]) -> tuple[dict[str, dict[str, object]], bool, list[str]]:
+    schema = scanner_heal_registry_schema(registry)
+    if schema == 1:
+        pending = registry.get("release_pending")
+        require(isinstance(pending, dict), "invalid scanner/heal release requirements")
+        requirements = {}
+        for gate, reason in pending.items():
+            require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                    "invalid scanner/heal release gate")
+            require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+            requirements[gate] = {"gate": gate, "status": "pending", "lane": "schema-1-pending",
+                                  "description": reason, "requires": [reason]}
+        return requirements, False, ["schema-1-pending"] if requirements else []
+
+    lanes = registry.get("release_lanes")
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    require(isinstance(lanes, dict) and lanes, "invalid scanner/heal release lanes")
+    lane_statuses = {}
+    lane_gates = {}
+    for lane_id, lane in lanes.items():
+        require(isinstance(lane_id, str) and re.fullmatch(r"[a-z0-9-]+", lane_id) is not None,
+                "invalid scanner/heal release lane")
+        require(isinstance(lane, dict), f"invalid release lane {lane_id}")
+        status = lane.get("status")
+        require(status in ("implemented", "pending"), f"invalid release lane status for {lane_id}")
+        lane_statuses[lane_id] = status
+        if status == "implemented":
+            lane_cases = lane.get("cases")
+            require(isinstance(lane_cases, list) and lane_cases and all(isinstance(case, str) and case for case in lane_cases),
+                    f"implemented release lane {lane_id} has no cases")
+            require(all(case in cases for case in lane_cases), f"implemented release lane {lane_id} has unknown cases")
+        else:
+            gates = lane.get("gates")
+            require(isinstance(gates, list) and gates and all(isinstance(gate, str) and gate for gate in gates),
+                    f"pending release lane {lane_id} has no gates")
+            lane_gates[lane_id] = set(gates)
+
+    raw_requirements = registry.get("release_requirements")
+    require(isinstance(raw_requirements, list) and raw_requirements, "invalid scanner/heal release requirements")
+    requirements: dict[str, dict[str, object]] = {}
+    for item in raw_requirements:
+        require(isinstance(item, dict), "invalid scanner/heal release requirement")
+        gate = item.get("gate")
+        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                "invalid scanner/heal release gate")
+        require(gate not in requirements, f"duplicate scanner/heal release gate {gate}")
+        status = item.get("status")
+        require(status == "pending", f"release gate {gate} must stay pending until real evidence is registered")
+        lane = item.get("lane")
+        require(isinstance(lane, str) and lane in lane_statuses, f"unknown release lane for {gate}")
+        require(lane_statuses[lane] == "pending", f"pending release gate {gate} mapped to non-pending lane {lane}")
+        description = item.get("description")
+        require(isinstance(description, str) and description.strip(), f"missing release requirement for {gate}")
+        requires = item.get("requires")
+        require(isinstance(requires, list) and requires and
+                all(isinstance(requirement, str) and requirement.strip() for requirement in requires),
+                f"missing concrete evidence requirements for {gate}")
+        evidence_fields = item.get("evidence_fields", [])
+        require(isinstance(evidence_fields, list) and
+                all(isinstance(field, str) and re.fullmatch(r"[a-z0-9][a-z0-9_]*", field) is not None
+                    for field in evidence_fields),
+                f"invalid evidence fields for release gate {gate}")
+        required_fields = set(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS.get(gate, ()))
+        missing_fields = sorted(required_fields - set(evidence_fields))
+        require(not missing_fields,
+                f"release gate {gate} missing required evidence fields: {', '.join(missing_fields)}")
+        requirements[gate] = item
+
+    missing = sorted(set(SCANNER_HEAL_RELEASE_REQUIRED_GATES) - set(requirements))
+    require(not missing, f"missing scanner/heal release requirements: {', '.join(missing)}")
+    for lane, gates in lane_gates.items():
+        unknown = sorted(gates - set(requirements))
+        require(not unknown, f"pending release lane {lane} has unknown gates: {', '.join(unknown)}")
+        mapped = {gate for gate, requirement in requirements.items() if requirement["lane"] == lane}
+        require(gates == mapped, f"pending release lane {lane} gates do not match release requirements")
+    pending_lanes = sorted(lane for lane, status in lane_statuses.items() if status == "pending")
+    return requirements, True, pending_lanes
 
 
 def begin_scanner_heal_receipt(root: Path, directory: Path, binary: Path, test_binary: Path) -> None:
@@ -969,7 +1590,7 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
     """Validate one actual case, or fail the release while required lanes are pending."""
     try:
         registry = read_json(root / ".config/scanner-heal-required-tests.json")
-        evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+        scanner_heal_registry_schema(registry)
         require(registry.get("cases"), "invalid scanner/heal registry")
         selected = registry["cases"] if case_id == "release" else {case_id: registry["cases"][case_id]}
         run = read_json(directory / "run.json")
@@ -1050,6 +1671,57 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(oracle.get("topology") == requirement["topology"], "oracle topology mismatch")
             for key in ("nodes", "drives_per_node"):
                 evidence_integer(oracle["topology"][key], f"observed {key}", 1, 16)
+            expected_set_drives = requirement.get(
+                "erasure_set_drive_count",
+                oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
+            )
+            require(oracle.get("erasure_set_drive_count") == expected_set_drives,
+                    "oracle erasure set drive count mismatch")
+            if "sets" in requirement:
+                require(oracle.get("sets") == requirement["sets"], "oracle set count mismatch")
+            if "pools" in requirement:
+                require(oracle.get("pools") == requirement["pools"], "oracle pool count mismatch")
+            expected_outage_target_required = requirement.get("outage_target_manifest_required", True)
+            require(oracle.get("outage_target_manifest_required", True) is expected_outage_target_required,
+                    "oracle outage target-manifest contract mismatch")
+            outage_write = oracle.get("outage_write")
+            outage_write_deferred = oracle.get("outage_write_deferred_until_rejoin", False)
+            require(type(outage_write_deferred) is bool, "invalid outage-write deferred flag")
+            if not expected_outage_target_required and outage_write is not None:
+                require(isinstance(outage_write, dict), "invalid optional outage-write diagnostic")
+                require(outage_write.get("attempted") is True, "optional outage-write diagnostic was not attempted")
+                require(outage_write.get("required") is False, "optional outage-write diagnostic required flag mismatch")
+                require(outage_write.get("accepted") is True, "optional outage-write final S3 body was not accepted")
+                outage_write_attempts = evidence_integer(outage_write.get("attempts"), "optional outage-write attempts", 1, 1024)
+                outage_write_service_unavailable = evidence_integer(
+                    outage_write.get("service_unavailable"), "optional outage-write ServiceUnavailable count", 0, 1024
+                )
+                if outage_write_deferred:
+                    require(
+                        outage_write_service_unavailable == outage_write_attempts,
+                        "deferred outage write must account for every down-window attempt",
+                    )
+            else:
+                require(outage_write_deferred is False, "outage-write deferred flag requires optional outage-write diagnostic")
+            if requirement.get("sets", 1) > 1 or requirement.get("pools", 1) > 1:
+                require(oracle.get("distributed_ec_invalidation") is True,
+                        "oracle missing distributed EC invalidation proof")
+                evidence_integer(oracle.get("peer_count"), "oracle peer_count", 3, 64)
+                require(oracle.get("same_window_remote_proof") is True, "oracle missing same-window remote proof")
+                require(oracle.get("all_peers_bound_to_generation_window") is True,
+                        "oracle missing peer generation-window binding")
+            expected_erasure = requirement.get("erasure")
+            if expected_erasure is not None:
+                require(isinstance(expected_erasure, dict), "invalid erasure expectation")
+                expected_data_blocks = evidence_integer(expected_erasure.get("data_blocks"), "expected EC data blocks", 1, 16)
+                expected_parity_blocks = evidence_integer(expected_erasure.get("parity_blocks"), "expected EC parity blocks", 1, 16)
+                require(
+                    expected_data_blocks + expected_parity_blocks == expected_set_drives,
+                    "expected EC geometry differs from topology",
+                )
+            else:
+                expected_data_blocks = None
+                expected_parity_blocks = None
             evidence_integer(oracle.get("pid_before"), "pid_before", 1, 2**32 - 1)
             evidence_integer(oracle.get("pid_after"), "pid_after", 1, 2**32 - 1)
             require(oracle["pid_before"] != oracle["pid_after"], "no process restart witnessed")
@@ -1057,8 +1729,8 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(isinstance(objects, list) and requirement["min_objects"] <= len(objects) <= requirement["max_objects"],
                     "incomplete/oversized object oracle")
             require(len({obj["key"] for obj in objects}) == len(objects), "duplicate object identity")
-            require(sum(obj["expected_physical"] is None for obj in objects) == 1,
-                    "only the outage object may lack a pre-fault target manifest")
+            outage_object_count = sum(obj["expected_physical"] is None for obj in objects)
+            require(outage_object_count == 1, "only the outage object may lack a pre-fault target manifest")
             for obj in objects:
                 require(isinstance(obj["key"], str) and 0 < len(obj["key"].encode()) <= 1024, "invalid object identity")
                 require(obj["version_id"] is None, "this case only covers unversioned objects")
@@ -1069,11 +1741,18 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
                 if obj["expected_physical"] is not None:
                     require(physical == obj["expected_physical"], "target shard differs from pre-fault manifest")
                 for geometry in [physical] + ([obj["expected_physical"]] if obj["expected_physical"] is not None else []):
+                    if not geometry["has_xl_meta"] and not expected_outage_target_required and obj["expected_physical"] is None:
+                        continue
                     data = evidence_integer(geometry["data_blocks"], "EC data blocks", 1, 16)
                     parity = evidence_integer(geometry["parity_blocks"], "EC parity blocks", 1, 16)
-                    require(data + parity == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
-                            "EC geometry differs from this case's single set")
+                    require(data + parity == expected_set_drives,
+                            "EC geometry differs from this case's erasure set")
+                    if expected_data_blocks is not None:
+                        require(data == expected_data_blocks and parity == expected_parity_blocks,
+                                "EC data/parity geometry differs from the required case")
                     evidence_integer(geometry["erasure_index"], "target erasure index", 1, data + parity)
+                if not expected_outage_target_required and obj["expected_physical"] is None and not physical["has_xl_meta"]:
+                    continue
                 require(physical["has_xl_meta"] is True and physical["version_id"] is None, "missing target metadata")
                 parts = physical["expected_part_numbers"]
                 require(isinstance(parts, list) and 0 < len(parts) <= 10000, "no physical part coverage")
@@ -1088,7 +1767,10 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(all(keys == sorted(obj["key"] for obj in objects) for keys in node_listings),
                     "S3 listing differs from object oracle")
         if case_id == "release":
-            errors.extend(f"pending {gate}: {reason}" for gate, reason in registry["release_pending"].items())
+            release_requirements, _, _ = scanner_heal_release_requirements(registry)
+            errors.extend(
+                f"pending {gate}: {requirement['description']}" for gate, requirement in release_requirements.items()
+            )
         return errors
     except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
         return [f"scanner/heal evidence rejected: {error}"]
@@ -1097,15 +1779,10 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
 def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object]:
     """Return a compact release decision without weakening case validation."""
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
-    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    scanner_heal_registry_schema(registry)
     cases = registry.get("cases")
     require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
-    pending = registry.get("release_pending")
-    require(isinstance(pending, dict), "invalid scanner/heal release requirements")
-    for gate, reason in pending.items():
-        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
-                "invalid scanner/heal release gate")
-        require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+    release_requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
 
     verified_cases = []
     rejected_cases = []
@@ -1119,11 +1796,1652 @@ def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object
         "schema": 1,
         "decision": "blocked",
         "release_approved": False,
-        "release_schema_capable": False,
+        "release_schema_capable": release_schema_capable,
         "verified_cases": verified_cases,
         "rejected_cases": rejected_cases,
-        "pending_gates": sorted(pending),
+        "pending_gates": sorted(release_requirements),
+        "pending_lanes": pending_lanes,
     }
+
+
+def release_bundle_artifact_path(bundle_path: Path, raw_path: object, gate: str, field: str) -> Path:
+    require(isinstance(raw_path, str) and raw_path.strip(), f"{gate}.{field} missing artifact")
+    path = Path(raw_path)
+    require(not path.is_absolute() and ".." not in path.parts, f"{gate}.{field} artifact path escapes bundle directory")
+    resolved = (bundle_path.parent / path).resolve()
+    require(resolved.is_relative_to(bundle_path.parent.resolve()), f"{gate}.{field} artifact path escapes bundle directory")
+    require(resolved.is_file(), f"{gate}.{field} artifact is missing")
+    require(resolved.stat().st_size > 0, f"{gate}.{field} artifact is empty")
+    return resolved
+
+
+def is_json_artifact_format(value: str) -> bool:
+    normalized = value.lower()
+    return normalized == "json" or normalized.endswith("+json")
+
+
+def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple[str, ...]:
+    fields: list[str] = []
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            fields.extend((
+                "root_authority_cases",
+                "root_cas_observed",
+                "root_readback_observed",
+                "incomplete_root_rejected",
+                "stale_root_rejected",
+            ))
+        if field == "quota_authority_evidence":
+            fields.extend((
+                "quota_authority_cases",
+                "quota_floor_readback_observed",
+                "over_limit_put_rejected",
+                "rejected_object_invisible",
+                "quota_fails_closed_without_authority",
+            ))
+    if gate in ("G03", "G09", "R-L"):
+        fields.extend(("versions", "mixed_version_role"))
+    if gate == "G02":
+        if field == "bounded_checkpoint_oracle":
+            fields.extend((
+                "checkpoint_progress_bounded",
+                "raw_entry_budget",
+                "max_raw_entries_per_round",
+                "max_objects_processed_per_round",
+                "bounded_work_quantum_observed",
+                "durable_checkpoint_committed",
+                "no_unbounded_tail",
+            ))
+        if field == "independent_version_inventory":
+            fields.extend((
+                "independent_version_inventory_observed",
+                "objects_expected",
+                "objects_retained",
+                "versions_retained",
+                "bytes_retained",
+            ))
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        fields.append("crash_points")
+    if gate == "R-E":
+        if field == "fixed_budget_restart_evidence":
+            fields.extend((
+                "fixed_budget_restart_converged",
+                "restart_rounds",
+                "raw_entry_budget",
+                "no_unbudgeted_final_sweep",
+            ))
+        if field == "enumeration_evidence":
+            fields.extend((
+                "raw_enumeration_observed",
+                "durable_raw_page_commit_observed",
+                "raw_page_index_complete",
+                "enumeration_frontier_retained",
+            ))
+        if field == "classification_evidence":
+            fields.extend((
+                "classification_observed",
+                "objects_processed",
+                "objects_retained",
+                "versions_retained",
+                "bytes_retained",
+            ))
+    if gate == "G03":
+        fields.append("scoped_ack_cases")
+        fields.extend(SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field])
+    if gate == "G04" and field == "root_floor_intent_crash_evidence":
+        fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G12":
+        fields.append("quota_path_cases")
+    if gate == "G05":
+        if field == "per_object_outcome_oracle":
+            fields.extend(("per_object_outcome_cases", "outcome_counts", "status_matches_object_oracle"))
+        if field == "terminal_retention_bounds":
+            fields.extend((
+                "terminal_retention_cases",
+                "terminal_retention_window_seconds",
+                "max_terminal_record_age_seconds",
+                "terminal_records_pruned_after_window",
+            ))
+    if gate == "G06":
+        if field == "concurrent_status_evidence":
+            fields.extend((
+                "concurrent_status_cases",
+                "status_samples",
+                "all_status_responses_http_success",
+                "partial_status_reports_degraded",
+            ))
+        if field == "legacy_client_compatibility":
+            fields.extend((
+                "legacy_client_cases",
+                "rustfs_and_minio_paths_compatible",
+                "empty_body_status_requests_accepted",
+            ))
+        if field == "truncation_behavior":
+            fields.extend(("truncation_cases", "truncated_payloads_rejected", "max_status_payload_bytes"))
+    if gate == "G07":
+        fields.append({
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field])
+    if gate == "G08":
+        fields.append({
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field])
+    if gate == "G09":
+        fields.append("mixed_version_cases")
+        if field == "rollback_payload_evidence":
+            fields.append("rollback_payload_replayed")
+    if gate == "G11":
+        fields.extend({
+            "maintenance_producer_matrix": (
+                "producer_identities",
+                "producer_families",
+                "matrix_cases",
+                "durable_identity_observed",
+                "durable_journal_replay_observed",
+                "durable_journal_hydration_bound",
+                "generation_window_bound",
+                "restart_gap_absent",
+                "overflow_absent",
+                "ack_clear_generation_observed",
+                "invalid_journal_inputs_rejected",
+            ),
+            "complete_producer_inventory": (
+                "required_producer_identities",
+                "observed_producer_identities",
+                "required_producer_families",
+                "observed_producer_families",
+                "missing_producer_identities",
+                "unknown_producer_excluded",
+            ),
+            "segment_activation_preflight": (
+                "production_activation",
+                "scanner_segment_reuse_activated",
+                "proof_inputs",
+                "fail_closed_checks",
+            ),
+        }[field])
+    if gate == "G13":
+        fields.extend({
+            "quorum_minus_one_matrix": (
+                "quorum_cases",
+                "no_success_at_quorum_minus_one",
+                "exact_quorum_restored",
+            ),
+            "unknown_disk_remount_matrix": (
+                "remount_cases",
+                "unknown_disks_excluded",
+                "remounted_disks_revalidated",
+                "stale_incarnation_rejected",
+            ),
+            "object_lock_dry_run_grace_evidence": (
+                "grace_cases",
+                "object_lock_denials_preserved",
+                "dry_run_mutation_count",
+                "grace_outcomes_retained",
+            ),
+        }[field])
+    if gate == "G14":
+        fields.append("case_evidence")
+        if field == "same_window_field_evidence":
+            fields.append("same_window_fields")
+        if field == "ec8_4_evidence":
+            fields.append("topology")
+        if field == "multi_set_evidence":
+            fields.append("sets")
+        if field == "multi_pool_evidence":
+            fields.append("pools")
+        if field == "distributed_segment_invalidation_evidence":
+            fields.extend((
+                "invalidation_domain",
+                "distributed_ec_invalidation",
+                "peer_count",
+                "same_window_remote_proof",
+                "all_peers_bound_to_generation_window",
+            ))
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        fields.extend(("replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"))
+    if gate == "P4" and field == "retained_responsibility_evidence":
+        fields.extend((
+            "duration_seconds",
+            "retained_responsibility_cases",
+            "retention_window_seconds",
+            "idle_cleanup_observed",
+            "verified_proof_discharge_observed",
+        ))
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        fields.extend((
+            "duration_seconds",
+            "cleanup_gc_cases",
+            "verified_idle_gc_observed",
+            "pending_responsibilities_after_gc",
+            "stale_journals_after_gc",
+        ))
+    if gate == "R-D":
+        if field == "manager_disposition_evidence":
+            fields.extend(("manager_disposition_cases", "manager_dispositions_are_terminal"))
+        if field == "event_disposition_evidence":
+            fields.extend(("event_disposition_cases", "events_correlate_to_manager_dispositions"))
+        if field == "ledger_disposition_evidence":
+            fields.extend((
+                "ledger_disposition_cases",
+                "ledger_correlates_to_events",
+                "ledger_replay_preserves_terminal_disposition",
+            ))
+        if field == "grace_handling":
+            fields.extend((
+                "grace_cases",
+                "grace_window_seconds",
+                "grace_retention_observed",
+                "grace_expiry_pruned_terminal_records",
+            ))
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            fields.extend((
+                "legacy_source_conflict_cases",
+                "source_conflicts_rejected",
+                "takeover_identity_bound",
+                "legacy_checksum_gap_rejected",
+            ))
+        if field == "migration_gap_evidence":
+            fields.extend((
+                "migration_gap_cases",
+                "migration_gap_closed",
+                "legacy_sources_fail_closed",
+                "prior_responsibilities_inherited",
+            ))
+        if field == "crash_safe_source_retirement_evidence":
+            fields.extend((
+                "source_retirement_cases",
+                "source_retirement_is_crash_safe",
+                "old_source_retained_until_successor",
+                "recovered_pending_migration",
+            ))
+    return tuple(dict.fromkeys(fields))
+
+
+PROFILE_ARTIFACT_REQUIRED_METRICS = {
+    "allocation-profile": ("resolved_samples", "allocation_bytes"),
+    "flamegraph": ("resolved_samples",),
+    "rss-samples": ("resolved_samples", "rss_peak_bytes"),
+    "save-frequency": ("resolved_samples", "save_operations", "saved_bytes"),
+}
+
+
+def validate_profile_json_artifact_payload(bundle_path: Path, path: Path, payload: dict[str, object],
+                                           gate: str, field: str, artifact_kind: str) -> None:
+    prefix = f"{gate}.{field}.{artifact_kind}"
+    raw_profile = release_bundle_artifact_path(
+        bundle_path,
+        payload.get("raw_profile_artifact"),
+        gate,
+        f"{field}.{artifact_kind}.raw_profile",
+    )
+    require(sha(payload.get("raw_profile_sha256")) and digest(raw_profile) == payload["raw_profile_sha256"],
+            f"{prefix} raw profile hash mismatch")
+    raw_bytes = evidence_integer(payload.get("raw_profile_bytes"), f"{prefix}.raw_profile_bytes", 1, 2**63 - 1)
+    require(raw_bytes == raw_profile.stat().st_size, f"{prefix} raw profile bytes mismatch")
+    evidence_string(payload.get("raw_profile_format"), f"{prefix}.raw_profile_format",
+                    r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+    require(raw_profile.resolve() != path.resolve(), f"{prefix} raw profile must be distinct from wrapper")
+    for metric in PROFILE_ARTIFACT_REQUIRED_METRICS[artifact_kind]:
+        evidence_integer(payload.get(metric), f"{prefix}.{metric}", 1, 2**63 - 1)
+
+
+def validate_g14_json_artifact_payload(bundle_path: Path, payload: dict[str, object],
+                                       evidence: dict[str, object] | None, gate: str, field: str,
+                                       source_revision: str, window_id: str) -> None:
+    prefix = f"{gate}.{field}"
+    require(evidence is not None, f"{prefix} JSON artifact missing outer evidence context")
+    for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
+        require(payload.get(mirror_field) == evidence.get(mirror_field),
+                f"{prefix} JSON artifact {mirror_field} mismatch")
+    cases = payload.get("case_evidence")
+    require(isinstance(cases, list) and cases, f"{prefix} JSON artifact missing case_evidence")
+    seen_cases = set()
+    for index, item in enumerate(cases):
+        require(isinstance(item, dict), f"{prefix} JSON artifact case_evidence[{index}] must be an object")
+        case = evidence_string(
+            item.get("case"),
+            f"{prefix} JSON artifact case_evidence[{index}].case",
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{1,127}",
+        )
+        require(case not in seen_cases, f"{prefix} JSON artifact case_evidence has duplicate case: {case}")
+        seen_cases.add(case)
+        artifact = release_bundle_artifact_path(
+            bundle_path,
+            item.get("artifact"),
+            gate,
+            f"{field}.case_evidence.{case}",
+        )
+        require(sha(item.get("sha256")) and digest(artifact) == item["sha256"],
+                f"{prefix} JSON artifact case_evidence[{index}] artifact hash mismatch")
+        require(item.get("source_revision") == source_revision,
+                f"{prefix} JSON artifact case_evidence[{index}].source_revision mismatch")
+        require(item.get("measurement_window_id") == window_id,
+                f"{prefix} JSON artifact case_evidence[{index}].measurement_window_id mismatch")
+        case_payload = read_json(artifact)
+        require(isinstance(case_payload, dict), f"{prefix} JSON artifact case_evidence[{index}] artifact must be a JSON object")
+        for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+            require(case_payload.get(marker) is not True,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact is {marker}")
+        require(case_payload.get("case") == case,
+                f"{prefix} JSON artifact case_evidence[{index}] artifact case mismatch")
+        if "source_revision" in case_payload:
+            require(case_payload["source_revision"] == source_revision,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact source revision mismatch")
+        if "measurement_window_id" in case_payload:
+            require(case_payload["measurement_window_id"] == window_id,
+                    f"{prefix} JSON artifact case_evidence[{index}] artifact measurement window mismatch")
+
+
+def validate_release_bundle_json_artifact_payload(bundle_path: Path, path: Path, source_revision: str, gate: str, field: str,
+                                                 run_id: str, window_id: str,
+                                                 artifact_kind: str | None = None,
+                                                 evidence: dict[str, object] | None = None) -> None:
+    payload = read_json(path)
+    prefix = f"{gate}.{field}"
+    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+        require(payload.get(marker) is not True, f"{prefix} JSON artifact is {marker}")
+    require(payload.get("evidence_type") == "measured", f"{prefix} JSON artifact must be measured")
+    require(payload.get("source_revision") == source_revision, f"{prefix} JSON artifact source revision mismatch")
+    require(payload.get("run_id") == run_id, f"{prefix} JSON artifact run_id mismatch")
+    require(payload.get("measurement_window_id") == window_id, f"{prefix} JSON artifact measurement window mismatch")
+    require(payload.get("gate") == gate, f"{prefix} JSON artifact gate mismatch")
+    require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
+    if artifact_kind is not None:
+        require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+        if field == "profile_evidence":
+            validate_profile_json_artifact_payload(bundle_path, path, payload, gate, field, artifact_kind)
+    mrf_artifact_kind = SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS.get((gate, field))
+    if mrf_artifact_kind is not None:
+        require(payload.get("artifact_kind") == mrf_artifact_kind,
+                f"{prefix} JSON artifact kind must be {mrf_artifact_kind}")
+    mirror_fields = release_bundle_json_artifact_mirrored_fields(gate, field)
+    for mirror_field in mirror_fields:
+        require(mirror_field in payload, f"{prefix} JSON artifact missing {mirror_field}")
+    if not mirror_fields:
+        return
+    validate_release_bundle_domain_evidence(gate, field, payload)
+    if gate == "G14":
+        validate_g14_json_artifact_payload(bundle_path, payload, evidence, gate, field, source_revision, window_id)
+    if gate in ("G03", "G09", "R-L"):
+        versions = payload.get("versions")
+        require(isinstance(versions, list) and
+                len(set(versions)) >= 2 and
+                all(isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+                    for version in versions),
+                f"{prefix} JSON artifact requires mixed-version evidence")
+        require(source_revision in versions, f"{prefix} JSON artifact versions omit tested source revision")
+        expected_role = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+        require(payload.get("mixed_version_role") == expected_role,
+                f"{prefix} JSON artifact mixed-version role must be {expected_role}")
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        crash_points = payload.get("crash_points")
+        require(isinstance(crash_points, list) and crash_points,
+                f"{prefix} JSON artifact requires crash-boundary evidence")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        evidence_integer(payload.get("replayed_records"), f"{prefix} JSON artifact replayed_records", 1, 2**63 - 1)
+        require(payload.get("responsibility_anchor_retained") is True,
+                f"{prefix} JSON artifact requires retained MRF responsibility anchors")
+        require(payload.get("successor_snapshot_published") is True,
+                f"{prefix} JSON artifact requires successor snapshot publication evidence")
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        release_bundle_exact_strings(
+            payload.get("cleanup_gc_cases"),
+            SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES,
+            f"{prefix} JSON artifact cleanup_gc_cases",
+        )
+        require(payload.get("verified_idle_gc_observed") is True,
+                f"{prefix} JSON artifact requires verified idle GC evidence")
+        require(payload.get("pending_responsibilities_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero pending responsibilities after GC")
+        require(payload.get("stale_journals_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero stale journals after GC")
+    if gate == "G07":
+        case_field = {
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
+    if gate == "G08":
+        case_field = {
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
+
+
+def release_bundle_bool_true(value: object, name: str) -> None:
+    require(value is True, f"{name} must be true")
+
+
+def release_bundle_exact_strings(value: object, expected: tuple[str, ...], name: str) -> None:
+    require(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value),
+            f"{name} must list measured cases")
+    observed = set(value)
+    require(len(observed) == len(value), f"{name} has duplicate cases")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"{name} missing cases: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"{name} has unknown cases: {', '.join(unknown)}")
+
+
+def release_bundle_number(value: object, name: str, minimum: int | float = 0) -> float:
+    return number(value, name, minimum)
+
+
+def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dict[str, object]) -> None:
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("root_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES,
+                f"{gate}.{field}.root_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("root_cas_observed"), f"{gate}.{field}.root_cas_observed")
+            release_bundle_bool_true(evidence.get("root_readback_observed"), f"{gate}.{field}.root_readback_observed")
+            release_bundle_bool_true(evidence.get("incomplete_root_rejected"),
+                                     f"{gate}.{field}.incomplete_root_rejected")
+            release_bundle_bool_true(evidence.get("stale_root_rejected"), f"{gate}.{field}.stale_root_rejected")
+        if field == "quota_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("quota_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES,
+                f"{gate}.{field}.quota_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("quota_floor_readback_observed"),
+                                     f"{gate}.{field}.quota_floor_readback_observed")
+            release_bundle_bool_true(evidence.get("over_limit_put_rejected"),
+                                     f"{gate}.{field}.over_limit_put_rejected")
+            release_bundle_bool_true(evidence.get("rejected_object_invisible"),
+                                     f"{gate}.{field}.rejected_object_invisible")
+            release_bundle_bool_true(evidence.get("quota_fails_closed_without_authority"),
+                                     f"{gate}.{field}.quota_fails_closed_without_authority")
+
+    if gate == "G02":
+        if field == "bounded_checkpoint_oracle":
+            release_bundle_bool_true(evidence.get("checkpoint_progress_bounded"),
+                                     f"{gate}.{field}.checkpoint_progress_bounded")
+            budget = evidence_integer(evidence.get("raw_entry_budget"), f"{gate}.{field}.raw_entry_budget", 1, 4096)
+            max_raw = evidence_integer(evidence.get("max_raw_entries_per_round"),
+                                       f"{gate}.{field}.max_raw_entries_per_round", 1, 4096)
+            max_objects = evidence_integer(evidence.get("max_objects_processed_per_round"),
+                                           f"{gate}.{field}.max_objects_processed_per_round", 1, 4096)
+            require(max_raw <= budget, f"{gate}.{field} raw entries exceed fixed budget")
+            require(max_objects <= budget, f"{gate}.{field} processed objects exceed fixed budget")
+            release_bundle_bool_true(evidence.get("bounded_work_quantum_observed"),
+                                     f"{gate}.{field}.bounded_work_quantum_observed")
+            release_bundle_bool_true(evidence.get("durable_checkpoint_committed"),
+                                     f"{gate}.{field}.durable_checkpoint_committed")
+            release_bundle_bool_true(evidence.get("no_unbounded_tail"), f"{gate}.{field}.no_unbounded_tail")
+        if field == "independent_version_inventory":
+            release_bundle_bool_true(evidence.get("independent_version_inventory_observed"),
+                                     f"{gate}.{field}.independent_version_inventory_observed")
+            objects_expected = evidence_integer(evidence.get("objects_expected"),
+                                                f"{gate}.{field}.objects_expected", 1, 2**63 - 1)
+            objects_retained = evidence_integer(evidence.get("objects_retained"),
+                                                f"{gate}.{field}.objects_retained", 1, 2**63 - 1)
+            versions_retained = evidence_integer(evidence.get("versions_retained"),
+                                                 f"{gate}.{field}.versions_retained", 1, 2**63 - 1)
+            bytes_retained = evidence_integer(evidence.get("bytes_retained"),
+                                              f"{gate}.{field}.bytes_retained", 1, 2**63 - 1)
+            require(objects_retained == objects_expected,
+                    f"{gate}.{field} retained object inventory must match expected objects")
+            require(versions_retained == objects_expected,
+                    f"{gate}.{field} retained version inventory must match expected objects")
+            require(bytes_retained == objects_expected,
+                    f"{gate}.{field} retained byte inventory must match expected objects")
+
+    if gate == "G03":
+        release_bundle_exact_strings(
+            evidence.get("scoped_ack_cases"),
+            SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field],
+            f"{gate}.{field}.scoped_ack_cases",
+        )
+        for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+            release_bundle_bool_true(evidence.get(required), f"{gate}.{field}.{required}")
+
+    if gate == "G04" and field == "root_floor_intent_crash_evidence":
+        release_bundle_exact_strings(
+            evidence.get("durable_intent_cases"),
+            SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)],
+            f"{gate}.{field}.durable_intent_cases",
+        )
+        release_bundle_bool_true(evidence.get("persist_failure_blocks_acceptance"),
+                                 f"{gate}.{field}.persist_failure_blocks_acceptance")
+
+    if gate == "G12":
+        release_bundle_exact_strings(
+            evidence.get("quota_path_cases"),
+            SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field],
+            f"{gate}.{field}.quota_path_cases",
+        )
+
+    if gate == "G05":
+        if field == "per_object_outcome_oracle":
+            release_bundle_exact_strings(
+                evidence.get("per_object_outcome_cases"),
+                SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES,
+                f"{gate}.{field}.per_object_outcome_cases",
+            )
+            outcomes = evidence.get("outcome_counts")
+            require(isinstance(outcomes, dict), f"{gate}.{field} missing outcome counts")
+            for outcome in ("repaired", "healthy", "skipped", "failed"):
+                evidence_integer(outcomes.get(outcome), f"{gate}.{field}.outcome_counts.{outcome}", 1, 2**63 - 1)
+            release_bundle_bool_true(evidence.get("status_matches_object_oracle"),
+                                     f"{gate}.{field}.status_matches_object_oracle")
+        if field == "terminal_retention_bounds":
+            release_bundle_exact_strings(
+                evidence.get("terminal_retention_cases"),
+                SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES,
+                f"{gate}.{field}.terminal_retention_cases",
+            )
+            retention_window = evidence_integer(
+                evidence.get("terminal_retention_window_seconds"),
+                f"{gate}.{field}.terminal_retention_window_seconds",
+                1,
+                86400,
+            )
+            max_age = evidence_integer(
+                evidence.get("max_terminal_record_age_seconds"),
+                f"{gate}.{field}.max_terminal_record_age_seconds",
+                0,
+                86400,
+            )
+            require(max_age <= retention_window, f"{gate}.{field}.max_terminal_record_age_seconds exceeds retention window")
+            evidence_integer(evidence.get("terminal_records_pruned_after_window"),
+                             f"{gate}.{field}.terminal_records_pruned_after_window", 1, 2**63 - 1)
+
+    if gate == "G06":
+        if field == "concurrent_status_evidence":
+            release_bundle_exact_strings(
+                evidence.get("concurrent_status_cases"),
+                SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES,
+                f"{gate}.{field}.concurrent_status_cases",
+            )
+            evidence_integer(evidence.get("status_samples"), f"{gate}.{field}.status_samples", 2, 2**63 - 1)
+            release_bundle_bool_true(evidence.get("all_status_responses_http_success"),
+                                     f"{gate}.{field}.all_status_responses_http_success")
+            release_bundle_bool_true(evidence.get("partial_status_reports_degraded"),
+                                     f"{gate}.{field}.partial_status_reports_degraded")
+        if field == "legacy_client_compatibility":
+            release_bundle_exact_strings(
+                evidence.get("legacy_client_cases"),
+                SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES,
+                f"{gate}.{field}.legacy_client_cases",
+            )
+            release_bundle_bool_true(evidence.get("rustfs_and_minio_paths_compatible"),
+                                     f"{gate}.{field}.rustfs_and_minio_paths_compatible")
+            release_bundle_bool_true(evidence.get("empty_body_status_requests_accepted"),
+                                     f"{gate}.{field}.empty_body_status_requests_accepted")
+        if field == "truncation_behavior":
+            release_bundle_exact_strings(
+                evidence.get("truncation_cases"),
+                SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES,
+                f"{gate}.{field}.truncation_cases",
+            )
+            release_bundle_bool_true(evidence.get("truncated_payloads_rejected"),
+                                     f"{gate}.{field}.truncated_payloads_rejected")
+            evidence_integer(evidence.get("max_status_payload_bytes"), f"{gate}.{field}.max_status_payload_bytes", 1, 2**20)
+
+    if gate == "R-E":
+        if field == "fixed_budget_restart_evidence":
+            release_bundle_bool_true(evidence.get("fixed_budget_restart_converged"),
+                                     f"{gate}.{field}.fixed_budget_restart_converged")
+            evidence_integer(evidence.get("restart_rounds"), f"{gate}.{field}.restart_rounds", 2, 64)
+            evidence_integer(evidence.get("raw_entry_budget"), f"{gate}.{field}.raw_entry_budget", 1, 4096)
+            release_bundle_bool_true(evidence.get("no_unbudgeted_final_sweep"),
+                                     f"{gate}.{field}.no_unbudgeted_final_sweep")
+        if field == "enumeration_evidence":
+            release_bundle_bool_true(evidence.get("raw_enumeration_observed"),
+                                     f"{gate}.{field}.raw_enumeration_observed")
+            release_bundle_bool_true(evidence.get("durable_raw_page_commit_observed"),
+                                     f"{gate}.{field}.durable_raw_page_commit_observed")
+            release_bundle_bool_true(evidence.get("raw_page_index_complete"),
+                                     f"{gate}.{field}.raw_page_index_complete")
+            release_bundle_bool_true(evidence.get("enumeration_frontier_retained"),
+                                     f"{gate}.{field}.enumeration_frontier_retained")
+        if field == "classification_evidence":
+            release_bundle_bool_true(evidence.get("classification_observed"),
+                                     f"{gate}.{field}.classification_observed")
+            objects_processed = evidence_integer(evidence.get("objects_processed"),
+                                                 f"{gate}.{field}.objects_processed", 1, 2**63 - 1)
+            objects_retained = evidence_integer(evidence.get("objects_retained"),
+                                                f"{gate}.{field}.objects_retained", 1, 2**63 - 1)
+            versions_retained = evidence_integer(evidence.get("versions_retained"),
+                                                 f"{gate}.{field}.versions_retained", 1, 2**63 - 1)
+            bytes_retained = evidence_integer(evidence.get("bytes_retained"),
+                                              f"{gate}.{field}.bytes_retained", 1, 2**63 - 1)
+            require(objects_processed <= objects_retained,
+                    f"{gate}.{field} processed objects exceed retained objects")
+            require(versions_retained == objects_retained,
+                    f"{gate}.{field} version inventory must match retained objects")
+            require(bytes_retained == objects_retained,
+                    f"{gate}.{field} byte inventory must match retained objects")
+
+    if gate == "G09":
+        release_bundle_exact_strings(
+            evidence.get("mixed_version_cases"),
+            SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES[field],
+            f"{gate}.{field}.mixed_version_cases",
+        )
+        if field == "rollback_payload_evidence":
+            release_bundle_bool_true(evidence.get("rollback_payload_replayed"),
+                                     f"{gate}.{field}.rollback_payload_replayed")
+
+    if gate == "G10":
+        if field == "scheduler_bound_evidence":
+            release_bundle_exact_strings(
+                evidence.get("scheduler_bounds"),
+                SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS,
+                f"{gate}.{field}.scheduler_bounds",
+            )
+            release_bundle_bool_true(evidence.get("duplicate_task_bound_observed"),
+                                     f"{gate}.{field}.duplicate_task_bound_observed")
+        if field == "pressure_recovery_evidence":
+            metrics = evidence.get("pressure_metrics")
+            require(isinstance(metrics, dict), f"{gate}.{field} missing pressure metrics")
+            for metric in SCANNER_HEAL_RELEASE_PRESSURE_METRICS:
+                release_bundle_number(metrics.get(metric), f"{gate}.{field}.{metric}")
+            evidence_integer(metrics.get("foreground_pressure_samples"),
+                             f"{gate}.{field}.foreground_pressure_samples", 1, 2**63 - 1)
+            evidence_integer(metrics.get("foreground_pressure_high_samples"),
+                             f"{gate}.{field}.foreground_pressure_high_samples", 1, 2**63 - 1)
+
+    if gate == "G11":
+        if field == "maintenance_producer_matrix":
+            release_bundle_exact_strings(
+                evidence.get("producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.producer_families",
+            )
+            release_bundle_exact_strings(
+                evidence.get("matrix_cases"),
+                SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES[field],
+                f"{gate}.{field}.matrix_cases",
+            )
+            release_bundle_bool_true(evidence.get("durable_identity_observed"),
+                                     f"{gate}.{field}.durable_identity_observed")
+            release_bundle_bool_true(evidence.get("durable_journal_replay_observed"),
+                                     f"{gate}.{field}.durable_journal_replay_observed")
+            release_bundle_bool_true(evidence.get("durable_journal_hydration_bound"),
+                                     f"{gate}.{field}.durable_journal_hydration_bound")
+            release_bundle_bool_true(evidence.get("generation_window_bound"),
+                                     f"{gate}.{field}.generation_window_bound")
+            release_bundle_bool_true(evidence.get("restart_gap_absent"), f"{gate}.{field}.restart_gap_absent")
+            release_bundle_bool_true(evidence.get("overflow_absent"), f"{gate}.{field}.overflow_absent")
+            release_bundle_bool_true(evidence.get("ack_clear_generation_observed"),
+                                     f"{gate}.{field}.ack_clear_generation_observed")
+            release_bundle_exact_strings(
+                evidence.get("invalid_journal_inputs_rejected"),
+                SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES,
+                f"{gate}.{field}.invalid_journal_inputs_rejected",
+            )
+        if field == "complete_producer_inventory":
+            release_bundle_exact_strings(
+                evidence.get("required_producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.required_producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("observed_producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.observed_producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("required_producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.required_producer_families",
+            )
+            release_bundle_exact_strings(
+                evidence.get("observed_producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.observed_producer_families",
+            )
+            require(evidence.get("missing_producer_identities") == [],
+                    f"{gate}.{field} requires zero missing producer identities")
+            release_bundle_bool_true(evidence.get("unknown_producer_excluded"),
+                                     f"{gate}.{field}.unknown_producer_excluded")
+
+    if gate == "G13":
+        if field == "quorum_minus_one_matrix":
+            release_bundle_exact_strings(
+                evidence.get("quorum_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.quorum_cases",
+            )
+            release_bundle_bool_true(evidence.get("no_success_at_quorum_minus_one"),
+                                     f"{gate}.{field}.no_success_at_quorum_minus_one")
+            release_bundle_bool_true(evidence.get("exact_quorum_restored"), f"{gate}.{field}.exact_quorum_restored")
+        if field == "unknown_disk_remount_matrix":
+            release_bundle_exact_strings(
+                evidence.get("remount_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.remount_cases",
+            )
+            release_bundle_bool_true(evidence.get("unknown_disks_excluded"),
+                                     f"{gate}.{field}.unknown_disks_excluded")
+            release_bundle_bool_true(evidence.get("remounted_disks_revalidated"),
+                                     f"{gate}.{field}.remounted_disks_revalidated")
+            release_bundle_bool_true(evidence.get("stale_incarnation_rejected"),
+                                     f"{gate}.{field}.stale_incarnation_rejected")
+        if field == "object_lock_dry_run_grace_evidence":
+            release_bundle_exact_strings(
+                evidence.get("grace_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.grace_cases",
+            )
+            release_bundle_bool_true(evidence.get("object_lock_denials_preserved"),
+                                     f"{gate}.{field}.object_lock_denials_preserved")
+            evidence_integer(evidence.get("dry_run_mutation_count"), f"{gate}.{field}.dry_run_mutation_count", 0, 0)
+            release_bundle_bool_true(evidence.get("grace_outcomes_retained"),
+                                     f"{gate}.{field}.grace_outcomes_retained")
+
+    if gate == "P1":
+        if field == "cold_walk_share_measurement":
+            share = release_bundle_number(evidence.get("cold_walk_share"), f"{gate}.{field}.cold_walk_share")
+            require(share <= 1, f"{gate}.{field}.cold_walk_share exceeds one")
+            evidence_integer(evidence.get("walk_objects"), f"{gate}.{field}.walk_objects", 1, 2**63 - 1)
+            evidence_integer(evidence.get("cold_walk_objects"), f"{gate}.{field}.cold_walk_objects", 0, 2**63 - 1)
+        if field == "foreground_latency_throughput_measurement":
+            for metric in ("foreground_p95_ms", "foreground_p99_ms", "throughput_ops", "error_rate"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}")
+        if field == "profile_evidence":
+            for metric in ("allocation_bytes", "rss_peak_bytes", "save_operations", "saved_bytes"):
+                evidence_integer(evidence.get(metric), f"{gate}.{field}.{metric}", 1, 2**63 - 1)
+
+    if gate == "P3":
+        if field == "two_hour_pressure_measurement":
+            release_bundle_exact_strings(evidence.get("abba_legs"), ("A1", "B1", "B2", "A2"),
+                                         f"{gate}.{field}.abba_legs")
+            release_bundle_exact_strings(evidence.get("scenarios"), SCENARIOS, f"{gate}.{field}.scenarios")
+            for metric in ("foreground_p95_ms", "foreground_p99_ms", "throughput_ops"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}", 1)
+        if field == "heal_capacity_measurement":
+            capacity = evidence.get("heal_capacity")
+            require(isinstance(capacity, dict), f"{gate}.{field} missing heal capacity")
+            for metric in ("objects", "versions", "bytes", "completed_objects"):
+                evidence_integer(capacity.get(metric), f"{gate}.{field}.{metric}", 1, 2**63 - 1)
+        if field == "recovery_window_measurement":
+            release_bundle_exact_strings(
+                evidence.get("fault_modes"),
+                ("process-restart", "process-crash-restart"),
+                f"{gate}.{field}.fault_modes",
+            )
+            for metric in ("recovery_p95_ms", "recovery_p99_ms"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}", 1)
+
+    if gate == "P4" and field == "retained_responsibility_evidence":
+        release_bundle_exact_strings(
+            evidence.get("retained_responsibility_cases"),
+            SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES,
+            f"{gate}.{field}.retained_responsibility_cases",
+        )
+        retention_window = evidence_integer(
+            evidence.get("retention_window_seconds"),
+            f"{gate}.{field}.retention_window_seconds",
+            7200,
+            86400,
+        )
+        duration = evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+        require(duration >= retention_window, f"{gate}.{field} duration must cover retention window")
+        release_bundle_bool_true(evidence.get("idle_cleanup_observed"), f"{gate}.{field}.idle_cleanup_observed")
+        release_bundle_bool_true(
+            evidence.get("verified_proof_discharge_observed"),
+            f"{gate}.{field}.verified_proof_discharge_observed",
+        )
+
+    if gate == "R-D":
+        if field == "manager_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("manager_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_MANAGER_CASES,
+                f"{gate}.{field}.manager_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("manager_dispositions_are_terminal"),
+                                     f"{gate}.{field}.manager_dispositions_are_terminal")
+        if field == "event_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("event_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_EVENT_CASES,
+                f"{gate}.{field}.event_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("events_correlate_to_manager_dispositions"),
+                                     f"{gate}.{field}.events_correlate_to_manager_dispositions")
+        if field == "ledger_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("ledger_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_LEDGER_CASES,
+                f"{gate}.{field}.ledger_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("ledger_correlates_to_events"),
+                                     f"{gate}.{field}.ledger_correlates_to_events")
+            release_bundle_bool_true(evidence.get("ledger_replay_preserves_terminal_disposition"),
+                                     f"{gate}.{field}.ledger_replay_preserves_terminal_disposition")
+        if field == "grace_handling":
+            release_bundle_exact_strings(
+                evidence.get("grace_cases"),
+                SCANNER_HEAL_RELEASE_RD_GRACE_CASES,
+                f"{gate}.{field}.grace_cases",
+            )
+            evidence_integer(evidence.get("grace_window_seconds"), f"{gate}.{field}.grace_window_seconds", 1, 86400)
+            release_bundle_bool_true(evidence.get("grace_retention_observed"),
+                                     f"{gate}.{field}.grace_retention_observed")
+            release_bundle_bool_true(evidence.get("grace_expiry_pruned_terminal_records"),
+                                     f"{gate}.{field}.grace_expiry_pruned_terminal_records")
+
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            release_bundle_exact_strings(
+                evidence.get("legacy_source_conflict_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.legacy_source_conflict_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_conflicts_rejected"),
+                                     f"{gate}.{field}.source_conflicts_rejected")
+            release_bundle_bool_true(evidence.get("takeover_identity_bound"),
+                                     f"{gate}.{field}.takeover_identity_bound")
+            release_bundle_bool_true(evidence.get("legacy_checksum_gap_rejected"),
+                                     f"{gate}.{field}.legacy_checksum_gap_rejected")
+        if field == "migration_gap_evidence":
+            release_bundle_exact_strings(
+                evidence.get("migration_gap_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.migration_gap_cases",
+            )
+            release_bundle_bool_true(evidence.get("migration_gap_closed"),
+                                     f"{gate}.{field}.migration_gap_closed")
+            release_bundle_bool_true(evidence.get("legacy_sources_fail_closed"),
+                                     f"{gate}.{field}.legacy_sources_fail_closed")
+            release_bundle_bool_true(evidence.get("prior_responsibilities_inherited"),
+                                     f"{gate}.{field}.prior_responsibilities_inherited")
+        if field == "crash_safe_source_retirement_evidence":
+            release_bundle_exact_strings(
+                evidence.get("source_retirement_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.source_retirement_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_retirement_is_crash_safe"),
+                                     f"{gate}.{field}.source_retirement_is_crash_safe")
+            release_bundle_bool_true(evidence.get("old_source_retained_until_successor"),
+                                     f"{gate}.{field}.old_source_retained_until_successor")
+            release_bundle_bool_true(evidence.get("recovered_pending_migration"),
+                                     f"{gate}.{field}.recovered_pending_migration")
+
+
+def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
+                                     evidence: dict[str, object]) -> str:
+    require(evidence.get("evidence_type") == "measured", f"{gate}.{field} must be measured evidence")
+    require(evidence.get("source_revision") == source_revision, f"{gate}.{field} source revision mismatch")
+    run_id = evidence_string(evidence.get("run_id"), f"{gate}.{field}.run_id", r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
+    window_id = evidence_string(evidence.get("measurement_window_id"), f"{gate}.{field}.measurement_window_id",
+                                r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
+    require(window_id != run_id, f"{gate}.{field} must separate run and measurement-window identities")
+    started = evidence_timestamp(evidence.get("started_at"), f"{gate}.{field}.started_at")
+    finished = evidence_timestamp(evidence.get("finished_at"), f"{gate}.{field}.finished_at")
+    require(started <= finished, f"{gate}.{field} evidence timestamps are inverted")
+    command = evidence.get("command")
+    require(isinstance(command, list) and command and
+            all(isinstance(part, str) and part.strip() for part in command),
+            f"{gate}.{field} missing command provenance")
+    artifact_format = evidence_string(evidence.get("artifact_format"), f"{gate}.{field}.artifact_format",
+                                      r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+    artifact = release_bundle_artifact_path(bundle_path, evidence.get("artifact"), gate, field)
+    require(sha(evidence.get("sha256")) and digest(artifact) == evidence["sha256"], f"{gate}.{field} artifact hash mismatch")
+    if is_json_artifact_format(artifact_format):
+        validate_release_bundle_json_artifact_payload(
+            bundle_path,
+            artifact,
+            source_revision,
+            gate,
+            field,
+            run_id,
+            window_id,
+            evidence=evidence,
+        )
+    summary = evidence.get("summary")
+    require(isinstance(summary, str) and summary.strip(), f"{gate}.{field} missing human summary")
+    if gate.startswith("P"):
+        duration = evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+        require((finished - started).total_seconds() + 1 >= duration, f"{gate}.{field} duration exceeds run window")
+        require(duration >= 900, f"{gate}.{field} requires at least 900 seconds")
+        if gate == "P3" and field == "two_hour_pressure_measurement":
+            require(duration >= 7200, f"{gate}.{field} requires at least two hours")
+        if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+            require(duration >= 7200, f"{gate}.{field} requires at least two hours")
+    elif "duration_seconds" in evidence:
+        evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+    if gate == "G10":
+        if field == "scheduler_bound_evidence":
+            evidence_integer(evidence.get("max_deferred_items"), f"{gate}.{field}.max_deferred_items", 1, 2**31 - 1)
+            evidence_integer(evidence.get("max_deferred_bytes"), f"{gate}.{field}.max_deferred_bytes", 1, 2**63 - 1)
+            evidence_integer(evidence.get("max_retry_age_seconds"), f"{gate}.{field}.max_retry_age_seconds", 1, 86400)
+            evidence_integer(evidence.get("duplicate_task_count"), f"{gate}.{field}.duplicate_task_count", 0, 0)
+        if field == "pressure_recovery_evidence":
+            require(evidence.get("pressure_pacing_engaged") is True,
+                    f"{gate}.{field} requires pressure pacing engagement")
+            evidence_integer(evidence.get("recovery_window_seconds"), f"{gate}.{field}.recovery_window_seconds", 1, 86400)
+            evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
+            evidence_integer(evidence.get("foreground_latency_p95_ms"),
+                             f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
+    if gate in ("G01", "G11", "G12", "G13", "R-L"):
+        validate_release_bundle_domain_evidence(gate, field, evidence)
+    if gate == "P1" and field == "foreground_latency_throughput_measurement":
+        evidence_integer(evidence.get("foreground_latency_p95_ms"),
+                         f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
+        evidence_integer(evidence.get("foreground_latency_p99_ms"),
+                         f"{gate}.{field}.foreground_latency_p99_ms", 1, 2**31 - 1)
+        evidence_integer(evidence.get("throughput_ops_per_second"),
+                         f"{gate}.{field}.throughput_ops_per_second", 1, 2**31 - 1)
+        evidence_integer(evidence.get("error_count"), f"{gate}.{field}.error_count", 0, 0)
+    if gate == "P3":
+        if field == "two_hour_pressure_measurement":
+            require(evidence.get("fixed_offered_load") is True, f"{gate}.{field} requires fixed offered load")
+            evidence_integer(evidence.get("foreground_latency_p99_ms"),
+                             f"{gate}.{field}.foreground_latency_p99_ms", 1, 2**31 - 1)
+            evidence_integer(evidence.get("attempt_cost_samples"),
+                             f"{gate}.{field}.attempt_cost_samples", 1, 2**63 - 1)
+        if field == "heal_capacity_measurement":
+            evidence_integer(evidence.get("completed_heal_objects"),
+                             f"{gate}.{field}.completed_heal_objects", 1, 2**63 - 1)
+            evidence_integer(evidence.get("duplicate_task_count"), f"{gate}.{field}.duplicate_task_count", 0, 0)
+        if field == "recovery_window_measurement":
+            evidence_integer(evidence.get("pressure_recovery_window_seconds"),
+                             f"{gate}.{field}.pressure_recovery_window_seconds", 1, 86400)
+            evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
+    if gate in ("G03", "G09", "R-L"):
+        versions = evidence.get("versions")
+        require(isinstance(versions, list) and
+                len(set(versions)) >= 2 and
+                all(isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+                    for version in versions),
+                f"{gate}.{field} requires mixed-version evidence")
+        require(source_revision in versions, f"{gate}.{field} versions omit tested source revision")
+        expected_role = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+        require(evidence.get("mixed_version_role") == expected_role,
+                f"{gate}.{field} mixed-version role must be {expected_role}")
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        crash_points = evidence.get("crash_points")
+        require(isinstance(crash_points, list) and crash_points,
+                f"{gate}.{field} requires crash-boundary evidence")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        evidence_integer(evidence.get("replayed_records"), f"{gate}.{field}.replayed_records", 1, 2**63 - 1)
+        require(evidence.get("responsibility_anchor_retained") is True,
+                f"{gate}.{field} requires retained MRF responsibility anchors")
+        require(evidence.get("successor_snapshot_published") is True,
+                f"{gate}.{field} requires successor snapshot publication evidence")
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        release_bundle_exact_strings(
+            evidence.get("cleanup_gc_cases"),
+            SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES,
+            f"{gate}.{field}.cleanup_gc_cases",
+        )
+        require(evidence.get("verified_idle_gc_observed") is True,
+                f"{gate}.{field} requires verified idle GC evidence")
+        require(evidence.get("pending_responsibilities_after_gc") == 0,
+                f"{gate}.{field} requires zero pending responsibilities after GC")
+        require(evidence.get("stale_journals_after_gc") == 0,
+                f"{gate}.{field} requires zero stale journals after GC")
+    if field == "segment_activation_preflight":
+        require(evidence.get("production_activation") is True,
+                f"{gate}.{field} must prove production activation is enabled")
+        require(evidence.get("scanner_segment_reuse_activated") is True,
+                f"{gate}.{field} must prove the runtime activation gate is enabled")
+        evidence_exact_strings(evidence.get("proof_inputs"),
+                               SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS,
+                               f"{gate}.{field}.proof_inputs")
+        evidence_exact_strings(evidence.get("fail_closed_checks"),
+                               SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS,
+                               f"{gate}.{field}.fail_closed_checks")
+    if field == "cold_segment_reuse_measurement":
+        evidence_integer(evidence.get("hot_walked_segments"), f"{gate}.{field}.hot_walked_segments", 1, 2**63 - 1)
+        evidence_integer(evidence.get("cold_walked_segments"), f"{gate}.{field}.cold_walked_segments", 0, 0)
+        require(evidence.get("full_walk_oracle_equivalent") is True,
+                f"{gate}.{field} requires full-walk oracle equivalence")
+        require(evidence.get("published_root_equivalent") is True,
+                f"{gate}.{field} requires published-root equivalence")
+    if field == "post_stop_convergence_measurement":
+        require(evidence.get("writes_stopped") is True,
+                f"{gate}.{field} requires writes-stopped evidence")
+        require(evidence.get("last_mutation_observed") is True,
+                f"{gate}.{field} requires last-mutation observation")
+        require(evidence.get("first_complete_publication") is True,
+                f"{gate}.{field} requires first complete publication evidence")
+        samples = evidence_integer(evidence.get("post_stop_samples"), f"{gate}.{field}.post_stop_samples", 1, 2**31 - 1)
+        multiple = release_bundle_number(evidence.get("post_stop_work_multiple"),
+                                         f"{gate}.{field}.post_stop_work_multiple", 0)
+        limit = release_bundle_number(evidence.get("post_stop_work_multiple_limit"),
+                                      f"{gate}.{field}.post_stop_work_multiple_limit", 1)
+        require(multiple <= limit, f"{gate}.{field} exceeds post-stop work multiple limit")
+        raw_multiples = evidence.get("post_stop_work_multiples")
+        require(isinstance(raw_multiples, list) and len(raw_multiples) == samples,
+                f"{gate}.{field} requires measured post-stop work multiple samples")
+        observed = [release_bundle_number(value, f"{gate}.{field}.post_stop_work_multiples", 0)
+                    for value in raw_multiples]
+        require(max(observed) == multiple, f"{gate}.{field} worst post-stop multiple mismatch")
+    if gate == "G07":
+        case_field = {
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field]
+        cases = evidence_string_list(evidence.get(case_field), f"{gate}.{field}.{case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{gate}.{field} missing cases: {', '.join(missing_cases)}")
+    if gate == "G08":
+        case_field = {
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field]
+        cases = evidence_string_list(evidence.get(case_field), f"{gate}.{field}.{case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{gate}.{field} missing cases: {', '.join(missing_cases)}")
+    if gate == "G14":
+        if field == "same_window_field_evidence":
+            required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]) - {field}
+            same_window_fields = evidence.get("same_window_fields")
+            require(isinstance(same_window_fields, list) and
+                    len(set(same_window_fields)) == len(same_window_fields) and
+                    all(isinstance(item, str) and item in required_fields for item in same_window_fields),
+                    "G14.same_window_field_evidence requires named G14 field coverage")
+            missing_same_window_fields = sorted(required_fields - set(same_window_fields))
+            require(not missing_same_window_fields,
+                    "G14.same_window_field_evidence missing fields: " + ", ".join(missing_same_window_fields))
+        if field == "ec8_4_evidence":
+            topology = evidence.get("topology")
+            require(isinstance(topology, dict), "G14.ec8_4_evidence missing topology")
+            require(topology.get("erasure") == "EC8+4", "G14.ec8_4_evidence must record EC8+4")
+            require(evidence_integer(topology.get("nodes"), "G14 topology nodes", 3, 64) >= 3,
+                    "G14.ec8_4_evidence requires at least three nodes")
+            require(evidence_integer(topology.get("drives_per_node"), "G14 topology drives", 4, 64) >= 4,
+                    "G14.ec8_4_evidence requires at least four drives per node")
+        if field == "multi_set_evidence":
+            evidence_integer(evidence.get("sets"), "G14 multi_set_evidence.sets", 2, 1024)
+        if field == "multi_pool_evidence":
+            evidence_integer(evidence.get("pools"), "G14 multi_pool_evidence.pools", 2, 1024)
+        if field == "distributed_segment_invalidation_evidence":
+            require(evidence.get("invalidation_domain") == "distributed-ec",
+                    "G14.distributed_segment_invalidation_evidence requires distributed EC invalidation")
+            require(evidence.get("distributed_ec_invalidation") is True,
+                    "G14.distributed_segment_invalidation_evidence requires peer invalidation proof")
+            evidence_integer(evidence.get("peer_count"), "G14 distributed_segment_invalidation_evidence.peer_count", 3, 64)
+            require(evidence.get("same_window_remote_proof") is True,
+                    "G14.distributed_segment_invalidation_evidence requires same-window remote proof")
+            require(evidence.get("all_peers_bound_to_generation_window") is True,
+                    "G14.distributed_segment_invalidation_evidence requires peer generation-window binding")
+    if field == "profile_evidence":
+        evidence_integer(evidence.get("resolved_samples"), f"{gate}.{field}.resolved_samples", 1, 2**63 - 1)
+        profile_artifacts = evidence.get("profile_artifacts")
+        require(isinstance(profile_artifacts, dict), f"{gate}.{field} missing profile artifacts")
+        missing_artifacts = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(profile_artifacts))
+        require(not missing_artifacts,
+                f"{gate}.{field} missing profile artifacts: {', '.join(missing_artifacts)}")
+        unknown_artifacts = sorted(set(profile_artifacts) - set(RELEASE_PROFILE_ARTIFACTS))
+        require(not unknown_artifacts,
+                f"{gate}.{field} unknown profile artifacts: {', '.join(unknown_artifacts)}")
+        for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+            item = profile_artifacts[artifact_kind]
+            require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} must be an object")
+            artifact_field = f"{field}.{artifact_kind}"
+            artifact_path = release_bundle_artifact_path(bundle_path, item.get("artifact"), gate, artifact_field)
+            require(sha(item.get("sha256")) and digest(artifact_path) == item["sha256"],
+                    f"{gate}.{artifact_field} artifact hash mismatch")
+            artifact_format = evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
+                                              r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+            require(item.get("source_revision") == source_revision,
+                    f"{gate}.{artifact_field} source revision mismatch")
+            require(item.get("run_id") == run_id, f"{gate}.{artifact_field} run_id mismatch")
+            require(item.get("measurement_window_id") == window_id,
+                    f"{gate}.{artifact_field} measurement window mismatch")
+            if is_json_artifact_format(artifact_format):
+                validate_release_bundle_json_artifact_payload(
+                    bundle_path,
+                    artifact_path,
+                    source_revision,
+                    gate,
+                    field,
+                    run_id,
+                    window_id,
+                    artifact_kind,
+                )
+            if "resolved_samples" in item:
+                evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
+                                 0, 2**63 - 1)
+    validate_release_bundle_domain_evidence(gate, field, evidence)
+    return window_id
+
+
+def validate_release_bundle_gate_windows(gate: str, field_windows: dict[str, str]) -> None:
+    if gate == "G14" or gate.startswith("P"):
+        windows = sorted(set(field_windows.values()))
+        require(len(windows) == 1, f"{gate} evidence fields must share one measurement window")
+
+
+def validate_scanner_heal_release_bundle_gate(bundle_path: Path, source_revision: str,
+                                              requirements: dict[str, dict[str, object]],
+                                              raw_gates: dict[str, object], gate: str) -> list[str]:
+    gate_errors: list[str] = []
+    requirement = requirements[gate]
+    gate_evidence = raw_gates.get(gate)
+    if not isinstance(gate_evidence, dict):
+        return ["missing gate evidence"]
+    if gate_evidence.get("status") != "pass":
+        gate_errors.append("gate status must be pass")
+    if gate_evidence.get("lane") != requirement["lane"]:
+        gate_errors.append("gate lane mismatch")
+    if gate_evidence.get("evidence_type") != "measured":
+        gate_errors.append("gate evidence type must be measured")
+    fields = gate_evidence.get("evidence_fields")
+    if not isinstance(fields, dict):
+        gate_errors.append("missing gate evidence fields")
+        fields = {}
+    required_fields = tuple(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+    missing_fields = [field for field in required_fields if field not in fields]
+    if missing_fields:
+        gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
+    field_windows: dict[str, str] = {}
+    for field in required_fields:
+        if field not in fields:
+            continue
+        evidence = fields[field]
+        if not isinstance(evidence, dict):
+            gate_errors.append(f"{field} must be an object")
+            continue
+        for marker in ("fixture_only", "dry_run", "synthetic"):
+            if evidence.get(marker) is True:
+                gate_errors.append(f"{field} is {marker}")
+                continue
+        try:
+            field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            gate_errors.append(str(error))
+    if not gate_errors:
+        try:
+            validate_release_bundle_gate_windows(gate, field_windows)
+        except ValueError as error:
+            gate_errors.append(str(error))
+    return gate_errors
+
+
+def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[str, object]:
+    """Validate a complete hard-gate evidence bundle without accepting synthetic claims."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle requires schema 2 registry")
+    bundle_path = bundle_path.resolve()
+    bundle = read_json(bundle_path)
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(bundle.get(marker) is not True, f"scanner/heal release evidence bundle is {marker}")
+    require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
+    require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    source_revision = bundle.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None and
+            source_revision == revision,
+            "scanner/heal release evidence source revision mismatch")
+    raw_gates = bundle.get("gates")
+    require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
+
+    verified: list[str] = []
+    rejected: dict[str, list[str]] = {}
+    for gate in requirements:
+        gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
+        if gate_errors:
+            rejected[gate] = gate_errors
+        else:
+            verified.append(gate)
+
+    unknown = sorted(set(raw_gates) - set(requirements))
+    if unknown:
+        rejected["unknown"] = [f"unknown gates: {', '.join(unknown)}"]
+    approved = not rejected and sorted(verified) == sorted(requirements)
+    return {
+        "schema": 1,
+        "decision": "approved" if approved else "blocked",
+        "release_approved": approved,
+        "release_schema_capable": release_schema_capable,
+        "verified_gates": sorted(verified),
+        "rejected_gates": rejected,
+        "pending_gates": [] if approved else sorted(gate for gate in requirements if gate not in verified),
+        "pending_lanes": [] if approved else pending_lanes,
+    }
+
+
+def scanner_heal_release_bundle_gate_status(root: Path, bundle_path: Path, gate: str) -> dict[str, object]:
+    """Validate one measured release-bundle gate without approving the full release."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle gate requires schema 2 registry")
+    require(gate in requirements, f"unknown scanner/heal release gate: {gate}")
+    bundle_path = bundle_path.resolve()
+    bundle = read_json(bundle_path)
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(bundle.get(marker) is not True, f"scanner/heal release evidence bundle is {marker}")
+    require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
+    require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    source_revision = bundle.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None and
+            source_revision == revision,
+            "scanner/heal release evidence source revision mismatch")
+    raw_gates = bundle.get("gates")
+    require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
+    unknown = sorted(set(raw_gates) - set(requirements))
+    require(not unknown, f"scanner/heal release evidence bundle has unknown gates: {', '.join(unknown)}")
+
+    gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
+    verified = not gate_errors
+    return {
+        "schema": 1,
+        "decision": "verified" if verified else "blocked",
+        "release_approved": False,
+        "release_schema_capable": release_schema_capable,
+        "verified_gate": gate if verified else None,
+        "rejected_gate": None if verified else gate,
+        "rejected_errors": gate_errors,
+        "pending_gates": sorted(item for item in requirements if item != gate),
+        "pending_lanes": pending_lanes,
+    }
+
+
+def release_bundle_descriptor_path(descriptor_path: Path, raw_path: object, gate: str, field: str) -> Path:
+    require(isinstance(raw_path, str) and raw_path.strip(), f"{gate}.{field} missing source artifact")
+    path = Path(raw_path)
+    resolved = path if path.is_absolute() else descriptor_path.parent / path
+    resolved = resolved.resolve(strict=True)
+    require(resolved.is_file(), f"{gate}.{field} source artifact is missing")
+    require(resolved.stat().st_size > 0, f"{gate}.{field} source artifact is empty")
+    return resolved
+
+
+def release_bundle_artifact_suffix(path: Path) -> str:
+    suffix = path.suffix
+    if re.fullmatch(r"\.[A-Za-z0-9._+-]{1,16}", suffix or "") is not None:
+        return suffix
+    return ".artifact"
+
+
+def reject_release_bundle_markers(item: dict[str, object], label: str) -> None:
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(item.get(marker) is not True, f"{label} is {marker}")
+
+
+def copy_release_bundle_artifact(descriptor_path: Path, bundle_dir: Path, evidence: dict[str, object],
+                                 gate: str, field: str, label: str) -> None:
+    source = release_bundle_descriptor_path(descriptor_path, evidence.get("artifact"), gate, field)
+    source_sha = digest(source)
+    if "sha256" in evidence:
+        require(sha(evidence.get("sha256")) and evidence["sha256"] == source_sha,
+                f"{gate}.{field} descriptor artifact hash mismatch")
+    artifact_dir = bundle_dir / "artifacts"
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "-", label)
+    target = artifact_dir / f"{safe_label}{release_bundle_artifact_suffix(source)}"
+    require(not target.exists(), f"{gate}.{field} duplicate assembled artifact path")
+    shutil.copyfile(source, target)
+    require(digest(target) == source_sha, f"{gate}.{field} assembled artifact hash mismatch")
+    evidence["artifact"] = target.relative_to(bundle_dir).as_posix()
+    evidence["sha256"] = source_sha
+
+
+def copy_release_bundle_profile_raw_artifact(descriptor_path: Path, bundle_dir: Path, item: dict[str, object],
+                                             gate: str, field: str, artifact_kind: str) -> None:
+    wrapper = release_bundle_artifact_path(bundle_dir / "release-evidence.json", item.get("artifact"), gate, field)
+    payload = read_json(wrapper)
+    raw_source = release_bundle_descriptor_path(
+        descriptor_path,
+        payload.get("raw_profile_artifact"),
+        gate,
+        f"{field}.raw_profile",
+    )
+    raw_sha = digest(raw_source)
+    require(sha(payload.get("raw_profile_sha256")) and payload["raw_profile_sha256"] == raw_sha,
+            f"{gate}.{field} descriptor raw profile hash mismatch")
+    raw_bytes = evidence_integer(payload.get("raw_profile_bytes"), f"{gate}.{field}.raw_profile_bytes", 1, 2**63 - 1)
+    require(raw_bytes == raw_source.stat().st_size, f"{gate}.{field} descriptor raw profile bytes mismatch")
+    artifact_dir = bundle_dir / "artifacts"
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "-", f"{gate}-{field}-{artifact_kind}-raw")
+    raw_target = artifact_dir / f"{safe_label}{release_bundle_artifact_suffix(raw_source)}"
+    require(not raw_target.exists(), f"{gate}.{field} duplicate assembled raw profile path")
+    shutil.copyfile(raw_source, raw_target)
+    require(digest(raw_target) == raw_sha, f"{gate}.{field} assembled raw profile hash mismatch")
+    payload["raw_profile_artifact"] = raw_target.relative_to(bundle_dir).as_posix()
+    payload["raw_profile_sha256"] = raw_sha
+    payload["raw_profile_bytes"] = raw_target.stat().st_size
+    write_json(wrapper, payload)
+    item["sha256"] = digest(wrapper)
+
+
+def copy_release_bundle_g14_case_artifacts(descriptor_path: Path, bundle_dir: Path, evidence: dict[str, object],
+                                           gate: str, field: str) -> None:
+    wrapper = release_bundle_artifact_path(bundle_dir / "release-evidence.json", evidence.get("artifact"), gate, field)
+    payload = read_json(wrapper)
+    cases = payload.get("case_evidence")
+    require(isinstance(cases, list), f"{gate}.{field} descriptor case_evidence must be a list")
+    artifact_dir = bundle_dir / "artifacts"
+    for index, item in enumerate(cases):
+        require(isinstance(item, dict), f"{gate}.{field} descriptor case_evidence[{index}] must be an object")
+        case = evidence_string(
+            item.get("case"),
+            f"{gate}.{field}.case_evidence[{index}].case",
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{1,127}",
+        )
+        source = release_bundle_descriptor_path(
+            descriptor_path,
+            item.get("artifact"),
+            gate,
+            f"{field}.case_evidence.{case}",
+        )
+        source_sha = digest(source)
+        require(sha(item.get("sha256")) and item["sha256"] == source_sha,
+                f"{gate}.{field} descriptor case_evidence[{index}] artifact hash mismatch")
+        safe_case = re.sub(r"[^A-Za-z0-9._-]", "-", case)
+        target = artifact_dir / f"{gate}-{field}-case-{safe_case}{release_bundle_artifact_suffix(source)}"
+        require(not target.exists(), f"{gate}.{field} duplicate assembled case evidence path")
+        shutil.copyfile(source, target)
+        require(digest(target) == source_sha, f"{gate}.{field} assembled case evidence hash mismatch")
+        item["artifact"] = target.relative_to(bundle_dir).as_posix()
+        item["sha256"] = source_sha
+    write_json(wrapper, payload)
+    evidence["case_evidence"] = payload["case_evidence"]
+    evidence["sha256"] = digest(wrapper)
+
+
+def assemble_scanner_heal_release_bundle_descriptors(
+    root: Path,
+    descriptor_paths: list[Path],
+    directory: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Copy measured Scanner/Heal evidence descriptors into one validated release bundle."""
+    require(not directory.exists(), "scanner/heal release bundle directory must be new")
+    require(descriptor_paths, "scanner/heal release bundle assembly requires at least one descriptor")
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle assembly requires schema 2 registry")
+
+    bundle_dir = directory.resolve()
+    artifact_dir = bundle_dir / "artifacts"
+    artifact_dir.mkdir(parents=True)
+    assembled_gates = {}
+    source_revision = None
+    for descriptor_index, raw_descriptor_path in enumerate(descriptor_paths):
+        descriptor_path = raw_descriptor_path.resolve(strict=True)
+        descriptor = read_json(descriptor_path)
+        label = f"scanner/heal release evidence descriptor {descriptor_index + 1}"
+        reject_release_bundle_markers(descriptor, label)
+        require(descriptor.get("schema") == 1, f"unsupported {label} schema")
+        require(descriptor.get("evidence") == "measured", f"{label} must be measured")
+        descriptor_revision = descriptor.get("source_revision")
+        require(isinstance(descriptor_revision, str) and re.fullmatch(r"[0-9a-f]{40}", descriptor_revision) is not None,
+                f"{label} source revision is invalid")
+        if source_revision is None:
+            source_revision = descriptor_revision
+        else:
+            require(descriptor_revision == source_revision, "scanner/heal release descriptor source revisions differ")
+        raw_gates = descriptor.get("gates")
+        require(isinstance(raw_gates, dict), f"{label} missing gates")
+        unknown_gates = sorted(set(raw_gates) - set(requirements))
+        require(not unknown_gates, f"{label} has unknown gates: {', '.join(unknown_gates)}")
+
+        for gate in sorted(raw_gates):
+            require(gate not in assembled_gates, f"scanner/heal release descriptor repeats gate: {gate}")
+            raw_gate = raw_gates[gate]
+            require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
+            reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
+            raw_fields = raw_gate.get("evidence_fields", raw_gate)
+            require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
+            required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+            unknown_fields = sorted(set(raw_fields) - required_fields)
+            require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
+            fields = {}
+            for field in sorted(raw_fields):
+                raw_evidence = raw_fields[field]
+                require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
+                evidence = json.loads(json.dumps(raw_evidence))
+                reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
+                copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
+                if gate == "G14":
+                    copy_release_bundle_g14_case_artifacts(descriptor_path, bundle_dir, evidence, gate, field)
+                profile_artifacts = evidence.get("profile_artifacts")
+                if profile_artifacts is not None:
+                    require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
+                    for artifact_kind, item in sorted(profile_artifacts.items()):
+                        require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
+                        reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
+                        copy_release_bundle_artifact(
+                            descriptor_path,
+                            bundle_dir,
+                            item,
+                            gate,
+                            f"{field}.{artifact_kind}",
+                            f"{gate}-{field}-{artifact_kind}",
+                        )
+                        if field == "profile_evidence":
+                            copy_release_bundle_profile_raw_artifact(
+                                descriptor_path,
+                                bundle_dir,
+                                item,
+                                gate,
+                                f"{field}.{artifact_kind}",
+                                artifact_kind,
+                            )
+                fields[field] = evidence
+            assembled_gates[gate] = {
+                "status": "pass",
+                "lane": requirements[gate]["lane"],
+                "evidence_type": "measured",
+                "evidence_fields": fields,
+            }
+
+    bundle = bundle_dir / "release-evidence.json"
+    write_json(bundle, {
+        "schema": 1,
+        "evidence": "measured",
+        "source_revision": source_revision,
+        "gates": assembled_gates,
+    })
+    return bundle, scanner_heal_release_bundle_status(root, bundle)
+
+
+def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
+    """Copy one measured Scanner/Heal evidence descriptor into a validated release bundle."""
+    return assemble_scanner_heal_release_bundle_descriptors(root, [descriptor_path], directory)
+
+
+def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Path:
+    """Write a non-approvable release bundle shape fixture for dry-run validation."""
+    bundle_dir = directory.resolve()
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = bundle_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle fixture requires schema 2 registry")
+    source_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    baseline_revision = "0" * 39 + "1"
+    require(baseline_revision != source_revision, "scanner/heal release bundle fixture needs a distinct baseline")
+    started = datetime.now(timezone.utc).replace(microsecond=0)
+    gates = {}
+    for gate, requirement in requirements.items():
+        fields = {}
+        for field in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate]:
+            artifact = artifact_dir / f"{gate}-{field}.json"
+            write_json(artifact, {
+                "schema": 1,
+                "fixture_only": True,
+                "gate": gate,
+                "field": field,
+                "source_revision": source_revision,
+            })
+            duration = 60
+            evidence = {
+                "fixture_only": True,
+                "artifact": artifact.relative_to(bundle_dir).as_posix(),
+                "sha256": digest(artifact),
+                "evidence_type": "measured",
+                "source_revision": source_revision,
+                "run_id": f"{gate.lower()}-{field.replace('_', '-')}-fixture-run",
+                "measurement_window_id": f"{gate.lower()}-fixture-window",
+                "started_at": started.isoformat().replace("+00:00", "Z"),
+                "command": ["fixture-only", "scanner-heal-release-bundle", gate, field],
+                "artifact_format": "json",
+                "summary": f"fixture-only parser sample for {gate}.{field}; not release evidence",
+            }
+            if gate.startswith("P"):
+                duration = 900
+                evidence["duration_seconds"] = duration
+            if gate == "P3" and field == "two_hour_pressure_measurement":
+                duration = 7200
+                evidence["duration_seconds"] = duration
+            evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+            if gate == "G10" and field == "scheduler_bound_evidence":
+                evidence.update({
+                    "max_deferred_items": 256,
+                    "max_deferred_bytes": 262144,
+                    "max_retry_age_seconds": 30,
+                    "duplicate_task_count": 0,
+                })
+            if gate == "G10" and field == "pressure_recovery_evidence":
+                evidence.update({
+                    "pressure_pacing_engaged": True,
+                    "recovery_window_seconds": 5,
+                    "lock_hold_p95_ms": 0,
+                    "foreground_latency_p95_ms": 10,
+                })
+            if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                evidence.update({
+                    "foreground_latency_p95_ms": 10,
+                    "foreground_latency_p99_ms": 20,
+                    "throughput_ops_per_second": 100,
+                    "error_count": 0,
+                })
+            if gate == "P3" and field == "two_hour_pressure_measurement":
+                evidence.update({
+                    "fixed_offered_load": True,
+                    "foreground_latency_p99_ms": 20,
+                    "attempt_cost_samples": 1,
+                })
+            if gate == "P3" and field == "heal_capacity_measurement":
+                evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
+            if gate == "P3" and field == "recovery_window_measurement":
+                evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
+            if gate == "G02" and field == "bounded_checkpoint_oracle":
+                evidence.update({
+                    "checkpoint_progress_bounded": True,
+                    "raw_entry_budget": 8,
+                    "max_raw_entries_per_round": 8,
+                    "max_objects_processed_per_round": 8,
+                    "bounded_work_quantum_observed": True,
+                    "durable_checkpoint_committed": True,
+                    "no_unbounded_tail": True,
+                })
+            if gate == "G02" and field == "independent_version_inventory":
+                evidence.update({
+                    "independent_version_inventory_observed": True,
+                    "objects_expected": 16,
+                    "objects_retained": 16,
+                    "versions_retained": 16,
+                    "bytes_retained": 16,
+                })
+            if gate == "R-E" and field == "fixed_budget_restart_evidence":
+                evidence.update({
+                    "fixed_budget_restart_converged": True,
+                    "restart_rounds": 3,
+                    "raw_entry_budget": 8,
+                    "no_unbudgeted_final_sweep": True,
+                })
+            if gate == "R-E" and field == "enumeration_evidence":
+                evidence.update({
+                    "raw_enumeration_observed": True,
+                    "durable_raw_page_commit_observed": True,
+                    "raw_page_index_complete": True,
+                    "enumeration_frontier_retained": True,
+                })
+            if gate == "R-E" and field == "classification_evidence":
+                evidence.update({
+                    "classification_observed": True,
+                    "objects_processed": 16,
+                    "objects_retained": 16,
+                    "versions_retained": 16,
+                    "bytes_retained": 16,
+                })
+            if gate in ("G03", "G09", "R-L"):
+                evidence["versions"] = [baseline_revision, source_revision]
+                evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+            if gate == "G03":
+                evidence["scoped_ack_cases"] = list(SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field])
+                for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+                    evidence[required] = True
+            if gate in ("G04", "G07", "R-E", "R-L"):
+                evidence["crash_points"] = ["fixture-before-commit"]
+            if gate == "G12":
+                evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
+            if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+                evidence["replayed_records"] = 1
+                evidence["responsibility_anchor_retained"] = True
+                evidence["successor_snapshot_published"] = True
+            if gate == "G14" and field == "ec8_4_evidence":
+                evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
+            if gate == "G14" and field == "same_window_field_evidence":
+                evidence["same_window_fields"] = [
+                    item
+                    for item in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]
+                    if item != "same_window_field_evidence"
+                ]
+            if gate == "G14" and field == "multi_set_evidence":
+                evidence["sets"] = 2
+            if gate == "G14" and field == "multi_pool_evidence":
+                evidence["pools"] = 2
+            if field == "profile_evidence":
+                evidence["resolved_samples"] = 1
+                artifacts = {}
+                for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                    profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                    write_json(profile_artifact, {
+                        "schema": 1,
+                        "fixture_only": True,
+                        "gate": gate,
+                        "field": field,
+                        "artifact": artifact_kind,
+                        "source_revision": source_revision,
+                    })
+                    artifacts[artifact_kind] = {
+                        "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
+                        "sha256": digest(profile_artifact),
+                        "artifact_format": "json",
+                        "source_revision": source_revision,
+                        "run_id": evidence["run_id"],
+                        "measurement_window_id": evidence["measurement_window_id"],
+                    }
+                evidence["profile_artifacts"] = artifacts
+            fields[field] = evidence
+        gates[gate] = {
+            "status": "pass",
+            "lane": requirement["lane"],
+            "evidence_type": "measured",
+            "evidence_fields": fields,
+        }
+    bundle = bundle_dir / "release-evidence.fixture.json"
+    write_json(bundle, {
+        "schema": 1,
+        "fixture_only": True,
+        "evidence": "measured",
+        "source_revision": source_revision,
+        "gates": gates,
+    })
+    return bundle
 
 
 def validate(root: Path) -> list[str]:
@@ -1309,28 +3627,1455 @@ class SelfTests(unittest.TestCase):
             )
             + "</testsuite></testsuites>"
         )
-        physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
-                    "erasure_index": 1, "data_blocks": 2, "parity_blocks": 2, "expected_part_numbers": [1],
-                    "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
-                    "inline_data_fingerprint": None}
-        obj = {"key": "object", "version_id": None, "expected_bytes": 16, "actual_bytes": 16,
-               "expected_sha256": "d" * 64, "actual_sha256": "d" * 64,
-               "expected_physical": physical, "physical": physical}
-        objects = [dict(obj, key=f"object-{index}") for index in range(9)]
-        objects[-1] = dict(objects[-1], expected_physical=None)
+        def oracle_objects(requirement: dict[str, object]) -> list[dict[str, object]]:
+            topology = requirement["topology"]
+            total_blocks = topology["nodes"] * topology["drives_per_node"]
+            erasure_set_drive_count = requirement.get("erasure_set_drive_count", total_blocks)
+            erasure = requirement.get("erasure")
+            if erasure is None:
+                parity_blocks = 4 if erasure_set_drive_count == 12 else erasure_set_drive_count // 2
+                data_blocks = erasure_set_drive_count - parity_blocks
+            else:
+                data_blocks = erasure["data_blocks"]
+                parity_blocks = erasure["parity_blocks"]
+            physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
+                        "erasure_index": 1, "data_blocks": data_blocks, "parity_blocks": parity_blocks,
+                        "expected_part_numbers": [1],
+                        "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
+                        "inline_data_fingerprint": None}
+            obj = {"key": "object", "version_id": None, "expected_bytes": 16, "actual_bytes": 16,
+                   "expected_sha256": "d" * 64, "actual_sha256": "d" * 64,
+                   "expected_physical": physical, "physical": physical}
+            count = requirement.get("min_objects", 9)
+            objects = [dict(obj, key=f"object-{index}") for index in range(count)]
+            objects[-1] = dict(objects[-1], expected_physical=None)
+            return objects
+
         for case_id, requirement in requirements.items():
+            objects = oracle_objects(requirement)
             write_json(run_dir / requirement["oracle"], {
                 "schema": 1, "evidence": requirement["evidence"], "case": case_id,
                 "run_id": "a" * 32, "source_revision": "b" * 40,
                 "test_build": {"source_revision": "b" * 40, "dirty": False, "lock_blob": "c" * 40,
                                "features": "default", "target": "aarch64-apple-darwin", "profile": "debug", "rustflags_hex": ""},
                 "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
-                "topology": requirement["topology"], "pid_before": 10, "pid_after": 11,
+                "topology": requirement["topology"],
+                "erasure_set_drive_count": requirement.get(
+                    "erasure_set_drive_count",
+                    requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+                ),
+                "sets": requirement.get("sets", 1),
+                "pools": requirement.get("pools", 1),
+                "outage_target_manifest_required": requirement.get("outage_target_manifest_required", True),
+                "distributed_ec_invalidation": True,
+                "peer_count": requirement["topology"]["nodes"],
+                "same_window_remote_proof": True,
+                "all_peers_bound_to_generation_window": True,
+                "pid_before": 10, "pid_after": 11,
                 "unclean_shutdown_marker": requirement["unclean_shutdown_marker"],
-                "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
+                "objects": objects, "node_listings": [[item["key"] for item in objects]] * requirement["topology"]["nodes"],
             })
         finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
+
+    def test_scanner_heal_case_lane_is_required_for_runner_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            registry_path = root / ".config/scanner-heal-required-tests.json"
+            registry = read_json(registry_path)
+            del registry["cases"]["ec84-target-drive-restart"]["lane"]
+            write_json(registry_path, registry)
+            with self.assertRaisesRegex(ValueError, "invalid nextest profile lane for ec84-target-drive-restart"):
+                scanner_heal_oracle_names(root)
+
+    def scanner_heal_release_bundle_fixture(self, directory: Path) -> tuple[Path, Path]:
+        """Parser fixtures only; the bundle is not runtime evidence."""
+        root, _ = self.scanner_heal_fixture(directory)
+        bundle_dir = directory / "bundle"
+        artifact_dir = bundle_dir / "artifacts"
+        artifact_dir.mkdir(parents=True)
+        registry = read_json(root / ".config/scanner-heal-required-tests.json")
+        requirements, _, _ = scanner_heal_release_requirements(registry)
+        gates = {}
+        source_revision = "b" * 40
+        started = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        for gate, requirement in requirements.items():
+            fields = {}
+            for field in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate]:
+                artifact = artifact_dir / f"{gate}-{field}.json"
+                run_id = f"{gate.lower()}-{field.replace('_', '-')}-run"
+                window_id = f"{gate.lower()}-window"
+                duration = 60
+                evidence = {
+                    "artifact": artifact.relative_to(bundle_dir).as_posix(),
+                    "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
+                    "started_at": started.isoformat().replace("+00:00", "Z"),
+                    "command": ["cargo", "nextest", "run", requirement["description"]],
+                    "artifact_format": "json",
+                    "summary": f"parser fixture for {gate}.{field}",
+                }
+                if gate.startswith("P"):
+                    duration = 900
+                    evidence["duration_seconds"] = duration
+                if gate == "P3" and field == "two_hour_pressure_measurement":
+                    duration = 7200
+                    evidence["duration_seconds"] = duration
+                if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+                    duration = 7200
+                    evidence["duration_seconds"] = duration
+                evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+                if gate == "G10" and field == "scheduler_bound_evidence":
+                    evidence.update({
+                        "max_deferred_items": 256,
+                        "max_deferred_bytes": 262144,
+                        "max_retry_age_seconds": 30,
+                        "duplicate_task_count": 0,
+                    })
+                if gate == "G10" and field == "pressure_recovery_evidence":
+                    evidence.update({
+                        "pressure_pacing_engaged": True,
+                        "recovery_window_seconds": 5,
+                        "lock_hold_p95_ms": 0,
+                        "foreground_latency_p95_ms": 10,
+                    })
+                if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                    evidence.update({
+                        "foreground_latency_p95_ms": 10,
+                        "foreground_latency_p99_ms": 20,
+                        "throughput_ops_per_second": 100,
+                        "error_count": 0,
+                    })
+                if gate == "P3" and field == "two_hour_pressure_measurement":
+                    evidence.update({
+                        "fixed_offered_load": True,
+                        "foreground_latency_p99_ms": 20,
+                        "attempt_cost_samples": 1,
+                    })
+                if gate == "P3" and field == "heal_capacity_measurement":
+                    evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
+                if gate == "P3" and field == "recovery_window_measurement":
+                    evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
+                if gate == "G02" and field == "bounded_checkpoint_oracle":
+                    evidence.update({
+                        "checkpoint_progress_bounded": True,
+                        "raw_entry_budget": 8,
+                        "max_raw_entries_per_round": 8,
+                        "max_objects_processed_per_round": 8,
+                        "bounded_work_quantum_observed": True,
+                        "durable_checkpoint_committed": True,
+                        "no_unbounded_tail": True,
+                    })
+                if gate == "G02" and field == "independent_version_inventory":
+                    evidence.update({
+                        "independent_version_inventory_observed": True,
+                        "objects_expected": 16,
+                        "objects_retained": 16,
+                        "versions_retained": 16,
+                        "bytes_retained": 16,
+                    })
+                if gate == "G01" and field == "root_authority_evidence":
+                    evidence.update({
+                        "root_authority_cases": list(SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES),
+                        "root_cas_observed": True,
+                        "root_readback_observed": True,
+                        "incomplete_root_rejected": True,
+                        "stale_root_rejected": True,
+                    })
+                if gate == "G01" and field == "quota_authority_evidence":
+                    evidence.update({
+                        "quota_authority_cases": list(SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES),
+                        "quota_floor_readback_observed": True,
+                        "over_limit_put_rejected": True,
+                        "rejected_object_invisible": True,
+                        "quota_fails_closed_without_authority": True,
+                    })
+                if gate in ("G03", "G09", "R-L"):
+                    evidence["versions"] = ["a" * 40, source_revision]
+                    evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+                if gate in ("G04", "G07", "R-E", "R-L"):
+                    evidence["crash_points"] = ["before-commit"]
+                if gate == "G03":
+                    evidence["scoped_ack_cases"] = list(SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field])
+                    for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+                        evidence[required] = True
+                if gate == "G04" and field == "root_floor_intent_crash_evidence":
+                    evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
+                    evidence["persist_failure_blocks_acceptance"] = True
+                if gate == "G12":
+                    evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
+                if gate == "G05" and field == "per_object_outcome_oracle":
+                    evidence["per_object_outcome_cases"] = list(SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES)
+                    evidence["outcome_counts"] = {"repaired": 4, "healthy": 3, "skipped": 2, "failed": 1}
+                    evidence["status_matches_object_oracle"] = True
+                if gate == "G05" and field == "terminal_retention_bounds":
+                    evidence["terminal_retention_cases"] = list(SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES)
+                    evidence["terminal_retention_window_seconds"] = 3600
+                    evidence["max_terminal_record_age_seconds"] = 3599
+                    evidence["terminal_records_pruned_after_window"] = 2
+                if gate == "G06" and field == "concurrent_status_evidence":
+                    evidence["concurrent_status_cases"] = list(SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES)
+                    evidence["status_samples"] = 4
+                    evidence["all_status_responses_http_success"] = True
+                    evidence["partial_status_reports_degraded"] = True
+                if gate == "G06" and field == "legacy_client_compatibility":
+                    evidence["legacy_client_cases"] = list(SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES)
+                    evidence["rustfs_and_minio_paths_compatible"] = True
+                    evidence["empty_body_status_requests_accepted"] = True
+                if gate == "G06" and field == "truncation_behavior":
+                    evidence["truncation_cases"] = list(SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES)
+                    evidence["truncated_payloads_rejected"] = True
+                    evidence["max_status_payload_bytes"] = 4096
+                if gate == "R-E" and field == "fixed_budget_restart_evidence":
+                    evidence.update({
+                        "fixed_budget_restart_converged": True,
+                        "restart_rounds": 3,
+                        "raw_entry_budget": 8,
+                        "no_unbudgeted_final_sweep": True,
+                    })
+                if gate == "R-E" and field == "enumeration_evidence":
+                    evidence.update({
+                        "raw_enumeration_observed": True,
+                        "durable_raw_page_commit_observed": True,
+                        "raw_page_index_complete": True,
+                        "enumeration_frontier_retained": True,
+                    })
+                if gate == "R-E" and field == "classification_evidence":
+                    evidence.update({
+                        "classification_observed": True,
+                        "objects_processed": 16,
+                        "objects_retained": 16,
+                        "versions_retained": 16,
+                        "bytes_retained": 16,
+                    })
+                if gate == "G09":
+                    evidence["mixed_version_cases"] = list(SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES[field])
+                    if field == "rollback_payload_evidence":
+                        evidence["rollback_payload_replayed"] = True
+                if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+                    evidence["replayed_records"] = 2
+                    evidence["responsibility_anchor_retained"] = True
+                    evidence["successor_snapshot_published"] = True
+                if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+                    evidence["cleanup_gc_cases"] = list(SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES)
+                    evidence["verified_idle_gc_observed"] = True
+                    evidence["pending_responsibilities_after_gc"] = 0
+                    evidence["stale_journals_after_gc"] = 0
+                if gate == "G07":
+                    case_field = {
+                        "mrf_responsibility_oracle": "mrf_responsibility_cases",
+                        "commit_boundary_crash_matrix": "commit_crash_cases",
+                    }[field]
+                    evidence[case_field] = list(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field])
+                if gate == "G08":
+                    case_field = {
+                        "mrf_capacity_evidence": "capacity_cases",
+                        "disk_full_matrix": "disk_full_cases",
+                        "replica_loss_matrix": "replica_loss_cases",
+                    }[field]
+                    evidence[case_field] = list(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field])
+                if gate == "G10" and field == "scheduler_bound_evidence":
+                    evidence["scheduler_bounds"] = list(SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS)
+                    evidence["duplicate_task_bound_observed"] = True
+                if gate == "G10" and field == "pressure_recovery_evidence":
+                    evidence["pressure_metrics"] = {
+                        "foreground_p95_ms": 40.0,
+                        "foreground_p99_ms": 90.0,
+                        "throughput_ops": 250.0,
+                        "error_rate": 0.0,
+                        "heal_lock_wait_p99_ms": 25.0,
+                        "attempt_cost_samples": 8.0,
+                        "foreground_pressure_samples": 120,
+                        "foreground_pressure_high_samples": 12,
+                    }
+                if gate == "G11" and field == "maintenance_producer_matrix":
+                    evidence["producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["matrix_cases"] = list(SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES[field])
+                    evidence["durable_identity_observed"] = True
+                    evidence["durable_journal_replay_observed"] = True
+                    evidence["durable_journal_hydration_bound"] = True
+                    evidence["generation_window_bound"] = True
+                    evidence["restart_gap_absent"] = True
+                    evidence["overflow_absent"] = True
+                    evidence["ack_clear_generation_observed"] = True
+                    evidence["invalid_journal_inputs_rejected"] = list(SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES)
+                if gate == "G11" and field == "complete_producer_inventory":
+                    evidence["required_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["observed_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["required_producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["observed_producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["missing_producer_identities"] = []
+                    evidence["unknown_producer_excluded"] = True
+                if gate == "G13" and field == "quorum_minus_one_matrix":
+                    evidence["quorum_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["no_success_at_quorum_minus_one"] = True
+                    evidence["exact_quorum_restored"] = True
+                if gate == "G13" and field == "unknown_disk_remount_matrix":
+                    evidence["remount_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["unknown_disks_excluded"] = True
+                    evidence["remounted_disks_revalidated"] = True
+                    evidence["stale_incarnation_rejected"] = True
+                if gate == "G13" and field == "object_lock_dry_run_grace_evidence":
+                    evidence["grace_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["object_lock_denials_preserved"] = True
+                    evidence["dry_run_mutation_count"] = 0
+                    evidence["grace_outcomes_retained"] = True
+                if gate == "G14" and field == "ec8_4_evidence":
+                    evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
+                if gate == "G14" and field == "same_window_field_evidence":
+                    evidence["same_window_fields"] = [
+                        item
+                        for item in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]
+                        if item != "same_window_field_evidence"
+                    ]
+                if gate == "G14" and field == "multi_set_evidence":
+                    evidence["sets"] = 2
+                if gate == "G14" and field == "multi_pool_evidence":
+                    evidence["pools"] = 2
+                if gate == "G14" and field == "distributed_segment_invalidation_evidence":
+                    evidence["invalidation_domain"] = "distributed-ec"
+                    evidence["distributed_ec_invalidation"] = True
+                    evidence["peer_count"] = 3
+                    evidence["same_window_remote_proof"] = True
+                    evidence["all_peers_bound_to_generation_window"] = True
+                if gate == "G14":
+                    case_id = "ec84-multiset-multipool"
+                    case_artifact = artifact_dir / "cases" / f"{gate}-{field}-{case_id}.json"
+                    case_artifact.parent.mkdir(parents=True, exist_ok=True)
+                    write_json(case_artifact, {
+                        "schema": 1,
+                        "case": case_id,
+                        "evidence_type": "measured",
+                        "source_revision": source_revision,
+                        "measurement_window_id": window_id,
+                        "topology": {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4},
+                        "sets": 2,
+                        "pools": 2,
+                        "invalidation_domain": "distributed-ec",
+                        "distributed_ec_invalidation": True,
+                        "peer_count": 3,
+                        "same_window_remote_proof": True,
+                        "all_peers_bound_to_generation_window": True,
+                    })
+                    evidence["case_evidence"] = [
+                        {
+                            "case": case_id,
+                            "artifact": case_artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(case_artifact),
+                            "source_revision": source_revision,
+                            "measurement_window_id": window_id,
+                        },
+                    ]
+                if field == "segment_activation_preflight":
+                    evidence["production_activation"] = True
+                    evidence["scanner_segment_reuse_activated"] = True
+                    evidence["proof_inputs"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS)
+                    evidence["fail_closed_checks"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS)
+                if field == "cold_segment_reuse_measurement":
+                    evidence["hot_walked_segments"] = 2
+                    evidence["cold_walked_segments"] = 0
+                    evidence["full_walk_oracle_equivalent"] = True
+                    evidence["published_root_equivalent"] = True
+                if field == "post_stop_convergence_measurement":
+                    evidence["writes_stopped"] = True
+                    evidence["last_mutation_observed"] = True
+                    evidence["first_complete_publication"] = True
+                    evidence["post_stop_samples"] = 2
+                    evidence["post_stop_work_multiple"] = 1.1
+                    evidence["post_stop_work_multiple_limit"] = 1.2
+                    evidence["post_stop_work_multiples"] = [1.0, 1.1]
+                if gate == "P4" and field == "retained_responsibility_evidence":
+                    evidence["duration_seconds"] = 7200
+                    evidence["finished_at"] = (started + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")
+                    evidence["retained_responsibility_cases"] = list(
+                        SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES
+                    )
+                    evidence["retention_window_seconds"] = 7200
+                    evidence["idle_cleanup_observed"] = True
+                    evidence["verified_proof_discharge_observed"] = True
+                if gate == "R-D" and field == "manager_disposition_evidence":
+                    evidence["manager_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_MANAGER_CASES)
+                    evidence["manager_dispositions_are_terminal"] = True
+                if gate == "R-D" and field == "event_disposition_evidence":
+                    evidence["event_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_EVENT_CASES)
+                    evidence["events_correlate_to_manager_dispositions"] = True
+                if gate == "R-D" and field == "ledger_disposition_evidence":
+                    evidence["ledger_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_LEDGER_CASES)
+                    evidence["ledger_correlates_to_events"] = True
+                    evidence["ledger_replay_preserves_terminal_disposition"] = True
+                if gate == "R-D" and field == "grace_handling":
+                    evidence["grace_cases"] = list(SCANNER_HEAL_RELEASE_RD_GRACE_CASES)
+                    evidence["grace_window_seconds"] = 300
+                    evidence["grace_retention_observed"] = True
+                    evidence["grace_expiry_pruned_terminal_records"] = True
+                if gate == "R-L" and field == "legacy_source_conflict_evidence":
+                    evidence["legacy_source_conflict_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_conflicts_rejected"] = True
+                    evidence["takeover_identity_bound"] = True
+                    evidence["legacy_checksum_gap_rejected"] = True
+                if gate == "R-L" and field == "migration_gap_evidence":
+                    evidence["migration_gap_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["migration_gap_closed"] = True
+                    evidence["legacy_sources_fail_closed"] = True
+                    evidence["prior_responsibilities_inherited"] = True
+                if gate == "R-L" and field == "crash_safe_source_retirement_evidence":
+                    evidence["source_retirement_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_retirement_is_crash_safe"] = True
+                    evidence["old_source_retained_until_successor"] = True
+                    evidence["recovered_pending_migration"] = True
+                if field == "profile_evidence":
+                    profile_metrics = {
+                        "resolved_samples": 1,
+                        "allocation_bytes": 1024,
+                        "rss_peak_bytes": 4096,
+                        "save_operations": 2,
+                        "saved_bytes": 2048,
+                    }
+                    evidence.update(profile_metrics)
+                    artifacts = {}
+                    for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                        raw_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.raw"
+                        raw_artifact.write_text(f"{artifact_kind} measured profile sample\n", encoding="utf-8")
+                        profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                        write_json(profile_artifact, {
+                            "schema": 1,
+                            "evidence_type": "measured",
+                            "source_revision": source_revision,
+                            "run_id": run_id,
+                            "measurement_window_id": window_id,
+                            "gate": gate,
+                            "field": field,
+                            "artifact_kind": artifact_kind,
+                            "raw_profile_artifact": raw_artifact.relative_to(bundle_dir).as_posix(),
+                            "raw_profile_sha256": digest(raw_artifact),
+                            "raw_profile_bytes": raw_artifact.stat().st_size,
+                            "raw_profile_format": "raw",
+                            **{
+                                metric: profile_metrics[metric]
+                                for metric in PROFILE_ARTIFACT_REQUIRED_METRICS[artifact_kind]
+                            },
+                        })
+                        artifacts[artifact_kind] = {
+                            "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(profile_artifact),
+                            "artifact_format": "json",
+                            "source_revision": source_revision,
+                            "run_id": run_id,
+                            "measurement_window_id": window_id,
+                        }
+                    evidence["profile_artifacts"] = artifacts
+                if gate == "P1" and field == "cold_walk_share_measurement":
+                    evidence["cold_walk_share"] = 0.5
+                    evidence["walk_objects"] = 100
+                    evidence["cold_walk_objects"] = 50
+                if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                    evidence["foreground_p95_ms"] = 50.0
+                    evidence["foreground_p99_ms"] = 100.0
+                    evidence["throughput_ops"] = 200.0
+                    evidence["error_rate"] = 0.0
+                if gate == "P3" and field == "two_hour_pressure_measurement":
+                    evidence["abba_legs"] = ["A1", "B1", "B2", "A2"]
+                    evidence["scenarios"] = list(SCENARIOS)
+                    evidence["foreground_p95_ms"] = 50.0
+                    evidence["foreground_p99_ms"] = 100.0
+                    evidence["throughput_ops"] = 200.0
+                if gate == "P3" and field == "heal_capacity_measurement":
+                    evidence["heal_capacity"] = {
+                        "objects": 100,
+                        "versions": 100,
+                        "bytes": 1048576,
+                        "completed_objects": 100,
+                    }
+                if gate == "P3" and field == "recovery_window_measurement":
+                    evidence["fault_modes"] = ["process-restart", "process-crash-restart"]
+                    evidence["recovery_p95_ms"] = 500.0
+                    evidence["recovery_p99_ms"] = 1000.0
+                artifact_payload = {
+                    "schema": 1,
+                    "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
+                    "gate": gate,
+                    "field": field,
+                }
+                mrf_artifact_kind = SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS.get((gate, field))
+                if mrf_artifact_kind is not None:
+                    artifact_payload["artifact_kind"] = mrf_artifact_kind
+                for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
+                    artifact_payload[mirror_field] = evidence[mirror_field]
+                write_json(artifact, artifact_payload)
+                evidence["sha256"] = digest(artifact)
+                fields[field] = evidence
+            gates[gate] = {
+                "status": "pass",
+                "lane": requirement["lane"],
+                "evidence_type": "measured",
+                "evidence_fields": fields,
+            }
+        bundle = bundle_dir / "release-evidence.json"
+        write_json(bundle, {"schema": 1, "evidence": "measured", "source_revision": source_revision, "gates": gates})
+        return root, bundle
+
+    def test_scanner_heal_release_bundle_accepts_complete_measured_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_status(root, bundle)
+            self.assertEqual(status["decision"], "approved")
+            self.assertTrue(status["release_approved"])
+            self.assertEqual(len(status["verified_gates"]), len(SCANNER_HEAL_RELEASE_REQUIRED_GATES))
+            self.assertEqual(status["pending_gates"], [])
+            self.assertEqual(status["pending_lanes"], [])
+
+    def test_scanner_heal_release_bundle_assembler_copies_measured_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle, status = assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
+            self.assertEqual(status["decision"], "approved")
+            self.assertTrue(status["release_approved"])
+            assembled = read_json(bundle)
+            evidence = assembled["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]
+            self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
+            self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
+            self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+            profile = assembled["gates"]["P1"]["evidence_fields"]["profile_evidence"]
+            profile_artifact = profile["profile_artifacts"]["save-frequency"]
+            profile_wrapper = bundle.parent / profile_artifact["artifact"]
+            profile_payload = read_json(profile_wrapper)
+            raw_profile = bundle.parent / profile_payload["raw_profile_artifact"]
+            self.assertTrue(raw_profile.is_file())
+            self.assertEqual(profile_payload["raw_profile_sha256"], digest(raw_profile))
+            self.assertEqual(profile_artifact["sha256"], digest(profile_wrapper))
+
+    def test_scanner_heal_release_bundle_assembler_merges_measured_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            descriptor_paths = []
+            for gate in ("G01", "G09"):
+                partial = descriptor.parent / f"release-bundle-{gate}.json"
+                write_json(partial, {
+                    "schema": 1,
+                    "evidence": "measured",
+                    "source_revision": source["source_revision"],
+                    "gates": {gate: source["gates"][gate]},
+                })
+                descriptor_paths.append(partial)
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                    root,
+                    descriptor_paths,
+                    Path(tmp) / "assembled",
+                )
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("G01", status["verified_gates"])
+            self.assertIn("G09", status["verified_gates"])
+            self.assertIn("G02", status["pending_gates"])
+            assembled = read_json(bundle)
+            self.assertEqual(sorted(assembled["gates"]), ["G01", "G09"])
+            g09 = assembled["gates"]["G09"]["evidence_fields"]["mixed_version_reader_evidence"]
+            self.assertTrue((bundle.parent / g09["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_assembler_rejects_duplicate_descriptor_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "repeats gate: G01"):
+                    assemble_scanner_heal_release_bundle_descriptors(
+                        root,
+                        [descriptor, descriptor],
+                        Path(tmp) / "assembled",
+                    )
+
+    def test_scanner_heal_release_bundle_assembler_rejects_mixed_descriptor_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            g01 = descriptor.parent / "release-bundle-g01.json"
+            g09 = descriptor.parent / "release-bundle-g09.json"
+            write_json(g01, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": source["source_revision"],
+                "gates": {"G01": source["gates"]["G01"]},
+            })
+            write_json(g09, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": "c" * 40,
+                "gates": {"G09": source["gates"]["G09"]},
+            })
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "source revisions differ"):
+                    assemble_scanner_heal_release_bundle_descriptors(root, [g01, g09], Path(tmp) / "assembled")
+
+    def test_scanner_heal_release_bundle_gate_accepts_single_measured_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"]}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+                full_status = scanner_heal_release_bundle_status(root, bundle)
+            self.assertEqual(status["decision"], "verified")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["verified_gate"], "G09")
+            self.assertIn("G07", status["pending_gates"])
+            self.assertEqual(full_status["decision"], "blocked")
+            self.assertFalse(full_status["release_approved"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_missing_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            del data["gates"]["G09"]["evidence_fields"]["rollback_payload_evidence"]
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("missing required fields: rollback_payload_evidence", status["rejected_errors"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_unknown_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"], "Z99": {"status": "pass"}}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "unknown gates: Z99"):
+                    scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+
+    def test_scanner_heal_release_bundle_assembler_rejects_fixture_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                descriptor = write_scanner_heal_release_bundle_fixture(root, Path(tmp) / "bundle")
+                with self.assertRaisesRegex(ValueError, "fixture_only"):
+                    assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
+
+    def test_scanner_heal_release_bundle_assembler_rejects_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(descriptor)
+            data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["sha256"] = "0" * 64
+            write_json(descriptor, data)
+
+            with self.assertRaisesRegex(ValueError, "descriptor artifact hash mismatch"):
+                assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
+
+    def test_scanner_heal_release_bundle_fixture_writer_is_not_release_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle = write_scanner_heal_release_bundle_fixture(root, Path(tmp) / "bundle")
+                with self.assertRaisesRegex(ValueError, "fixture_only"):
+                    scanner_heal_release_bundle_status(root, bundle)
+            data = read_json(bundle)
+            self.assertTrue(data["fixture_only"])
+            self.assertEqual(data["source_revision"], "b" * 40)
+
+    def test_scanner_heal_release_bundle_rejects_synthetic_or_missing_fields(self) -> None:
+        for fault in ("synthetic", "missing-field", "hash", "empty-artifact"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                if fault == "synthetic":
+                    data["evidence"] = "synthetic"
+                elif fault == "missing-field":
+                    del data["gates"]["G09"]["evidence_fields"]["rollback_payload_evidence"]
+                elif fault == "hash":
+                    artifact = bundle.parent / data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["artifact"]
+                    artifact.write_text(artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+                else:
+                    artifact = bundle.parent / data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["artifact"]
+                    artifact.write_text("", encoding="utf-8")
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    if fault == "synthetic":
+                        with self.assertRaisesRegex(ValueError, "must be measured"):
+                            scanner_heal_release_bundle_status(root, bundle)
+                    else:
+                        status = scanner_heal_release_bundle_status(root, bundle)
+                if fault != "synthetic":
+                    self.assertEqual(status["decision"], "blocked")
+                    self.assertFalse(status["release_approved"])
+                    self.assertTrue(status["rejected_gates"])
+
+    def test_scanner_heal_release_bundle_enforces_topology_duration_profile_and_versions(self) -> None:
+        for fault, gate, field, mutation, expected in (
+            ("topology", "G14", "ec8_4_evidence", lambda item: item.update({"topology": {"erasure": "EC4+2", "nodes": 2, "drives_per_node": 3}}), "JSON artifact topology mismatch"),
+            ("missing-duration", "P1", "cold_walk_share_measurement", lambda item: item.pop("duration_seconds"), "duration_seconds"),
+            ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
+            ("mrf-cleanup-soak-duration", "P4", "mrf_cleanup_gc_soak_evidence", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
+            ("profile", "P1", "profile_evidence", lambda item: item.pop("resolved_samples"), "resolved_samples"),
+            (
+                "profile-artifact",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"].pop("flamegraph"),
+                "missing profile artifacts",
+            ),
+            (
+                "profile-artifact-hash",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["rss-samples"].update({"sha256": "0" * 64}),
+                "artifact hash mismatch",
+            ),
+            (
+                "profile-artifact-source",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["allocation-profile"].update({"source_revision": "c" * 40}),
+                "source revision mismatch",
+            ),
+            (
+                "profile-artifact-run",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["flamegraph"].update({"run_id": "p1-different-profile-run"}),
+                "run_id mismatch",
+            ),
+            (
+                "profile-artifact-window",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["save-frequency"].update(
+                    {"measurement_window_id": "p1-different-window"}
+                ),
+                "measurement window mismatch",
+            ),
+            ("g05-outcome-cases", "G05", "per_object_outcome_oracle", lambda item: item["per_object_outcome_cases"].remove("object-failed-and-retained"), "missing cases"),
+            ("g05-outcome-counts", "G05", "per_object_outcome_oracle", lambda item: item["outcome_counts"].pop("failed"), "outcome_counts.failed"),
+            (
+                "g05-retention-window",
+                "G05",
+                "terminal_retention_bounds",
+                lambda item: item.update({"max_terminal_record_age_seconds": item["terminal_retention_window_seconds"] + 1}),
+                "exceeds retention window",
+            ),
+            (
+                "g06-concurrent-status",
+                "G06",
+                "concurrent_status_evidence",
+                lambda item: item["concurrent_status_cases"].remove("status-while-peer-down"),
+                "missing cases",
+            ),
+            (
+                "g06-legacy-client",
+                "G06",
+                "legacy_client_compatibility",
+                lambda item: item.update({"empty_body_status_requests_accepted": False}),
+                "empty_body_status_requests_accepted",
+            ),
+            (
+                "g06-truncation",
+                "G06",
+                "truncation_behavior",
+                lambda item: item["truncation_cases"].remove("truncated-node-status-reject"),
+                "missing cases",
+            ),
+            ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
+            ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
+            ("g08-capacity-cases", "G08", "mrf_capacity_evidence", lambda item: item.update({"capacity_cases": ["queue-count-limit"]}), "missing cases"),
+            (
+                "g08-disk-full-cases",
+                "G08",
+                "disk_full_matrix",
+                lambda item: item["disk_full_cases"].remove("cleanup-delete-enospc"),
+                "missing cases",
+            ),
+            ("g08-replica-loss-cases", "G08", "replica_loss_matrix", lambda item: item.update({"replica_loss_cases": ["single-replica-loss"]}), "missing cases"),
+            ("g07-responsibility-cases", "G07", "mrf_responsibility_oracle", lambda item: item.update({"mrf_responsibility_cases": ["legacy-journal-replay"]}), "missing cases"),
+            ("g07-crash-cases", "G07", "commit_boundary_crash_matrix", lambda item: item.pop("commit_crash_cases"), "non-empty string list"),
+            ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
+            ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
+            ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
+            (
+                "g02-raw-budget",
+                "G02",
+                "bounded_checkpoint_oracle",
+                lambda item: item.update({"max_raw_entries_per_round": item["raw_entry_budget"] + 1}),
+                "raw entries exceed fixed budget",
+            ),
+            (
+                "g02-durable-checkpoint",
+                "G02",
+                "bounded_checkpoint_oracle",
+                lambda item: item.update({"durable_checkpoint_committed": False}),
+                "durable_checkpoint_committed",
+            ),
+            (
+                "g02-version-inventory",
+                "G02",
+                "independent_version_inventory",
+                lambda item: item.update({"versions_retained": item["objects_retained"] - 1}),
+                "version inventory",
+            ),
+            (
+                "re-converged",
+                "R-E",
+                "fixed_budget_restart_evidence",
+                lambda item: item.update({"fixed_budget_restart_converged": False}),
+                "fixed_budget_restart_converged",
+            ),
+            (
+                "re-enumeration-commit",
+                "R-E",
+                "enumeration_evidence",
+                lambda item: item.update({"durable_raw_page_commit_observed": False}),
+                "durable_raw_page_commit_observed",
+            ),
+            (
+                "re-classification-inventory",
+                "R-E",
+                "classification_evidence",
+                lambda item: item.update({"bytes_retained": item["objects_retained"] - 1}),
+                "byte inventory",
+            ),
+            (
+                "mrf-cleanup-gc-cases",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item["cleanup_gc_cases"].remove("repeated-replay-no-resurrection"),
+                "cleanup_gc_cases missing cases",
+            ),
+            (
+                "mrf-cleanup-gc-idle",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"verified_idle_gc_observed": False}),
+                "verified idle GC",
+            ),
+            (
+                "mrf-cleanup-gc-pending",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"pending_responsibilities_after_gc": 1}),
+                "zero pending responsibilities",
+            ),
+            (
+                "mrf-cleanup-gc-stale",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"stale_journals_after_gc": 1}),
+                "zero stale journals",
+            ),
+            ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "JSON artifact same_window_fields mismatch"),
+            ("activation-disabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": False}), "production activation is enabled"),
+            (
+                "activation-runtime-disabled",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item.update({"scanner_segment_reuse_activated": False}),
+                "runtime activation gate is enabled",
+            ),
+            (
+                "activation-missing-fail-closed",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["fail_closed_checks"].remove("overflow"),
+                "missing G11.segment_activation_preflight.fail_closed_checks",
+            ),
+            (
+                "activation-missing-proof-input",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["proof_inputs"].remove("process_epoch"),
+                "missing G11.segment_activation_preflight.proof_inputs",
+            ),
+            (
+                "activation-missing-durable-journal-input",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["proof_inputs"].remove("durable_dirty_producer_journal"),
+                "missing G11.segment_activation_preflight.proof_inputs",
+            ),
+            (
+                "activation-missing-ack-guard",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["fail_closed_checks"].remove("stale_ack_generation"),
+                "missing G11.segment_activation_preflight.fail_closed_checks",
+            ),
+            (
+                "producer-matrix-missing",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item["producer_identities"].remove("tier_expiration"),
+                "producer_identities missing cases",
+            ),
+            (
+                "producer-matrix-no-journal-replay",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"durable_journal_replay_observed": False}),
+                "durable_journal_replay_observed",
+            ),
+            (
+                "producer-matrix-no-hydration-bound",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"durable_journal_hydration_bound": False}),
+                "durable_journal_hydration_bound",
+            ),
+            (
+                "producer-matrix-no-ack-clear-generation",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"ack_clear_generation_observed": False}),
+                "ack_clear_generation_observed",
+            ),
+            (
+                "producer-matrix-missing-invalid-journal-case",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item["invalid_journal_inputs_rejected"].remove("mixed-version-producer"),
+                "invalid_journal_inputs_rejected missing cases",
+            ),
+            (
+                "producer-inventory-missing",
+                "G11",
+                "complete_producer_inventory",
+                lambda item: item.update({"missing_producer_identities": ["tier_expiration"]}),
+                "zero missing producer identities",
+            ),
+            (
+                "producer-inventory-unknown",
+                "G11",
+                "complete_producer_inventory",
+                lambda item: item.update({"unknown_producer_excluded": False}),
+                "unknown_producer_excluded",
+            ),
+            (
+                "quorum-minus-one-success",
+                "G13",
+                "quorum_minus_one_matrix",
+                lambda item: item.update({"no_success_at_quorum_minus_one": False}),
+                "no_success_at_quorum_minus_one",
+            ),
+            (
+                "remount-revalidation",
+                "G13",
+                "unknown_disk_remount_matrix",
+                lambda item: item.update({"remounted_disks_revalidated": False}),
+                "remounted_disks_revalidated",
+            ),
+            (
+                "dry-run-mutates",
+                "G13",
+                "object_lock_dry_run_grace_evidence",
+                lambda item: item.update({"dry_run_mutation_count": 1}),
+                "dry_run_mutation_count",
+            ),
+            (
+                "distributed-invalidation",
+                "G14",
+                "distributed_segment_invalidation_evidence",
+                lambda item: item.update({"distributed_ec_invalidation": False}),
+                "JSON artifact distributed_ec_invalidation mismatch",
+            ),
+            (
+                "distributed-peer-window",
+                "G14",
+                "distributed_segment_invalidation_evidence",
+                lambda item: item.update({"all_peers_bound_to_generation_window": False}),
+                "JSON artifact all_peers_bound_to_generation_window mismatch",
+            ),
+            (
+                "post-stop-work-multiple",
+                "P2",
+                "post_stop_convergence_measurement",
+                lambda item: item.update({"post_stop_work_multiple": 1.3}),
+                "post-stop work multiple limit",
+            ),
+            (
+                "post-stop-publication",
+                "P2",
+                "post_stop_convergence_measurement",
+                lambda item: item.update({"first_complete_publication": False}),
+                "first complete publication",
+            ),
+            (
+                "cold-segment-walk",
+                "P2",
+                "cold_segment_reuse_measurement",
+                lambda item: item.update({"cold_walked_segments": 1}),
+                "cold_walked_segments",
+            ),
+            (
+                "cold-segment-oracle",
+                "P2",
+                "cold_segment_reuse_measurement",
+                lambda item: item.update({"full_walk_oracle_equivalent": False}),
+                "full-walk oracle equivalence",
+            ),
+            (
+                "p4-retained-responsibility-cases",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item["retained_responsibility_cases"].remove("idle-cleanup-reclaims-replay-source"),
+                "retained_responsibility_cases missing cases",
+            ),
+            (
+                "p4-retention-window",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.update({"retention_window_seconds": 7199}),
+                "retention_window_seconds",
+            ),
+            (
+                "p4-idle-cleanup",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.update({"idle_cleanup_observed": False}),
+                "idle_cleanup_observed",
+            ),
+            (
+                "p4-proof-discharge",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.pop("verified_proof_discharge_observed"),
+                "verified_proof_discharge_observed",
+            ),
+            ("scheduler-duplicates", "G10", "scheduler_bound_evidence", lambda item: item.pop("duplicate_task_count"), "duplicate_task_count"),
+            ("p1-throughput", "P1", "foreground_latency_throughput_measurement", lambda item: item.pop("throughput_ops_per_second"), "throughput_ops_per_second"),
+            ("p3-fixed-load", "P3", "two_hour_pressure_measurement", lambda item: item.update({"fixed_offered_load": False}), "fixed offered load"),
+            (
+                "g01-root-cases",
+                "G01",
+                "root_authority_evidence",
+                lambda item: item["root_authority_cases"].remove("stale-root-rejected"),
+                "root_authority_cases missing cases",
+            ),
+            (
+                "g01-quota-fail-closed",
+                "G01",
+                "quota_authority_evidence",
+                lambda item: item.update({"quota_fails_closed_without_authority": False}),
+                "quota_fails_closed_without_authority",
+            ),
+            (
+                "rd-manager",
+                "R-D",
+                "manager_disposition_evidence",
+                lambda item: item["manager_disposition_cases"].remove("rejected-policy"),
+                "missing cases",
+            ),
+            (
+                "rd-event",
+                "R-D",
+                "event_disposition_evidence",
+                lambda item: item.update({"events_correlate_to_manager_dispositions": False}),
+                "events_correlate_to_manager_dispositions",
+            ),
+            (
+                "rd-ledger",
+                "R-D",
+                "ledger_disposition_evidence",
+                lambda item: item.update({"ledger_replay_preserves_terminal_disposition": False}),
+                "ledger_replay_preserves_terminal_disposition",
+            ),
+            (
+                "rd-grace",
+                "R-D",
+                "grace_handling",
+                lambda item: item["grace_cases"].remove("restart-preserves-grace-clock"),
+                "missing cases",
+            ),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                mutation(data["gates"][gate]["evidence_fields"][field])
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_mixed_version_field_roles(self) -> None:
+        for gate, field, wrong_role in (
+            ("G03", "mixed_peer_ack_fallback_oracle", "mixed-version-reader"),
+            ("G09", "mixed_version_reader_evidence", "mixed-version-writer"),
+            ("G09", "mixed_version_writer_evidence", "mixed-version-reader"),
+            ("G09", "rollback_payload_evidence", "mixed-version-reader"),
+            ("R-L", "crash_safe_source_retirement_evidence", "migration-gap"),
+        ):
+            with self.subTest(gate=gate, field=field), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                data["gates"][gate]["evidence_fields"][field]["mixed_version_role"] = wrong_role
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any("mixed-version role" in error for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_field_provenance(self) -> None:
+        for fault, mutation, expected in (
+            ("source", lambda item: item.update({"source_revision": "c" * 40}), "source revision mismatch"),
+            ("run-id", lambda item: item.pop("run_id"), "run_id"),
+            ("window-id", lambda item: item.update({"measurement_window_id": item["run_id"]}), "separate run"),
+            ("started-at", lambda item: item.update({"started_at": "not-a-time"}), "timestamp"),
+            ("finished-at", lambda item: item.update({"finished_at": "2026-09-07T00:00:00Z"}), "timestamps are inverted"),
+            ("command", lambda item: item.update({"command": []}), "command provenance"),
+            ("artifact-format", lambda item: item.pop("artifact_format"), "artifact_format"),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                mutation(data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"])
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"]["G01"]), fault)
+
+    def test_scanner_heal_release_bundle_requires_json_artifact_provenance(self) -> None:
+        for fault, mutation, evidence_path, expected in (
+            (
+                "summary-window",
+                lambda payload: payload.update({"measurement_window_id": "p1-stale-window"}),
+                ("P1", "profile_evidence"),
+                "JSON artifact measurement window mismatch",
+            ),
+            (
+                "summary-source",
+                lambda payload: payload.update({"source_revision": "c" * 40}),
+                ("G09", "mixed_version_reader_evidence"),
+                "JSON artifact source revision mismatch",
+            ),
+            (
+                "profile-kind",
+                lambda payload: payload.update({"artifact_kind": "flamegraph"}),
+                ("P1", "profile_evidence", "allocation-profile"),
+                "JSON artifact kind mismatch",
+            ),
+            (
+                "profile-run",
+                lambda payload: payload.update({"run_id": "p1-different-profile-run"}),
+                ("P1", "profile_evidence", "rss-samples"),
+                "JSON artifact run_id mismatch",
+            ),
+            (
+                "profile-raw-hash",
+                lambda payload: payload.update({"raw_profile_sha256": "0" * 64}),
+                ("P1", "profile_evidence", "flamegraph"),
+                "raw profile hash mismatch",
+            ),
+            (
+                "profile-save-cost",
+                lambda payload: payload.pop("saved_bytes"),
+                ("P1", "profile_evidence", "save-frequency"),
+                "save-frequency.saved_bytes",
+            ),
+            (
+                "fixture-marker",
+                lambda payload: payload.update({"fixture": True}),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact is fixture",
+            ),
+            (
+                "g05-outcome-mirror",
+                lambda payload: payload["per_object_outcome_cases"].remove("object-skipped-by-policy"),
+                ("G05", "per_object_outcome_oracle"),
+                "per_object_outcome_cases missing cases",
+            ),
+            (
+                "g01-authority-mirror",
+                lambda payload: payload["root_authority_cases"].remove("incomplete-root-rejected"),
+                ("G01", "root_authority_evidence"),
+                "root_authority_cases missing cases",
+            ),
+            (
+                "g06-truncation-mirror",
+                lambda payload: payload["truncation_cases"].remove("trailing-data-node-status-reject"),
+                ("G06", "truncation_behavior"),
+                "truncation_cases missing cases",
+            ),
+            (
+                "mrf-artifact-kind",
+                lambda payload: payload.update({"artifact_kind": "generic-json"}),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact kind must be mrf-disk-full-enospc-matrix",
+            ),
+            (
+                "g08-case-mirror",
+                lambda payload: payload["disk_full_cases"].remove("manifest-write-enospc"),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact missing cases",
+            ),
+            (
+                "p4-gc-mirror",
+                lambda payload: payload.update({"pending_responsibilities_after_gc": 1}),
+                ("P4", "mrf_cleanup_gc_soak_evidence"),
+                "JSON artifact requires zero pending responsibilities",
+            ),
+            (
+                "rd-grace-mirror",
+                lambda payload: payload["grace_cases"].remove("grace-expired-prunes-terminal"),
+                ("R-D", "grace_handling"),
+                "grace_cases missing cases",
+            ),
+            (
+                "rl-migration-gap-mirror",
+                lambda payload: payload.update({"migration_gap_closed": False}),
+                ("R-L", "migration_gap_evidence"),
+                "migration_gap_closed",
+            ),
+            (
+                "g14-topology-mirror",
+                lambda payload: payload.update({"topology": {"erasure": "EC8+4", "nodes": 4, "drives_per_node": 4}}),
+                ("G14", "ec8_4_evidence"),
+                "JSON artifact topology mismatch",
+            ),
+            (
+                "g14-case-source",
+                lambda payload: payload["case_evidence"][0].update({"source_revision": "c" * 40}),
+                ("G14", "multi_pool_evidence"),
+                "JSON artifact case_evidence mismatch",
+            ),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                gate, field, *artifact_kind = evidence_path
+                evidence = data["gates"][gate]["evidence_fields"][field]
+                if artifact_kind:
+                    item = evidence["profile_artifacts"][artifact_kind[0]]
+                else:
+                    item = evidence
+                artifact = bundle.parent / item["artifact"]
+                payload = read_json(artifact)
+                mutation(payload)
+                write_json(artifact, payload)
+                item["sha256"] = digest(artifact)
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]), fault)
+
+    def test_scanner_heal_release_bundle_requires_same_gate_measurement_window(self) -> None:
+        for gate, field in (("G14", "multi_pool_evidence"), ("P1", "profile_evidence"), ("P3", "heal_capacity_measurement")):
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                evidence = data["gates"][gate]["evidence_fields"][field]
+                evidence["measurement_window_id"] = f"{gate.lower()}-different-window"
+                artifacts = [evidence]
+                if "profile_artifacts" in evidence:
+                    artifacts.extend(evidence["profile_artifacts"].values())
+                for item in artifacts:
+                    artifact = bundle.parent / item["artifact"]
+                    payload = read_json(artifact)
+                    payload["measurement_window_id"] = evidence["measurement_window_id"]
+                    write_json(artifact, payload)
+                    if "measurement_window_id" in item:
+                        item["measurement_window_id"] = evidence["measurement_window_id"]
+                    item["sha256"] = digest(artifact)
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                expected = (
+                    "case_evidence[0].measurement_window_id mismatch"
+                    if gate == "G14"
+                    else "must share one measurement window"
+                )
+                self.assertTrue(any(expected in error
+                                    for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_domain_evidence(self) -> None:
+        for fault, gate, field, mutation, expected in (
+            (
+                "scoped-ack-cases",
+                "G03",
+                "scoped_ack_request_identity",
+                lambda item: item["scoped_ack_cases"].remove("exact-generation"),
+                "missing cases",
+            ),
+            (
+                "scoped-ack-fallback",
+                "G03",
+                "scoped_ack_request_identity",
+                lambda item: item.update({"whole_cycle_fallback_observed": False}),
+                "whole_cycle_fallback_observed",
+            ),
+            (
+                "scoped-ack-capability-snapshot",
+                "G03",
+                "participating_peer_capability_snapshot",
+                lambda item: item.pop("capability_probe_observed"),
+                "capability_probe_observed",
+            ),
+            (
+                "scoped-ack-mixed-peer-restart",
+                "G03",
+                "mixed_peer_ack_fallback_oracle",
+                lambda item: item.update({"restarted_peer_rejected": False}),
+                "restarted_peer_rejected",
+            ),
+            (
+                "durable-intent-cases",
+                "G04",
+                "root_floor_intent_crash_evidence",
+                lambda item: item["durable_intent_cases"].remove("persist-failure-no-202"),
+                "durable_intent_cases missing cases",
+            ),
+            (
+                "durable-intent-persist",
+                "G04",
+                "root_floor_intent_crash_evidence",
+                lambda item: item.pop("persist_failure_blocks_acceptance"),
+                "persist_failure_blocks_acceptance",
+            ),
+            (
+                "g12-reset-quota-cases",
+                "G12",
+                "reset_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("future-reservation-protocol-fail-closed"),
+                "quota_path_cases missing cases",
+            ),
+            (
+                "g12-settlement-quota-cases",
+                "G12",
+                "settlement_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("rejected-object-not-visible"),
+                "quota_path_cases missing cases",
+            ),
+            (
+                "mixed-version-cases",
+                "G09",
+                "mixed_version_writer_evidence",
+                lambda item: item["mixed_version_cases"].remove("old-reader-new-writer"),
+                "mixed_version_cases missing cases",
+            ),
+            (
+                "rollback-payload",
+                "G09",
+                "rollback_payload_evidence",
+                lambda item: item.update({"rollback_payload_replayed": False}),
+                "rollback_payload_replayed",
+            ),
+            (
+                "legacy-source-conflict-cases",
+                "R-L",
+                "legacy_source_conflict_evidence",
+                lambda item: item["legacy_source_conflict_cases"].remove("newer-target-conflict-rejected"),
+                "legacy_source_conflict_cases missing cases",
+            ),
+            (
+                "migration-gap-closed",
+                "R-L",
+                "migration_gap_evidence",
+                lambda item: item.update({"migration_gap_closed": False}),
+                "migration_gap_closed",
+            ),
+            (
+                "source-retirement-crash-safe",
+                "R-L",
+                "crash_safe_source_retirement_evidence",
+                lambda item: item.update({"source_retirement_is_crash_safe": False}),
+                "source_retirement_is_crash_safe",
+            ),
+            (
+                "scheduler-bounds",
+                "G10",
+                "scheduler_bound_evidence",
+                lambda item: item["scheduler_bounds"].remove("lock-hold-bound"),
+                "scheduler_bounds missing cases",
+            ),
+            (
+                "pressure-metric",
+                "G10",
+                "pressure_recovery_evidence",
+                lambda item: item["pressure_metrics"].pop("heal_lock_wait_p99_ms"),
+                "heal_lock_wait_p99_ms",
+            ),
+            (
+                "cold-walk-share",
+                "P1",
+                "cold_walk_share_measurement",
+                lambda item: item.update({"cold_walk_share": 1.2}),
+                "cold_walk_share exceeds one",
+            ),
+            (
+                "foreground-throughput",
+                "P1",
+                "foreground_latency_throughput_measurement",
+                lambda item: item.pop("throughput_ops"),
+                "throughput_ops",
+            ),
+            (
+                "profile-cost",
+                "P1",
+                "profile_evidence",
+                lambda item: item.pop("save_operations"),
+                "save_operations",
+            ),
+            (
+                "abba-leg",
+                "P3",
+                "two_hour_pressure_measurement",
+                lambda item: item["abba_legs"].remove("B2"),
+                "abba_legs missing cases",
+            ),
+            (
+                "pressure-scenario",
+                "P3",
+                "two_hour_pressure_measurement",
+                lambda item: item["scenarios"].remove("running-heal"),
+                "scenarios missing cases",
+            ),
+            (
+                "heal-capacity",
+                "P3",
+                "heal_capacity_measurement",
+                lambda item: item["heal_capacity"].pop("completed_objects"),
+                "completed_objects",
+            ),
+            (
+                "recovery-window",
+                "P3",
+                "recovery_window_measurement",
+                lambda item: item["fault_modes"].remove("process-crash-restart"),
+                "fault_modes missing cases",
+            ),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                mutation(data["gates"][gate]["evidence_fields"][field])
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]), fault)
 
     def test_scanner_heal_case_does_not_approve_pending_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1345,14 +5090,21 @@ class SelfTests(unittest.TestCase):
             status = scanner_heal_release_status(root, run_dir)
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
+            self.assertTrue(status["release_schema_capable"])
             self.assertEqual(status["rejected_cases"], [])
             self.assertEqual(len(status["pending_gates"]), 21)
+            self.assertIn("mixed-version-rollback", status["pending_lanes"])
+            self.assertIn("ec8-4-multiset", status["pending_lanes"])
+            self.assertIn("scheduler-pressure", status["pending_lanes"])
 
     def test_scanner_heal_case_only_schema_cannot_approve_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
 
             status = scanner_heal_release_status(root, run_dir)
@@ -1362,11 +5114,128 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["rejected_cases"], [])
             self.assertEqual(status["pending_gates"], [])
 
+    def test_scanner_heal_release_requirements_cannot_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_requirements"] = []
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            with self.assertRaisesRegex(ValueError, "invalid scanner/heal release requirements"):
+                scanner_heal_release_status(root, run_dir)
+
+    def test_scanner_heal_release_matrix_lanes_remain_pending_without_real_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+
+            errors = check_scanner_heal_evidence(root, run_dir, "release")
+            for gate, text in (
+                ("G03", "Exact scoped ACK"),
+                ("G09", "mixed-version reader/writer"),
+                ("G14", "3x4 EC8+4"),
+                ("P3", "two-hour pressure/heal capacity"),
+                ("R-L", "Legacy source conflicts"),
+            ):
+                self.assertTrue(any(error.startswith(f"pending {gate}:") and text in error for error in errors), gate)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertFalse(status["release_approved"])
+            self.assertIn("mixed-version-rollback", status["pending_lanes"])
+            self.assertIn("ec8-4-multiset", status["pending_lanes"])
+            self.assertIn("scheduler-pressure", status["pending_lanes"])
+            requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
+                self.assertEqual(tuple(requirements[gate]["evidence_fields"]), expected_fields, gate)
+
+    def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
+                for requirement in registry["release_requirements"]:
+                    if requirement["gate"] == gate:
+                        requirement["evidence_fields"] = []
+                        break
+                write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+                with self.subTest(gate=gate):
+                    with self.assertRaisesRegex(ValueError, f"release gate {gate} missing required evidence fields"):
+                        scanner_heal_release_status(root, run_dir)
+
+                registry = read_json(root / ".config/scanner-heal-required-tests.json")
+                for requirement in registry["release_requirements"]:
+                    if requirement["gate"] == gate:
+                        requirement["evidence_fields"] = list(expected_fields)
+                        break
+
+    def test_scanner_heal_ec84_case_rejects_wrong_erasure_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4"), [])
+
+            path = run_dir / "background-target-crash-ec8-4.json"
+            oracle = read_json(path)
+            oracle["objects"][0]["physical"]["data_blocks"] = 10
+            oracle["objects"][0]["physical"]["parity_blocks"] = 2
+            oracle["objects"][0]["expected_physical"]["data_blocks"] = 10
+            oracle["objects"][0]["expected_physical"]["parity_blocks"] = 2
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            errors = check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4")
+            self.assertTrue(
+                any("EC data/parity geometry differs from the required case" in error for error in errors),
+                errors,
+            )
+
+    def test_scanner_heal_multipool_case_accepts_deferred_optional_outage_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            path = run_dir / "background-target-crash-ec8-4-multi-pool.json"
+            oracle = read_json(path)
+            oracle["outage_write_deferred_until_rejoin"] = True
+            oracle["outage_write"] = {
+                "attempted": True,
+                "required": False,
+                "accepted": True,
+                "attempts": 36,
+                "service_unavailable": 36,
+            }
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4-multi-pool"), [])
+
+            oracle["outage_write"]["accepted"] = False
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+            errors = check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4-multi-pool")
+            self.assertTrue(
+                any("optional outage-write final S3 body was not accepted" in error for error in errors),
+                errors,
+            )
+
+    def test_scanner_heal_pending_gate_cannot_map_to_implemented_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_requirements"][0]["lane"] = "single-set-restart"
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            with self.assertRaisesRegex(ValueError, "mapped to non-pending lane"):
+                scanner_heal_release_status(root, run_dir)
+
     def test_scanner_heal_release_status_rejects_synthetic_case(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
             path = run_dir / "background-target-crash.json"
             oracle = read_json(path)
@@ -1378,6 +5247,7 @@ class SelfTests(unittest.TestCase):
             status = scanner_heal_release_status(root, run_dir)
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
+            self.assertFalse(status["release_schema_capable"])
             self.assertEqual(status["rejected_cases"], ["background-target-crash"])
             self.assertEqual(status["pending_gates"], [])
 
@@ -1385,9 +5255,14 @@ class SelfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
-            (run_dir / "background-target-crash.json").unlink()
+            for case_id, requirement in registry["cases"].items():
+                if case_id != "background-target-restart":
+                    (run_dir / requirement["oracle"]).unlink()
             (run_dir / "execution.json").unlink()
             finish_scanner_heal_receipt(run_dir, 0, root)
 
@@ -1395,7 +5270,7 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
             self.assertEqual(status["verified_cases"], ["background-target-restart"])
-            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
+            self.assertEqual(status["rejected_cases"], sorted(set(registry["cases"]) - {"background-target-restart"}))
 
     def test_scanner_heal_finish_collects_oracles_from_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2245,7 +6120,10 @@ def main() -> int:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
-                         ["--check-scanner-heal-release"]):
+                         ["--check-scanner-heal-release"], ["--check-scanner-heal-release-bundle"],
+                         ["--check-scanner-heal-release-bundle-gate"],
+                         ["--assemble-scanner-heal-release-bundle"],
+                         ["--write-scanner-heal-release-bundle-fixture"]):
         try:
             if len(sys.argv) == 5 and sys.argv[1] == "--begin-scanner-heal":
                 begin_scanner_heal_receipt(ROOT, Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
@@ -2269,7 +6147,43 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["release_approved"] else 1
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, or --check-scanner-heal-release DIR")
+            if len(sys.argv) == 3 and sys.argv[1] == "--check-scanner-heal-release-bundle":
+                try:
+                    status = scanner_heal_release_bundle_status(ROOT, Path(sys.argv[2]))
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["release_approved"] else 1
+            if len(sys.argv) == 4 and sys.argv[1] == "--check-scanner-heal-release-bundle-gate":
+                try:
+                    status = scanner_heal_release_bundle_gate_status(ROOT, Path(sys.argv[2]), sys.argv[3])
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["decision"] == "verified" else 1
+            if len(sys.argv) >= 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
+                try:
+                    bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                        ROOT,
+                        [Path(item) for item in sys.argv[2:-1]],
+                        Path(sys.argv[-1]),
+                    )
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(bundle)
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["release_approved"] else 1
+            if len(sys.argv) == 3 and sys.argv[1] == "--write-scanner-heal-release-bundle-fixture":
+                bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
+                print(bundle)
+                return 0
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -2296,7 +6210,10 @@ def main() -> int:
     if sys.argv[1:]:
         print(
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
-            "--update-profile PROFILE LISTING PLATFORM]",
+            "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
+            "--check-scanner-heal-release-bundle-gate FILE GATE | "
+            "--assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR | "
+            "--write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
         return 2

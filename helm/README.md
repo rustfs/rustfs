@@ -160,7 +160,7 @@ behavior.
 | config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
 | config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
 | config.rustfs.kms.vault.vault_token | string | `""`| The vault token. Rendered into a dedicated Secret (`<fullname>-kms-secret`), never into the ConfigMap. |
-| config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
+| config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path. Rendered as `RUSTFS_KMS_VAULT_MOUNT_PATH` for `vault-transit`, and as `RUSTFS_KMS_VAULT_KV_MOUNT` for `vault-kv2` (only when set; unset keeps the `secret` default). |
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | list | `[]` | Extra environment variables for the RustFS container. An explicit `RUSTFS_LOCAL_ENDPOINT_HOST` or `RUSTFS_VOLUMES`, or a bounded, dynamic, or unrecognized startup mode, disables generated anchor injection. `POD_NAME` and `RUSTFS_ADDRESS` remain independent overrides. |
 | extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |

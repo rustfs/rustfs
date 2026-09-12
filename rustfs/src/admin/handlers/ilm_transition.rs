@@ -15,21 +15,22 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, object_store_from_extensions};
-use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
+use crate::admin::storage_api::bucket::{is_reserved_or_invalid_bucket, utils::is_valid_object_prefix};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
     IlmRecoveryClassification, IlmRecoveryControlView, IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionReasonCode,
-    IlmRecoveryDispositionState, IlmRecoveryExportObservation, IlmRecoveryProtocol, ManualTransitionCancelCheck,
-    ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink, ManualTransitionQueueSnapshot,
-    ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-    TransitionOperatorDeleteResult, TransitionOperatorError, TransitionRecoveryRetryResult, TransitionRecoveryRetryStatus,
-    claim_manual_transition_scope_admission, create_recovery_export, delete_manual_transition_scope_admission_if_current,
-    delete_transition_candidate_for_operator, dry_run_recovery_disposition, enqueue_transition_for_existing_objects_scoped,
-    execute_recovery_disposition, finalize_missing_transition_transaction_for_operator, inspect_recovery_control,
-    inspect_recovery_export_observation, inspect_transition_recovery_retry_for_operator,
-    inspect_transition_transaction_for_operator, list_recovery_controls, load_manual_transition_job_record,
-    load_manual_transition_scope_admission, load_recovery_export, manual_transition_job_lease_expired,
-    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
+    IlmRecoveryDispositionState, IlmRecoveryExportObservation, IlmRecoveryProtocol, LegacyTransitionStateReconcileError,
+    LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse, LegacyTransitionStateReconcileSelector,
+    ManualTransitionCancelCheck, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink,
+    ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission,
+    ManualTransitionScopeAdmissionClaim, TransitionOperatorDeleteResult, TransitionOperatorError, TransitionRecoveryRetryResult,
+    TransitionRecoveryRetryStatus, claim_manual_transition_scope_admission, create_recovery_export,
+    delete_manual_transition_scope_admission_if_current, delete_transition_candidate_for_operator, dry_run_recovery_disposition,
+    enqueue_transition_for_existing_objects_scoped, execute_recovery_disposition,
+    finalize_missing_transition_transaction_for_operator, inspect_recovery_control, inspect_recovery_export_observation,
+    inspect_transition_recovery_retry_for_operator, inspect_transition_transaction_for_operator, list_recovery_controls,
+    load_manual_transition_job_record, load_manual_transition_scope_admission, load_recovery_export,
+    manual_transition_job_lease_expired, manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
     persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
     request_manual_transition_job_cancel, retry_transition_recovery_for_operator, save_manual_transition_job_record,
     update_manual_transition_job_record,
@@ -266,6 +267,16 @@ pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::i
         Method::GET,
         format!("{ADMIN_PREFIX}/v3/ilm/recovery/exports/{{export_id}}").as_str(),
         AdminOperation(&IlmRecoveryExportDownloadHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/state/reconcile").as_str(),
+        AdminOperation(&LegacyTransitionStateReconcileInspectHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/state/reconcile").as_str(),
+        AdminOperation(&LegacyTransitionStateReconcileApplyHandler {}),
     )?;
     Ok(())
 }
@@ -999,6 +1010,98 @@ fn validate_recovery_observation_receipt(
         return Err(admin_s3_error(AdminS3ErrorCode::AccessDenied, "invalid or expired ILM recovery receipt"));
     }
     Ok(receipt.observation)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTransitionStateReconcileQuery {
+    bucket: Option<String>,
+    object: Option<String>,
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
+}
+
+fn parse_legacy_transition_state_reconcile_query(query: Option<&str>) -> S3Result<LegacyTransitionStateReconcileSelector> {
+    let query: LegacyTransitionStateReconcileQuery = serde_urlencoded::from_bytes(query.unwrap_or_default().as_bytes())
+        .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid legacy transition-state reconcile query"))?;
+    let bucket = query
+        .bucket
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or_else(|| admin_s3_error(AdminS3ErrorCode::InvalidRequest, "bucket is required"))?;
+    if is_reserved_or_invalid_bucket(&bucket, false) {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidBucketName, "invalid bucket name"));
+    }
+
+    let object = query
+        .object
+        .filter(|object| !object.is_empty())
+        .ok_or_else(|| admin_s3_error(AdminS3ErrorCode::InvalidRequest, "object is required"))?;
+    if !is_valid_object_prefix(&object) || object.contains('\n') || object.contains('\r') {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid object name"));
+    }
+
+    let version_id = query
+        .version_id
+        .filter(|version_id| !version_id.is_empty())
+        .ok_or_else(|| admin_s3_error(AdminS3ErrorCode::InvalidRequest, "versionId is required"))?;
+    let version_id = if version_id == "null" {
+        version_id
+    } else {
+        let parsed = Uuid::parse_str(&version_id)
+            .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid local versionId"))?;
+        if parsed.is_nil() {
+            return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid local versionId"));
+        }
+        parsed.to_string()
+    };
+
+    Ok(LegacyTransitionStateReconcileSelector {
+        bucket,
+        object,
+        version_id,
+    })
+}
+
+fn validate_legacy_transition_state_reconcile_request(
+    query_selector: &LegacyTransitionStateReconcileSelector,
+    confirm: bool,
+    request_selector: &LegacyTransitionStateReconcileSelector,
+) -> S3Result<()> {
+    if !confirm {
+        return Err(admin_s3_error(
+            AdminS3ErrorCode::InvalidRequest,
+            "legacy transition-state reconciliation requires confirm=true; use GET to inspect without changes",
+        ));
+    }
+    if request_selector != query_selector {
+        return Err(admin_s3_error(
+            AdminS3ErrorCode::InvalidRequest,
+            "request selector must exactly match the query selector",
+        ));
+    }
+    Ok(())
+}
+
+fn map_legacy_transition_state_reconcile_error(err: LegacyTransitionStateReconcileError) -> S3Error {
+    match err {
+        LegacyTransitionStateReconcileError::InvalidSelector(_) | LegacyTransitionStateReconcileError::InvalidRequest(_) => {
+            admin_s3_error(AdminS3ErrorCode::InvalidRequest, "invalid legacy transition-state reconciliation request")
+        }
+        LegacyTransitionStateReconcileError::StaleExpectedTuple(_) | LegacyTransitionStateReconcileError::Corrupt(_) => {
+            admin_s3_error(
+                AdminS3ErrorCode::OperationAborted,
+                "legacy transition-state reconciliation metadata is stale or corrupt",
+            )
+        }
+        LegacyTransitionStateReconcileError::WriteFenceUnavailable(_) => admin_s3_error(
+            AdminS3ErrorCode::OperationAborted,
+            "legacy transition-state reconciliation could not acquire safe write authority",
+        ),
+        LegacyTransitionStateReconcileError::BackendUnavailable(_) => admin_s3_error(
+            AdminS3ErrorCode::InternalError,
+            "legacy transition-state reconciliation backend is unavailable",
+        ),
+    }
 }
 
 fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
@@ -1961,6 +2064,58 @@ impl Operation for TransitionReconcileApplyHandler {
     }
 }
 
+pub struct LegacyTransitionStateReconcileInspectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for LegacyTransitionStateReconcileInspectHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
+        let selector = parse_legacy_transition_state_reconcile_query(req.uri.query())?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
+        };
+        let response: LegacyTransitionStateReconcileResponse = store
+            .inspect_legacy_transition_state(selector)
+            .await
+            .map_err(map_legacy_transition_state_reconcile_error)?;
+        json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct LegacyTransitionStateReconcileApplyHandler {}
+
+#[async_trait::async_trait]
+impl Operation for LegacyTransitionStateReconcileApplyHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
+        let selector = parse_legacy_transition_state_reconcile_query(req.uri.query())?;
+        let store = object_store_from_extensions(&req.extensions);
+        let mut input = req.input;
+        let body = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|_| {
+            admin_s3_error(
+                AdminS3ErrorCode::InvalidRequest,
+                "legacy transition-state reconciliation body is too large or unreadable",
+            )
+        })?;
+        let request: LegacyTransitionStateReconcileRequest = serde_json::from_slice(&body).map_err(|_| {
+            admin_s3_error(
+                AdminS3ErrorCode::InvalidRequest,
+                "legacy transition-state reconciliation request must be valid JSON",
+            )
+        })?;
+        validate_legacy_transition_state_reconcile_request(&selector, request.confirm, &request.selector)?;
+        let Some(store) = store else {
+            return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
+        };
+
+        let response: LegacyTransitionStateReconcileResponse = store
+            .reconcile_legacy_transition_state(request)
+            .await
+            .map_err(map_legacy_transition_state_reconcile_error)?;
+        json_response(StatusCode::OK, &response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2592,10 +2747,85 @@ mod tests {
         let apply = src
             .split("impl Operation for TransitionReconcileApplyHandler")
             .nth(1)
-            .and_then(|block| block.split("#[cfg(test)]").next())
+            .and_then(|block| block.split("pub struct LegacyTransitionStateReconcileInspectHandler").next())
             .expect("apply handler block");
         assert!(apply.contains("AdminAction::SetTierAction"));
         assert!(!apply.contains("AdminAction::ListTierAction"));
+    }
+
+    #[test]
+    fn legacy_transition_state_query_requires_one_exact_selector() {
+        let version_id = Uuid::new_v4();
+        let query = format!("bucket=test-bucket&object=logs%2F2026%20report&versionId={version_id}");
+        let selector = parse_legacy_transition_state_reconcile_query(Some(&query)).expect("exact version selector should parse");
+        assert_eq!(selector.bucket, "test-bucket");
+        assert_eq!(selector.object, "logs/2026 report");
+        assert_eq!(selector.version_id, version_id.to_string());
+
+        let unversioned =
+            parse_legacy_transition_state_reconcile_query(Some("bucket=test-bucket&object=logs%2Fcurrent&versionId=null"))
+                .expect("explicit null selector should parse");
+        assert_eq!(unversioned.version_id, "null");
+
+        for query in [
+            None,
+            Some("bucket=test-bucket&object=key"),
+            Some("bucket=test-bucket&object=&versionId=null"),
+            Some("bucket=test-bucket&object=key&versionId="),
+            Some("bucket=test-bucket&object=key&versionId=not-a-uuid"),
+            Some("bucket=test-bucket&object=key&versionId=00000000-0000-0000-0000-000000000000"),
+            Some("bucket=test-bucket&object=bad%0Akey&versionId=null"),
+            Some("bucket=test-bucket&object=key&versionId=null&prefix=wide"),
+            Some("bucket=test-bucket&bucket=other-bucket&object=key&versionId=null"),
+        ] {
+            assert!(
+                parse_legacy_transition_state_reconcile_query(query).is_err(),
+                "query should fail closed: {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_transition_state_apply_requires_confirmation_and_matching_selector() {
+        let selector = LegacyTransitionStateReconcileSelector {
+            bucket: "test-bucket".to_string(),
+            object: "key".to_string(),
+            version_id: "null".to_string(),
+        };
+        let different = LegacyTransitionStateReconcileSelector {
+            object: "other-key".to_string(),
+            ..selector.clone()
+        };
+
+        assert!(validate_legacy_transition_state_reconcile_request(&selector, false, &selector).is_err());
+        assert!(validate_legacy_transition_state_reconcile_request(&selector, true, &different).is_err());
+        validate_legacy_transition_state_reconcile_request(&selector, true, &selector)
+            .expect("confirmed exact selector should pass handler validation");
+    }
+
+    #[test]
+    fn legacy_transition_state_routes_use_read_and_write_tier_actions() {
+        let src = include_str!("ilm_transition.rs");
+        let inspect = src
+            .split("impl Operation for LegacyTransitionStateReconcileInspectHandler")
+            .nth(1)
+            .and_then(|block| {
+                block
+                    .split("impl Operation for LegacyTransitionStateReconcileApplyHandler")
+                    .next()
+            })
+            .expect("legacy inspect handler block");
+        assert!(inspect.contains("AdminAction::ListTierAction"));
+        assert!(!inspect.contains("AdminAction::SetTierAction"));
+
+        let apply = src
+            .split("impl Operation for LegacyTransitionStateReconcileApplyHandler")
+            .nth(1)
+            .and_then(|block| block.split("#[cfg(test)]").next())
+            .expect("legacy apply handler block");
+        assert!(apply.contains("AdminAction::SetTierAction"));
+        assert!(!apply.contains("AdminAction::ListTierAction"));
+        assert!(apply.contains("validate_legacy_transition_state_reconcile_request"));
     }
 
     #[test]
@@ -3064,6 +3294,24 @@ mod tests {
             .expect_err("cancel handler must reject unsigned requests");
         assert_eq!(cancel_err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(cancel_err.message(), Some("authentication required"));
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_handlers_reject_missing_credentials_before_selector_or_body() {
+        let path = "/rustfs/admin/v3/ilm/transition/state/reconcile?bucket=test-bucket&object=key&versionId=null";
+        let inspect_err = LegacyTransitionStateReconcileInspectHandler {}
+            .call(credential_less_admin_request(Method::GET, path), Params::new())
+            .await
+            .expect_err("inspect handler must reject unsigned requests");
+        assert_eq!(inspect_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(inspect_err.message(), Some("authentication required"));
+
+        let apply_err = LegacyTransitionStateReconcileApplyHandler {}
+            .call(credential_less_admin_request(Method::POST, path), Params::new())
+            .await
+            .expect_err("apply handler must reject unsigned requests");
+        assert_eq!(apply_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(apply_err.message(), Some("authentication required"));
     }
 
     #[test]

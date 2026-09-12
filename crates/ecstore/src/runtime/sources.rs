@@ -14,7 +14,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock},
     time::SystemTime,
 };
 
@@ -57,6 +57,13 @@ use uuid::Uuid;
 const TEST_RPC_SECRET: &str = "test-rpc-secret";
 
 pub(crate) type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+pub type ScannerDirtyUsageMutationObserver = Arc<dyn Fn(&str, &str, ScannerDirtyUsageMutationSource) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerDirtyUsageMutationSource {
+    Replication,
+    TierExpiration,
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct LockRegistry {
@@ -88,6 +95,8 @@ impl LockRegistry {
 }
 
 static WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER: OnceLock<WorkloadSnapshotProviderRef> = OnceLock::new();
+static SCANNER_DIRTY_USAGE_MUTATION_OBSERVER: LazyLock<StdRwLock<Option<ScannerDirtyUsageMutationObserver>>> =
+    LazyLock::new(|| StdRwLock::new(None));
 
 pub(crate) fn set_workload_admission_snapshot_provider(
     provider: WorkloadSnapshotProviderRef,
@@ -97,6 +106,28 @@ pub(crate) fn set_workload_admission_snapshot_provider(
 
 pub(crate) fn workload_admission_snapshot_provider() -> Option<WorkloadSnapshotProviderRef> {
     WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER.get().cloned()
+}
+
+pub fn set_scanner_dirty_usage_mutation_observer(
+    observer: Option<ScannerDirtyUsageMutationObserver>,
+) -> Option<ScannerDirtyUsageMutationObserver> {
+    let mut slot = SCANNER_DIRTY_USAGE_MUTATION_OBSERVER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *slot, observer)
+}
+
+pub(crate) fn notify_scanner_dirty_usage_mutation(bucket: &str, object: &str, source: ScannerDirtyUsageMutationSource) {
+    if bucket.is_empty() || object.is_empty() {
+        return;
+    }
+    let observer = SCANNER_DIRTY_USAGE_MUTATION_OBSERVER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer(bucket, object, source);
+    }
 }
 
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
@@ -580,12 +611,16 @@ pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockRegistry, clear_local_disk_id_map_for_test, local_disk_path_by_id, local_node_name, reconcile_local_disk_ids,
-        replace_local_disk_id, set_local_node_name,
+        LockRegistry, ScannerDirtyUsageMutationSource, clear_local_disk_id_map_for_test, local_disk_path_by_id, local_node_name,
+        notify_scanner_dirty_usage_mutation, reconcile_local_disk_ids, replace_local_disk_id, set_local_node_name,
+        set_scanner_dirty_usage_mutation_observer,
     };
     use crate::disk::endpoint::Endpoint;
     use rustfs_lock::{LocalClient, LockClient};
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
     use uuid::Uuid;
 
     fn url_endpoint(raw: &str) -> Endpoint {
@@ -618,6 +653,42 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert!(Arc::ptr_eq(&clients[0], &client_a));
         assert!(Arc::ptr_eq(&clients[1], &client_b));
+    }
+
+    #[test]
+    #[serial_test::serial(scanner_dirty_usage_mutation_observer)]
+    fn scanner_dirty_usage_mutation_observer_filters_empty_identity_and_preserves_source() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let previous = set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
+            observed_clone.lock().expect("observer lock should not be poisoned").push((
+                bucket.to_string(),
+                object.to_string(),
+                source,
+            ));
+        })));
+
+        notify_scanner_dirty_usage_mutation("photos", "2026/image.jpg", ScannerDirtyUsageMutationSource::Replication);
+        notify_scanner_dirty_usage_mutation("", "2026/empty-bucket.jpg", ScannerDirtyUsageMutationSource::TierExpiration);
+        notify_scanner_dirty_usage_mutation("photos", "", ScannerDirtyUsageMutationSource::TierExpiration);
+        notify_scanner_dirty_usage_mutation("archive", "expired.bin", ScannerDirtyUsageMutationSource::TierExpiration);
+        set_scanner_dirty_usage_mutation_observer(previous);
+
+        assert_eq!(
+            *observed.lock().expect("observer lock should not be poisoned"),
+            vec![
+                (
+                    "photos".to_string(),
+                    "2026/image.jpg".to_string(),
+                    ScannerDirtyUsageMutationSource::Replication
+                ),
+                (
+                    "archive".to_string(),
+                    "expired.bin".to_string(),
+                    ScannerDirtyUsageMutationSource::TierExpiration
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

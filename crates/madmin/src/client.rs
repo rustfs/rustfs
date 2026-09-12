@@ -263,6 +263,14 @@ pub struct ScannerUsageRecoveryIntentResponse {
     pub mode: String,
     pub intent_id: String,
     pub state: String,
+    #[serde(default)]
+    pub actor_sha256: Option<String>,
+    #[serde(default)]
+    pub idempotency_key_sha256: Option<String>,
+    #[serde(default)]
+    pub request_sha256: Option<String>,
+    #[serde(default)]
+    pub accepted_at_unix_secs: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -869,6 +877,10 @@ mod tests {
             "mode": "full-rebuild",
             "intent_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "state": "accepted",
+            "actor_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "idempotency_key_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "request_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "accepted_at_unix_secs": 7,
             "future": {"worker": "pending"}
         }))
         .unwrap();
@@ -877,7 +889,33 @@ mod tests {
         assert_eq!(intent.mode, "full-rebuild");
         assert_eq!(intent.intent_id, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         assert_eq!(intent.state, "accepted");
+        assert_eq!(
+            intent.actor_sha256.as_deref(),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            intent.idempotency_key_sha256.as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            intent.request_sha256.as_deref(),
+            Some("3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        assert_eq!(intent.accepted_at_unix_secs, Some(7));
         assert_eq!(intent.extra["future"]["worker"], "pending");
+
+        let legacy_intent: ScannerUsageRecoveryIntentResponse = serde_json::from_value(json!({
+            "status": "accepted",
+            "action": "usage-full-rebuild",
+            "mode": "full-rebuild",
+            "intent_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "state": "accepted"
+        }))
+        .unwrap();
+        assert!(legacy_intent.actor_sha256.is_none());
+        assert!(legacy_intent.idempotency_key_sha256.is_none());
+        assert!(legacy_intent.request_sha256.is_none());
+        assert!(legacy_intent.accepted_at_unix_secs.is_none());
     }
 
     #[test]
@@ -971,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn scanner_usage_async_reset_posts_explicit_intent_contract() {
         let server = TestServer::spawn(
-            r#"{"status":"accepted","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted"}"#,
+            r#"{"status":"accepted","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","actor_sha256":"1111111111111111111111111111111111111111111111111111111111111111","idempotency_key_sha256":"2222222222222222222222222222222222222222222222222222222222222222","request_sha256":"3333333333333333333333333333333333333333333333333333333333333333","accepted_at_unix_secs":7}"#,
             202,
         )
         .await;
@@ -985,6 +1023,7 @@ mod tests {
         assert_eq!(accepted.status, "accepted");
         assert_eq!(accepted.mode, "full-rebuild");
         assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.accepted_at_unix_secs, Some(7));
         let request = server.recorded();
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");

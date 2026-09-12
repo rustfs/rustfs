@@ -19,17 +19,27 @@ on:
     - cron: "7 0 * * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch/ref to build and publish as the nightly (empty = scheduled source, see NIGHTLY_BUILD_REF)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
+# Scheduled builds follow the NIGHTLY_BRANCH repo variable so the channel can
+# be pointed at e.g. `release` for the GA cycle and back to `main` afterwards
+# without touching this file. Manual runs take the `branch` input, falling
+# back to the branch the run was dispatched from.
 concurrency:
-  group: nightly-gnu-build-main-${{ github.event_name }}
+  group: nightly-gnu-build-${{ github.event_name }}-${{ github.event_name == 'schedule' && (vars.NIGHTLY_BRANCH || 'main') || (inputs.branch || github.ref_name) }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  NIGHTLY_BUILD_REF: ${{ github.event_name == 'schedule' && (vars.NIGHTLY_BRANCH || 'main') || (inputs.branch || github.ref_name) }}
 
 jobs:
   build:
@@ -43,6 +53,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -152,13 +163,104 @@ jobs:
 
           fakeroot dpkg-deb --build "${PKG_DIR}"
           ls -lh "${DEB_FILE}"
+          echo "deb_date=${DEB_DATE}" >> "${GITHUB_OUTPUT}"
           echo "deb_file=${DEB_FILE}" >> "${GITHUB_OUTPUT}"
+
+      # Same packaging scheme as .github/workflows/package.yml (fpm), but from
+      # the locally built nightly binary instead of a release artifact, with a
+      # date-based version that mirrors the DEB.
+      - name: Build RPM package
+        id: rpm
+        shell: bash
+        env:
+          DEB_DATE: ${{ steps.deb.outputs.deb_date }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v fpm >/dev/null 2>&1; then
+            SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+            ${SUDO} apt-get update -qq && ${SUDO} apt-get install -y -qq ruby ruby-dev build-essential rpm >/dev/null
+            ${SUDO} gem install fpm --no-document >/dev/null
+          fi
+
+          RPM_FILE="rustfs-nightly-${DEB_DATE}.rpm"
+          RPM_VERSION="0"
+          RPM_RELEASE="0.nightly.${DEB_DATE//-/.}"
+
+          echo "Building RPM: ${RPM_FILE} (version ${RPM_VERSION}-${RPM_RELEASE})"
+
+          # fpm wants the config file to exist before packaging.
+          mkdir -p ./tmp-pkg/etc/default
+          cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
+          fpm -s dir -t rpm \
+            --name rustfs \
+            --version "$RPM_VERSION" \
+            --iteration "$RPM_RELEASE" \
+            --architecture x86_64 \
+            --package "$RPM_FILE" \
+            --depends "glibc >= 2.31" \
+            --maintainer "RustFS Team <support@rustfs.com>" \
+            --description "High-performance distributed object storage" \
+            --url "https://rustfs.com" \
+            --license "Apache-2.0" \
+            --after-install <(cat << 'POSTINST'
+          #!/bin/bash
+          set -e
+          if ! getent passwd rustfs > /dev/null 2>&1; then
+              useradd -r -s /bin/false -d /opt/rustfs rustfs
+          fi
+          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
+          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTINST
+            ) \
+            --before-remove <(cat << 'PRERM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
+              systemctl stop rustfs
+          fi
+          PRERM
+            ) \
+            --after-remove <(cat << 'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTRM
+            ) \
+            --config-files /etc/default/rustfs \
+            "rustfs-nightly-${DEB_DATE}/usr/bin/rustfs=/usr/bin/rustfs" \
+            ./tmp-pkg/etc/default/rustfs=/etc/default/rustfs \
+            deploy/build/rustfs.service=/lib/systemd/system/rustfs.service \
+            LICENSE=/usr/share/doc/rustfs/LICENSE \
+            README.md=/usr/share/doc/rustfs/README.md
+
+          [[ -f "$RPM_FILE" ]] || { echo "RPM build failed"; exit 1; }
+          rpm -qpl "$RPM_FILE" | grep -Fx '/usr/bin/rustfs' >/dev/null
+          stat --printf='%n %s bytes\n' "$RPM_FILE"
+          echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ steps.deb.outputs.deb_file }}
           path: ${{ steps.deb.outputs.deb_file }}
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.rpm.outputs.rpm_file }}
+          path: ${{ steps.rpm.outputs.rpm_file }}
           if-no-files-found: error
 
       # Persist the nightly deb on Cloudflare R2 (same channel as package.yml)
@@ -187,11 +289,10 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
+          # The candidate manifest must describe the tree that was actually
+          # built. With a ref override (NIGHTLY_BRANCH / dispatch input) that
+          # is not necessarily GITHUB_SHA, so always advertise HEAD.
           SOURCE_SHA="$(git rev-parse HEAD)"
-          if [[ "${SOURCE_SHA}" != "${GITHUB_SHA}" ]]; then
-            echo "Checkout SHA does not match the nightly build run" >&2
-            exit 1
-          fi
           DEB_SHA256="$(sha256sum "${DEB_FILE}" | cut -d ' ' -f 1)"
           CANDIDATE_KEY="artifacts/rustfs/packages/nightly/runs/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${DEB_SHA256}/rustfs.deb"
           CANDIDATE_URL="https://dl.rustfs.com/${CANDIDATE_KEY}"
@@ -247,6 +348,20 @@ jobs:
           path: ${{ steps.publish.outputs.candidate_file }}
           if-no-files-found: error
 
+      # Publish the deb/rpm pair to the auto-testing repo's `assets` branch so
+      # engineers can download and install the nightly directly. The branch is
+      # a single-commit orphan rewritten on every build, which keeps the repo
+      # small while the latest files stay reachable at stable raw URLs.
+      # Publish the deb/rpm pair as assets of the rolling `nightly` release on
+      # rustfs/auto-testing (see scripts/release/publish_nightly_assets.sh).
+      - name: Publish packages to auto-testing release assets
+        env:
+          ASSETS_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
+          DEB_DATE: ${{ steps.deb.outputs.deb_date }}
+          BUILD_REF: ${{ env.NIGHTLY_BUILD_REF }}
+        run: bash scripts/release/publish_nightly_assets.sh
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #
   # RUSTFS_KMS_VAULT_TOKEN is the single switch that adds the Vault KV2 and
@@ -284,6 +399,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -372,6 +488,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup

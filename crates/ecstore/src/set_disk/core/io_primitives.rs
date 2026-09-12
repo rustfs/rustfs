@@ -51,12 +51,12 @@ use super::super::{
     can_try_inline_data_shards_direct, capacity_scope_from_disks, codec_streaming_rollout_applies, coding,
     collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug, disk,
     file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
-    is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling, is_version_early_stop_enabled,
-    issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure, merge_file_meta_versions,
-    object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs,
-    send_heal_request_with_admission, should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
+    inline_erasure_shard_size, is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling,
+    is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
+    merge_file_meta_versions, object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs,
+    reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 pub(in crate::set_disk) use super::metadata_quorum::MetadataEarlyStopDecision;
@@ -3086,19 +3086,59 @@ impl SetDisks {
         let read_quorum = disks.len().div_ceil(2).max(1);
         let (raw_fileinfos, errs) = Self::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), false).await;
 
-        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
-            let object_err = to_object_err(err.into(), vec![bucket, object]);
-            if is_err_object_not_found(&object_err) || is_err_version_not_found(&object_err) {
-                return Ok(None);
-            }
-            return Err(object_err);
+        if let Some(err) = errs
+            .iter()
+            .flatten()
+            .find(|err| !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound))
+        {
+            return Err(to_object_err(err.clone().into(), vec![bucket, object]));
+        }
+        // A minority live owner must not disappear behind majority absence.
+        // Only explicit absence on every readable disk proves no ownership.
+        if raw_fileinfos.iter().all(Option::is_none) {
+            return Ok(None);
         }
 
         let mut shallow_versions = Vec::with_capacity(raw_fileinfos.len());
+        type TransitionCopy = (FileInfo, Option<crate::services::tier::tier::TierDestinationId>);
+        let mut transition_copies: std::collections::HashMap<Option<Uuid>, Vec<TransitionCopy>> =
+            std::collections::HashMap::new();
+        let decode_error = |err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}"));
         for raw_fileinfo in raw_fileinfos.into_iter().flatten() {
             let meta = FileMeta::load(&raw_fileinfo.buf)
                 .map_err(|err| Error::other(format!("exact object metadata decode failed for {bucket}/{object}: {err}")))?;
+            let versions = meta.get_all_file_info_versions(bucket, object, true).map_err(decode_error)?;
+            for version in versions.versions.into_iter().chain(versions.free_versions) {
+                if version.transition_status != rustfs_filemeta::TRANSITION_COMPLETE {
+                    continue;
+                }
+                let destination =
+                    crate::services::tier::tier::tier_destination_id_from_metadata(&version.metadata).map_err(Error::other)?;
+                transition_copies
+                    .entry(version.version_id.filter(|id| !id.is_nil()))
+                    .or_default()
+                    .push((version, destination));
+            }
             shallow_versions.push(meta.versions);
+        }
+
+        // Exact cleanup/recovery reads must not select a repaired majority
+        // while another physical copy still carries legacy absence. Missing
+        // copies permit deletion retries; an unreadable disk proves nothing.
+        for copies in transition_copies
+            .values()
+            .filter(|copies| copies.iter().any(|(_, destination)| destination.is_some()))
+        {
+            let (first, destination) = &copies[0];
+            if copies.iter().any(|(copy, identity)| {
+                identity != destination
+                    || copy.transition_version_state != first.transition_version_state
+                    || copy.transition_version != first.transition_version
+                    || copy.transition_tier != first.transition_tier
+                    || copy.transitioned_objname != first.transitioned_objname
+            }) {
+                return Err(Error::other("exact transition metadata has not converged across physical copies"));
+            }
         }
 
         if shallow_versions.len() < read_quorum {
@@ -3117,7 +3157,7 @@ impl SetDisks {
             ..Default::default()
         }
         .get_all_file_info_versions(bucket, object, true)
-        .map_err(|err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}")))?;
+        .map_err(decode_error)?;
 
         for file_info in file_info_versions
             .versions
@@ -5815,17 +5855,17 @@ impl SetDisks {
                 }
 
                 if let Some(disk) = disks[i].as_ref() {
-                    let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
+                    // A failed version-only copy owns only its new version.
+                    // Removing the whole xl.meta would also erase existing
+                    // versions and any concurrently reconciled tier binding.
+                    let mut rollback = FileInfo {
+                        version_id: files[i].version_id,
+                        ..Default::default()
+                    };
+                    rollback.set_skip_tier_free_version();
                     revert_futures.push(async move {
                         if let Err(err) = disk
-                            .delete(
-                                bucket,
-                                &path,
-                                DeleteOptions {
-                                    recursive: true,
-                                    ..Default::default()
-                                },
-                            )
+                            .delete_version(bucket, prefix, rollback, false, DeleteOptions::default())
                             .await
                         {
                             warn!("write meta revert err {:?}", err);
@@ -12092,7 +12132,9 @@ mod tests {
         let bucket = "write-unique-bucket";
         let object = "object";
         let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
-        let files = vec![metadata_test_fileinfo(object), metadata_test_fileinfo(object)];
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        let files = vec![fi.clone(), fi];
 
         let result = SetDisks::write_unique_file_info(&[Some(disk.clone()), None], bucket, bucket, object, &files, 2).await;
 
@@ -12104,6 +12146,53 @@ mod tests {
             ),
             "successful metadata write must be reverted when quorum is not reached"
         );
+    }
+
+    #[tokio::test]
+    async fn write_unique_file_info_rollback_preserves_existing_reconciled_version() {
+        let bucket = "write-unique-existing";
+        let object = "object";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let mut original = metadata_test_fileinfo(object);
+        original.version_id = Some(Uuid::from_u128(1));
+        original.data_dir = Some(Uuid::from_u128(3));
+        original.mod_time = Some(OffsetDateTime::now_utc());
+        original.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        original.transition_tier = "WARM".to_string();
+        original.transitioned_objname = "remote-original".to_string();
+        original.transition_version_state = rustfs_filemeta::TransitionVersionState::KnownDisabled;
+        rustfs_utils::http::insert_str(
+            &mut original.metadata,
+            rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "ab".repeat(32),
+        );
+        disk.write_metadata(bucket, bucket, object, original.clone())
+            .await
+            .expect("existing reconciled source");
+        let raw = disk
+            .read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .await
+            .expect("original metadata");
+        let before = FileMeta::load(&raw).unwrap().find_version(original.version_id).unwrap().1;
+        let mut added = original.clone();
+        added.version_id = Some(Uuid::from_u128(2));
+        let result =
+            SetDisks::write_unique_file_info(&[Some(disk.clone()), None], bucket, bucket, object, &[added.clone(), added], 2)
+                .await;
+        assert!(result.is_err());
+        let raw = disk
+            .read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .await
+            .expect("preserved xl.meta");
+        let after = FileMeta::load(&raw).expect("preserved metadata");
+        assert_eq!(
+            after
+                .find_version(original.version_id)
+                .expect("original source survives rollback")
+                .1,
+            before
+        );
+        assert!(after.find_version(Some(Uuid::from_u128(2))).is_err());
     }
 
     #[tokio::test]

@@ -475,6 +475,8 @@ pub(crate) mod ecstore_disk {
         RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -952,6 +954,25 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
 }
 
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
+    let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
+    let mutation_journal = durable_dirty_usage_journal.clone();
+    rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+        mutation_journal.record_committed_mutation(bucket, object, producer);
+    })));
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
+        let producer = match source {
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
+            }
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
+            }
+        };
+        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
+    })));
+    rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
+        durable_dirty_usage_journal.clear_confirmed_buckets(cleared);
+    })));
     ecstore_bucket::replication::init_background_replication(store).await;
 }
 
@@ -1164,17 +1185,21 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store).await;
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
-pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) {
+pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) -> std::io::Result<()> {
     // MinIO encrypts IAM identity/service-account files at rest with a key derived
     // from the root credentials. Inject the IAM crate's decryption so those blobs
     // are decrypted before normalization instead of being skipped as "incompatible".
     let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
         Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
-    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn)).await;
+    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn))
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
 pub(crate) fn init_ecstore_config() {

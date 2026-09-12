@@ -225,6 +225,10 @@ KMS configured through the admin API is persisted to cluster storage and restore
 
 To recover from `load_failed` — or from any state where the server runs but its in-memory KMS lags the persisted configuration — call `POST /rustfs/admin/v3/kms/reload` (`kms:ServiceControl`). It re-reads the persisted configuration from cluster storage and reconfigures the service without resubmitting secrets, then broadcasts the reload to peer nodes. If reload keeps failing, check cluster storage health first (the read needs quorum), then `RUSTFS_KMS_CONFIG_SECRET`: an unseal error means the secret is missing or differs from the one that sealed the persisted copy — it must be identical on every node.
 
+Reload short-circuits only when this node is **already running** the persisted configuration. A node whose KMS failed to start keeps that configuration and sits in `Error`, so reload reconfigures it — which starts the service — rather than reporting success while the node stays down. The same holds on every peer, which reaches the same path through the reload broadcast.
+
+**Cluster-wide versus node-local routes.** `configure`, `reconfigure` and `reload` are cluster operations: the node that serves the request broadcasts to its peers. `start` and `stop` are node-local and are **not** broadcast. Calling `POST /rustfs/admin/v3/kms/stop` through a load balancer therefore stops whichever node answered and leaves the cluster in a mixed state; address a specific node directly when you mean node-local semantics, and expect a later cluster-wide `reload` to start a stopped node again.
+
 A separate event, `kms_config_load_skipped` with `reason="storage_uninitialized"`, comes from the ambient loader used by the peer-reload RPC path; seeing it outside a peer reload indicates a request arrived before storage initialization finished.
 
 ## Threshold calibration

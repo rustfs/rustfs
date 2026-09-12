@@ -506,6 +506,25 @@ fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key:
         .map(|(task_id, task)| (task_id.clone(), task.heal_type.clone()))
 }
 
+fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
+    request.heal_type == task.heal_type
+        && request.options == task.options
+        && request.priority == task.priority
+        && request.source == task.source
+        && request.retry_attempts == task.retry_attempts
+        && request.heal_endpoints == task.heal_endpoints
+}
+
+fn request_matches_request(request: &HealRequest, existing: &HealRequest) -> bool {
+    request.heal_type == existing.heal_type
+        && request.options == existing.options
+        && request.priority == existing.priority
+        && request.source == existing.source
+        && request.force_start == existing.force_start
+        && request.retry_attempts == existing.retry_attempts
+        && request.heal_endpoints == existing.heal_endpoints
+}
+
 fn retrying_heal_for_dedup_key(retrying_heals: &HashMap<String, RetryingHeal>, key: &str) -> Option<(String, HealType)> {
     retrying_heals
         .iter()
@@ -517,19 +536,22 @@ fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
     matches!(status, HealTaskStatus::Retrying { .. })
 }
 
-fn retry_budget_for_result(task: &HealTask, result: &Result<()>) -> Option<(Duration, String)> {
+fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch_failure: bool) -> Option<(Duration, String)> {
     let Err(err) = result else {
         return None;
     };
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
-    if task.has_batch_failure() {
+    if task.has_batch_failure() && !retryable_batch_failure {
         return None;
     }
 
     let error = err.to_string();
-    if !err.is_recoverable_heal() {
+    // Batch aggregation preserves the typed classification in its counters,
+    // while the returned task error retains only the first error's display text.
+    let retryable_batch_result = retryable_batch_failure && matches!(err, Error::TaskExecutionFailed { .. });
+    if !retryable_batch_result && !err.is_recoverable_heal() {
         return None;
     }
 
@@ -540,12 +562,13 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>) -> Option<(Dura
 
 #[cfg(test)]
 fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
-    let (delay, error) = retry_budget_for_result(task, result)?;
+    let (delay, error) = retry_budget_for_result(task, result, false)?;
     Some((task.retry_request(), delay, error))
 }
 
 async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
-    let (delay, error) = retry_budget_for_result(task, result)?;
+    let retryable_batch_failure = task.batch_failure_is_retryable().await;
+    let (delay, error) = retry_budget_for_result(task, result, retryable_batch_failure)?;
     let request = match task.retry_request_with_remaining_timeout().await {
         Ok(request) => request,
         Err(err) => {
@@ -822,6 +845,10 @@ pub struct HealManager {
     replacement_recovery_anchors: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Set IDs whose durable replacement metadata is corrupt or conflicting.
     replacement_recovery_blocked_sets: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Durable handoff of interrupted administrator root traversals.
+    root_recovery: Arc<root_recovery::RootHealRecovery>,
+    /// Keep forceStart's cancellation side effects inside the shutdown fence.
+    force_start_shutdown: Mutex<()>,
     /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
     /// Cancel token
@@ -857,6 +884,7 @@ struct HealQueueContext<'a> {
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
     mrf_repair_notice_targets: &'a Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
     replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
+    root_recovery: &'a Arc<root_recovery::RootHealRecovery>,
     config: &'a Arc<RwLock<HealConfig>>,
     statistics: &'a Arc<RwLock<HealStatistics>>,
     storage: &'a Arc<dyn HealStorageAPI>,
@@ -918,6 +946,10 @@ impl HealManager {
 
     fn can_displace_queued_work(request: &HealRequest) -> bool {
         matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
+    }
+
+    fn queued_request_can_be_displaced(request: &HealRequest) -> bool {
+        !root_recovery::is_admin_heal_recovery(&request.heal_type, request.source)
     }
 
     fn request_bypasses_mainline_throttle(request: &HealRequest) -> bool {
@@ -1056,11 +1088,15 @@ impl HealManager {
         let per_object_request = request.heal_type.is_per_object();
 
         if queue_len >= queue_capacity && !request.force_start {
-            if Self::can_displace_queued_work(&request) && queue.can_displace_lower_priority(request.priority) {
+            if Self::can_displace_queued_work(&request)
+                && queue.can_displace_lower_priority_where(request.priority, Self::queued_request_can_be_displaced)
+            {
                 let request_id = request.id.clone();
                 let priority = request.priority;
                 let source = request.source;
-                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
+                if let Some(displaced) =
+                    queue.push_displacing_lower_priority_where(request, Self::queued_request_can_be_displaced)
+                {
                     publish_heal_queue_length(queue);
                     Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
                     demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
@@ -1334,6 +1370,51 @@ impl HealManager {
         });
     }
 
+    async fn start_root_recovery_terminal_gc(&self) {
+        let cancel = self.cancel_token.clone();
+        let root_recovery = self.root_recovery.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(RESUME_GC_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match root_recovery.gc_terminal_receipts_once(SystemTime::now()).await {
+                            Ok(report) => {
+                                if report.pending_removed > 0 || report.terminals_removed > 0 || report.budget_exhausted {
+                                    debug!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_RESUME_GC,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        state = "root_terminal_gc",
+                                        scanned = report.scanned,
+                                        retained = report.retained,
+                                        pending_removed = report.pending_removed,
+                                        terminals_removed = report.terminals_removed,
+                                        budget_exhausted = report.budget_exhausted,
+                                        "Root heal terminal receipt GC inspected durable state"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_RESUME_GC,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    state = "root_terminal_gc_failed",
+                                    error = %error,
+                                    "Root heal terminal receipt GC failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         Self::new_with_workload_provider(storage, config, None)
@@ -1344,6 +1425,15 @@ impl HealManager {
         storage: Arc<dyn HealStorageAPI>,
         config: Option<HealConfig>,
         workload_provider: Option<WorkloadSnapshotProviderRef>,
+    ) -> Self {
+        Self::new_with_root_recovery(storage, config, workload_provider, Arc::new(root_recovery::RootHealRecovery::default()))
+    }
+
+    fn new_with_root_recovery(
+        storage: Arc<dyn HealStorageAPI>,
+        config: Option<HealConfig>,
+        workload_provider: Option<WorkloadSnapshotProviderRef>,
+        root_recovery: Arc<root_recovery::RootHealRecovery>,
     ) -> Self {
         let config = config.unwrap_or_default();
         Self {
@@ -1358,6 +1448,8 @@ impl HealManager {
             mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
             replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             replacement_recovery_blocked_sets: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            root_recovery,
+            force_start_shutdown: Mutex::new(()),
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
@@ -1365,6 +1457,27 @@ impl HealManager {
             workload_provider,
             admission_telemetry: Arc::new(StdMutex::new(HealAdmissionTelemetry::default())),
         }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_without_root_recovery_for_test(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
+        Self::new_with_root_recovery(storage, config, None, Arc::new(root_recovery::RootHealRecovery::disabled_for_tests()))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_with_workload_provider_without_root_recovery_for_test(
+        storage: Arc<dyn HealStorageAPI>,
+        config: Option<HealConfig>,
+        workload_provider: Option<WorkloadSnapshotProviderRef>,
+    ) -> Self {
+        Self::new_with_root_recovery(
+            storage,
+            config,
+            workload_provider,
+            Arc::new(root_recovery::RootHealRecovery::disabled_for_tests()),
+        )
     }
 
     /// Start HealManager
@@ -1393,6 +1506,23 @@ impl HealManager {
             "Heal manager starting"
         );
 
+        // Restore graceful-shutdown root responsibilities before automatic
+        // repair can admit overlapping work.
+        if let Err(error) = self.replay_root_heals().await {
+            // A missing owner or invalid root record must not block existing
+            // replacement recovery. Keep its file for a later restart after
+            // the owner is readable or the record has been repaired.
+            warn!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                state = "root_recovery_deferred",
+                error = %error,
+                "Root heal restart recovery deferred"
+            );
+        }
+
         // start scheduler
         self.start_scheduler().await?;
 
@@ -1402,6 +1532,7 @@ impl HealManager {
 
         // Inspect resume artifacts in a bounded, fail-closed background task.
         self.start_resume_gc().await;
+        self.start_root_recovery_terminal_gc().await;
 
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
@@ -1430,6 +1561,7 @@ impl HealManager {
 
     /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
+        let _force_start_guard = self.force_start_shutdown.lock().await;
         info!(
             target: "rustfs::heal::manager",
             event = EVENT_HEAL_MANAGER_STATE,
@@ -1439,11 +1571,39 @@ impl HealManager {
             "Heal manager stopping"
         );
 
-        // cancel all tasks
-        self.cancel_token.cancel();
-
-        // wait for all tasks to complete
+        // Keep scheduler, cancellation, and retry ownership stable until every
+        // unfinished admin control-plane heal has a durable successor. A failed
+        // write must leave the manager running and the shutdown marker unclean.
         let mut active_heals = self.active_heals.lock().await;
+        let queue = self.heal_queue.lock().await;
+        let retrying = self.retrying_heals.lock().await;
+        for task in active_heals.values() {
+            if root_recovery::is_admin_heal_recovery(&task.heal_type, task.source) {
+                if task.get_status().await == HealTaskStatus::Completed {
+                    self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
+                } else {
+                    let mut request = match task.retry_request_with_remaining_timeout().await {
+                        Ok(request) => request,
+                        Err(Error::TaskTimeout) => {
+                            let mut request = task.retry_request();
+                            request.options.timeout = Some(Duration::ZERO);
+                            request
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    request.retry_attempts = task.retry_attempts;
+                    self.root_recovery.persist(&request).await?;
+                }
+            }
+        }
+        for request in queue.requests().chain(retrying.values().map(|retrying| &retrying.request)) {
+            self.root_recovery.persist(request).await?;
+        }
+        self.cancel_token.cancel();
+        drop(retrying);
+        drop(queue);
+
+        // cancel active workers after the durable handoff
         for task in active_heals.values() {
             if let Err(e) = task.cancel().await {
                 warn!(
@@ -1508,7 +1668,7 @@ impl HealManager {
         request: HealRequest,
         preserve_alias: bool,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, None)
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, None)
             .await
     }
 
@@ -1544,19 +1704,43 @@ impl HealManager {
         request: HealRequest,
         mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, Some(mrf_notice_target))
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, true, Some(mrf_notice_target))
             .await
+    }
+
+    pub(crate) async fn durable_mrf_repair_anchor(
+        &self,
+        intent: &rustfs_common::mrf_channel::MrfIntent,
+    ) -> Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor> {
+        match self.storage.mrf_bucket_incarnation_id(intent.bucket.as_ref()).await {
+            Ok(Some(bucket_incarnation_id)) => {
+                rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, bucket_incarnation_id)
+            }
+            Ok(None) | Err(_) => None,
+        }
     }
 
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
         &self,
         request: HealRequest,
         preserve_alias: bool,
+        accept_same_request_id_replay: bool,
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
     ) -> Result<HealAdmissionReceipt> {
         let admission_start = Instant::now();
         let source = request.source;
         let force_start = request.force_start;
+        // A forceStart must not retire an old durable owner if shutdown will
+        // reject its replacement. Hold the same gate through final admission.
+        let _force_start_guard = if source == HealRequestSource::Admin && force_start {
+            let guard = self.force_start_shutdown.lock().await;
+            if self.cancel_token.is_cancelled() {
+                return Err(Error::Other("Heal manager is stopping".to_string()));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         // HS-06 forceStart semantics (admin only): MinIO stops the old task
         // first and then starts the new one. Cancel any active admin task
         // overlapping this request's path before entering admission, so the
@@ -1564,7 +1748,9 @@ impl HealManager {
         if request.source == HealRequestSource::Admin && request.force_start {
             let overlapping: Vec<String> = {
                 let active_heals = self.active_heals.lock().await;
-                active_heals
+                let queue = self.heal_queue.lock().await;
+                let retrying = self.retrying_heals.lock().await;
+                let mut ids = active_heals
                     .iter()
                     .filter(|(task_id, task)| {
                         task.source == HealRequestSource::Admin
@@ -1572,7 +1758,19 @@ impl HealManager {
                             && *task_id != &request.id
                     })
                     .map(|(task_id, _)| task_id.clone())
-                    .collect()
+                    .collect::<Vec<_>>();
+                ids.extend(
+                    queue
+                        .requests()
+                        .chain(retrying.values().map(|retrying| &retrying.request))
+                        .filter(|pending| {
+                            root_recovery::is_admin_heal_recovery(&pending.heal_type, pending.source)
+                                && heal_types_overlap(&request.heal_type, &pending.heal_type) != OverlapVerdict::Disjoint
+                                && pending.id != request.id
+                        })
+                        .map(|pending| pending.id.clone()),
+                );
+                ids
             };
             for task_id in overlapping {
                 match self.cancel_task(&task_id).await {
@@ -1586,17 +1784,16 @@ impl HealManager {
                         result = "force_start_cancelled_overlap",
                         "Admin forceStart cancelled an overlapping heal task"
                     ),
-                    Err(err) => warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        cancelled_task_id = %task_id,
-                        error = %err,
-                        result = "force_start_cancel_failed",
-                        "Admin forceStart failed to cancel an overlapping heal task"
-                    ),
+                    Err(err) => return Err(err),
+                }
+            }
+            // A failed or timed-out replay may have only its durable owner
+            // left. Cancel only records that overlap this forced start.
+            for pending in self.root_recovery.pending().await? {
+                if pending.id != request.id
+                    && heal_types_overlap(&request.heal_type, &pending.heal_type) != OverlapVerdict::Disjoint
+                {
+                    self.cancel_task(&pending.id).await?;
                 }
             }
         }
@@ -1609,10 +1806,75 @@ impl HealManager {
         // active -> retrying transitions can slip between duplicate checks.
         let lock_phase_start = Instant::now();
         let active_heals = self.active_heals.lock().await;
+        if self.cancel_token.is_cancelled() {
+            return Err(Error::Other("Heal manager is stopping".to_string()));
+        }
         #[cfg(test)]
         pause_duplicate_admission_after_active_lock(&request.id).await;
         let mut queue = self.heal_queue.lock().await;
         let retrying_heals = self.retrying_heals.lock().await;
+
+        let request_id_admission = active_heals
+            .get(&request.id)
+            .map(|task| (request_matches_task(&request, task), "active"))
+            .or_else(|| {
+                queue
+                    .requests()
+                    .find(|queued| queued.id == request.id)
+                    .map(|queued| (request_matches_request(&request, queued), "queued"))
+            })
+            .or_else(|| {
+                retrying_heals
+                    .get(&request.id)
+                    .map(|retrying| (request_matches_request(&request, &retrying.request), "retrying"))
+            });
+        if let Some((matches_existing, duplicate_state)) = request_id_admission {
+            let admission = if matches_existing {
+                if accept_same_request_id_replay {
+                    HealAdmissionResult::Accepted
+                } else {
+                    Self::duplicate_admission_for_request(&request, &config)
+                }
+            } else {
+                HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+            };
+            if matches!(admission, HealAdmissionResult::Accepted | HealAdmissionResult::Merged)
+                && let Some(target) = mrf_notice_target
+            {
+                let mut targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+                Self::insert_mrf_repair_notice_target(&mut targets, &request.id, target);
+            }
+            drop(retrying_heals);
+            drop(queue);
+            drop(active_heals);
+            let lock_phase = lock_phase_start.elapsed();
+            Self::record_admission_metric(request.source, admission, "duplicate");
+            self.record_admission_observation(HealAdmissionObservation {
+                source,
+                result: admission,
+                context: "duplicate",
+                force_start,
+                displaced: false,
+                start_duration: admission_start.elapsed(),
+                lock_phase,
+            });
+            debug!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request.id,
+                duplicate_state,
+                result = admission.result_label(),
+                reason = admission.reason_label(),
+                "Heal queue admission reused an existing request id"
+            );
+            return Ok(HealAdmissionReceipt {
+                result: admission,
+                task_id: request.id,
+            });
+        }
+
         let duplicate = (!request.force_start).then(|| {
             active_heal_for_dedup_key(&active_heals, &dedup_key)
                 .map(|(task_id, _)| (task_id, "active"))
@@ -1760,9 +2022,29 @@ impl HealManager {
             }
         }
 
+        let durable_handoff = root_recovery::is_admin_heal_recovery(&request.heal_type, request.source);
+        let durable_handoff_required = durable_handoff
+            && (request.force_start
+                || queue.len() < config.queue_size
+                || (Self::can_displace_queued_work(&request)
+                    && queue.can_displace_lower_priority_where(request.priority, Self::queued_request_can_be_displaced)));
+        // An admin receipt is a control-plane responsibility. Persist it before
+        // queue publication so a crash after admission can replay it.
+        if durable_handoff_required {
+            self.root_recovery.persist(&request).await?;
+        }
+
         let mut task_id = request.id.clone();
+        let request_id = request.id.clone();
+        let request_heal_type = request.heal_type.clone();
+        let request_source = request.source;
         let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
         let admission = admission_decision.result;
+        if durable_handoff_required && !admission.is_admitted() {
+            self.root_recovery
+                .remove(&request_id, &request_heal_type, request_source)
+                .await?;
+        }
         if admission == HealAdmissionResult::Merged
             && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
         {
@@ -1819,7 +2101,10 @@ impl HealManager {
 
     /// Submit heal request.
     pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
-        Ok(self.submit_heal_request_with_receipt_and_alias(request, true).await?.result)
+        Ok(self
+            .submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, false, None)
+            .await?
+            .result)
     }
 
     /// Get task status
@@ -1830,7 +2115,7 @@ impl HealManager {
     /// Retrying, never Pending — then the queue, and finally a terminal
     /// completed entry. `heal_path` additionally constrains the map matches
     /// the way the `*_for_path` variants always have.
-    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> TaskStateLookup {
+    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> Result<TaskStateLookup> {
         let matches_path = |heal_type: &HealType| heal_path.is_none_or(|path| heal_type_matches_path(heal_type, path));
 
         {
@@ -1839,7 +2124,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|task| matches_path(&task.heal_type))
             {
-                return TaskStateLookup::Active(Arc::clone(task));
+                return Ok(TaskStateLookup::Active(Arc::clone(task)));
             }
         }
 
@@ -1849,7 +2134,7 @@ impl HealManager {
                 .get(canonical_task_id)
                 .filter(|retrying| matches_path(&retrying.request.heal_type))
             {
-                return TaskStateLookup::Retrying(retrying.status());
+                return Ok(TaskStateLookup::Retrying(retrying.status()));
             }
         }
 
@@ -1862,7 +2147,7 @@ impl HealManager {
             prune_completed_heal_statuses(&mut completed_heals);
             if let Some(completed) = completed_heals.get(canonical_task_id).filter(|c| matches_path(&c.heal_type)) {
                 if completed_status_is_retrying(&completed.status) {
-                    return TaskStateLookup::Completed(Arc::clone(completed));
+                    return Ok(TaskStateLookup::Completed(Arc::clone(completed)));
                 }
                 terminal_completed = Some(Arc::clone(completed));
             }
@@ -1875,7 +2160,7 @@ impl HealManager {
                 None => queue.contains_request_id(canonical_task_id),
             };
             if queued {
-                return TaskStateLookup::Queued;
+                return Ok(TaskStateLookup::Queued);
             }
         }
 
@@ -1888,15 +2173,55 @@ impl HealManager {
                 .cloned();
         }
 
-        match terminal_completed {
+        if terminal_completed.is_none()
+            && let Some(completed) = self.root_recovery.completed(canonical_task_id).await?
+            && matches_path(&completed.heal_type)
+        {
+            terminal_completed = Some(Arc::new(completed));
+        }
+
+        Ok(match terminal_completed {
             Some(completed) => TaskStateLookup::Completed(completed),
             None => TaskStateLookup::NotFound,
-        }
+        })
+    }
+
+    async fn publish_admin_terminal(
+        &self,
+        task_id: &str,
+        heal_type: &HealType,
+        source: HealRequestSource,
+        completed: &CompletedHealStatus,
+    ) -> Result<bool> {
+        self.root_recovery
+            .persist_terminal(task_id, heal_type, source, completed)
+            .await
+    }
+
+    async fn publish_admin_cancelled_terminal(
+        &self,
+        task_id: &str,
+        heal_type: &HealType,
+        source: HealRequestSource,
+    ) -> Result<bool> {
+        let completed = CompletedHealStatus {
+            outcome: None,
+            progress: None,
+            retained_bytes: std::sync::OnceLock::new(),
+            heal_type: heal_type.clone(),
+            status: HealTaskStatus::Cancelled,
+            result_items_truncated: false,
+            completed_at: SystemTime::now(),
+            seqed_items: Vec::new(),
+            next_seq: 0,
+            min_seq: 0,
+        };
+        self.publish_admin_terminal(task_id, heal_type, source, &completed).await
     }
 
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, None).await {
+        match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
             TaskStateLookup::Retrying(status) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
@@ -1916,7 +2241,7 @@ impl HealManager {
     /// full-snapshot semantics.
     pub async fn get_task_report_since(&self, task_id: &str, since: Option<u64>) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, None).await {
+        match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
             TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
@@ -1939,7 +2264,7 @@ impl HealManager {
         since: Option<u64>,
     ) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
             TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
@@ -1962,7 +2287,7 @@ impl HealManager {
     /// recently completed task, a different token is invalid for that path.
     pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await? {
             TaskStateLookup::Active(task) => Ok(task.get_status().await),
             TaskStateLookup::Retrying(status) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
@@ -2016,11 +2341,18 @@ impl HealManager {
         }
         drop(completed_heals);
 
-        let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
-        prune_completed_heal_statuses(&mut displaced_terminals);
-        displaced_terminals
-            .values()
-            .any(|terminal| heal_type_matches_path(&terminal.heal_type, heal_path))
+        {
+            let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
+            prune_completed_heal_statuses(&mut displaced_terminals);
+            if displaced_terminals
+                .values()
+                .any(|terminal| heal_type_matches_path(&terminal.heal_type, heal_path))
+            {
+                return true;
+            }
+        }
+
+        self.root_recovery.completed_matches_path(heal_path).await.unwrap_or(false)
     }
 
     /// Get task progress
@@ -2032,7 +2364,7 @@ impl HealManager {
 
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        let progress = match self.lookup_task_state(&canonical_task_id, None).await {
+        let progress = match self.lookup_task_state(&canonical_task_id, None).await? {
             TaskStateLookup::Active(task) => Some(task.get_progress().await),
             TaskStateLookup::Completed(completed) => completed.progress.clone(),
             _ => None,
@@ -2048,8 +2380,11 @@ impl HealManager {
         {
             let mut active_heals = self.active_heals.lock().await;
             if let Some(task) = active_heals.get(&canonical_task_id) {
-                task.cancel().await?;
                 let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                self.publish_admin_terminal(&canonical_task_id, &task.heal_type, task.source, &completed)
+                    .await?;
+                self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
+                task.cancel().await?;
                 publish_completed_heal(&self.completed_heals, &self.task_aliases, &canonical_task_id, completed, true).await;
                 active_heals.remove(&canonical_task_id);
                 publish_active_heal_count(&active_heals);
@@ -2071,6 +2406,13 @@ impl HealManager {
 
         {
             let mut retrying_heals = self.retrying_heals.lock().await;
+            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
+                self.publish_admin_cancelled_terminal(&canonical_task_id, &retrying.request.heal_type, retrying.request.source)
+                    .await?;
+                self.root_recovery
+                    .remove(&canonical_task_id, &retrying.request.heal_type, retrying.request.source)
+                    .await?;
+            }
             if let Some(retrying) = retrying_heals.remove(&canonical_task_id) {
                 retrying.cancel_token.cancel();
                 drop(retrying_heals);
@@ -2091,6 +2433,13 @@ impl HealManager {
         }
 
         let mut queue = self.heal_queue.lock().await;
+        if let Some(request) = queue.requests().find(|request| request.id == canonical_task_id) {
+            self.publish_admin_cancelled_terminal(&canonical_task_id, &request.heal_type, request.source)
+                .await?;
+            self.root_recovery
+                .remove(&request.id, &request.heal_type, request.source)
+                .await?;
+        }
         if queue.remove_request_id(&canonical_task_id).is_some() {
             publish_heal_queue_length(&queue);
             info!(
@@ -2108,6 +2457,10 @@ impl HealManager {
             return Ok(());
         }
 
+        drop(queue);
+        if self.root_recovery.cancel_pending(&canonical_task_id).await? {
+            return Ok(());
+        }
         Err(Error::TaskNotFound {
             task_id: task_id.to_string(),
         })
@@ -2126,8 +2479,11 @@ impl HealManager {
 
             for task_id in &task_ids {
                 if let Some(task) = active_heals.get(task_id) {
-                    task.cancel().await?;
                     let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                    self.publish_admin_terminal(task_id, &task.heal_type, task.source, &completed)
+                        .await?;
+                    self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
+                    task.cancel().await?;
                     publish_completed_heal(&self.completed_heals, &self.task_aliases, task_id, completed, true).await;
                 }
                 active_heals.remove(task_id);
@@ -2154,6 +2510,13 @@ impl HealManager {
                 .collect::<Vec<_>>();
 
             for task_id in &task_ids {
+                if let Some(retrying) = retrying_heals.get(task_id) {
+                    self.publish_admin_cancelled_terminal(task_id, &retrying.request.heal_type, retrying.request.source)
+                        .await?;
+                    self.root_recovery
+                        .remove(task_id, &retrying.request.heal_type, retrying.request.source)
+                        .await?;
+                }
                 if let Some(retrying) = retrying_heals.remove(task_id) {
                     retrying.cancel_token.cancel();
                     cancelled += 1;
@@ -2175,6 +2538,21 @@ impl HealManager {
             }
         }
 
+        let queued_matches = {
+            let queue = self.heal_queue.lock().await;
+            queue
+                .requests()
+                .filter(|request| heal_type_matches_path(&request.heal_type, heal_path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for request in &queued_matches {
+            self.publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source)
+                .await?;
+            self.root_recovery
+                .remove(&request.id, &request.heal_type, request.source)
+                .await?;
+        }
         let mut queue = self.heal_queue.lock().await;
         let queued_cancelled = queue.remove_matching(|request| heal_type_matches_path(&request.heal_type, heal_path));
         if !queued_cancelled.is_empty() {
@@ -2187,6 +2565,17 @@ impl HealManager {
             self.remove_mrf_repair_notice_targets_for_task(&request.id);
         }
 
+        for pending in self
+            .root_recovery
+            .pending()
+            .await?
+            .into_iter()
+            .filter(|pending| heal_type_matches_path(&pending.heal_type, heal_path))
+        {
+            if self.root_recovery.cancel_pending(&pending.id).await? {
+                cancelled += 1;
+            }
+        }
         if cancelled == 0 {
             return Err(Error::TaskNotFound {
                 task_id: heal_path.to_string(),
@@ -2298,6 +2687,7 @@ impl std::fmt::Debug for HealManager {
 
 mod auto_scan;
 mod queue;
+mod root_recovery;
 mod scheduler;
 mod unclean_shutdown;
 

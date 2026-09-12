@@ -19,7 +19,7 @@ use crate::bucket::{
 };
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
-use crate::set_disk::get_lock_acquire_timeout;
+use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
@@ -770,19 +770,66 @@ impl ECStore {
         Ok(())
     }
 
+    /// Prove a live bucket generation before repairing missing expansion volumes.
+    /// Unlike request validation, repair only needs one erasure set to confirm
+    /// existence; an incomplete expansion set is precisely what repair fixes.
+    /// Callers must hold the bucket namespace lock through the subsequent heal.
+    pub(crate) async fn bucket_exists_for_heal(&self, bucket: &str) -> Result<bool> {
+        let results = futures::future::join_all(
+            self.bucket_sets()
+                .map(|(_, _, set)| async move { set.get_bucket_info(bucket, &BucketOptions::default()).await }),
+        )
+        .await;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(_) => return Ok(true),
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(false),
+        }
+    }
+
     #[instrument(skip(self))]
     pub(crate) async fn get_bucket_info_from_sets(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Write)
+            .await
+    }
+
+    pub(crate) async fn get_bucket_info_from_sets_at_read_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+    ) -> Result<BucketInfo> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+            .await
+    }
+
+    async fn get_bucket_info_from_sets_with_quorum(
+        &self,
+        bucket: &str,
+        opts: &BucketOptions,
+        quorum: BucketInfoQuorum,
+    ) -> Result<BucketInfo> {
         // One host may participate in several pools after expansion. Resolve the
         // namespace against each erasure set so disks from different pools can
         // never be combined into one bucket quorum.
         // Bucket validation is request-path IO. Keep the previous peer fanout's
         // latency shape by probing every set concurrently; scanner listings use
         // a separate bounded path below because they run continuously.
-        let mut scoped_results =
-            futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
-                (pool_index, set_index, set.get_bucket_info(bucket, opts).await)
-            }))
-            .await;
+        let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
+            let result = match quorum {
+                BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
+                BucketInfoQuorum::Write => set.get_bucket_info(bucket, opts).await,
+            };
+            (pool_index, set_index, result)
+        }))
+        .await;
         scoped_results.sort_unstable_by_key(|(pool_index, set_index, _)| (*pool_index, *set_index));
 
         let mut first_info = None;
@@ -806,7 +853,11 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self.get_bucket_info_from_sets(bucket, opts).await?;
+        let mut info = match self.get_bucket_info_from_sets(bucket, opts).await {
+            Ok(info) => info,
+            Err(Error::ErasureWriteQuorum) => return self.get_bucket_info_at_read_quorum(bucket, opts).await,
+            Err(err) => return Err(err),
+        };
 
         if let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await {
             if should_override_created_from_metadata(sys.created) {
@@ -817,6 +868,35 @@ impl ECStore {
         }
 
         Ok(info)
+    }
+
+    async fn get_bucket_info_at_read_quorum(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        // Lock order: bucket lifecycle -> internal metadata object read locks.
+        // Keep create/delete from changing the namespace while a read quorum
+        // confirms both physical presence and persisted bucket metadata.
+        let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        await_bucket_namespace_operation(Some(&guard), bucket, "bucket read quorum validation", async {
+            let mut info = self
+                .get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+                .await?;
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            if !persisted {
+                // A minority of directories left by failed creation is not an
+                // authoritative bucket. Never turn fabricated defaults into
+                // permission to serve degraded reads.
+                return Err(Error::ErasureReadQuorum);
+            }
+            if metadata.name != bucket {
+                return Err(Error::FileCorrupt);
+            }
+            if should_override_created_from_metadata(metadata.created) {
+                info.created = Some(metadata.created);
+            }
+            info.versioning = metadata.versioning();
+            info.object_locking = metadata.object_locking();
+            Ok(info)
+        })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -1049,7 +1129,7 @@ mod tests {
         run_physical_bucket_deletion, scan_metadata_less_residue, scan_metadata_less_residue_with_budget,
         should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
-    use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
+    use crate::bucket::metadata::{BucketMetadata, table_bucket_catalog_metadata_prefix};
     use crate::bucket::metadata_sys;
     use crate::cluster::rpc::peer_s3_client::install_delete_bucket_empty_scan_barrier;
     use crate::disk::{BUCKET_META_PREFIX, DiskAPI, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE};
@@ -1076,6 +1156,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Notify, OnceCell};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -1359,11 +1440,18 @@ mod tests {
     }
 
     async fn setup_multi_pool_bucket_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
+        setup_bucket_quorum_test_env(&[4, 4], None).await
+    }
+
+    async fn setup_bucket_quorum_test_env(
+        drives_per_pool: &[usize],
+        standard_parity: Option<usize>,
+    ) -> (tempfile::TempDir, Arc<ECStore>) {
         let temp_dir = tempfile::tempdir().expect("multi-pool bucket test directory should be created");
         let mut pools = Vec::new();
-        for pool_index in 0..2 {
+        for (pool_index, &drive_count) in drives_per_pool.iter().enumerate() {
             let mut endpoints = Vec::new();
-            for disk_index in 0..4 {
+            for disk_index in 0..drive_count {
                 let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
                 tokio::fs::create_dir_all(&disk_path)
                     .await
@@ -1378,7 +1466,7 @@ mod tests {
             pools.push(PoolEndpoints {
                 legacy: false,
                 set_count: 1,
-                drives_per_set: 4,
+                drives_per_set: drive_count,
                 endpoints: Endpoints::from(endpoints),
                 cmd_line: format!("bucket-test-pool-{pool_index}"),
                 platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
@@ -1399,9 +1487,12 @@ mod tests {
         )
         .await
         .expect("multi-pool ECStore should initialize");
-        let storage_class =
-            crate::config::storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[4, 4])
-                .expect("multi-pool storage class should match both four-disk pools");
+        let mut storage_class_kvs = rustfs_config::server_config::KVS::new();
+        if let Some(parity) = standard_parity {
+            storage_class_kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), format!("EC:{parity}"));
+        }
+        let storage_class = crate::config::storageclass::lookup_config_for_pools_without_env(&storage_class_kvs, drives_per_pool)
+            .expect("storage class should match every test erasure set");
         for pool in &ecstore.pools {
             for set in &pool.disk_set {
                 set.set_test_storage_class_config(storage_class.clone());
@@ -2052,6 +2143,98 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn bucket_metadata_init_repairs_half_created_expansion_pool() {
+        // Check both pool orders: an incomplete set must not hide a later
+        // complete set, and a complete set must not weaken request validation.
+        for complete_pool in 0..2 {
+            let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+            let bucket = format!("partial-expansion-{}", Uuid::new_v4().simple());
+            for pool_index in 0..2 {
+                let present_disks = if pool_index == complete_pool { 4 } else { 2 };
+                for disk_index in 0..present_disks {
+                    tokio::fs::create_dir(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket),
+                    )
+                    .await
+                    .expect("fixture bucket volume should be created");
+                }
+            }
+            assert_eq!(
+                ecstore
+                    .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("request validation must reject a half-created expansion set"),
+                StorageError::ErasureWriteQuorum
+            );
+
+            metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+            for pool_index in 0..2 {
+                for disk_index in 0..4 {
+                    assert!(
+                        temp_dir
+                            .path()
+                            .join(format!("pool{pool_index}-disk{disk_index}"))
+                            .join(&bucket)
+                            .is_dir(),
+                        "metadata initialization must heal every missing expansion volume"
+                    );
+                }
+            }
+            ecstore
+                .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                .await
+                .expect("strict request validation should succeed after volume repair");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_does_not_combine_partial_set_evidence() {
+        let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("no-quorum-expansion-{}", Uuid::new_v4().simple());
+        for pool_index in 0..2 {
+            for disk_index in 0..2 {
+                tokio::fs::create_dir(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket),
+                )
+                .await
+                .expect("fixture bucket volume should be created");
+            }
+        }
+        assert_eq!(
+            ecstore
+                .bucket_exists_for_heal(&bucket)
+                .await
+                .expect_err("repair must require a complete quorum within one set"),
+            StorageError::ErasureWriteQuorum
+        );
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        for pool_index in 0..2 {
+            for disk_index in 0..4 {
+                assert_eq!(
+                    temp_dir
+                        .path()
+                        .join(format!("pool{pool_index}-disk{disk_index}"))
+                        .join(&bucket)
+                        .is_dir(),
+                    disk_index < 2,
+                    "unproven bucket generations must not recreate missing volumes"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn bucket_metadata_init_does_not_recreate_stale_bucket_name() {
         let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("stale-expansion-{}", Uuid::new_v4().simple());
@@ -2065,6 +2248,218 @@ mod tests {
                 .expect_err("a stale startup listing must not recreate a deleted bucket");
             assert_eq!(err, StorageError::VolumeNotFound);
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_tracks_erasure_layout() {
+        for (drive_count, parity) in [(2, 1), (3, 1), (4, 2), (5, 2), (6, 3), (8, 4), (6, 2), (12, 6)] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&[drive_count], Some(parity)).await;
+            metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("read-quorum-{drive_count}-{parity}");
+            let object = "uncached-object";
+            let body = b"erasure read quorum must follow the persisted layout".repeat(32_768);
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("healthy namespace should accept bucket creation");
+            store
+                .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &ObjectOptions::default())
+                .await
+                .expect("healthy erasure set should accept the seed object");
+            let set = &store.pools[0].disk_set[0];
+            let lock = set
+                .new_ns_lock(&bucket, object)
+                .await
+                .expect("seed namespace lock should resolve");
+            drop(
+                lock.get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("seed physical fanout must finish before taking disks offline"),
+            );
+            if (drive_count, parity) == (6, 3) {
+                let mut kvs = rustfs_config::server_config::KVS::new();
+                kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+                set.set_test_storage_class_config(
+                    crate::config::storageclass::lookup_config_for_pools_without_env(&kvs, &[drive_count])
+                        .expect("a later storage-class change must not raise old objects' read quorum"),
+                );
+            }
+
+            let offline_indexes = (0..parity).collect::<Vec<_>>();
+            let offline = take_set_disks_offline(&store, set, &offline_indexes).await;
+            let info = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("bucket validation must admit the object's exact read quorum");
+            assert_eq!(info.name, bucket);
+
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("the persisted layout should remain readable at its exact data-shard quorum");
+            let mut restored = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("quorum read should reconstruct the body");
+            assert_eq!(restored, body, "layout {drive_count}/{parity} must retain exact object contents");
+            drop(reader);
+
+            if drive_count - parity == drive_count / 2 {
+                let error = store
+                    .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("bucket mutations must retain their majority namespace check");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+            }
+
+            let below_quorum = take_set_disks_offline(&store, set, &[parity]).await;
+            let read = store
+                .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await;
+            match read {
+                Ok(mut reader) => assert!(
+                    reader.stream.read_to_end(&mut Vec::new()).await.is_err(),
+                    "layout {drive_count}/{parity} must reject fewer than its data-shard quorum"
+                ),
+                Err(error) => assert!(
+                    matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)),
+                    "a missing shard must report read quorum loss, got {error}"
+                ),
+            }
+            restore_set_disks(&store, set, below_quorum).await;
+            restore_set_disks(&store, set, offline).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_is_scoped_to_each_erasure_set() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4, 6], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "read-quorum-mixed-pools";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy pools should accept bucket creation");
+
+        let first_set = &store.pools[0].disk_set[0];
+        let second_set = &store.pools[1].disk_set[0];
+        let first_offline = take_set_disks_offline(&store, first_set, &[0, 1]).await;
+        let second_offline = take_set_disks_offline(&store, second_set, &[0, 1, 2]).await;
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("each set independently satisfies its namespace read quorum");
+
+        for (set, extra_disk) in [(first_set, 2), (second_set, 3)] {
+            let extra_offline = take_set_disks_offline(&store, set, &[extra_disk]).await;
+            assert_eq!(
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .expect_err("another pool must not subsidize a set below its read quorum"),
+                StorageError::ErasureReadQuorum
+            );
+            restore_set_disks(&store, set, extra_offline).await;
+        }
+        restore_set_disks(&store, first_set, first_offline).await;
+        restore_set_disks(&store, second_set, second_offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_requires_authoritative_metadata() {
+        for state in ["missing", "corrupt", "foreign", "incarnation"] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+            metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("read-quorum-{state}-metadata");
+            let mut metadata = if state == "missing" {
+                store
+                    .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("simulate directories left before bucket metadata is published");
+                BucketMetadata::new(&bucket)
+            } else {
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("healthy bucket should publish metadata");
+                metadata_sys::get_in(&store.ctx, &bucket)
+                    .await
+                    .expect("seed metadata should be cached")
+                    .as_ref()
+                    .clone()
+            };
+            let path = metadata.save_file_path();
+            match state {
+                "corrupt" => crate::config::com::save_config(store.clone(), &path, b"corrupt".to_vec())
+                    .await
+                    .expect("persist corrupt metadata while the cached copy remains valid"),
+                "foreign" => {
+                    metadata.name = "different-bucket".to_string();
+                    let mut encoded = vec![1, 0, 1, 0];
+                    encoded.extend(metadata.marshal_msg().expect("foreign metadata should encode"));
+                    crate::config::com::save_config(store.clone(), &path, encoded)
+                        .await
+                        .expect("persist metadata for a different bucket at the requested path");
+                }
+                "incarnation" => crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, Uuid::new_v4())
+                    .await
+                    .expect("persist a different bucket generation"),
+                _ => {}
+            }
+
+            let set = &store.pools[0].disk_set[0];
+            let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+            let error = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("read admission must not trust residual directories or cached metadata");
+            match state {
+                "missing" => assert_eq!(error, StorageError::ErasureReadQuorum),
+                "foreign" => assert_eq!(error, StorageError::FileCorrupt),
+                "incarnation" => assert!(error.to_string().contains("sidecar does not match bucket metadata")),
+                "corrupt" => assert!(error.to_string().contains("format invalid"), "unexpected corruption error: {error}"),
+                _ => unreachable!(),
+            }
+            restore_set_disks(&store, set, offline).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_info_read_quorum_accepts_persisted_legacy_metadata() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "interop";
+        store
+            .make_bucket_on_sets(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("legacy bucket directories should exist");
+        let hex = include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex")
+            .split_whitespace()
+            .collect::<String>();
+        let body = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("pinned MinIO metadata fixture"))
+            .collect();
+        crate::config::com::save_config(store.clone(), &BucketMetadata::new(bucket).save_file_path(), body)
+            .await
+            .expect("legacy metadata should be persisted without an incarnation sidecar");
+
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+        let info = store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("persisted MinIO metadata should authorize reads at the namespace read quorum");
+        assert_eq!(info.name, bucket);
+        assert!(info.versioning);
+        assert!(info.object_locking);
+        restore_set_disks(&store, set, offline).await;
     }
 
     #[tokio::test]
@@ -2090,6 +2485,7 @@ mod tests {
     #[serial]
     async fn bucket_namespace_reads_fail_closed_when_any_set_loses_quorum() {
         let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
         let bucket = format!("degraded-expansion-{}", Uuid::new_v4().simple());
         ecstore.pools[0].disk_set[0]
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -2097,6 +2493,7 @@ mod tests {
             .expect("bucket should be created in the original pool only");
         ecstore.pools[1].disk_set[0].disks.write().await[0] = None;
         ecstore.pools[1].disk_set[0].disks.write().await[1] = None;
+        ecstore.pools[1].disk_set[0].disks.write().await[2] = None;
 
         let list_err = ecstore
             .list_bucket(&BucketOptions::default())
@@ -2108,7 +2505,7 @@ mod tests {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .expect_err("bucket validation must fail when an expansion pool is unavailable");
-        assert_eq!(info_err, StorageError::ErasureWriteQuorum);
+        assert_eq!(info_err, StorageError::ErasureReadQuorum);
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ pub enum SegmentInvalidationError {
     ByteLimit,
     InvalidProof,
     InvalidKey,
+    UnknownProducer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -48,6 +49,102 @@ impl SegmentInvalidationProducer {
         Self::Tier,
         Self::DirectoryObject,
     ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentInvalidationProducerIdentity {
+    PutObject,
+    DeleteObject,
+    DeleteMarker,
+    CompleteMultipartUpload,
+    AbortMultipartUpload,
+    ObjectMetadata,
+    BucketMetadata,
+    Replication,
+    TierTransition,
+    TierExpiration,
+    DirectoryObject,
+    Unknown,
+    TestFixture,
+}
+
+impl SegmentInvalidationProducerIdentity {
+    pub const REQUIRED_PRODUCTION: [Self; 11] = [
+        Self::PutObject,
+        Self::DeleteObject,
+        Self::DeleteMarker,
+        Self::CompleteMultipartUpload,
+        Self::AbortMultipartUpload,
+        Self::ObjectMetadata,
+        Self::BucketMetadata,
+        Self::Replication,
+        Self::TierTransition,
+        Self::TierExpiration,
+        Self::DirectoryObject,
+    ];
+
+    pub(crate) const REQUIRED_PRODUCTION_COVERAGE_MASK: u64 = (1_u64 << 11) - 1;
+
+    pub(crate) const fn production_coverage_bit(self) -> Option<u64> {
+        match self {
+            Self::PutObject => Some(1_u64 << 0),
+            Self::DeleteObject => Some(1_u64 << 1),
+            Self::DeleteMarker => Some(1_u64 << 2),
+            Self::CompleteMultipartUpload => Some(1_u64 << 3),
+            Self::AbortMultipartUpload => Some(1_u64 << 4),
+            Self::ObjectMetadata => Some(1_u64 << 5),
+            Self::BucketMetadata => Some(1_u64 << 6),
+            Self::Replication => Some(1_u64 << 7),
+            Self::TierTransition => Some(1_u64 << 8),
+            Self::TierExpiration => Some(1_u64 << 9),
+            Self::DirectoryObject => Some(1_u64 << 10),
+            Self::Unknown | Self::TestFixture => None,
+        }
+    }
+
+    pub fn producer(self) -> Option<SegmentInvalidationProducer> {
+        match self {
+            Self::PutObject => Some(SegmentInvalidationProducer::Put),
+            Self::DeleteObject => Some(SegmentInvalidationProducer::Delete),
+            Self::DeleteMarker => Some(SegmentInvalidationProducer::DeleteMarker),
+            Self::CompleteMultipartUpload | Self::AbortMultipartUpload => Some(SegmentInvalidationProducer::Multipart),
+            Self::ObjectMetadata => Some(SegmentInvalidationProducer::Put),
+            Self::BucketMetadata => Some(SegmentInvalidationProducer::DirectoryObject),
+            Self::Replication => Some(SegmentInvalidationProducer::Replication),
+            Self::TierTransition | Self::TierExpiration => Some(SegmentInvalidationProducer::Tier),
+            Self::DirectoryObject => Some(SegmentInvalidationProducer::DirectoryObject),
+            Self::Unknown | Self::TestFixture => None,
+        }
+    }
+}
+
+pub fn complete_segment_invalidation_producers<I>(
+    identities: I,
+) -> Result<BTreeSet<SegmentInvalidationProducer>, SegmentInvalidationError>
+where
+    I: IntoIterator<Item = SegmentInvalidationProducerIdentity>,
+{
+    let mut covered_identities = BTreeSet::new();
+    let mut producers = BTreeSet::new();
+    for identity in identities {
+        let Some(producer) = identity.producer() else {
+            return Err(SegmentInvalidationError::UnknownProducer);
+        };
+        covered_identities.insert(identity);
+        producers.insert(producer);
+    }
+    if SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+        .iter()
+        .all(|identity| covered_identities.contains(identity))
+        && SegmentInvalidationProducer::REQUIRED
+            .iter()
+            .all(|producer| producers.contains(producer))
+    {
+        Ok(producers)
+    } else {
+        Err(SegmentInvalidationError::InvalidProof)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,7 +267,8 @@ mod tests {
     use super::*;
 
     fn producers() -> BTreeSet<SegmentInvalidationProducer> {
-        SegmentInvalidationProducer::REQUIRED.into_iter().collect()
+        complete_segment_invalidation_producers(SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION)
+            .expect("production producer matrix should be complete")
     }
 
     fn envelope() -> SegmentInvalidationEnvelope {
@@ -317,6 +415,82 @@ mod tests {
         assert_eq!(
             admit_segment_invalidation(&envelope, &distributed_with_invalidation, ["hot/one"]),
             Ok(BTreeSet::from(["hot".to_string()]))
+        );
+    }
+
+    #[test]
+    fn segment_invalidation_producer_identities_must_be_known_and_complete() {
+        let coverage_mask = SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+            .into_iter()
+            .filter_map(SegmentInvalidationProducerIdentity::production_coverage_bit)
+            .fold(0_u64, std::ops::BitOr::bitor);
+        assert_eq!(coverage_mask, SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK);
+        assert_eq!(SegmentInvalidationProducerIdentity::Unknown.production_coverage_bit(), None);
+        assert_eq!(SegmentInvalidationProducerIdentity::TestFixture.production_coverage_bit(), None);
+        assert_eq!(
+            complete_segment_invalidation_producers(SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION),
+            Ok(SegmentInvalidationProducer::REQUIRED.into_iter().collect())
+        );
+        assert_eq!(
+            complete_segment_invalidation_producers([
+                SegmentInvalidationProducerIdentity::PutObject,
+                SegmentInvalidationProducerIdentity::DeleteObject,
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+                SegmentInvalidationProducerIdentity::ObjectMetadata,
+                SegmentInvalidationProducerIdentity::BucketMetadata,
+                SegmentInvalidationProducerIdentity::Replication,
+                SegmentInvalidationProducerIdentity::TierTransition,
+                SegmentInvalidationProducerIdentity::TierExpiration,
+                SegmentInvalidationProducerIdentity::DirectoryObject,
+                SegmentInvalidationProducerIdentity::Unknown,
+            ]),
+            Err(SegmentInvalidationError::UnknownProducer)
+        );
+        assert_eq!(
+            complete_segment_invalidation_producers([
+                SegmentInvalidationProducerIdentity::PutObject,
+                SegmentInvalidationProducerIdentity::DeleteObject,
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+                SegmentInvalidationProducerIdentity::ObjectMetadata,
+                SegmentInvalidationProducerIdentity::BucketMetadata,
+                SegmentInvalidationProducerIdentity::Replication,
+                SegmentInvalidationProducerIdentity::TierTransition,
+                SegmentInvalidationProducerIdentity::TierExpiration,
+                SegmentInvalidationProducerIdentity::DirectoryObject,
+                SegmentInvalidationProducerIdentity::TestFixture,
+            ]),
+            Err(SegmentInvalidationError::UnknownProducer)
+        );
+        assert_eq!(
+            complete_segment_invalidation_producers([
+                SegmentInvalidationProducerIdentity::PutObject,
+                SegmentInvalidationProducerIdentity::DeleteObject,
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                SegmentInvalidationProducerIdentity::Replication,
+                SegmentInvalidationProducerIdentity::TierTransition,
+                SegmentInvalidationProducerIdentity::DirectoryObject,
+            ]),
+            Err(SegmentInvalidationError::InvalidProof)
+        );
+        assert_eq!(
+            complete_segment_invalidation_producers([
+                SegmentInvalidationProducerIdentity::PutObject,
+                SegmentInvalidationProducerIdentity::DeleteObject,
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+                SegmentInvalidationProducerIdentity::ObjectMetadata,
+                SegmentInvalidationProducerIdentity::BucketMetadata,
+                SegmentInvalidationProducerIdentity::Replication,
+                SegmentInvalidationProducerIdentity::TierTransition,
+                SegmentInvalidationProducerIdentity::DirectoryObject,
+            ]),
+            Err(SegmentInvalidationError::InvalidProof)
         );
     }
 

@@ -15,6 +15,7 @@
 //! Regression coverage for anonymous access on multipart control APIs.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use crate::kms::common::LocalKMSTestEnvironment;
 use async_compression::tokio::write::{BzEncoder, Lz4Encoder, XzEncoder};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -1465,10 +1466,10 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
-    let mut env = RustFSTestEnvironment::new().await?;
-    let master_key = local_sse_master_key_value();
-    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
-        .await?;
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
+    kms_env.wait_for_kms_ready().await?;
+    let env = &kms_env.base_env;
 
     let bucket = "anon-post-default-sse-kms";
     let object_key = "post-default-sse-kms-object.txt";
@@ -1484,7 +1485,7 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
                 .apply_server_side_encryption_by_default(
                     ServerSideEncryptionByDefault::builder()
                         .sse_algorithm(ServerSideEncryption::AwsKms)
-                        .kms_master_key_id("test-key")
+                        .kms_master_key_id(default_key_id)
                         .build()
                         .expect("default encryption rule should build"),
                 )

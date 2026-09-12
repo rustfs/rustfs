@@ -219,6 +219,7 @@ fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, r
     }
 }
 
+#[cfg(test)]
 async fn write_metadata_rollback_backup(object_dir: &Path, rollback_dir: Uuid, data: &[u8]) -> Result<()> {
     write_delete_rollback_file(object_dir, rollback_dir, STORAGE_FORMAT_FILE_BACKUP, data, None).await
 }
@@ -250,6 +251,7 @@ async fn write_delete_rollback_file(
     Ok(())
 }
 
+#[cfg(test)]
 async fn restore_metadata_backup(
     object_dir: &Path,
     xl_path: &Path,
@@ -275,15 +277,6 @@ async fn restore_metadata_backup_with_namespace_owner(
     // no-op there (mirrors restore_delete_rollback).
     let _ = os::remove_dir_with_owner(&rollback_path, namespace_owner.clone()).await;
     Ok(())
-}
-
-async fn restore_delete_rollback(
-    object_dir: &Path,
-    xl_path: &Path,
-    rollback_dir: Uuid,
-    publication_root: &os::PublicationRoot,
-) -> Result<()> {
-    restore_delete_rollback_with_namespace_owner(object_dir, xl_path, rollback_dir, publication_root, None).await
 }
 
 async fn restore_delete_rollback_with_namespace_owner(
@@ -5857,6 +5850,8 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+        let namespace_owner: Option<Arc<dyn Send + Sync>> =
+            Some(os::acquire_metadata_mutation_lease(&self.get_object_path(volume, path)?, namespace_owner).await);
         if opts.old_data_dir.is_some() && opts.undo_write {
             return self.undo_write(file_path.as_path(), &fi, &opts, namespace_owner).await;
         }
@@ -6414,6 +6409,10 @@ impl LocalDisk {
                 // A missing or still-populated directory is benign here; see
                 // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
                 // convention, rustfs/rustfs#4978).
+                if is_dir_not_empty_error(&err) {
+                    // A populated directory keeps its ancestors populated; no further pruning is needed.
+                    return Ok(());
+                }
                 if !is_benign_object_rmdir_error(&err) {
                     warn!(
                         event = EVENT_DISK_LOCAL_DELETE_FAILED,
@@ -6714,6 +6713,8 @@ impl LocalDisk {
 
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo], opts: &DeleteOptions) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
+        let object_path = self.get_object_path(volume, path)?;
+        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
         let xlpath = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
         let object_dir = xlpath
             .parent()
@@ -6723,10 +6724,24 @@ impl LocalDisk {
             && opts.undo_write
         {
             if opts.undo_delete {
-                return restore_delete_rollback(object_dir, &xlpath, rollback_dir, &self.publication_root).await;
+                return restore_delete_rollback_with_namespace_owner(
+                    object_dir,
+                    &xlpath,
+                    rollback_dir,
+                    &self.publication_root,
+                    namespace_owner.clone(),
+                )
+                .await;
             }
 
-            return restore_metadata_backup(object_dir, &xlpath, rollback_dir, &self.publication_root).await;
+            return restore_metadata_backup_with_namespace_owner(
+                object_dir,
+                &xlpath,
+                rollback_dir,
+                &self.publication_root,
+                namespace_owner.clone(),
+            )
+            .await;
         }
 
         let (data, _) = match self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await {
@@ -6738,7 +6753,14 @@ impl LocalDisk {
                     return Err(DiskError::FileNotFound);
                 };
                 return self
-                    .write_missing_delete_marker(volume, path, delete_marker, object_dir, opts.old_data_dir, None)
+                    .write_missing_delete_marker(
+                        volume,
+                        path,
+                        delete_marker,
+                        object_dir,
+                        opts.old_data_dir,
+                        namespace_owner.clone(),
+                    )
                     .await;
             }
             Err(err) => return Err(err),
@@ -6754,7 +6776,8 @@ impl LocalDisk {
         let rollback_dir = opts.old_data_dir;
         let mut reserved_version_delete = false;
         if let Some(rollback_dir) = rollback_dir {
-            write_metadata_rollback_backup(object_dir, rollback_dir, &data).await?;
+            write_delete_rollback_file(object_dir, rollback_dir, STORAGE_FORMAT_FILE_BACKUP, &data, namespace_owner.clone())
+                .await?;
         }
 
         for fi in fis.iter() {
@@ -6768,13 +6791,16 @@ impl LocalDisk {
 
                     if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                         return Err(self
-                            .abort_reserved_version_delete(
+                            .abort_reserved_version_delete_with_failure(
                                 object_dir,
                                 rollback_dir,
                                 volume,
                                 path,
-                                "delete_versions_metadata_update",
-                                err,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_metadata_update",
+                                    error: err,
+                                    namespace_owner: namespace_owner.clone(),
+                                },
                             )
                             .await);
                     }
@@ -6787,7 +6813,7 @@ impl LocalDisk {
                         DeleteRollbackFailure {
                             stage: "delete_versions_metadata_update",
                             error: err,
-                            namespace_owner: None,
+                            namespace_owner: namespace_owner.clone(),
                         },
                         &self.publication_root,
                     )
@@ -6804,13 +6830,16 @@ impl LocalDisk {
                     Err(err) => {
                         if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                             return Err(self
-                                .abort_reserved_version_delete(
+                                .abort_reserved_version_delete_with_failure(
                                     object_dir,
                                     rollback_dir,
                                     volume,
                                     path,
-                                    "delete_versions_data_path",
-                                    err,
+                                    DeleteRollbackFailure {
+                                        stage: "delete_versions_data_path",
+                                        error: err,
+                                        namespace_owner: namespace_owner.clone(),
+                                    },
                                 )
                                 .await);
                         }
@@ -6823,7 +6852,7 @@ impl LocalDisk {
                             DeleteRollbackFailure {
                                 stage: "delete_versions_data_path",
                                 error: err,
-                                namespace_owner: None,
+                                namespace_owner: namespace_owner.clone(),
                             },
                             &self.publication_root,
                         )
@@ -6836,13 +6865,16 @@ impl LocalDisk {
                         let err: DiskError = to_file_error(err).into();
                         if reserved_version_delete {
                             return Err(self
-                                .abort_reserved_version_delete(
+                                .abort_reserved_version_delete_with_failure(
                                     object_dir,
                                     rollback_dir,
                                     volume,
                                     path,
-                                    "delete_versions_rollback_dir",
-                                    err,
+                                    DeleteRollbackFailure {
+                                        stage: "delete_versions_rollback_dir",
+                                        error: err,
+                                        namespace_owner: namespace_owner.clone(),
+                                    },
                                 )
                                 .await);
                         }
@@ -6855,23 +6887,29 @@ impl LocalDisk {
                             DeleteRollbackFailure {
                                 stage: "delete_versions_rollback_dir",
                                 error: err,
-                                namespace_owner: None,
+                                namespace_owner: namespace_owner.clone(),
                             },
                             &self.publication_root,
                         )
                         .await);
                     }
-                    let reserved = match self.reserve_version_delete(volume, path, dir, rollback_dir).await {
+                    let reserved = match self
+                        .reserve_version_delete_with_namespace_owner(volume, path, dir, rollback_dir, namespace_owner.clone())
+                        .await
+                    {
                         Ok(reserved) => reserved,
                         Err(err) => {
                             return Err(self
-                                .abort_reserved_version_delete(
+                                .abort_reserved_version_delete_with_failure(
                                     object_dir,
                                     rollback_dir,
                                     volume,
                                     path,
-                                    "delete_versions_reserve_data",
-                                    err,
+                                    DeleteRollbackFailure {
+                                        stage: "delete_versions_reserve_data",
+                                        error: err,
+                                        namespace_owner: namespace_owner.clone(),
+                                    },
                                 )
                                 .await);
                         }
@@ -6879,11 +6917,12 @@ impl LocalDisk {
                     reserved_version_delete |= reserved;
                     let rollback_data_path = rollback_path.join(dir.to_string());
                     if !reserved
-                        && let Err(err) = rename_all_ignore_missing_source(
+                        && let Err(err) = os::rename_all_ignore_missing_source_with_owner(
                             &dir_path,
                             &rollback_data_path,
                             &rollback_path,
                             &self.publication_root,
+                            namespace_owner.clone(),
                         )
                         .await
                     {
@@ -6896,7 +6935,7 @@ impl LocalDisk {
                             DeleteRollbackFailure {
                                 stage: "delete_versions_stage_data",
                                 error: err,
-                                namespace_owner: None,
+                                namespace_owner: namespace_owner.clone(),
                             },
                             &self.publication_root,
                         )
@@ -6905,13 +6944,16 @@ impl LocalDisk {
                     if should_fail_after_delete_data_staged(path) {
                         if reserved_version_delete {
                             return Err(self
-                                .abort_reserved_version_delete(
+                                .abort_reserved_version_delete_with_failure(
                                     object_dir,
                                     rollback_dir,
                                     volume,
                                     path,
-                                    "delete_versions_test_after_stage",
-                                    DiskError::Unexpected,
+                                    DeleteRollbackFailure {
+                                        stage: "delete_versions_test_after_stage",
+                                        error: DiskError::Unexpected,
+                                        namespace_owner: namespace_owner.clone(),
+                                    },
                                 )
                                 .await);
                         }
@@ -6924,13 +6966,15 @@ impl LocalDisk {
                             DeleteRollbackFailure {
                                 stage: "delete_versions_test_after_stage",
                                 error: DiskError::Unexpected,
-                                namespace_owner: None,
+                                namespace_owner: namespace_owner.clone(),
                             },
                             &self.publication_root,
                         )
                         .await);
                     }
-                } else if let Err(err) = self.move_to_trash(&dir_path, true, false).await
+                } else if let Err(err) = self
+                    .move_to_trash_with_namespace_owner(&dir_path, true, false, namespace_owner.clone())
+                    .await
                     && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
                 {
                     return Err(err);
@@ -6945,16 +6989,22 @@ impl LocalDisk {
 
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
-            if let Err(err) = self.delete_file(&volume_dir, &xlpath, true, false).await {
+            if let Err(err) = self
+                .delete_file_with_namespace_owner(&volume_dir, &xlpath, true, false, namespace_owner.clone())
+                .await
+            {
                 if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                     return Err(self
-                        .abort_reserved_version_delete(
+                        .abort_reserved_version_delete_with_failure(
                             object_dir,
                             rollback_dir,
                             volume,
                             path,
-                            "delete_versions_commit_delete",
-                            err,
+                            DeleteRollbackFailure {
+                                stage: "delete_versions_commit_delete",
+                                error: err,
+                                namespace_owner: namespace_owner.clone(),
+                            },
                         )
                         .await);
                 }
@@ -6967,7 +7017,7 @@ impl LocalDisk {
                     DeleteRollbackFailure {
                         stage: "delete_versions_commit_delete",
                         error: err,
-                        namespace_owner: None,
+                        namespace_owner: namespace_owner.clone(),
                     },
                     &self.publication_root,
                 )
@@ -6975,10 +7025,22 @@ impl LocalDisk {
             }
             if reserved_version_delete
                 && let Some(rollback_dir) = rollback_dir
-                && let Err(err) = self.commit_reserved_version_delete(volume, path, rollback_dir).await
+                && let Err(err) = self
+                    .commit_reserved_version_delete_with_namespace_owner(volume, path, rollback_dir, namespace_owner.clone())
+                    .await
             {
                 return Err(self
-                    .abort_reserved_version_delete(object_dir, rollback_dir, volume, path, "delete_versions_commit_intent", err)
+                    .abort_reserved_version_delete_with_failure(
+                        object_dir,
+                        rollback_dir,
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_commit_intent",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                        },
+                    )
                     .await);
             }
             if should_fail_after_delete_commit(self.root.as_path(), path) {
@@ -6995,13 +7057,16 @@ impl LocalDisk {
                 let err: DiskError = err.into();
                 if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                     return Err(self
-                        .abort_reserved_version_delete(
+                        .abort_reserved_version_delete_with_failure(
                             object_dir,
                             rollback_dir,
                             volume,
                             path,
-                            "delete_versions_metadata_encode",
-                            err,
+                            DeleteRollbackFailure {
+                                stage: "delete_versions_metadata_encode",
+                                error: err,
+                                namespace_owner: namespace_owner.clone(),
+                            },
                         )
                         .await);
                 }
@@ -7014,7 +7079,7 @@ impl LocalDisk {
                     DeleteRollbackFailure {
                         stage: "delete_versions_metadata_encode",
                         error: err,
-                        namespace_owner: None,
+                        namespace_owner: namespace_owner.clone(),
                     },
                     &self.publication_root,
                 )
@@ -7023,12 +7088,28 @@ impl LocalDisk {
         };
 
         if let Err(err) = self
-            .write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+            .write_all_meta_with_namespace_owner(
+                volume,
+                format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
+                &buf,
+                true,
+                namespace_owner.clone(),
+            )
             .await
         {
             if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                 return Err(self
-                    .abort_reserved_version_delete(object_dir, rollback_dir, volume, path, "delete_versions_commit_write", err)
+                    .abort_reserved_version_delete_with_failure(
+                        object_dir,
+                        rollback_dir,
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_commit_write",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                        },
+                    )
                     .await);
             }
             return Err(restore_delete_rollback_after_error(
@@ -7040,7 +7121,7 @@ impl LocalDisk {
                 DeleteRollbackFailure {
                     stage: "delete_versions_commit_write",
                     error: err,
-                    namespace_owner: None,
+                    namespace_owner: namespace_owner.clone(),
                 },
                 &self.publication_root,
             )
@@ -7049,10 +7130,22 @@ impl LocalDisk {
 
         if reserved_version_delete
             && let Some(rollback_dir) = rollback_dir
-            && let Err(err) = self.commit_reserved_version_delete(volume, path, rollback_dir).await
+            && let Err(err) = self
+                .commit_reserved_version_delete_with_namespace_owner(volume, path, rollback_dir, namespace_owner.clone())
+                .await
         {
             return Err(self
-                .abort_reserved_version_delete(object_dir, rollback_dir, volume, path, "delete_versions_commit_intent", err)
+                .abort_reserved_version_delete_with_failure(
+                    object_dir,
+                    rollback_dir,
+                    volume,
+                    path,
+                    DeleteRollbackFailure {
+                        stage: "delete_versions_commit_intent",
+                        error: err,
+                        namespace_owner: namespace_owner.clone(),
+                    },
+                )
                 .await);
         }
 
@@ -7063,6 +7156,107 @@ impl LocalDisk {
         Ok(())
     }
 
+    async fn reconcile_transition_state_metadata(
+        &self,
+        volume: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+        condition: &super::TransitionStateReconcileCondition,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
+    ) -> Result<()> {
+        condition.target.validate()?;
+        if !authority.is_current()
+            || [
+                condition.expected_metadata_digest.as_str(),
+                condition.unchanged_metadata_digest.as_str(),
+            ]
+            .iter()
+            .any(|digest| {
+                digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
+        let original = self.read_all(volume, &metadata_path).await?;
+        let original_digest = rustfs_utils::crypto::hex(<sha2::Sha256 as sha2::Digest>::digest(&original));
+        let mut metadata = FileMeta::load(&original)?;
+        let (_, selected) = metadata.find_version(version_id)?;
+        if selected.into_fileinfo(volume, object, true)?.transition_tier != condition.tier {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let generation = metadata.transition_reconcile_generation(version_id)?;
+        if rustfs_utils::crypto::hex(<sha2::Sha256 as sha2::Digest>::digest(&generation)) != condition.unchanged_metadata_digest {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let changed = metadata.reconcile_transition_state(version_id, &condition.target)?;
+        if !changed {
+            return Ok(());
+        }
+        if condition.verify_only || original_digest != condition.expected_metadata_digest {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        // fsync_dir_std is a no-op outside Unix, so those platforms cannot
+        // yet prove this repair's durable publication requirement.
+        if !cfg!(unix) || !effective_durability(volume).syncs_commit_metadata() {
+            return Err(DiskError::other(
+                "transition reconciliation requires Unix directory sync and enabled bucket metadata durability",
+            ));
+        }
+        // An outstanding rollback can still restore an older whole xl.meta.
+        // Its preparation and execution share this mutation domain; refuse
+        // repair until that transaction has settled and removed its backup.
+        let mut entries = fs::read_dir(self.io_get_object_path(volume, object)?)
+            .await
+            .map_err(to_file_error)?;
+        let mut remaining = 4096usize;
+        while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+            remaining = remaining.checked_sub(1).ok_or(DiskError::OutdatedXLMeta)?;
+            if Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err() {
+                continue;
+            }
+            for marker in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
+                if fs::try_exists(entry.path().join(marker)).await.map_err(to_file_error)? {
+                    return Err(DiskError::OutdatedXLMeta);
+                }
+            }
+        }
+        let replacement = metadata.marshal_msg()?;
+        let tmp_volume = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
+        let tmp_file = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, &Uuid::new_v4().to_string())?;
+        // Admission above requires metadata durability. Keep rename and its
+        // directory sync in the same owned executor even after cancellation.
+        self.write_all_internal(&tmp_file, InternalBuf::Ref(&replacement), SyncMode::FileOnly, &tmp_volume)
+            .await?;
+        if crash_inject::should_crash_at(CrashPoint::MetaWriteAfterTmpBeforeRename, &metadata_path) {
+            return Err(DiskError::Unexpected);
+        }
+        os::rename_reconciled_metadata(
+            tmp_file,
+            self.io_get_object_path(volume, &metadata_path)?,
+            self.io_get_bucket_path(volume)?,
+            self.publication_root.clone(),
+            namespace_owner.clone(),
+            authority,
+        )
+        .await?;
+        // Keep the same mutation lease through strong readback. Response loss
+        // leaves a monotonic subset for the coordinator's exact-copy retry.
+        let committed = self.read_all(volume, &metadata_path).await?;
+        let mut committed = FileMeta::load(&committed)?;
+        if committed.reconcile_transition_state(version_id, &condition.target)?
+            || committed.transition_reconcile_generation(version_id)? != generation
+        {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
         self.write_all_meta_with_namespace_owner(volume, path, buf, sync, None).await
     }
@@ -8321,6 +8515,7 @@ impl LocalDisk {
         Ok(Arc::new(QuotaMutationFenceClaim { state }))
     }
 
+    #[cfg(test)]
     async fn reserve_version_delete(&self, volume: &str, object: &str, data_dir: Uuid, rollback_dir: Uuid) -> Result<bool> {
         self.reserve_version_delete_with_namespace_owner(volume, object, data_dir, rollback_dir, None)
             .await
@@ -8373,6 +8568,7 @@ impl LocalDisk {
         Ok(true)
     }
 
+    #[cfg(test)]
     async fn commit_reserved_version_delete(&self, volume: &str, object: &str, rollback_dir: Uuid) -> Result<()> {
         self.commit_reserved_version_delete_with_namespace_owner(volume, object, rollback_dir, None)
             .await
@@ -8462,29 +8658,6 @@ impl LocalDisk {
             }
         }
         first_err.map_or(Ok(found), Err)
-    }
-
-    async fn abort_reserved_version_delete(
-        &self,
-        object_dir: &Path,
-        rollback_dir: Uuid,
-        volume: &str,
-        object: &str,
-        stage: &'static str,
-        err: DiskError,
-    ) -> DiskError {
-        self.abort_reserved_version_delete_with_failure(
-            object_dir,
-            rollback_dir,
-            volume,
-            object,
-            DeleteRollbackFailure {
-                stage,
-                error: err,
-                namespace_owner: None,
-            },
-        )
-        .await
     }
 
     async fn abort_reserved_version_delete_with_failure(
@@ -10031,6 +10204,23 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        let object_path = self.get_object_path(volume, path)?;
+        if let Some(condition) = &opts.transition_reconcile {
+            if !fi.metadata.is_empty() || opts.no_persistence || opts.replace_user_metadata {
+                return Err(DiskError::FileCorrupt);
+            }
+            let authority =
+                crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority::for_disk(
+                    condition,
+                )
+                .await?;
+            let owner: Option<Arc<dyn Send + Sync>> = Some(authority.clone());
+            let owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, owner).await);
+            return self
+                .reconcile_transition_state_metadata(volume, path, fi.version_id, condition, owner, authority)
+                .await;
+        }
+        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
         if !fi.metadata.is_empty() {
             let file_path = self.io_get_object_path(volume, path)?;
 
@@ -10058,7 +10248,13 @@ impl DiskAPI for LocalDisk {
             let wbuf = xl_meta.marshal_msg()?;
 
             return self
-                .write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &wbuf, !opts.no_persistence)
+                .write_all_meta_with_namespace_owner(
+                    volume,
+                    format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
+                    &wbuf,
+                    !opts.no_persistence,
+                    namespace_owner,
+                )
                 .await;
         }
 
@@ -10066,7 +10262,10 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        self.write_metadata_with_namespace_owner(volume, path, fi, None).await
+        let object_path = self.get_object_path(volume, path)?;
+        let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
+        self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -11027,6 +11226,176 @@ mod test {
             (disk, dir)
         }
 
+        #[tokio::test]
+        async fn delete_pruning_stops_at_live_metadata_below_a_guarded_ancestor() {
+            // Tuple fields drop in order, releasing the disk's root handle before the temporary directory.
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            let base = disk.get_bucket_path(RUSTFS_META_BUCKET).expect("resolve metadata volume");
+            let shared = base.join("buckets");
+            let guard = Arc::new(
+                os::mkdir_all_below_existing_base_std(&shared, &base, &disk.publication_root)
+                    .expect("retain the shared publication directory"),
+            );
+
+            for owned in [false, true] {
+                for missing_backup in [false, true] {
+                    let transaction = Uuid::new_v4();
+                    let object = shared.join(".bloomcycle.bin");
+                    let rollback = object.join(transaction.to_string());
+                    let metadata = object.join(STORAGE_FORMAT_FILE);
+                    let backup = rollback.join(STORAGE_FORMAT_FILE_BACKUP);
+                    fs::create_dir_all(&rollback).await.expect("create rollback directory");
+                    fs::write(&metadata, b"committed metadata")
+                        .await
+                        .expect("write live metadata");
+                    if !missing_backup {
+                        fs::write(&backup, b"old metadata").await.expect("write rollback backup");
+                    }
+                    let owner: Option<Arc<dyn Send + Sync>> = if owned { Some(guard.clone()) } else { None };
+                    let result = disk
+                        .delete_with_namespace_owner(
+                            RUSTFS_META_BUCKET,
+                            &format!("buckets/.bloomcycle.bin/{transaction}/{STORAGE_FORMAT_FILE_BACKUP}"),
+                            DeleteOptions::default(),
+                            owner,
+                        )
+                        .await;
+
+                    assert!(!backup.exists(), "backup must be absent, owned={owned}, missing={missing_backup}");
+                    assert!(!rollback.exists(), "empty rollback directory must be pruned");
+                    assert_eq!(fs::read(&metadata).await.expect("read committed metadata"), b"committed metadata");
+                    result.expect("a nonempty object must stop pruning before the guarded ancestor");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_removes_empty_and_missing_ancestors_but_keeps_the_volume() {
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+
+            for missing in [false, true] {
+                let parent = base.join("parent");
+                let rollback = parent.join("object/transaction");
+                fs::create_dir_all(&rollback).await.expect("create empty ancestor chain");
+                let path = if missing {
+                    "parent/object/transaction/missing/xl.meta.bkp"
+                } else {
+                    fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), b"backup")
+                        .await
+                        .expect("create backup");
+                    "parent/object/transaction/xl.meta.bkp"
+                };
+
+                disk.delete("pruning", path, DeleteOptions::default())
+                    .await
+                    .expect("empty and missing ancestors should be pruned");
+                assert!(!parent.exists(), "the whole empty chain should be removed");
+                assert!(base.is_dir(), "pruning must stop at the volume boundary");
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_does_not_remove_the_base_or_an_outside_path() {
+            let fixture = new_disk().await;
+            let (disk, dir) = &fixture;
+            let base = dir.path().join("base");
+            let outside = dir.path().join("outside");
+            fs::create_dir(&base).await.expect("create base");
+            fs::write(&outside, b"outside data").await.expect("create outside file");
+
+            disk.delete_file(&base, &base, false, false)
+                .await
+                .expect("base path is protected");
+            disk.delete_file(&base, &outside, false, false)
+                .await
+                .expect("outside path is protected");
+            assert!(base.is_dir(), "the base must not be removed even when empty");
+            assert_eq!(fs::read(&outside).await.expect("read outside file"), b"outside data");
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_backup_error() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
+
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let backup = base.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&backup)
+                .expect("hold the backup without delete sharing");
+
+            let err = disk
+                .delete("pruning", STORAGE_FORMAT_FILE_BACKUP, DeleteOptions::default())
+                .await
+                .expect_err("a genuine target-file deletion failure must propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve the failing path and original OS error");
+            assert_eq!(context.path, backup);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert_eq!(fs::read(&backup).await.expect("backup remains readable"), b"backup");
+            drop(guard);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_empty_parent_error() {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let parent = base.join("parent");
+            let guard = os::mkdir_all_below_existing_base_std(&parent, &base, &disk.publication_root)
+                .expect("retain an empty parent without delete sharing");
+            let backup = parent.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+
+            let err = disk
+                .delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect_err("a real parent failure without a nonempty boundary must still propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve parent failure context");
+            assert_eq!(context.path, parent);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert!(!backup.exists(), "the target was removed before the parent error");
+            assert!(parent.is_dir(), "the guarded parent remains");
+            drop(guard);
+            disk.delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect("pruning should succeed once the actual guard is released");
+            assert!(!parent.exists());
+            assert!(base.is_dir());
+        }
+
         // #948: a genuinely missing source is benign and must still return Ok.
         #[tokio::test]
         async fn windows_and_unix_move_to_trash_missing_source_is_ok() {
@@ -11510,12 +11879,57 @@ mod test {
     /// stale deterministically, instead of sleeping and hoping the filesystem
     /// timestamp granularity (or a backward wall-clock step) cooperates.
     fn backdate_mtime(path: &Path, age: Duration) {
-        use std::fs::{File, FileTimes};
+        use std::fs::{FileTimes, OpenOptions};
         let mtime = std::time::SystemTime::now() - age;
-        File::open(path)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+            // Directories need backup semantics, and changing mtime needs attribute-write access.
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options
+            .open(path)
             .expect("path should open to backdate its mtime")
             .set_times(FileTimes::new().set_modified(mtime))
             .expect("mtime should rewind into the past");
+    }
+
+    #[test]
+    fn cleanup_tmp_on_startup_backdate_mtime_preserves_files_and_directory_contents() {
+        use std::time::SystemTime;
+
+        let root = tempfile::tempdir().expect("create timestamp fixture root");
+        let directory = root.path().join("directory");
+        let file = directory.join("payload");
+        std::fs::create_dir(&directory).expect("create timestamp fixture directory");
+        std::fs::write(&file, b"unchanged payload").expect("write timestamp fixture payload");
+        let age = Duration::from_secs(60);
+        // Filesystems may round stored timestamps; do not require subsecond precision or sleep.
+        let rounding = Duration::from_secs(2);
+
+        for path in [&file, &directory] {
+            let earliest = SystemTime::now() - age - rounding;
+            backdate_mtime(path, age);
+            let latest = SystemTime::now() - age + rounding;
+            let modified = std::fs::metadata(path)
+                .expect("read backdated path metadata")
+                .modified()
+                .expect("read backdated modification time");
+            assert!(modified >= earliest && modified <= latest, "mtime must be backdated for {path:?}");
+        }
+
+        let moved = root.path().join("moved");
+        std::fs::rename(&directory, &moved).expect("mtime helper must release its handles before cleanup");
+        assert_eq!(
+            std::fs::read(moved.join("payload")).expect("read preserved payload"),
+            b"unchanged payload"
+        );
     }
 
     #[tokio::test]
@@ -22460,6 +22874,192 @@ mod test {
                 .await
                 .expect("previous bytes should remain readable after rollback"),
             previous
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_mrf_manifest_dir_fsync_failure_keeps_recovery_anchors() {
+        use tempfile::tempdir;
+
+        const MRF_COMMIT_MANIFEST_SLOT_0: &str = ".heal-mrf-commit.0.bin";
+        const MRF_COMMIT_MANIFEST_SLOT_1: &str = ".heal-mrf-commit.1.bin";
+        const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scoped.bin";
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let previous_manifest = Bytes::from_static(b"mrf-committed-manifest-v1");
+        let successor_manifest = Bytes::from_static(b"mrf-committed-manifest-v2");
+        let legacy_journal = Bytes::from_static(b"legacy-mrf-journal-records");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, None, Some(previous_manifest.clone()),)
+                .await
+                .expect("previous MRF manifest should commit"),
+            ConditionalFileUpdate::Updated
+        );
+        disk.write_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy_journal.clone())
+            .await
+            .expect("legacy MRF journal should be retained");
+
+        let manifest_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+            .expect("MRF manifest path should resolve");
+        let parent = manifest_path.parent().expect("MRF manifest path should have a parent");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(parent),
+            "system metadata MRF manifest publication must fsync the metadata directory even under relaxed durability"
+        );
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                MRF_COMMIT_MANIFEST_SLOT_0,
+                Some(previous_manifest.clone()),
+                Some(successor_manifest),
+            )
+            .await
+            .expect_err("directory fsync failure must fail the MRF manifest successor commit");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+                .await
+                .expect("previous committed MRF manifest should remain readable after rollback"),
+            previous_manifest
+        );
+
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                MRF_COMMIT_MANIFEST_SLOT_1,
+                None,
+                Some(Bytes::from_static(b"first-successor-manifest")),
+            )
+            .await
+            .expect_err("directory fsync failure must fail first MRF manifest commit");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert!(
+            matches!(
+                disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_1).await,
+                Err(DiskError::FileNotFound)
+            ),
+            "uncommitted first MRF manifest must be removed when no committed anchor exists"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy MRF journal should remain readable after failed manifest publication"),
+            legacy_journal
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_mrf_manifest_storage_full_keeps_recovery_anchors() {
+        use tempfile::tempdir;
+
+        const MRF_COMMIT_MANIFEST_SLOT_0: &str = ".heal-mrf-commit.0.bin";
+        const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scoped.bin";
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let previous_manifest = Bytes::from_static(b"mrf-committed-manifest-v1");
+        let successor_manifest = Bytes::from_static(b"mrf-committed-manifest-v2");
+        let legacy_journal = Bytes::from_static(b"legacy-mrf-journal-records");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, None, Some(previous_manifest.clone()),)
+                .await
+                .expect("previous MRF manifest should commit"),
+            ConditionalFileUpdate::Updated
+        );
+        disk.write_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy_journal.clone())
+            .await
+            .expect("legacy MRF journal should be retained");
+
+        let manifest_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+            .expect("MRF manifest path should resolve");
+        let parent = manifest_path.parent().expect("MRF manifest path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::StorageFull);
+
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                MRF_COMMIT_MANIFEST_SLOT_0,
+                Some(previous_manifest.clone()),
+                Some(successor_manifest),
+            )
+            .await
+            .expect_err("storage-full fsync failure must fail the MRF manifest successor commit");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::StorageFull));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+                .await
+                .expect("previous committed MRF manifest should remain readable after storage-full rollback"),
+            previous_manifest
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy MRF journal should remain readable after storage-full manifest publication failure"),
+            legacy_journal
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_mrf_manifest_storage_full_delete_keeps_recovery_anchors() {
+        use tempfile::tempdir;
+
+        const MRF_COMMIT_MANIFEST_SLOT_0: &str = ".heal-mrf-commit.0.bin";
+        const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scoped.bin";
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let committed_manifest = Bytes::from_static(b"mrf-committed-manifest-v1");
+        let legacy_journal = Bytes::from_static(b"legacy-mrf-journal-records");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, None, Some(committed_manifest.clone()),)
+                .await
+                .expect("committed MRF manifest should publish"),
+            ConditionalFileUpdate::Updated
+        );
+        disk.write_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy_journal.clone())
+            .await
+            .expect("legacy MRF journal should be retained");
+
+        let manifest_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+            .expect("MRF manifest path should resolve");
+        let parent = manifest_path.parent().expect("MRF manifest path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::StorageFull);
+
+        let err = disk
+            .compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, Some(committed_manifest.clone()), None)
+            .await
+            .expect_err("storage-full fsync failure must fail the MRF manifest cleanup delete");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::StorageFull));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+                .await
+                .expect("committed MRF manifest should be restored after failed cleanup delete"),
+            committed_manifest
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy MRF journal should remain readable after failed cleanup delete"),
+            legacy_journal
         );
     }
 

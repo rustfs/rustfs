@@ -28,10 +28,10 @@ use metrics::{counter, describe_counter, describe_histogram, histogram};
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
-    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSnapshotSetState, LEGACY_DATA_USAGE_OBJECT_NAME,
-    PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeReconciliationEntry,
-    SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER, UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP,
-    UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSegmentInvalidationProof, DataUsageSnapshotSetState,
+    LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary,
+    SizeReconciliationEntry, SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
 };
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -657,6 +657,11 @@ pub struct DataUsageCacheInfo {
     /// structural plan remains reusable across ordinary bucket writes.
     #[serde(default)]
     pub scan_execution_digest: Option<DataUsageScanPlanDigest>,
+    /// Process-epoch and generation window that produced a complete set cache
+    /// with all known segment invalidation producers wired. This proof is
+    /// additive compatibility metadata; absence keeps segment reuse disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_invalidation_proof: Option<DataUsageSegmentInvalidationProof>,
     /// Durable bucket incarnations captured for a complete set aggregate.
     /// Missing or nil entries are legacy/unproven and cannot authorize
     /// skipping an unselected bucket in a later scoped set scan.
@@ -686,6 +691,7 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_leader_epoch.is_some())
             + usize::from(self.lkg_scan_plan_digest.is_some())
             + usize::from(self.scan_execution_digest.is_some())
+            + usize::from(self.segment_invalidation_proof.is_some())
             + usize::from(!self.scan_bucket_incarnations.is_empty());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
@@ -745,6 +751,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(scan_execution_digest) = self.scan_execution_digest {
             state.serialize_entry("scan_execution_digest", &scan_execution_digest)?;
+        }
+        if let Some(proof) = &self.segment_invalidation_proof {
+            state.serialize_entry("segment_invalidation_proof", proof)?;
         }
         if !self.scan_bucket_incarnations.is_empty() {
             state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;

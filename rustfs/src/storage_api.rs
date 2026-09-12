@@ -211,12 +211,19 @@ pub(crate) mod server {
     pub(crate) mod readiness {
         pub(crate) mod contract {
             pub(crate) mod admin {
-                pub(crate) use super::super::super::super::storage_contracts::StorageAdminApi;
+                pub(crate) use super::super::super::super::storage_contracts::{DiskSetSelector, StorageAdminApi};
             }
         }
 
+        pub(crate) use crate::storage::storage_api::ecstore_disk::DiskStore;
         pub(crate) use crate::storage::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
 
+        pub(crate) fn disk_endpoint_snapshot(disk: &DiskStore) -> Endpoint {
+            crate::storage::storage_api::ecstore_disk::DiskAPI::endpoint(disk.as_ref())
+        }
+
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{DiskOption, new_disk};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{Endpoints, PoolEndpoints};
     }

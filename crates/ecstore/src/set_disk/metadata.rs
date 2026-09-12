@@ -326,14 +326,15 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
-            // No parity value reached read quorum. Distinguish two cases:
-            // enough disks answered with valid-looking metadata that simply
-            // cannot be reconciled (corrupt/foreign entries — retrying cannot
-            // help, and heal should see Corrupt, rustfs#5801) versus too few
-            // healthy answers (a genuine quorum condition where retry may
-            // succeed once disks recover).
+            // A consistent layout can require more replies than the initial
+            // half-set probe. Reaching that probe alone is not corruption;
+            // only invalid or conflicting healthy replies establish that.
             let healthy_replies = errs.iter().filter(|err| err.is_none()).count();
-            if healthy_replies >= expected_rquorum {
+            let consistent_parity = parities
+                .iter()
+                .find(|&&parity| parity >= 0)
+                .filter(|&&parity| parities.iter().filter(|&&candidate| candidate == parity).count() == healthy_replies);
+            if healthy_replies >= expected_rquorum && consistent_parity.is_none() {
                 error!(
                     "object_quorum_from_meta: irreconcilable parity across {healthy_replies} healthy replies (corrupt metadata), errs={errs:?}"
                 );
@@ -1650,6 +1651,40 @@ mod tests {
 
         let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("garbage parity cannot form a quorum");
         assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn consistent_parity_below_its_data_shard_quorum_is_not_corruption() {
+        for (drive_count, parity) in [(6, 2), (8, 2), (12, 4)] {
+            let data = drive_count - parity;
+            let mut metas = (1..=drive_count)
+                .map(|index| {
+                    let mut info = FileInfo::new("bucket/object", data, parity);
+                    info.size = 1024;
+                    info.erasure.index = index;
+                    info
+                })
+                .collect::<Vec<_>>();
+            let mut errs = vec![Some(DiskError::DiskNotFound); drive_count];
+            errs[..data].fill(None);
+            assert_eq!(
+                SetDisks::object_quorum_from_meta(&metas, &errs, parity).expect("exact data quorum should resolve"),
+                (data as i32, data as i32)
+            );
+
+            errs[data - 1] = Some(DiskError::DiskNotFound);
+            assert_eq!(
+                SetDisks::object_quorum_from_meta(&metas, &errs, parity).expect_err("one fewer shard cannot resolve"),
+                DiskError::ErasureReadQuorum,
+                "layout {drive_count}/{parity} has consistent metadata but insufficient shards"
+            );
+
+            metas[0].erasure.parity_blocks = usize::MAX;
+            assert_eq!(
+                SetDisks::object_quorum_from_meta(&metas, &errs, parity).expect_err("corrupt healthy replies must be rejected"),
+                DiskError::FileCorrupt
+            );
+        }
     }
 
     /// Too few healthy replies remains a genuine quorum condition where a

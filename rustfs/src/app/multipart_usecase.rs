@@ -69,7 +69,7 @@ use super::storage_api::multipart_usecase::{
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout,
+    put_object_body_read_timeout, reject_oversize_single_upload,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -532,7 +532,11 @@ impl DefaultMultipartUsecase {
             .await
         {
             Ok(_) => {
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+                );
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
             Err(err) => {
@@ -802,7 +806,11 @@ impl DefaultMultipartUsecase {
                     schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                );
                 Ok::<_, S3Error>(obj_info)
             }
         });
@@ -1161,6 +1169,9 @@ impl DefaultMultipartUsecase {
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let mut size = resolve_upload_part_size(&req.headers, content_length)?;
+        if let Some(size) = size {
+            reject_oversize_single_upload(size)?;
+        }
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3199,6 +3210,36 @@ mod tests {
 
         let err = make_usecase().execute_upload_part(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    /// issue #7596: a part whose declared length exceeds the 5 GiB
+    /// single-request ceiling is rejected before the body is polled or the
+    /// store is consulted. Exact-cap and zero-length parts pass admission.
+    #[tokio::test]
+    async fn execute_upload_part_rejects_oversize_declared_part_before_reading_the_body() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+
+        for (declared, expect_too_large) in [(ceiling + 1, true), (ceiling, false), (0, false)] {
+            let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
+            let input = UploadPartInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .body(Some(body))
+                .content_length(Some(declared))
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::PUT);
+
+            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            if expect_too_large {
+                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared}");
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+            } else {
+                assert_ne!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared} must pass admission");
+            }
+        }
     }
 
     #[tokio::test]

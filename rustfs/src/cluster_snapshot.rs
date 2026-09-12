@@ -277,6 +277,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
+            storage_details: None,
         });
         assert_eq!(ready.state, ClusterRuntimeReadinessState::Ready);
 
@@ -288,6 +289,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageQuorumUnavailable],
+            storage_details: None,
         });
         assert_eq!(degraded.state, ClusterRuntimeReadinessState::Degraded);
         assert_eq!(degraded.degraded_reasons, vec![ReadinessDegradedReason::StorageQuorumUnavailable]);
@@ -304,6 +306,7 @@ mod tests {
                 peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageAndLockUnavailable],
+            storage_details: None,
         });
 
         let snapshot = cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status);

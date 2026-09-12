@@ -33,6 +33,7 @@ use rustfs_credentials::Credentials;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::sys::is_rustfs_oidc_claims;
 use rustfs_madmin::account::{AccountMutability, CredentialsSource, IdentityType};
+use serde_json::Value;
 
 /// Claim written by the Keystone middleware onto its synthesized credentials.
 const KEYSTONE_ROLES_CLAIM: &str = "keystone_roles";
@@ -52,6 +53,23 @@ pub(crate) fn session_parent_identity(credentials: &Credentials) -> Option<&str>
         .as_ref()
         .and_then(|claims| claims.get("parent"))
         .and_then(|value| value.as_str())
+}
+
+/// Human-readable OIDC identity metadata for self-service responses. These
+/// values never replace the issuer-scoped virtual parent used for authorization.
+pub(crate) fn oidc_profile_fields(credentials: &Credentials) -> (Option<String>, Option<String>) {
+    let Some(claims) = credentials.claims.as_ref().filter(|claims| is_rustfs_oidc_claims(claims)) else {
+        return (None, None);
+    };
+    let string_claim = |name| {
+        claims
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+
+    (string_claim("preferred_username"), string_claim("email"))
 }
 
 /// Why a credential may not change its own authentication material.
@@ -396,6 +414,48 @@ mod tests {
 
         assert_eq!(caller.mutation_denial, Some(CredentialMutationDenial::FederatedIdentity));
         assert!(!caller.mutability().password);
+    }
+
+    #[test]
+    fn oidc_profile_fields_return_normalized_display_claims() {
+        let mut credentials = sts_session("TEMPKEY", "oidc-parent");
+        credentials.claims = Some(HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("entraid".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("preferred_username".to_string(), Value::String("j.bruijns@pay.nl".to_string())),
+            ("email".to_string(), Value::String("fallback@pay.nl".to_string())),
+        ]));
+
+        assert_eq!(
+            oidc_profile_fields(&credentials),
+            (Some("j.bruijns@pay.nl".to_string()), Some("fallback@pay.nl".to_string()))
+        );
+    }
+
+    #[test]
+    fn oidc_profile_fields_omit_missing_blank_and_non_string_values() {
+        let mut credentials = sts_session("TEMPKEY", "oidc-parent");
+        credentials.claims = Some(HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("keycloak".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("preferred_username".to_string(), Value::String("   ".to_string())),
+            ("email".to_string(), Value::Array(vec![Value::String("user@example.test".to_string())])),
+        ]));
+
+        assert_eq!(oidc_profile_fields(&credentials), (None, None));
+    }
+
+    #[test]
+    fn oidc_profile_fields_ignore_non_oidc_claim_shapes() {
+        let mut credentials = sts_session("TEMPKEY", "ordinary-parent");
+        credentials.claims = Some(HashMap::from([
+            ("preferred_username".to_string(), Value::String("attacker".to_string())),
+            ("email".to_string(), Value::String("attacker@example.test".to_string())),
+        ]));
+
+        assert_eq!(oidc_profile_fields(&credentials), (None, None));
     }
 
     #[test]

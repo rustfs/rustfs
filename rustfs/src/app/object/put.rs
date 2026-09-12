@@ -109,6 +109,21 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
     Ok(size)
 }
 
+/// Reject a declared upload length above the single-request ceiling
+/// ([`rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE`]) with `EntityTooLarge`.
+///
+/// Applies to `PutObject` and `UploadPart`. A negative or unknown length is
+/// left to the caller's existing validation.
+pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
+    if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::EntityTooLarge,
+            ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the S3 request-body inter-chunk read timeout from the environment.
 ///
 /// Returns `Duration::ZERO` when disabled (`RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT=0`),
@@ -1287,6 +1302,12 @@ impl DefaultObjectUsecase {
         // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
         let size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
 
+        // The streaming-body limit (s3s `put_object_max_size`) only fires once the
+        // client has already streamed 5 GiB. The declared length is authoritative,
+        // so reject an oversize single PUT here, before any body byte is read
+        // (issue #7596).
+        reject_oversize_single_upload(size)?;
+
         if let Some(limit) = max_content_length
             && u64::try_from(size).is_ok_and(|size| size > limit)
         {
@@ -1515,7 +1536,7 @@ impl DefaultObjectUsecase {
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
             server_side_encryption,
             ssekms_key_id,
-            false,
+            sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some(),
         );
         debug!(
             target: "rustfs::app::object_usecase",
@@ -2054,7 +2075,11 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, dsc).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                );
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
                 let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -3314,6 +3339,77 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
+    /// issue #7596: a single PUT whose declared length exceeds the 5 GiB
+    /// ceiling must be rejected from the headers, before any body byte is
+    /// requested.
+    #[tokio::test]
+    async fn execute_put_object_rejects_oversize_content_length_before_reading_the_body() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+        let (body, polls) = PollCountingBody::streaming_blob();
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("huge.bin".to_string())
+            .body(Some(body))
+            .content_length(Some(ceiling + 1))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+    }
+
+    /// Admission uses the logical object size, not the wire length: a signed
+    /// aws-chunked request whose framed `Content-Length` exceeds the cap but
+    /// whose decoded length is within it must not be rejected as oversize,
+    /// while a decoded length above the cap must be.
+    #[tokio::test]
+    async fn execute_put_object_oversize_admission_uses_decoded_length_for_aws_chunked() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+        let framing_overhead = 1_000_000;
+
+        for (decoded, expect_too_large) in [(ceiling, false), (ceiling + 1, true)] {
+            let (body, polls) = PollCountingBody::streaming_blob();
+            let input = PutObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("huge.bin".to_string())
+                .body(Some(body))
+                .content_length(Some(decoded + framing_overhead))
+                .build()
+                .unwrap();
+
+            let mut req = build_request(input, Method::PUT);
+            req.headers
+                .insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+            req.headers.insert(
+                HeaderName::from_static("x-amz-content-sha256"),
+                HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            );
+            req.headers.insert(
+                HeaderName::from_static("x-amz-decoded-content-length"),
+                HeaderValue::from_str(&decoded.to_string()).unwrap(),
+            );
+            let usecase = DefaultObjectUsecase::without_context();
+            let fs = FS::new();
+
+            let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+            if expect_too_large {
+                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "decoded {decoded}");
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
+            } else {
+                assert_ne!(
+                    err.code(),
+                    &S3ErrorCode::EntityTooLarge,
+                    "framed wire length above the cap must not reject a decoded length at the cap"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_headers() {
         let input = PutObjectInput::builder()
@@ -3518,6 +3614,104 @@ mod tests {
             resolve_put_object_authoritative_size(&headers, Some(87)).expect("zero-length decoded is valid"),
             0
         );
+    }
+
+    async fn install_bucket_default_sse_for_test(bucket: &str, algorithm: &'static str, kms_key_id: Option<&str>) {
+        use crate::app::storage_api::test::bucket::utils::serialize;
+        use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+
+        let sys = get_global_bucket_metadata_sys().expect("bucket metadata system");
+        let metadata = {
+            let sys = sys.read().await;
+            sys.get(bucket).await.expect("bucket metadata cached")
+        };
+        let mut metadata = (*metadata).clone();
+        let config = ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from_static(algorithm),
+                    kms_master_key_id: kms_key_id.map(|id| id.to_string()),
+                }),
+                blocked_encryption_types: None,
+                bucket_key_enabled: None,
+            }],
+        };
+        metadata.encryption_config_xml = serialize(&config).expect("sse config serializes");
+        metadata.sse_config = Some(config);
+        set_bucket_metadata(bucket.to_string(), metadata)
+            .await
+            .expect("install bucket default SSE");
+    }
+
+    /// backlog#2368 B1: an SSE-C request suppresses the bucket default, the way
+    /// COPY already did. PUT passed a hard-coded `has_explicit_ssec = false`,
+    /// so the default filled in a managed algorithm and the request then failed
+    /// its own mutual-exclusion check — every bucket with default encryption
+    /// refused SSE-C outright.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sse_c_put_is_accepted_on_a_bucket_with_default_encryption() {
+        use md5::{Digest as _, Md5};
+
+        for (algorithm, kms_key_id, prefix) in [
+            (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
+            (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
+        ] {
+            let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket(prefix, 1 << 20).await;
+            install_bucket_default_sse_for_test(&bucket, algorithm, kms_key_id).await;
+
+            let customer_key = [0x2a_u8; 32];
+            let key_md5 = {
+                let mut hasher = Md5::new();
+                hasher.update(customer_key);
+                base64_simd::STANDARD.encode_to_string(hasher.finalize())
+            };
+            let payload = Bytes::from_static(b"customer-key protected payload");
+            let input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+                .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(base64_simd::STANDARD.encode_to_string(customer_key)))
+                .sse_customer_key_md5(Some(key_md5))
+                .build()
+                .expect("SSE-C PUT input must build");
+
+            DefaultObjectUsecase::from_global()
+                .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+                .await
+                .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
+
+            let stored = store
+                .get_object_info(&bucket, "ledger.csv", &ObjectOptions::default())
+                .await
+                .expect("the SSE-C object should be readable");
+            assert!(
+                stored
+                    .user_defined
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-amz-server-side-encryption-customer-algorithm")),
+                "the object must be stored as SSE-C: {:?}",
+                stored.user_defined
+            );
+            assert!(
+                !stored
+                    .user_defined
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-amz-server-side-encryption-aws-kms-key-id")),
+                "the bucket default must not attach a KMS key to an SSE-C object: {:?}",
+                stored.user_defined
+            );
+            assert!(
+                !stored
+                    .user_defined
+                    .values()
+                    .any(|value| value == ServerSideEncryption::AWS_KMS),
+                "the bucket default must not claim managed encryption on an SSE-C object: {:?}",
+                stored.user_defined
+            );
+        }
     }
 
     #[tokio::test]
@@ -4080,5 +4274,57 @@ mod tests {
             .await
             .expect_err("a refused extract upload must not leave an object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+}
+
+/// Test-only request body that records how often it is polled, so admission
+/// tests can prove a rejection happened before any body byte was requested.
+#[cfg(test)]
+pub(crate) struct PollCountingBody {
+    pub(crate) polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl PollCountingBody {
+    pub(crate) fn streaming_blob() -> (StreamingBlob, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = StreamingBlob::new(Self {
+            polls: std::sync::Arc::clone(&polls),
+        });
+        (body, polls)
+    }
+}
+
+#[cfg(test)]
+impl Stream for PollCountingBody {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
+    }
+}
+
+#[cfg(test)]
+impl ByteStream for PollCountingBody {}
+
+#[cfg(test)]
+mod oversize_single_upload_tests {
+    use super::*;
+
+    #[test]
+    fn reject_oversize_single_upload_enforces_the_single_request_ceiling() {
+        let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
+
+        assert!(reject_oversize_single_upload(0).is_ok());
+        assert!(reject_oversize_single_upload(ceiling).is_ok(), "exact ceiling is allowed");
+        assert!(reject_oversize_single_upload(-1).is_ok(), "unknown length is left to later validation");
+
+        let err = reject_oversize_single_upload(ceiling + 1).expect_err("one byte over must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+        assert_eq!(
+            err.message(),
+            Some(ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge).as_str())
+        );
     }
 }

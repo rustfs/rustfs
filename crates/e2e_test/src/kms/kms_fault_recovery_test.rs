@@ -109,10 +109,10 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .await;
 
     let unavailable_error = put_result2.expect_err("a missing Local KMS key directory must reject encrypted writes");
-    assert_eq!(unavailable_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(unavailable_error.raw_response().map(|response| response.status().as_u16()), Some(503));
     assert_eq!(
         unavailable_error.as_service_error().and_then(ProvideErrorMetadata::code),
-        Some("InternalError")
+        Some("ServiceUnavailable")
     );
     let unavailable_absence = s3_client
         .get_object()

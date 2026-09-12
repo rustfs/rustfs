@@ -288,16 +288,29 @@ impl PriorityHealQueue {
         QueuePushOutcome::Accepted
     }
 
-    pub(super) fn can_displace_lower_priority(&self, priority: HealPriority) -> bool {
-        self.heap.iter().any(|item| item.priority < priority)
+    pub(super) fn can_displace_lower_priority_where<F>(&self, priority: HealPriority, can_displace: F) -> bool
+    where
+        F: Fn(&HealRequest) -> bool,
+    {
+        self.heap
+            .iter()
+            .any(|item| item.priority < priority && can_displace(&item.request))
     }
 
-    pub(super) fn push_displacing_lower_priority(&mut self, request: HealRequest) -> Option<HealRequest> {
+    #[cfg(test)]
+    pub(super) fn can_displace_lower_priority(&self, priority: HealPriority) -> bool {
+        self.can_displace_lower_priority_where(priority, |_| true)
+    }
+
+    pub(super) fn push_displacing_lower_priority_where<F>(&mut self, request: HealRequest, can_displace: F) -> Option<HealRequest>
+    where
+        F: Fn(&HealRequest) -> bool,
+    {
         let mut retained = BinaryHeap::new();
         let mut displaced: Option<PriorityQueueItem> = None;
 
         while let Some(item) = self.heap.pop() {
-            if item.priority < request.priority {
+            if item.priority < request.priority && can_displace(&item.request) {
                 let should_displace = displaced
                     .as_ref()
                     .map(|current| {
@@ -335,6 +348,11 @@ impl PriorityHealQueue {
         }
 
         displaced
+    }
+
+    #[cfg(test)]
+    pub(super) fn push_displacing_lower_priority(&mut self, request: HealRequest) -> Option<HealRequest> {
+        self.push_displacing_lower_priority_where(request, |_| true)
     }
 
     /// Get statistics about queue contents by priority

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
-    is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, clear_peer_replay_state_for_addr, embedded_tonic_status,
+    gen_tonic_signature_interceptor, heal_control_time_out_client, is_network_like_status, message_has_network_needle,
+    node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
@@ -50,10 +51,10 @@ use rustfs_protos::proto_gen::node_service::{
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
     ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
     ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
-    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
-    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
-    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
-    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
+    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
+    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -288,8 +289,30 @@ fn scanner_scoped_dirty_usage_ack_payload(
     Ok(payload)
 }
 
-fn scanner_scoped_dirty_usage_ack_reconciled(activity: &ScannerPeerActivity, expected_instance_id: &str) -> bool {
-    activity.instance_id == expected_instance_id && activity.dirty_usage_pending == Some(false)
+fn scanner_scoped_dirty_usage_ack_response_matches(
+    request: &ScannerScopedDirtyUsageAckRequest,
+    response: &ScannerScopedDirtyUsageAckResponse,
+) -> bool {
+    let cleared_within_request = u64::try_from(request.entries.len())
+        .is_ok_and(|entry_count| response.cleared <= entry_count && (!request.probe_only || response.cleared == 0));
+    response.protocol_version == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
+        && response.owner_id == request.owner_id
+        && response.instance_id == request.instance_id
+        && response.max_entries == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_ENTRIES
+        && response.max_request_bytes == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
+        && cleared_within_request
+}
+
+fn scanner_scoped_dirty_usage_ack_reconciled(
+    activity: &ScannerPeerActivity,
+    expected_instance_id: &str,
+    expected_generation: u64,
+) -> bool {
+    activity.instance_id == expected_instance_id
+        && activity.dirty_usage_pending == Some(false)
+        && activity
+            .dirty_usage_generation
+            .is_some_and(|generation| generation >= expected_generation)
 }
 
 fn scanner_instance_id_is_valid(instance_id: &str) -> bool {
@@ -542,6 +565,16 @@ fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) ->
 fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8]) -> Result<()> {
     verify_tonic_rpc_response_proof(canonical_response, proof)
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
+}
+
+fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(io_err)
+            if embedded_tonic_status(io_err).is_some_and(|status| {
+                status.code() == tonic::Code::Unauthenticated && status.message() == "No valid auth token"
+            })
+    )
 }
 
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
@@ -1720,45 +1753,72 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        self.finalize_result(
-            async {
-                let mut client = self
-                    .get_heal_control_client()
-                    .await?
-                    .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
-                    .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
-                let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, &topology_fingerprint, &command)
-                    .map_err(|_| Error::other("heal control request length cannot be represented"))?;
-                let mut request = Request::new(HealControlRequest {
-                    version,
-                    topology_fingerprint: topology_fingerprint.clone(),
-                    command: command.clone().into(),
-                });
-                request.set_timeout(rustfs_protos::heal_control_execution_timeout());
-                set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                let response = client.heal_control(request).await?.into_inner();
-                if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
-                    ));
-                }
-                if !capability_probe {
-                    let canonical_response = rustfs_protos::canonical_heal_control_response_body(
-                        version,
-                        &topology_fingerprint,
-                        &command,
-                        &response.result,
-                    )
+        let result = self
+            .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(heal_control_auth_may_need_replay_scope_refresh)
+        {
+            self.prepare_heal_control_auth_retry().await;
+            return self
+                .finalize_result(
+                    self.heal_control_once(version, &topology_fingerprint, &command, capability_probe)
+                        .await,
+                )
+                .await;
+        }
+        self.finalize_result(result).await
+    }
+
+    async fn prepare_heal_control_auth_retry(&self) {
+        if let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host) {
+            debug!(
+                peer = %self.grid_host,
+                error = %err,
+                "could not clear heal control replay state before retry"
+            );
+        }
+        self.evict_connection().await;
+    }
+
+    async fn heal_control_once(
+        &self,
+        version: u32,
+        topology_fingerprint: &str,
+        command: &[u8],
+        capability_probe: bool,
+    ) -> Result<Vec<u8>> {
+        let mut client = self
+            .get_heal_control_client()
+            .await?
+            .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
+        let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, topology_fingerprint, command)
+            .map_err(|_| Error::other("heal control request length cannot be represented"))?;
+        let mut request = Request::new(HealControlRequest {
+            version,
+            topology_fingerprint: topology_fingerprint.to_string(),
+            command: command.to_vec().into(),
+        });
+        request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+        set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+        let response = client.heal_control(request).await?.into_inner();
+        if !response.success {
+            return Err(Error::other(
+                response
+                    .error_info
+                    .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
+            ));
+        }
+        if !capability_probe {
+            let canonical_response =
+                rustfs_protos::canonical_heal_control_response_body(version, topology_fingerprint, command, &response.result)
                     .map_err(|_| Error::other("heal control response length cannot be represented"))?;
-                    validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
-                }
-                Ok(response.result.to_vec())
-            }
-            .await,
-        )
-        .await
+            validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
+        }
+        Ok(response.result.to_vec())
     }
 
     /// Confirms that a peer supports the current heal-control coordination
@@ -2217,13 +2277,7 @@ impl PeerRestClient {
                     let body = canonical_scoped_dirty_usage_response(&canonical, &response)
                         .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
                     verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
-                    if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
-                        || response.owner_id != payload.owner_id
-                        || response.instance_id != payload.instance_id
-                        || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
-                        || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
-                        || response.cleared != 0
-                    {
+                    if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) {
                         return Err(Error::other("scoped dirty usage capability response does not match request"));
                     }
                     if !response.supported {
@@ -2244,6 +2298,7 @@ impl PeerRestClient {
         entries: Vec<ScannerScopedDirtyUsageAckEntry>,
     ) -> Result<ScannerPeerActivity> {
         use rustfs_protos::scoped_dirty_usage::*;
+        let expected_generation = entries.iter().map(|entry| entry.generation).max().unwrap_or(0);
         let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id.clone(), false, entries)?;
         let ack_attempt = async {
             let mut client = super::client::scanner_control_time_out_client(
@@ -2259,13 +2314,7 @@ impl PeerRestClient {
                 let body = canonical_scoped_dirty_usage_response(&canonical, &response)
                     .map_err(|_| Error::other("scoped dirty usage acknowledgement response is too large"))?;
                 verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
-                if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
-                    || response.owner_id != payload.owner_id
-                    || response.instance_id != payload.instance_id
-                    || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
-                    || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
-                    || !response.supported
-                {
+                if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) || !response.supported {
                     return Err(Error::other("scoped dirty usage acknowledgement response does not match request"));
                 }
             }
@@ -2297,7 +2346,9 @@ impl PeerRestClient {
                         .await;
                 }
                 match self.scanner_scoped_dirty_usage_activity_confirmation().await {
-                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id) => Ok(activity),
+                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id, expected_generation) => {
+                        Ok(activity)
+                    }
                     _ => Err(err),
                 }
             }
@@ -3081,31 +3132,103 @@ mod tests {
     }
 
     #[test]
+    fn scanner_scoped_dirty_usage_ack_response_bounds_cleared_entries_to_request() {
+        use rustfs_protos::scoped_dirty_usage::{
+            SCOPED_DIRTY_USAGE_MAX_ENTRIES, SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES, SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+        };
+
+        let mut request = scanner_scoped_dirty_usage_ack_payload(
+            "33333333-3333-3333-3333-333333333333",
+            "0123456789abcdef0123456789abcdef",
+            false,
+            vec![
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "archive".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
+                    generation: 3,
+                },
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "photos".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222).as_bytes().to_vec().into(),
+                    generation: 7,
+                },
+            ],
+        )
+        .expect("two ordered entries should form a valid scoped ACK request");
+        let mut response = ScannerScopedDirtyUsageAckResponse {
+            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+            owner_id: request.owner_id.clone(),
+            instance_id: request.instance_id.clone(),
+            supported: true,
+            max_entries: SCOPED_DIRTY_USAGE_MAX_ENTRIES,
+            max_request_bytes: SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES,
+            cleared: 1,
+            response_proof: Bytes::new(),
+        };
+
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 2;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 3;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a peer cannot clear more entries than the signed request contains"
+        );
+
+        request.probe_only = true;
+        response.cleared = 1;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a capability probe cannot report a mutation"
+        );
+        response.cleared = 0;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+    }
+
+    #[test]
     fn scanner_scoped_dirty_usage_ack_reconciliation_requires_same_clean_instance() {
-        let activity = |instance_id: &str, pending| ScannerPeerActivity {
+        let activity = |instance_id: &str, generation, pending| ScannerPeerActivity {
             instance_id: instance_id.to_string(),
             namespace_generation: 1,
             maintenance_generation: 1,
             protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
             topology_digest: Some([1; 32]),
             data_movement_active: Some(false),
-            dirty_usage_generation: Some(9),
+            dirty_usage_generation: generation,
             dirty_usage_pending: pending,
             movement_generation: Some(1),
             publication_blocked: Some(false),
         };
 
         assert!(scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("0123456789abcdef0123456789abcdef", Some(false)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(10), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
         assert!(!scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("0123456789abcdef0123456789abcdef", Some(true)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", Some(8), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
         assert!(!scanner_scoped_dirty_usage_ack_reconciled(
-            &activity("fedcba9876543210fedcba9876543210", Some(false)),
-            "0123456789abcdef0123456789abcdef"
+            &activity("0123456789abcdef0123456789abcdef", None, Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(9), Some(true)),
+            "0123456789abcdef0123456789abcdef",
+            9
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("fedcba9876543210fedcba9876543210", Some(9), Some(false)),
+            "0123456789abcdef0123456789abcdef",
+            9
         ));
     }
 
@@ -3726,6 +3849,22 @@ mod tests {
                 "an answered application status must not mark the peer offline: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn heal_control_auth_retry_is_limited_to_transport_auth_rejection() {
+        assert!(heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("No valid auth token")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::permission_denied("bad signature")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("application rejected heal control")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::other(
+            "Io error: code: 'Unauthenticated', message: \"No valid auth token\""
+        )));
     }
 
     #[test]

@@ -26,6 +26,7 @@ impl HealManager {
         let retrying_heals = self.retrying_heals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
+        let root_recovery = self.root_recovery.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
@@ -59,6 +60,7 @@ impl HealManager {
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
+                            root_recovery: &root_recovery,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -78,6 +80,7 @@ impl HealManager {
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
+                            root_recovery: &root_recovery,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -106,6 +109,7 @@ impl HealManager {
             retrying_heals,
             mrf_repair_notice_targets,
             replacement_recovery_anchors,
+            root_recovery,
             config,
             statistics,
             storage,
@@ -117,6 +121,9 @@ impl HealManager {
         let config = config.read().await;
         let mainline_pressure = Self::mainline_throttle_active(&config, workload_provider);
         let mut active_heals_guard = active_heals.lock().await;
+        if cancel_token.is_cancelled() {
+            return;
+        }
         publish_active_heal_count(&active_heals_guard);
 
         // Check if new heal tasks can be started
@@ -206,6 +213,7 @@ impl HealManager {
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
+                let root_recovery_clone = root_recovery.clone();
                 let manager_cancel_token = cancel_token.clone();
                 let task_type_label_for_spawn = task_type_label.clone();
                 let task_set_label_for_spawn = task_set_label.clone();
@@ -312,7 +320,47 @@ impl HealManager {
                         completed_status_entry.status = HealTaskStatus::Cancelled;
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
                     }
-                    let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                    let terminal_completion = matches!(
+                        completed_status,
+                        HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
+                    );
+                    if owns_completion
+                        && terminal_completion
+                        && root_recovery::is_admin_heal_recovery(&task.heal_type, task.source)
+                        && let Err(error) = root_recovery_clone
+                            .persist_terminal(&task_id, &task.heal_type, task.source, &completed_status_entry)
+                            .await
+                    {
+                        // Keep the durable responsibility if terminal
+                        // publication fails. Replaying the task is preferable
+                        // to losing the final receipt across restart.
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_terminal_publish_failed",
+                            error = %error,
+                            "Failed to publish heal terminal receipt"
+                        );
+                    }
+                    if owns_completion
+                        && !terminal_completion
+                        && result.is_err()
+                        && let Err(error) = root_recovery_clone.checkpoint_failed_execution(&task).await
+                    {
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_checkpoint_failed",
+                            error = %error,
+                            "Failed to checkpoint root heal recovery execution budget"
+                        );
+                    }
                     let completed_status_for_verified_events = completed_status_entry.clone();
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
@@ -733,23 +781,30 @@ pub(super) fn mrf_verified_repair_event_for_target(
         HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
         _ => return None,
     };
-    if target.kind != MrfKind::PartialWrite {
-        return None;
-    }
-    let expected_kind = HealObjectKind::Object;
+    let expected_kind = match target.kind {
+        MrfKind::DecodeFailure => HealObjectKind::Decode,
+        MrfKind::MetadataCorruption => HealObjectKind::Metadata,
+        MrfKind::PartialWrite => HealObjectKind::Object,
+    };
     if outcome.identity.kind != expected_kind
         || outcome.identity.bucket.as_str() != target.bucket.as_ref()
         || outcome.identity.object.as_str() != target.object.as_ref()
     {
         return None;
     }
-    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let version_id = (!matches!(target.kind, MrfKind::MetadataCorruption))
+        .then_some(target.version_id)
+        .flatten()
+        .filter(|bytes| *bytes != [0; 16]);
     let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
     if outcome.identity.version_id != expected_version {
         return None;
     }
-    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
-    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    let scope = (!matches!(target.kind, MrfKind::MetadataCorruption))
+        .then_some(target.scope)
+        .flatten();
+    let expected_pool = scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = scope.and_then(|scope| usize::try_from(scope.set_index).ok());
     if outcome.identity.pool_index != expected_pool || outcome.identity.set_index != expected_set {
         return None;
     }
@@ -759,7 +814,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         bucket: target.bucket.clone(),
         object: target.object.clone(),
         version_id,
-        scope: target.scope,
+        scope,
         lease: target.lease,
         bucket_incarnation_id,
         disposition,

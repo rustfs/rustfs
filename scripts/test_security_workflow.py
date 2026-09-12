@@ -273,7 +273,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertNotIn("OLD RUN REPORT", body.read_text())
             self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
 
-    def test_all_ten_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
+    def test_all_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
         for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()

@@ -76,6 +76,44 @@ fn unreachable_vault_config() -> KmsConfig {
 }
 
 #[tokio::test]
+async fn transient_health_failure_does_not_latch_the_service_status() {
+    let kms = TestKms::local().await;
+    let manager = kms.manager();
+    let service = manager.get_encryption_service().await.expect("running service");
+    let version = manager.get_service_version().await.expect("running version");
+    assert!(manager.health_check().await.expect("initial backend health"));
+
+    // Move only this test's keys out of reach, then restore the same backend.
+    let key_dir = kms.key_dir().expect("local key directory");
+    let outage = tempfile::TempDir::new().expect("temporary outage directory");
+    let hidden_keys = outage.path().join("keys");
+    tokio::fs::rename(&key_dir, &hidden_keys)
+        .await
+        .expect("make backend unavailable");
+    let failure = manager.health_check().await;
+    let outage_status = manager.get_status().await;
+    tokio::fs::rename(&hidden_keys, &key_dir).await.expect("restore backend");
+
+    assert!(failure.is_err(), "the outage must surface as a health-check error");
+    assert!(manager.health_check().await.expect("backend recovers without restart"));
+    assert!(Arc::ptr_eq(
+        &service,
+        &manager.get_encryption_service().await.expect("service survives the outage")
+    ));
+    assert_eq!(manager.get_service_version().await, Some(version));
+    assert_eq!(
+        manager.get_status().await,
+        KmsServiceStatus::Running,
+        "a recovered backend must not leave service-status and readiness latched in Error"
+    );
+    assert_eq!(
+        outage_status,
+        KmsServiceStatus::Running,
+        "backend health does not change the running service's lifecycle state"
+    );
+}
+
+#[tokio::test]
 async fn starting_against_an_unreachable_backend_fails_without_publishing_a_service() {
     let manager = KmsServiceManager::new();
     let config = unreachable_vault_config();

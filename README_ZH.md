@@ -46,14 +46,31 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 - **完全开源**：采用 Apache 2.0 许可证，鼓励社区贡献和商业使用。
 - **简单易用**：设计简洁，易于部署和管理。
 
-| 功能               | 状态    | 功能                    | 状态      |
-| :----------------- | :------ | :---------------------- | :-------- |
-| **S3 核心功能**    | ✅ 可用 | **Bitrot (防数据腐烂)** | ✅ 可用   |
-| **上传 / 下载**    | ✅ 可用 | **单机模式**            | ✅ 可用   |
-| **版本控制**       | ✅ 可用 | **存储桶复制**          | ✅ 可用   |
-| **日志功能**       | ✅ 可用 | **生命周期管理**        | 🚧 测试中 |
-| **事件通知**       | ✅ 可用 | **分布式模式**          | 🚧 测试中 |
-| **K8s Helm Chart** | ✅ 可用 | **OPA (策略引擎)**      | 🚧 测试中 |
+状态说明：✅ 可用 —— 已发布并有 CI 门禁覆盖；🧪 预览 —— 已发布但需显式开关，或兼容性承诺有边界。
+
+| 功能                        | 状态    | 功能                     | 状态    |
+| :-------------------------- | :------ | :----------------------- | :------ |
+| **S3 核心功能**             | ✅ 可用 | **分布式模式**           | ✅ 可用 |
+| **上传 / 下载**             | ✅ 可用 | **单机模式**             | ✅ 可用 |
+| **版本控制**                | ✅ 可用 | **Bitrot (防数据腐烂)**  | ✅ 可用 |
+| **对象锁定 (WORM)**         | ✅ 可用 | **修复与扫描器**         | ✅ 可用 |
+| **服务端加密 (SSE)**        | ✅ 可用 | **存储池扩容 / 下线**    | ✅ 可用 |
+| **RustFS KMS**              | ✅ 可用 | **存储桶复制**           | ✅ 可用 |
+| **生命周期管理 (ILM)**      | ✅ 可用 | **站点复制**             | ✅ 可用 |
+| **ILM 分层 (远端 S3)**      | ✅ 可用 | **存储桶配额**           | ✅ 可用 |
+| **S3 Select**               | ✅ 可用 | **事件通知**             | ✅ 可用 |
+| **S3 Tables (Iceberg REST)**| 🧪 预览 | **审计日志**             | ✅ 可用 |
+| **IAM / 策略**              | ✅ 可用 | **日志与可观测性**       | ✅ 可用 |
+| **OIDC / SSO**              | ✅ 可用 | **Web 控制台**           | ✅ 可用 |
+| **Keystone 认证**           | ✅ 可用 | **K8s Helm Chart**       | ✅ 可用 |
+| **Swift API**               | ✅ 可用 | **FTPS / WebDAV**        | ✅ 可用 |
+| **多租户**                  | ✅ 可用 | **SFTP**                 | ✅ 可用 |
+| **MinIO 磁盘格式兼容**      | 🧪 预览 |                          |         |
+
+说明：
+
+- **服务端加密**：支持 SSE-C、SSE-S3 与 SSE-KMS。SSE-KMS 必须先配置 KMS 服务；未配置 KMS 时请求 `aws:kms` 会被拒绝，不会降级到本地主密钥。
+- **RustFS KMS**：生产环境支持 Vault（KV2 / Transit）与 AWS KMS 后端；`Local` 与 `Static` 后端仅供开发与测试使用，详见 [KMS 后端安全属性](docs/operations/kms-backend-security.md)。
 
 ## RustFS vs MinIO 性能对比
 
@@ -121,7 +138,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # 使用指定版本运行
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-rc.5
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-rc.6
 ```
 
 如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
@@ -150,7 +167,10 @@ docker compose -f docker-compose-simple.yml up -d
 
 ```bash
 # 在本地构建多架构镜像
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# 在本地构建单平台镜像
+./docker-buildx.sh -p linux/amd64
 
 # 构建并推送到仓库
 ./docker-buildx.sh --push
