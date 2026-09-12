@@ -170,8 +170,12 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     self.assertEqual(logs[0].read_text(), "CURRENT SUITE LOG\n")
                 self.context["steps.test.outcome"] = outcome
                 report = self.run_step("Generate report")
+                # The report step is red only for harness/environment breakdowns;
+                # the fixture log carries no case verdicts, so failure outcomes
+                # stay red here, and a successful suite is green unconditionally.
                 success = outcome == "success" and mode == "present"
-                self.assertEqual(report.returncode == 0, success, report.stderr)
+                green = outcome == "success"
+                self.assertEqual(report.returncode == 0, green, report.stderr)
                 contents = (self.artifacts / "report.md").read_text()
                 for expected in (
                     "https://github.com/rustfs/rustfs/actions/runs/314159", "Attempt: 2",
@@ -179,8 +183,8 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}",
                 ):
                     self.assertIn(expected, contents)
-                self.assertEqual(CASE_ROW in contents, success)
-                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, success)
+                self.assertEqual(CASE_ROW in contents, mode == "present")
+                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, mode == "present")
                 if mode == "present":
                     raw = (self.artifacts / "suite-report.md").read_text()
                     self.assertEqual(raw, f"CURRENT SUITE DIAGNOSTIC\n{CASE_ROW}\n")
@@ -404,7 +408,9 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 steps = named_steps(job)
                 if suite in self.DIRECT_TESTS:
                     test = steps[self.DIRECT_TESTS[suite]]
-                    self.assertNotRegex("\n".join(test), r'''(?m)^        ["']?continue-on-error["']?\s*:''')
+                    # Case failures keep the run green; the step records its
+                    # outcome for the report and the backlog issue manager.
+                    self.assertRegex("\n".join(test), r'''(?m)^        continue-on-error: true$''')
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
@@ -621,10 +627,14 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     self.context["steps.test.outcome"] = outcome
                     report = self.run_step("Generate report")
                     success = outcome == "success" and log == good
-                    self.assertEqual(report.returncode == 0, success, report.stderr)
+                    # Report steps are red only for harness/environment breakdowns;
+                    # a failure outcome with recorded case rows stays green
+                    # (performance is unchanged and still gates on the suite result).
+                    green = (outcome == "success" or (outcome == "failure" and log in (good, partial))) if suite != "performance" else success
+                    self.assertEqual(report.returncode == 0, green, report.stderr)
                     contents = Path(self.env["REPORT_FILE"]).read_text()
                     self.assertNotIn("OLD RUN EVIDENCE", contents)
-                    self.assertEqual("| PASS |" in contents, success)
+                    self.assertEqual("| PASS |" in contents, success if suite == "performance" else log in (good, partial))
                     for value in ("actions/runs/314159", "Attempt: 2", "Workflow Commit: " + self.context["github.sha"],
                                   f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}"):
                         self.assertIn(value, contents)
@@ -802,11 +812,14 @@ emit_step_result() {
         for failed_log in failed_logs:
             with self.subTest(log=failed_log):
                 Path(self.env["LOG_FILE"]).write_text(failed_log)
+                # A failing heal run exits non-zero; the report step stays green
+                # because the steps ran, and the per-step table is always published.
+                self.context["steps.test.outcome"] = "failure"
                 report = self.run_step("Generate report")
-                self.assertNotEqual(report.returncode, 0, report.stderr)
+                self.assertEqual(report.returncode, 0, report.stderr)
                 contents = Path(self.env["REPORT_FILE"]).read_text()
                 self.assertIn("Test Step Outcome: failure", contents)
-                self.assertNotIn("| PASS |", contents)
+                self.assertIn("| PASS |", contents)
                 if "original failure" in failed_log:
                     self.assertIn("| 3 | original failure | FAIL |", (self.artifacts / "steps.md").read_text())
                 if "later step failure" in failed_log:

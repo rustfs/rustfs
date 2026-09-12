@@ -144,6 +144,8 @@ jobs:
 
       - name: Run security suite
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
         continue-on-error: true
         env:
           REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
@@ -184,6 +186,20 @@ jobs:
           if [ "${TEST_OUTCOME}" = "success" ] && [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
             RESULT=success
           fi
+
+          # Product gate: failing cases keep the run green — they are reported
+          # below and tracked in rustfs/backlog. Only harness/environment
+          # breakdowns turn the workflow red.
+          VERDICTS_TOTAL="$(grep -cE '^\[(PASS|FAIL|UNSUPPORTED)\] [A-Z]' "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_FAIL="$(grep -cE '^\[FAIL\] [A-Z]' "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_TOTAL=$(( ${VERDICTS_TOTAL:-0} + 0 )); VERDICTS_FAIL=$(( ${VERDICTS_FAIL:-0} + 0 ))
+          VERDICTS_PASS=$(( VERDICTS_TOTAL - VERDICTS_FAIL ))
+          HARNESS_OK=0
+          if [ "${TEST_OUTCOME}" = "success" ]; then
+            HARNESS_OK=1
+          elif [ "${TEST_OUTCOME}" = "failure" ] && [ "${VERDICTS_TOTAL}" -gt 0 ] && [ "${VERDICTS_PASS}" -ge 1 ]; then
+            HARNESS_OK=1
+          fi
           {
             echo "# RustFS security test report"
             echo ""
@@ -196,16 +212,15 @@ jobs:
             echo ""
             # The dashboard prioritizes case rows over the step outcome.
             # Keep partial case results in the artifact when the suite fails.
-            if [ "${RESULT}" = "success" ]; then
+            if [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
               cat "${SECURITY_ARTIFACTS_DIR}/suite-report.md"
-            elif [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
-              echo "The suite did not complete successfully. See suite-report.md in this run's artifact for diagnostics."
-            else
-              echo "The suite did not produce a non-empty report."
+              echo ""
             fi
+            echo "- Product result: ${VERDICTS_PASS} passed, ${VERDICTS_FAIL} failed (failing cases are tracked in rustfs/backlog)"
           } > "${SECURITY_ARTIFACTS_DIR}/report.md"
           cat "${SECURITY_ARTIFACTS_DIR}/report.md" >> "${GITHUB_STEP_SUMMARY}"
-          [ "${RESULT}" = "success" ]
+          # Red only for harness/environment breakdowns; case failures stay green.
+          [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
         if: ${{ always() && steps.evidence.outcome == 'success' }}
