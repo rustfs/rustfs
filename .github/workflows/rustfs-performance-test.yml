@@ -260,12 +260,9 @@ jobs:
             exit 0
           fi
           PACKAGE_URL='${{ inputs.package_url }}'
-          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
           PACKAGE_SOURCE=""
           if [ -n "${PACKAGE_URL}" ]; then
             PACKAGE_SOURCE="${PACKAGE_URL}"
-          elif [ -n "${RUSTFS_VERSION}" ]; then
-            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
