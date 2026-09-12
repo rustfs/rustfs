@@ -18,12 +18,12 @@ use super::config::TftpConfig;
 use super::errors::backend_error_to_tftp;
 use super::paths::resolve_object_path;
 use super::reader::ObjectReader;
+use super::writer::ObjectWriter;
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use async_tftp::packet::Error as TftpPacketError;
 use async_tftp::server::Handler;
-use futures_lite::io::Sink;
 use rustfs_credentials::Credentials;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -68,6 +68,13 @@ impl<S: StorageBackend + Send + Sync + 'static> TftpStorageHandler<S> {
             .map_err(|_| TftpPacketError::DiskFull)
     }
 
+    fn effective_max_transfer_bytes(&self, advertised: Option<u64>) -> u64 {
+        advertised
+            .filter(|size| *size > 0)
+            .map(|size| size.min(self.config.max_transfer_bytes))
+            .unwrap_or(self.config.max_transfer_bytes)
+    }
+
     fn session_for_client(&self, client: &SocketAddr) -> SessionContext {
         SessionContext::new(self.session_context.principal.clone(), self.session_context.protocol, client.ip())
     }
@@ -96,7 +103,7 @@ impl<S: StorageBackend + Send + Sync + 'static> TftpStorageHandler<S> {
 
 impl<S: StorageBackend + Send + Sync + 'static> Handler for TftpStorageHandler<S> {
     type Reader = ObjectReader<S>;
-    type Writer = Sink;
+    type Writer = ObjectWriter<S>;
 
     async fn read_req_open(&mut self, client: &SocketAddr, path: &Path) -> Result<(Self::Reader, Option<u64>), TftpPacketError> {
         if !self.config.access_mode.allows_read() {
@@ -129,13 +136,30 @@ impl<S: StorageBackend + Send + Sync + 'static> Handler for TftpStorageHandler<S
 
     async fn write_req_open(
         &mut self,
-        _client: &SocketAddr,
-        _path: &Path,
-        _size: Option<u64>,
+        client: &SocketAddr,
+        path: &Path,
+        size: Option<u64>,
     ) -> Result<Self::Writer, TftpPacketError> {
         if !self.config.access_mode.allows_write() {
             return Err(TftpPacketError::PermissionDenied);
         }
-        Err(TftpPacketError::IllegalOperation)
+
+        let permit = self.try_acquire_permit()?;
+        let (bucket, key) = resolve_object_path(path, self.config.default_bucket.as_deref())?;
+        self.authorize(client, &S3Action::PutObject, &bucket, &key).await?;
+
+        let max_bytes = self.effective_max_transfer_bytes(size);
+        let writer = ObjectWriter::new(
+            Arc::clone(&self.storage),
+            bucket,
+            key,
+            self.credentials.clone(),
+            self.config.read_fetch_bytes.max(super::constants::S3_MIN_PART_SIZE),
+            max_bytes,
+            self.backend_timeout(),
+            permit,
+        );
+
+        Ok(writer)
     }
 }

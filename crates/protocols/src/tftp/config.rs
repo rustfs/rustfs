@@ -16,13 +16,14 @@
 
 use super::constants::{
     BACKEND_OP_TIMEOUT_MAX_SECS, BACKEND_OP_TIMEOUT_MIN_SECS, MAX_BLOCK_SIZE_MAX, MAX_BLOCK_SIZE_MIN,
-    MAX_CONCURRENT_TRANSFERS_MAX, MAX_CONCURRENT_TRANSFERS_MIN, MAX_SEND_RETRIES_MAX, MAX_SEND_RETRIES_MIN, MAX_WINDOW_SIZE_MAX,
-    MAX_WINDOW_SIZE_MIN, READ_FETCH_BYTES_MAX, READ_FETCH_BYTES_MIN,
+    MAX_CONCURRENT_TRANSFERS_MAX, MAX_CONCURRENT_TRANSFERS_MIN, MAX_SEND_RETRIES_MAX, MAX_SEND_RETRIES_MIN,
+    MAX_TRANSFER_BYTES_MAX, MAX_TRANSFER_BYTES_MIN, MAX_WINDOW_SIZE_MAX, MAX_WINDOW_SIZE_MIN, READ_FETCH_BYTES_MAX,
+    READ_FETCH_BYTES_MIN,
 };
 use rustfs_config::{
     DEFAULT_TFTP_ACCESS_MODE, DEFAULT_TFTP_BACKEND_OP_TIMEOUT_SECS, DEFAULT_TFTP_MAX_BLOCK_SIZE,
-    DEFAULT_TFTP_MAX_CONCURRENT_TRANSFERS, DEFAULT_TFTP_MAX_SEND_RETRIES, DEFAULT_TFTP_MAX_WINDOW_SIZE,
-    DEFAULT_TFTP_READ_FETCH_BYTES,
+    DEFAULT_TFTP_MAX_CONCURRENT_TRANSFERS, DEFAULT_TFTP_MAX_SEND_RETRIES, DEFAULT_TFTP_MAX_TRANSFER_BYTES,
+    DEFAULT_TFTP_MAX_WINDOW_SIZE, DEFAULT_TFTP_READ_FETCH_BYTES,
 };
 use std::net::SocketAddr;
 use thiserror::Error;
@@ -65,6 +66,7 @@ pub struct TftpConfig {
     pub max_block_size: u16,
     pub max_window_size: u16,
     pub max_concurrent_transfers: usize,
+    pub max_transfer_bytes: u64,
     pub backend_op_timeout_secs: u64,
     pub read_fetch_bytes: u64,
     pub max_send_retries: u32,
@@ -94,6 +96,11 @@ impl TftpConfig {
     pub fn resolve_max_concurrent_transfers(raw: Option<usize>) -> usize {
         raw.filter(|&v| (MAX_CONCURRENT_TRANSFERS_MIN..=MAX_CONCURRENT_TRANSFERS_MAX).contains(&v))
             .unwrap_or(DEFAULT_TFTP_MAX_CONCURRENT_TRANSFERS)
+    }
+
+    pub fn resolve_max_transfer_bytes(raw: Option<u64>) -> u64 {
+        raw.filter(|&v| (MAX_TRANSFER_BYTES_MIN..=MAX_TRANSFER_BYTES_MAX).contains(&v))
+            .unwrap_or(DEFAULT_TFTP_MAX_TRANSFER_BYTES)
     }
 
     pub fn resolve_backend_op_timeout_secs(raw: Option<u64>) -> u64 {

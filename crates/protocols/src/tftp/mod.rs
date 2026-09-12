@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! TFTP protocol support for RustFS (RFC 1350 RRQ via `async-tftp`).
+//! TFTP protocol support for RustFS (RFC 1350 read/write via `async-tftp`).
 //!
-//! RRQ maps to ranged S3 GETs with bounded memory. WRQ upload support
-//! lands in a follow-up change.
+//! RRQ and WRQ map to ranged S3 GETs and multipart/put uploads with
+//! commit-on-close semantics. Failed WRQ transfers abort in-progress
+//! multipart uploads from `Drop` and never commit partial objects.
 
 mod config;
 mod constants;
@@ -24,6 +25,7 @@ mod handler;
 mod paths;
 mod reader;
 mod server;
+mod writer;
 
 pub use config::{TftpAccessMode, TftpConfig, TftpInitError};
 pub use handler::TftpStorageHandler;

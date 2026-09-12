@@ -28,6 +28,7 @@ const EVENT_TFTP_ERROR_MAPPING: &str = "tftp_error_mapping";
 enum BackendErrorKind {
     NotFound,
     PermissionDenied,
+    NoSuchUpload,
     Other,
 }
 
@@ -35,6 +36,7 @@ fn classify_s3_code(code: &S3ErrorCode) -> BackendErrorKind {
     match code {
         S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchBucket => BackendErrorKind::NotFound,
         S3ErrorCode::AccessDenied => BackendErrorKind::PermissionDenied,
+        S3ErrorCode::NoSuchUpload => BackendErrorKind::NoSuchUpload,
         _ => BackendErrorKind::Other,
     }
 }
@@ -47,12 +49,17 @@ fn classify_backend_error<E: Display + 'static>(err: &E) -> BackendErrorKind {
     BackendErrorKind::Other
 }
 
+/// Returns true when AbortMultipartUpload reports an already-missing upload.
+pub fn is_no_such_upload_backend_error<E: Display + 'static>(err: &E) -> bool {
+    classify_backend_error(err) == BackendErrorKind::NoSuchUpload
+}
+
 pub fn backend_error_to_tftp<E: Display + 'static>(op: &str, err: E) -> TftpPacketError {
     let msg = err.to_string();
     let code = match classify_backend_error(&err) {
         BackendErrorKind::NotFound => TftpPacketError::FileNotFound,
         BackendErrorKind::PermissionDenied => TftpPacketError::PermissionDenied,
-        BackendErrorKind::Other => TftpPacketError::UnknownError,
+        BackendErrorKind::NoSuchUpload | BackendErrorKind::Other => TftpPacketError::UnknownError,
     };
     warn!(
         event = EVENT_TFTP_ERROR_MAPPING,

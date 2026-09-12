@@ -192,6 +192,7 @@ pub const ENV_TFTP_ACCESS_MODE: &str = "RUSTFS_TFTP_ACCESS_MODE";
 pub const ENV_TFTP_MAX_BLOCK_SIZE: &str = "RUSTFS_TFTP_MAX_BLOCK_SIZE";
 pub const ENV_TFTP_MAX_WINDOW_SIZE: &str = "RUSTFS_TFTP_MAX_WINDOW_SIZE";
 pub const ENV_TFTP_MAX_CONCURRENT_TRANSFERS: &str = "RUSTFS_TFTP_MAX_CONCURRENT_TRANSFERS";
+pub const ENV_TFTP_MAX_TRANSFER_BYTES: &str = "RUSTFS_TFTP_MAX_TRANSFER_BYTES";
 pub const ENV_TFTP_BACKEND_OP_TIMEOUT_SECS: &str = "RUSTFS_TFTP_BACKEND_OP_TIMEOUT_SECS";
 pub const ENV_TFTP_READ_FETCH_BYTES: &str = "RUSTFS_TFTP_READ_FETCH_BYTES";
 /// UDP retransmit attempts after the last good block before giving up on a
@@ -214,6 +215,9 @@ pub const DEFAULT_TFTP_MAX_WINDOW_SIZE: u16 = 65535;
 /// Default concurrent TFTP transfers per process.
 pub const DEFAULT_TFTP_MAX_CONCURRENT_TRANSFERS: usize = 64;
 
+/// Default per-transfer byte ceiling (256 MiB).
+pub const DEFAULT_TFTP_MAX_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Default backend operation timeout in seconds.
 pub const DEFAULT_TFTP_BACKEND_OP_TIMEOUT_SECS: u64 = 60;
 
@@ -223,5 +227,6 @@ pub const DEFAULT_TFTP_READ_FETCH_BYTES: u64 = 4 * 1024 * 1024;
 /// Default UDP retransmit attempts per TFTP block/window after timeout.
 ///
 /// With the server timeout of 3s, five retries give up in ~18s instead of
-/// async-tftp's library default of 100 (~5 minutes).
+/// async-tftp's library default of 100 (~5 minutes), so abandoned WRQ
+/// multipart uploads are aborted promptly.
 pub const DEFAULT_TFTP_MAX_SEND_RETRIES: u32 = 5;

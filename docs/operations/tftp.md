@@ -2,9 +2,9 @@
 
 RustFS exposes an optional UDP TFTP sidecar for PXE boot file serving and
 similar read-mostly workflows. The implementation uses the [`async-tftp`](https://crates.io/crates/async-tftp)
-crate and maps RRQ transfers to the S3 storage API.
+crate and maps transfers to the S3 storage API.
 
-For RRQ sequence diagrams, env-knob meaning, and `async-tftp` dependency
+For RRQ/WRQ sequence diagrams, env-knob meaning, and `async-tftp` dependency
 options, see [TFTP transfer model](tftp-transfer-model.md).
 
 ## Enable
@@ -19,12 +19,12 @@ export RUSTFS_TFTP_ADDRESS=0.0.0.0:6969
 export RUSTFS_TFTP_ACCESS_KEY=<service-account-access-key>
 export RUSTFS_TFTP_SECRET_KEY=<service-account-secret-key>
 export RUSTFS_TFTP_DEFAULT_BUCKET=pxe-boot
-export RUSTFS_TFTP_ACCESS_MODE=ro   # ro | wo | rw (WRQ not yet supported)
+export RUSTFS_TFTP_ACCESS_MODE=ro   # ro | wo | rw
 ```
 
 ## Path mapping
 
-| `RUSTFS_TFTP_DEFAULT_BUCKET` | Client RRQ filename | Resolved object |
+| `RUSTFS_TFTP_DEFAULT_BUCKET` | Client RRQ/WRQ filename | Resolved object |
 | --- | --- | --- |
 | `pxe-boot` | `pxelinux.0` | bucket `pxe-boot`, key `pxelinux.0` |
 | unset | `/mybucket/boot/vmlinuz` | bucket `mybucket`, key `boot/vmlinuz` |
@@ -41,11 +41,14 @@ Temporary STS credentials are rejected at startup.
 ## Transfer semantics
 
 - **RRQ**: streamed ranged `GetObject` reads with bounded memory.
-- **WRQ**: not supported in this release; clients receive TFTP
-  `Illegal operation`.
+- **WRQ**: streamed multipart upload; **commit happens only on successful
+  `close()`** after the full transfer completes. Failed or timed-out WRQs
+  abort in-progress multipart uploads and never commit partial objects.
 - Concurrent transfers are capped by `RUSTFS_TFTP_MAX_CONCURRENT_TRANSFERS`.
-- RRQ block size and window size are negotiated with the client; RustFS caps
-  them via `RUSTFS_TFTP_MAX_BLOCK_SIZE` and `RUSTFS_TFTP_MAX_WINDOW_SIZE`.
+- Per-transfer size is capped by `RUSTFS_TFTP_MAX_TRANSFER_BYTES` and the
+  client-advertised `tsize` option when present.
+- RRQ/WRQ block size and window size are negotiated with the client; RustFS
+  caps them via `RUSTFS_TFTP_MAX_BLOCK_SIZE` and `RUSTFS_TFTP_MAX_WINDOW_SIZE`.
 
 ## Environment reference
 
@@ -56,10 +59,11 @@ Temporary STS credentials are rejected at startup.
 | `RUSTFS_TFTP_ACCESS_KEY` | (required) | IAM access key for authorization |
 | `RUSTFS_TFTP_SECRET_KEY` | (required) | Secret for the access key |
 | `RUSTFS_TFTP_DEFAULT_BUCKET` | unset | Lock all requests to one bucket |
-| `RUSTFS_TFTP_ACCESS_MODE` | `ro` | `ro`, `wo`, or `rw` (WRQ pending follow-up) |
+| `RUSTFS_TFTP_ACCESS_MODE` | `ro` | `ro`, `wo`, or `rw` |
 | `RUSTFS_TFTP_MAX_BLOCK_SIZE` | `65464` | RFC 2348 block size ceiling |
 | `RUSTFS_TFTP_MAX_WINDOW_SIZE` | `65535` | RFC 7440 window size ceiling |
-| `RUSTFS_TFTP_MAX_CONCURRENT_TRANSFERS` | `64` | Concurrent RRQ limit |
+| `RUSTFS_TFTP_MAX_CONCURRENT_TRANSFERS` | `64` | Concurrent RRQ/WRQ limit |
+| `RUSTFS_TFTP_MAX_TRANSFER_BYTES` | `268435456` | Per-transfer byte ceiling (256 MiB) |
 | `RUSTFS_TFTP_BACKEND_OP_TIMEOUT_SECS` | `60` | S3 call timeout |
 | `RUSTFS_TFTP_READ_FETCH_BYTES` | `4194304` | RRQ read-ahead window (4 MiB) |
 
@@ -78,4 +82,4 @@ Until upstream fixes are released or the crate is vendored with patches, use:
 | Out-of-range `blksize` may be silently ignored at parse time | Send only RFC-valid block sizes |
 
 Details, local fix branches, and merge-vs-vendor-vs-document options:
-[tftp-transfer-model.md](tftp-transfer-model.md#known-async-tftp-issues-and-fork-branches).
+[tftp-transfer-model.md](tftp-transfer-model.md#known-async-tftp-issues-and-local-branches).

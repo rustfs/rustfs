@@ -1380,7 +1380,8 @@ pub async fn init_tftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
     use rustfs_config::{
         DEFAULT_TFTP_ADDRESS, ENV_TFTP_ACCESS_KEY, ENV_TFTP_ACCESS_MODE, ENV_TFTP_ADDRESS, ENV_TFTP_BACKEND_OP_TIMEOUT_SECS,
         ENV_TFTP_DEFAULT_BUCKET, ENV_TFTP_ENABLE, ENV_TFTP_MAX_BLOCK_SIZE, ENV_TFTP_MAX_CONCURRENT_TRANSFERS,
-        ENV_TFTP_MAX_SEND_RETRIES, ENV_TFTP_MAX_WINDOW_SIZE, ENV_TFTP_READ_FETCH_BYTES, ENV_TFTP_SECRET_KEY,
+        ENV_TFTP_MAX_SEND_RETRIES, ENV_TFTP_MAX_TRANSFER_BYTES, ENV_TFTP_MAX_WINDOW_SIZE, ENV_TFTP_READ_FETCH_BYTES,
+        ENV_TFTP_SECRET_KEY,
     };
     use rustfs_protocols::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
     use rustfs_protocols::{TftpConfig, TftpServer, TftpStorageHandler};
@@ -1440,6 +1441,9 @@ pub async fn init_tftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
     let max_concurrent_transfers = TftpConfig::resolve_max_concurrent_transfers(
         rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_CONCURRENT_TRANSFERS).and_then(|v| v.parse::<usize>().ok()),
     );
+    let max_transfer_bytes = TftpConfig::resolve_max_transfer_bytes(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_TRANSFER_BYTES).and_then(|v| v.parse::<u64>().ok()),
+    );
     let backend_op_timeout_secs = TftpConfig::resolve_backend_op_timeout_secs(
         rustfs_utils::get_env_opt_str(ENV_TFTP_BACKEND_OP_TIMEOUT_SECS).and_then(|v| v.parse::<u64>().ok()),
     );
@@ -1457,6 +1461,7 @@ pub async fn init_tftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         max_block_size,
         max_window_size,
         max_concurrent_transfers,
+        max_transfer_bytes,
         backend_op_timeout_secs,
         read_fetch_bytes,
         max_send_retries,
