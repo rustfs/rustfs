@@ -18,9 +18,8 @@ on:
   workflow_dispatch:
     inputs:
       rustfs_version:
-        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
+        description: 'RustFS release tag to test (leave empty to use the latest nightly deb)'
         required: false
-        default: '1.0.0-rc.4-preview.1'
       package_url:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
