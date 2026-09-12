@@ -9498,6 +9498,7 @@ dependencies = [
  "clap",
  "const-str",
  "datafusion",
+ "ed25519-dalek 2.2.0",
  "faster-hex",
  "flatbuffers",
  "flate2",

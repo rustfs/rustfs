@@ -139,6 +139,7 @@ impl Opt {
             Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
             Some(Commands::Connect(opts)) => match opts.command {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
+                ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
             },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
