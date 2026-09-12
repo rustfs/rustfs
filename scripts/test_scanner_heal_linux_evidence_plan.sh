@@ -108,6 +108,60 @@ assert status["release_approved"] is False
 assert status["artifact_totals"]["missing"] == 0
 PY
 
+"${RUSTFS_PYTHON_BIN:-python3}" - "$TMP_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+same_head = root / "same-head.json"
+old_head = root / "old-head.json"
+case_level = root / "case-level.json"
+same_head.write_text(json.dumps({
+    "schema": 1,
+    "evidence": "measured",
+    "source_revision": "a" * 40,
+    "gates": {"G01": {}, "G02": {}},
+}) + "\n")
+old_head.write_text(json.dumps({
+    "schema": 1,
+    "evidence": "measured",
+    "source_revision": "b" * 40,
+    "gates": {"G03": {}, "G09": {}},
+}) + "\n")
+case_level.write_text(json.dumps({
+    "schema": 1,
+    "evidence": "case",
+    "source_revision": "a" * 40,
+    "gates": {"G14": {}},
+}) + "\n")
+PY
+
+"${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" \
+  --source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --descriptor-ledger "$TMP_DIR/same-head.json" "$TMP_DIR/old-head.json" "$TMP_DIR/case-level.json" \
+  "$TMP_DIR/missing.json" >"$TMP_DIR/ledger.json"
+
+"${RUSTFS_PYTHON_BIN:-python3}" - "$TMP_DIR/ledger.json" <<'PY'
+import json
+import pathlib
+import sys
+
+ledger = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert ledger["kind"] == "scanner-heal-descriptor-ledger"
+assert ledger["release_approved"] is False
+assert ledger["same_head_verified_gates"] == ["G01", "G02"]
+assert ledger["old_head_measured_gates"] == ["G03", "G09"]
+assert "G14" in ledger["missing_measured_gates"]
+assert "G03" in ledger["missing_current_head_gates"]
+assert ledger["totals"]["invalid_descriptors"] == 1
+classifications = {entry["file_name"]: entry["classification"] for entry in ledger["entries"]}
+assert classifications["same-head.json"] == "same-head verified"
+assert classifications["old-head.json"] == "old-head measured, drift-readable"
+assert classifications["case-level.json"] == "case-level only"
+assert classifications["missing.json"] == "invalid"
+PY
+
 if "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" \
   --phase performance \
   --run-preflight >/dev/null 2>"$TMP_DIR/no-preflight.err"; then
