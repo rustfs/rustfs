@@ -1978,6 +1978,92 @@ fn test_site_replication_bucket_target_replaces_tls_and_preserves_operational_fi
     assert!(target.disable_proxy);
 }
 
+/// rustfs/backlog#2489: an operator's bucket-level target that points at a
+/// peer (different target bucket, operator credentials) must survive site
+/// replication wiring untouched, with the site target added next to it.
+/// Replacing it left the operator's rule pointing at an ARN no target backs.
+#[test]
+fn test_reconcile_site_replication_bucket_targets_keeps_operator_target_to_peer() {
+    let local = PeerInfo {
+        deployment_id: "local".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote = PeerInfo {
+        deployment_id: "remote".to_string(),
+        ..peer("remote", "http://remote.example.com:9000")
+    };
+    let state = SiteReplicationState {
+        service_account_access_key: "svc".to_string(),
+        peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote.clone())]),
+        ..Default::default()
+    };
+
+    let operator_target = BucketTarget {
+        arn: "arn:minio:replication::7c0c5a1e-operator:photos-dst".to_string(),
+        source_bucket: "photos".to_string(),
+        target_bucket: "photos-dst".to_string(),
+        endpoint: "remote.example.com:9000".to_string(),
+        target_type: BucketTargetType::ReplicationService,
+        deployment_id: "remote".to_string(),
+        credentials: Some(Credentials {
+            access_key: "operator-key".to_string(),
+            secret_key: "operator-secret".to_string(),
+            session_token: None,
+            expiration: None,
+        }),
+        reset_id: "bucket-level-reset".to_string(),
+        ..Default::default()
+    };
+    let reconciled = reconcile_site_replication_bucket_targets(
+        BucketTargets {
+            targets: vec![operator_target.clone()],
+        },
+        "photos",
+        &state,
+        &local,
+        None,
+        "secret",
+    )
+    .expect("reconcile targets");
+    assert_eq!(reconciled.targets.len(), 2, "the site target is added next to the operator target");
+    let kept = &reconciled.targets[0];
+    assert_eq!(
+        (kept.arn.as_str(), kept.target_bucket.as_str(), kept.reset_id.as_str()),
+        ("arn:minio:replication::7c0c5a1e-operator:photos-dst", "photos-dst", "bucket-level-reset"),
+        "the operator target is untouched"
+    );
+    assert_eq!(kept.credentials.as_ref().map(|c| c.access_key.as_str()), Some("operator-key"));
+    let site_target = &reconciled.targets[1];
+    assert_eq!(site_target.arn, "arn:minio:replication::remote:photos");
+    assert_eq!(site_target.target_bucket, "photos");
+    assert!(
+        site_target.reset_id.is_empty(),
+        "the operator's resync identity must not leak into the site target"
+    );
+
+    // A site target under an older ARN shape is still recognised and updated in place.
+    let mut legacy = site_target.clone();
+    legacy.arn = "arn:rustfs:replication:us-east-1:remote:photos".to_string();
+    legacy.bandwidth_limit = 9;
+    let reconciled_again = reconcile_site_replication_bucket_targets(
+        BucketTargets {
+            targets: vec![operator_target.clone(), legacy],
+        },
+        "photos",
+        &state,
+        &local,
+        None,
+        "secret",
+    )
+    .expect("reconcile targets again");
+    assert_eq!(reconciled_again.targets.len(), 2, "a legacy-ARN site target is updated, not duplicated");
+    assert_eq!(reconciled_again.targets[0].arn, operator_target.arn);
+    assert_eq!(
+        reconciled_again.targets[1].bandwidth_limit, 9,
+        "operator tuning of the site target carries over"
+    );
+}
+
 #[test]
 fn test_bucket_versioning_xml_enables_versioning() {
     let data = bucket_versioning_xml().expect("versioning XML should serialize");
