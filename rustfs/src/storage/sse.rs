@@ -2747,9 +2747,21 @@ async fn apply_managed_encryption_material_inner(
         }
         (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
         (SSEType::SseKms, None) => {
-            return Err(ApiError::from(StorageError::other(
-                "No KMS key available for managed server-side encryption (required for SSE-KMS)",
-            )));
+            // Neither the request nor the bucket default named a key and no
+            // service default filled in. Without a service this is the same
+            // outage/misconfiguration the provider check below reports, so it
+            // must carry the same 503/400 split rather than an untyped
+            // internal error; with a running service that has no default key
+            // the caller simply has to name one.
+            if runtime_sources::current_encryption_service().await.is_none() {
+                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable().await));
+            }
+            return Err(ApiError {
+                code: S3ErrorCode::InvalidRequest,
+                message: "SSE-KMS requires a KMS key id: the request named none and the KMS service has no default key"
+                    .to_string(),
+                source: None,
+            });
         }
         _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
     };
@@ -4488,6 +4500,56 @@ mod tests {
             },
         )
         .await;
+
+        reset_sse_dek_provider();
+    }
+
+    /// A bare `aws:kms` request (no key id, no bucket default) on a node with
+    /// no KMS has no key to resolve. It must get the same configuration
+    /// refusal as the keyed form, whether or not the SSE-S3 master key is
+    /// set, rather than an untyped internal error (backlog#2368 B4).
+    #[tokio::test]
+    async fn sse_kms_write_without_a_key_id_is_refused_like_the_keyed_form() {
+        let _guard = lock_sse_test_state().await;
+
+        for master_key in [None, Some(BASE64_STANDARD.encode_to_string([9u8; 32]))] {
+            reset_sse_dek_provider();
+            async_with_vars(
+                [
+                    ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                    ("RUSTFS_SSE_S3_MASTER_KEY", master_key.clone()),
+                ],
+                async {
+                    // Entered directly: `sse_encryption` consults the bucket
+                    // default first, which needs a bucket metadata store.
+                    let error = apply_managed_encryption_material(
+                        "finance",
+                        "ledger.csv",
+                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        None,
+                        None,
+                        128,
+                        None,
+                    )
+                    .await
+                    .expect_err("SSE-KMS without a key id must be refused when no KMS is running");
+
+                    assert_eq!(
+                        error.code,
+                        S3ErrorCode::InvalidRequest,
+                        "master_key={master_key:?}: message was {}",
+                        error.message
+                    );
+                    assert!(error.message.contains("SSE-KMS requires"), "message was {}", error.message);
+                    assert!(
+                        !error.message.contains("RUSTFS_SSE_S3_MASTER_KEY"),
+                        "an SSE-KMS refusal must not name the SSE-S3 master key: {}",
+                        error.message
+                    );
+                },
+            )
+            .await;
+        }
 
         reset_sse_dek_provider();
     }

@@ -40,6 +40,9 @@ mod kms_edge_cases_test;
 mod kms_fault_recovery_test;
 
 #[cfg(test)]
+mod kms_service_stop_test;
+
+#[cfg(test)]
 mod bucket_default_encryption_test;
 
 #[cfg(test)]
