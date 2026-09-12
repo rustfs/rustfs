@@ -6134,6 +6134,144 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
     Ok(())
 }
 
+/// rustfs/backlog#2479: a bucket that had a bucket-level `replication-reset`
+/// against a target on the future peer must still resync once the sites are
+/// joined. Site replication takes that operator target over under its own
+/// ARN; the old `reset_id` used to travel with it and every site resync then
+/// refused the bucket as "owned by a different active resync operation".
+#[tokio::test]
+async fn test_site_replication_resync_after_bucket_level_reset_to_same_peer() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "site-repl-after-reset-src";
+    let operator_target_bucket = "site-repl-after-reset-dst";
+    let key = "preexisting.bin";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    target_client.create_bucket().bucket(operator_target_bucket).send().await?;
+    enable_bucket_versioning(&target_env, operator_target_bucket).await?;
+
+    // Operator-configured bucket replication to the future peer, then an
+    // existing-object resync that stamps the target with a reset id.
+    let operator_arn = set_replication_target(&source_env, source_bucket, &target_env, operator_target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &operator_arn).await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(key)
+        .body(ByteStream::from(vec![b'p'; 4096]))
+        .send()
+        .await?;
+    wait_for_object_on_target(&target_client, operator_target_bucket, key).await?;
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, operator_arn, "the reset must target the operator ARN");
+    wait_for_replication_reset_target(&source_env, source_bucket, &operator_arn, |target| {
+        target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, source_bucket).await?;
+
+    // Site replication rewires the operator target under the peer's ARN.
+    let site_arn = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = list_replication_targets_request(&source_env, Some(source_bucket)).await?;
+            if response.status() == StatusCode::OK {
+                let targets: Vec<serde_json::Value> = response.json().await?;
+                if let Some(arn) = targets
+                    .iter()
+                    .filter_map(|target| target.get("arn").and_then(|arn| arn.as_str()))
+                    .find(|arn| arn.contains(&remote_peer.deployment_id))
+                {
+                    break arn.to_string();
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("site replication never rewired the target of {source_bucket}").into());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    };
+    assert_ne!(site_arn, operator_arn, "the site target must carry the peer ARN");
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    let entry = started
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("start response lost the bucket: {started:?}"))?;
+    assert_ne!(
+        entry.status, "conflict",
+        "a finished bucket-level resync must not block the site resync: {entry:?}"
+    );
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "{finished:?}"
+    );
+    wait_for_object_on_target(&target_client, source_bucket, key).await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();

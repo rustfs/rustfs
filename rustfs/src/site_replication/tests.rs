@@ -1978,6 +1978,80 @@ fn test_site_replication_bucket_target_replaces_tls_and_preserves_operational_fi
     assert!(target.disable_proxy);
 }
 
+/// rustfs/backlog#2479: a bucket-level target to the same peer that had a
+/// `replication-reset` run against it carries a `reset_id` keyed by its own
+/// ARN. Taking that target over for site replication must not inherit the
+/// id, otherwise every site resync reports the bucket as owned by another
+/// active resync. An SR target re-reconciled under its own ARN keeps it.
+#[test]
+fn test_reconcile_site_replication_bucket_targets_drops_reset_id_from_taken_over_operator_target() {
+    let local = PeerInfo {
+        deployment_id: "local".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote = PeerInfo {
+        deployment_id: "remote".to_string(),
+        ..peer("remote", "http://remote.example.com:9000")
+    };
+    let state = SiteReplicationState {
+        service_account_access_key: "svc".to_string(),
+        peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote.clone())]),
+        ..Default::default()
+    };
+
+    let operator_target = BucketTarget {
+        arn: "arn:minio:replication::7c0c5a1e-operator:photos-dst".to_string(),
+        source_bucket: "photos".to_string(),
+        target_bucket: "photos-dst".to_string(),
+        endpoint: "remote.example.com:9000".to_string(),
+        target_type: BucketTargetType::ReplicationService,
+        deployment_id: "remote".to_string(),
+        reset_id: "bucket-level-reset".to_string(),
+        reset_before_date: Some(OffsetDateTime::UNIX_EPOCH),
+        bandwidth_limit: 7,
+        ..Default::default()
+    };
+    let reconciled = reconcile_site_replication_bucket_targets(
+        BucketTargets {
+            targets: vec![operator_target],
+        },
+        "photos",
+        &state,
+        &local,
+        None,
+        "secret",
+    )
+    .expect("reconcile targets");
+    assert_eq!(reconciled.targets.len(), 1, "the operator target is taken over, not duplicated");
+    let taken_over = &reconciled.targets[0];
+    assert_eq!(taken_over.arn, "arn:minio:replication::remote:photos");
+    assert_eq!(taken_over.target_bucket, "photos");
+    assert!(
+        taken_over.reset_id.is_empty(),
+        "the bucket-level resync id must not follow the ARN change"
+    );
+    assert!(taken_over.reset_before_date.is_none());
+    assert_eq!(taken_over.bandwidth_limit, 7, "operator tuning still carries over");
+
+    let mut resynced = taken_over.clone();
+    resynced.reset_id = "site-resync-1".to_string();
+    resynced.reset_before_date = Some(OffsetDateTime::UNIX_EPOCH);
+    let reconciled_again = reconcile_site_replication_bucket_targets(
+        BucketTargets { targets: vec![resynced] },
+        "photos",
+        &state,
+        &local,
+        None,
+        "secret",
+    )
+    .expect("reconcile targets again");
+    assert_eq!(
+        reconciled_again.targets[0].reset_id, "site-resync-1",
+        "an SR target keeps its own resync id"
+    );
+    assert!(reconciled_again.targets[0].reset_before_date.is_some());
+}
+
 #[test]
 fn test_bucket_versioning_xml_enables_versioning() {
     let data = bucket_versioning_xml().expect("versioning XML should serialize");

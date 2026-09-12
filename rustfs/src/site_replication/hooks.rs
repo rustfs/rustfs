@@ -1396,8 +1396,17 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
             target.storage_class = existing.storage_class;
             target.health_check_duration = existing.health_check_duration;
             target.disable_proxy = existing.disable_proxy;
-            target.reset_before_date = existing.reset_before_date;
-            target.reset_id = existing.reset_id;
+            // A resync is keyed by the ARN it started under. When this pass
+            // takes over an operator target to the same peer (different ARN),
+            // its `reset_id` names a bucket-level resync the site resync
+            // status map cannot see, and `start_site_bucket_resync` would
+            // report the bucket as owned by "a different active resync"
+            // forever (rustfs/backlog#2479). Only an SR target being
+            // re-reconciled under its own ARN keeps its resync identity.
+            if existing.arn == target.arn {
+                target.reset_before_date = existing.reset_before_date;
+                target.reset_id = existing.reset_id;
+            }
             target.total_downtime = existing.total_downtime;
             target.last_online = existing.last_online;
             target.online = existing.online;
