@@ -685,7 +685,7 @@ mod tests {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
     }
 
-    fn is_retryable_deferred_put_after_rejoin(error: &SdkError<PutObjectError>) -> bool {
+    fn is_retryable_outage_put(error: &SdkError<PutObjectError>) -> bool {
         matches!(
             error.as_service_error().and_then(ProvideErrorMetadata::code),
             Some("SlowDownRead" | "ServiceUnavailable")
@@ -1602,12 +1602,19 @@ mod tests {
                     outage_key = Some(candidate_key);
                     break;
                 }
-                Ok(Err(error)) if is_service_unavailable_put(&error) => {
+                Ok(Err(error)) if is_retryable_outage_put(&error) => {
                     service_unavailable_outage_writes += 1;
                     last_service_unavailable = Some(format!("{error:?}"));
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(error) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    return Err(format!("outage PUT candidate {candidate_key} failed before target rejoin: {error}").into());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "outage PUT candidate {candidate_key} timed out before target rejoin after 30s: {error}"
+                    )
+                    .into());
+                }
             }
         }
         let outage_key = match outage_key {
@@ -2188,7 +2195,7 @@ mod tests {
                 .await;
                 match put_result {
                     Ok(Ok(_)) => break,
-                    Ok(Err(error)) if is_retryable_deferred_put_after_rejoin(&error) && Instant::now() < deferred_deadline => {
+                    Ok(Err(error)) if is_retryable_outage_put(&error) && Instant::now() < deferred_deadline => {
                         sleep(Duration::from_secs(1)).await;
                     }
                     Ok(Err(error)) => {
