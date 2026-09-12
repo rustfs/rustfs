@@ -651,7 +651,9 @@ mod tests {
         let Some(Commands::Connect(connect)) = cli.command else {
             panic!("connect command expected");
         };
-        let ConnectCommands::Register(register) = connect.command;
+        let ConnectCommands::Register(register) = connect.command else {
+            panic!("register command expected");
+        };
         assert_eq!(register.endpoint, "https://connect.example/agent/");
         assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
         assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));

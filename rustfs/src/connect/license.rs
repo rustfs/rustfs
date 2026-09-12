@@ -147,7 +147,7 @@ impl LicenseReport {
 pub struct LicenseArtifactError {
     pub status: LicenseArtifactStatus,
     pub message: String,
-    pub license: Option<LicenseClaims>,
+    pub license: Option<Box<LicenseClaims>>,
 }
 
 impl LicenseArtifactError {
@@ -156,7 +156,7 @@ impl LicenseArtifactError {
             status: self.status,
             installed,
             idempotent: false,
-            license: self.license,
+            license: self.license.map(|b| *b),
             message: Some(self.message),
         }
     }
@@ -302,10 +302,10 @@ pub fn verify_license_artifact(
 ) -> Result<LicenseReport, LicenseArtifactError> {
     let candidate = validate_artifact(read_artifact(artifact_path)?, context, true)?;
     let state_path = state_path(state_directory, context);
-    if let Some(current) = load_installed(&state_path, context)? {
-        if matches!(compare_sequence(&candidate, &current)?, SequenceDecision::Idempotent) {
-            return Ok(LicenseReport::valid(candidate.claims, true, true));
-        }
+    if let Some(current) = load_installed(&state_path, context)?
+        && matches!(compare_sequence(&candidate, &current)?, SequenceDecision::Idempotent)
+    {
+        return Ok(LicenseReport::valid(candidate.claims, true, true));
     }
     Ok(LicenseReport::valid(candidate.claims, false, false))
 }
@@ -712,7 +712,7 @@ fn failure_with_license(
     LicenseArtifactError {
         status,
         message: message.into(),
-        license: Some(license),
+        license: Some(Box::new(license)),
     }
 }
 
