@@ -3880,6 +3880,96 @@ async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
 }
 
 #[tokio::test]
+async fn table_metadata_data_plane_resource_resolves_only_current_metadata() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    backend.reset_call_counts().await;
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("metadata ownership lookup should succeed")
+        .expect("current metadata should resolve to its table");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "orders");
+    assert_eq!(backend.list_call_count().await, 1);
+    assert_eq!(backend.read_call_count().await, 2);
+    assert_eq!(backend.metadata_call_count().await, 1);
+
+    let historical = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &historical)
+            .await
+            .expect("historical metadata lookup should succeed")
+            .is_none()
+    );
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
+            .await
+            .expect("ordinary object lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn table_metadata_data_plane_resource_follows_a_renamed_table() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    store
+        .rename_table(bucket, "sales", "orders", "sales", "archived_orders")
+        .await
+        .expect("table rename should succeed");
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("renamed metadata ownership lookup should succeed")
+        .expect("current metadata should remain owned after rename");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "archived_orders");
+}
+
+#[tokio::test]
+async fn table_metadata_data_plane_resource_rejects_multiple_active_owners() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    store
+        .rename_table(bucket, "sales", "orders", "sales", "archived_orders")
+        .await
+        .expect("table rename should succeed");
+
+    let mut replacement = test_table_entry(bucket, &namespace, &table, current.clone());
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = format!("s3://{bucket}/tables/replacement-table-id");
+    store
+        .create_table(replacement)
+        .await
+        .expect("replacement table should be created");
+
+    assert_matches!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &current).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message.contains("multiple active tables")
+    );
+}
+
+#[tokio::test]
 async fn table_data_plane_resource_does_not_match_sibling_prefix() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
@@ -12482,24 +12572,78 @@ async fn strong_catalog_backing_resolves_data_plane_resource_without_catalog_sca
 }
 
 #[tokio::test]
+async fn strong_catalog_table_metadata_data_plane_resource_resolves_only_current_metadata() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current.clone()))
+        .await
+        .expect("table should be created");
+
+    let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
+        .await
+        .expect("metadata ownership lookup should succeed")
+        .expect("current metadata should resolve to its table");
+    assert_eq!(resource.namespace, "sales");
+    assert_eq!(resource.table, "orders");
+
+    let historical = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &historical)
+            .await
+            .expect("historical metadata lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn strong_catalog_data_plane_fails_closed_for_missing_bucket_snapshot() {
     let store = StrongTableCatalogStore::new(TestCatalogObjectBackend::default());
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     let error = table_data_plane_resource_for_object(&store, "analytics", "tables/table-id/data/file.parquet")
         .await
         .expect_err("a table-enabled bucket missing from the strong snapshot must fail closed");
 
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, "analytics", &metadata)
+        .await
+        .expect_err("metadata access must reject a missing strong bucket snapshot");
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
 }
 
 #[tokio::test]
 async fn object_catalog_data_plane_fails_closed_for_missing_bucket_entry() {
     let store = ObjectTableCatalogStore::new(TestCatalogObjectBackend::default());
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     let error = table_data_plane_resource_for_object(&store, "analytics", "tables/table-id/data/file.parquet")
         .await
         .expect_err("a table-enabled bucket missing from the object catalog must fail closed");
 
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, "analytics", &metadata)
+        .await
+        .expect_err("metadata access must reject a missing object-backed bucket entry");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("no entry for table-enabled bucket"));
 }
 
@@ -12507,6 +12651,9 @@ async fn object_catalog_data_plane_fails_closed_for_missing_bucket_entry() {
 async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
     let bucket = "analytics";
     let object = "tables/table-id/data/file.parquet";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
     let mut inactive = test_bucket_entry(bucket);
     inactive.state = TableCatalogEntryState::Deleted;
 
@@ -12518,6 +12665,13 @@ async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
     let object_error = table_data_plane_resource_for_object(&object_store, bucket, object)
         .await
         .expect_err("inactive object-backed table buckets must fail closed");
+    assert_matches!(
+        object_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
+    );
+    let object_error = table_metadata_data_plane_resource_for_object(&object_store, bucket, &metadata)
+        .await
+        .expect_err("metadata access must reject an inactive object-backed table bucket");
     assert_matches!(
         object_error,
         TableCatalogStoreError::Internal(message) if message.contains("inactive object-backed catalog entry")
@@ -12535,6 +12689,13 @@ async fn catalog_backings_fail_closed_for_inactive_table_bucket_data_plane() {
         strong_error,
         TableCatalogStoreError::Internal(message) if message.contains("inactive durable strong catalog entry")
     );
+    let strong_error = table_metadata_data_plane_resource_for_object(&strong_store, bucket, &metadata)
+        .await
+        .expect_err("metadata access must reject an inactive durable strong table bucket");
+    assert_matches!(
+        strong_error,
+        TableCatalogStoreError::Internal(message) if message.contains("inactive durable strong catalog entry")
+    );
 }
 
 #[tokio::test]
@@ -12543,18 +12704,19 @@ async fn strong_catalog_data_plane_requires_v2_snapshot_after_fleet_confirmation
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
-    let table_entry = test_table_entry(
-        bucket,
-        &namespace,
-        &table,
-        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
-    );
+    let metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let table_entry = test_table_entry(bucket, &namespace, &table, metadata.clone());
     seed_strong_snapshot(&backend, &test_strong_snapshot(bucket, &namespace, vec![table_entry], Vec::new())).await;
     let store = StrongTableCatalogStore::new_with_snapshot_write_version(backend.clone(), STRONG_TABLE_CATALOG_SNAPSHOT_VERSION);
 
     let error = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
         .await
         .expect_err("fleet-confirmed readers must reject a version 1 snapshot on the data plane");
+    assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("requires a version 2 snapshot"));
+
+    let error = table_metadata_data_plane_resource_for_object(&store, bucket, &metadata)
+        .await
+        .expect_err("fleet-confirmed readers must reject metadata from a version 1 snapshot");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("requires a version 2 snapshot"));
 
     store
@@ -12566,6 +12728,12 @@ async fn strong_catalog_data_plane_requires_v2_snapshot_after_fleet_confirmation
         table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
             .await
             .expect("version 2 data-plane lookup should succeed")
+            .is_some()
+    );
+    assert!(
+        table_metadata_data_plane_resource_for_object(&store, bucket, &metadata)
+            .await
+            .expect("version 2 metadata lookup should succeed")
             .is_some()
     );
 }

@@ -1531,6 +1531,33 @@ where
         Ok(())
     }
 
+    fn require_data_plane_ready_locked(
+        &self,
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let Some(bucket_entry) = state.table_buckets.get(table_bucket) else {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "durable strong catalog has no entry for table-enabled bucket {table_bucket}"
+            )));
+        };
+        if bucket_entry.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table-enabled bucket {table_bucket} has an inactive durable strong catalog entry"
+            )));
+        }
+        if self.snapshot_write_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
+            && state
+                .snapshot_version
+                .is_none_or(|version| version < STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "durable strong catalog data-plane access requires a version 2 snapshot after fleet confirmation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_table_warehouse_prefix_available_locked(
         state: &StrongTableCatalogState,
         candidate: &TableEntry,
@@ -2390,25 +2417,7 @@ where
 
         self.hydrate_state().await?;
         let state = self.state.lock().await;
-        let Some(bucket_entry) = state.table_buckets.get(table_bucket) else {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "durable strong catalog has no entry for table-enabled bucket {table_bucket}"
-            )));
-        };
-        if bucket_entry.state != TableCatalogEntryState::Active {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "table-enabled bucket {table_bucket} has an inactive durable strong catalog entry"
-            )));
-        }
-        if self.snapshot_write_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
-            && state
-                .snapshot_version
-                .is_none_or(|version| version < STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
-        {
-            return Err(TableCatalogStoreError::Internal(
-                "durable strong catalog data-plane access requires a version 2 snapshot after fleet confirmation".to_string(),
-            ));
-        }
+        self.require_data_plane_ready_locked(&state, table_bucket)?;
 
         let Some(bucket_index) = state.warehouse_index.get(table_bucket) else {
             return Ok(None);
@@ -2427,6 +2436,27 @@ where
             }
         }
         Ok(None)
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        self.require_data_plane_ready_locked(&state, table_bucket)?;
+        Self::ensure_table_bucket_identifiers_are_unambiguous_locked(&state, table_bucket)?;
+        let entries = state
+            .tables
+            .range((table_bucket.to_string(), String::new(), String::new())..)
+            .take_while(|((bucket, _, _), _)| bucket == table_bucket)
+            .map(|(_, entry)| entry);
+        table_metadata_data_plane_resource_from_entries(entries, table_bucket, object)
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {

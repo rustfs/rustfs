@@ -1638,6 +1638,8 @@ async fn table_data_plane_resource_for_request<T>(
         return Ok(None);
     }
 
+    let catalog_metadata = crate::table_catalog::is_reserved_table_object_key(object)
+        && crate::table_catalog::table_identity_from_metadata_object_key(object).is_some();
     let key = (bucket.to_string(), object.to_string());
     let retained = req
         .extensions
@@ -1649,38 +1651,50 @@ async fn table_data_plane_resource_for_request<T>(
         if state.missing_resources.contains(&key) {
             return Ok(None);
         }
-        if let Some(resource) = state
-            .resources
-            .values()
-            .find(|resource| resource.table_bucket == bucket && object.starts_with(&resource.warehouse_object_prefix))
-            .cloned()
+        if !catalog_metadata
+            && let Some(resource) = state
+                .resources
+                .values()
+                .find(|resource| resource.table_bucket == bucket && object.starts_with(&resource.warehouse_object_prefix))
+                .cloned()
         {
             return Ok(Some(resource));
         }
     }
 
     let store = table_catalog_store_for_data_plane(req)?;
-    let resource = crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object)
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                bucket = %bucket,
-                object = %object,
-                error = %err,
-                "failed to resolve table data-plane resource"
-            );
-            if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-                S3Error::from(ApiError::service_unavailable())
-            } else {
-                s3_error!(AccessDenied, "Access Denied")
-            }
-        })?;
+    let resource = if catalog_metadata {
+        crate::table_catalog::table_metadata_data_plane_resource_for_object(&store, bucket, object).await
+    } else {
+        crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object).await
+    }
+    .map_err(|err| {
+        tracing::warn!(
+            bucket = %bucket,
+            object = %object,
+            error = %err,
+            "failed to resolve table data-plane resource"
+        );
+        if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
+            S3Error::from(ApiError::service_unavailable())
+        } else {
+            s3_error!(AccessDenied, "Access Denied")
+        }
+    })?;
+    let resource = require_owned_reserved_table_object(object, resource)?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
     let mut state = retained.state.lock();
     if resource.is_none() && state.keys.contains(&bucket_fence_key) {
         state.missing_resources.insert(key);
         drop(state);
         req.extensions.insert(retained);
+    }
+    Ok(resource)
+}
+
+fn require_owned_reserved_table_object<T>(object: &str, resource: Option<T>) -> S3Result<Option<T>> {
+    if crate::table_catalog::is_reserved_table_object_key(object) && resource.is_none() {
+        return Err(S3Error::from(ApiError::access_denied()));
     }
     Ok(resource)
 }
@@ -3112,8 +3126,8 @@ mod tests {
         install_restore_authorization_test_hook, legal_hold_write_requested, list_parts_authorize_action,
         load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions,
         merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
-        put_bucket_policy_authorize_action, request_context_from_req, request_object_store, retention_write_requested,
-        secondary_tag_hint_action, table_data_plane_admin_action, table_data_plane_content_mutation,
+        put_bucket_policy_authorize_action, request_context_from_req, request_object_store, require_owned_reserved_table_object,
+        retention_write_requested, secondary_tag_hint_action, table_data_plane_admin_action, table_data_plane_content_mutation,
         table_data_plane_resource_for_request, table_publication_guard_error, validate_post_object_success_controls,
         versioned_read_action,
     };
@@ -3252,6 +3266,27 @@ mod tests {
             Some(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction)
         );
         assert_eq!(table_data_plane_admin_action(Action::S3Action(S3Action::ListBucketAction)), None);
+    }
+
+    #[test]
+    fn reserved_table_metadata_requires_an_active_table_owner() {
+        let error = require_owned_reserved_table_object::<()>(
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            None,
+        )
+        .expect_err("unowned reserved metadata must fail closed");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+
+        assert!(
+            require_owned_reserved_table_object("objects/data.parquet", None::<()>)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            require_owned_reserved_table_object(".rustfs-table/metadata.json", Some(()))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -3591,6 +3626,35 @@ mod tests {
             .await
             .expect("commit should continue after the request releases its publication guard")
             .expect("commit task should join");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_request_reuses_reserved_warehouse_resource() {
+        let resource = crate::table_catalog::TableDataPlaneResource {
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            warehouse_object_prefix: ".rustfs-table/custom-warehouse/events/".to_string(),
+        };
+        let retained = TableDataPlanePublicationGuards::default();
+        retained.state.lock().resources.insert(
+            (resource.table_bucket.clone(), resource.warehouse_object_prefix.clone()),
+            resource.clone(),
+        );
+        let mut req = build_request((), Method::GET);
+        req.extensions.insert(retained);
+
+        let resolved = table_data_plane_resource_for_request(
+            &mut req,
+            "warehouse",
+            ".rustfs-table/custom-warehouse/events/data/part-00001.parquet",
+            true,
+        )
+        .await
+        .expect("a reserved-prefix warehouse object should use ordinary table resolution");
+
+        assert_eq!(resolved, Some(resource));
     }
 
     #[tokio::test]
