@@ -474,7 +474,11 @@ jobs:
           }
 
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-test.log"
-          require_nonempty "${POOL_ARTIFACT_DIR}/warp.log"
+          # warp is stopped early (SIGINT/SIGTERM) once the storage threshold
+          # is reached, and it only writes its final report on a clean exit —
+          # an empty warp.log is the expected shape of a healthy run, so only
+          # require that the redirect target exists.
+          require_available "${POOL_ARTIFACT_DIR}/warp.log"
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-report.md"
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-baseline.log"
           require_nonempty "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"
@@ -523,6 +527,16 @@ jobs:
           if grep -Eiq 'upstream prematurely closed connection|upstream timed out|(connect\(\)|recv\(\)|send\(\)) failed.*upstream|connection reset by peer.*upstream' \
             "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-error-redacted.log"; then
             echo "dedicated proxy error log contains an upstream timeout or connection failure" >&2
+            failed=1
+          fi
+          # A mid-script abort is a product/harness signal: the run step's
+          # continue-on-error would otherwise keep the workflow green, so the
+          # validator must turn it red. Aborts go through die(), which prints
+          # an [ERROR] line; a step that dies never emits its [POOL-STEP]
+          # verdict, so "any FAIL verdict" cannot be the trigger.
+          if grep -q '^\[POOL-STEP\] .* FAIL' "${POOL_ARTIFACT_DIR}/pool-test.log" 2>/dev/null \
+            || grep -q '\[ERROR\]' "${POOL_ARTIFACT_DIR}/pool-test.log" 2>/dev/null; then
+            echo "pool test script reported a failure (step FAIL verdict or die() abort)" >&2
             failed=1
           fi
           [ "${failed}" -eq 0 ] || exit 1

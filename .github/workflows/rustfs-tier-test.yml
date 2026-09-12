@@ -344,6 +344,10 @@ jobs:
               echo "Structured report generation failed before producing output (exit ${CASE_GATE_RC})."
             } > "${CASE_TABLE}"
           fi
+          CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
+          CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
           {
             echo "# RustFS tier test report"
             echo ""
@@ -355,6 +359,8 @@ jobs:
             echo "- Structured Gate Exit: ${CASE_GATE_RC}"
             echo ""
             cat "${CASE_TABLE}"
+            echo ""
+            echo "- Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed (failing cases are tracked in rustfs/backlog)"
             echo ""
             echo "## Log tail"
             echo '```text'
