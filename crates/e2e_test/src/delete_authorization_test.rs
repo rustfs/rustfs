@@ -119,7 +119,11 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> TestResult<Ver
     }
 }
 
-async fn force_delete(client: &Client, bucket: &str, prefix: &str) -> Result<DeleteObjectOutput, SdkError<DeleteObjectError>> {
+async fn force_delete(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<DeleteObjectOutput, Box<SdkError<DeleteObjectError>>> {
     client
         .delete_object()
         .bucket(bucket)
@@ -130,13 +134,14 @@ async fn force_delete(client: &Client, bucket: &str, prefix: &str) -> Result<Del
         })
         .send()
         .await
+        .map_err(Box::new)
 }
 
 async fn replica_force_delete(
     client: &Client,
     bucket: &str,
     prefix: &str,
-) -> Result<DeleteObjectOutput, SdkError<DeleteObjectError>> {
+) -> Result<DeleteObjectOutput, Box<SdkError<DeleteObjectError>>> {
     client
         .delete_object()
         .bucket(bucket)
@@ -148,6 +153,7 @@ async fn replica_force_delete(
         })
         .send()
         .await
+        .map_err(Box::new)
 }
 
 fn assert_denied<T, E>(result: Result<T, SdkError<E>>)
@@ -161,6 +167,14 @@ where
         Some("AccessDenied"),
         "expected an S3 authorization denial, got {error:?}"
     );
+}
+
+fn assert_boxed_denied<T, E>(result: Result<T, Box<SdkError<E>>>)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    assert_denied(result.map_err(|error| *error));
 }
 
 #[tokio::test]
@@ -436,13 +450,13 @@ async fn force_delete_denied_child_preserves_every_object_despite_bucket_allow()
         ]}).to_string())
         .send().await?;
     let before = versions(&root, bucket, "folder/").await?;
-    assert_denied(force_delete(&user, bucket, "folder/").await);
+    assert_boxed_denied(force_delete(&user, bucket, "folder/").await);
     assert_eq!(
         versions(&root, bucket, "folder/").await?,
         before,
         "a denied descendant must prevent every mutation in the force scope"
     );
-    assert_denied(replica_force_delete(&user, bucket, "folder/").await);
+    assert_boxed_denied(replica_force_delete(&user, bucket, "folder/").await);
     assert_eq!(
         versions(&root, bucket, "folder/").await?,
         before,
@@ -495,7 +509,7 @@ async fn force_delete_denied_historical_version_preserves_versions_and_markers()
     let before = versions(&root, bucket, "folder/").await?;
     for version in [protected_version.as_str(), "null", marker_version] {
         set_policy(&env, "version-denier", &policy(version)).await?;
-        assert_denied(force_delete(&user, bucket, "folder/").await);
+        assert_boxed_denied(force_delete(&user, bucket, "folder/").await);
         assert_eq!(
             versions(&root, bucket, "folder/").await?,
             before,
@@ -625,7 +639,7 @@ async fn force_delete_checks_every_version_page_before_mutation() -> TestResult 
     .await?;
     let before = versions(&root, bucket, "folder/").await?;
     assert_eq!(before.len(), 1001, "the denied key must be beyond one default versions page");
-    assert_denied(force_delete(&user, bucket, "folder/").await);
+    assert_boxed_denied(force_delete(&user, bucket, "folder/").await);
     assert_eq!(
         versions(&root, bucket, "folder/").await?,
         before,
