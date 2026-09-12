@@ -14,7 +14,12 @@ NC='\033[0m' # No Color
 
 # Default values
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET_DIR="$PROJECT_ROOT/target/debug"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+if [[ "$CARGO_TARGET_DIR" != /* ]]; then
+    CARGO_TARGET_DIR="$PROJECT_ROOT/$CARGO_TARGET_DIR"
+fi
+export CARGO_TARGET_DIR
+TARGET_DIR="$CARGO_TARGET_DIR/debug"
 RUSTFS_BINARY="$TARGET_DIR/rustfs"
 DATA_DIR="$TARGET_DIR/rustfs_test_data"
 RUSTFS_PID=""
@@ -94,7 +99,7 @@ build_rustfs() {
     print_info "Building RustFS..."
     cd "$PROJECT_ROOT"
     
-    if ! cargo build --bin rustfs --features "$RUSTFS_BUILD_FEATURES"; then
+    if ! python3 scripts/e2e_binary.py build --features "$RUSTFS_BUILD_FEATURES"; then
         print_error "Failed to build RustFS"
         exit 1
     fi
@@ -115,6 +120,10 @@ check_dependencies() {
         missing_tools+=("curl")
     fi
     
+    if ! command -v python3 >/dev/null 2>&1; then
+        missing_tools+=("python3")
+    fi
+
     if ! command -v cargo >/dev/null 2>&1; then
         missing_tools+=("cargo")
     fi
@@ -203,7 +212,7 @@ run_tests() {
 
     print_info "Test command: ${test_cmd[*]}"
 
-    if "${test_cmd[@]}"; then
+    if python3 scripts/e2e_binary.py run --features "$RUSTFS_BUILD_FEATURES" -- "${test_cmd[@]}"; then
         print_success "All tests passed!"
         return 0
     else
