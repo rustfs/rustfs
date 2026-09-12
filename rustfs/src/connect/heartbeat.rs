@@ -25,6 +25,7 @@ use uuid::Uuid;
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
 use super::diagnostics::DiagnosticCollectionPolicy;
+use super::environment::ENVIRONMENT_CAPABILITY;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
 use super::registration::CredentialValidationError;
@@ -94,7 +95,13 @@ impl PendingHeartbeat {
         self.protocol_version == PROTOCOL_VERSION
             && self.agent_version == AGENT_VERSION
             && (self.capabilities == ["heartbeat"]
-                || self.capabilities == ["heartbeat", DiagnosticCollectionPolicy::policy_sync_capability()])
+                || self.capabilities == ["heartbeat", DiagnosticCollectionPolicy::policy_sync_capability()]
+                || self.capabilities
+                    == [
+                        "heartbeat",
+                        DiagnosticCollectionPolicy::policy_sync_capability(),
+                        ENVIRONMENT_CAPABILITY,
+                    ])
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)
@@ -243,6 +250,7 @@ impl HeartbeatStateStore {
             capabilities: vec![
                 "heartbeat".to_owned(),
                 DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
+                ENVIRONMENT_CAPABILITY.to_owned(),
             ],
             sequence: state.next_sequence,
             client_time: now.to_rfc3339_opts(SecondsFormat::Secs, true),

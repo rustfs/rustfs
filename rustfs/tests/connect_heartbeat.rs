@@ -28,8 +28,8 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use rustfs::connect::{
-    CoarseNodeSummary, CredentialStore, DeviceCredential, HeartbeatConfig, HeartbeatSchedule, HeartbeatStatus, IdentityStore,
-    spawn_heartbeat_runtime,
+    CoarseNodeSummary, CredentialStore, DeviceCredential, ENVIRONMENT_CAPABILITY, HeartbeatConfig, HeartbeatSchedule,
+    HeartbeatStatus, IdentityStore, spawn_heartbeat_runtime,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -514,10 +514,53 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "sequence"
         ]
     );
-    assert_eq!(request["capabilities"], json!(["heartbeat", "diagnostics.policy.v1"]));
+    assert_eq!(ENVIRONMENT_CAPABILITY, "inventory.environment@1");
+    assert_eq!(
+        request["capabilities"],
+        json!(["heartbeat", "diagnostics.policy.v1", "inventory.environment@1"])
+    );
     assert_eq!(request["coarseNodeSummary"], json!({"total": 8, "healthy": 7, "degraded": 1}));
     assert_ne!(request["clientTime"], "2038-01-19T03:14:07Z");
     assert!(request.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn restart_replays_a_pending_heartbeat_from_before_environment_collection() {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shutdown = CancellationToken::new();
+    let config = config(&temp, &pki, &server);
+    let directory = config.state_path.parent().expect("state directory");
+    fs::create_dir_all(directory).expect("create state directory");
+    let state = json!({
+        "nextSequence": 0,
+        "pending": {
+            "protocolVersion": "v1",
+            "requestId": "550e8400-e29b-41d4-a716-446655440000",
+            "agentVersion": format!("rustfs-agent/{}", env!("CARGO_PKG_VERSION")),
+            "capabilities": ["heartbeat", "diagnostics.policy.v1"],
+            "sequence": 0,
+            "clientTime": "2026-08-22T01:02:03Z",
+            "coarseNodeSummary": {"total": 1, "healthy": 1, "degraded": 0}
+        }
+    });
+    fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
+    private_mode(&config.state_path);
+
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+        .expect("start runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    let seen = server.seen.lock().expect("seen lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["capabilities"], json!(["heartbeat", "diagnostics.policy.v1"]));
 }
 
 #[tokio::test]
