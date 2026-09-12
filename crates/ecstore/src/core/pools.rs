@@ -17609,6 +17609,17 @@ impl ECStore {
         }
         self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
             .await?;
+        self.decommission_durable_ilm_receipt_path_for_test(source_pool_idx, source_path, record)
+            .await
+    }
+
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) async fn decommission_durable_ilm_receipt_path_for_test(
+        &self,
+        source_pool_idx: usize,
+        source_path: &str,
+        record: &ValidatedDurableIlmRecord,
+    ) -> Result<String> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
         Ok(decommission_durable_ilm_receipt_path(&run_token, source_path, record.id_kind, &record.id))
     }
