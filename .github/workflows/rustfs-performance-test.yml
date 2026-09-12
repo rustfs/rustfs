@@ -237,65 +237,51 @@ jobs:
             echo "created ${REPORT_PATH} in rustfs/dashboard"
           fi
 
-      - name: File failure issue in rustfs/backlog
-        if: ${{ always() && (failure() || steps.benchmark.outcome == 'failure' || steps.benchmark.outcome == 'cancelled') }}
+      - name: Manage backlog issues (dedup / label / auto-close)
+        # Signal-based lifecycle: dedups against open issues by label,
+        # labels new issues (functional-test, category, case IDs, env),
+        # closes fixed issues after a fully green run. Never acts on
+        # cancelled runs. Logic lives in auto-testing/scripts/.
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           SUITE: 'performance'
           SUITE_LABEL: 'Performance'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
-          EXISTING="$(gh issue list -R rustfs/backlog --state all \
-            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
-          if [ -n "${EXISTING}" ]; then
-            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found in auto-testing checkout; skipping"
             exit 0
           fi
-          redact() {
-            sed -E \
-              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
-              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
-          }
-          BODY_FILE="$(mktemp)"
-          {
-            echo "The **${SUITE_LABEL}** functional suite failed."
-            echo ""
-            echo "- Suite: \`${SUITE}\`"
-            echo "- Run: ${RUN_URL}"
-            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
-            echo "- Workflow Commit: ${GITHUB_SHA}"
-            echo "- Trigger: ${GITHUB_EVENT_NAME}"
-            echo "- Date: $(date -u +%Y-%m-%d)"
-            echo ""
-            echo "## Report (errors and symptoms)"
-            echo ""
-            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
-              redact < "${REPORT_FILE}"
-            elif [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${LOG_FILE:-}" ]; then
-              echo "(report file missing; log tail below)"
-              echo ""
-              tail -n 200 "${LOG_FILE}" | redact
-            else
-              echo "(no report or log file was produced)"
-            fi
-          } | head -c 55000 > "${BODY_FILE}"
-          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
-          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test; then
-            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          PACKAGE_SOURCE=""
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          echo "filed backlog issue for suite ${SUITE}"
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
+            --outcome "${{ steps.benchmark.outcome }}" \
+            --report-file "${REPORT_FILE}" \
+            --log "${LOG_FILE}" \
+            --run-url "${RUN_URL}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${{ github.event_name }}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload test logs & results
         if: ${{ always() && steps.evidence.outcome == 'success' }}
