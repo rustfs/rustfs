@@ -21,6 +21,7 @@
 
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ServerSideEncryption,
@@ -629,5 +630,94 @@ async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn s
     );
 
     info!("Test passed: SSE-KMS without key ID correctly populates default key '{}'", default_key_id);
+    Ok(())
+}
+
+/// A default-encryption configuration the write path cannot honour as written
+/// must be refused rather than stored: the write path falls back to AES256 for
+/// any algorithm it does not know, so storing `AES128` would make
+/// GetBucketEncryption report a scheme no object is encrypted under.
+#[tokio::test]
+async fn test_put_bucket_encryption_rejects_unknown_algorithm_and_misplaced_key_id()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
+    kms_env.wait_for_kms_ready().await?;
+
+    let s3_client = kms_env.base_env.create_s3_client();
+    kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
+
+    let config_with = |algorithm: ServerSideEncryption, key_id: Option<&str>| {
+        let mut by_default = ServerSideEncryptionByDefault::builder().sse_algorithm(algorithm);
+        if let Some(key_id) = key_id {
+            by_default = by_default.kms_master_key_id(key_id);
+        }
+        ServerSideEncryptionConfiguration::builder()
+            .rules(
+                ServerSideEncryptionRule::builder()
+                    .apply_server_side_encryption_by_default(by_default.build().unwrap())
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    };
+
+    // Baseline the bucket on AES256 so a refused update has something to leave untouched.
+    s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(config_with(ServerSideEncryption::Aes256, None))
+        .send()
+        .await?;
+
+    let unknown = s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(config_with(ServerSideEncryption::from("AES128"), None))
+        .send()
+        .await
+        .expect_err("an unknown SSEAlgorithm must be refused");
+    assert_eq!(unknown.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        unknown.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("MalformedXML"),
+        "unknown algorithm error was {unknown:?}"
+    );
+
+    let misplaced_key = s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(config_with(ServerSideEncryption::Aes256, Some(&default_key_id)))
+        .send()
+        .await
+        .expect_err("KMSMasterKeyID with AES256 must be refused");
+    assert_eq!(misplaced_key.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        misplaced_key.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InvalidArgument"),
+        "misplaced key id error was {misplaced_key:?}"
+    );
+
+    // The refused updates left the baseline in place.
+    let stored = s3_client.get_bucket_encryption().bucket(TEST_BUCKET).send().await?;
+    let by_default = stored
+        .server_side_encryption_configuration()
+        .and_then(|config| config.rules().first())
+        .and_then(|rule| rule.apply_server_side_encryption_by_default())
+        .expect("baseline configuration must still be present");
+    assert_eq!(by_default.sse_algorithm(), &ServerSideEncryption::Aes256);
+    assert_eq!(by_default.kms_master_key_id(), None);
+
+    // aws:kms with a key id stays accepted.
+    s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(config_with(ServerSideEncryption::AwsKms, Some(&default_key_id)))
+        .send()
+        .await?;
+
+    kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     Ok(())
 }

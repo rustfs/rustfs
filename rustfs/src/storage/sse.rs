@@ -220,8 +220,9 @@ pub struct SseConfiguration {
 /// malformed bucket default pass the `copy_changes_encryption` guard and take
 /// the metadata-only shortcut while this layer still encrypts: fresh DEK
 /// metadata is committed beside the untouched plaintext blocks and the object
-/// becomes unreadable. Reachable only via corrupt or hand-edited bucket
-/// metadata — PutBucketEncryption rejects unknown algorithms (backlog#1826).
+/// becomes unreadable. PutBucketEncryption refuses unknown algorithms, so this
+/// is reachable only through a configuration stored before that check or
+/// through hand-edited bucket metadata (backlog#1826).
 pub(crate) fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
     match sse.sse_algorithm.as_str() {
         "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
