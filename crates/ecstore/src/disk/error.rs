@@ -865,8 +865,9 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             "staging rejected",
         )));
+        let cloned = marked.clone();
         assert!(marked.is_conditional_file_not_committed());
-        assert!(marked.clone().is_conditional_file_not_committed());
+        assert!(cloned.is_conditional_file_not_committed());
         assert!(!DiskError::Timeout.is_conditional_file_not_committed());
         assert!(
             !DiskError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "rename rejected"))
