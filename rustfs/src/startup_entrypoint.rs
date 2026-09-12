@@ -15,7 +15,8 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
-        ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope, Opt,
+        ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
+        ConnectThreadProfileScope, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -26,7 +27,8 @@ use crate::{
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::io::{Error, Read as _, Result};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, instrument};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -136,6 +138,7 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
+        CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::Server(config) => config,
     };
 
@@ -245,6 +248,231 @@ async fn execute_connect_logs(options: ConnectLogsOpts) -> Result<()> {
     );
     println!("upload=not-performed");
     Ok(())
+}
+
+async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<()> {
+    use crate::connect::{
+        LocalOtlpHeaders, LocallyReviewedTraceArtifact, MAX_OTLP_BODY_BYTES, MAX_TELEMETRY_RESULT_BYTES, OtlpBatch,
+        RecordedTrace, TelemetryDiagnosticResult, TelemetryProducerError, TelemetryTool, TraceRecordLimits, analyze_trace,
+        export_trace_otlp_result, record_diagnostic_result, record_trace_bus, replay_trace_result,
+    };
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    match command {
+        ConnectTelemetryCommands::Record(options) => {
+            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            if options.duration_millis == 0
+                || options.duration_millis > 30_000
+                || options.max_spans == 0
+                || options.max_spans > 1_024
+            {
+                return Err(Error::other("telemetry record limits are invalid"));
+            }
+            let cancel = CancellationToken::new();
+            let started = Instant::now();
+            let capture = record_trace_bus(
+                consent,
+                TraceRecordLimits {
+                    duration: Duration::from_millis(options.duration_millis),
+                    max_spans: options.max_spans,
+                },
+                &cancel,
+            );
+            tokio::pin!(capture);
+            let capture = tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    return Err(Error::other("telemetry record cancelled"));
+                }
+                result = capture.as_mut() => result,
+            };
+            match capture {
+                Ok(capture) => {
+                    let result = record_diagnostic_result(&request, capture, started.elapsed());
+                    save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
+                }
+                Err(TelemetryProducerError::SourceUnavailable) => {
+                    let result = TelemetryDiagnosticResult::<RecordedTrace>::unsupported(
+                        &request,
+                        TelemetryTool::Record,
+                        started.elapsed(),
+                    );
+                    println!("{}", serde_json::to_string(&result).map_err(Error::other)?);
+                    Ok(())
+                }
+                Err(error) => Err(Error::other(error)),
+            }
+        }
+        ConnectTelemetryCommands::Otlp(options) => {
+            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            let body = read_bounded_stdin(MAX_OTLP_BODY_BYTES)?;
+            let batch = OtlpBatch::new(body).map_err(Error::other)?;
+            let endpoint = reqwest::Url::parse(&options.endpoint).map_err(|_| Error::other("invalid OTLP endpoint"))?;
+            let mut headers = HeaderMap::new();
+            if let Some(name) = options.authorization_env.as_deref() {
+                if !valid_environment_name(name) {
+                    return Err(Error::other("invalid OTLP authorization environment variable name"));
+                }
+                let value = std::env::var(name).map_err(|_| Error::other("OTLP authorization is unavailable"))?;
+                let value = HeaderValue::from_str(&value).map_err(|_| Error::other("OTLP authorization is invalid"))?;
+                headers.insert(AUTHORIZATION, value);
+            }
+            let cancel = CancellationToken::new();
+            let result = export_trace_otlp_result(
+                &request,
+                endpoint,
+                LocalOtlpHeaders::new(headers),
+                batch,
+                consent,
+                Duration::from_millis(options.timeout_millis),
+                &cancel,
+            )
+            .await
+            .map_err(Error::other)?;
+            save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
+        }
+        ConnectTelemetryCommands::Replay(options) => {
+            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            let bytes = read_bounded_stdin(MAX_TELEMETRY_RESULT_BYTES)?;
+            let cancel = CancellationToken::new();
+            let result = replay_trace_result(
+                &request,
+                LocallyReviewedTraceArtifact::new(&bytes).map_err(Error::other)?,
+                consent,
+                &cancel,
+            )
+            .map_err(Error::other)?;
+            let analysis = analyze_trace(
+                result
+                    .data()
+                    .ok_or_else(|| Error::other("telemetry replay returned no data"))?,
+                consent,
+                &cancel,
+            )
+            .map_err(Error::other)?;
+            save_telemetry_result(
+                &options.artifact,
+                &request,
+                &result,
+                &key,
+                &cancel,
+                Some(serde_json::to_value(analysis).map_err(Error::other)?),
+            )
+        }
+    }
+}
+
+fn telemetry_context(
+    options: &ConnectTelemetryArtifactOpts,
+) -> Result<(
+    crate::connect::DeviceIdentity,
+    crate::connect::TelemetryArtifactRequest,
+    crate::connect::LocalTelemetryConsent,
+)> {
+    use crate::connect::{
+        IdentityStore, LocalTelemetryConsent, TelemetryArtifactConsent, TelemetryArtifactRequest, TelemetryProvenance,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect telemetry requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let remaining = options
+        .consent_expires_at_unix
+        .checked_sub(produced_at_unix)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| Error::other("local telemetry consent is expired"))?;
+    let consent = LocalTelemetryConsent::new(
+        Instant::now()
+            .checked_add(Duration::from_secs(remaining))
+            .ok_or_else(|| Error::other("local telemetry consent is expired"))?,
+    )
+    .map_err(Error::other)?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = TelemetryArtifactRequest {
+        organization_name: options.organization.clone(),
+        cluster_name: options.cluster.clone(),
+        device_name: options.device.clone(),
+        run_uid: options.run_uid.clone(),
+        artifact_uid: options.artifact_uid.clone(),
+        schema_version: crate::connect::TELEMETRY_SCHEMA_VERSION,
+        consent: TelemetryArtifactConsent {
+            consent_uid: options.consent_uid.clone(),
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        provenance: TelemetryProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    Ok((key, request, consent))
+}
+
+fn save_telemetry_result<T: serde::Serialize>(
+    options: &ConnectTelemetryArtifactOpts,
+    request: &crate::connect::TelemetryArtifactRequest,
+    result: &crate::connect::TelemetryDiagnosticResult<T>,
+    key: &crate::connect::DeviceIdentity,
+    cancel: &CancellationToken,
+    analysis: Option<serde_json::Value>,
+) -> Result<()> {
+    let export = crate::connect::encode_signed_telemetry_export(request, result, key, cancel).map_err(Error::other)?;
+    let receipt = crate::connect::save_signed_telemetry_export(&options.output, &export, cancel).map_err(Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "toolId": export.tool.id(),
+            "outcome": export.outcome.as_str(),
+            "reasonCode": export.reason_code.as_str(),
+            "artifactUid": receipt.artifact_uid,
+            "archiveSizeBytes": receipt.archive_size_bytes,
+            "archiveSha256": receipt.archive_sha256,
+            "analysis": analysis,
+            "upload": "NOT_PERFORMED",
+        })
+    );
+    Ok(())
+}
+
+fn read_bounded_stdin(limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    std::io::stdin()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err(Error::other("telemetry stdin is empty or exceeds its limit"));
+    }
+    Ok(bytes)
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn unix_now() -> Result<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(Error::other)?;
+    i64::try_from(duration.as_secs()).map_err(Error::other)
 }
 
 async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
