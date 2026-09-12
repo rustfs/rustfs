@@ -81,7 +81,8 @@ def summarize(runs):
             "successful_code_runs": len(successful_code_runs),
             "successful_code_wall": distribution(wall), "successful_code_job_sum": distribution(job_time),
             "jobs": job_summary,
-            "limits": ["Job creation-to-start is scheduler wait; dependency delay is not included.",
+            "limits": ["Live collection samples completed runs; ongoing queue depth is not measured.",
+                       "Job creation-to-start is scheduler wait; dependency delay is not included.",
                        "Step times can combine setup, compilation and tests; they do not isolate compiler time.",
                        "Job sums are unweighted runner minutes, not billing or wall time.",
                        "Actions timing does not establish functional completeness, escaped regressions or quarantine health."]}
@@ -97,7 +98,7 @@ def collect(repository, limit, since=None):
     runs = []
     page = 1
     while len(runs) < limit:
-        query = urlencode({"event": "pull_request", "per_page": 100, "page": page, "created": ">=" + since.isoformat()})
+        query = urlencode({"event": "pull_request", "status": "completed", "per_page": 100, "page": page, "created": ">=" + since.isoformat()})
         batch = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}")["workflow_runs"]
         if any(timestamp(run.get("created_at")) is None or timestamp(run["created_at"]) < since for run in batch):
             raise ValueError("GitHub returned runs outside the requested date range")
