@@ -719,6 +719,11 @@ pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
         let code = match resolution_error.kind() {
             EncryptionResolutionErrorKind::InvalidRequest => S3ErrorCode::InvalidRequest,
             EncryptionResolutionErrorKind::ServiceUnavailable => S3ErrorCode::ServiceUnavailable,
+            // Same code the write path returns for this key; `From<ApiError>`
+            // attaches the 400 that s3s cannot derive for a custom code.
+            EncryptionResolutionErrorKind::KeyNotFound => S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+            EncryptionResolutionErrorKind::AccessDenied => S3ErrorCode::AccessDenied,
+            EncryptionResolutionErrorKind::NotImplemented => S3ErrorCode::NotImplemented,
             // A permanent property of the stored object, not a transient server
             // fault: 5xx would invite client retry storms against an object
             // this server can never decrypt.
@@ -1508,10 +1513,19 @@ fn normalize_encryption_metadata_case(
     Ok(Cow::Owned(normalized))
 }
 
+/// Carry the S3-level classification of a decryption failure through the
+/// ecstore boundary. Every code produced by `data_plane_kms_error` needs a
+/// kind here, otherwise the read path reports it as an internal fault even
+/// though the write path already reports the same KMS error to the client.
 fn map_encryption_resolution_error(error: ApiError) -> EncryptionResolutionError {
-    let kind = match error.code {
+    let kind = match &error.code {
         S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => EncryptionResolutionErrorKind::InvalidRequest,
         S3ErrorCode::ServiceUnavailable => EncryptionResolutionErrorKind::ServiceUnavailable,
+        S3ErrorCode::Custom(code) if &**code == crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE => {
+            EncryptionResolutionErrorKind::KeyNotFound
+        }
+        S3ErrorCode::AccessDenied => EncryptionResolutionErrorKind::AccessDenied,
+        S3ErrorCode::NotImplemented => EncryptionResolutionErrorKind::NotImplemented,
         _ => EncryptionResolutionErrorKind::DecryptionFailed,
     };
     EncryptionResolutionError::new(kind, error.message)
@@ -3362,6 +3376,25 @@ fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
     api_error
 }
 
+/// Classification for a failed data-key unwrap.
+///
+/// An AEAD failure stays `500` (the envelope is an integrity fault, not a
+/// request a retry or a different header can fix), but the generic internal
+/// error text hides the one diagnosis an operator needs: the configured
+/// backend holds different key material under this key id than the one that
+/// wrapped the object, typically after re-creating a key of the same name or
+/// switching backends.
+fn kms_unwrap_error(error: rustfs_kms::KmsError) -> ApiError {
+    let unwrap_rejected = matches!(error, rustfs_kms::KmsError::CryptographicError { .. });
+    let mut api_error = kms_operation_error(error);
+    if unwrap_rejected && api_error.code == S3ErrorCode::InternalError {
+        api_error.message = "The object's data key envelope could not be unwrapped by the configured KMS backend: the \
+                             key material under this key id differs from the one that wrapped it, or the envelope is damaged"
+            .to_string();
+    }
+    api_error
+}
+
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
@@ -3446,7 +3479,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_data_key(encrypted_dek, context)
             .await
-            .map_err(kms_operation_error)?;
+            .map_err(kms_unwrap_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -3465,7 +3498,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_legacy_data_key(encrypted_dek)
             .await
-            .map_err(kms_operation_error)?;
+            .map_err(kms_unwrap_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -4415,6 +4448,56 @@ mod tests {
         assert_eq!(corrupt.code, S3ErrorCode::InternalError);
         assert_eq!(missing.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
         assert_eq!(super::kms_data_plane_error_class(&missing), "key_not_found");
+    }
+
+    /// The read path squeezes the S3 classification through ecstore's
+    /// resolution-error kinds; every KMS class the write path reports to the
+    /// client must survive that hop instead of collapsing onto `DecryptionFailed`
+    /// (which the S3 layer reports as `500`).
+    #[test]
+    fn encryption_resolution_kinds_preserve_kms_read_classification() {
+        let cases = [
+            (
+                rustfs_kms::KmsError::key_not_found("no-such-key"),
+                EncryptionResolutionErrorKind::KeyNotFound,
+            ),
+            (rustfs_kms::KmsError::access_denied("policy"), EncryptionResolutionErrorKind::AccessDenied),
+            (
+                rustfs_kms::KmsError::unsupported_capability("local", "decrypt_legacy"),
+                EncryptionResolutionErrorKind::NotImplemented,
+            ),
+            (
+                rustfs_kms::KmsError::backend_error("connection refused"),
+                EncryptionResolutionErrorKind::ServiceUnavailable,
+            ),
+            (
+                rustfs_kms::KmsError::invalid_operation("key is disabled"),
+                EncryptionResolutionErrorKind::InvalidRequest,
+            ),
+            (
+                rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"),
+                EncryptionResolutionErrorKind::DecryptionFailed,
+            ),
+        ];
+        for (error, expected) in cases {
+            let description = error.to_string();
+            let resolution = super::map_encryption_resolution_error(kms_operation_error(error));
+            assert_eq!(resolution.kind(), expected, "{description}");
+        }
+    }
+
+    /// An unwrap the backend rejects stays an internal error, but says why in
+    /// words an operator can act on rather than the generic 500 text.
+    #[test]
+    fn kms_unwrap_error_keeps_500_but_names_the_envelope_mismatch() {
+        let rejected = super::kms_unwrap_error(rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"));
+        assert_eq!(rejected.code, S3ErrorCode::InternalError);
+        assert!(rejected.message.contains("could not be unwrapped"), "message was {}", rejected.message);
+        assert_eq!(super::kms_data_plane_error_class(&rejected), "cryptographic");
+
+        let missing = super::kms_unwrap_error(rustfs_kms::KmsError::key_not_found("no-such-key"));
+        assert_eq!(missing.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(missing.message, "KMS key not found: no-such-key");
     }
 
     #[test]
@@ -7584,6 +7667,32 @@ mod tests {
         let err = map_get_object_reader_error(StorageError::other(resolution_error));
         assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message, "KMS unavailable");
+    }
+
+    /// The reader wraps the resolution error in an io error exactly like
+    /// `readers.rs` does; a missing key must come out as the same `400
+    /// KMS.NotFoundException` the write path returns, not `500`.
+    #[test]
+    fn test_map_get_object_reader_error_reports_missing_kms_key_as_client_error() {
+        let resolution_error =
+            super::EncryptionResolutionError::new(EncryptionResolutionErrorKind::KeyNotFound, "KMS key not found: finance-key");
+        let err = map_get_object_reader_error(StorageError::other(resolution_error));
+        assert_eq!(err.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(err.message, "KMS key not found: finance-key");
+        let s3_error = s3s::S3Error::from(err);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        let denied = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
+            EncryptionResolutionErrorKind::AccessDenied,
+            "Access Denied",
+        )));
+        assert_eq!(denied.code, S3ErrorCode::AccessDenied);
+
+        let unsupported = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
+            EncryptionResolutionErrorKind::NotImplemented,
+            "backend cannot unwrap legacy envelopes",
+        )));
+        assert_eq!(unsupported.code, S3ErrorCode::NotImplemented);
     }
 
     #[test]

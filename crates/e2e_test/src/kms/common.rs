@@ -349,7 +349,7 @@ pub async fn create_default_key(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let create_key_body = serde_json::json!({
-        "key_usage": "ENCRYPT_DECRYPT",
+        "key_usage": "EncryptDecrypt",
         "description": "Default key for e2e testing"
     })
     .to_string();

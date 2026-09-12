@@ -21,7 +21,7 @@
 //! - Corrupted key files
 //! - Recovery from transient failures
 
-use super::common::LocalKMSTestEnvironment;
+use super::common::{LocalKMSTestEnvironment, create_default_key, create_key_with_specific_id, kms_admin_request};
 use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::ServerSideEncryption;
@@ -532,5 +532,131 @@ async fn test_kms_concurrent_encryption_requests() -> Result<(), Box<dyn std::er
     );
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
+    Ok(())
+}
+
+/// Once the key an object was wrapped under is deleted, the object cannot be
+/// read until the key is restored. That is the same `400 KMS.NotFoundException`
+/// a write under a missing key returns, not a `500`; `HeadObject` never unwraps
+/// the data key and keeps answering `200`.
+#[tokio::test]
+async fn test_reads_under_a_deleted_kms_key_report_key_not_found() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = "rustfs-e2e-test-default-key";
+    create_key_with_specific_id(&kms_env.kms_keys_dir, default_key_id).await?;
+    let key_dir = kms_env.kms_keys_dir.clone();
+    kms_env
+        .base_env
+        .start_rustfs_server_with_env(
+            vec![
+                "--kms-enable",
+                "--kms-backend",
+                "local",
+                "--kms-key-dir",
+                &key_dir,
+                "--kms-default-key-id",
+                default_key_id,
+            ],
+            &[
+                ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+                // Immediate deletion is refused on a default server; the test
+                // needs the key gone now rather than after the waiting window.
+                ("RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION", "true"),
+            ],
+        )
+        .await?;
+    kms_env.wait_for_kms_ready().await?;
+    let base = &kms_env.base_env;
+    let s3_client = base.create_s3_client();
+    base.create_test_bucket(TEST_BUCKET).await?;
+
+    let doomed_key_id = create_default_key(&base.url, &base.access_key, &base.secret_key).await?;
+    let object_key = "wrapped-under-doomed-key";
+    let payload = b"readable only while the key exists".to_vec();
+    let put = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(payload.clone()))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .ssekms_key_id(&doomed_key_id)
+        .send()
+        .await?;
+    assert_eq!(put.ssekms_key_id(), Some(doomed_key_id.as_str()));
+
+    info!("🗑️ deleting {doomed_key_id} immediately");
+    kms_admin_request(
+        &base.url,
+        http::Method::DELETE,
+        "/rustfs/admin/v3/kms/keys/delete",
+        Some(
+            &serde_json::json!({
+                "key_id": doomed_key_id,
+                "force_immediate": true,
+                "confirm_key_id": doomed_key_id,
+            })
+            .to_string(),
+        ),
+        &base.access_key,
+        &base.secret_key,
+    )
+    .await?;
+    kms_admin_request(
+        &base.url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/clear-cache",
+        Some("{}"),
+        &base.access_key,
+        &base.secret_key,
+    )
+    .await?;
+
+    let head = s3_client.head_object().bucket(TEST_BUCKET).key(object_key).send().await?;
+    assert_eq!(head.ssekms_key_id(), Some(doomed_key_id.as_str()));
+
+    let get_error = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .send()
+        .await
+        .expect_err("an object wrapped under a deleted key must not be readable");
+    assert_eq!(get_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        get_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException"),
+        "GetObject error was {get_error:?}"
+    );
+
+    let copy_error = s3_client
+        .copy_object()
+        .bucket(TEST_BUCKET)
+        .key("copied-from-doomed-source")
+        .copy_source(format!("{TEST_BUCKET}/{object_key}"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await
+        .expect_err("copying from an object wrapped under a deleted key must fail the same way");
+    assert_eq!(copy_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        copy_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException"),
+        "CopyObject error was {copy_error:?}"
+    );
+
+    // The default key is untouched, so the node keeps serving other objects.
+    let unaffected = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("wrapped-under-default-key")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"still fine"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await?;
+    assert_eq!(unaffected.ssekms_key_id(), Some(default_key_id));
+
+    base.delete_test_bucket(TEST_BUCKET).await?;
     Ok(())
 }
