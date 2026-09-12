@@ -1026,7 +1026,7 @@ impl DefaultMultipartUsecase {
         let (effective_sse, effective_kms_key_id) = match prepared_material {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
-                let ssekms_key_id = material.kms_key_id.clone();
+                let ssekms_key_id = material.response_kms_key_id();
 
                 let mut encryption_metadata = encryption_material_to_metadata(&material)?;
                 if material.key_kind == EncryptionKeyKind::Object {

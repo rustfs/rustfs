@@ -357,3 +357,97 @@ async fn test_multipart_upload_writes_encrypted_data() -> Result<(), Box<dyn std
 
     Ok(())
 }
+
+/// `x-amz-server-side-encryption-aws-kms-key-id` is defined for `aws:kms`
+/// objects only. SSE-S3 wraps its data key under the service default key too,
+/// but that key is internal: PutObject, CopyObject and CreateMultipartUpload
+/// responses for an `AES256` object must not name it.
+#[tokio::test]
+async fn test_sse_s3_write_responses_carry_no_kms_key_id() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key = kms_env.start_rustfs_for_local_kms().await?;
+    kms_env.wait_for_kms_ready().await?;
+
+    let s3_client = kms_env.base_env.create_s3_client();
+    kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
+
+    let put = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sse-s3-put")
+        .body(ByteStream::from_static(b"sse-s3 payload"))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    assert_eq!(put.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(put.ssekms_key_id(), None, "PutObject AES256 must not advertise the wrapping key");
+
+    let get = s3_client.get_object().bucket(TEST_BUCKET).key("sse-s3-put").send().await?;
+    assert_eq!(get.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(get.ssekms_key_id(), None, "GetObject AES256 must not advertise the wrapping key");
+    let head = s3_client.head_object().bucket(TEST_BUCKET).key("sse-s3-put").send().await?;
+    assert_eq!(head.ssekms_key_id(), None, "HeadObject AES256 must not advertise the wrapping key");
+
+    let copy = s3_client
+        .copy_object()
+        .bucket(TEST_BUCKET)
+        .key("sse-s3-copy")
+        .copy_source(format!("{TEST_BUCKET}/sse-s3-put"))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    assert_eq!(copy.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(copy.ssekms_key_id(), None, "CopyObject AES256 must not advertise the wrapping key");
+
+    let multipart = s3_client
+        .create_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key("sse-s3-multipart")
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    assert_eq!(multipart.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(
+        multipart.ssekms_key_id(),
+        None,
+        "CreateMultipartUpload AES256 must not advertise the wrapping key"
+    );
+    s3_client
+        .abort_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key("sse-s3-multipart")
+        .upload_id(multipart.upload_id().expect("upload id"))
+        .send()
+        .await?;
+
+    // Control: the same responses keep naming the key for an aws:kms object.
+    let kms_put = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sse-kms-put")
+        .body(ByteStream::from_static(b"sse-kms payload"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await?;
+    assert_eq!(kms_put.ssekms_key_id(), Some(default_key.as_str()));
+    let kms_multipart = s3_client
+        .create_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key("sse-kms-multipart")
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .send()
+        .await?;
+    assert_eq!(kms_multipart.ssekms_key_id(), Some(default_key.as_str()));
+    s3_client
+        .abort_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key("sse-kms-multipart")
+        .upload_id(kms_multipart.upload_id().expect("upload id"))
+        .send()
+        .await?;
+
+    kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
+    Ok(())
+}

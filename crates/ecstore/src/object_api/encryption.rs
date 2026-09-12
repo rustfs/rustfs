@@ -34,6 +34,14 @@ pub enum EncryptionResolutionErrorKind {
     InvalidRequest,
     InvalidMetadata,
     ServiceUnavailable,
+    /// The key named by the object's metadata no longer exists in the KMS.
+    /// A client error on the read (the object is unreadable until the key is
+    /// restored), distinct from a damaged envelope.
+    KeyNotFound,
+    /// The KMS refused the unwrap for the caller's principal.
+    AccessDenied,
+    /// The configured KMS backend lacks the capability the unwrap needs.
+    NotImplemented,
     DecryptionFailed,
 }
 
