@@ -52,6 +52,7 @@ mod config_test;
 // Re-export public types
 pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
+pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
 pub use cli::{DiagnoseFormat, DiagnoseOpts};
 pub use cli::{InspectBucketMetaOpts, InspectCommands, InspectOpts};

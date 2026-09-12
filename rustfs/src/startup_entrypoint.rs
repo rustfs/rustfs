@@ -14,8 +14,8 @@
 
 use crate::{
     config::{
-        CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectThreadProfileScope, Opt,
+        CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
+        ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -135,6 +135,7 @@ async fn async_main() -> Result<()> {
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
+        CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::Server(config) => config,
     };
 
@@ -162,6 +163,88 @@ async fn async_main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+async fn execute_connect_logs(options: ConnectLogsOpts) -> Result<()> {
+    use crate::connect::{
+        CaptureMode, IdentityStore, LocalLogConsent, LogCaptureRequest, LogProvenance, export_logs, save_signed_log_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect logs requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = LogCaptureRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalLogConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        mode: match options.mode {
+            ConnectLogsMode::Batch => CaptureMode::Batch,
+            ConnectLogsMode::Live => CaptureMode::Live,
+        },
+        duration: Duration::from_millis(options.duration_millis),
+        max_events: options.max_events,
+        provenance: LogProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let capture = export_logs(&request, &key, &cancel);
+    tokio::pin!(capture);
+    let export = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return Err(Error::other("log collection cancelled"));
+        }
+        result = capture.as_mut() => result.map_err(Error::other)?,
+    };
+    drop(capture);
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_log_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+
+    println!("tool=logs.capture outcome=SUCCEEDED reason=COMPLETE");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
 }
 
 async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
