@@ -1540,6 +1540,19 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
+    /// The KMS key id a write response may advertise.
+    ///
+    /// `kms_key_id` is always set for managed SSE because SSE-S3 also wraps
+    /// its data key under the service default key, but that key is an
+    /// internal detail of an `AES256` object: only an `aws:kms` object names
+    /// a key the caller can act on, and `x-amz-server-side-encryption-aws-kms-key-id`
+    /// is defined only for that scheme.
+    pub fn response_kms_key_id(&self) -> Option<SSEKMSKeyId> {
+        matches!(self.sse_type, SSEType::SseKms)
+            .then(|| self.kms_key_id.clone())
+            .flatten()
+    }
+
     pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> super::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
@@ -2483,7 +2496,9 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
         server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(sse_type).to_string()),
         sse_customer_algorithm: None,
         sse_customer_key_md5: None,
-        ssekms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
+        // The key id was needed above to authorize the read, but an AES256
+        // object's wrapping key is internal: only aws:kms objects advertise it.
+        ssekms_key_id: matches!(sse_type, SSEType::SseKms).then(|| SSEKMSKeyId::from(kms_key_id)),
     }))
 }
 
@@ -5975,7 +5990,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
-        let metadata = encryption_material_to_metadata(&EncryptionMaterial {
+        let material = EncryptionMaterial {
             sse_type: SSEType::SseKms,
             server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
             kms_key_id: Some("test-key".to_string()),
@@ -5988,8 +6003,10 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        })
-        .expect("managed SSE metadata should serialize");
+        };
+        // Only an aws:kms object names its key in write responses.
+        assert_eq!(material.response_kms_key_id().as_deref(), Some("test-key"));
+        let metadata = encryption_material_to_metadata(&material).expect("managed SSE metadata should serialize");
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -6166,6 +6183,9 @@ mod tests {
                 let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
                 assert_eq!(material.kms_key_id.as_deref(), Some("default"));
+                // The wrapping key stays internal: no write response may
+                // advertise it for an AES256 object.
+                assert_eq!(material.response_kms_key_id(), None);
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
                 assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
                 assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
@@ -8241,6 +8261,32 @@ mod tests {
     // ========================================================================
     // Read-side response classification (single-decrypt GET path)
     // ========================================================================
+
+    /// An AES256 object is read under the same key-id resolution as aws:kms
+    /// (authorization needs it), but the response must not advertise that
+    /// internal wrapping key.
+    #[tokio::test]
+    async fn classification_withholds_the_wrapping_key_for_sse_s3_reads() {
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "service-default".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string([1u8; 16])),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([2u8; 12])),
+        ]);
+        let headers = super::classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect("sse-s3 classification should succeed")
+        .expect("managed metadata should classify");
+        assert_eq!(headers.server_side_encryption.as_str(), ServerSideEncryption::AES256);
+        assert_eq!(headers.ssekms_key_id, None);
+    }
 
     #[tokio::test]
     async fn classification_reproduces_managed_read_headers_and_audit_without_a_kms_unwrap() {

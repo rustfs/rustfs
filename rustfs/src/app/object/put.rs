@@ -1867,7 +1867,7 @@ impl DefaultObjectUsecase {
 
         if let Some(material) = encryption_material {
             effective_sse = Some(material.server_side_encryption.clone());
-            effective_kms_key_id = material.kms_key_id.clone();
+            effective_kms_key_id = material.response_kms_key_id();
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
