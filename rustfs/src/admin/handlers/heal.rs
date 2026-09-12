@@ -242,6 +242,40 @@ struct HealStartSuccess {
     start_time: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct HealStatusSettings {
+    recursive: bool,
+    dry_run: bool,
+    remove: bool,
+    recreate: bool,
+    scan_mode: HealScanMode,
+    update_parity: bool,
+    #[serde(rename = "nolock")]
+    no_lock: bool,
+    #[serde(rename = "readRepair")]
+    read_repair: bool,
+    pool: Option<usize>,
+    set: Option<usize>,
+}
+
+impl From<HealOpts> for HealStatusSettings {
+    fn from(settings: HealOpts) -> Self {
+        Self {
+            recursive: settings.recursive,
+            dry_run: settings.dry_run,
+            remove: settings.remove,
+            recreate: settings.recreate,
+            scan_mode: settings.scan_mode,
+            update_parity: settings.update_parity,
+            no_lock: settings.no_lock,
+            read_repair: settings.read_repair,
+            pool: settings.pool,
+            set: settings.set,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealTaskStatus {
@@ -251,7 +285,7 @@ struct HealTaskStatus {
     failure_detail: String,
     start_time: String,
     #[serde(rename = "settings")]
-    heal_settings: HealOpts,
+    heal_settings: HealStatusSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -1076,6 +1110,8 @@ async fn submit_cluster_heal_channel_command(
 struct HealTaskStatusPayload {
     #[serde(skip)]
     adapted_detail: Option<String>,
+    #[serde(default, rename = "settings", skip_serializing)]
+    heal_settings: Option<HealStatusSettings>,
     summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
@@ -1130,9 +1166,10 @@ fn encode_heal_start_success(client_token: String, client_address: String) -> S3
 fn encode_heal_task_status(
     mut payload: HealTaskStatusPayload,
     failure_detail: String,
-    heal_settings: HealOpts,
+    fallback_heal_settings: HealOpts,
 ) -> S3Result<Vec<u8>> {
     let failure_detail = payload.adapted_detail.take().unwrap_or(failure_detail);
+    let heal_settings = payload.heal_settings.take().unwrap_or_else(|| fallback_heal_settings.into());
     encode_json(&HealTaskStatus {
         payload,
         failure_detail,
@@ -2957,6 +2994,50 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_uses_settings_from_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(
+                br#"{"summary":"running","settings":{"recursive":true,"dryRun":true,"remove":true,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false,"readRepair":false,"pool":1,"set":2}}"#
+                    .to_vec(),
+            ),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 2);
+        assert_eq!(json["settings"]["dryRun"], true);
+        assert_eq!(json["settings"]["remove"], true);
+        assert_eq!(json["settings"]["recreate"], false);
+        assert_eq!(json["settings"]["updateParity"], false);
+        assert_eq!(json["settings"]["recursive"], true);
+        assert_eq!(json["settings"]["pool"], 1);
+        assert_eq!(json["settings"]["set"], 2);
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_defaults_settings_for_legacy_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(br#"{"summary":"running"}"#.to_vec()),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("legacy channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("legacy public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 1);
+        assert_eq!(json["settings"]["dryRun"], false);
+        assert_eq!(json["settings"]["remove"], false);
     }
 
     #[test]

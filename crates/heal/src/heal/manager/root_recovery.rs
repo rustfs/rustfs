@@ -208,6 +208,8 @@ struct RootHealTerminal {
     task_id: String,
     heal_type: RecoveryHealType,
     status: HealTaskStatus,
+    #[serde(default, deserialize_with = "decode_options")]
+    options: HealOptions,
     progress: Option<HealProgress>,
     completed_at: SystemTime,
 }
@@ -219,17 +221,19 @@ impl RootHealTerminal {
             task_id: task_id.to_owned(),
             heal_type: RecoveryHealType::from(&completed.heal_type),
             status: completed.status.clone(),
+            options: completed.options.clone(),
             progress: completed.progress.clone(),
             completed_at: completed.completed_at,
         }
     }
 
-    fn cancelled(task_id: &str, heal_type: &HealType) -> Self {
+    fn cancelled(task_id: &str, heal_type: &HealType, options: HealOptions) -> Self {
         Self {
             schema: ROOT_TERMINAL_SCHEMA,
             task_id: task_id.to_owned(),
             heal_type: RecoveryHealType::from(heal_type),
             status: HealTaskStatus::Cancelled,
+            options,
             progress: None,
             completed_at: SystemTime::now(),
         }
@@ -241,6 +245,7 @@ impl RootHealTerminal {
             progress: self.progress,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: self.heal_type.into(),
+            options: self.options,
             status: self.status,
             result_items_truncated: false,
             completed_at: self.completed_at,
@@ -676,7 +681,7 @@ impl RootHealRecovery {
         };
         let pending = decode_intent(task_id, &bytes)?;
         let heal_type = HealType::from(pending.heal_type);
-        let terminal = RootHealTerminal::cancelled(task_id, &heal_type);
+        let terminal = RootHealTerminal::cancelled(task_id, &heal_type, pending.options);
         let _ = Self::persist_terminal_locked(&disks, task_id, terminal).await?;
         match EcstoreDiskAPI::compare_and_update_file(
             disk.as_ref(),

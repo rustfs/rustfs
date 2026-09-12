@@ -112,6 +112,7 @@ fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus 
     CompletedHealStatus {
         outcome: None,
         heal_type: HealType::Cluster,
+        options: HealOptions::default(),
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
             objects_scanned: 9,
@@ -2697,6 +2698,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
             outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
+            options: request.options.clone(),
             status: HealTaskStatus::Retrying {
                 error: "Lock acquisition timeout".to_string(),
                 retry_attempt: request.retry_attempts,
@@ -3468,12 +3470,19 @@ async fn test_get_task_report_queries_queued_task_by_token_without_path() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(storage, None);
 
+    let options = HealOptions {
+        scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+        dry_run: true,
+        remove_corrupted: true,
+        recreate_missing: false,
+        ..Default::default()
+    };
     let request = HealRequest::new(
         HealType::ErasureSet {
             buckets: vec![],
             set_disk_id: "pool_0_set_1".to_string(),
         },
-        HealOptions::default(),
+        options.clone(),
         HealPriority::High,
     );
     let request_id = request.id.clone();
@@ -3489,7 +3498,35 @@ async fn test_get_task_report_queries_queued_task_by_token_without_path() {
         .expect("queued task should be queryable by token");
 
     assert_eq!(report.status, HealTaskStatus::Pending);
+    assert_eq!(report.options, Some(options));
     assert!(report.result_items.is_empty());
+}
+
+#[tokio::test]
+async fn test_get_task_report_preserves_retrying_options() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new_without_root_recovery_for_test(storage, None);
+    let options = HealOptions {
+        scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+        dry_run: true,
+        recreate_missing: false,
+        ..Default::default()
+    };
+    let mut request = HealRequest::bucket("bucket-retrying-options".to_string());
+    request.options = options.clone();
+    let task_id = request.id.clone();
+    manager.retrying_heals.lock().await.insert(
+        task_id.clone(),
+        RetryingHeal {
+            request,
+            error: "transient".to_string(),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+
+    let report = manager.get_task_report(&task_id).await.expect("retrying task report");
+    assert!(matches!(report.status, HealTaskStatus::Retrying { .. }));
+    assert_eq!(report.options, Some(options));
 }
 
 #[tokio::test]
@@ -3510,6 +3547,7 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
             outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
+            options: request.options.clone(),
             status: HealTaskStatus::Retrying {
                 error: "transient disk failure".to_string(),
                 retry_attempt: 1,
@@ -3550,6 +3588,7 @@ async fn test_get_task_status_reads_recent_completed_status() {
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
             },
+            options: HealOptions::default(),
             status: HealTaskStatus::Completed,
             result_items_truncated: false,
             seqed_items: Vec::new(),
@@ -3584,6 +3623,7 @@ async fn test_get_task_report_for_path_reads_completed_items() {
                 object: "object".to_string(),
                 version_id: None,
             },
+            options: HealOptions::default(),
             status: HealTaskStatus::Completed,
             result_items_truncated: true,
             seqed_items: vec![(
