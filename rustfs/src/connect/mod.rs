@@ -28,6 +28,7 @@
 pub mod client;
 pub mod config;
 pub mod credential_store;
+pub mod environment;
 pub mod heartbeat;
 pub mod identity;
 pub mod identity_store;
@@ -41,6 +42,10 @@ mod telemetry;
 pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
 pub use credential_store::{CredentialStore, DeviceCredential};
+pub use environment::{
+    ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
+    EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, collect_environment,
+};
 pub use heartbeat::{CoarseNodeSummary, HeartbeatError, HeartbeatStatus};
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};
 pub use identity_store::{IdentityStore, StoreError};
