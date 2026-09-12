@@ -20,6 +20,8 @@ use s3s::{S3Error, S3ErrorCode};
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
+const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
+const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
 pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
@@ -105,6 +107,7 @@ fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
         S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
             Some(StatusCode::BAD_REQUEST)
         }
+        S3ErrorCode::Custom(custom) if &**custom == SLOW_DOWN_READ_CODE => Some(StatusCode::SERVICE_UNAVAILABLE),
         _ => None,
     }
 }
@@ -403,6 +406,7 @@ impl ApiError {
             S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE => {
                 MAX_VERSIONS_EXCEEDED_MESSAGE.to_string()
             }
+            S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE => SLOW_DOWN_READ_MESSAGE.to_string(),
             _ => code.as_str().to_string(),
         }
     }
@@ -577,10 +581,10 @@ impl From<StorageError> for ApiError {
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
-            StorageError::ErasureReadQuorum
-            | StorageError::InsufficientReadQuorum(_, _)
-            | StorageError::ErasureWriteQuorum
-            | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
+            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => {
+                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())
+            }
+            StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             StorageError::MaxVersionsExceeded => S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()),
@@ -1288,10 +1292,10 @@ mod tests {
             (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::DiskNotFound, S3ErrorCode::ServiceUnavailable),
             (StorageError::TooManyOpenFiles, S3ErrorCode::ServiceUnavailable),
-            (StorageError::ErasureReadQuorum, S3ErrorCode::ServiceUnavailable),
+            (StorageError::ErasureReadQuorum, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())),
             (
                 StorageError::InsufficientReadQuorum("test".into(), "test".into()),
-                S3ErrorCode::ServiceUnavailable,
+                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()),
             ),
             (StorageError::ErasureWriteQuorum, S3ErrorCode::ServiceUnavailable),
             (
@@ -1427,6 +1431,21 @@ mod tests {
 
         assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn read_quorum_failure_matches_minio_slow_down_read_response() {
+        for error in [
+            StorageError::ErasureReadQuorum,
+            StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
+        ] {
+            let api_error = ApiError::from(error);
+            assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+            assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
+
+            let s3_error: S3Error = api_error.into();
+            assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        }
     }
 
     #[test]
