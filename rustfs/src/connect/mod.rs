@@ -45,12 +45,14 @@ pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
 pub use credential_store::{CredentialStore, DeviceCredential};
 pub use diagnostics::{
-    CPU_PROFILE_CAPABILITY, DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime,
-    DiagnosticScheduleStatus, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
-    ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
-    ProfileTool, ReceiptOutcome, SavedProfileExport, SignedProfileExport, THREAD_PROFILE_CAPABILITY, ThreadProfileScope,
-    capture_cpu_profile, capture_thread_profile, encode_signed_profile_export, export_cpu_profile, export_memory_profile,
-    export_thread_profile, run_local_environment_once, save_signed_profile_export, spawn_environment_schedule,
+    CPU_PROFILE_CAPABILITY, CaptureMode, DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError,
+    DiagnosticScheduleRuntime, DiagnosticScheduleStatus, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent,
+    LocalProfileConsent, LogCaptureError, LogCaptureRequest, LogProvenance, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY,
+    PROFILE_SCHEMA_VERSION, ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance,
+    ProfileReasonCode, ProfileResult, ProfileTool, ReceiptOutcome, SavedLogExport, SavedProfileExport, SignedLogExport,
+    SignedProfileExport, THREAD_PROFILE_CAPABILITY, ThreadProfileScope, capture_cpu_profile, capture_thread_profile,
+    encode_signed_profile_export, export_cpu_profile, export_logs, export_memory_profile, export_thread_profile,
+    run_local_environment_once, save_signed_log_export, save_signed_profile_export, spawn_environment_schedule,
 };
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,

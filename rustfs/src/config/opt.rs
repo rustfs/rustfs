@@ -141,6 +141,7 @@ impl Opt {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
+                ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
             },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
