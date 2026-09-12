@@ -278,7 +278,8 @@ class ScannerAbbaTest(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}), \
                  patch.object(harness, "__file__", str(self.root / "scanner_abba.py")), \
-                 patch.object(harness, "invoke", side_effect=failed_measure):
+                 patch.object(harness, "invoke", side_effect=failed_measure), \
+                 patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}):
                 with self.assertRaisesRegex(ValueError, "injected measurement failure"):
                     harness.collect_live({"collector": {"alias": "fixture", "endpoint": "fixture", "metrics_endpoints": "fixture"}},
                                          {"duration_seconds": 900}, request, self.adapter)
@@ -537,7 +538,8 @@ class ScannerAbbaTest(unittest.TestCase):
                 process = Mock(pid=123, wait=Mock(return_value=1 if name == "collector-exit" else 0))
                 with patch.object(harness, "OwnedCommand", return_value=process), \
                         patch.object(harness, "invoke", return_value={"sample_count": 10}), \
-                        patch.object(harness.time, "monotonic", side_effect=(0, 900)):
+                        patch.object(harness.time, "monotonic", side_effect=(0, 900)), \
+                        patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}):
                     if error:
                         with self.assertRaisesRegex(ValueError, error):
                             harness.collect_live(prepared, {"duration_seconds": 900}, self.root / "request.json", self.adapter)
@@ -546,6 +548,19 @@ class ScannerAbbaTest(unittest.TestCase):
                                                              self.root / "request.json", self.adapter), {"sample_count": 10})
 
                 process.finish.assert_called_once_with(terminate=True)
+
+    def test_live_collector_requires_credentials_before_measurement(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        prepared = {"collector": {"alias": "test", "endpoint": "http://node-a:9000",
+                                  "metrics_endpoints": "http://node-a:9000"}}
+        with patch.object(harness, "OwnedCommand") as command, \
+                patch.object(harness, "invoke") as invoke, \
+                patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "collector requires RUSTFS_ACCESS_KEY"):
+                harness.collect_live(prepared, {"duration_seconds": 900}, request, self.adapter)
+        command.assert_not_called()
+        invoke.assert_not_called()
 
     def test_live_collector_binds_release_evidence_metrics_endpoints(self):
         telemetry = self.root / "telemetry"
@@ -570,7 +585,8 @@ class ScannerAbbaTest(unittest.TestCase):
         process = Mock(pid=123, wait=Mock(return_value=0))
         with patch.object(harness, "OwnedCommand", return_value=process), \
                 patch.object(harness, "invoke", return_value={"sample_count": 10}), \
-                patch.object(harness.time, "monotonic", side_effect=(0, 900)):
+                patch.object(harness.time, "monotonic", side_effect=(0, 900)), \
+                patch.dict(os.environ, {"RUSTFS_ACCESS_KEY": "test", "RUSTFS_SECRET_KEY": "test"}):
             with self.assertRaisesRegex(ValueError, "collector metrics endpoints"):
                 harness.collect_live(prepared, request, self.root / "request.json", self.adapter)
         process.finish.assert_called_once_with(terminate=True)
