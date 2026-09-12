@@ -119,21 +119,34 @@ fn encode_heal_task_status_payload(
     }
 }
 
-fn encode_heal_status_response(
-    summary: &str,
-    items: Vec<HealResultItem>,
-    progress: Option<&HealProgress>,
+#[derive(Default)]
+struct HealStatusResponseContext<'a> {
+    progress: Option<&'a HealProgress>,
     detail: Option<String>,
     truncated: bool,
     sequence: (u64, u64),
-    outcome: Option<&super::outcome::HealTaskOutcome>,
-    settings: Option<&HealOpts>,
+    outcome: Option<&'a super::outcome::HealTaskOutcome>,
+    settings: Option<&'a HealOpts>,
+}
+
+fn encode_heal_status_response(
+    summary: &str,
+    items: Vec<HealResultItem>,
+    context: HealStatusResponseContext<'_>,
 ) -> Result<(Vec<u8>, Option<String>)> {
-    let (summary, detail) = match outcome {
-        Some(outcome) => outcome.legacy_status(summary, detail),
-        None => (summary, detail),
+    let (summary, detail) = match context.outcome {
+        Some(outcome) => outcome.legacy_status(summary, context.detail),
+        None => (summary, context.detail),
     };
-    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, sequence, outcome, settings)?;
+    let (data, truncated) = encode_heal_task_status_payload(
+        summary,
+        items,
+        context.progress,
+        context.truncated,
+        context.sequence,
+        context.outcome,
+        context.settings,
+    )?;
     Ok((data, super::outcome::heal_status_detail(detail, truncated)))
 }
 
@@ -589,12 +602,14 @@ impl HealChannelProcessor {
         let (data, detail) = encode_heal_status_response(
             &summary,
             items,
-            progress.as_ref(),
-            detail,
-            truncated,
-            (next_seq, min_seq),
-            outcome.as_deref(),
-            settings.as_ref(),
+            HealStatusResponseContext {
+                progress: progress.as_ref(),
+                detail,
+                truncated,
+                sequence: (next_seq, min_seq),
+                outcome: outcome.as_deref(),
+                settings: settings.as_ref(),
+            },
         )?;
 
         let response = HealChannelResponse {
@@ -899,7 +914,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let (data, detail) = encode_heal_status_response("running", items, None, None, false, (0, 0), None, None).unwrap();
+        let (data, detail) = encode_heal_status_response("running", items, HealStatusResponseContext::default()).unwrap();
 
         assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
@@ -959,12 +974,13 @@ mod tests {
             let (bytes, detail) = encode_heal_status_response(
                 if abort.is_some() { "stopped" } else { "finished" },
                 Vec::new(),
-                None,
-                initial_detail,
-                true,
-                (9, 4),
-                Some(&outcome),
-                None,
+                HealStatusResponseContext {
+                    detail: initial_detail,
+                    truncated: true,
+                    sequence: (9, 4),
+                    outcome: Some(&outcome),
+                    ..Default::default()
+                },
             )
             .expect("canonical owner encoding");
             let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("wire payload");
@@ -987,9 +1003,15 @@ mod tests {
         ] {
             let mut outcome = HealTaskOutcome::default();
             outcome.finish(Some(reason));
-            let (data, detail) =
-                encode_heal_status_response("finished", Vec::new(), None, None, false, (0, 0), Some(&outcome), None)
-                    .expect("canonical abort adapter");
+            let (data, detail) = encode_heal_status_response(
+                "finished",
+                Vec::new(),
+                HealStatusResponseContext {
+                    outcome: Some(&outcome),
+                    ..Default::default()
+                },
+            )
+            .expect("canonical abort adapter");
             let json: serde_json::Value = serde_json::from_slice(&data).expect("public state");
             assert_eq!(json["summary"], "stopped");
             assert_eq!(json["outcome"]["execution"]["state"], "aborted");
@@ -1025,8 +1047,16 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (bytes, detail) = encode_heal_status_response("running", items, None, None, false, (9, 4), Some(&outcome), None)
-            .expect("bounded status with cumulative outcome");
+        let (bytes, detail) = encode_heal_status_response(
+            "running",
+            items,
+            HealStatusResponseContext {
+                sequence: (9, 4),
+                outcome: Some(&outcome),
+                ..Default::default()
+            },
+        )
+        .expect("bounded status with cumulative outcome");
         assert!(bytes.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("bounded payload");
         assert_eq!(wire["items"].as_array().expect("items").len(), 1);
