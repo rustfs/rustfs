@@ -83,7 +83,7 @@ jobs:
       RUSTFS_POOL_PROXY_ENDPOINT: http://127.0.0.1:19000
       RUSTFS_POOL_WARP_ENDPOINT: http://127.0.0.1:19000
       RUSTFS_SHARED_PROXY_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
-      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000' }}
+      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000 http://rustfs-node4:9000' }}
     steps:
       # auto-testing is private: clone it with the dedicated PF token (not
       # GITHUB_TOKEN) and retry transient GitHub/network failures.
