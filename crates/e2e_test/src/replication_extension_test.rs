@@ -6134,6 +6134,118 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
     Ok(())
 }
 
+/// rustfs/backlog#2479: a site resync must count a replicated delete marker
+/// as converged. The peer answers `HEAD ?versionId=<marker>` with a bodiless
+/// 405, which the SDK surfaces without an error code; the resync worker used
+/// to record that as `target service error` and fail the whole bucket.
+#[tokio::test]
+async fn test_site_replication_resync_replicates_delete_marker() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let bucket = "site-repl-resync-marker";
+    let live_key = "live.bin";
+    let gone_key = "gone.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    wait_for_remote_target_arn(&source_env, bucket).await?;
+
+    // One live object and one key whose latest version is a delete marker,
+    // both converged to the peer through live replication first so the
+    // resync re-drives objects the peer already holds.
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(live_key)
+        .body(ByteStream::from(vec![b'l'; 4096]))
+        .send()
+        .await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(gone_key)
+        .body(ByteStream::from(vec![b'g'; 128]))
+        .send()
+        .await?;
+    let delete = source_client.delete_object().bucket(bucket).key(gone_key).send().await?;
+    assert_eq!(delete.delete_marker(), Some(true), "a versioned delete must create a delete marker");
+    wait_for_object_on_target(&target_client, bucket, live_key).await?;
+    wait_for_target_delete_marker(&target_client, bucket, gone_key).await?;
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "the delete marker must verify as replicated, not fail the bucket: {finished:?}"
+    );
+    assert!(
+        entry.replicated_objects >= 2,
+        "the live object and the delete marker both count as replicated: {entry:?}"
+    );
+    assert!(entry.err_detail.is_empty(), "unexpected bucket error: {entry:?}");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();

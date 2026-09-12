@@ -1814,12 +1814,17 @@ async fn verify_resync_head_result(
             // (retryable/ambiguous) HEAD error leaves the outcome
             // unverified, so it must count as failed — not as a
             // blanket success (backlog#862 / #799 B13).
+            // A HEAD carries no body, so the SDK only synthesizes an error
+            // code for 404; a target answering the delete marker's version
+            // with 405 (RustFS, MinIO, AWS) leaves `code()` empty and the
+            // raw status is the only evidence (rustfs/backlog#2479).
             let retryable = {
                 let (is_not_found, code) = err
                     .as_service_error()
                     .map(|se| (se.is_not_found(), se.code()))
                     .unwrap_or((false, None));
-                is_retryable_delete_replication_head_error(is_not_found, code)
+                let code = code.or_else(|| has_raw_status(&err, 405).then_some("405"));
+                is_retryable_delete_replication_head_error(is_not_found || has_raw_status(&err, 404), code)
             };
             if retryable {
                 st.failed_count += 1;
@@ -6499,6 +6504,63 @@ mod tests {
 
         assert!(err.is_none(), "{err:?}");
         assert_eq!((size, st.replicated_count, st.failed_count), (4, 1, 0));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    fn delete_marker_roi() -> ReplicateObjectInfo {
+        ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "gone.txt".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::ExistingObject,
+            replication_status: ReplicationStatusType::Pending,
+            delete_marker: true,
+            ..Default::default()
+        }
+    }
+
+    /// A target answers `HEAD ?versionId=<delete marker>` with a bodiless
+    /// 405, so the SDK reports no error code. That is the marker having
+    /// propagated, not a failure (rustfs/backlog#2479).
+    #[tokio::test]
+    async fn resync_verification_accepts_bodiless_405_for_delete_marker() {
+        let (endpoint, server) = spawn_head_status_server(405);
+        let target = test_target_client(endpoint);
+        let roi = delete_marker_roi();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        assert_eq!(
+            head_result
+                .as_ref()
+                .err()
+                .and_then(|err| err.as_service_error())
+                .and_then(|se| se.code()),
+            None,
+            "the fixture must reproduce the codeless 405 the SDK yields for a bodiless HEAD"
+        );
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((size, st.replicated_count, st.failed_count), (0, 1, 0));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    /// Ambiguous HEAD failures still leave the delete marker unverified.
+    #[tokio::test]
+    async fn resync_verification_still_fails_delete_marker_on_ambiguous_head_error() {
+        let (endpoint, server) = spawn_head_status_server(503);
+        let target = test_target_client(endpoint);
+        let roi = delete_marker_roi();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_some(), "a 503 must not count as a propagated delete marker");
+        assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
         server.join().expect("test HTTP server should finish");
     }
 
