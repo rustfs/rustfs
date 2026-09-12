@@ -140,9 +140,9 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertNotIn("        continue-on-error: true", self.steps[name])
         self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", self.steps["Generate report"])
         self.assertNotIn("/tmp/rustfs-security", self.source)
-        for name in ("Upload functional report to dashboard", "File failure issue in rustfs/backlog"):
-            report = next(line for line in self.steps[name] if line.strip().startswith("REPORT_FILE:"))
-            self.assertIn("${{ env.SECURITY_ARTIFACTS_DIR }}/report.md", report)
+        for name in ("Upload functional report to dashboard", "Manage backlog issues (dedup / label / auto-close)"):
+            expected = "${{ env.SECURITY_ARTIFACTS_DIR }}/report.md" if name.startswith("Upload") else '--report-file "${SECURITY_ARTIFACTS_DIR}/report.md"'
+            self.assertIn(expected, "\n".join(self.steps[name]))
         for name in ("Upload functional report to dashboard", "Upload report and logs"):
             self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", self.steps[name])
         artifact_settings = yaml_block(self.steps["Upload report and logs"], "with", 8)
@@ -268,10 +268,12 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             gh.chmod(0o755)
             body = self.directory / "issue-body.md"
             self.env.update(PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", CAPTURE_BODY=str(body))
-            result = self.run_step("File failure issue in rustfs/backlog")
+            result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("OLD RUN REPORT", body.read_text())
-            self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
+            # The manager lives in the private auto-testing checkout; without it
+            # the step must skip without publishing anything.
+            self.assertIn("issue_manager.py not found", result.stdout + result.stderr)
+            self.assertFalse(body.exists())
 
     def test_all_ten_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
         for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
@@ -587,11 +589,10 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 initialized = self.run_step("Initialize functional evidence")
                 self.assertNotEqual(initialized.returncode, 0)
                 self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
-                issue = self.run_step("File failure issue in rustfs/backlog")
-                self.assertEqual(issue.returncode, 0, issue.stderr)
-                body = Path(self.env["CAPTURE_BODY"]).read_text()
-                self.assertNotIn("OLD RUN EVIDENCE", body)
-                self.assertIn("no report or log file was produced", body)
+                manager = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+                self.assertEqual(manager.returncode, 0, manager.stderr)
+                self.assertIn("issue_manager.py not found", manager.stdout + manager.stderr)
+                self.assertFalse(Path(self.env["CAPTURE_BODY"]).exists())
                 self.assertEqual((existing / "report.md").read_text(), "OLD RUN EVIDENCE")
 
     def test_reports_use_only_current_complete_suite_evidence(self):
