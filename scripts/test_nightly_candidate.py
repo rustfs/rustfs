@@ -96,7 +96,7 @@ SH
 ''')
         self.env = dict(os.environ, BASH_ENV=str(self.shims), DEB_FILE=self.package.name,
                         R2_ACCESS_KEY_ID="fake-access", R2_SECRET_ACCESS_KEY="fake-secret", R2_ENDPOINT="https://r2.example.invalid", R2_BUCKET="test-bucket",
-                        RUNNER_TEMP=str(self.root), GITHUB_SHA=self.sha, GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="1", GITHUB_OUTPUT=str(self.output),
+                        RUNNER_TEMP=str(self.root), GITHUB_SHA=self.sha, NIGHTLY_BUILD_REF="main", GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="1", GITHUB_OUTPUT=str(self.output),
                         FAKE_STORE=str(self.store), FAKE_AWS_LOG=str(self.root / "aws.log"), FAKE_CURL_LOG=str(self.root / "curl.log"), FAKE_INSTALLED=str(self.root / "installed"), FAKE_MODE="success")
         source = WORKFLOW.read_text()
         job = yaml_block(source.splitlines(), "build", 2)
@@ -123,7 +123,7 @@ SH
         result = self.run_publish()
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = self.manifest()
-        self.assertEqual(manifest, {"schema": 1, "source_sha": self.sha, "build_run_id": 12345, "build_run_attempt": 1,
+        self.assertEqual(manifest, {"schema": 2, "workflow_sha": self.sha, "source_ref": "main", "source_sha": self.sha, "build_run_id": 12345, "build_run_attempt": 1,
                                    "package_sha256": self.digest, "package_url": f"https://dl.rustfs.com/artifacts/rustfs/packages/nightly/runs/12345/1/{self.digest}/rustfs.deb"})
         for path in (f"runs/12345/1/{self.digest}/rustfs.deb", self.package.name, "rustfs-nightly-latest.deb"):
             self.assertEqual((self.store / "artifacts/rustfs/packages/nightly" / path).read_bytes(), self.package.read_bytes())
@@ -167,9 +167,23 @@ SH
         # With a ref override (NIGHTLY_BRANCH variable / dispatch `branch`
         # input) the checked-out HEAD intentionally differs from GITHUB_SHA;
         # the candidate manifest must record the tree that was built.
-        result = self.run_publish(GITHUB_SHA="f" * 40)
+        result = self.run_publish(GITHUB_SHA="f" * 40, NIGHTLY_BUILD_REF="release")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.manifest()["source_sha"], self.sha)
+        self.assertEqual(self.manifest()["workflow_sha"], "f" * 40)
+        self.assertEqual(self.manifest()["source_ref"], "release")
+
+    def test_every_lane_uses_the_same_resolved_source(self):
+        lines = WORKFLOW.read_text().splitlines()
+        resolver = "\n".join(yaml_block(lines, "resolve-source", 2))
+        self.assertIn("ref: ${{ env.NIGHTLY_BUILD_REF }}", resolver)
+        self.assertIn('git rev-parse HEAD', resolver)
+        for lane in ("build", "kms-vault-lane", "kms-vault-ha-failover"):
+            with self.subTest(lane=lane):
+                job = "\n".join(yaml_block(lines, lane, 2))
+                self.assertIn("needs: resolve-source", job)
+                self.assertIn("ref: ${{ needs.resolve-source.outputs.source_sha }}", job)
+                self.assertNotIn("ref: ${{ env.NIGHTLY_BUILD_REF }}", job)
 
     def test_same_date_builds_and_reruns_keep_distinct_candidates(self):
         urls = []

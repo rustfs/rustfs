@@ -42,18 +42,39 @@ env:
   NIGHTLY_BUILD_REF: ${{ github.event_name == 'schedule' && (vars.NIGHTLY_BRANCH || 'main') || (inputs.branch || github.ref_name) }}
 
 jobs:
+  resolve-source:
+    name: Resolve nightly source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_ref: ${{ steps.source.outputs.ref }}
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
+      - name: Record immutable source
+        id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ref=${NIGHTLY_BUILD_REF}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve-source
     name: Build x86_64 GNU
     runs-on: sm-standard-4
     timeout-minutes: 150
     env:
+      NIGHTLY_BUILD_REF: ${{ needs.resolve-source.outputs.source_ref }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: ${{ env.NIGHTLY_BUILD_REF }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -334,9 +355,10 @@ jobs:
 
           CANDIDATE_FILE="${RUNNER_TEMP}/nightly-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           jq -n --arg source_sha "${SOURCE_SHA}" \
+            --arg workflow_sha "${GITHUB_SHA}" --arg source_ref "${NIGHTLY_BUILD_REF}" \
             --argjson build_run_id "${GITHUB_RUN_ID}" --argjson build_run_attempt "${GITHUB_RUN_ATTEMPT}" \
             --arg package_url "${CANDIDATE_URL}" --arg package_sha256 "${DEB_SHA256}" \
-            '{schema: 1, source_sha: $source_sha, build_run_id: $build_run_id, build_run_attempt: $build_run_attempt, package_url: $package_url, package_sha256: $package_sha256}' \
+            '{schema: 2, workflow_sha: $workflow_sha, source_ref: $source_ref, source_sha: $source_sha, build_run_id: $build_run_id, build_run_attempt: $build_run_attempt, package_url: $package_url, package_sha256: $package_sha256}' \
             > "${CANDIDATE_FILE}"
           echo "candidate_file=${CANDIDATE_FILE}" >> "${GITHUB_OUTPUT}"
 
@@ -378,6 +400,7 @@ jobs:
   # self-hosted fleet is heterogeneous — a docker-dependent workflow has been
   # burned by it before (see the banner in e2e-s3tests.yml, rustfs/backlog#1149).
   kms-vault-lane:
+    needs: resolve-source
     name: KMS live Vault lane
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -399,7 +422,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: ${{ env.NIGHTLY_BUILD_REF }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -477,6 +500,7 @@ jobs:
   # flake cannot mask the main lane's verdict, and vice versa. The script
   # provisions and tears down its own Docker cluster.
   kms-vault-ha-failover:
+    needs: resolve-source
     name: KMS Vault HA failover lane
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -488,7 +512,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: ${{ env.NIGHTLY_BUILD_REF }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
