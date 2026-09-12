@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import statistics
 import subprocess
+from urllib.parse import urlencode
 
 
 def timestamp(value):
@@ -46,7 +47,8 @@ def summarize(runs):
                 jobs_by_name[job["name"]].append(job)
         # Exclude docs-only and pull_request.closed cancellation-handler greens.
         if (run.get("status") == "completed" and run.get("conclusion") == "success" and jobs
-                and any(job["name"] == "Workspace Test and Lint" and job.get("conclusion") == "success" for job in jobs)
+                and any(job["name"] in ("Workspace Test and Lint", "Test and Lint") and job.get("conclusion") == "success"
+                        and any(step.get("name") == "Run nextest tests" and step.get("conclusion") == "success" for step in (job.get("steps") or [])) for job in jobs)
                 and all(job.get("status") == "completed" for job in jobs)):
             successful_code_runs.append(run)
 
@@ -90,11 +92,15 @@ def api(path):
     return json.loads(result.stdout)
 
 
-def collect(repository, limit):
+def collect(repository, limit, since=None):
+    since = since or datetime.now(timezone.utc) - timedelta(days=7)
     runs = []
     page = 1
     while len(runs) < limit:
-        batch = api(f"repos/{repository}/actions/workflows/ci.yml/runs?event=pull_request&per_page=100&page={page}")["workflow_runs"]
+        query = urlencode({"event": "pull_request", "per_page": 100, "page": page, "created": ">=" + since.isoformat()})
+        batch = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}")["workflow_runs"]
+        if any(timestamp(run.get("created_at")) is None or timestamp(run["created_at"]) < since for run in batch):
+            raise ValueError("GitHub returned runs outside the requested date range")
         runs.extend(batch[:limit - len(runs)])
         if len(batch) < 100:
             break
@@ -117,7 +123,7 @@ def collect(repository, limit):
         sample = {key: run.get(key) for key in ("id", "run_attempt", "head_sha", "created_at", "run_started_at", "status", "conclusion", "html_url")}
         sample["jobs"] = [{key: job.get(key) for key in ("id", "name", "created_at", "started_at", "completed_at", "status", "conclusion", "steps")} for job in jobs]
         samples.append(sample)
-    return {"schema": 1, "repository": repository, "observed_at": datetime.now(timezone.utc).isoformat(), "runs": samples}
+    return {"schema": 1, "repository": repository, "observed_at": datetime.now(timezone.utc).isoformat(), "created_since": since.isoformat(), "runs": samples}
 
 
 def main():
