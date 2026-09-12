@@ -1994,7 +1994,7 @@ fn test_reconcile_site_replication_bucket_targets_keeps_operator_target_to_peer(
     };
     let state = SiteReplicationState {
         service_account_access_key: "svc".to_string(),
-        peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote.clone())]),
+        peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote)]),
         ..Default::default()
     };
 
