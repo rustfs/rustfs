@@ -1372,6 +1372,160 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
     }
 }
 
+/// Start the TFTP server when `RUSTFS_TFTP_ENABLE` is set.
+#[cfg(feature = "tftp")]
+#[instrument(skip_all)]
+pub async fn init_tftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::protocols::ProtocolStorageClient;
+    use rustfs_config::{
+        DEFAULT_TFTP_ADDRESS, ENV_TFTP_ACCESS_KEY, ENV_TFTP_ACCESS_MODE, ENV_TFTP_ADDRESS, ENV_TFTP_BACKEND_OP_TIMEOUT_SECS,
+        ENV_TFTP_DEFAULT_BUCKET, ENV_TFTP_ENABLE, ENV_TFTP_MAX_BLOCK_SIZE, ENV_TFTP_MAX_CONCURRENT_TRANSFERS,
+        ENV_TFTP_MAX_SEND_RETRIES, ENV_TFTP_MAX_TRANSFER_BYTES, ENV_TFTP_MAX_WINDOW_SIZE, ENV_TFTP_READ_FETCH_BYTES,
+        ENV_TFTP_SECRET_KEY,
+    };
+    use rustfs_protocols::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
+    use rustfs_protocols::{TftpConfig, TftpServer, TftpStorageHandler};
+    use rustfs_utils::MaskedAccessKey;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use subtle::ConstantTimeEq;
+
+    let enabled = rustfs_utils::get_env_bool(ENV_TFTP_ENABLE, false);
+    if !enabled {
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "tftp",
+            state = "disabled",
+            "Protocol runtime disabled"
+        );
+        return Ok(None);
+    }
+
+    let addr_str = rustfs_utils::get_env_str(ENV_TFTP_ADDRESS, DEFAULT_TFTP_ADDRESS);
+    let bind_addr =
+        rustfs_utils::net::parse_and_resolve_address(&addr_str).map_err(|e| format!("Invalid TFTP address '{addr_str}': {e}"))?;
+
+    let access_key =
+        rustfs_utils::get_env_opt_str(ENV_TFTP_ACCESS_KEY).ok_or("RUSTFS_TFTP_ACCESS_KEY is required when TFTP is enabled")?;
+    let secret_key =
+        rustfs_utils::get_env_opt_str(ENV_TFTP_SECRET_KEY).ok_or("RUSTFS_TFTP_SECRET_KEY is required when TFTP is enabled")?;
+
+    let iam_sys = rustfs_iam::get().map_err(|e| format!("IAM unavailable for TFTP startup: {e}"))?;
+    let (identity_opt, is_valid) = iam_sys
+        .check_key(&access_key)
+        .await
+        .map_err(|e| format!("TFTP credential lookup failed: {e}"))?;
+    let identity = identity_opt.ok_or_else(|| format!("Unknown TFTP access key: {}", MaskedAccessKey(&access_key)))?;
+    if !is_valid {
+        return Err("TFTP access key is disabled or expired".into());
+    }
+    if is_temporary_credential(&identity.credentials) {
+        return Err("TFTP does not accept temporary STS credentials".into());
+    }
+    let secret_matches: bool = identity.credentials.secret_key.as_bytes().ct_eq(secret_key.as_bytes()).into();
+    if !secret_matches {
+        return Err("RUSTFS_TFTP_SECRET_KEY does not match the configured access key".into());
+    }
+
+    let default_bucket = rustfs_utils::get_env_opt_str(ENV_TFTP_DEFAULT_BUCKET);
+    let access_mode = TftpConfig::resolve_access_mode(rustfs_utils::get_env_opt_str(ENV_TFTP_ACCESS_MODE).as_deref())?;
+    let max_block_size = TftpConfig::resolve_max_block_size(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_BLOCK_SIZE).and_then(|v| v.parse::<u16>().ok()),
+    );
+    let max_window_size = TftpConfig::resolve_max_window_size(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_WINDOW_SIZE).and_then(|v| v.parse::<u16>().ok()),
+    );
+    let max_concurrent_transfers = TftpConfig::resolve_max_concurrent_transfers(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_CONCURRENT_TRANSFERS).and_then(|v| v.parse::<usize>().ok()),
+    );
+    let max_transfer_bytes = TftpConfig::resolve_max_transfer_bytes(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_TRANSFER_BYTES).and_then(|v| v.parse::<u64>().ok()),
+    );
+    let backend_op_timeout_secs = TftpConfig::resolve_backend_op_timeout_secs(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_BACKEND_OP_TIMEOUT_SECS).and_then(|v| v.parse::<u64>().ok()),
+    );
+    let read_fetch_bytes = TftpConfig::resolve_read_fetch_bytes(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_READ_FETCH_BYTES).and_then(|v| v.parse::<u64>().ok()),
+    );
+    let max_send_retries = TftpConfig::resolve_max_send_retries(
+        rustfs_utils::get_env_opt_str(ENV_TFTP_MAX_SEND_RETRIES).and_then(|v| v.parse::<u32>().ok()),
+    );
+
+    let config = TftpConfig {
+        bind_addr,
+        default_bucket,
+        access_mode,
+        max_block_size,
+        max_window_size,
+        max_concurrent_transfers,
+        max_transfer_bytes,
+        backend_op_timeout_secs,
+        read_fetch_bytes,
+        max_send_retries,
+    };
+
+    let principal = ProtocolPrincipal::new(Arc::new(identity));
+    let session_context = SessionContext::new(principal, Protocol::Tftp, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+    let fs = crate::storage_api::startup::init::ecfs::FS::new();
+    let storage_client = ProtocolStorageClient::new(fs);
+    let handler = TftpStorageHandler::new(storage_client, config.clone(), session_context.credentials().clone(), session_context);
+    let server = TftpServer::new(config.clone(), handler);
+
+    debug!(
+        target: "rustfs::init",
+        event = EVENT_PROTOCOL_RUNTIME_STATE,
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_PROTOCOL,
+        protocol = "tftp",
+        state = "configured",
+        bind_addr = %config.bind_addr,
+        access_mode = ?config.access_mode,
+        default_bucket = config.default_bucket.as_deref().unwrap_or("-"),
+        "Protocol runtime configured"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let task_handle = tokio::spawn(async move {
+        if let Err(e) = server.start(shutdown_rx).await {
+            error!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "tftp",
+                state = "runtime_failed",
+                error = %e,
+                "Protocol server failed"
+            );
+        }
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_SERVER_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "tftp",
+            state = "stopped",
+            "Protocol server stopped"
+        );
+    });
+
+    info!(
+        target: "rustfs::init",
+        event = EVENT_PROTOCOL_RUNTIME_STATE,
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_PROTOCOL,
+        protocol = "tftp",
+        state = "started",
+        bind_addr = %config.bind_addr,
+        "Protocol runtime started"
+    );
+    Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

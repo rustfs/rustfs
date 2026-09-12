@@ -169,3 +169,64 @@ pub const DEFAULT_SFTP_READ_ONLY: bool = false;
 
 /// Default SSH identification string (no version disclosure).
 pub const DEFAULT_SFTP_BANNER: &str = "SSH-2.0-RustFS";
+
+/// Default TFTP server bind address. The well-known TFTP port is UDP 69,
+/// which needs CAP_NET_BIND_SERVICE (or root) on Linux. The default binds
+/// an unprivileged port instead so enabling the protocol never requires
+/// extra capabilities; operators fronting real PXE clients set
+/// `RUSTFS_TFTP_ADDRESS` to port 69 explicitly.
+pub const DEFAULT_TFTP_ADDRESS: &str = "0.0.0.0:6969";
+
+/// TFTP environment variable names.
+pub const ENV_TFTP_ENABLE: &str = "RUSTFS_TFTP_ENABLE";
+pub const ENV_TFTP_ADDRESS: &str = "RUSTFS_TFTP_ADDRESS";
+/// Access key of the IAM identity every TFTP transfer is authorized as.
+pub const ENV_TFTP_ACCESS_KEY: &str = "RUSTFS_TFTP_ACCESS_KEY";
+pub const ENV_TFTP_SECRET_KEY: &str = "RUSTFS_TFTP_SECRET_KEY";
+/// When set, every request resolves inside this one bucket and the
+/// request filename becomes the object key. When unset, filenames are
+/// addressed as `/<bucket>/<key>`.
+pub const ENV_TFTP_DEFAULT_BUCKET: &str = "RUSTFS_TFTP_DEFAULT_BUCKET";
+/// `ro` (RRQ only), `wo` (WRQ only), or `rw` (both).
+pub const ENV_TFTP_ACCESS_MODE: &str = "RUSTFS_TFTP_ACCESS_MODE";
+pub const ENV_TFTP_MAX_BLOCK_SIZE: &str = "RUSTFS_TFTP_MAX_BLOCK_SIZE";
+pub const ENV_TFTP_MAX_WINDOW_SIZE: &str = "RUSTFS_TFTP_MAX_WINDOW_SIZE";
+pub const ENV_TFTP_MAX_CONCURRENT_TRANSFERS: &str = "RUSTFS_TFTP_MAX_CONCURRENT_TRANSFERS";
+pub const ENV_TFTP_MAX_TRANSFER_BYTES: &str = "RUSTFS_TFTP_MAX_TRANSFER_BYTES";
+pub const ENV_TFTP_BACKEND_OP_TIMEOUT_SECS: &str = "RUSTFS_TFTP_BACKEND_OP_TIMEOUT_SECS";
+pub const ENV_TFTP_READ_FETCH_BYTES: &str = "RUSTFS_TFTP_READ_FETCH_BYTES";
+/// UDP retransmit attempts after the last good block before giving up on a
+/// transfer. Lower values abort dangling multipart uploads sooner when a
+/// client disappears; raise for lossy PXE/firmware networks.
+pub const ENV_TFTP_MAX_SEND_RETRIES: &str = "RUSTFS_TFTP_MAX_SEND_RETRIES";
+
+/// Default TFTP access mode. TFTP has no authentication on the wire, so
+/// an unset mode grants reads only; enabling writes is an explicit
+/// operator decision.
+pub const DEFAULT_TFTP_ACCESS_MODE: &str = "ro";
+
+/// Default maximum negotiated TFTP block size (RFC 2348 upper bound).
+pub const DEFAULT_TFTP_MAX_BLOCK_SIZE: u16 = 65464;
+
+/// Default maximum negotiated TFTP window size (RFC 7440). Preserves
+/// client-negotiated pipelining unless the operator lowers the ceiling.
+pub const DEFAULT_TFTP_MAX_WINDOW_SIZE: u16 = 65535;
+
+/// Default concurrent TFTP transfers per process.
+pub const DEFAULT_TFTP_MAX_CONCURRENT_TRANSFERS: usize = 64;
+
+/// Default per-transfer byte ceiling (256 MiB).
+pub const DEFAULT_TFTP_MAX_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default backend operation timeout in seconds.
+pub const DEFAULT_TFTP_BACKEND_OP_TIMEOUT_SECS: u64 = 60;
+
+/// Default read-ahead fetch size for RRQ streaming (4 MiB).
+pub const DEFAULT_TFTP_READ_FETCH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Default UDP retransmit attempts per TFTP block/window after timeout.
+///
+/// With the server timeout of 3s, five retries give up in ~18s instead of
+/// async-tftp's library default of 100 (~5 minutes), so abandoned WRQ
+/// multipart uploads are aborted promptly.
+pub const DEFAULT_TFTP_MAX_SEND_RETRIES: u32 = 5;

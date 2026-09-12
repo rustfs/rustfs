@@ -367,6 +367,9 @@ rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"
 russh = { version = "0.63.3" }
 russh-sftp = "3.0.0"
 
+# TFTP
+async-tftp = "0.4.2"
+
 # WebDAV
 dav-server = "0.11.0"
 
