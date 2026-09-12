@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
+use super::diagnostics::DiagnosticCollectionPolicy;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
 use super::registration::CredentialValidationError;
@@ -82,7 +83,7 @@ pub(crate) struct PendingHeartbeat {
     protocol_version: String,
     request_id: String,
     agent_version: String,
-    capabilities: [String; 1],
+    capabilities: Vec<String>,
     sequence: u64,
     client_time: String,
     coarse_node_summary: CoarseNodeSummary,
@@ -92,7 +93,8 @@ impl PendingHeartbeat {
     fn is_valid(&self) -> bool {
         self.protocol_version == PROTOCOL_VERSION
             && self.agent_version == AGENT_VERSION
-            && self.capabilities[0] == "heartbeat"
+            && (self.capabilities == ["heartbeat"]
+                || self.capabilities == ["heartbeat", DiagnosticCollectionPolicy::policy_sync_capability()])
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)
@@ -108,13 +110,26 @@ struct HeartbeatResponse {
     accepted_version: String,
     #[serde(default)]
     capability_hints: Vec<String>,
+    #[serde(default)]
+    diagnostic_collection_policy: Option<DiagnosticCollectionPolicy>,
 }
 
 pub(crate) enum Delivery {
-    Accepted { server_time: String },
-    Retry { retry_after: Option<Duration> },
-    AuthenticationStopped { status: u16, reason: Option<String> },
-    Rejected { status: u16, reason: Option<String> },
+    Accepted {
+        server_time: String,
+        diagnostic_collection_policy: DiagnosticCollectionPolicy,
+    },
+    Retry {
+        retry_after: Option<Duration>,
+    },
+    AuthenticationStopped {
+        status: u16,
+        reason: Option<String>,
+    },
+    Rejected {
+        status: u16,
+        reason: Option<String>,
+    },
 }
 
 pub(crate) struct HeartbeatSender {
@@ -143,8 +158,13 @@ impl HeartbeatSender {
                 {
                     return Err(HeartbeatError::Response);
                 }
+                let policy = accepted
+                    .diagnostic_collection_policy
+                    .unwrap_or_else(DiagnosticCollectionPolicy::stopped);
+                policy.validate().map_err(|_| HeartbeatError::Response)?;
                 Ok(Delivery::Accepted {
                     server_time: accepted.server_time,
+                    diagnostic_collection_policy: policy,
                 })
             }
             TelemetryDelivery::Retry { retry_after } => Ok(Delivery::Retry { retry_after }),
@@ -220,7 +240,10 @@ impl HeartbeatStateStore {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             request_id: Uuid::new_v4().to_string(),
             agent_version: AGENT_VERSION.to_owned(),
-            capabilities: ["heartbeat".to_owned()],
+            capabilities: vec![
+                "heartbeat".to_owned(),
+                DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
+            ],
             sequence: state.next_sequence,
             client_time: now.to_rfc3339_opts(SecondsFormat::Secs, true),
             coarse_node_summary: summary,
