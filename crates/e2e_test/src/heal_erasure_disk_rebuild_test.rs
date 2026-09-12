@@ -601,7 +601,9 @@ mod tests {
                         .set_continuation_token(continuation_token.clone())
                         .send(),
                 )
-                .await??;
+                .await
+                .map_err(|error| format!("node {node_index} recovery listing timed out for bucket {bucket}: {error}"))?
+                .map_err(|error| format!("node {node_index} recovery listing failed for bucket {bucket}: {error}"))?;
                 listed_keys.extend(
                     response
                         .contents()
@@ -707,8 +709,14 @@ mod tests {
                 Ok(Err(error)) if is_retryable_recovery_get(&error) && Instant::now() < deadline => {
                     sleep(Duration::from_millis(250)).await;
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(error) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    return Err(
+                        format!("recovery GET failed for {bucket}/{key} after waiting up to {timeout_secs}s: {error}").into(),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!("recovery GET timed out for {bucket}/{key} after 30s attempt: {error}").into());
+                }
             }
         }
     }
