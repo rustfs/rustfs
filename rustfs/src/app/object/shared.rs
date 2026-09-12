@@ -1412,9 +1412,10 @@ mod tests {
 
     #[test]
     fn resolve_bucket_default_sse_falls_back_to_aes256_for_an_unknown_algorithm() {
-        // Reachable only through corrupt or hand-edited bucket metadata;
-        // PutBucketEncryption rejects unknown algorithms. All three call sites
-        // now share this single decision (backlog#1826).
+        // PutBucketEncryption refuses unknown algorithms, so this is reachable
+        // only through a configuration stored before that check or through
+        // hand-edited bucket metadata. All three call sites share this single
+        // decision (backlog#1826).
         let config = bucket_sse_config_with("garbage", None);
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);

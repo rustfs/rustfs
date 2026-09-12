@@ -220,8 +220,9 @@ pub struct SseConfiguration {
 /// malformed bucket default pass the `copy_changes_encryption` guard and take
 /// the metadata-only shortcut while this layer still encrypts: fresh DEK
 /// metadata is committed beside the untouched plaintext blocks and the object
-/// becomes unreadable. Reachable only via corrupt or hand-edited bucket
-/// metadata — PutBucketEncryption rejects unknown algorithms (backlog#1826).
+/// becomes unreadable. PutBucketEncryption refuses unknown algorithms, so this
+/// is reachable only through a configuration stored before that check or
+/// through hand-edited bucket metadata (backlog#1826).
 pub(crate) fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
     match sse.sse_algorithm.as_str() {
         "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
@@ -719,6 +720,11 @@ pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
         let code = match resolution_error.kind() {
             EncryptionResolutionErrorKind::InvalidRequest => S3ErrorCode::InvalidRequest,
             EncryptionResolutionErrorKind::ServiceUnavailable => S3ErrorCode::ServiceUnavailable,
+            // Same code the write path returns for this key; `From<ApiError>`
+            // attaches the 400 that s3s cannot derive for a custom code.
+            EncryptionResolutionErrorKind::KeyNotFound => S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+            EncryptionResolutionErrorKind::AccessDenied => S3ErrorCode::AccessDenied,
+            EncryptionResolutionErrorKind::NotImplemented => S3ErrorCode::NotImplemented,
             // A permanent property of the stored object, not a transient server
             // fault: 5xx would invite client retry storms against an object
             // this server can never decrypt.
@@ -1508,10 +1514,19 @@ fn normalize_encryption_metadata_case(
     Ok(Cow::Owned(normalized))
 }
 
+/// Carry the S3-level classification of a decryption failure through the
+/// ecstore boundary. Every code produced by `data_plane_kms_error` needs a
+/// kind here, otherwise the read path reports it as an internal fault even
+/// though the write path already reports the same KMS error to the client.
 fn map_encryption_resolution_error(error: ApiError) -> EncryptionResolutionError {
-    let kind = match error.code {
+    let kind = match &error.code {
         S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => EncryptionResolutionErrorKind::InvalidRequest,
         S3ErrorCode::ServiceUnavailable => EncryptionResolutionErrorKind::ServiceUnavailable,
+        S3ErrorCode::Custom(code) if &**code == crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE => {
+            EncryptionResolutionErrorKind::KeyNotFound
+        }
+        S3ErrorCode::AccessDenied => EncryptionResolutionErrorKind::AccessDenied,
+        S3ErrorCode::NotImplemented => EncryptionResolutionErrorKind::NotImplemented,
         _ => EncryptionResolutionErrorKind::DecryptionFailed,
     };
     EncryptionResolutionError::new(kind, error.message)
@@ -1526,6 +1541,19 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
+    /// The KMS key id a write response may advertise.
+    ///
+    /// `kms_key_id` is always set for managed SSE because SSE-S3 also wraps
+    /// its data key under the service default key, but that key is an
+    /// internal detail of an `AES256` object: only an `aws:kms` object names
+    /// a key the caller can act on, and `x-amz-server-side-encryption-aws-kms-key-id`
+    /// is defined only for that scheme.
+    pub fn response_kms_key_id(&self) -> Option<SSEKMSKeyId> {
+        matches!(self.sse_type, SSEType::SseKms)
+            .then(|| self.kms_key_id.clone())
+            .flatten()
+    }
+
     pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> super::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
@@ -2469,7 +2497,9 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
         server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(sse_type).to_string()),
         sse_customer_algorithm: None,
         sse_customer_key_md5: None,
-        ssekms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
+        // The key id was needed above to authorize the read, but an AES256
+        // object's wrapping key is internal: only aws:kms objects advertise it.
+        ssekms_key_id: matches!(sse_type, SSEType::SseKms).then(|| SSEKMSKeyId::from(kms_key_id)),
     }))
 }
 
@@ -2747,9 +2777,21 @@ async fn apply_managed_encryption_material_inner(
         }
         (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
         (SSEType::SseKms, None) => {
-            return Err(ApiError::from(StorageError::other(
-                "No KMS key available for managed server-side encryption (required for SSE-KMS)",
-            )));
+            // Neither the request nor the bucket default named a key and no
+            // service default filled in. Without a service this is the same
+            // outage/misconfiguration the provider check below reports, so it
+            // must carry the same 503/400 split rather than an untyped
+            // internal error; with a running service that has no default key
+            // the caller simply has to name one.
+            if runtime_sources::current_encryption_service().await.is_none() {
+                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable().await));
+            }
+            return Err(ApiError {
+                code: S3ErrorCode::InvalidRequest,
+                message: "SSE-KMS requires a KMS key id: the request named none and the KMS service has no default key"
+                    .to_string(),
+                source: None,
+            });
         }
         _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
     };
@@ -3350,6 +3392,25 @@ fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
     api_error
 }
 
+/// Classification for a failed data-key unwrap.
+///
+/// An AEAD failure stays `500` (the envelope is an integrity fault, not a
+/// request a retry or a different header can fix), but the generic internal
+/// error text hides the one diagnosis an operator needs: the configured
+/// backend holds different key material under this key id than the one that
+/// wrapped the object, typically after re-creating a key of the same name or
+/// switching backends.
+fn kms_unwrap_error(error: rustfs_kms::KmsError) -> ApiError {
+    let unwrap_rejected = matches!(error, rustfs_kms::KmsError::CryptographicError { .. });
+    let mut api_error = kms_operation_error(error);
+    if unwrap_rejected && api_error.code == S3ErrorCode::InternalError {
+        api_error.message = "The object's data key envelope could not be unwrapped by the configured KMS backend: the \
+                             key material under this key id differs from the one that wrapped it, or the envelope is damaged"
+            .to_string();
+    }
+    api_error
+}
+
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
@@ -3434,7 +3495,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_data_key(encrypted_dek, context)
             .await
-            .map_err(kms_operation_error)?;
+            .map_err(kms_unwrap_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -3453,7 +3514,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_legacy_data_key(encrypted_dek)
             .await
-            .map_err(kms_operation_error)?;
+            .map_err(kms_unwrap_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -4405,6 +4466,56 @@ mod tests {
         assert_eq!(super::kms_data_plane_error_class(&missing), "key_not_found");
     }
 
+    /// The read path squeezes the S3 classification through ecstore's
+    /// resolution-error kinds; every KMS class the write path reports to the
+    /// client must survive that hop instead of collapsing onto `DecryptionFailed`
+    /// (which the S3 layer reports as `500`).
+    #[test]
+    fn encryption_resolution_kinds_preserve_kms_read_classification() {
+        let cases = [
+            (
+                rustfs_kms::KmsError::key_not_found("no-such-key"),
+                EncryptionResolutionErrorKind::KeyNotFound,
+            ),
+            (rustfs_kms::KmsError::access_denied("policy"), EncryptionResolutionErrorKind::AccessDenied),
+            (
+                rustfs_kms::KmsError::unsupported_capability("local", "decrypt_legacy"),
+                EncryptionResolutionErrorKind::NotImplemented,
+            ),
+            (
+                rustfs_kms::KmsError::backend_error("connection refused"),
+                EncryptionResolutionErrorKind::ServiceUnavailable,
+            ),
+            (
+                rustfs_kms::KmsError::invalid_operation("key is disabled"),
+                EncryptionResolutionErrorKind::InvalidRequest,
+            ),
+            (
+                rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"),
+                EncryptionResolutionErrorKind::DecryptionFailed,
+            ),
+        ];
+        for (error, expected) in cases {
+            let description = error.to_string();
+            let resolution = super::map_encryption_resolution_error(kms_operation_error(error));
+            assert_eq!(resolution.kind(), expected, "{description}");
+        }
+    }
+
+    /// An unwrap the backend rejects stays an internal error, but says why in
+    /// words an operator can act on rather than the generic 500 text.
+    #[test]
+    fn kms_unwrap_error_keeps_500_but_names_the_envelope_mismatch() {
+        let rejected = super::kms_unwrap_error(rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"));
+        assert_eq!(rejected.code, S3ErrorCode::InternalError);
+        assert!(rejected.message.contains("could not be unwrapped"), "message was {}", rejected.message);
+        assert_eq!(super::kms_data_plane_error_class(&rejected), "cryptographic");
+
+        let missing = super::kms_unwrap_error(rustfs_kms::KmsError::key_not_found("no-such-key"));
+        assert_eq!(missing.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(missing.message, "KMS key not found: no-such-key");
+    }
+
     #[test]
     fn sse_kms_never_falls_back_to_the_local_sse_s3_provider() {
         let unconfigured = super::sse_kms_unavailable_error(false);
@@ -4488,6 +4599,56 @@ mod tests {
             },
         )
         .await;
+
+        reset_sse_dek_provider();
+    }
+
+    /// A bare `aws:kms` request (no key id, no bucket default) on a node with
+    /// no KMS has no key to resolve. It must get the same configuration
+    /// refusal as the keyed form, whether or not the SSE-S3 master key is
+    /// set, rather than an untyped internal error (backlog#2368 B4).
+    #[tokio::test]
+    async fn sse_kms_write_without_a_key_id_is_refused_like_the_keyed_form() {
+        let _guard = lock_sse_test_state().await;
+
+        for master_key in [None, Some(BASE64_STANDARD.encode_to_string([9u8; 32]))] {
+            reset_sse_dek_provider();
+            async_with_vars(
+                [
+                    ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                    ("RUSTFS_SSE_S3_MASTER_KEY", master_key.clone()),
+                ],
+                async {
+                    // Entered directly: `sse_encryption` consults the bucket
+                    // default first, which needs a bucket metadata store.
+                    let error = apply_managed_encryption_material(
+                        "finance",
+                        "ledger.csv",
+                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        None,
+                        None,
+                        128,
+                        None,
+                    )
+                    .await
+                    .expect_err("SSE-KMS without a key id must be refused when no KMS is running");
+
+                    assert_eq!(
+                        error.code,
+                        S3ErrorCode::InvalidRequest,
+                        "master_key={master_key:?}: message was {}",
+                        error.message
+                    );
+                    assert!(error.message.contains("SSE-KMS requires"), "message was {}", error.message);
+                    assert!(
+                        !error.message.contains("RUSTFS_SSE_S3_MASTER_KEY"),
+                        "an SSE-KMS refusal must not name the SSE-S3 master key: {}",
+                        error.message
+                    );
+                },
+            )
+            .await;
+        }
 
         reset_sse_dek_provider();
     }
@@ -5830,7 +5991,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
-        let metadata = encryption_material_to_metadata(&EncryptionMaterial {
+        let material = EncryptionMaterial {
             sse_type: SSEType::SseKms,
             server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
             kms_key_id: Some("test-key".to_string()),
@@ -5843,8 +6004,10 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        })
-        .expect("managed SSE metadata should serialize");
+        };
+        // Only an aws:kms object names its key in write responses.
+        assert_eq!(material.response_kms_key_id().as_deref(), Some("test-key"));
+        let metadata = encryption_material_to_metadata(&material).expect("managed SSE metadata should serialize");
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -6021,6 +6184,9 @@ mod tests {
                 let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
                 assert_eq!(material.kms_key_id.as_deref(), Some("default"));
+                // The wrapping key stays internal: no write response may
+                // advertise it for an AES256 object.
+                assert_eq!(material.response_kms_key_id(), None);
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
                 assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
                 assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
@@ -7524,6 +7690,32 @@ mod tests {
         assert_eq!(err.message, "KMS unavailable");
     }
 
+    /// The reader wraps the resolution error in an io error exactly like
+    /// `readers.rs` does; a missing key must come out as the same `400
+    /// KMS.NotFoundException` the write path returns, not `500`.
+    #[test]
+    fn test_map_get_object_reader_error_reports_missing_kms_key_as_client_error() {
+        let resolution_error =
+            super::EncryptionResolutionError::new(EncryptionResolutionErrorKind::KeyNotFound, "KMS key not found: finance-key");
+        let err = map_get_object_reader_error(StorageError::other(resolution_error));
+        assert_eq!(err.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(err.message, "KMS key not found: finance-key");
+        let s3_error = s3s::S3Error::from(err);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        let denied = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
+            EncryptionResolutionErrorKind::AccessDenied,
+            "Access Denied",
+        )));
+        assert_eq!(denied.code, S3ErrorCode::AccessDenied);
+
+        let unsupported = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
+            EncryptionResolutionErrorKind::NotImplemented,
+            "backend cannot unwrap legacy envelopes",
+        )));
+        assert_eq!(unsupported.code, S3ErrorCode::NotImplemented);
+    }
+
     #[test]
     fn test_map_get_object_reader_error_redacts_non_ssec_internal_errors() {
         let err = map_get_object_reader_error(StorageError::other("plain io failure"));
@@ -8070,6 +8262,32 @@ mod tests {
     // ========================================================================
     // Read-side response classification (single-decrypt GET path)
     // ========================================================================
+
+    /// An AES256 object is read under the same key-id resolution as aws:kms
+    /// (authorization needs it), but the response must not advertise that
+    /// internal wrapping key.
+    #[tokio::test]
+    async fn classification_withholds_the_wrapping_key_for_sse_s3_reads() {
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "service-default".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string([1u8; 16])),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([2u8; 12])),
+        ]);
+        let headers = super::classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect("sse-s3 classification should succeed")
+        .expect("managed metadata should classify");
+        assert_eq!(headers.server_side_encryption.as_str(), ServerSideEncryption::AES256);
+        assert_eq!(headers.ssekms_key_id, None);
+    }
 
     #[tokio::test]
     async fn classification_reproduces_managed_read_headers_and_audit_without_a_kms_unwrap() {
