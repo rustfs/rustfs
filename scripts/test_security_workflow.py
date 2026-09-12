@@ -117,14 +117,16 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.artifacts = self.directory / "rustfs-security-314159-2"
         suite = self.directory / "auto-testing/rustfs-security-test.sh"
         suite.parent.mkdir()
-        ansi = {"ANSI_GREEN": "\033[1;32m", "ANSI_RED": "\033[1;31m", "ANSI_YELLOW": "\033[1;33m"}
+        ansi = {"ANSI_GREEN": "\033[1;32m", "ANSI_RED": "\033[1;31m", "ANSI_YELLOW": "\033[1;33m", "ANSI_RESET": "\033[0m"}
         suite.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'log_dir=$(mktemp -d "$TMPDIR/rustfs-security.XXXXXX")\n'
             # Verdict lines carry ANSI color escapes and are printed to stdout
             # (captured via tee into the artifacts suite.log), exactly like the
-            # real suite output the report step has to grep through.
-            'printf "%s\\n" "${ANSI_GREEN}[PASS] IAM-101 ok" "${ANSI_RED}[FAIL] STS-105 broken" "${ANSI_YELLOW}[SKIP] OIDC-103 skipped" | tee "$log_dir/suite.log"\n'
+            # real suite output the report step has to grep through: a color
+            # tag before the verdict and a reset escape between the tag and
+            # the case id.
+            'printf "%s\\n" "${ANSI_GREEN}[PASS]${ANSI_RESET} IAM-101 ok" "${ANSI_RED}[FAIL]${ANSI_RESET} STS-105 broken" "${ANSI_YELLOW}[SKIP]${ANSI_RESET} OIDC-103 skipped" | tee "$log_dir/suite.log"\n'
             'echo "CURRENT SUITE LOG" >> "$log_dir/suite.log"\n'
             'echo "CURRENT SUITE STDOUT"; echo "CURRENT SUITE STDERR" >&2\n'
             'case "$FAKE_REPORT" in\n'

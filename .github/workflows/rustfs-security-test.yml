@@ -190,15 +190,16 @@ jobs:
 
           # Product gate: failing cases keep the run green — they are reported
           # below and tracked in rustfs/backlog. Only harness/environment
-          # breakdowns turn the workflow red. The suite log lines may carry
-          # ANSI color escapes in front of the verdict tag, so the pattern
-          # allows any number of them before the leading '['.
+          # breakdowns turn the workflow red. The suite log lines carry ANSI
+          # color escapes both before and after the verdict tag
+          # (e.g. "\e[1;31m[FAIL]\e[0m STS-105 ..."), so the pattern allows
+          # any number of escapes on each side of it.
           ESC=$'\033'
-          VERDICTS_TOTAL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[(PASS|FAIL|UNSUPPORTED)\] [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
-          VERDICTS_FAIL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[FAIL\] [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_TOTAL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[(PASS|FAIL|UNSUPPORTED)\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_FAIL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[FAIL\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
           VERDICTS_TOTAL=$(( ${VERDICTS_TOTAL:-0} + 0 )); VERDICTS_FAIL=$(( ${VERDICTS_FAIL:-0} + 0 ))
           VERDICTS_PASS=$(( VERDICTS_TOTAL - VERDICTS_FAIL ))
-          VERDICTS_SKIPPED="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[SKIP\] [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_SKIPPED="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[SKIP\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
           VERDICTS_SKIPPED=$(( ${VERDICTS_SKIPPED:-0} + 0 ))
           HARNESS_OK=0
           if [ "${TEST_OUTCOME}" = "success" ]; then
