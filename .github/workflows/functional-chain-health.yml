@@ -1,0 +1,30 @@
+name: Functional chain health
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: functional-chain-health
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Collect and publish verified chain health
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: python3 scripts/functional_chain_health.py --publish --output "${RUNNER_TEMP}/chain-health.json"
+      - name: Retain health observation
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-health-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-health.json
+          if-no-files-found: error

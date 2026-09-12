@@ -133,7 +133,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
 
     def test_workflow_wiring(self) -> None:
         names = list(self.steps)
-        self.assertLess(names.index("Checkout repository (for the OIDC live gate script)"), names.index("Checkout auto-testing scripts (with retry)"))
+        self.assertLess(names.index("Checkout repository (for the OIDC live gate script)"), names.index("Checkout auto-testing scripts"))
         self.assertNotIn("    continue-on-error: true", self.job)
         self.assertIn("        continue-on-error: true", self.steps["Run security suite"])
         for name in ("Initialize security evidence", "Generate report"):
@@ -291,7 +291,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 cleanup = named_steps(yaml_block(source, "jobs", 0))[cleanup_name]
                 self.assertTrue(any(line.startswith("        if:") and "always()" in line for line in cleanup))
 
-    def test_root_dispatches_only_upgrade_and_replication_hands_off_after_failure(self) -> None:
+    def test_legacy_replication_hands_off_after_failure(self) -> None:
         for failed_attempts, issue_exit, token in ((0, 0, "fixture"), (2, 0, "fixture"), (3, 0, "fixture"), (3, 7, "fixture"), (0, 0, "")):
             with self.subTest(failed_attempts=failed_attempts, issue_exit=issue_exit, token=bool(token)):
                 self.setUp()
@@ -337,16 +337,6 @@ fi
                     RUSTFS_NIGHTLY_PACKAGE_URL="https://example.invalid/package.deb",
                 )
                 self.context.update({"secrets.PF_TESTING_GH_TOKEN": "fixture", "inputs.suite": "all"})
-                driver = (ROOT / ".github/workflows/rustfs-functional-chain.yml").read_text()
-                self.steps = named_steps(yaml_block(driver.splitlines(), "start-chain", 2))
-                self.assertEqual(list(self.steps), ["Dispatch first suite (upgrade)"])
-                started = self.run_step("Dispatch first suite (upgrade)")
-                self.assertEqual(started.returncode, 0, started.stderr)
-                self.assertEqual(dispatches.read_text().splitlines(), [
-                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-upgrade -F client_payload[from_suite]=nightly-build",
-                ])
-                dispatches.unlink()
-
                 replication = (ROOT / ".github/workflows/rustfs-replication-test.yml").read_text()
                 job = yaml_block(replication.splitlines(), "replication-test", 2)
                 self.assertFalse(any(line.startswith("    continue-on-error:") for line in job))
@@ -570,10 +560,15 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 self.prepare(suite)
                 self.assertNotIn("/tmp/rustfs-", self.source)
                 names = list(self.steps)
-                self.assertLess(names.index("Initialize functional evidence"), names.index("Checkout auto-testing scripts (with retry)"))
+                self.assertLess(names.index("Initialize functional evidence"), names.index("Checkout auto-testing scripts"))
                 if suite in FunctionalWorkflowTests.DIRECT_TESTS:
-                    self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts (with retry)"))
+                    self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts"))
                 for name, lines in self.steps.items():
+                    if name == "Upload chain evidence":
+                        self.assertIn("        if: ${{ always() && steps.chain_record.outcome == 'success' }}", lines)
+                        self.assertIn("        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}", self.steps["Record chain evidence"])
+                        self.assertIn("          if-no-files-found: error", lines)
+                        continue
                     if name in ("Generate report", "Upload functional report to dashboard") or any("uses: actions/upload-artifact@" in line for line in lines):
                         self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", lines)
                     if any("uses: actions/upload-artifact@" in line for line in lines):
