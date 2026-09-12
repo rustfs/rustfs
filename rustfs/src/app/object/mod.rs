@@ -211,6 +211,7 @@ mod head;
 mod internal_put;
 mod on_demand_migration_put;
 mod put;
+pub(crate) mod request_body;
 mod restore;
 pub(crate) mod shared;
 #[cfg(test)]

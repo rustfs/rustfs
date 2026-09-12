@@ -90,6 +90,7 @@ use crate::auth::{
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
+#[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
@@ -104,7 +105,7 @@ use rustfs_utils::http::{
     SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
     SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header, get_source_scheme,
-    headers::{AMZ_CHECKSUM_TYPE, AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
+    headers::{AMZ_CHECKSUM_TYPE, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
 use s3s::dto::{
@@ -114,6 +115,7 @@ use s3s::dto::{
     ServerSideEncryption, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
+use s3s::stream::ByteStream;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -377,42 +379,31 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
 }
 
-fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
-    let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
-        return Ok(None);
-    };
+fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&StreamingBlob>) -> S3Result<Option<i64>> {
+    if let Some(length) = content_length {
+        return Ok(Some(length));
+    }
+    body.and_then(|body| body.remaining_length().exact())
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| s3_error!(UnexpectedContent))
+}
 
-    match atoi::atoi::<i64>(val.as_bytes()) {
-        Some(x) => Ok(Some(x)),
-        None => Err(s3_error!(UnexpectedContent)),
+fn require_upload_part_size(size: Option<i64>, capped: bool) -> S3Result<i64> {
+    match size {
+        Some(size) if size >= 0 => Ok(size),
+        Some(_) => Err(s3_error!(UnexpectedContent)),
+        None if capped => Err(s3_error!(UnexpectedContent)),
+        None => Err(S3Error::new(S3ErrorCode::MissingContentLength)),
     }
 }
 
-fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
-    let has_aws_chunked = |header_name: &str| {
-        headers
-            .get(header_name)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
-    };
-
-    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
-}
-
-fn resolve_upload_part_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<Option<i64>> {
-    let decoded_content_length = decoded_content_length_from_headers(headers)?;
-    let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
-        (true, Some(decoded), _) => Some(decoded),
-        (_, _, Some(length)) => Some(length),
-        (_, Some(decoded), None) => Some(decoded),
-        _ => None,
-    };
-
-    if size == Some(-1) {
-        return Err(s3_error!(UnexpectedContent));
+fn upload_part_body_read_timeout(configured: Duration, capped: bool) -> Duration {
+    if capped {
+        configured.max(Duration::from_secs(rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT))
+    } else {
+        configured
     }
-
-    Ok(size)
 }
 
 fn build_complete_multipart_location(headers: &HeaderMap, uri: &Uri, bucket: &str, key: &str) -> String {
@@ -1168,7 +1159,7 @@ impl DefaultMultipartUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let mut size = resolve_upload_part_size(&req.headers, content_length)?;
+        let size = resolve_upload_part_size(content_length, body.as_ref())?;
         if let Some(size) = size {
             reject_oversize_single_upload(size)?;
         }
@@ -1181,20 +1172,15 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
-        if max_total_object_size.is_some() && size.is_some_and(|size| size < 0) {
-            return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
-        }
-        if max_total_object_size.is_some() && size.is_none() {
-            return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
-        }
-        if let (Some(limit), Some(size)) = (max_total_object_size, size)
+        let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
+        if let Some(limit) = max_total_object_size
             && u64::try_from(size).is_ok_and(|size| size > limit)
         {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
         let upload_part_admission = match self
             .concurrency_manager()
-            .admit_multipart_part(size.unwrap_or(-1))
+            .admit_multipart_part(size)
             .await
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
         {
@@ -1211,42 +1197,30 @@ impl DefaultMultipartUsecase {
                 ));
             }
         };
-        if max_total_object_size.is_some() {
-            let request_id = req
-                .extensions
-                .get::<super::storage_api::multipart_usecase::request_context::RequestContext>()
-                .map(|ctx| ctx.request_id.clone())
-                .unwrap_or_default();
-            body_stream = guard_put_object_body_read_timeout(
-                body_stream,
+        let request_id = req
+            .extensions
+            .get::<super::storage_api::multipart_usecase::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.as_str())
+            .unwrap_or_default();
+        let timeout = upload_part_body_read_timeout(put_object_body_read_timeout(), max_total_object_size.is_some());
+        let raw_control = req.extensions.get::<super::object::request_body::BodyReadControl>().cloned();
+        let observe_read_demand = if let Some(control) = &raw_control {
+            control.activate(
+                timeout,
                 &bucket,
                 &key,
-                &request_id,
-                content_length,
-                put_object_body_read_timeout().max(Duration::from_secs(rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT)),
-            );
-        }
-
-        if size.is_none() {
-            let mut total = 0i64;
-            let mut buffer = bytes::BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|e| ApiError::from(s3s_body_error_to_io(e)))?;
-                total += chunk.len() as i64;
-                buffer.extend_from_slice(&chunk);
+                request_id,
+                u64::try_from(size).map_err(|_| s3_error!(UnexpectedContent))?,
+            )
+        } else {
+            // Direct protocol callers have no raw HTTP body. Retain their
+            // existing capped-session guard without inventing a client cause.
+            if max_total_object_size.is_some() {
+                body_stream = guard_put_object_body_read_timeout(body_stream, &bucket, &key, request_id, Some(size), timeout);
             }
+            false
+        };
 
-            if total <= 0 {
-                return Err(s3_error!(UnexpectedContent));
-            }
-
-            size = Some(total);
-            let combined = buffer.freeze();
-            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-            body_stream = StreamingBlob::wrap(stream);
-        }
-
-        let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
         let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
@@ -1391,6 +1365,11 @@ impl DefaultMultipartUsecase {
         };
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
+        if observe_read_demand && let Some(control) = raw_control {
+            use rustfs_rio::HashReaderMut;
+            let inner = reader.take_inner();
+            reader.inner = rustfs_rio::boxed_reader(super::object::request_body::DemandReader::new(inner, control));
+        }
 
         let mut reader = PutObjReader::new(reader);
 
@@ -1935,6 +1914,8 @@ fn passthrough_part_actual_size(headers: &HeaderMap) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod body_read_tests;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
     use rustfs_filemeta::ObjectPartInfo;
     use rustfs_utils::http::{
@@ -2139,23 +2120,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_upload_part_size_uses_decoded_length_for_aws_chunked() {
-        let mut headers = HeaderMap::new();
-        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
-        headers.insert(AMZ_DECODED_CONTENT_LENGTH, HeaderValue::from_static("5242880"));
-
-        let size = resolve_upload_part_size(&headers, Some(5242962)).expect("decoded size should parse");
-
-        assert_eq!(size, Some(5242880));
+    fn resolve_upload_part_size_uses_normalized_logical_length() {
+        assert_eq!(resolve_upload_part_size(Some(5242880), None).expect("DTO length"), Some(5242880));
+        assert_eq!(resolve_upload_part_size(None, None).expect("unknown length"), None);
+        let body = StreamingBlob::from(Bytes::from_static(b"abc"));
+        assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("exact bytes"), Some(3));
+        assert_eq!(resolve_upload_part_size(Some(0), Some(&body)).expect("explicit length wins"), Some(0));
+        let body = StreamingBlob::wrap(futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]));
+        assert_eq!(futures::Stream::size_hint(&body), (1, Some(1)), "the stream knows its item count");
+        assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("unknown byte length"), None);
     }
 
     #[test]
-    fn resolve_upload_part_size_preserves_regular_content_length() {
-        let headers = HeaderMap::new();
+    fn upload_part_length_contract_rejects_unknown_and_all_negative_lengths() {
+        assert_eq!(
+            require_upload_part_size(None, false).expect_err("ordinary unknown").code(),
+            &S3ErrorCode::MissingContentLength
+        );
+        assert_eq!(
+            require_upload_part_size(None, true).expect_err("capped unknown").code(),
+            &S3ErrorCode::UnexpectedContent
+        );
+        for capped in [false, true] {
+            for size in [-1, -2, i64::MIN] {
+                assert_eq!(
+                    require_upload_part_size(Some(size), capped).expect_err("negative").code(),
+                    &S3ErrorCode::UnexpectedContent
+                );
+            }
+            assert_eq!(require_upload_part_size(Some(0), capped).expect("zero is valid"), 0);
+        }
+    }
 
-        let size = resolve_upload_part_size(&headers, Some(5242880)).expect("regular size should parse");
-
-        assert_eq!(size, Some(5242880));
+    #[test]
+    fn upload_part_timeout_policy_preserves_disabled_and_capped_floor() {
+        for seconds in [0, 1, 299, 300, 601] {
+            let configured = Duration::from_secs(seconds);
+            assert_eq!(upload_part_body_read_timeout(configured, false), configured);
+            assert_eq!(upload_part_body_read_timeout(configured, true), Duration::from_secs(seconds.max(300)));
+        }
     }
 
     #[test]
@@ -3258,6 +3261,85 @@ mod tests {
             assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_rejects_unknown_length_before_admission_or_body_polling() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("upload-part-length-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let concurrency_manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            true,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let held = concurrency_manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("hold the only permit");
+        let usecase = DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), concurrency_manager);
+
+        for capped in [false, true] {
+            let mut options = ObjectOptions::default();
+            if capped {
+                insert_str(&mut options.user_defined, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "1024".to_owned());
+            }
+            let upload = store
+                .new_multipart_upload(&bucket, "object", &options)
+                .await
+                .expect("upload session");
+            for content_length in [None, Some(-1)] {
+                for declared_chunk_encoding in [false, true] {
+                    let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
+                    let input = UploadPartInput::builder()
+                        .bucket(bucket.clone())
+                        .key("object".to_owned())
+                        .upload_id(upload.upload_id.clone())
+                        .part_number(1)
+                        .content_length(content_length)
+                        .body(Some(body))
+                        .build()
+                        .expect("part request");
+                    let mut request = build_request(input, Method::PUT);
+                    request
+                        .headers
+                        .insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
+                    if declared_chunk_encoding {
+                        request
+                            .headers
+                            .insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+                    }
+                    let error = usecase
+                        .execute_upload_part(request)
+                        .await
+                        .expect_err("unknown or negative logical size");
+                    assert_eq!(
+                        error.code(),
+                        &if capped || content_length.is_some() {
+                            S3ErrorCode::UnexpectedContent
+                        } else {
+                            S3ErrorCode::MissingContentLength
+                        }
+                    );
+                    assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 0);
+                }
+            }
+            let parts = store
+                .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
+                .await
+                .expect("list rejected session");
+            assert!(parts.parts.is_empty());
+        }
+        drop(held);
     }
 
     #[tokio::test]
