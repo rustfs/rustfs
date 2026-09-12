@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod logs;
+mod perf_drive;
 mod profile_cpu;
 mod profile_memory;
 mod profile_threads;
@@ -25,6 +26,12 @@ mod trace_replay;
 pub use logs::{
     CaptureMode, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent, LogCaptureError, LogCaptureRequest, LogProvenance,
     SavedLogExport, SignedLogExport, export_logs, save_signed_log_export,
+};
+pub use perf_drive::{
+    DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DriveDiagnosticResult, DriveMeasurement, DriveOutcome, DrivePerformanceData,
+    DrivePerformanceError, DrivePerformanceRequest, DriveProvenance, DriveReadMode, DriveReasonCode, DriveTargetParameters,
+    DriveTargetReasonCode, DriveTargetResult, DriveTargetUnits, LocalDriveConsent, SavedDriveExport, SignedDriveExport,
+    measure_drive, save_signed_drive_export, sign_drive_export, validate_drive_limits,
 };
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,

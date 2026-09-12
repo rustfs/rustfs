@@ -14,8 +14,8 @@
 
 use crate::{
     config::{
-        CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
-        ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
+        CommandResult, Config, ConnectDrivePerformanceOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode,
+        ConnectLogsOpts, ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
         ConnectThreadProfileScope, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
@@ -26,7 +26,7 @@ use crate::{
     storage_api::server::http::ServerContextSlot,
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
-use std::io::{Error, Read as _, Result};
+use std::io::{Error, Read as _, Result, Write as _};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, instrument};
@@ -136,6 +136,7 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
@@ -473,6 +474,100 @@ fn valid_environment_name(value: &str) -> bool {
 fn unix_now() -> Result<i64> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(Error::other)?;
     i64::try_from(duration.as_secs()).map_err(Error::other)
+}
+
+async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        DriveOutcome, DrivePerformanceRequest, DriveProvenance, IdentityStore, LocalDriveConsent, measure_drive,
+        save_signed_drive_export, sign_drive_export, validate_drive_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let duration = Duration::from_millis(options.duration_millis);
+    validate_drive_limits(duration, options.scratch_bytes, options.block_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect drive performance requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = DrivePerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalDriveConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        target_alias: "drive-1".to_owned(),
+        scratch_root: options.scratch_dir,
+        scratch_bytes: options.scratch_bytes,
+        block_bytes: options.block_bytes,
+        provenance: DriveProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_drive(&request, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.drive outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != DriveOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "drive performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_drive_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_drive_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
 }
 
 async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {

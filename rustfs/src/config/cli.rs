@@ -127,12 +127,101 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Run an explicitly approved, bounded local performance measurement
+    Performance(ConnectPerformanceOpts),
     /// Capture a consent-bound local profile and write a signed export
     Profile(ConnectProfileOpts),
     /// Capture allow-listed local log events and write a signed export
     Logs(ConnectLogsOpts),
     /// Record, forward, or replay consent-bound telemetry
     Telemetry(ConnectTelemetryOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectPerformanceOpts {
+    #[command(subcommand)]
+    pub command: ConnectPerformanceCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectPerformanceCommands {
+    /// Measure generated-file write and warm page-cache read performance
+    Drive(ConnectDrivePerformanceOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectDrivePerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Existing approved directory in which to create task-owned scratch state
+    #[arg(long = "scratch-dir")]
+    pub scratch_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.drive@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Generated scratch payload size in bytes
+    #[arg(long = "scratch-bytes", default_value_t = 32_768)]
+    pub scratch_bytes: u64,
+
+    /// Individual read/write block size in bytes
+    #[arg(long = "block-bytes", default_value_t = 4_096)]
+    pub block_bytes: u64,
+
+    /// Confirm this explicit local diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
 }
 
 #[derive(Args, Clone)]
@@ -793,6 +882,8 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Consent-bound local Connect drive performance export
+    ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export
