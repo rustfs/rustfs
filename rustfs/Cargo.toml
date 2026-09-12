@@ -317,6 +317,7 @@ snap.workspace = true
 zstd.workspace = true
 
 # Cryptography and Security
+ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }

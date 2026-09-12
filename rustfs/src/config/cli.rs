@@ -125,6 +125,8 @@ pub struct ConnectOpts {
 pub enum ConnectCommands {
     /// Exchange a protected one-time token for a durable device credential (Unix only)
     Register(ConnectRegisterOpts),
+    /// Import, verify, or inspect a signed Connect service license
+    License(ConnectLicenseOpts),
 }
 
 /// `connect register` options
@@ -145,6 +147,71 @@ pub struct ConnectRegisterOpts {
     /// Owner-only regular token file; omit to read the token from stdin
     #[arg(long = "token-file")]
     pub token_file: Option<PathBuf>,
+}
+
+/// Signed Connect service-license operations.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseOpts {
+    #[command(subcommand)]
+    pub command: ConnectLicenseCommands,
+}
+
+/// Local service-license operations.
+#[derive(Subcommand, Clone)]
+pub enum ConnectLicenseCommands {
+    /// Verify and atomically install a downloaded or hand-carried license file
+    Import(ConnectLicenseArtifactOpts),
+    /// Verify a license file without changing installed state
+    Verify(ConnectLicenseArtifactOpts),
+    /// Verify and display the installed license for one deployment and service
+    Show(ConnectLicenseScopeOpts),
+}
+
+/// Trust and scope pins shared by service-license commands.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseScopeOpts {
+    /// Directory containing local service-license state
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// File containing the pinned Ed25519 public key as canonical base64url
+    #[arg(long = "public-key-file")]
+    pub public_key_file: PathBuf,
+
+    /// SHA-256 key ID for the pinned public key
+    #[arg(long = "key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub key_id: String,
+
+    /// Expected Connect license issuer
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub issuer: String,
+
+    /// Expected RustFS license audience
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub audience: String,
+
+    /// Expected organization resource name
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Expected deployment resource name
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub deployment: String,
+
+    /// Expected service code
+    #[arg(long = "service-code", value_parser = NonEmptyStringValueParser::new())]
+    pub service_code: String,
+}
+
+/// A service-license file plus its local trust and scope pins.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseArtifactOpts {
+    /// Downloaded or hand-carried signed license artifact
+    #[arg(long)]
+    pub artifact: PathBuf,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
 }
 
 /// Offline inspection subcommand options
@@ -446,6 +513,8 @@ pub enum CommandResult {
     Inspect(InspectOpts),
     /// One-time Connect registration command
     ConnectRegister(ConnectRegisterOpts),
+    /// Local Connect service-license command
+    ConnectLicense(ConnectLicenseCommands),
 }
 
 /// Create default ServerOpts from environment variables

@@ -33,6 +33,7 @@ pub mod heartbeat;
 pub mod identity;
 pub mod identity_store;
 pub mod inventory;
+pub mod license;
 pub mod offline;
 pub mod registration;
 pub mod registration_bootstrap;
@@ -52,6 +53,10 @@ pub use identity_store::{IdentityStore, StoreError};
 pub use inventory::{
     InventoryError, InventoryFlag, InventoryOsVersion, InventorySchedule, InventorySnapshot, InventoryStatus,
     OperatingSystemFamily,
+};
+pub use license::{
+    LICENSE_DOMAIN_SEPARATION_TAG, LicenseArtifactError, LicenseArtifactStatus, LicenseClaims, LicenseReport,
+    LicenseVerificationContext, apply_license_artifact, inspect_installed_license, verify_license_artifact,
 };
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};

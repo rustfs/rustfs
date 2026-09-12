@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    config::{CommandResult, Config, Opt},
+    config::{CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, Opt},
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
@@ -129,6 +129,7 @@ async fn async_main() -> Result<()> {
             println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
             return Ok(());
         }
+        CommandResult::ConnectLicense(command) => return execute_connect_license(command),
         CommandResult::Server(config) => config,
     };
 
@@ -156,6 +157,55 @@ async fn async_main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
+    use crate::connect::{apply_license_artifact, inspect_installed_license, verify_license_artifact};
+
+    let scope = match &command {
+        ConnectLicenseCommands::Import(options) | ConnectLicenseCommands::Verify(options) => &options.scope,
+        ConnectLicenseCommands::Show(options) => options,
+    };
+    let context = license_context(scope);
+    let report = match context {
+        Ok(context) => match &command {
+            ConnectLicenseCommands::Import(options) => apply_license_artifact(&options.artifact, &scope.state_dir, &context),
+            ConnectLicenseCommands::Verify(options) => verify_license_artifact(&options.artifact, &scope.state_dir, &context),
+            ConnectLicenseCommands::Show(_) => inspect_installed_license(&scope.state_dir, &context),
+        }
+        .unwrap_or_else(|error| {
+            let installed = matches!(&command, ConnectLicenseCommands::Show(_))
+                && error.status != crate::connect::LicenseArtifactStatus::Missing;
+            error.report(installed)
+        }),
+        Err(error) => error.report(false),
+    };
+    print_license_report(&report)?;
+    if report.is_valid() {
+        Ok(())
+    } else {
+        Err(Error::other(format!("Connect service license status is {}", report.status)))
+    }
+}
+
+fn license_context(
+    scope: &ConnectLicenseScopeOpts,
+) -> std::result::Result<crate::connect::LicenseVerificationContext, crate::connect::LicenseArtifactError> {
+    crate::connect::LicenseVerificationContext::from_public_key_file(
+        &scope.public_key_file,
+        scope.key_id.clone(),
+        scope.issuer.clone(),
+        scope.audience.clone(),
+        scope.organization.clone(),
+        scope.deployment.clone(),
+        scope.service_code.clone(),
+    )
+}
+
+fn print_license_report(report: &crate::connect::LicenseReport) -> Result<()> {
+    let output = serde_json::to_string(report).map_err(Error::other)?;
+    println!("{output}");
+    Ok(())
 }
 
 #[instrument(skip(config))]

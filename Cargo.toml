@@ -263,6 +263,7 @@ crossbeam-deque = "0.8.8"
 crossbeam-utils = "0.8.23"
 datafusion = { default-features = false, version = "55.0.0" }
 derive_builder = "0.20.2"
+ed25519-dalek = "2.2.0"
 enumset = "1.1.14"
 faster-hex = "0.10.0"
 flate2 = "1.1.10"
