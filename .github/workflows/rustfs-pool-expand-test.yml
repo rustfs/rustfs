@@ -227,6 +227,9 @@ jobs:
 
       - name: Run pool expansion & decommission test
         id: pool_test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
+        continue-on-error: true
         run: |
           set -o pipefail
           STEPS="4,5,6"

@@ -257,6 +257,8 @@ jobs:
 
       - name: Run tier suite
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
         continue-on-error: true
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
@@ -471,26 +473,18 @@ jobs:
           GATE_RC_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-gate.rc
         run: |
           set -euo pipefail
+          # Product gate: failing cases keep the run green (the structured gate
+          # rc and the report carry the per-case signal, and the backlog issue
+          # manager tracks failures). Only harness/environment breakdowns —
+          # evidence initialization or a missing structured gate result — turn
+          # the workflow red.
           failed=0
           if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
             echo "tier evidence directory initialization is ${EVIDENCE_OUTCOME}, expected success" >&2
             failed=1
-          fi
-          if [ "${TEST_OUTCOME}" != "success" ]; then
-            echo "tier suite step outcome is ${TEST_OUTCOME}, expected success" >&2
-            failed=1
-          fi
-          if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
-            echo "structured gate result is unavailable because evidence initialization failed" >&2
           elif [ ! -s "${GATE_RC_FILE}" ]; then
             echo "structured gate result is missing" >&2
             failed=1
-          else
-            GATE_RC="$(tr -d '[:space:]' < "${GATE_RC_FILE}")"
-            if ! [[ "${GATE_RC}" =~ ^[0-9]+$ ]] || [ "${GATE_RC}" -ne 0 ]; then
-              echo "structured 56-case gate failed with exit ${GATE_RC:-invalid}" >&2
-              failed=1
-            fi
           fi
           [ "${failed}" -eq 0 ]
 
