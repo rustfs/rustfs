@@ -11205,7 +11205,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/s3s.git?rev=bdcb6259339c41369f9f1c60e3a42b5ab8da607b#bdcb6259339c41369f9f1c60e3a42b5ab8da607b"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3e17541f366696bf0cbaf380fcbd8b44c17eba4#f3e17541f366696bf0cbaf380fcbd8b44c17eba4"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11263,7 +11263,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=bdcb6259339c41369f9f1c60e3a42b5ab8da607b#bdcb6259339c41369f9f1c60e3a42b5ab8da607b"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3e17541f366696bf0cbaf380fcbd8b44c17eba4#f3e17541f366696bf0cbaf380fcbd8b44c17eba4"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.20",
@@ -11272,7 +11272,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=bdcb6259339c41369f9f1c60e3a42b5ab8da607b#bdcb6259339c41369f9f1c60e3a42b5ab8da607b"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3e17541f366696bf0cbaf380fcbd8b44c17eba4#f3e17541f366696bf0cbaf380fcbd8b44c17eba4"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11285,7 +11285,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=bdcb6259339c41369f9f1c60e3a42b5ab8da607b#bdcb6259339c41369f9f1c60e3a42b5ab8da607b"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3e17541f366696bf0cbaf380fcbd8b44c17eba4#f3e17541f366696bf0cbaf380fcbd8b44c17eba4"
 dependencies = [
  "arrayvec",
  "base64-simd",

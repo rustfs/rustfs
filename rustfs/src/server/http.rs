@@ -14,6 +14,7 @@
 
 // Import HTTP server components and compression configuration
 use crate::admin;
+use crate::app::object::request_body::{BodyReadControl, ObservedBody};
 use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
@@ -825,13 +826,11 @@ where
 
 impl<S, B, ResBody, ServiceError> Service<HttpRequest<B>> for EarlyResponseBodyService<S>
 where
-    S: Service<HttpRequest<B>, Response = Response<ResBody>, Error = ServiceError>
-        + Service<HttpRequest<EarlyResponseBody<B>>, Response = Response<ResBody>, Error = ServiceError>
+    S: Service<HttpRequest<ObservedBody<EarlyResponseBody<B>>>, Response = Response<ResBody>, Error = ServiceError>
         + Clone
         + Send
         + 'static,
-    <S as Service<HttpRequest<B>>>::Future: Send + 'static,
-    <S as Service<HttpRequest<EarlyResponseBody<B>>>>::Future: Send + 'static,
+    <S as Service<HttpRequest<ObservedBody<EarlyResponseBody<B>>>>>::Future: Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
     ResBody: Send + 'static,
@@ -842,32 +841,32 @@ where
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        match <S as Service<HttpRequest<B>>>::poll_ready(&mut self.inner, cx)? {
-            Poll::Ready(()) => <S as Service<HttpRequest<EarlyResponseBody<B>>>>::poll_ready(&mut self.inner, cx),
-            Poll::Pending => Poll::Pending,
-        }
+        self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
         let version = req.version();
         let preserve_on_drop = matches!(version, Version::HTTP_10 | Version::HTTP_11) && !req.body().is_end_stream();
         let mut inner = self.inner.clone();
-        if !preserve_on_drop {
-            return Box::pin(async move { <S as Service<HttpRequest<B>>>::call(&mut inner, req).await });
-        }
+        let mut req = req;
+        let control = BodyReadControl::default();
+        req.extensions_mut().insert(control.clone());
 
         let mut drain_context = EarlyResponseBodyDrainContext::from_request(&req, self.idle_timeout);
         let state = Arc::new(EarlyResponseBodyState::default());
         let guarded_req = req.map({
             let state = Arc::clone(&state);
-            move |body| EarlyResponseBody::new(body, state)
+            move |body| ObservedBody::new(EarlyResponseBody::new(body, state), control)
         });
 
         Box::pin(async move {
-            let result = <S as Service<HttpRequest<EarlyResponseBody<B>>>>::call(&mut inner, guarded_req).await;
+            let result = inner.call(guarded_req).await;
             let Some(abandoned) = state.take_abandoned() else {
                 return result;
             };
+            if !preserve_on_drop {
+                return result;
+            }
 
             match result {
                 Ok(mut response) => {
@@ -2458,9 +2457,10 @@ mod tests {
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
     use http::Request as HttpRequest;
+    use http::header::CONTENT_LENGTH;
     use http::{HeaderMap, StatusCode};
     use http_body::Frame;
-    use http_body_util::{Empty, Full};
+    use http_body_util::{BodyExt, Empty, Full};
     use metrics::with_local_recorder;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use opentelemetry::propagation::Extractor;
@@ -2885,6 +2885,159 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert!(sender.send(Bytes::from_static(b"payload")).is_err());
         assert_eq!(bytes_polled.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Clone, Copy)]
+    struct UploadPartTimeoutS3 {
+        timeout: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for UploadPartTimeoutS3 {
+        async fn upload_part(
+            &self,
+            req: s3s::S3Request<s3s::dto::UploadPartInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
+            use futures::StreamExt;
+            use tokio_util::io::StreamReader;
+
+            let control = req
+                .extensions
+                .get::<BodyReadControl>()
+                .expect("HTTP route must install the control")
+                .clone();
+            control.activate(self.timeout, "bucket", "object", "request", 1024);
+            let body = req.input.body.expect("upload body");
+            let inner = rustfs_rio::wrap_reader(StreamReader::new(body.map(|item| item.map_err(std::io::Error::other))));
+            let mut reader = crate::app::object::request_body::DemandReader::new(inner, control);
+            reader
+                .read_to_end(&mut Vec::new())
+                .await
+                .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
+            Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput::default()))
+        }
+
+        async fn head_bucket(
+            &self,
+            _req: s3s::S3Request<s3s::dto::HeadBucketInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
+            Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput::default()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_part_timeout_preserves_http1_drain_and_http2_stream_drop() {
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            let (sender, body, bytes_polled, dropped) = tracked_request_body();
+            let request = HttpRequest::builder()
+                .version(version)
+                .method(Method::PUT)
+                .uri("/bucket/object?partNumber=1&uploadId=upload")
+                .header(CONTENT_LENGTH, "1024")
+                .body(body)
+                .expect("upload request");
+            let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
+                timeout: Duration::from_secs(300),
+            })
+            .build();
+            let mut service = EarlyResponseBodyService::new(inner, Duration::from_secs(30));
+            let mut call = Box::pin(service.call(request));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(300)).await;
+            let response = call.await.expect("timeout response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers().get(CONNECTION).is_some(), version == Version::HTTP_11);
+            let xml = response.into_body().collect().await.expect("timeout XML").to_bytes();
+            assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+            if version == Version::HTTP_11 {
+                assert!(
+                    !dropped.load(Ordering::Acquire),
+                    "synthetic errors must retain the unfinished raw transport"
+                );
+                sender
+                    .send(Bytes::from_static(b"late payload"))
+                    .expect("native drain receiver");
+                drop(sender);
+                tokio::task::yield_now().await;
+                assert_eq!(bytes_polled.load(Ordering::Relaxed), 12);
+            } else {
+                assert!(sender.is_closed(), "HTTP/2 must drop only the failed body");
+                assert_eq!(bytes_polled.load(Ordering::Relaxed), 0);
+            }
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_part_timeout_leaves_other_http2_streams_usable() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
+            timeout: Duration::from_millis(500),
+        })
+        .build();
+        let service = EarlyResponseBodyService::new(inner, Duration::from_secs(1));
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(TokioIo::new(server_io), TowerToHyperService::new(service))
+                .await
+        });
+        let (mut client, connection) = hyper::client::conn::http2::handshake::<_, _, TrackedRequestBody>(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("HTTP/2 handshake");
+        let connection = tokio::spawn(connection);
+        let (_sender, body, _, _) = tracked_request_body();
+        let stalled = client.send_request(
+            HttpRequest::builder()
+                .method(Method::PUT)
+                .uri("http://localhost/bucket/object?partNumber=1&uploadId=upload")
+                .header(CONTENT_LENGTH, "1024")
+                .body(body)
+                .expect("stalled request"),
+        );
+
+        client.ready().await.expect("same connection remains ready");
+        let (sender, body, _, _) = tracked_request_body();
+        drop(sender);
+        let response = client
+            .send_request(
+                HttpRequest::builder()
+                    .method(Method::HEAD)
+                    .uri("http://localhost/bucket")
+                    .body(body)
+                    .expect("healthy stream"),
+            )
+            .await
+            .expect("healthy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(CONNECTION));
+        response.into_body().collect().await.expect("healthy stream completes");
+        let response = tokio::time::timeout(Duration::from_secs(5), stalled)
+            .await
+            .expect("stream timeout")
+            .expect("S3 response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let xml = response.into_body().collect().await.expect("timeout body").to_bytes();
+        assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+        client.ready().await.expect("connection after failed stream");
+        let (sender, body, _, _) = tracked_request_body();
+        drop(sender);
+        let response = client
+            .send_request(
+                HttpRequest::builder()
+                    .method(Method::HEAD)
+                    .uri("http://localhost/bucket")
+                    .body(body)
+                    .expect("later stream"),
+            )
+            .await
+            .expect("later response");
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(client);
+        connection.abort();
+        server.abort();
     }
 
     #[tokio::test(start_paused = true)]
