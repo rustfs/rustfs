@@ -274,7 +274,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
 
     def test_all_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
-        for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "fault-tolerance", "performance"):
+        for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
                 # Workflow-level concurrency covers every job, including cleanup,
@@ -351,7 +351,7 @@ fi
                 job = yaml_block(replication.splitlines(), "replication-test", 2)
                 self.assertFalse(any(line.startswith("    continue-on-error:") for line in job))
                 self.steps = named_steps(job)
-                handoff = "Continue functional chain (next: Fault tolerance)"
+                handoff = "Continue functional chain (next: Performance)"
                 self.assertIn("        if: ${{ always() && github.event_name == 'repository_dispatch' }}", self.steps[handoff])
                 self.assertFalse(any(line.strip().startswith("continue-on-error:") for line in self.steps[handoff]))
                 self.assertIn("        if: always()", self.steps["Cleanup environment (after)"])
@@ -371,11 +371,11 @@ fi
                 self.assertEqual(forwarded.returncode == 0, bool(token) and failed_attempts < 3, forwarded.stderr)
                 calls = dispatches.read_text().splitlines() if dispatches.exists() else []
                 self.assertEqual(calls, [
-                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-fault-tolerance -F client_payload[from_suite]=replication",
+                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-performance -F client_payload[from_suite]=replication",
                 ] * (min(failed_attempts + 1, 3) if token else 0))
                 if failed_attempts == 3:
-                    self.assertIn("could not hand off from **replication** to **Fault tolerance**", body.read_text())
-                    self.assertIn("rustfs-chain-fault-tolerance", body.read_text())
+                    self.assertIn("could not hand off from **replication** to **Performance**", body.read_text())
+                    self.assertIn("rustfs-chain-performance", body.read_text())
                     self.assertEqual(executed.read_text().splitlines().count("issue"), 2 if issue_exit else 1)
                     self.assertFalse(Path(body_path.read_text().strip()).exists())
 
