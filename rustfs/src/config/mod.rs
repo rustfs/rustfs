@@ -54,6 +54,10 @@ pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
 pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
+pub use cli::{
+    ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
+    ConnectTelemetryReplayOpts,
+};
 pub use cli::{DiagnoseFormat, DiagnoseOpts};
 pub use cli::{InspectBucketMetaOpts, InspectCommands, InspectOpts};
 pub use cli::{TlsCommands, TlsInspectOpts, TlsOpts};

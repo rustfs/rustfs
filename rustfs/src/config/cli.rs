@@ -131,6 +131,113 @@ pub enum ConnectCommands {
     Profile(ConnectProfileOpts),
     /// Capture allow-listed local log events and write a signed export
     Logs(ConnectLogsOpts),
+    /// Record, forward, or replay consent-bound telemetry
+    Telemetry(ConnectTelemetryOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryOpts {
+    #[command(subcommand)]
+    pub command: ConnectTelemetryCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectTelemetryCommands {
+    /// Capture process-local telemetry when an approved typed source is available
+    Record(ConnectTelemetryRecordOpts),
+    /// Forward an OTLP protobuf batch from stdin to a customer-approved collector
+    Otlp(ConnectTelemetryOtlpOpts),
+    /// Replay reviewed trace JSON read from stdin and write a signed export
+    Replay(ConnectTelemetryReplayOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryArtifactOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this operation
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Confirm this explicit local L3 telemetry operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryRecordOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
+
+    /// Capture duration in milliseconds
+    #[arg(long = "duration-millis")]
+    pub duration_millis: u64,
+
+    /// Maximum exported span count
+    #[arg(long = "max-spans", default_value_t = 1_024)]
+    pub max_spans: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryOtlpOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
+
+    /// Customer-approved OTLP/HTTP traces endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Forward timeout in milliseconds
+    #[arg(long = "timeout-millis")]
+    pub timeout_millis: u64,
+
+    /// Environment variable containing the local Authorization header value
+    #[arg(long = "authorization-env", value_parser = NonEmptyStringValueParser::new())]
+    pub authorization_env: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryReplayOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
 }
 
 /// `connect logs` options.
@@ -690,6 +797,8 @@ pub enum CommandResult {
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export
     ConnectLogs(ConnectLogsOpts),
+    /// Consent-bound local Connect telemetry operation
+    ConnectTelemetry(ConnectTelemetryCommands),
 }
 
 /// Create default ServerOpts from environment variables
@@ -943,6 +1052,43 @@ mod tests {
             "1000",
         ];
         let error = Cli::try_parse_from(arguments).expect_err("unacknowledged log capture must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l3"));
+    }
+
+    #[test]
+    fn connect_telemetry_record_requires_explicit_l3_acknowledgement() {
+        let arguments = [
+            "rustfs",
+            "connect",
+            "telemetry",
+            "record",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--output",
+            "/tmp/telemetry.zip",
+            "--organization",
+            "organizations/019e3ae0-0000-7000-8000-000000000001",
+            "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002/clusterDevices/019e3ae0-0000-7000-8000-000000000003",
+            "--run-uid",
+            "019e3ae0-0000-7000-8000-000000000004",
+            "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000005",
+            "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000006",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "4102444800",
+            "--expires-at",
+            "4102444700",
+            "--duration-millis",
+            "10",
+        ];
+        let error = Cli::try_parse_from(arguments).expect_err("unacknowledged telemetry capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }
