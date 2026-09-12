@@ -18604,71 +18604,75 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn cancelled_rename_keeps_namespace_lock_until_publication() {
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
-        let bucket = "put-commit-lock-cancelled-rename";
-        let object = "commit-lock-cancelled-rename-object";
-        for disk in &disk_stores {
-            disk.make_volume(bucket).await.expect("bucket volume should be created");
-        }
-
-        let rename_tasks = rename_fanout_barrier::observe_tasks(object);
-        let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
-        let first_store = Arc::clone(&set_disks);
-        let first = tokio::spawn(async move {
-            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
-            first_store
-                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
-            .await
-            .expect("first PUT should pause during the authoritative rename");
-
-        let second_namespace_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
-        let second_store = Arc::clone(&set_disks);
-        let second = tokio::spawn(async move {
-            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
-            second_store
-                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-        });
-        second_namespace_barrier.release_and_wait_until_namespace_pending().await;
-
-        first.abort();
-        assert!(
-            first
-                .await
-                .expect_err("the first request should be cancelled while rename is parked")
-                .is_cancelled()
-        );
-        tokio::task::yield_now().await;
-        assert!(
-            !second.is_finished(),
-            "the second writer must remain blocked by the cancelled commit owner"
-        );
-
-        rename_barrier.release();
-        drop(rename_barrier);
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while rename_tasks.running() != 0 {
-                tokio::task::yield_now().await;
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-commit-lock-cancelled-rename";
+            let object = "commit-lock-cancelled-rename-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
             }
-        })
-        .await
-        .expect("the cancelled owner's rename fanout should drain");
-        second
-            .await
-            .expect("second overwrite task should join")
-            .expect("second overwrite should commit after the cancelled owner reaches publication");
 
-        let mut reader = set_disks
-            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&set_disks);
+            let first = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                first_store
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("first PUT should pause during the authoritative rename");
+
+            let second_namespace_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+            let second_store = Arc::clone(&set_disks);
+            let second = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+                second_store
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            second_namespace_barrier.release_and_wait_until_namespace_pending().await;
+
+            first.abort();
+            assert!(
+                first
+                    .await
+                    .expect_err("the first request should be cancelled while rename is parked")
+                    .is_cancelled()
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !second.is_finished(),
+                "the second writer must remain blocked by the cancelled commit owner"
+            );
+
+            rename_barrier.release();
+            drop(rename_barrier);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("the latest overwrite should be readable");
-        let mut body = Vec::new();
-        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
-        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+            .expect("the cancelled owner's rename fanout should drain");
+            second
+                .await
+                .expect("second overwrite task should join")
+                .expect("second overwrite should commit after the cancelled owner reaches publication");
+
+            let mut reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the latest overwrite should be readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+            assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+        })
+        .await;
     }
 
     #[tokio::test]
