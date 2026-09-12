@@ -26,7 +26,7 @@ Options:
   --out-dir DIR       Alias for --run-dir
   --test NAME         all, g04, or g12 (default: all)
   --allow-dirty      Allow tracked source changes while collecting evidence
-  --skip-build       Reuse an existing target/debug/rustfs binary
+  --skip-build       Reuse a binary built by scripts/e2e_binary.py build from the current sources
   --plan-only        Print the resolved plan without building or running tests
   --dry-run          Alias for --plan-only
   --self-test        Run lightweight CLI and descriptor checks
@@ -97,13 +97,6 @@ cargo_target_dir() {
     else
         echo "$ROOT/target"
     fi
-}
-
-write_rustfs_features_stamp() {
-    local target_dir
-    target_dir="$(cargo_target_dir)"
-    mkdir -p "$target_dir/debug"
-    : >"$target_dir/debug/rustfs.features"
 }
 
 artifact_dir_for() {
@@ -585,8 +578,7 @@ SOURCE_REVISION="$(git rev-parse HEAD)"
 printf '%s\n' "$SOURCE_REVISION" >"$RUN_DIR/source-revision.txt"
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
-    run_logged build-current cargo build --locked -p rustfs --bin rustfs
-    write_rustfs_features_stamp
+    run_logged build-current "$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" build
 fi
 
 if [[ " ${CASES[*]} " == *" g04 "* ]]; then
@@ -601,6 +593,7 @@ if [[ " ${CASES[*]} " == *" g12 "* ]]; then
         NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
         HTTP_PROXY= \
         HTTPS_PROXY= \
+        "$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" run -- \
         cargo test --locked -p e2e_test \
         distributed::replication_quota_test::four_node_four_drive_hard_quota_rejects_over_limit_put \
         -- --exact --nocapture
