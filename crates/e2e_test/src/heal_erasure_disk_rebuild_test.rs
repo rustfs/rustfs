@@ -681,10 +681,6 @@ mod tests {
             && operations["activeBySource"]["admin"].as_u64() == Some(1)
     }
 
-    fn is_service_unavailable_put(error: &SdkError<PutObjectError>) -> bool {
-        error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
-    }
-
     fn is_retryable_outage_put(error: &SdkError<PutObjectError>) -> bool {
         matches!(
             error.as_service_error().and_then(ProvideErrorMetadata::code),
