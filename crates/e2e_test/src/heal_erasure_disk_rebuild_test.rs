@@ -685,6 +685,13 @@ mod tests {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
     }
 
+    fn is_retryable_deferred_put_after_rejoin(error: &SdkError<PutObjectError>) -> bool {
+        matches!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("SlowDownRead" | "ServiceUnavailable")
+        )
+    }
+
     fn is_service_unavailable_delete(error: &SdkError<DeleteObjectError>) -> bool {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
     }
@@ -2181,11 +2188,21 @@ mod tests {
                 .await;
                 match put_result {
                     Ok(Ok(_)) => break,
-                    Ok(Err(error)) if is_service_unavailable_put(&error) && Instant::now() < deferred_deadline => {
+                    Ok(Err(error)) if is_retryable_deferred_put_after_rejoin(&error) && Instant::now() < deferred_deadline => {
                         sleep(Duration::from_secs(1)).await;
                     }
-                    Ok(Err(error)) => return Err(error.into()),
-                    Err(error) => return Err(error.into()),
+                    Ok(Err(error)) => {
+                        return Err(format!(
+                            "deferred outage PUT failed for {bucket}/{outage_key} after target rejoin and up to 60s wait: {error}"
+                        )
+                        .into());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "deferred outage PUT timed out for {bucket}/{outage_key} after 30s attempt: {error}"
+                        )
+                        .into());
+                    }
                 }
             }
             info!(
