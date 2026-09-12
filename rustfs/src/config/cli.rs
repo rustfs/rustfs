@@ -127,6 +127,97 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Capture a consent-bound local profile and write a signed export
+    Profile(ConnectProfileOpts),
+}
+
+/// `connect profile` options.
+#[derive(Args, Clone)]
+pub struct ConnectProfileOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Profile producer to run
+    #[arg(long, value_enum)]
+    pub tool: ConnectProfileTool,
+
+    /// Thread source required by the threads producer
+    #[arg(long = "thread-scope", value_enum)]
+    pub thread_scope: Option<ConnectThreadProfileScope>,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability, such as profile.memory@1
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this capture
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Maximum capture duration in milliseconds
+    #[arg(long = "duration-millis")]
+    pub duration_millis: u64,
+
+    /// Sampling interval in microseconds
+    #[arg(long = "sample-period-micros")]
+    pub sample_period_micros: u64,
+
+    /// Confirm this explicit local L3 profile capture
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectProfileTool {
+    Cpu,
+    Memory,
+    Threads,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectThreadProfileScope {
+    TokioRuntime,
+    NativeThreads,
 }
 
 /// `connect register` options
@@ -515,6 +606,8 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Consent-bound local Connect profile export
+    ConnectProfile(ConnectProfileOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -651,7 +744,9 @@ mod tests {
         let Some(Commands::Connect(connect)) = cli.command else {
             panic!("connect command expected");
         };
-        let ConnectCommands::Register(register) = connect.command;
+        let ConnectCommands::Register(register) = connect.command else {
+            panic!("connect register command expected");
+        };
         assert_eq!(register.endpoint, "https://connect.example/agent/");
         assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
         assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));
@@ -690,6 +785,48 @@ mod tests {
 
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("Unix only"));
+    }
+
+    #[test]
+    fn connect_profile_requires_explicit_l3_acknowledgement() {
+        let arguments = [
+            "rustfs",
+            "connect",
+            "profile",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--output",
+            "/tmp/profile.zip",
+            "--tool",
+            "memory",
+            "--capability",
+            "profile.memory@1",
+            "--organization",
+            "organizations/019e3ae0-0000-7000-8000-000000000001",
+            "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002/clusterDevices/019e3ae0-0000-7000-8000-000000000003",
+            "--run-uid",
+            "019e3ae0-0000-7000-8000-000000000004",
+            "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000005",
+            "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000006",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "4102444800",
+            "--expires-at",
+            "4102444700",
+            "--duration-millis",
+            "10",
+            "--sample-period-micros",
+            "1000",
+        ];
+        let error = Cli::try_parse_from(arguments).expect_err("an incomplete unacknowledged profile must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l3"));
     }
 
     #[test]

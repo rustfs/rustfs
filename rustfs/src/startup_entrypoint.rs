@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::{
-    config::{CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, Opt},
+    config::{
+        CommandResult, Config, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectProfileOpts, ConnectProfileTool,
+        ConnectThreadProfileScope, Opt,
+    },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
@@ -22,7 +25,8 @@ use crate::{
     storage_api::server::http::ServerContextSlot,
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
-use std::io::{Error, Result};
+use std::io::{Error, Read as _, Result};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, instrument};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -130,6 +134,7 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::Server(config) => config,
     };
 
@@ -157,6 +162,173 @@ async fn async_main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalProfileConsent, ProfileCaptureRequest, ProfileProvenance, ThreadProfileScope, export_cpu_profile,
+        export_memory_profile, export_thread_profile, save_signed_profile_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ProfileCaptureRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalProfileConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration: Duration::from_millis(options.duration_millis),
+        sample_period: Duration::from_micros(options.sample_period_micros),
+        provenance: ProfileProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let capture = async {
+        match options.tool {
+            ConnectProfileTool::Cpu => {
+                if options.thread_scope.is_some() {
+                    return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                }
+                export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
+            }
+            ConnectProfileTool::Memory => {
+                if options.thread_scope.is_some() {
+                    return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                }
+                export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
+            }
+            ConnectProfileTool::Threads => {
+                let scope = match options.thread_scope {
+                    Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
+                    Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
+                    None => return Err(Error::other("--thread-scope is required for the threads profile")),
+                };
+                export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+            }
+        }
+    };
+    tokio::pin!(capture);
+    let export = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return Err(Error::other("profile collection cancelled"));
+        }
+        result = capture.as_mut() => result?,
+    };
+    drop(capture);
+    let tool = export.tool;
+    let outcome = export.outcome;
+    let reason_code = export.reason_code;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_profile_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+
+    println!("tool={} outcome={} reason={}", tool.id(), outcome.as_str(), reason_code.as_str());
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+fn hash_current_executable() -> Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    const MAX_EXECUTABLE_BYTES: u64 = 1_073_741_824;
+    let path = std::env::current_exe().map_err(Error::other)?;
+    let mut file = std::fs::File::open(path).map_err(Error::other)?;
+    let metadata = file.metadata().map_err(Error::other)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
+        return Err(Error::other("current executable is outside the profile provenance limit"));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_bytes = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(Error::other)?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(u64::try_from(count).map_err(Error::other)?)
+            .ok_or_else(|| Error::other("current executable is outside the profile provenance limit"))?;
+        if read_bytes > MAX_EXECUTABLE_BYTES {
+            return Err(Error::other("current executable is outside the profile provenance limit"));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if read_bytes != metadata.len() {
+        return Err(Error::other("current executable changed while hashing profile provenance"));
+    }
+    Ok(hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower))
+}
+
+fn enabled_build_features() -> Vec<String> {
+    let mut features = Vec::new();
+    for (enabled, name) in [
+        (cfg!(feature = "connect-e2e-short-credentials"), "connect-e2e-short-credentials"),
+        (cfg!(feature = "dial9"), "dial9"),
+        (cfg!(feature = "e2e-test-hooks"), "e2e-test-hooks"),
+        (cfg!(feature = "ftps"), "ftps"),
+        (cfg!(feature = "full"), "full"),
+        (cfg!(feature = "gcs"), "gcs"),
+        (cfg!(feature = "hotpath"), "hotpath"),
+        (cfg!(feature = "hotpath-alloc"), "hotpath-alloc"),
+        (cfg!(feature = "hotpath-cpu"), "hotpath-cpu"),
+        (cfg!(feature = "io-scheduler-debug"), "io-scheduler-debug"),
+        (cfg!(feature = "license"), "license"),
+        (cfg!(feature = "metrics-gpu"), "metrics-gpu"),
+        (cfg!(feature = "offline-enrollment-e2e-root"), "offline-enrollment-e2e-root"),
+        (cfg!(feature = "pyroscope"), "pyroscope"),
+        (cfg!(feature = "rio-v2"), "rio-v2"),
+        (cfg!(feature = "sftp"), "sftp"),
+        (cfg!(feature = "swift"), "swift"),
+        (cfg!(feature = "tracing-chunk-debug"), "tracing-chunk-debug"),
+        (cfg!(feature = "webdav"), "webdav"),
+    ] {
+        if enabled {
+            features.push(name.to_owned());
+        }
+    }
+    features
 }
 
 fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
