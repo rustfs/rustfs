@@ -12,8 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod profile_cpu;
+mod profile_memory;
+mod profile_threads;
 mod schedule;
 
+pub use profile_cpu::{
+    CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
+    ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
+    ProfileTool, SavedProfileExport, SignedProfileExport, THREAD_PROFILE_CAPABILITY, ThreadProfileScope, capture_cpu_profile,
+    encode_signed_profile_export, export_cpu_profile, save_signed_profile_export,
+};
+pub use profile_memory::export_memory_profile;
+pub use profile_threads::{capture_thread_profile, export_thread_profile};
 pub use schedule::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
