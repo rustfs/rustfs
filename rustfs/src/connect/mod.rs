@@ -28,6 +28,7 @@
 pub mod client;
 pub mod config;
 pub mod credential_store;
+pub mod diagnostics;
 pub mod environment;
 pub mod heartbeat;
 pub mod identity;
@@ -43,6 +44,10 @@ mod telemetry;
 pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
 pub use credential_store::{CredentialStore, DeviceCredential};
+pub use diagnostics::{
+    DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
+    ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
+};
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
     EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, collect_environment,

@@ -514,7 +514,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "sequence"
         ]
     );
-    assert_eq!(request["capabilities"], json!(["heartbeat"]));
+    assert_eq!(request["capabilities"], json!(["heartbeat", "diagnostics.policy.v1"]));
     assert_eq!(request["coarseNodeSummary"], json!({"total": 8, "healthy": 7, "degraded": 1}));
     assert_ne!(request["clientTime"], "2038-01-19T03:14:07Z");
     assert!(request.get("authorization").is_none());

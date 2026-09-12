@@ -25,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{ClientError, ConnectClient, ConnectConfig, RotationAttempt};
 use super::config::HeartbeatConfig;
+use super::diagnostics::{
+    DiagnosticCollectionPolicy, DiagnosticScheduleRuntime, DiagnosticScheduleStatus, spawn_environment_schedule,
+};
 use super::heartbeat::{CoarseNodeSummary, Delivery, HeartbeatError, HeartbeatSender, HeartbeatStateStore, HeartbeatStatus};
 use super::inventory::{
     InventoryDelivery, InventoryError, InventorySchedule, InventorySender, InventorySnapshot, InventoryStateStore,
@@ -35,6 +38,8 @@ pub struct HeartbeatRuntime {
     shutdown: CancellationToken,
     status: watch::Receiver<HeartbeatStatus>,
     task: Option<JoinHandle<()>>,
+    diagnostic_status: watch::Receiver<DiagnosticScheduleStatus>,
+    diagnostic_task: Option<DiagnosticScheduleRuntime>,
 }
 
 impl HeartbeatRuntime {
@@ -42,10 +47,17 @@ impl HeartbeatRuntime {
         self.status.clone()
     }
 
+    pub fn diagnostic_status(&self) -> watch::Receiver<DiagnosticScheduleStatus> {
+        self.diagnostic_status.clone()
+    }
+
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+        if let Some(task) = self.diagnostic_task.take() {
+            task.shutdown().await;
         }
     }
 }
@@ -122,9 +134,14 @@ where
     let store = HeartbeatStateStore::new(config.state_path.clone());
     let lock = store.try_runtime_lock()?;
     let schedule = config.schedule;
+    let state_root = config.state_root().ok_or(HeartbeatError::StateConflict)?.to_path_buf();
     let shutdown = parent_shutdown.child_token();
     let task_shutdown = shutdown.clone();
     let (status_tx, status_rx) = watch::channel(HeartbeatStatus::Starting);
+    let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+    let diagnostic_task =
+        spawn_environment_schedule(&state_root, policy_rx, shutdown.clone()).map_err(|_| HeartbeatError::StateConflict)?;
+    let diagnostic_status = diagnostic_task.status();
     let task = tokio::spawn(async move {
         let _lock = lock;
         let mut backoff = schedule.initial_backoff;
@@ -178,11 +195,15 @@ where
                 None => break,
             };
             let delay = match delivery {
-                Delivery::Accepted { server_time } => {
+                Delivery::Accepted {
+                    server_time,
+                    diagnostic_collection_policy,
+                } => {
                     if let Err(error) = store.mark_accepted(&pending).await {
                         return failed(&status_tx, error);
                     }
                     backoff = schedule.initial_backoff;
+                    let _ = policy_tx.send(diagnostic_collection_policy);
                     let _ = status_tx.send(HeartbeatStatus::Online { server_time });
                     schedule.cadence.saturating_add(jitter(schedule.jitter))
                 }
@@ -216,6 +237,8 @@ where
         shutdown,
         status: status_rx,
         task: Some(task),
+        diagnostic_status,
+        diagnostic_task: Some(diagnostic_task),
     }))
 }
 
@@ -547,6 +570,7 @@ mod tests {
         let (release_heartbeat, wait_for_release) = tokio::sync::oneshot::channel();
         let (inventory_stopped, stopped) = tokio::sync::oneshot::channel();
         let (_, heartbeat_status) = watch::channel(HeartbeatStatus::Starting);
+        let (_, diagnostic_status) = watch::channel(DiagnosticScheduleStatus::Waiting);
         let (_, inventory_status) = watch::channel(InventoryStatus::Starting);
         let heartbeat_task = tokio::spawn(async move {
             let _ = wait_for_release.await;
@@ -560,6 +584,8 @@ mod tests {
             shutdown: heartbeat_shutdown,
             status: heartbeat_status,
             task: Some(heartbeat_task),
+            diagnostic_status,
+            diagnostic_task: None,
         };
         let inventory = InventoryRuntime {
             shutdown: inventory_shutdown,
