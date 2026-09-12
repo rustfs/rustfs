@@ -214,6 +214,13 @@ impl KmsManager {
     }
 
     async fn create_key_inner(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
+        // A blank name is neither "generate one" (that is `None`) nor a usable
+        // id: the Local backend would write a key file with an empty stem and
+        // the Vault backends would address their mount root, each failing with
+        // a different backend-specific error.
+        if request.key_name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+            return Err(KmsError::validation_error("key name must not be empty or whitespace"));
+        }
         let response = self.backend.create_key(request).await?;
 
         // Cache the key metadata if enabled

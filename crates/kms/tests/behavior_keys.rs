@@ -43,7 +43,7 @@ use common::{
 };
 use rustfs_kms::{
     CancelKeyDeletionRequest, CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeKeyRequest, EncryptRequest,
-    GenerateDataKeyRequest, KeySpec, KeyState, KeyStatus, KeyUsage, KmsManager, ListKeysRequest,
+    GenerateDataKeyRequest, KeySpec, KeyState, KeyStatus, KeyUsage, KmsError, KmsManager, ListKeysRequest,
 };
 
 async fn describe_state(kms: &KmsManager, key_id: &str) -> KeyState {
@@ -111,6 +111,29 @@ async fn created_key_is_enabled_and_fully_described() {
         described.creation_date, created.key_metadata.creation_date,
         "the creation timestamp is stable across reads"
     );
+}
+
+/// A blank name is refused by the manager before any backend sees it, so every
+/// backend answers the same `ValidationError` instead of its own failure mode
+/// (an empty Local key file stem, a Vault mount root, a Transit 405).
+#[tokio::test]
+async fn create_key_refuses_a_blank_name_before_reaching_the_backend() {
+    for kms in [TestKms::local().await, TestKms::static_backend().await] {
+        let manager = kms.kms().await;
+        for name in ["", "   ", "\t\n"] {
+            let result = manager
+                .create_key(CreateKeyRequest {
+                    key_name: Some(name.to_string()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::ValidationError { .. })),
+                "{:?} with key_name {name:?} must be a ValidationError, got {result:?}",
+                kms.config().backend
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -344,7 +367,7 @@ async fn scheduled_deletion_carries_a_deadline_and_can_be_cancelled() {
         .expect("a cancelled key must accept new cryptographic work");
 
     // Cancelling a key that is not pending deletion is a state error.
-    assert_invalid_operation(
+    assert_unsupported_capability(
         manager
             .cancel_key_deletion(CancelKeyDeletionRequest { key_id: key_id.clone() })
             .await,
@@ -607,14 +630,14 @@ async fn static_backend_refuses_every_lifecycle_mutation() {
         "static must advertise no lifecycle capability: {caps:?}"
     );
 
-    assert_invalid_operation(
+    assert_unsupported_capability(
         manager
             .create_key(CreateKeyRequest {
                 key_name: Some("another-key".to_string()),
                 ..Default::default()
             })
             .await,
-        "read-only",
+        "create_key",
     );
     // Re-creating the configured key is a conflict, not a generic refusal.
     assert_key_already_exists(
@@ -628,7 +651,7 @@ async fn static_backend_refuses_every_lifecycle_mutation() {
     );
 
     let key_id = kms.config().static_config().expect("static config").key_id.clone();
-    assert_invalid_operation(
+    assert_unsupported_capability(
         manager
             .delete_key(DeleteKeyRequest {
                 key_id: key_id.clone(),
@@ -637,13 +660,13 @@ async fn static_backend_refuses_every_lifecycle_mutation() {
                 confirm_key_id: None,
             })
             .await,
-        "read-only",
+        "delete_key",
     );
-    assert_invalid_operation(
+    assert_unsupported_capability(
         manager
             .cancel_key_deletion(CancelKeyDeletionRequest { key_id: key_id.clone() })
             .await,
-        "read-only",
+        "cancel_key_deletion",
     );
     assert_unsupported_capability(manager.enable_key(&key_id).await, "enable_key");
     assert_unsupported_capability(manager.disable_key(&key_id).await, "disable_key");

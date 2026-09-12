@@ -299,14 +299,16 @@ async fn static_backend_stateless_contract() {
     assert_eq!(decrypted.plaintext, data_key.plaintext_key);
     assert_key_state(backend, key_id, KeyState::Enabled).await;
 
-    expect_invalid_key_state(backend.create_key(create_request("another-key".to_string())).await, "read-only");
-    expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "read-only");
-    expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "read-only");
-    // Enable/disable, rotation and rewrap are capability gaps at the product
-    // surface, not state-machine rejections. A single fixed key has no second
-    // version to rewrap onto, so reporting the gap is the only honest answer —
-    // re-wrapping with the same material would look like progress while
-    // changing nothing.
+    // Every mutation of the key set is a capability gap at the product surface,
+    // not a state-machine rejection: the backend has exactly one externally
+    // supplied key and no way to add, remove or alter it, so the admin API
+    // reports 501 for all of them rather than 400 for some.
+    expect_unsupported(backend.create_key(create_request("another-key".to_string())).await);
+    expect_unsupported(backend.delete_key(schedule_request(key_id)).await);
+    expect_unsupported(backend.cancel_key_deletion(cancel_request(key_id)).await);
+    // A single fixed key has no second version to rewrap onto, so reporting the
+    // gap is the only honest answer: re-wrapping with the same material would
+    // look like progress while changing nothing.
     expect_unsupported(backend.enable_key(key_id).await);
     expect_unsupported(backend.disable_key(key_id).await);
     expect_unsupported(backend.rotate_key(key_id).await);
