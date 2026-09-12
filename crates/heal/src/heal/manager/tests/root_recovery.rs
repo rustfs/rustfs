@@ -100,6 +100,7 @@ fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> Com
     CompletedHealStatus {
         outcome: None,
         heal_type: heal_type.clone(),
+        options: HealOptions::default(),
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
             objects_scanned: 1,
@@ -381,9 +382,12 @@ async fn root_recovery_non_admin_request_is_not_persisted() {
 async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
-    let request = admin_request(HealType::Bucket {
+    let mut request = admin_request(HealType::Bucket {
         bucket: "bucket".to_string(),
     });
+    request.options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Deep;
+    request.options.dry_run = true;
+    request.options.recreate_missing = false;
     manager
         .root_recovery
         .persist(&request)
@@ -417,6 +421,14 @@ async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
             .await
             .expect("durable cancellation remains queryable by id"),
         HealTaskStatus::Cancelled
+    );
+    assert_eq!(
+        restarted
+            .get_task_report(&request.id)
+            .await
+            .expect("durable cancellation report")
+            .options,
+        Some(request.options)
     );
 }
 
@@ -480,7 +492,7 @@ async fn root_recovery_terminal_receipt_wins_over_stale_pending_scoped_intent_af
         .await
         .expect("durable bucket responsibility");
     manager
-        .publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source)
+        .publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source, &request.options)
         .await
         .expect("publish terminal receipt");
     manager
@@ -517,9 +529,12 @@ async fn root_recovery_terminal_receipt_wins_over_stale_pending_scoped_intent_af
 async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
-    let request = admin_request(HealType::Bucket {
+    let mut request = admin_request(HealType::Bucket {
         bucket: "bucket".to_string(),
     });
+    request.options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Deep;
+    request.options.dry_run = true;
+    request.options.recreate_missing = false;
     manager
         .root_recovery
         .persist(&request)
@@ -528,6 +543,7 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
     let completed = CompletedHealStatus {
         outcome: None,
         heal_type: request.heal_type.clone(),
+        options: request.options.clone(),
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
             objects_scanned: 2,
@@ -574,6 +590,49 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
         .expect("completed terminal exposes progress");
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
+    assert_eq!(
+        restarted
+            .get_task_report(&request.id)
+            .await
+            .expect("completed terminal report")
+            .options,
+        Some(request.options)
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_legacy_terminal_without_options_uses_defaults() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "legacy-bucket".to_string(),
+    });
+    let completed = completed_admin_status(&request.heal_type, SystemTime::now());
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("publish terminal receipt");
+
+    let path = format!("terminal-root-heal-{}.json", request.id);
+    let bytes = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read terminal receipt");
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("decode terminal receipt");
+    value.as_object_mut().expect("terminal object").remove("options");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &path,
+        serde_json::to_vec(&value).expect("encode legacy receipt").into(),
+    )
+    .await
+    .expect("write legacy terminal receipt");
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    let report = restarted
+        .get_task_report(&request.id)
+        .await
+        .expect("legacy terminal remains queryable");
+    assert_eq!(report.status, HealTaskStatus::Completed);
+    assert_eq!(report.options, Some(HealOptions::default()));
 }
 
 #[tokio::test]

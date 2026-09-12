@@ -21,7 +21,8 @@ use crate::heal::{
 use crate::{Error, Result};
 use rustfs_heal_contracts::heal_channel::{
     HealAdmissionReceipt, HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest,
-    HealChannelResponse, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode, publish_heal_response,
+    HealChannelResponse, HealOpts, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode,
+    publish_heal_response,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::Serialize;
@@ -78,6 +79,8 @@ struct HealTaskStatusPayload<'a> {
     progress: Option<&'a HealProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<&'a super::outcome::HealTaskOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<&'a HealOpts>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -91,6 +94,7 @@ fn encode_heal_task_status_payload(
     mut truncated: bool,
     sequence: (u64, u64),
     outcome: Option<&super::outcome::HealTaskOutcome>,
+    settings: Option<&HealOpts>,
 ) -> Result<(Vec<u8>, bool)> {
     loop {
         let data = serde_json::to_vec(&HealTaskStatusPayload {
@@ -101,6 +105,7 @@ fn encode_heal_task_status_payload(
             min_seq: sequence.1,
             progress,
             outcome,
+            settings,
         })
         .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
         if data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE {
@@ -122,12 +127,13 @@ fn encode_heal_status_response(
     truncated: bool,
     sequence: (u64, u64),
     outcome: Option<&super::outcome::HealTaskOutcome>,
+    settings: Option<&HealOpts>,
 ) -> Result<(Vec<u8>, Option<String>)> {
     let (summary, detail) = match outcome {
         Some(outcome) => outcome.legacy_status(summary, detail),
         None => (summary, detail),
     };
-    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, sequence, outcome)?;
+    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, sequence, outcome, settings)?;
     Ok((data, super::outcome::heal_status_detail(detail, truncated)))
 }
 
@@ -439,6 +445,10 @@ impl HealChannelProcessor {
         };
 
         let outcome = report.as_ref().ok().and_then(|report| report.outcome.clone());
+        let settings = report
+            .as_ref()
+            .ok()
+            .and_then(|report| report.options.as_ref().map(heal_options_to_wire));
         let (summary, detail, items, truncated, progress, next_seq, min_seq) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
@@ -584,6 +594,7 @@ impl HealChannelProcessor {
             truncated,
             (next_seq, min_seq),
             outcome.as_deref(),
+            settings.as_ref(),
         )?;
 
         let response = HealChannelResponse {
@@ -778,6 +789,21 @@ impl HealChannelProcessor {
     }
 }
 
+fn heal_options_to_wire(options: &HealOptions) -> HealOpts {
+    HealOpts {
+        recursive: options.recursive,
+        dry_run: options.dry_run,
+        remove: options.remove_corrupted,
+        recreate: options.recreate_missing,
+        scan_mode: options.scan_mode,
+        update_parity: options.update_parity,
+        no_lock: options.no_lock,
+        read_repair: false,
+        pool: options.pool_index,
+        set: options.set_index,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::DiskStore;
@@ -873,7 +899,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let (data, detail) = encode_heal_status_response("running", items, None, None, false, (0, 0), None).unwrap();
+        let (data, detail) = encode_heal_status_response("running", items, None, None, false, (0, 0), None, None).unwrap();
 
         assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
@@ -938,6 +964,7 @@ mod tests {
                 true,
                 (9, 4),
                 Some(&outcome),
+                None,
             )
             .expect("canonical owner encoding");
             let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("wire payload");
@@ -960,8 +987,9 @@ mod tests {
         ] {
             let mut outcome = HealTaskOutcome::default();
             outcome.finish(Some(reason));
-            let (data, detail) = encode_heal_status_response("finished", Vec::new(), None, None, false, (0, 0), Some(&outcome))
-                .expect("canonical abort adapter");
+            let (data, detail) =
+                encode_heal_status_response("finished", Vec::new(), None, None, false, (0, 0), Some(&outcome), None)
+                    .expect("canonical abort adapter");
             let json: serde_json::Value = serde_json::from_slice(&data).expect("public state");
             assert_eq!(json["summary"], "stopped");
             assert_eq!(json["outcome"]["execution"]["state"], "aborted");
@@ -997,7 +1025,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (bytes, detail) = encode_heal_status_response("running", items, None, None, false, (9, 4), Some(&outcome))
+        let (bytes, detail) = encode_heal_status_response("running", items, None, None, false, (9, 4), Some(&outcome), None)
             .expect("bounded status with cumulative outcome");
         assert!(bytes.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("bounded payload");
@@ -1881,7 +1909,23 @@ mod tests {
     #[tokio::test]
     async fn test_process_query_request_reports_running_for_queued_task() {
         let heal_manager = create_test_heal_manager();
-        let request = HealRequest::bucket("bucket".to_string());
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions {
+                scan_mode: HealScanMode::Deep,
+                remove_corrupted: true,
+                recreate_missing: false,
+                update_parity: false,
+                recursive: true,
+                dry_run: true,
+                pool_index: Some(1),
+                set_index: Some(2),
+                ..Default::default()
+            },
+            HealPriority::High,
+        );
         let task_id = request.id.clone();
         assert_eq!(
             heal_manager
@@ -1910,6 +1954,14 @@ mod tests {
                 .expect("status payload should be json");
         assert_eq!(payload["summary"], "running");
         assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
+        assert_eq!(payload["settings"]["scanMode"], 2);
+        assert_eq!(payload["settings"]["dryRun"], true);
+        assert_eq!(payload["settings"]["remove"], true);
+        assert_eq!(payload["settings"]["recreate"], false);
+        assert_eq!(payload["settings"]["updateParity"], false);
+        assert_eq!(payload["settings"]["recursive"], true);
+        assert_eq!(payload["settings"]["pool"], 1);
+        assert_eq!(payload["settings"]["set"], 2);
     }
 
     #[tokio::test]
