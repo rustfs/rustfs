@@ -6466,12 +6466,11 @@ mod tests {
         )
         .await
         .expect("reservation bypass must construct the normal streaming fallback");
-        let chunk = fallback_body
-            .next()
-            .await
-            .expect("fallback stream must yield a body chunk")
-            .expect("fallback stream must not fail");
-        assert_eq!(chunk, Bytes::from_static(b"body"));
+        let mut received = Vec::new();
+        while let Some(chunk) = fallback_body.next().await {
+            received.extend_from_slice(&chunk.expect("fallback stream must not fail"));
+        }
+        assert_eq!(received, b"body");
         assert!(fallback_reads.load(AtomicOrdering::Relaxed) > 0);
         assert_eq!(readers.load(AtomicOrdering::Relaxed), 0, "cold-fill materialization must remain unopened");
         assert_eq!(coordinator.active_session_count_for_test(), 0);
