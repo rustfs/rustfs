@@ -45,14 +45,17 @@ pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
 pub use credential_store::{CredentialStore, DeviceCredential};
 pub use diagnostics::{
-    CPU_PROFILE_CAPABILITY, CaptureMode, DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError,
-    DiagnosticScheduleRuntime, DiagnosticScheduleStatus, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent, LocalOtlpHeaders,
-    LocalProfileConsent, LocalTelemetryConsent, LocallyReviewedTraceArtifact, LogCaptureError, LogCaptureRequest, LogProvenance,
-    MAX_OTLP_BODY_BYTES, MAX_PROFILE_DURATION, MAX_SAFE_INTEGER, MAX_TELEMETRY_DURATION, MAX_TELEMETRY_RESULT_BYTES,
-    MAX_TELEMETRY_SPANS, MEMORY_PROFILE_CAPABILITY, ObservedTelemetrySpan, OperationSummary, OtlpBatch, OtlpForwardError,
-    OtlpReceipt, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance,
-    ProfileReasonCode, ProfileResult, ProfileTool, ReceiptOutcome, RecordedTrace, ReplayedTrace, SavedLogExport,
-    SavedProfileExport, SavedTelemetryExport, SignedLogExport, SignedProfileExport, SignedTelemetryExport,
+    CPU_PROFILE_CAPABILITY, CaptureMode, DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DiagnosticCollectionPolicy, DiagnosticReceipt,
+    DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus, DriveDiagnosticResult, DriveMeasurement,
+    DriveOutcome, DrivePerformanceData, DrivePerformanceError, DrivePerformanceRequest, DriveProvenance, DriveReadMode,
+    DriveReasonCode, DriveTargetParameters, DriveTargetReasonCode, DriveTargetResult, DriveTargetUnits, LOGS_CAPABILITY,
+    LOGS_SCHEMA_VERSION, LocalDriveConsent, LocalLogConsent, LocalOtlpHeaders, LocalProfileConsent, LocalTelemetryConsent,
+    LocallyReviewedTraceArtifact, LogCaptureError, LogCaptureRequest, LogProvenance, MAX_OTLP_BODY_BYTES, MAX_PROFILE_DURATION,
+    MAX_SAFE_INTEGER, MAX_TELEMETRY_DURATION, MAX_TELEMETRY_RESULT_BYTES, MAX_TELEMETRY_SPANS, MEMORY_PROFILE_CAPABILITY,
+    ObservedTelemetrySpan, OperationSummary, OtlpBatch, OtlpForwardError, OtlpReceipt, PROFILE_SCHEMA_VERSION,
+    ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
+    ProfileTool, ReceiptOutcome, RecordedTrace, ReplayedTrace, SavedDriveExport, SavedLogExport, SavedProfileExport,
+    SavedTelemetryExport, SignedDriveExport, SignedLogExport, SignedProfileExport, SignedTelemetryExport,
     TELEMETRY_OTLP_CAPABILITY, TELEMETRY_RECORD_CAPABILITY, TELEMETRY_REPLAY_CAPABILITY, TELEMETRY_SCHEMA_VERSION,
     THREAD_PROFILE_CAPABILITY, TelemetryArtifactConsent, TelemetryArtifactError, TelemetryArtifactRequest, TelemetryCoverage,
     TelemetryDiagnosticResult, TelemetryOperation, TelemetryOutcome, TelemetryProducerError, TelemetryProvenance,
@@ -60,8 +63,9 @@ pub use diagnostics::{
     TraceAnalysisError, TraceRecordCapture, TraceRecordCompletion, TraceRecordLimits, TraceReplayError, analyze_trace,
     capture_cpu_profile, capture_thread_profile, encode_signed_profile_export, encode_signed_telemetry_export,
     export_cpu_profile, export_logs, export_memory_profile, export_thread_profile, export_trace_otlp, export_trace_otlp_result,
-    record_diagnostic_result, record_trace, record_trace_bus, replay_trace, replay_trace_result, run_local_environment_once,
-    save_signed_log_export, save_signed_profile_export, save_signed_telemetry_export, spawn_environment_schedule,
+    measure_drive, record_diagnostic_result, record_trace, record_trace_bus, replay_trace, replay_trace_result,
+    run_local_environment_once, save_signed_drive_export, save_signed_log_export, save_signed_profile_export,
+    save_signed_telemetry_export, sign_drive_export, spawn_environment_schedule, validate_drive_limits,
 };
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
