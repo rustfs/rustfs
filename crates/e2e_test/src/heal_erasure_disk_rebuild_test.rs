@@ -24,7 +24,7 @@ mod tests {
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::{
         error::{ProvideErrorMetadata, SdkError},
-        operation::{delete_object::DeleteObjectError, put_object::PutObjectError},
+        operation::{delete_object::DeleteObjectError, get_object::GetObjectError, put_object::PutObjectError},
         primitives::ByteStream,
     };
     use http::Method;
@@ -685,6 +685,32 @@ mod tests {
 
     fn is_service_unavailable_delete(error: &SdkError<DeleteObjectError>) -> bool {
         error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
+    }
+
+    fn is_retryable_recovery_get(error: &SdkError<GetObjectError>) -> bool {
+        matches!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("SlowDownRead" | "ServiceUnavailable")
+        )
+    }
+
+    async fn get_object_after_recovery(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        timeout_secs: u64,
+    ) -> Result<bytes::Bytes, Box<dyn Error + Send + Sync>> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            match timeout(Duration::from_secs(30), client.get_object().bucket(bucket).key(key).send()).await {
+                Ok(Ok(response)) => return Ok(response.body.collect().await?.into_bytes()),
+                Ok(Err(error)) if is_retryable_recovery_get(&error) && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn select_replacement_drive(
@@ -2172,9 +2198,13 @@ mod tests {
         let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
+        let readback_timeout_secs = std::env::var("RUSTFS_HEAL_READBACK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .clamp(5, 180);
         for (key, payload_seed) in &created_online_objects {
-            let response = target_client.get_object().bucket(bucket).key(key).send().await?;
-            let actual = response.body.collect().await?.into_bytes();
+            let actual = get_object_after_recovery(&target_client, bucket, key, readback_timeout_secs).await?;
             let expected_body = deterministic_object_body(object_size_bytes, *payload_seed);
             assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {key}");
             if evidence_run.is_some()
@@ -2192,8 +2222,7 @@ mod tests {
                 }));
             }
         }
-        let response = target_client.get_object().bucket(bucket).key(&outage_key).send().await?;
-        let actual = response.body.collect().await?.into_bytes();
+        let actual = get_object_after_recovery(&target_client, bucket, &outage_key, readback_timeout_secs).await?;
         let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
         assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
         if evidence_run.is_some() {
