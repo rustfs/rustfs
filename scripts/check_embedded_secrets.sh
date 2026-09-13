@@ -110,6 +110,8 @@ PATTERNS=(
 #      both unusable: 6 is a PKCS#8 wrapper whose OCTET STRING declares 32
 #      bytes and holds the 7 ASCII bytes "example", and 7 spells out in the
 #      body that it is not a real key.
+# 8: rustfs/tests/fixtures/connect-logs-v1.json includes an explicitly
+#    synthetic PEM-shaped value to prove log redaction removes key material.
 AWS_EXAMPLE_STEM="AKIAIOSFODNN7EXAMPL"
 AGENT_FIXTURE_RSA_BODY="MIIEowIBAAKCAQEAxEXAMPLEKEYBODYnotarealkey0000000000000000000000"
 NON_SECRET_LITERALS=(
@@ -120,6 +122,7 @@ NON_SECRET_LITERALS=(
     "\"-----${BEGIN_MARK} PRIVATE KEY-----\""
     "-----${BEGIN_MARK} PRIVATE KEY-----\\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBleGFtcGxl\\n-----END PRIVATE KEY-----"
     "-----${BEGIN_MARK} RSA PRIVATE KEY-----\\n${AGENT_FIXTURE_RSA_BODY}\\nEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE=\\n-----END RSA PRIVATE KEY-----"
+    "-----${BEGIN_MARK} PRIVATE KEY-----\\nSYNTHETIC_PRIVATE_KEY_BYTES\\n-----END PRIVATE KEY-----"
 )
 
 run_scan() {
