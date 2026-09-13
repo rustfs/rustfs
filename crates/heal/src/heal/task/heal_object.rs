@@ -183,7 +183,8 @@ impl HealTask {
                 let result = storage_result.item;
                 let error = storage_result.error;
                 if let Some(e) = error {
-                    if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                    if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await
+                    {
                         return Ok(());
                     }
 
@@ -277,7 +278,7 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await {
                     return Ok(());
                 }
 

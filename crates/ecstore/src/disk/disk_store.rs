@@ -1597,6 +1597,7 @@ impl LocalDiskWrapper {
                     undo_write: false,
                     undo_delete: false,
                     old_data_dir: None,
+                    expected_delete_marker: None,
                 },
             )
             .await?;

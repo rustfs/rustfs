@@ -676,7 +676,13 @@ impl HealTask {
                             _ => {}
                         }
                         detail = Some(err.to_string());
-                        if Self::is_dangling_delete_grace_error(&err) {
+                        if matches!(&err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+                            disposition = HealObjectDisposition::Deferred {
+                                reason: HealDeferredReason::RetiredMarkerProof,
+                                retry_not_before: None,
+                            };
+                            telemetry_unknown |= !increment_counter(&mut skipped);
+                        } else if Self::is_dangling_delete_grace_error(&err) {
                             disposition = HealObjectDisposition::Deferred {
                                 reason: HealDeferredReason::DanglingDeleteGrace,
                                 retry_not_before: err.dangling_delete_retry_not_before(),
