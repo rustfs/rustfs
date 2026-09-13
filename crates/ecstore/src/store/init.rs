@@ -2921,6 +2921,12 @@ mod tests {
                         )
                         .await
                         .expect("seed transitioned source with locally restored bytes");
+                    // The overwrite queues its committed cleanup owner right
+                    // away, and from the second iteration on the restarted
+                    // store already runs expiry workers. Fail that first remote
+                    // DELETE so the owner stays durable and the restart below
+                    // still has to rediscover it from xl.meta.
+                    backend.set_remove_failure(true);
                     let expected = if self_copy {
                         payload.clone()
                     } else {
@@ -16426,11 +16432,13 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = set
-                    .load_file_info_versions_exact(bucket, object)
-                    .await
-                    .expect("retry cleanup metadata should remain readable")
-                    .is_none();
+                // Cleanup rewrites xl.meta disk by disk, so a read racing it
+                // can briefly miss quorum; any other error is a real failure.
+                let metadata_absent = match set.load_file_info_versions_exact(bucket, object).await {
+                    Ok(versions) => versions.is_none(),
+                    Err(StorageError::InsufficientReadQuorum(..)) => false,
+                    Err(err) => panic!("retry cleanup metadata should remain readable: {err:?}"),
+                };
                 if metadata_absent && backend.remove_count().await == 1 {
                     return;
                 }
