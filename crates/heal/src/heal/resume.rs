@@ -62,10 +62,9 @@ const REPLACEMENT_RECOVERY_CONFLICT_PREFIX: &str = "replacement recovery conflic
 const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corruption:";
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
-/// older schema (which tracked latest-only object names and a positional
-/// cursor) are incompatible with the per-version resume cursor, so they are
-/// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 5;
+/// older schema could mark historical null versions covered after reading
+/// latest. Discard their cursor and progress and scan from the beginning.
+const CURRENT_RESUME_SCHEMA: u32 = 6;
 
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
@@ -812,9 +811,7 @@ impl ResumeManager {
             });
         }
 
-        // A snapshot written by an older schema tracked a latest-only positional
-        // cursor that is meaningless under per-version resume. Discard the stale
-        // progress so the scan restarts cleanly, then stamp the current schema.
+        // Older progress cannot prove that the exact null slot was inspected.
         if state.schema_version > CURRENT_RESUME_SCHEMA {
             return Err(Error::TaskExecutionFailed {
                 message: format!(
@@ -824,6 +821,14 @@ impl ResumeManager {
             });
         }
         if state.schema_version < CURRENT_RESUME_SCHEMA {
+            // Replacement intents may already have a separate completion proof.
+            // Resetting only their cursor could revive that stale proof or reopen
+            // a target for formatting. Preserve ownership for explicit recovery.
+            if state.replacement_generation.is_some() || !state.replacement_targets.is_empty() {
+                return Err(replacement_recovery_conflict(format!(
+                    "Replacement intent {task_id} has legacy version coverage; explicit recovery is required before resuming"
+                )));
+            }
             warn!(
                 target: "rustfs::heal::resume",
                 event = EVENT_HEAL_RESUME_STATE,
@@ -849,7 +854,11 @@ impl ResumeManager {
             state.baseline_known = false;
             state.counter_unknown = false;
             state.completed = false;
-            state.completed_buckets.clear();
+            state.pending_buckets.append(&mut state.completed_buckets);
+            state.pending_buckets.sort();
+            state.pending_buckets.dedup();
+            state.current_bucket = None;
+            state.current_object = None;
             state.schema_version = CURRENT_RESUME_SCHEMA;
         }
 

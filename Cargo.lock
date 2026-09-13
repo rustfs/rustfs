@@ -9933,6 +9933,7 @@ dependencies = [
  "rustfs-concurrency",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-filemeta",
  "rustfs-heal-contracts",
  "rustfs-lock",
  "rustfs-madmin",

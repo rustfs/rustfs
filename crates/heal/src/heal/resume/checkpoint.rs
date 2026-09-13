@@ -31,12 +31,12 @@ use super::{
 
 const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 const RESUME_CHECKPOINT_DIGEST_FILE: &str = "ahm_checkpoint.sha256";
-const CHECKPOINT_PER_VERSION_SCHEMA: u32 = 5;
+const CHECKPOINT_PER_VERSION_SCHEMA: u32 = 7;
 
 /// Current on-disk schema version for `ResumeCheckpoint`. Schema 5 could
-/// persist dedup identities without the aggregate counters needed to restore
-/// them safely, so stale checkpoints are discarded and replayed.
-pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 6;
+/// persist incomplete counters; schema 6 could acknowledge null as latest.
+/// Discard those positions and dedup identities and replay the scan.
+pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 7;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CheckpointObjectOutcome {
