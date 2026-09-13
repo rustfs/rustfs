@@ -396,6 +396,13 @@ impl StorageError {
         )
     }
 
+    pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Io(error) => DiskError::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }
+    }
+
     pub fn is_dangling_delete_grace(&self) -> bool {
         matches!(self, StorageError::Io(io_error) if DiskError::io_error_is_dangling_delete_grace(io_error))
     }
@@ -608,6 +615,9 @@ impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
             StorageError::Io(e) => {
+                if let Some(error) = DiskError::clone_dangling_delete_grace(e) {
+                    return StorageError::Io(error);
+                }
                 if let Some(context) = self.pool_metadata_failure() {
                     Self::Io(std::io::Error::new(
                         e.kind(),
