@@ -34,7 +34,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_presigned_request};
+use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
@@ -3270,9 +3270,8 @@ where
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // GHSA-g8w9-qw9q-fghr: custom routes bypass `S3Access::check`, so the
-        // presigned signed-header rule is enforced here as well. A request
-        // without a presigned signature passes through untouched.
-        reject_unsigned_amz_headers_on_presigned_request(&req.headers, req.uri.query())?;
+        // SigV4 signed-header rule is enforced here as well.
+        reject_unsigned_amz_headers_on_sigv4_request(&req.headers, req.uri.query())?;
 
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
@@ -5644,6 +5643,43 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("presigned custom-route request with an unsigned x-amz header must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
+    }
+
+    /// GHSA-xm99-m3gq-83g8: custom routes must apply the header-signed SigV4
+    /// signed-header rule too, since they never reach `S3Access::check`.
+    #[tokio::test]
+    async fn ghsa_xm99_check_access_rejects_unsigned_amz_header_on_header_signed_custom_route() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut headers = HeaderMap::new();
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=test/20260827/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}",
+            "0".repeat(64)
+        );
+        headers.insert("authorization", authorization.parse().expect("authorization"));
+        headers.insert("x-amz-date", HeaderValue::from_static("20260827T000000Z"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=attacker"));
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics".parse().expect("uri should parse"),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: s3s::auth::SecretKey::from("secret".to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("header-signed custom-route request with an unsigned x-amz header must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
     }
