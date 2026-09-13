@@ -225,12 +225,11 @@ pub struct HealOpts {
 pub enum HealAdmissionDropReason {
     QueueFull,
     PolicyDropped,
-    /// HS-06: an admin heal start overlaps (same bucket with mutually
-    /// containing prefixes, or the same erasure set) an already running or
-    /// queued task. Only produced when RUSTFS_HEAL_OVERLAP_POLICY=minio_error.
+    /// An admin target already has an incompatible or durable-only owner,
+    /// or an equivalent start was rejected by the `minio_error` policy.
     AlreadyRunning,
-    /// HS-06: same as [`Self::AlreadyRunning`] but for paths that merely
-    /// contain (or are contained by) the active task's path.
+    /// An admin scope intersects another owner's scope without being an
+    /// equivalent request. Produced by both overlap policies.
     OverlappingPaths,
 }
 

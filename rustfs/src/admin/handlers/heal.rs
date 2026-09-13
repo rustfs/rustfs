@@ -1989,6 +1989,7 @@ mod tests {
         ] {
             let error = reject_heal_admission(HealAdmissionResult::Dropped(reason));
             assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+            assert_eq!(error.code().status_code(), Some(StatusCode::CONFLICT));
             assert!(
                 error.to_string().contains(label),
                 "the caller must distinguish conflicts from transient coordination failure"

@@ -916,6 +916,161 @@ async fn root_recovery_force_start_cancels_only_overlapping_durable_admin_record
 }
 
 #[tokio::test]
+async fn root_recovery_admin_overlap_rejects_durable_only_owners_without_writing_new_intents() {
+    for (existing, incoming, reason) in [
+        ("scope/", "scope/", HealAdmissionDropReason::AlreadyRunning),
+        ("scope/", "scope/child/", HealAdmissionDropReason::OverlappingPaths),
+        ("scope/child/", "scope/", HealAdmissionDropReason::OverlappingPaths),
+    ] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk]);
+        let mut owner = admin_prefix_request("bucket", existing);
+        owner.options.timeout = Some(Duration::ZERO);
+        manager.root_recovery.persist(&owner).await.expect("persist unreplayed owner");
+        let receipt = manager
+            .submit_heal_request_with_receipt(admin_prefix_request("bucket", incoming))
+            .await
+            .expect("durable overlap decision");
+        assert_eq!(receipt.result, HealAdmissionResult::Dropped(reason));
+        assert_eq!(receipt.task_id, owner.id);
+        assert!(manager.heal_queue.lock().await.is_empty());
+        let pending = manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("original durable responsibility remains");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, owner.id);
+        assert_eq!(
+            pending[0].options.timeout,
+            Some(Duration::ZERO),
+            "admission must not reset an exhausted budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_same_id_does_not_overwrite_a_durable_only_budget() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let mut owner = admin_prefix_request("bucket", "scope/");
+    owner.options.timeout = Some(Duration::ZERO);
+    manager.root_recovery.persist(&owner).await.expect("exhausted owner");
+    let mut replay = owner.clone();
+    replay.options.timeout = Some(Duration::from_secs(60));
+    replay.force_start = true;
+    let receipt = manager
+        .submit_heal_request_with_receipt(replay)
+        .await
+        .expect("same ID conflicts with durable owner");
+    assert_eq!(receipt.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    let pending = manager.root_recovery.pending().await.expect("retained owner");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].options.timeout, Some(Duration::ZERO));
+    assert!(manager.heal_queue.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_owner() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let owner = admin_prefix_request("bucket", "scope/child/");
+    manager
+        .submit_heal_request(owner.clone())
+        .await
+        .expect("admit original owner");
+    let corrupt = root_request();
+    let path = format!("root-heal-{}.json", corrupt.id);
+    disk.write_all(RUSTFS_META_BUCKET, &path, b"{".to_vec().into())
+        .await
+        .expect("inject corrupt ownership record");
+    let mut replacement = admin_prefix_request("bucket", "scope/");
+    replacement.force_start = true;
+    assert!(
+        manager.submit_heal_request(replacement).await.is_err(),
+        "unknown ownership must fail before cancellation"
+    );
+    assert_eq!(
+        manager
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>(),
+        vec![owner.id.clone()]
+    );
+    assert_eq!(
+        manager
+            .get_task_status(&owner.id)
+            .await
+            .expect("original owner remains queryable"),
+        HealTaskStatus::Pending
+    );
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("retain corrupt record")
+            .as_ref(),
+        b"{"
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_preserves_legacy_owners_and_replays_replacement_cancellations() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let parent = admin_prefix_request("bucket", "scope/");
+    let child = admin_prefix_request("bucket", "scope/child/");
+    manager
+        .root_recovery
+        .persist(&parent)
+        .await
+        .expect("legacy parent responsibility");
+    manager
+        .root_recovery
+        .persist(&child)
+        .await
+        .expect("legacy child responsibility");
+    manager
+        .replay_root_heals()
+        .await
+        .expect("accepted legacy owners must not be discarded");
+    assert_eq!(manager.heal_queue.lock().await.len(), 2);
+    let rejected = manager
+        .submit_heal_request_with_receipt(admin_prefix_request("bucket", "scope/child/deep/"))
+        .await
+        .expect("new overlap must reject after replay");
+    assert_eq!(rejected.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths));
+    let mut replacement = admin_prefix_request("bucket", "scope/");
+    replacement.force_start = true;
+    let receipt = manager
+        .submit_heal_request_with_receipt(replacement)
+        .await
+        .expect("replace both recovered owners");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    drop(manager);
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restart replacement");
+    assert_eq!(
+        restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>(),
+        vec![receipt.task_id]
+    );
+    for owner in [&parent.id, &child.id] {
+        assert_eq!(
+            restarted.get_task_status(owner).await.expect("cancellation survives restart"),
+            HealTaskStatus::Cancelled
+        );
+    }
+}
+
+#[tokio::test]
 async fn root_recovery_queued_non_root_admin_owner_is_not_priority_displaced() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
@@ -1040,7 +1195,9 @@ async fn root_recovery_queued_owner_is_not_priority_displaced() {
         HealOptions::default(),
         HealPriority::Urgent,
     );
-    bucket.source = HealRequestSource::Admin;
+    // Internal urgent work has the same displacement eligibility without
+    // taking the administrator overlap rejection before the capacity check.
+    bucket.source = HealRequestSource::Internal;
     assert_eq!(
         manager
             .submit_heal_request(bucket)
