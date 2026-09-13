@@ -36,13 +36,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The registry is closed; adding another set is a protocol change, not a
 /// fixture change. Mirrors `EXPECTED_SETS` in Connect's checker.
-const EXPECTED_SETS: [&str; 9] = [
+const EXPECTED_SETS: [&str; 13] = [
     "auth",
     "version",
     "registration",
     "heartbeat",
     "inventory",
     "object-performance",
+    "network-performance",
+    "site-replication-performance",
+    "telemetry",
+    "diagnostic-scheduler",
     "offline-enrollment",
     "bundle",
     "redaction",

@@ -1,0 +1,138 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "telemetry",
+  "schemaVersion": 1,
+  "classification": "L3",
+  "fixture": "accept-vectors",
+  "producer": {
+    "repository": "rustfs/rustfs",
+    "headCommit": "85b8dc44d7d06d17ad5f5324b0a2766889d873e5",
+    "mergeCommit": "f2cdca42eddd44681cd220d7b9dfdbbe91c719a1",
+    "pullRequest": 7720,
+    "evidenceUrl": "https://github.com/rustfs/rustfs/pull/7720",
+    "verifiedRuns": {
+      "record": "UNSUPPORTED_SOURCE_UNAVAILABLE",
+      "otlp": "REAL_BINARY_LOOPBACK_VERIFIED",
+      "replay": "REAL_BINARY_ARCHIVE_VERIFIED"
+    },
+    "sourceFiles": [
+      "rustfs/src/connect/diagnostics/trace_record.rs",
+      "rustfs/src/connect/diagnostics/trace_otlp.rs",
+      "rustfs/src/connect/diagnostics/trace_replay.rs",
+      "rustfs/src/connect/diagnostics/trace_analysis.rs"
+    ],
+    "testCommand": "cargo test -p rustfs --test connect_trace_analysis --test connect_trace_otlp --test connect_trace_record --test connect_trace_replay"
+  },
+  "limits": {
+    "maxDurationMillis": 30000,
+    "maxSpans": 1024,
+    "maxResultBytes": 262144,
+    "maxOtlpBodyBytes": 1048576,
+    "maxArchiveBytes": 524288,
+    "maxDecompressedBytes": 278528,
+    "maxConcurrency": 1
+  },
+  "signedExport": {
+    "members": ["envelope.json", "envelope.sig", "result.json"],
+    "algorithm": "ES256",
+    "signatureDomain": "rustfs-diagnostic-envelope-v1\u0000",
+    "fileMode": "0600",
+    "noClobber": true,
+    "classification": "L3",
+    "requiresConfirmedConsent": true
+  },
+  "vectors": [
+    {
+      "id": "telemetry.record.source-unavailable",
+      "evidenceType": "SOURCE_VERIFIED_CONTRACT_VECTOR",
+      "accepted": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "telemetry.record",
+        "capability": "telemetry.record@1",
+        "outcome": "UNSUPPORTED",
+        "reasonCode": "UNSUPPORTED_TOOL",
+        "durationMillis": 1,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "85b8dc44d7d06d17ad5f5324b0a2766889d873e5",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "x86_64",
+          "buildFeatures": []
+        },
+        "coverage": {"requestedUnits": 1, "completedUnits": 0, "unit": "WINDOW"},
+        "data": null
+      },
+      "expected": {
+        "artifactCreated": false,
+        "reason": "The current TraceBus has no approved typed S3 or RPC source."
+      }
+    },
+    {
+      "id": "telemetry.otlp.succeeded",
+      "evidenceType": "SYNTHETIC_CONTRACT_VECTOR_WITH_REAL_BINARY_RUN",
+      "accepted": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "telemetry.otlp",
+        "capability": "telemetry.otlp@1",
+        "outcome": "SUCCEEDED",
+        "reasonCode": "COMPLETE",
+        "durationMillis": 10,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "85b8dc44d7d06d17ad5f5324b0a2766889d873e5",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "x86_64",
+          "buildFeatures": []
+        },
+        "coverage": {"requestedUnits": 1, "completedUnits": 1, "unit": "WINDOW"},
+        "data": {"acceptedSpanCount": 2, "rejectedSpanCount": 0, "exportedBytes": 128}
+      },
+      "expected": {
+        "artifactCreated": true,
+        "credentialsRemainLocal": true,
+        "receiptContainsCredentials": false
+      }
+    },
+    {
+      "id": "telemetry.replay.succeeded",
+      "evidenceType": "SYNTHETIC_CONTRACT_VECTOR_WITH_REAL_BINARY_RUN",
+      "accepted": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "telemetry.replay",
+        "capability": "telemetry.replay@1",
+        "outcome": "SUCCEEDED",
+        "reasonCode": "COMPLETE",
+        "durationMillis": 1,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "85b8dc44d7d06d17ad5f5324b0a2766889d873e5",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "x86_64",
+          "buildFeatures": []
+        },
+        "coverage": {"requestedUnits": 1, "completedUnits": 1, "unit": "WINDOW"},
+        "data": {
+          "inputArtifactSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "spans": [{"operation": "GET_OBJECT", "durationMicros": 500, "status": "OK"}]
+        }
+      },
+      "expected": {
+        "artifactCreated": true,
+        "inputWasLocallyReviewed": true,
+        "analysisUsesObservedValuesOnly": true
+      }
+    }
+  ]
+}
