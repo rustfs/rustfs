@@ -34,6 +34,11 @@
       "purpose": "Inventory snapshot payloads and their allow-listed collection fields."
     },
     {
+      "name": "object-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.object@1 result acceptance and rejection vectors."
+    },
+    {
       "name": "offline-enrollment",
       "status": "populated",
       "purpose": "Air-gapped device enrolment and signed artifact exchange without a certificate."

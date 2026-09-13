@@ -34,21 +34,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The registry is closed at eight sets; a ninth is a protocol change, not a
+/// The registry is closed; adding another set is a protocol change, not a
 /// fixture change. Mirrors `EXPECTED_SETS` in Connect's checker.
-const EXPECTED_SETS: [&str; 8] = [
+const EXPECTED_SETS: [&str; 9] = [
     "auth",
     "version",
     "registration",
     "heartbeat",
     "inventory",
+    "object-performance",
     "offline-enrollment",
     "bundle",
     "redaction",
 ];
 
 #[test]
-fn agent_protocol_fixtures_registry_is_the_frozen_eight_sets() {
+fn agent_protocol_fixtures_registry_is_the_frozen_sets() {
     let registry: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture_root().join("fixture-sets.json")).expect("read fixture-sets.json"))
             .expect("fixture-sets.json parses");
