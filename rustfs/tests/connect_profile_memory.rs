@@ -214,7 +214,7 @@ async fn memory_profile_uses_only_bounded_allocator_aggregates() {
 
 #[tokio::test(start_paused = true)]
 async fn memory_profile_accepts_nested_string_mimalloc_totals() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let first = Box::leak(nested_string_stats(1_000, 20).into_boxed_str());
     let second = Box::leak(nested_string_stats(1_250, 24).into_boxed_str());
     let source = SequenceSource::new(first, second);
