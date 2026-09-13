@@ -20,8 +20,9 @@ pub(crate) mod endpoint_index {
 // still touch directly.
 #[allow(unused_imports)]
 pub(crate) mod integration {
-    pub(crate) use rustfs_ecstore::api::disk::error::DiskError;
-    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskStore, RUSTFS_META_BUCKET, ReadOptions};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        DiskAPI, DiskError, DiskOption, DiskStore, Endpoint, RUSTFS_META_BUCKET, ReadOptions, new_disk,
+    };
     pub(crate) use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_storage_api::BucketOperations;

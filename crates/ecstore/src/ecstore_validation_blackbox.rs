@@ -374,9 +374,9 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     let mut heal_rx = rustfs_heal_contracts::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
 
-    // A partial PUT can satisfy write quorum while waiting for repair
-    // admission. Drive the receiver concurrently, as the Heal manager does,
-    // so the test acknowledges admission before waiting for the PUT result.
+    // Without a durable MRF consumer, partial PUTs fall back to the heal
+    // admission channel and wait for its receipt before acknowledging the write.
+    // Drive the test receiver alongside the PUT so neither waits on the other.
     let (_put_dirs, put_set) = make_local_set_disks(4, 2).await;
     let put_bucket = "bb-put-partial-convergence";
     let put_object = "object.bin";
@@ -389,21 +389,29 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         disks[0].take()
     };
     let mut put_reader = PutObjReader::from_vec(vec![0x42; BLOCK_SIZE_V2 + 1024]);
-    let put_options = ObjectOptions {
-        no_lock: true,
-        versioned: true,
-        ..Default::default()
-    };
     let (committed, request) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         tokio::join!(
-            put_set.put_object(put_bucket, put_object, &mut put_reader, &put_options),
+            async {
+                put_set
+                    .put_object(
+                        put_bucket,
+                        put_object,
+                        &mut put_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("partial ordinary PUT should succeed at write quorum")
+            },
             receive_matching_heal(&mut heal_rx, put_bucket, put_object),
         )
     })
     .await
-    .expect("partial PUT and its repair admission should complete");
+    .expect("partial ordinary PUT and repair admission should complete together");
     let committed_version = committed
-        .expect("partial ordinary PUT should succeed at write quorum")
         .version_id
         .expect("versioned PUT should return a version id")
         .to_string();

@@ -127,13 +127,10 @@ pub(crate) use rustfs_ecstore::api::runtime::{
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::SCANNER_PUBLICATION_LEASE_TTL_MS as ECSTORE_SCANNER_PUBLICATION_LEASE_TTL_MS;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, ScannerDataMovementPauseStatus as EcstoreScannerDataMovementPauseStatus,
-};
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::api::storage::{
-    init_local_disks as ecstore_init_local_disks,
-    init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx,
 };
 pub(crate) use rustfs_lifecycle::{
     Evaluator as EcstoreEvaluator, Event as EcstoreEvent, Lifecycle as EcstoreLifecycle, ObjectOpts as EcstoreObjectOpts,
@@ -182,10 +179,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreExpirationStatus, EcstoreHealResultItem, EcstoreInstanceContext, EcstoreLifecycleRule,
-        EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta,
-        EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks,
-        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
+        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
+        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 

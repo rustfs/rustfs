@@ -49,14 +49,14 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
         .await
         .expect("initial responsibility must commit");
     assert!(snapshot_contains("old.bin").await);
-    // Linux disks retain a directory descriptor for their root, so fault the
-    // metadata volume inside that root instead of replacing the root pathname.
-    for disk_path in &env.disk_paths {
-        let path = disk_path.join(RUSTFS_META_BUCKET);
-        tokio::fs::rename(&path, path.with_extension("offline"))
+    // Linux pins the disk root with a directory descriptor, so renaming that
+    // root does not interrupt I/O. Block the metadata volume below it instead.
+    let metadata_roots: Vec<_> = env.disk_paths.iter().map(|path| path.join(RUSTFS_META_BUCKET)).collect();
+    for path in &metadata_roots {
+        tokio::fs::rename(path, path.with_extension("offline"))
             .await
-            .expect("detach journal volume");
-        tokio::fs::write(&path, b"unwritable journal volume")
+            .expect("detach journal disk");
+        tokio::fs::write(path, b"unwritable journal root")
             .await
             .expect("prevent journal writes");
     }
@@ -65,12 +65,11 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
         Err(MrfDurableAdmissionError::Persistence),
         "failed checkpoint publication must not be acknowledged as durable success"
     );
-    for disk_path in &env.disk_paths {
-        let path = disk_path.join(RUSTFS_META_BUCKET);
-        tokio::fs::remove_file(&path).await.expect("remove journal fault");
-        tokio::fs::rename(path.with_extension("offline"), &path)
+    for path in &metadata_roots {
+        tokio::fs::remove_file(path).await.expect("remove journal fault");
+        tokio::fs::rename(path.with_extension("offline"), path)
             .await
-            .expect("restore journal volume");
+            .expect("restore journal disk");
     }
     for disk in env.ecstore.pools[0].get_disks(0).disks.read().await.iter().flatten() {
         disk.reset_health_for_store_init_retry();

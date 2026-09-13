@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use super::*;
-use crate::storage_api::owner::{EcstoreHealResultItem as HealItem, ecstore_init_local_disks};
+use crate::storage_api::EcstoreHealResultItem as HealItem;
 use crate::storage_api::scanner_io::BucketInfo;
-use crate::{EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::mrf_channel::{
     MrfIngressResult, MrfKind, MrfScope, note_mrf_repaired, take_mrf_repaired_events_for, try_send_mrf_intent_typed,
 };
@@ -220,6 +219,7 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
 struct NoticeStorage {
     calls: std::sync::Mutex<HashMap<String, u32>>,
     retry_started: tokio::sync::Notify,
+    bucket_incarnation_id: Uuid,
 }
 
 #[async_trait::async_trait]
@@ -237,7 +237,7 @@ impl HealStorageAPI for NoticeStorage {
         }))
     }
     async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
-        Ok(Some(Uuid::from_u128(1)))
+        Ok(Some(self.bucket_incarnation_id))
     }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
@@ -319,29 +319,23 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
     }
     // The production ingress channel is a process singleton; isolation keeps
     // its receiver and lease generations independent from other scanner tests.
+    // Partial writes require a committed journal and a complete bucket identity
+    // before the real consumer may dispatch them.
+    let journal_root = tempfile::tempdir().expect("MRF journal fixture");
+    let _journal_env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(journal_root.path())
+        .build()
+        .await;
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
-    // Partial writes must checkpoint to a registered local disk and bind to
-    // the fixture's bucket incarnation before the consumer can dispatch them.
-    let mut endpoint = Endpoint::try_from(scanner.root.as_str()).expect("journal disk endpoint");
-    endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
-    ecstore_init_local_disks(EndpointServerPools::from(vec![PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 1,
-        endpoints: Endpoints::from(vec![endpoint]),
-        cmd_line: "mrf-ownership-test".to_string(),
-        platform: String::new(),
-    }]))
-    .await
-    .expect("register the isolated consumer's journal disk");
     let bucket = format!("mrf-ownership-{}", Uuid::new_v4());
     scanner.new_cache.info.name = bucket.clone();
     scanner.update_cache.info.name = bucket.clone();
     scanner.heal_object_select = 1;
-    let storage = Arc::new(NoticeStorage::default());
+    let storage = Arc::new(NoticeStorage {
+        bucket_incarnation_id: Uuid::new_v4(),
+        ..Default::default()
+    });
     let manager = Arc::new(HealManager::new(
         storage.clone(),
         Some(HealConfig {
