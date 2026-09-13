@@ -127,6 +127,8 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Read the persisted deployment inventory and collect an approved environment summary
+    Inventory(ConnectInventoryOpts),
     /// Run an explicitly approved, bounded local performance measurement
     Performance(ConnectPerformanceOpts),
     /// Capture a consent-bound local profile and write a signed export
@@ -137,6 +139,37 @@ pub enum ConnectCommands {
     Telemetry(ConnectTelemetryOpts),
     /// Capture a consent-bound local top snapshot
     Top(ConnectTopOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInventoryOpts {
+    #[command(subcommand)]
+    pub command: ConnectInventoryCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectInventoryCommands {
+    /// Collect the bounded inventory.environment@1 summary
+    Environment(ConnectEnvironmentInventoryOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectEnvironmentInventoryOpts {
+    /// Directory containing the persisted Connect inventory
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// Negotiated environment schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated environment capability
+    #[arg(long, default_value = "inventory.environment@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Maximum collection time in seconds
+    #[arg(long = "timeout-seconds", default_value_t = 30)]
+    pub timeout_seconds: u64,
+    /// Confirm this explicit local L1 inventory operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
 }
 
 #[derive(Args, Clone)]
@@ -1057,6 +1090,8 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Explicit local Connect environment inventory command
+    ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
@@ -1246,6 +1281,43 @@ mod tests {
 
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("Unix only"));
+    }
+
+    #[test]
+    fn connect_environment_inventory_requires_explicit_l1_acknowledgement() {
+        let error = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+        ])
+        .expect_err("unacknowledged L1 inventory must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l1"));
+
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--acknowledge-l1",
+        ])
+        .expect("acknowledged environment inventory parses");
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Inventory(inventory) = connect.command else {
+            panic!("inventory command expected");
+        };
+        let ConnectInventoryCommands::Environment(environment) = inventory.command;
+        assert_eq!(environment.schema_version, 1);
+        assert_eq!(environment.capability, "inventory.environment@1");
+        assert_eq!(environment.timeout_seconds, 30);
+        assert!(environment.acknowledge_l1);
     }
 
     #[test]

@@ -15,9 +15,9 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
-        ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectProfileOpts,
-        ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
-        ConnectTopCommands, Opt,
+        ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
+        ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
+        ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -137,6 +137,7 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
@@ -170,6 +171,41 @@ async fn async_main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+async fn execute_connect_environment_inventory(options: ConnectEnvironmentInventoryOpts) -> Result<()> {
+    use crate::connect::environment::collect_environment;
+    use crate::connect::inventory::InventoryStateStore;
+    use crate::connect::{EnvironmentCollectionRequest, EnvironmentError};
+
+    let request = EnvironmentCollectionRequest::negotiate(
+        options.schema_version,
+        &options.capability,
+        Duration::from_secs(options.timeout_seconds),
+    )
+    .map_err(Error::other)?;
+    let store = InventoryStateStore::from_state_root(&options.state_dir).map_err(Error::other)?;
+    let persisted = tokio::task::spawn_blocking(move || store.read_latest(chrono::Utc::now()))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    let cancel = CancellationToken::new();
+    let collection = collect_environment(&persisted.snapshot, request, &cancel);
+    tokio::pin!(collection);
+    let inventory = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            collection.await.map_err(Error::other)?
+        }
+        result = collection.as_mut() => result.map_err(|error| match error {
+            EnvironmentError::Cancelled => Error::other("inventory environment collection cancelled"),
+            error => Error::other(error),
+        })?,
+    };
+    println!("{}", serde_json::to_string(&inventory).map_err(Error::other)?);
+    Ok(())
 }
 
 async fn execute_connect_logs(options: ConnectLogsOpts) -> Result<()> {
