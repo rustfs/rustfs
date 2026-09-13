@@ -44,6 +44,11 @@
       "purpose": "Bounded performance.network@1 aggregate results, peer attribution, unit semantics, and budget rejection vectors."
     },
     {
+      "name": "site-replication-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.siteReplication@1 aggregate results, destination-confirmation semantics, and rejection of operational secrets and unresolved target controls."
+    },
+    {
       "name": "diagnostic-scheduler",
       "status": "populated",
       "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and local execution receipts."
