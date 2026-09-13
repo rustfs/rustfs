@@ -252,7 +252,10 @@ fn heal_control_remaining(expires_at_unix_ms: i64, now_unix_ms: i64) -> Result<D
     Ok(Duration::from_millis(remaining_ms))
 }
 
-fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_channel::HealChannelRequest) -> Result<(), Status> {
+fn validate_admin_heal_control_start(
+    request: &rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    endpoints: &EndpointServerPools,
+) -> Result<(), Status> {
     if request.source != rustfs_heal_contracts::heal_channel::HealRequestSource::Admin {
         return Err(Status::permission_denied("heal control start source must be admin"));
     }
@@ -261,9 +264,8 @@ fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_chann
             "admin heal control start cannot contain automatic replacement endpoints",
         ));
     }
-    if request.pool_index.is_some() != request.set_index.is_some() {
-        return Err(Status::invalid_argument("heal control start requires both pool and set"));
-    }
+    heal::validate_heal_selector(endpoints, request.pool_index, request.set_index)
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
     if request.bucket.is_empty() {
         if request.object_prefix.as_deref().is_some_and(|prefix| !prefix.is_empty()) {
             return Err(Status::invalid_argument("root heal control start cannot contain an object prefix"));
@@ -274,6 +276,14 @@ fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_chann
         let erasure_set_target = request.pool_index.is_some();
         if request.disk.is_some() != erasure_set_target {
             return Err(Status::invalid_argument("root erasure-set heal control target is inconsistent"));
+        }
+        if let Some(disk) = &request.disk {
+            let selector = rustfs_heal::heal::utils::normalize_set_disk_id(disk)
+                .and_then(|normalized| rustfs_heal::heal::utils::parse_set_disk_id(&normalized).ok())
+                .ok_or_else(|| Status::invalid_argument("invalid root erasure-set heal control target"))?;
+            if (Some(selector.0), Some(selector.1)) != (request.pool_index, request.set_index) {
+                return Err(Status::invalid_argument("root erasure-set heal control target is inconsistent"));
+            }
         }
     } else if request.disk.is_some() {
         return Err(Status::invalid_argument(
@@ -763,14 +773,16 @@ async fn initialize_heal_topology_fingerprint_with_probe(
 pub(crate) async fn execute_heal_control_envelope(
     envelope: rustfs_protos::heal_control::Envelope,
     expected_coordinator_epoch: u64,
+    endpoints: &EndpointServerPools,
 ) -> Result<Vec<u8>, Status> {
-    execute_heal_control_envelope_with_manager(envelope, expected_coordinator_epoch, None).await
+    execute_heal_control_envelope_with_manager(envelope, expected_coordinator_epoch, None, endpoints).await
 }
 
 async fn execute_heal_control_envelope_with_manager(
     envelope: rustfs_protos::heal_control::Envelope,
     expected_coordinator_epoch: u64,
     manager: Option<Arc<rustfs_heal::HealManager>>,
+    endpoints: &EndpointServerPools,
 ) -> Result<Vec<u8>, Status> {
     let now = heal_control_now_unix_ms()?;
     envelope
@@ -780,6 +792,12 @@ async fn execute_heal_control_envelope_with_manager(
     let canonical_envelope = rustfs_protos::heal_control::encode_envelope(&envelope).map_err(Status::invalid_argument)?;
     let command_digest = Sha256::digest(&canonical_envelope).into();
     let (request_id, coordinator_epoch, command) = envelope.into_execution().map_err(Status::invalid_argument)?;
+
+    // Reject invalid targets before replay admission or forceStart can mutate
+    // task ownership. Both local and forwarded starts use this boundary.
+    if let rustfs_protos::heal_control::ExecutableCommand::Start { request } = &command {
+        validate_admin_heal_control_start(request, endpoints)?;
+    }
 
     let replay_cache = HEAL_CONTROL_REPLAY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
     let replay_entry = {
@@ -799,9 +817,6 @@ async fn execute_heal_control_envelope_with_manager(
         return Ok(cached.clone());
     }
 
-    if let rustfs_protos::heal_control::ExecutableCommand::Start { request } = &command {
-        validate_admin_heal_control_start(request)?;
-    }
     let retain_completed_result = !matches!(&command, rustfs_protos::heal_control::ExecutableCommand::Query { .. });
 
     let manager = manager
@@ -1197,7 +1212,7 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             rustfs_protos::heal_control::decode_envelope(&request.get_ref().command).map_err(Status::invalid_argument)?;
         let coordinator_epoch =
             rustfs_protos::heal_control_coordinator_epoch(fingerprint).map_err(Status::failed_precondition)?;
-        let result = execute_heal_control_envelope(envelope, coordinator_epoch).await?;
+        let result = execute_heal_control_envelope(envelope, coordinator_epoch, &endpoints).await?;
         let canonical_response = rustfs_protos::canonical_heal_control_response_body(
             request.get_ref().version,
             &request.get_ref().topology_fingerprint,
@@ -3090,7 +3105,7 @@ mod tests {
         request.recursive = Some(true);
         request.heal_endpoints = vec!["/mnt/replacement".to_string()];
 
-        let err = validate_admin_heal_control_start(&request)
+        let err = validate_admin_heal_control_start(&request, &heal_control_test_endpoints_with_coordinator("node-d", true))
             .expect_err("admin heal-control must not accept automatic replacement targets");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
@@ -3153,9 +3168,13 @@ mod tests {
             }
 
             let envelope = rustfs_protos::heal_control::decode_envelope(&command).map_err(Status::invalid_argument)?;
-            let result =
-                execute_heal_control_envelope_with_manager(envelope, self.coordinator_epoch, Some(Arc::clone(&self.manager)))
-                    .await?;
+            let result = execute_heal_control_envelope_with_manager(
+                envelope,
+                self.coordinator_epoch,
+                Some(Arc::clone(&self.manager)),
+                &heal_control_test_endpoints_with_coordinator("node-d", true),
+            )
+            .await?;
             if matches!(self.fault, HealControlTransportFault::DropAfterAdmission) {
                 return Err(Status::unavailable("transport failed after heal admission"));
             }
@@ -3281,20 +3300,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_selector_rejection_preserves_existing_task_and_replay_state() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let original_id = request.id.clone();
+        let original = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("valid original start");
+        execute_heal_control_envelope_with_manager(original, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+            .await
+            .expect("original heal should be admitted");
+        for (pool, set) in [(99, 99), (1, 0), (0, 2)] {
+            for root in [false, true] {
+                let mut invalid = request.clone();
+                invalid.id = Uuid::new_v4().to_string();
+                invalid.pool_index = Some(pool);
+                invalid.set_index = Some(set);
+                if root {
+                    invalid.bucket.clear();
+                    invalid.object_prefix = None;
+                    invalid.disk = Some(rustfs_heal::heal::utils::format_set_disk_id(pool, set));
+                }
+                let invalid_id = invalid.id.clone();
+                let envelope = rustfs_protos::heal_control::Envelope::start(invalid, metadata).expect("invalid selector encodes");
+                let error = execute_heal_control_envelope_with_manager(
+                    envelope,
+                    metadata.coordinator_epoch,
+                    Some(manager.clone()),
+                    &endpoints,
+                )
+                .await
+                .expect_err("invalid forceStart must be rejected before cancelling or admitting work");
+                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+                manager
+                    .get_task_status(&original_id)
+                    .await
+                    .expect("original task must retain ownership");
+                assert!(matches!(
+                    manager.get_task_status(&invalid_id).await,
+                    Err(rustfs_heal::Error::TaskNotFound { .. })
+                ));
+                let cache = super::HEAL_CONTROL_REPLAY_CACHE
+                    .get()
+                    .expect("original request initialized replay cache")
+                    .lock()
+                    .await;
+                assert!(!cache.contains_key(&invalid_id), "rejected request must not consume replay admission");
+            }
+        }
+    }
+
+    #[test]
+    fn heal_selector_rpc_target_must_match_validated_selector() {
+        let (_, mut request, _) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        request.bucket.clear();
+        request.object_prefix = None;
+        request.pool_index = Some(0);
+        request.set_index = Some(0);
+        for disk in ["pool_99_set_99", "pool_0_set_1", "0_1", "invalid"] {
+            request.disk = Some(disk.to_string());
+            let err = validate_admin_heal_control_start(&request, &endpoints).expect_err("RPC target must match selector");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+        for disk in ["pool_0_set_0", "0_0"] {
+            request.disk = Some(disk.to_string());
+            validate_admin_heal_control_start(&request, &endpoints).expect("matching canonical or compact selector is valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_selector_transport_returns_invalid_argument_without_admission() {
+        let (manager, mut request, metadata) = heal_start_retry_fixture();
+        request.pool_index = Some(99);
+        request.set_index = Some(99);
+        let request_id = request.id.clone();
+        let command = encode_transport_start(request, metadata);
+        let fingerprint = "selector-validation-transport";
+        let mut client = connect_faulty_heal_control_client(
+            manager.clone(),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("loopback listener is required for selector transport regression");
+        let error = call_heal_control_transport(&mut client, fingerprint, command)
+            .await
+            .expect_err("peer must reject selector");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+        assert!(matches!(
+            manager.get_task_status(&request_id).await,
+            Err(rustfs_heal::Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn heal_start_retry_exact_forced_envelope_returns_cached_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let request_id = request.id.clone();
         let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("valid forced start");
-        let lost_response =
-            execute_heal_control_envelope_with_manager(envelope.clone(), metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect("first request is admitted before its response is lost");
+        let lost_response = execute_heal_control_envelope_with_manager(
+            envelope.clone(),
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("first request is admitted before its response is lost");
         assert_eq!(manager.operations_snapshot().await.queue_length, 1);
 
         // The caller sees no first response, but retries the original envelope.
-        let replayed = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("an exact envelope replay must recover its receipt");
+        let replayed = execute_heal_control_envelope_with_manager(
+            envelope,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("an exact envelope replay must recover its receipt");
         assert_eq!(replayed, lost_response);
         assert_eq!(
             manager.operations_snapshot().await.queue_length,
@@ -3395,9 +3519,14 @@ mod tests {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let first_id = request.id.clone();
         let first = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("first start");
-        let _lost_response = execute_heal_control_envelope_with_manager(first, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("first admission");
+        let _lost_response = execute_heal_control_envelope_with_manager(
+            first,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("first admission");
 
         // A fresh HTTP forceStart request intentionally requests another start.
         let mut next_request = request;
@@ -3408,9 +3537,14 @@ mod tests {
             ..metadata
         };
         let next = rustfs_protos::heal_control::Envelope::start(next_request, next_metadata).expect("new forced start");
-        let response = execute_heal_control_envelope_with_manager(next, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("forceStart preserves its explicit admission semantics");
+        let response = execute_heal_control_envelope_with_manager(
+            next,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("forceStart preserves its explicit admission semantics");
         let outcome = rustfs_protos::heal_control::decode_result(&response)
             .and_then(|result| result.into_outcome(&next_id, metadata.coordinator_epoch))
             .expect("new receipt");
@@ -3428,10 +3562,14 @@ mod tests {
     async fn heal_start_retry_same_id_with_changed_envelope_conflicts_before_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let original = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("original start");
-        let receipt =
-            execute_heal_control_envelope_with_manager(original.clone(), metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect("original admission");
+        let receipt = execute_heal_control_envelope_with_manager(
+            original.clone(),
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("original admission");
         let mut changed_options = request.clone();
         changed_options.remove_corrupted = Some(true);
         let changed_metadata = rustfs_protos::heal_control::RequestMetadata {
@@ -3442,16 +3580,26 @@ mod tests {
             rustfs_protos::heal_control::Envelope::start(changed_options, metadata).expect("changed options"),
             rustfs_protos::heal_control::Envelope::start(request, changed_metadata).expect("changed nonce"),
         ] {
-            let error = execute_heal_control_envelope_with_manager(changed, metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect_err("one request ID cannot identify different envelope bytes");
+            let error = execute_heal_control_envelope_with_manager(
+                changed,
+                metadata.coordinator_epoch,
+                Some(manager.clone()),
+                &heal_control_test_endpoints_with_coordinator("node-d", true),
+            )
+            .await
+            .expect_err("one request ID cannot identify different envelope bytes");
             assert_eq!(error.code(), tonic::Code::AlreadyExists);
             assert_eq!(manager.operations_snapshot().await.queue_length, 1);
         }
         assert_eq!(
-            execute_heal_control_envelope_with_manager(original, metadata.coordinator_epoch, Some(manager))
-                .await
-                .expect("conflicts must preserve the original receipt"),
+            execute_heal_control_envelope_with_manager(
+                original,
+                metadata.coordinator_epoch,
+                Some(manager),
+                &heal_control_test_endpoints_with_coordinator("node-d", true)
+            )
+            .await
+            .expect("conflicts must preserve the original receipt"),
             receipt
         );
     }
@@ -3461,9 +3609,14 @@ mod tests {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let request_id = request.id.clone();
         let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("start envelope");
-        let error = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch + 1, Some(manager.clone()))
-            .await
-            .expect_err("a different coordinator epoch cannot accept the request");
+        let error = execute_heal_control_envelope_with_manager(
+            envelope,
+            metadata.coordinator_epoch + 1,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect_err("a different coordinator epoch cannot accept the request");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(manager.operations_snapshot().await.queue_length, 0);
         assert!(matches!(
@@ -3763,9 +3916,14 @@ mod tests {
 
         let canonical_token = uuid::Uuid::new_v4().to_string();
         let first = rustfs_protos::heal_control::Envelope::start(start(canonical_token.clone()), metadata()).unwrap();
-        let first_result = execute_heal_control_envelope_with_manager(first, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let first_result = execute_heal_control_envelope_with_manager(
+            first,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let first_outcome = rustfs_protos::heal_control::decode_result(&first_result)
             .and_then(|result| result.into_outcome(&canonical_token, coordinator_epoch))
             .unwrap();
@@ -3779,10 +3937,14 @@ mod tests {
 
         let duplicate_id = uuid::Uuid::new_v4().to_string();
         let duplicate = rustfs_protos::heal_control::Envelope::start(start(duplicate_id.clone()), metadata()).unwrap();
-        let duplicate_result =
-            execute_heal_control_envelope_with_manager(duplicate, coordinator_epoch, Some(Arc::clone(&manager)))
-                .await
-                .unwrap();
+        let duplicate_result = execute_heal_control_envelope_with_manager(
+            duplicate,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let duplicate_outcome = rustfs_protos::heal_control::decode_result(&duplicate_result)
             .and_then(|result| result.into_outcome(&duplicate_id, coordinator_epoch))
             .unwrap();
@@ -3803,9 +3965,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let query_result = execute_heal_control_envelope_with_manager(
+            query,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let query_outcome = rustfs_protos::heal_control::decode_result(&query_result)
             .and_then(|result| result.into_outcome(&query_id, coordinator_epoch))
             .unwrap();
@@ -3822,9 +3989,14 @@ mod tests {
             canonical_token.clone(),
         )
         .unwrap();
-        let cancel_result = execute_heal_control_envelope_with_manager(cancel, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let cancel_result = execute_heal_control_envelope_with_manager(
+            cancel,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let cancel_outcome = rustfs_protos::heal_control::decode_result(&cancel_result)
             .and_then(|result| result.into_outcome(&cancel_id, coordinator_epoch))
             .unwrap();
@@ -3842,9 +4014,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))
-            .await
-            .unwrap();
+        let stopped_result = execute_heal_control_envelope_with_manager(
+            stopped_query,
+            coordinator_epoch,
+            Some(manager),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let stopped_outcome = rustfs_protos::heal_control::decode_result(&stopped_result)
             .and_then(|result| result.into_outcome(&stopped_query_id, coordinator_epoch))
             .unwrap();
