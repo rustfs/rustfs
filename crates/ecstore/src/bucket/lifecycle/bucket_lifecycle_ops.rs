@@ -5190,6 +5190,7 @@ pub async fn put_restore_opts(
         // Restore writes stored (possibly encrypted) bytes, so the writer's
         // computed MD5 is not the object's public plaintext ETag.
         preserve_etag: oi.etag.clone(),
+        shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         //expires:           oi.expires,
         ..Default::default()
     })

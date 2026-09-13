@@ -51,6 +51,8 @@ thiserror.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 regex.workspace = true
 arc-swap.workspace = true
+sha2.workspace = true
+base64-simd.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

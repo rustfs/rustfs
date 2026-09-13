@@ -26,8 +26,8 @@ use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, 
 use super::progress::stable_generation;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
-    BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
-    ObjectOperations as _, StorageAdminApi,
+    BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
+    ObjectIO as _, ObjectOperations as _, StorageAdminApi,
 };
 use super::{DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
@@ -76,6 +76,16 @@ pub struct HealStorageObjectResult {
     pub receipt: Option<HealObjectReceipt>,
 }
 
+fn incarnation_storage_error(bucket: &str, expected: Uuid, error: StorageError) -> Error {
+    match error {
+        StorageError::BucketNotFound(_) => Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected: Some(expected),
+        },
+        error => Error::Storage(error),
+    }
+}
+
 impl From<(HealResultItem, Option<Error>)> for HealStorageObjectResult {
     fn from((item, error): (HealResultItem, Option<Error>)) -> Self {
         Self {
@@ -84,6 +94,47 @@ impl From<(HealResultItem, Option<Error>)> for HealStorageObjectResult {
             receipt: None,
         }
     }
+}
+
+fn verified_object_receipt(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    opts: &HealOpts,
+    item: &HealResultItem,
+    bucket_incarnation_id: Uuid,
+) -> Option<HealObjectReceipt> {
+    if opts.dry_run || !item.integrity_verified {
+        return None;
+    }
+    let resolved_version = Uuid::from_bytes(item.resolved_version_id?);
+    if let Some(requested) = version_id.filter(|version| !version.is_empty())
+        && Uuid::parse_str(requested).ok()? != resolved_version
+    {
+        return None;
+    }
+    item.drives_reported()?;
+    let drives_healed = item.drives_healed()?;
+    let ok_drive_state = DriveState::Ok.to_string();
+    if !item.after.drives.iter().all(|drive| drive.state == ok_drive_state) {
+        return None;
+    }
+    Some(HealObjectReceipt {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: version_id.map(ToOwned::to_owned),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            pool_index: opts.pool,
+            set_index: opts.set,
+        },
+        disposition: if drives_healed > 0 {
+            HealObjectDisposition::Repaired
+        } else {
+            HealObjectDisposition::VerifiedHealthy
+        },
+    })
 }
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -320,13 +371,13 @@ pub(crate) fn decode_disk_walk_token(token: &str) -> Option<String> {
 /// `is_delete_marker` is OBSERVABILITY-ONLY (metrics / logging / e2e
 /// assertions); it MUST NOT gate healing logic. Whether the delete-marker path
 /// or the data path is taken is decided internally in `ops/heal.rs` from
-/// `latest_meta.deleted`. `version_id` is normalized (nil/absent UUID => `None`)
-/// at the single construction point in `list_objects_for_heal_page`.
+/// `latest_meta.deleted`. Every enumerated version has an exact selector:
+/// nil/absent metadata UUIDs select the nil UUID, never an unspecified latest.
 #[derive(Debug, Clone)]
 pub struct HealListItem {
     /// object key
     pub name: String,
-    /// normalized version id (`None` when the version is nil/absent)
+    /// Exact version id, including the nil UUID for the null slot.
     pub version_id: Option<String>,
     /// version modification time as Unix nanoseconds
     pub mod_time_unix_nanos: Option<i128>,
@@ -395,6 +446,46 @@ pub trait HealStorageAPI: Send + Sync {
     /// Stable bucket incarnation observed before an object heal starts.
     async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
         Ok(None)
+    }
+
+    /// Admission must use authoritative metadata, not an outcome cache.
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        self.bucket_incarnation_id(bucket)
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            })
+    }
+
+    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Option<Uuid>) -> Result<()> {
+        let stale = || Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected,
+        };
+        let expected = expected.filter(|id| !id.is_nil()).ok_or_else(stale)?;
+        match self.admit_bucket_incarnation(bucket).await {
+            Ok(current) if current == expected => Ok(()),
+            Ok(_) | Err(Error::StaleBucketIncarnation { .. }) => Err(stale()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Implementations must retain the bucket lifecycle fence through storage mutation.
+    async fn heal_bucket_at_incarnation(&self, _bucket: &str, _expected: Uuid, _opts: &HealOpts) -> Result<HealResultItem> {
+        Err(Error::other("storage does not support incarnation-bound bucket healing"))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _expected: Uuid,
+        _opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        Err(Error::other("storage does not support incarnation-bound object healing"))
     }
 
     /// Heal object using ecstore
@@ -532,6 +623,66 @@ impl ECStoreHealStorage {
         Self { ecstore }
     }
 
+    async fn object_result_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        result: EcstoreHealObjectStorageResult,
+        expected: Option<Uuid>,
+    ) -> HealStorageObjectResult {
+        let item = result.item;
+        let error = result.error.map(Error::Storage);
+        let receipt = if let Some(proof) = result.absence {
+            if error.is_none()
+                && !opts.dry_run
+                && proof.bucket == bucket
+                && proof.object == object
+                && proof.version_id == version_id.unwrap_or("")
+                && proof.pool_index == opts.pool
+                && proof.set_index == opts.set
+                && !proof.bucket_incarnation_id.is_nil()
+                && expected.is_none_or(|expected| expected == proof.bucket_incarnation_id)
+                && !proof.locations.is_empty()
+                && proof.locations.iter().all(|(pool, set)| {
+                    opts.pool.is_none_or(|expected| expected == *pool) && opts.set.is_none_or(|expected| expected == *set)
+                })
+            {
+                Some(HealObjectReceipt {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: proof.bucket,
+                        object: proof.object,
+                        version_id: version_id.map(ToOwned::to_owned),
+                        bucket_incarnation_id: Some(proof.bucket_incarnation_id),
+                        pool_index: proof.pool_index,
+                        set_index: proof.set_index,
+                    },
+                    // A committed cleanup repaired the stale replica. A replay
+                    // observing an already absent version made no new repair.
+                    disposition: if proof.removed {
+                        HealObjectDisposition::Repaired
+                    } else {
+                        HealObjectDisposition::AuthoritativelyAbsent
+                    },
+                })
+            } else {
+                None
+            }
+        } else if error.is_none() && !opts.dry_run && item.integrity_verified {
+            let bucket_incarnation_id = match expected {
+                Some(expected) => Some(expected),
+                None => self.ecstore.bucket_incarnation_id(bucket).await.ok(),
+            };
+            bucket_incarnation_id
+                .and_then(|incarnation| verified_object_receipt(bucket, object, version_id, opts, &item, incarnation))
+        } else {
+            None
+        };
+        HealStorageObjectResult { item, error, receipt }
+    }
+
     /// Read back an object's bytes, capped to bound memory.
     ///
     /// Private support for the reserved `ec_decode_rebuild` (HS-01); not part
@@ -656,6 +807,42 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        match self.ecstore.bucket_incarnation_id_from_disk(bucket).await {
+            Ok(id) if !id.is_nil() => Ok(id),
+            Ok(_) | Err(StorageError::BucketNotFound(_)) => Err(Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            }),
+            Err(error) => Err(Error::Storage(error)),
+        }
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.ecstore
+            .heal_bucket_at_incarnation(bucket, expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let result = self
+            .ecstore
+            .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+            .await)
+    }
+
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1132,77 +1319,9 @@ impl HealStorageAPI for ECStoreHealStorage {
             .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
             .await
             .map_err(Error::Storage)?;
-        let item = result.item;
-        let error = result.error.map(Error::Storage);
-        let receipt = if let Some(proof) = result.absence {
-            if error.is_none()
-                && !opts.dry_run
-                && proof.bucket == bucket
-                && proof.object == object
-                && proof.version_id == version_id.unwrap_or("")
-                && proof.pool_index == opts.pool
-                && proof.set_index == opts.set
-                && !proof.bucket_incarnation_id.is_nil()
-                && !proof.locations.is_empty()
-                && proof.locations.iter().all(|(pool, set)| {
-                    opts.pool.is_none_or(|expected| expected == *pool) && opts.set.is_none_or(|expected| expected == *set)
-                })
-            {
-                Some(HealObjectReceipt {
-                    identity: HealObjectIdentity {
-                        kind: HealObjectKind::Object,
-                        bucket: proof.bucket,
-                        object: proof.object,
-                        version_id: version_id.map(ToOwned::to_owned),
-                        bucket_incarnation_id: Some(proof.bucket_incarnation_id),
-                        pool_index: proof.pool_index,
-                        set_index: proof.set_index,
-                    },
-                    // A committed cleanup repaired the stale replica. A replay
-                    // observing an already absent version made no new repair.
-                    disposition: if proof.removed {
-                        HealObjectDisposition::Repaired
-                    } else {
-                        HealObjectDisposition::AuthoritativelyAbsent
-                    },
-                })
-            } else {
-                None
-            }
-        } else if error.is_none() && !opts.dry_run {
-            let ok_drive_state = DriveState::Ok.to_string();
-            let all_after_drives_ok = item.after.drives.iter().all(|drive| drive.state == ok_drive_state);
-            match (
-                self.ecstore.bucket_incarnation_id(bucket).await,
-                item.drives_reported(),
-                item.drives_healed(),
-                all_after_drives_ok,
-            ) {
-                (Ok(bucket_incarnation_id), Some(_), Some(drives_healed), true) => {
-                    let disposition = if drives_healed > 0 {
-                        HealObjectDisposition::Repaired
-                    } else {
-                        HealObjectDisposition::VerifiedHealthy
-                    };
-                    Some(HealObjectReceipt {
-                        identity: HealObjectIdentity {
-                            kind: HealObjectKind::Object,
-                            bucket: bucket.to_string(),
-                            object: object.to_string(),
-                            version_id: version_id.map(ToOwned::to_owned),
-                            bucket_incarnation_id: Some(bucket_incarnation_id),
-                            pool_index: opts.pool,
-                            set_index: opts.set,
-                        },
-                        disposition,
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        Ok(HealStorageObjectResult { item, error, receipt })
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, None)
+            .await)
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
@@ -1381,14 +1500,14 @@ impl HealStorageAPI for ECStoreHealStorage {
             }
         };
 
-        // Collect versions from this page. version_id is normalized to Option<String>
-        // here at the single construction point: nil/absent UUID => None.
+        // Listing has already selected a concrete version. Preserve the null
+        // slot's identity even when a newer UUID has become latest.
         let page_objects: Vec<HealListItem> = list_info
             .objects
             .into_iter()
             .map(|mut obj| {
+                let version_id = Some(obj.version_id.unwrap_or_default().to_string());
                 obj.version_id = obj.version_id.filter(|u| !u.is_nil());
-                let version_id = obj.version_id.map(|u| u.to_string());
                 let mod_time_unix_nanos = obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos());
                 let is_delete_marker = obj.delete_marker;
                 if include_lifecycle_object_info {
@@ -1647,6 +1766,68 @@ mod tests {
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
         is_transient_object_exists_message, next_heal_listing_token,
     };
+
+    #[test]
+    fn object_receipt_requires_integrity_and_resolved_version_evidence() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+        let incarnation = Uuid::new_v4();
+        let null = Uuid::nil().to_string();
+        let latest = Uuid::new_v4();
+        let options = HealOpts::default();
+        let mut item = HealResultItem {
+            integrity_verified: true,
+            version_id: null.clone(),
+            resolved_version_id: Some(*latest.as_bytes()),
+            ..Default::default()
+        };
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "echoing null cannot certify a different resolved version"
+        );
+        assert!(
+            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_some(),
+            "an omitted selector still means latest"
+        );
+        assert!(verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation).is_some());
+        assert!(
+            verified_object_receipt("bucket", "object", Some("null"), &options, &item, incarnation).is_none(),
+            "the internal boundary requires a UUID, not an S3 spelling"
+        );
+        assert!(verified_object_receipt("bucket", "object", Some(&latest.to_string()), &options, &item, incarnation).is_some());
+
+        item.resolved_version_id = Some([0; 16]);
+        let receipt = verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+            .expect("the exact healthy null version should be certifiable");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(null.as_str()));
+        assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+        item.before.drives[0].state = "missing".to_string();
+        assert_eq!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+                .expect("the restored null version should be certifiable")
+                .disposition,
+            HealObjectDisposition::Repaired
+        );
+        item.integrity_verified = false;
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "the exact version cannot certify unverified shard integrity"
+        );
+        assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+        item.integrity_verified = true;
+        item.resolved_version_id = None;
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "legacy results cannot prove the selected version"
+        );
+        assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+    }
 
     #[test]
     fn next_heal_listing_token_returns_none_for_complete_page() {

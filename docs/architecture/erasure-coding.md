@@ -156,6 +156,73 @@ Each shard file is self-verifying against silent disk corruption.
 
 ---
 
+### 5.1 Independent shard commitments
+
+New PUTs and newly initiated multipart uploads retain `CSumAlgo = 1` and the
+existing `[HighwayHash256][shard]` frames. Independent commitments are disabled
+for new writes by default; both `RUSTFS_SHARD_INTEGRITY_WRITE` and
+`RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED` must be enabled to start protecting new
+writes. Existing protected objects and uploads retain their mode. An independent SHA-256
+commitment protects against replacing a complete frame with a same-length donor
+frame whose self-contained checksum is valid (backlog#2497).
+
+The commitment describes an immutable part generation, with a random UUID,
+part number, exact encoded length, erasure geometry, codec mode, stripe count,
+and Merkle root. Each leaf commits to the ordered SHA-256 digests of **all**
+encoded shards in one stripe. Payload digests include generation, part, stripe,
+coding index, length, and geometry. The root also commits to the final part size.
+A valid metadata quorum selects the expected root; neither RS consistency nor
+an intact adjacent HighwayHash checksum establishes the root.
+
+The dual-prefix internal `shard-integrity-v1` metadata value encodes a canonical
+Base64 table: a 32-byte header and 64 bytes per part, up to 10,000 sorted unique
+parts. The same table is stored under both internal prefixes. Readers reject a
+malformed, conflicting, or incomplete descriptor instead of treating it as
+legacy metadata. Each external part has an immutable
+`part.N.integrity.<generation UUID>` sidecar, replicated on every participating
+disk. Its 64-byte header is followed by stripe records containing all shard
+digests and a Merkle path. An inline object stores the small proof under the
+dual-prefix `shard-integrity-inline-v1` key.
+
+GET authenticates a stripe record against the selected root, then verifies each
+source shard before decoding or emitting bytes. Reconstructed data is also
+checked against its expected digest. Range reads fetch only the proof records
+for touched stripes; deferred parity readers retain their exact stripe position.
+A missing or corrupt index replica can use another authenticated replica. Deep
+Heal verifies at the coordinator, including data returned by older disk servers,
+and restores missing indexes only from proofs matching the existing root. It
+never mints a new commitment from suspect stored bytes. Index-only repair leaves
+payload and `xl.meta` bytes unchanged and requires acknowledged durable publish.
+
+Writes publish the payload and proof on the same write quorum. UploadPart uses
+a fresh generation for each replacement, includes that generation and root in
+part-metadata quorum selection, and publishes its index before the existing
+part transaction switches data and metadata. Settlement removes only the
+obsolete generation; rollback retains the old index. Interrupted preparation
+can leave unreferenced files until the upload directory is reclaimed. Ordinary
+metadata COPY preserves commitments. Physical rewrites inherit their source
+mode: protected sources create new commitments after reading through their
+verifier; legacy sources remain legacy. Rewriting existing bytes is not a
+trusted migration of their historical identity. An upload's persisted marker,
+not the current node's write switch, determines its UploadPart/Complete mode.
+
+Digest/index builders spill above a 1 MiB buffer limit, and request readers keep
+a bounded stripe cache. For EC 12+4, a 5 GiB part with 1 MiB stripes has a
+4,751,424-byte index on each disk (about 1.42% of logical data across 16 disks).
+The maximum descriptor is 853,376 Base64 bytes per prefix, about 1.63 MiB for
+both copies. These are format bounds, not measured throughput guarantees.
+
+Legacy objects retain their existing GET and traditional Heal behavior and
+therefore their residual complete-donor substitution risk. Ordinary shard repair
+and the existing explicit-version metadata recovery path remain available, but
+do not create commitments or certify object identity. Actual drive repairs are
+reported separately from strong integrity receipts. Normal
+presence scans do not issue strong integrity receipts even for protected
+objects. Only a completed exclusive Deep scan/repair with authenticated sources
+can do so. See the [upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
+for mixed-version and migration constraints and the
+[rollout runbook](../operations/shard-integrity-rollout.md) for activation and rollback.
+
 ## 6. On-disk format (`xl.meta`)
 
 This section is the load-bearing compatibility contract for stored metadata. It is byte-compatible with MinIO's `xl.meta`; interop proof, the fixture corpus, and the out-of-scope list are owned by [minio-file-format-compat.md](minio-file-format-compat.md) — cite it, do not re-derive interop claims.
@@ -252,7 +319,7 @@ Version-aware heal ([set_disk/ops/heal.rs](../../crates/ecstore/src/set_disk/ops
 
 - **INVARIANT — reconstructability.** Heal refuses when `meta_to_heal_count > parity_blocks` (relaxed only if a quorum etag exists) or when any part loses more than `parity_blocks` shards.
 - **INVARIANT — geometry match.** `latest_meta.erasure.distribution.len()` must equal the online-disk, outdated-disk, and parts-metadata counts, else heal refuses ("backend disks manually modified"). A real object missing `data_dir` is `FileCorrupt`.
-- **Data-safety guard (backlog#920).** If data shards survive on ≥ `data_blocks` disks, regenerate the missing `xl.meta` from a valid FileInfo and re-drive heal rather than dangling-delete; torn writes (< `data_blocks`) fall through to dangling-delete handling.
+- **Data-safety guard (backlog#920).** Legacy explicit-version metadata recovery retains its validated geometry, consistent candidate identity, online-disk and available-data bounds. It does not establish independent payload identity. Protected recovery additionally requires a matching metadata quorum and authenticated data on ≥ `data_blocks` disks. Conflicting metadata and uncertain deletion conditions retain their existing refusal/grace behavior.
 - Healed shards are written to the outdated disks, each recording `erasure.index = slot + 1`, then `rename_data` to final. Heal admission / scanner budget is owned by [placement-repair-invariants.md](placement-repair-invariants.md).
 
 ---

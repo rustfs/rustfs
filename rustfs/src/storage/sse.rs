@@ -159,7 +159,7 @@ fn md5_base64(input: impl AsRef<[u8]>) -> String {
 
 use super::Error;
 use super::get_bucket_sse_config;
-use crate::error::ApiError;
+use crate::error::{ApiError, slow_down_read_api_error};
 use rustfs_utils::http::headers::{
     AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -711,6 +711,10 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
 }
 
 pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
+    if matches!(err, StorageError::PartMissingOrCorrupt) {
+        return slow_down_read_api_error(err);
+    }
+
     if let StorageError::Io(io_error) = &err
         && let Some(resolution_error) = io_error
             .get_ref()
@@ -7522,6 +7526,14 @@ mod tests {
         let err = map_get_object_reader_error(StorageError::other(resolution_error));
         assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message, "KMS unavailable");
+    }
+
+    #[test]
+    fn test_map_get_object_reader_error_maps_part_missing_to_slow_down_read() {
+        let err = map_get_object_reader_error(StorageError::PartMissingOrCorrupt);
+
+        assert_eq!(err.code, S3ErrorCode::Custom("SlowDownRead".into()));
+        assert_eq!(err.message, "Resource requested is unreadable, please reduce your request rate");
     }
 
     #[test]

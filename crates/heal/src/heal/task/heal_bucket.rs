@@ -134,6 +134,10 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
         self.pace_mainline().await?;
+        if self.source == HealRequestSource::Admin && matches!(self.heal_type, HealType::Bucket { .. }) {
+            self.await_with_control(self.storage.validate_bucket_incarnation(bucket, self.bucket_incarnation_id))
+                .await?;
+        }
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_BUCKET_STAGE,
@@ -216,7 +220,13 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        let heal_result = self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await;
+        let heal_result = match self.bucket_incarnation_id {
+            Some(expected) => {
+                self.await_with_control(self.storage.heal_bucket_at_incarnation(bucket, expected, &heal_opts))
+                    .await
+            }
+            None => self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await,
+        };
 
         match heal_result {
             Ok(result) => {
@@ -247,6 +257,7 @@ impl HealTask {
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(error @ Error::StaleBucketIncarnation { .. }) => Err(error),
             Err(e) => {
                 error!(
                     target: "rustfs::heal::task",
@@ -482,7 +493,14 @@ impl HealTask {
         };
 
         for (set_disk_id, heal_opts) in listing_scopes {
-            let bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, heal_opts.dry_run).await?;
+            let bucket_incarnation_id = match self.bucket_incarnation_id {
+                Some(expected) => {
+                    self.await_with_control(self.storage.validate_bucket_incarnation(bucket, Some(expected)))
+                        .await?;
+                    Some(expected)
+                }
+                None => self.outcome_bucket_incarnation_id(bucket, heal_opts.dry_run).await?,
+            };
             let mut continuation_token: Option<String> = None;
             let mut deferred = DeferredWindow::default();
             let mut inline_retry: Option<DeferredObject> = None;
@@ -602,12 +620,26 @@ impl HealTask {
                         Some(Error::other("heal object retry age exhausted"))
                     } else {
                         match self
-                            .await_with_control(self.storage.heal_object_with_receipt(
-                                bucket,
-                                object,
-                                item.version_id.as_deref(),
-                                &heal_opts,
-                            ))
+                            .await_with_control(async {
+                                match self.bucket_incarnation_id {
+                                    Some(expected) => {
+                                        self.storage
+                                            .heal_object_at_incarnation(
+                                                bucket,
+                                                object,
+                                                item.version_id.as_deref(),
+                                                expected,
+                                                &heal_opts,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        self.storage
+                                            .heal_object_with_receipt(bucket, object, item.version_id.as_deref(), &heal_opts)
+                                            .await
+                                    }
+                                }
+                            })
                             .await
                         {
                             Ok(storage_result) if storage_result.error.is_none() => {
@@ -654,6 +686,7 @@ impl HealTask {
 
                     if let Some(err) = error {
                         match err {
+                            Error::StaleBucketIncarnation { .. } => return Err(err),
                             Error::TaskCancelled | Error::TaskTimeout => {
                                 let disposition = if matches!(err, Error::TaskCancelled) {
                                     HealObjectDisposition::Cancelled
@@ -676,7 +709,13 @@ impl HealTask {
                             _ => {}
                         }
                         detail = Some(err.to_string());
-                        if Self::is_dangling_delete_grace_error(&err) {
+                        if matches!(&err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+                            disposition = HealObjectDisposition::Deferred {
+                                reason: HealDeferredReason::RetiredMarkerProof,
+                                retry_not_before: None,
+                            };
+                            telemetry_unknown |= !increment_counter(&mut skipped);
+                        } else if Self::is_dangling_delete_grace_error(&err) {
                             disposition = HealObjectDisposition::Deferred {
                                 reason: HealDeferredReason::DanglingDeleteGrace,
                                 retry_not_before: err.dangling_delete_retry_not_before(),

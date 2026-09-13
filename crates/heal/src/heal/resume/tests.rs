@@ -1603,6 +1603,152 @@ async fn test_resumestate_schema_v0_discarded_on_load() {
 }
 
 #[tokio::test]
+async fn historical_null_progress_is_replayed_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut state = ResumeState::new(
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["pending-bucket".to_string()],
+    );
+    state.schema_version = 5;
+    state.resume_cursor = Some("dw1:old-page".to_string());
+    state.completed_buckets = vec!["completed-bucket".to_string()];
+    state.processed_objects = 5;
+    state.successful_objects = 5;
+    state.completed = true;
+    let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize schema 5").into(),
+    )
+    .await
+    .expect("persist old resume state");
+
+    let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
+    checkpoint.schema_version = 6;
+    checkpoint.current_bucket_index = 1;
+    checkpoint.current_object_index = 5;
+    checkpoint.processed_objects.insert(compose_key("versions/object.bin", None));
+    checkpoint.successful_objects = 5;
+    // Schema 6 used a digest over the canonical JSON with a null digest field.
+    let mut wire = serde_json::to_value(&checkpoint).expect("serialize schema 6");
+    let unsigned = serde_json::to_vec(&wire).expect("serialize unsigned schema 6");
+    wire["integrity_digest"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)));
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &checkpoint_path,
+        serde_json::to_vec(&wire).expect("serialize signed schema 6").into(),
+    )
+    .await
+    .expect("persist old checkpoint");
+
+    let restored = ResumeManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("load old resume state")
+        .get_state()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_RESUME_SCHEMA);
+    assert_eq!(restored.resume_cursor, None);
+    assert_eq!(restored.processed_objects, 0);
+    assert_eq!(restored.successful_objects, 0);
+    assert!(!restored.completed);
+    assert!(restored.completed_buckets.is_empty());
+    assert_eq!(
+        restored.pending_buckets,
+        ["completed-bucket", "pending-bucket"],
+        "formerly completed buckets must be rescanned too"
+    );
+    let restored = CheckpointManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("load old signed checkpoint")
+        .get_checkpoint()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+    assert!(
+        restored.processed_objects.is_empty(),
+        "ambiguous null coverage cannot survive the upgrade"
+    );
+    assert_eq!(restored.current_bucket_index, 0);
+    assert_eq!(restored.current_object_index, 0);
+    assert_eq!(restored.successful_objects, 0);
+    temp_dir.close().expect("remove upgrade fixture");
+}
+
+#[tokio::test]
+async fn legacy_replacement_null_coverage_cannot_reuse_a_completion_proof() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("persist replacement intent");
+    manager
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("persist the old completion proof");
+    let proof_path = replacement_completion_proof_path(&task_id);
+    let proof_path = proof_path.to_str().expect("proof path must be UTF-8");
+    let proof_before = disk
+        .read_all(RUSTFS_META_BUCKET, proof_path)
+        .await
+        .expect("read completion proof");
+    let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+    let intent_path = intent_path.to_str().expect("intent path must be UTF-8");
+    for phase in [
+        ReplacementPhase::Intent,
+        ReplacementPhase::Rebuilding,
+        ReplacementPhase::Verified,
+        ReplacementPhase::CleanupPending,
+    ] {
+        let mut legacy = manager.get_state().await;
+        legacy.schema_version = 5;
+        legacy.replacement_phase = phase;
+        legacy.completed = matches!(phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
+        let bytes = serde_json::to_vec(&legacy).expect("serialize old replacement state");
+        disk.write_all(RUSTFS_META_BUCKET, intent_path, bytes.clone().into())
+            .await
+            .expect("write old replacement state");
+        let error = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .err()
+            .expect("legacy replacement coverage must require explicit recovery");
+        assert!(
+            error.to_string().contains("legacy version coverage"),
+            "unexpected recovery error: {error}"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, intent_path)
+                .await
+                .expect("retained intent")
+                .as_ref(),
+            bytes
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, proof_path).await.expect("retained proof"),
+            proof_before,
+            "an upgrade must not discard the ownership/completion fence"
+        );
+    }
+    temp_dir.close().expect("remove replacement upgrade fixture");
+}
+
+#[tokio::test]
 async fn test_checkpoint_schema_v5_discarded_on_load() {
     let (temp_dir, disk) = schema_test_disk().await;
 

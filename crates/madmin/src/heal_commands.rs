@@ -36,6 +36,10 @@ const DRIVE_STATE_OK: &str = "ok";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
+    /// Only the coordinator's authenticated full scan may set this. Transported
+    /// or old-peer results default to unproven and cannot advance heal receipts.
+    #[serde(skip)]
+    pub integrity_verified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]
@@ -46,6 +50,10 @@ pub struct HealResultItem {
     pub object: String,
     #[serde(rename = "versionId")]
     pub version_id: String,
+    /// Exact version selected by the storage owner, including the nil UUID.
+    /// Wire-decoded and legacy results cannot supply this in-process proof.
+    #[serde(skip)]
+    pub resolved_version_id: Option<[u8; 16]>,
     #[serde(rename = "detail")]
     pub detail: String,
     #[serde(rename = "parityBlocks")]
@@ -95,6 +103,20 @@ impl HealResultItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_heal_version_is_not_wire_proof() {
+        let item = HealResultItem {
+            resolved_version_id: Some([0; 16]),
+            ..Default::default()
+        };
+        let mut wire = serde_json::to_value(&item).expect("heal result should serialize");
+        assert!(wire.get("resolved_version_id").is_none());
+        assert!(wire.get("resolvedVersionId").is_none());
+        wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
+        let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
+        assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");
+    }
 
     fn drive(state: &str) -> HealDriveInfo {
         HealDriveInfo {

@@ -582,6 +582,7 @@ mod absence_receipt_regressions {
     use super::*;
     use rustfs_heal::heal::outcome::{HealDeferredReason, HealObjectDisposition};
     use rustfs_heal::heal::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+    use rustfs_heal_contracts::heal_channel::HealRequestSource;
     use storage_api::integration::{DiskAPI as _, DiskSetSelector, ObjectOperations as _, ReadOptions, StorageAdminApi as _};
 
     const OBJECT: &str = "history.txt";
@@ -717,13 +718,23 @@ mod absence_receipt_regressions {
     #[test]
     #[serial]
     fn historical_absence_receipt_bucket_outcome_matches_c06() {
+        run_historical_absence_receipt_bucket_outcome(HealRequestSource::Internal);
+    }
+
+    #[test]
+    #[serial]
+    fn historical_absence_receipt_bucket_at_incarnation_matches_c06() {
+        run_historical_absence_receipt_bucket_outcome(HealRequestSource::Admin);
+    }
+
+    fn run_historical_absence_receipt_bucket_outcome(source: HealRequestSource) {
         // The real ECStore initialization and bucket traversal need the debug
         // server's stack budget, which exceeds libtest's default on Linux.
         const STACK_SIZE: usize = 8 * 1024 * 1024;
         std::thread::Builder::new()
             .name("absence-receipt-c06".to_owned())
             .stack_size(STACK_SIZE)
-            .spawn(|| {
+            .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(4)
                     .thread_stack_size(STACK_SIZE)
@@ -731,42 +742,60 @@ mod absence_receipt_regressions {
                     .build()
                     .expect("C06 test runtime should build");
 
-                runtime.block_on(historical_absence_receipt_bucket_outcome_matches_c06_inner());
+                runtime.block_on(historical_absence_receipt_bucket_outcome_matches_c06_inner(source));
             })
             .expect("C06 test thread should spawn")
             .join()
             .expect("C06 test thread should finish");
     }
 
-    async fn historical_absence_receipt_bucket_outcome_matches_c06_inner() {
+    async fn historical_absence_receipt_bucket_outcome_matches_c06_inner(source: HealRequestSource) {
         let bucket = "absence-receipt-c06";
         let (_paths, store, storage, old, current) = stale_history(bucket).await;
         put_versioned(&store, bucket, "healthy.txt", b"already healthy").await;
-        let task = HealTask::from_request(
-            HealRequest::new(
-                HealType::Bucket {
-                    bucket: bucket.to_owned(),
-                },
-                HealOptions {
-                    recursive: true,
-                    scan_mode: HealScanMode::Deep,
-                    ..Default::default()
-                },
-                HealPriority::Normal,
-            ),
-            storage,
+        let mut request = HealRequest::new(
+            HealType::Bucket {
+                bucket: bucket.to_owned(),
+            },
+            HealOptions {
+                recursive: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+            HealPriority::Normal,
         );
+        request.source = source;
+        if source == HealRequestSource::Admin {
+            request.bucket_incarnation_id = Some(storage.admit_bucket_incarnation(bucket).await.expect("admin admission"));
+        }
+        let expected = request.bucket_incarnation_id;
+        let task = HealTask::from_request(request, storage.clone());
         with_dangling_grace_disabled(task.execute())
             .await
             .expect("C06 bucket traversal should complete");
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.counters.processed, 3);
         assert_eq!(outcome.counters.healed, 1, "completed cleanup must be repaired: {outcome:?}");
-        assert_eq!(outcome.counters.unchanged, 2);
-        assert_eq!(outcome.counters.unknown, 0);
+        // Exact historical absence has its own proof. The two live legacy
+        // versions remain readable but carry no independent payload receipt.
+        assert_eq!(outcome.counters.unchanged, 0);
+        assert_eq!(outcome.counters.unknown, 2);
         assert_eq!(outcome.counters.failed, 0);
-        assert_eq!(outcome.counters.skipped, 0);
+        assert_eq!(outcome.counters.skipped, 2);
         assert_versions(&store, bucket, &old, &current).await;
+
+        if let Some(expected) = expected {
+            let replay = storage
+                .heal_object_at_incarnation(bucket, OBJECT, Some(&old), expected, &deep_heal_opts())
+                .await
+                .expect("bound replay should retain the exact-version absence proof");
+            assert!(replay.error.is_none(), "bound replay failed: {:?}", replay.error);
+            let receipt = replay.receipt.expect("already absent history needs a receipt");
+            assert_eq!(receipt.disposition, HealObjectDisposition::AuthoritativelyAbsent);
+            assert_eq!(receipt.identity.bucket_incarnation_id, Some(expected));
+            assert_eq!(receipt.identity.version_id.as_deref(), Some(old.as_str()));
+            assert_versions(&store, bucket, &old, &current).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

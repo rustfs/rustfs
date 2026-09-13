@@ -25,6 +25,7 @@
 #![recursion_limit = "256"]
 
 use http::HeaderMap;
+use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{
@@ -46,6 +47,7 @@ mod storage_api;
 
 use storage_api::integration::{
     BucketOperations, ECStore, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _,
+    ShardIntegrityWriteMode,
 };
 
 /// 256 KiB + change: large enough to be stored as non-inline erasure shards
@@ -102,6 +104,7 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
     let mut reader = PutObjReader::from_vec(data.to_vec());
     let opts = ObjectOptions {
         versioned: true,
+        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
         ..Default::default()
     };
     let info = (**ecstore)
@@ -117,7 +120,15 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
 async fn put_unversioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
-        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            },
+        )
         .await
         .expect("unversioned put_object failed");
     wait_for_put_tail(ecstore, bucket, object).await;
@@ -145,8 +156,8 @@ fn object_dir(disk: &Path, bucket: &str, object: &str) -> PathBuf {
     disk.join(bucket).join(object)
 }
 
-/// Count `part.*` data-shard files two levels below the object dir
-/// (`<object>/<data-uuid>/part.N`). One data dir per non-delete-marker version.
+/// Count `part.N` data-shard files two levels below the object dir, excluding
+/// integrity indexes. One data dir per non-delete-marker version.
 fn count_part_files(obj_dir: &Path) -> usize {
     if !obj_dir.exists() {
         return 0;
@@ -156,7 +167,14 @@ fn count_part_files(obj_dir: &Path) -> usize {
         .max_depth(2)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part."))
+                    .is_some_and(|number| number.parse::<usize>().is_ok())
+        })
         .count()
 }
 
@@ -251,6 +269,278 @@ async fn read_version(ecstore: &Arc<ECStore>, bucket: &str, object: &str, versio
 
 mod serial_tests {
     use super::*;
+
+    fn physical_version(disk: &Path, bucket: &str, object: &str, version: &str) -> FileInfo {
+        let bytes = std::fs::read(xl_meta_path(&object_dir(disk, bucket, object))).expect("physical xl.meta must exist");
+        FileMeta::load_or_convert(&bytes)
+            .expect("physical metadata must decode")
+            .into_fileinfo(bucket, object, version, true, false, true)
+            .expect("the exact physical version must exist")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_exact_null_heal_with_current_and_historical_markers() {
+        let (disks, ecstore, storage) = heal_env().await;
+        let null = uuid::Uuid::nil().to_string();
+        let object = "object.bin";
+        for (null_marker, newer, latest_marker) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let bucket = format!("null-marker-{null_marker}-{newer}-{latest_marker}");
+            create_versioned_bucket(&ecstore, &bucket).await;
+            let old = put_versioned(&ecstore, &bucket, object, &versioned_test_data(10)).await;
+            put_unversioned(&ecstore, &bucket, object, &versioned_test_data(11)).await;
+            if null_marker {
+                let info = ecstore
+                    .delete_object(
+                        &bucket,
+                        object,
+                        ObjectOptions {
+                            version_suspended: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("suspended delete must create a null marker");
+                assert!(info.delete_marker);
+                assert_eq!(info.version_id.unwrap_or_default(), uuid::Uuid::nil());
+            }
+            let latest = if !newer {
+                null.clone()
+            } else if latest_marker {
+                put_delete_marker(&ecstore, &bucket, object).await
+            } else {
+                put_versioned(&ecstore, &bucket, object, &versioned_test_data(12)).await
+            };
+            let mut expected = vec![old, null.clone()];
+            if newer {
+                expected.push(latest.clone());
+            }
+            let originals: Vec<_> = expected
+                .iter()
+                .map(|version| physical_version(&disks[0], &bucket, object, version))
+                .collect();
+            assert_eq!(originals[1].deleted, null_marker);
+            assert_eq!(originals[1].is_latest, !newer);
+            let listed = enumerate_all_versions(&storage, &bucket).await;
+            let (walked, _, truncated) = storage
+                .list_versions_for_heal_page_disk_walk(SET_DISK_ID, &bucket, "", None, false)
+                .await
+                .expect("disk walk must enumerate null and UUID versions");
+            assert!(!truncated);
+            for items in [&listed, &walked] {
+                assert_eq!(items.len(), expected.len());
+                for version in &expected {
+                    assert_eq!(
+                        items
+                            .iter()
+                            .filter(|item| item.version_id.as_deref() == Some(version.as_str()))
+                            .count(),
+                        1
+                    );
+                }
+                let item = items
+                    .iter()
+                    .find(|item| item.version_id.as_deref() == Some(null.as_str()))
+                    .expect("exact null entry");
+                assert_eq!(item.is_delete_marker, null_marker);
+            }
+            std::fs::remove_file(xl_meta_path(&object_dir(&disks[0], &bucket, object))).expect("remove one member's metadata");
+            let options = HealOpts {
+                scan_mode: HealScanMode::Deep,
+                pool: Some(0),
+                set: Some(0),
+                ..Default::default()
+            };
+            for item in listed {
+                let healed = storage
+                    .heal_object_with_receipt(&bucket, object, item.version_id.as_deref(), &options)
+                    .await
+                    .expect("heal exact version");
+                assert!(healed.error.is_none(), "exact version repair failed: {:?}", healed.error);
+                if item.is_delete_marker {
+                    assert!(!healed.item.integrity_verified);
+                    assert!(healed.receipt.is_none(), "delete markers carry no shard-integrity proof");
+                } else {
+                    assert!(healed.item.integrity_verified);
+                    let receipt = healed
+                        .receipt
+                        .expect("verified exact data version repair must produce a receipt");
+                    assert_eq!(receipt.identity.version_id, item.version_id);
+                }
+                assert_eq!(
+                    healed.item.resolved_version_id,
+                    Some(
+                        *uuid::Uuid::parse_str(item.version_id.as_deref().expect("exact selector"))
+                            .expect("UUID selector")
+                            .as_bytes()
+                    )
+                );
+            }
+            for (version, original) in expected.iter().zip(originals) {
+                let repaired = physical_version(&disks[0], &bucket, object, version);
+                assert_eq!(repaired.version_id, original.version_id);
+                assert_eq!(repaired.deleted, original.deleted);
+                assert_eq!(repaired.data_dir, original.data_dir);
+                assert_eq!(repaired.size, original.size);
+            }
+            let latest_result = storage
+                .heal_object_with_receipt(&bucket, object, None, &options)
+                .await
+                .expect("heal latest");
+            assert!(latest_result.error.is_none());
+            assert_eq!(
+                latest_result.item.resolved_version_id,
+                Some(*uuid::Uuid::parse_str(&latest).expect("latest UUID").as_bytes())
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_historical_null_recursive_heal_restores_physical_versions() {
+        use rustfs_heal::heal::outcome::HealObjectDisposition;
+        let (disk_paths, ecstore, storage) = heal_env().await;
+        let manager = HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                heal_interval: Duration::from_millis(1),
+                ..Default::default()
+            }),
+        );
+        manager.start().await.expect("heal manager should start");
+        let null = uuid::Uuid::nil().to_string();
+        let object = "versions/object.bin";
+
+        for (parity, missing_metadata) in [(false, false), (true, false), (false, true), (true, true)] {
+            let bucket = format!("historical-null-{parity}-{missing_metadata}");
+            create_versioned_bucket(&ecstore, &bucket).await;
+            let mut versions = Vec::new();
+            for seed in 1..=3 {
+                let data = versioned_test_data(seed);
+                let version = put_versioned(&ecstore, &bucket, object, &data).await;
+                versions.push((version, data));
+            }
+            // Exercise the suspended null slot, including an overwrite, before
+            // a new versioned write makes that slot historical.
+            put_unversioned(&ecstore, &bucket, object, &versioned_test_data(4)).await;
+            let null_data = versioned_test_data(5);
+            put_unversioned(&ecstore, &bucket, object, &null_data).await;
+            versions.push((null.clone(), null_data.clone()));
+            let mut latest_data = versioned_test_data(6);
+            latest_data.extend_from_slice(b"new-uuid");
+            let latest = put_versioned(&ecstore, &bucket, object, &latest_data).await;
+            versions.push((latest, latest_data.clone()));
+
+            let target = disk_paths
+                .iter()
+                .find(|disk| {
+                    let info = physical_version(disk, &bucket, object, &null);
+                    assert!(!info.is_latest, "the damaged null must be historical");
+                    info.erasure.index == if parity { info.erasure.data_blocks + 1 } else { 1 }
+                })
+                .expect("the requested data/parity member must exist");
+            let originals: Vec<_> = versions
+                .iter()
+                .map(|(version, _)| {
+                    let info = physical_version(target, &bucket, object, version);
+                    let part = object_dir(target, &bucket, object)
+                        .join(info.data_dir.expect("data version must have a data directory").to_string())
+                        .join("part.1");
+                    let bytes = std::fs::read(&part).expect("original physical shard must exist");
+                    (info, part, bytes)
+                })
+                .collect();
+            if missing_metadata {
+                std::fs::remove_file(xl_meta_path(&object_dir(target, &bucket, object))).expect("remove one xl.meta");
+            } else {
+                std::fs::remove_file(&originals[3].1).expect("remove only the historical null shard");
+            }
+
+            let request = HealRequest::new(
+                HealType::Bucket { bucket: bucket.clone() },
+                HealOptions {
+                    recursive: true,
+                    scan_mode: HealScanMode::Deep,
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            );
+            let task_id = request.id.clone();
+            assert!(
+                manager
+                    .submit_heal_request(request)
+                    .await
+                    .expect("submit recursive heal")
+                    .is_admitted()
+            );
+            wait_for_task(&manager, &task_id, Duration::from_secs(60)).await;
+
+            // Inspect physical repair before any GET can trigger read repair.
+            for ((version, _), (original, part, bytes)) in versions.iter().zip(&originals) {
+                assert_eq!(std::fs::read(part).expect("heal must restore every physical shard"), *bytes);
+                let repaired = physical_version(target, &bucket, object, version);
+                assert_eq!(repaired.version_id, original.version_id);
+                assert_eq!(repaired.data_dir, original.data_dir);
+                assert_eq!(repaired.size, original.size);
+            }
+            let report = manager.get_task_report(&task_id).await.expect("completed task report");
+            let outcome = report.outcome.expect("recursive task must have an outcome");
+            assert_eq!(outcome.counters.processed, 5);
+            assert_eq!(outcome.counters.failed, 0);
+            assert_eq!(outcome.counters.unknown, 0);
+            assert_eq!(outcome.counters.healed, if missing_metadata { 5 } else { 1 });
+            let null_outcome = outcome
+                .objects
+                .iter()
+                .find(|item| item.identity.version_id.as_deref() == Some(null.as_str()))
+                .expect("historical null must have its own exact receipt");
+            assert_eq!(null_outcome.disposition, HealObjectDisposition::Repaired);
+            let null_item = report
+                .result_items
+                .iter()
+                .find(|item| item.version_id == null)
+                .expect("historical null must have its own result item");
+            assert_eq!(null_item.object_size, null_data.len(), "null must not report the latest UUID's size");
+
+            let listed = enumerate_all_versions(&storage, &bucket).await;
+            assert_eq!(listed.len(), 5);
+            assert!(listed.iter().any(|item| item.version_id.as_deref() == Some(null.as_str())));
+            let latest_result = storage
+                .heal_object_with_receipt(&bucket, object, None, &HealOpts::default())
+                .await
+                .expect("an omitted selector must still heal latest");
+            assert!(latest_result.error.is_none());
+            assert_eq!(latest_result.item.object_size, latest_data.len());
+            assert!(latest_result.receipt.is_none(), "a normal scan cannot certify payload integrity");
+            let verified_latest = storage
+                .heal_object_with_receipt(
+                    &bucket,
+                    object,
+                    None,
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("deep heal of latest");
+            assert!(verified_latest.error.is_none());
+            assert_eq!(verified_latest.item.object_size, latest_data.len());
+            assert!(verified_latest.receipt.is_some(), "a deep scan can certify the exact latest version");
+            for (version, data) in &versions {
+                assert_eq!(&read_version(&ecstore, &bucket, object, version).await, data);
+            }
+        }
+        manager.stop().await.expect("heal manager should stop");
+    }
 
     /// Directly exercises `ECStoreHealStorage::list_objects_for_heal_page` on a
     /// real versioned fixture: two data versions + a delete-marker-latest. Proves
@@ -416,8 +706,7 @@ mod serial_tests {
         );
     }
 
-    /// Unversioned objects normalize to `version_id == None` and enumerate once
-    /// each (never a phantom `Some("null")`).
+    /// Enumerated unversioned objects select the exact null slot once each.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_version_id_normalization_null_and_unversioned_real_fixture() {
@@ -434,21 +723,14 @@ mod serial_tests {
         let items = enumerate_all_versions(&heal_storage, bucket).await;
         assert_eq!(items.len(), 2, "unversioned bucket => exactly one heal unit per object, got {items:?}");
         assert!(
-            items.iter().all(|it| it.version_id.is_none()),
-            "unversioned objects must normalize to version_id == None, never Some(\"null\"): {items:?}"
+            items
+                .iter()
+                .all(|it| it.version_id.as_deref() == Some(uuid::Uuid::nil().to_string().as_str())),
+            "enumerated null versions must retain an exact selector: {items:?}"
         );
         assert!(items.iter().all(|it| !it.is_delete_marker), "no delete markers expected");
         let names: std::collections::HashSet<&str> = items.iter().map(|it| it.name.as_str()).collect();
         assert!(names.contains("a.bin") && names.contains("b.bin"), "both objects enumerated once");
-
-        // NOTE: A literal MinIO-interop "null" *string* version id is only minted
-        // by the S3 request layer (versioning-suspended writes); it cannot be
-        // constructed through the internal ECStore put path used here (suspended/
-        // unversioned writes store no version id at all -> None). The nil-UUID ->
-        // None normalization itself is unit-covered in B5-1
-        // (crates/heal storage list_objects_for_heal_page maps
-        // `version_id.filter(|u| !u.is_nil())`). This test covers the real
-        // unversioned-object => None path end-to-end.
     }
 
     /// Unversioned bucket, full heal path via `HealManager` (recursive bucket
@@ -479,7 +761,11 @@ mod serial_tests {
         // Enumeration returns exactly one unit per object (no duplicates).
         let items = enumerate_all_versions(&heal_storage, bucket).await;
         assert_eq!(items.len(), objects.len(), "one heal unit per object");
-        assert!(items.iter().all(|it| it.version_id.is_none()));
+        assert!(
+            items
+                .iter()
+                .all(|it| it.version_id.as_deref() == Some(uuid::Uuid::nil().to_string().as_str()))
+        );
 
         // Drive the real recursive bucket heal through the HealManager task loop.
         let cfg = HealConfig {

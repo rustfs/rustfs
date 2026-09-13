@@ -56,6 +56,7 @@ pub(crate) struct StripeReadState {
     shards: ShardBuffers,
     errors: ShardErrors,
     read_quorum: usize,
+    pub(crate) integrity: Option<crate::io_support::shard_integrity::ReconstructionProof>,
 }
 
 impl StripeReadState {
@@ -70,6 +71,7 @@ impl StripeReadState {
             shards,
             errors,
             read_quorum,
+            integrity: None,
         }
     }
 
@@ -78,6 +80,7 @@ impl StripeReadState {
             shards: SmallVec::new(),
             errors: SmallVec::new(),
             read_quorum,
+            integrity: None,
         };
         state.reset(slot_count, read_quorum);
         state
@@ -89,6 +92,7 @@ impl StripeReadState {
         self.errors.clear();
         self.errors.resize_with(slot_count, || None);
         self.read_quorum = read_quorum;
+        self.integrity = None;
     }
 
     pub(crate) fn available_shards(&self) -> usize {
@@ -122,6 +126,13 @@ impl StripeReadState {
 
     pub(crate) fn shards_mut(&mut self) -> &mut ShardBuffers {
         &mut self.shards
+    }
+
+    pub(crate) fn verify_reconstructed_integrity(&self) -> std::io::Result<()> {
+        if let Some(proof) = &self.integrity {
+            proof.verify(&self.shards)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn into_parts(self) -> (ShardBuffers, ShardErrors) {

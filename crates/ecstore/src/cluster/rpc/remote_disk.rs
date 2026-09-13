@@ -844,6 +844,44 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn rename_file_with_durability(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        durable: bool,
+    ) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(RenameFileRequest {
+                    durable,
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+
+                let response = client.rename_file(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                if durable && !response.durability_applied {
+                    return Err(DiskError::MethodNotAllowed);
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
@@ -2084,6 +2122,9 @@ impl RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(dst_volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2096,7 +2137,8 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2104,7 +2146,13 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
                 }
 
-                let response = client.rename_data(request).await?.into_inner();
+                let response = if incarnation_bound {
+                    // Older peers return Unimplemented before mutation; never downgrade.
+                    client.rename_data_at_incarnation(request).await?
+                } else {
+                    client.rename_data(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2154,6 +2202,9 @@ impl RemoteDisk {
                 let options = serde_json::to_string(&opt)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2163,7 +2214,7 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                if scanner_publication_lease_token.is_some() || !request.get_ref().bucket_incarnation_id.is_empty() {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("delete request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2171,7 +2222,12 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
                 }
 
-                let response = client.delete(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    client.delete(request).await?
+                } else {
+                    client.delete_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2466,11 +2522,15 @@ impl DiskAPI for RemoteDisk {
                 // JSON + msgpack until its fallback counter has read zero across a release window.
                 let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let opts_bin = encode_msgpack(&opts)?;
+                let conditional_marker = opts.expected_delete_marker.is_some();
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteVersionRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2481,9 +2541,24 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if incarnation_bound {
+                    let body = canonical_body.map_err(|_| Error::other("delete-version body length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                }
 
-                let response = client.delete_version(request).await?.into_inner();
+                // The marker-specific method rejects older peers; its body digest
+                // also binds any incarnation, so neither precondition can be lost.
+                let response = if conditional_marker {
+                    client.delete_retired_marker(request).await?
+                } else if incarnation_bound {
+                    client.delete_version_at_incarnation(request).await?
+                } else {
+                    client.delete_version(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2751,6 +2826,9 @@ impl DiskAPI for RemoteDisk {
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(WriteMetadataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2758,9 +2836,15 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
-
-                let response = client.write_metadata(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
+                    client.write_metadata(request).await?
+                } else {
+                    let body = canonical_body.map_err(|_| Error::other("write metadata request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                    client.write_metadata_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -3401,30 +3485,13 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(RenameFileRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                });
-                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, false)
+            .await
+    }
 
-                let response = client.rename_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, true)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -3885,6 +3952,49 @@ mod tests {
                 send_site.json_encoder
             );
         }
+    }
+
+    #[test]
+    fn retired_marker_options_preserve_legacy_positional_wire_shape() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct LegacyDeleteOptions {
+            recursive: bool,
+            immediate: bool,
+            undo_write: bool,
+            undo_delete: bool,
+            old_data_dir: Option<Uuid>,
+        }
+        let legacy = LegacyDeleteOptions {
+            recursive: false,
+            immediate: false,
+            undo_write: false,
+            undo_delete: false,
+            old_data_dir: None,
+        };
+        let original = encode_msgpack(&legacy).unwrap();
+        let current = encode_msgpack(&DeleteOptions::default()).unwrap();
+        assert_eq!(current, original, "ordinary deletes must retain the older peer's positional payload");
+        assert_eq!(rmp_serde::from_slice::<LegacyDeleteOptions>(&current).unwrap(), legacy);
+        assert!(
+            rmp_serde::from_slice::<DeleteOptions>(&original)
+                .unwrap()
+                .expected_delete_marker
+                .is_none()
+        );
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(::time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        let marker = rustfs_filemeta::MetaDeleteMarker::from(marker);
+        let options = DeleteOptions {
+            expected_delete_marker: Some(marker.clone()),
+            ..Default::default()
+        };
+        let decoded: DeleteOptions = rmp_serde::from_slice(&encode_msgpack(&options).unwrap()).unwrap();
+        assert_eq!(decoded.expected_delete_marker, Some(marker));
     }
 
     #[test]
