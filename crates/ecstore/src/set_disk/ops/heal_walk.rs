@@ -45,12 +45,12 @@ const BACKGROUND_WALKDIR_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// `is_delete_marker` is OBSERVABILITY-ONLY (metrics / logging / e2e assertions);
 /// it must not gate healing logic — the delete-marker vs data path is chosen
 /// inside `ops/heal.rs` from the resolved latest metadata. `version_id` is
-/// normalized (nil/absent UUID => `None`).
+/// exact: an enumerated nil/absent UUID selects the null slot, never latest.
 #[derive(Debug, Clone)]
 pub struct HealWalkVersion {
     /// object key
     pub name: String,
-    /// normalized version id (`None` when the version is nil/absent)
+    /// Exact version id, including the nil UUID for the null slot.
     pub version_id: Option<String>,
     /// version modification time as Unix nanoseconds
     pub mod_time_unix_nanos: Option<i128>,
@@ -136,8 +136,7 @@ impl HealWalkCollector {
             };
             versions.push(HealWalkVersion {
                 name: entry.name.clone(),
-                // Normalize: nil/absent version id => None.
-                version_id: version_uuid.map(|u| u.to_string()),
+                version_id: Some(fi.version_id.unwrap_or_default().to_string()),
                 mod_time_unix_nanos: fi.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos()),
                 lifecycle_object_info,
                 is_delete_marker: fi.deleted,
@@ -194,7 +193,7 @@ impl HealWalkCollector {
             };
             for fi in fiv.versions.iter().chain(fiv.free_versions.iter()) {
                 let version_uuid = fi.version_id.filter(|version_id| !version_id.is_nil());
-                let vid = version_uuid.map(|u| u.to_string());
+                let vid = Some(fi.version_id.unwrap_or_default().to_string());
                 if seen.insert(vid.clone()) {
                     let lifecycle_object_info = if self.include_lifecycle_object_info {
                         Some(ObjectInfo::from_file_info_with_version_id(fi, &self.bucket, &entry.name, version_uuid))
@@ -384,6 +383,58 @@ mod tests {
             truncated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn collectors_preserve_historical_null_identity() {
+        use rustfs_filemeta::FileInfo;
+        let latest = Uuid::from_u128(7);
+        for null_marker in [false, true] {
+            let mut metadata = FileMeta::new();
+            for (version, seconds, deleted) in [(Uuid::nil(), 1, null_marker), (latest, 2, false)] {
+                // Delete markers have no erasure payload geometry.
+                let mut info = if deleted {
+                    FileInfo::default()
+                } else {
+                    FileInfo::new("object", 4, 2)
+                };
+                info.name = "object".to_string();
+                info.volume = "bucket".to_string();
+                info.version_id = Some(version);
+                info.versioned = true;
+                info.deleted = deleted;
+                info.size = if deleted { 0 } else { 100 };
+                info.mod_time = Some(OffsetDateTime::from_unix_timestamp(seconds).expect("fixture timestamp"));
+                metadata.add_version(info).expect("fixture version should be valid");
+            }
+            let entry = MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: metadata.marshal_msg().expect("fixture metadata should serialize"),
+                ..Default::default()
+            };
+            for merged in [false, true] {
+                let collector = test_collector();
+                if merged {
+                    collector.ingest_merged(&MetaCacheEntries(vec![Some(entry.clone()), Some(entry.clone())]));
+                } else {
+                    collector.ingest(entry.clone());
+                }
+                let objects = collector.lock_objects().expect("collector should remain readable");
+                assert_eq!(objects.len(), 1);
+                let versions = &objects[0].versions;
+                assert_eq!(versions.len(), 2, "one exact unit per version, including merged duplicates");
+                let null = versions
+                    .iter()
+                    .find(|item| item.version_id.as_deref() == Some(Uuid::nil().to_string().as_str()))
+                    .expect("historical null must remain an explicit selector");
+                assert_eq!(null.is_delete_marker, null_marker);
+                assert!(
+                    versions
+                        .iter()
+                        .any(|item| item.version_id.as_deref() == Some(latest.to_string().as_str()))
+                );
+            }
+        }
     }
 
     fn crc_valid_semantically_corrupt_entry(name: &str) -> MetaCacheEntry {

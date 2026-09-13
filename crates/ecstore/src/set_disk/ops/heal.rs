@@ -905,6 +905,7 @@ impl SetDisks {
 
                         result.object_size =
                             ObjectInfo::from_file_info(&latest_meta, bucket, object, true).get_actual_size()? as usize;
+                        result.resolved_version_id = Some(*latest_meta.version_id.unwrap_or_default().as_bytes());
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
