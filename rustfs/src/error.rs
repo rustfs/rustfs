@@ -112,6 +112,14 @@ fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
     }
 }
 
+pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
+    ApiError {
+        code: S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()),
+        message: SLOW_DOWN_READ_MESSAGE.to_string(),
+        source: Some(Box::new(err)),
+    }
+}
+
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
 /// This marker must survive the body-reader and storage layers so the client
@@ -1217,6 +1225,14 @@ mod tests {
         let s3_error = S3Error::from(ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("down"))));
 
         assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn test_slow_down_read_api_error_maps_to_retryable_status() {
+        let api_error = slow_down_read_api_error(StorageError::PartMissingOrCorrupt);
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+        assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]
