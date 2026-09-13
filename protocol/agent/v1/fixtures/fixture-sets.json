@@ -39,6 +39,16 @@
       "purpose": "Bounded performance.object@1 result acceptance and rejection vectors."
     },
     {
+      "name": "network-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.network@1 aggregate results, peer attribution, unit semantics, and budget rejection vectors."
+    },
+    {
+      "name": "diagnostic-scheduler",
+      "status": "populated",
+      "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and local execution receipts."
+    },
+    {
       "name": "offline-enrollment",
       "status": "populated",
       "purpose": "Air-gapped device enrolment and signed artifact exchange without a certificate."
@@ -46,7 +56,7 @@
     {
       "name": "bundle",
       "status": "populated",
-      "purpose": "Support bundle manifests, upload authorization, and archive validation."
+      "purpose": "Support bundle manifests, upload authorization, archive validation, and signed typed offline diagnostic imports."
     },
     {
       "name": "redaction",
