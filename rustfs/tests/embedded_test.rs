@@ -21,7 +21,7 @@
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
+use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectAttributes, ObjectIdentifier, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 
@@ -246,6 +246,194 @@ async fn test_null_version_delete_marker_round_trip_body() {
         .expect("list versions after cleanup");
     assert!(after.versions().is_empty() && after.delete_markers().is_empty());
     client.delete_bucket().bucket(bucket).send().await.expect("delete bucket");
+
+    server.shutdown().await;
+}
+
+async fn assert_read_version(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    selector: Option<&str>,
+    expected_version: Option<&str>,
+    expected_body: &[u8],
+) {
+    let get = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(selector.map(str::to_owned))
+        .send()
+        .await
+        .expect("get selected version");
+    assert_eq!(get.version_id(), expected_version, "GET identity for selector {selector:?}");
+    assert_eq!(get.content_length(), Some(expected_body.len() as i64));
+    let etag = get.e_tag().expect("GET ETag").to_owned();
+    assert_eq!(get.body.collect().await.expect("read selected body").into_bytes().as_ref(), expected_body);
+
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(selector.map(str::to_owned))
+        .send()
+        .await
+        .expect("head selected version");
+    assert_eq!(head.version_id(), expected_version, "HEAD identity for selector {selector:?}");
+    assert_eq!(head.content_length(), Some(expected_body.len() as i64));
+    assert_eq!(head.e_tag(), Some(etag.as_str()));
+
+    let attributes = client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(selector.map(str::to_owned))
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .send()
+        .await
+        .expect("get selected version attributes");
+    assert_eq!(attributes.version_id(), expected_version, "Attributes identity for selector {selector:?}");
+    assert_eq!(attributes.object_size(), Some(expected_body.len() as i64));
+}
+
+#[test]
+fn test_read_version_headers_across_versioning_states() {
+    common::run_embedded_test(test_read_version_headers_across_versioning_states_body);
+}
+
+async fn test_read_version_headers_across_versioning_states_body() {
+    let port = find_available_port().expect("find free port");
+    let server = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port}"))
+        .access_key("testaccesskey")
+        .secret_key("testsecretkey")
+        .build()
+        .await
+        .expect("start embedded server");
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let bucket = "read-version-headers";
+    let key = "history.txt";
+    client.create_bucket().bucket(bucket).send().await.expect("create bucket");
+
+    let unversioned = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"before-versioning"))
+        .send()
+        .await
+        .expect("put unversioned object");
+    assert_eq!(unversioned.version_id(), None);
+    for selector in [None, Some("null")] {
+        assert_read_version(&client, bucket, key, selector, None, b"before-versioning").await;
+    }
+
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+    for selector in [None, Some("null")] {
+        assert_read_version(&client, bucket, key, selector, Some("null"), b"before-versioning").await;
+    }
+
+    let mut history = Vec::new();
+    for body in [b"enabled-one".as_slice(), b"enabled-second".as_slice()] {
+        let put = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("put enabled version");
+        let version = put.version_id().expect("enabled PUT version").to_owned();
+        assert!(!uuid::Uuid::parse_str(&version).expect("version UUID").is_nil());
+        assert_read_version(&client, bucket, key, None, Some(&version), body).await;
+        history.push((version, body));
+    }
+
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("suspend versioning");
+    for (version, body) in &history {
+        assert_read_version(&client, bucket, key, Some(version), Some(version), body).await;
+    }
+    let (latest_version, latest_body) = history.last().expect("latest UUID version");
+    assert_read_version(&client, bucket, key, None, Some(latest_version), latest_body).await;
+    assert_read_version(&client, bucket, key, Some("null"), Some("null"), b"before-versioning").await;
+
+    for body in [b"null-one".as_slice(), b"null-overwritten".as_slice()] {
+        let put = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("put suspended null version");
+        // S3 omits the null identity on PUT, but returns it on subsequent reads.
+        assert_eq!(put.version_id(), None, "suspended PUT keeps its write response contract");
+        for selector in [None, Some("null")] {
+            assert_read_version(&client, bucket, key, selector, Some("null"), body).await;
+        }
+    }
+
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("re-enable versioning");
+    let enabled_again = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"enabled-again"))
+        .send()
+        .await
+        .expect("put after re-enabling");
+    let current = enabled_again.version_id().expect("re-enabled PUT version");
+    assert_read_version(&client, bucket, key, None, Some(current), b"enabled-again").await;
+    assert_read_version(&client, bucket, key, Some("null"), Some("null"), b"null-overwritten").await;
+    for (version, body) in &history {
+        assert_read_version(&client, bucket, key, Some(version), Some(version), body).await;
+    }
+    let listed = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix(key)
+        .send()
+        .await
+        .expect("list history");
+    let mut versions: Vec<_> = listed
+        .versions()
+        .iter()
+        .map(|version| version.version_id().expect("listed identity"))
+        .collect();
+    versions.sort_unstable();
+    let mut expected = vec!["null", history[0].0.as_str(), history[1].0.as_str(), current];
+    expected.sort_unstable();
+    assert_eq!(versions, expected, "one null slot and all UUID versions must remain");
 
     server.shutdown().await;
 }
