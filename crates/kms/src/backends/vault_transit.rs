@@ -22,7 +22,7 @@ use crate::backends::vault_credentials::{
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
     classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_rewrap_context_matches,
-    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
+    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key, validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
@@ -491,6 +491,7 @@ impl VaultTransitKmsClient {
     }
 
     async fn read_transit_key(&self, key_id: &str) -> Result<vaultrs::api::transit::responses::ReadKeyResponse> {
+        validate_key_id_segment(key_id)?;
         self.run("vault_transit_read_key", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             key::read(&vault.client, &self.config.mount_path, key_id)
@@ -501,6 +502,7 @@ impl VaultTransitKmsClient {
     }
 
     async fn create_transit_key(&self, key_id: &str) -> Result<()> {
+        validate_key_id_segment(key_id)?;
         // Single attempt: create carries external side effects and the caller
         // owns the read-confirm recovery for lost responses.
         self.run("vault_transit_create_key", OpClass::MutatingNonIdempotent, move || async move {
@@ -524,6 +526,7 @@ impl VaultTransitKmsClient {
         plaintext: &[u8],
         encryption_context: &HashMap<String, String>,
     ) -> Result<String> {
+        validate_key_id_segment(key_id)?;
         let plaintext_b64 = BASE64.encode_to_string(plaintext);
         let plaintext_b64 = plaintext_b64.as_str();
         let aad = Self::canonicalize_context(encryption_context)?;
@@ -551,6 +554,7 @@ impl VaultTransitKmsClient {
         ciphertext: &str,
         encryption_context: &HashMap<String, String>,
     ) -> Result<Vec<u8>> {
+        validate_key_id_segment(key_id)?;
         let aad = Self::canonicalize_context(encryption_context)?;
         let aad = aad.as_deref();
 
@@ -579,6 +583,7 @@ impl VaultTransitKmsClient {
     /// nothing, and a replayed attempt only produces another ciphertext of the
     /// same data key under the same version.
     async fn transit_rewrap(&self, key_id: &str, ciphertext: &str) -> Result<String> {
+        validate_key_id_segment(key_id)?;
         let response = self
             .run("vault_transit_rewrap", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
@@ -613,12 +618,16 @@ impl VaultTransitKmsClient {
         Ok(latest)
     }
 
-    fn metadata_key_path(&self, key_id: &str) -> String {
-        format!("{}/{}", self.metadata_key_prefix, key_id)
+    /// KV2 path of a key's metadata record. Refuses identifiers that are not a
+    /// single path segment so the join cannot leave `metadata_key_prefix`; the
+    /// transit calls apply the same rule before naming the key to Vault.
+    fn metadata_key_path(&self, key_id: &str) -> Result<String> {
+        validate_key_id_segment(key_id)?;
+        Ok(format!("{}/{}", self.metadata_key_prefix, key_id))
     }
 
     async fn read_metadata_from_kv(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
-        let path = self.metadata_key_path(key_id);
+        let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
         self.run("vault_transit_read_metadata", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
@@ -643,7 +652,7 @@ impl VaultTransitKmsClient {
     /// holding it, so a later write can be check-and-set against exactly this
     /// snapshot. `None` means no record exists (a pre-persistence key).
     async fn read_metadata_from_kv_versioned(&self, key_id: &str) -> Result<Option<(u32, TransitKeyMetadata)>> {
-        let path = self.metadata_key_path(key_id);
+        let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
 
         let kv_metadata = self
@@ -693,7 +702,7 @@ impl VaultTransitKmsClient {
     /// double-apply the mutation, and a CAS conflict is a normal concurrency
     /// signal, not a backend failure.
     async fn cas_write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata, cas: u32) -> Result<bool> {
-        let path = self.metadata_key_path(key_id);
+        let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
         let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
         let persisted = &persisted;
@@ -721,7 +730,7 @@ impl VaultTransitKmsClient {
     }
 
     async fn delete_metadata_from_kv(&self, key_id: &str) -> Result<()> {
-        let path = self.metadata_key_path(key_id);
+        let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
         self.run("vault_transit_delete_metadata", OpClass::MutatingNonIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
@@ -740,6 +749,7 @@ impl VaultTransitKmsClient {
 
     /// Flip `deletion_allowed` on the transit key so it can be deleted.
     async fn allow_transit_key_deletion(&self, key_id: &str) -> Result<()> {
+        validate_key_id_segment(key_id)?;
         self.run("vault_transit_allow_deletion", OpClass::MutatingNonIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             let mut builder = UpdateKeyConfigurationRequestBuilder::default();
@@ -758,6 +768,7 @@ impl VaultTransitKmsClient {
 
     /// Physically delete the transit key material in Vault.
     async fn delete_transit_key(&self, key_id: &str) -> Result<()> {
+        validate_key_id_segment(key_id)?;
         self.run("vault_transit_delete_key", OpClass::MutatingNonIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             key::delete(&vault.client, &self.config.mount_path, key_id)
@@ -1452,6 +1463,7 @@ impl VaultTransitKmsClient {
     }
 
     pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+        validate_key_id_segment(key_id)?;
         self.ensure_key_state_allows(key_id, StateGatedOperation::Rotate).await?;
 
         // Single attempt, never retried: replaying a rotate whose response was
@@ -2034,6 +2046,40 @@ mod tests {
     /// A caller asking for no keys gets an empty page, and the page arithmetic
     /// never reaches for the element before an empty page. The scripted key
     /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    /// The identifier names both the transit key (`transit/keys/<id>`) and its
+    /// KV2 metadata record, so a non-segment id is refused before either path
+    /// is formed and no request reaches Vault.
+    #[tokio::test]
+    async fn transit_operations_refuse_key_ids_that_leave_the_key_prefix() {
+        let (vault, client) = scripted_client(vec![]).await;
+
+        for key_id in ["bad/name", "../escape", "..", ".", "", "back\\slash", "nul\0byte"] {
+            let err = client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect_err("create must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "create {key_id:?}: {err:?}");
+
+            let err = client
+                .describe_key(key_id, None)
+                .await
+                .expect_err("describe must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "describe {key_id:?}: {err:?}");
+
+            let err = client
+                .transit_encrypt(key_id, b"plaintext", &HashMap::new())
+                .await
+                .expect_err("encrypt must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "encrypt {key_id:?}: {err:?}");
+        }
+
+        assert!(
+            vault.requests().is_empty(),
+            "a refused key id must never reach Vault: {:?}",
+            vault.requests()
+        );
+    }
+
     #[tokio::test]
     async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
         let (vault, client) =

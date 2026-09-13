@@ -19,7 +19,7 @@ The wire prefix is `/rustfs/admin/v3`. `GET /kms/status` and `GET /kms/service-s
 | `GET /kms/service-status` | `kms:ServiceControl` | sensitive | no | Carries `cluster_config` fingerprints and the `consistent` flag |
 | `GET /kms/config` | `kms:Configure` | sensitive | no | Contains operational paths; redact before display |
 | `POST /kms/clear-cache` | `kms:ClearCache` | high | no | `KmsClearCacheResponse` (`{status,message}`) |
-| `POST /kms/keys` | `kms:Configure` | high | no | Key creation shares the configure action |
+| `POST /kms/keys` | `kms:Configure` | high | no | Key creation shares the configure action. On the Local, Vault KV2 and Vault Transit backends the name must be a single path segment: empty names, names containing `/`, `\\` or NUL, and the dot segments `.` and `..` are refused with `400` before any backend request; the AWS backend takes ARNs and aliases and does not apply this rule |
 | `GET /kms/keys` | `kms:ListKeys` | sensitive | no | See the key listing contract below |
 | `GET /kms/keys/{key_id}` | `kms:DescribeKey` | sensitive | yes | `?impact=true` opts into the configuration-reference report |
 | `DELETE /kms/keys/delete` | `kms:DeleteKey` | critical | yes | JSON body; `force_immediate` also requires `confirm_key_id` and the server-side `RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION` gate |
