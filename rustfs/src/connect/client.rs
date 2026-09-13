@@ -657,9 +657,12 @@ pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configure
         {
             return Some(TransportFailure::TlsPeer);
         }
+        if proxy_configured && message.contains("unsuccessful tunnel") {
+            return Some(TransportFailure::ProxyRejected);
+        }
         source = error.source();
     }
-    proxy_configured.then_some(TransportFailure::ProxyRejected)
+    None
 }
 
 impl From<TransportFailure> for ClientError {
