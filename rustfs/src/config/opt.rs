@@ -144,7 +144,8 @@ impl Opt {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
                 ConnectCommands::Performance(opts) => match opts.command {
-                    ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(opts)),
+                    ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(*opts)),
+                    ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
                 },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
                 ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),

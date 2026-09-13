@@ -14,9 +14,10 @@
 
 use crate::{
     config::{
-        CommandResult, Config, ConnectDrivePerformanceOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode,
-        ConnectLogsOpts, ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
-        ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
+        ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectProfileOpts,
+        ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
+        ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -136,6 +137,7 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
@@ -606,6 +608,137 @@ async fn finish_top_capture<T: serde::Serialize>(
     Ok(())
 }
 
+async fn execute_connect_client_performance(options: ConnectClientPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        ClientOperation, ClientOutcome, ClientPerformanceRequest, ClientProvenance, HttpClientProbe, IdentityStore,
+        LocalClientConsent, measure_client, read_protected_client_credential, save_signed_client_export, sign_client_export,
+        validate_client_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    validate_client_limits(duration, options.traffic_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?;
+    let access_key = read_protected_client_credential(&options.access_key_file).map_err(Error::other)?;
+    let secret_key = read_protected_client_credential(&options.secret_key_file).map_err(Error::other)?;
+    let session_token = options
+        .session_token_file
+        .as_deref()
+        .map(read_protected_client_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let root_ca = if let Some(path) = options.ca_file.as_deref() {
+        const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        std::fs::File::open(path)?
+            .take(MAX_ROOT_CA_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+        if bytes.len() > max_bytes {
+            return Err(Error::other("connect client root CA exceeds the 1048576-byte limit"));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let probe = HttpClientProbe::new(
+        &options.endpoint,
+        root_ca.as_deref(),
+        options.proxy.as_deref(),
+        access_key,
+        secret_key,
+        session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ClientPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalClientConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        operation: match options.operation {
+            ConnectClientPerformanceOperation::Get => ClientOperation::GetObject,
+            ConnectClientPerformanceOperation::Put => ClientOperation::PutObject,
+        },
+        traffic_bytes: options.traffic_bytes,
+        target_alias: options.target_alias,
+        provenance: ClientProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_client(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.client outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != ClientOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "client performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_client_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_client_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
 async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
     use crate::connect::{
         DriveOutcome, DrivePerformanceRequest, DriveProvenance, IdentityStore, LocalDriveConsent, measure_drive,
@@ -808,12 +941,12 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
 fn hash_current_executable() -> Result<String> {
     use sha2::{Digest as _, Sha256};
 
-    const MAX_EXECUTABLE_BYTES: u64 = 1_073_741_824;
+    const MAX_EXECUTABLE_BYTES: u64 = 2_147_483_648;
     let path = std::env::current_exe().map_err(Error::other)?;
     let mut file = std::fs::File::open(path).map_err(Error::other)?;
     let metadata = file.metadata().map_err(Error::other)?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
-        return Err(Error::other("current executable is outside the profile provenance limit"));
+        return Err(Error::other("current executable is outside the diagnostic provenance limit"));
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -825,14 +958,14 @@ fn hash_current_executable() -> Result<String> {
         }
         read_bytes = read_bytes
             .checked_add(u64::try_from(count).map_err(Error::other)?)
-            .ok_or_else(|| Error::other("current executable is outside the profile provenance limit"))?;
+            .ok_or_else(|| Error::other("current executable is outside the diagnostic provenance limit"))?;
         if read_bytes > MAX_EXECUTABLE_BYTES {
-            return Err(Error::other("current executable is outside the profile provenance limit"));
+            return Err(Error::other("current executable is outside the diagnostic provenance limit"));
         }
         hasher.update(&buffer[..count]);
     }
     if read_bytes != metadata.len() {
-        return Err(Error::other("current executable changed while hashing profile provenance"));
+        return Err(Error::other("current executable changed while hashing diagnostic provenance"));
     }
     Ok(hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower))
 }

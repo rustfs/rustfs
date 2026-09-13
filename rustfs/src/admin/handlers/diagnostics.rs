@@ -53,6 +53,7 @@ const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
 pub(crate) const CLIENT_DEVNULL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const CLIENT_DEVNULL_MAX_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const CLIENT_DEVNULL_MAX_CONCURRENCY: usize = 4;
+pub(crate) const CLIENT_DEVNULL_SOURCE_MAX_BYTES: u64 = 1024 * 1024;
 static CLIENT_DEVNULL_ADMISSION: Semaphore = Semaphore::const_new(CLIENT_DEVNULL_MAX_CONCURRENCY);
 
 /// Cap on how many locks a single `top/locks` response enumerates, matching the
@@ -123,6 +124,11 @@ pub fn register_diagnostics_route(r: &mut S3Router<AdminOperation>) -> std::io::
         Method::POST,
         format!("{ADMIN_PREFIX}/v3/speedtest/client/devnull").as_str(),
         AdminOperation(&SpeedtestClientDevnullHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/speedtest/client/devnull").as_str(),
+        AdminOperation(&SpeedtestClientSourceHandler {}),
     )?;
 
     Ok(())
@@ -940,6 +946,23 @@ impl Operation for SpeedtestHandler {
 /// number (mirrors MinIO's `ClientDevNull`).
 pub struct SpeedtestClientDevnullHandler {}
 
+/// `GET /v3/speedtest/client/devnull?bytes=N` — bounded generated download.
+pub struct SpeedtestClientSourceHandler {}
+
+fn client_source_bytes(uri: &Uri) -> S3Result<usize> {
+    let bytes = query_value(uri, "bytes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| s3_error!(InvalidRequest, "client speedtest requires a positive bytes parameter"))?;
+    if bytes == 0 || bytes > CLIENT_DEVNULL_SOURCE_MAX_BYTES {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "client speedtest download exceeds the {}-byte limit",
+            CLIENT_DEVNULL_SOURCE_MAX_BYTES
+        ));
+    }
+    usize::try_from(bytes).map_err(|_| s3_error!(EntityTooLarge, "client speedtest download exceeds platform limits"))
+}
+
 fn validate_client_devnull_content_length(headers: &HeaderMap) -> S3Result<()> {
     let Some(content_length) = headers.get(CONTENT_LENGTH) else {
         return Ok(());
@@ -1026,6 +1049,17 @@ impl Operation for SpeedtestClientDevnullHandler {
             duration_secs: Some(elapsed.as_secs_f64()),
         };
         json_response(StatusCode::OK, &response)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for SpeedtestClientSourceHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize(&req, AdminAction::HealthInfoAdminAction).await?;
+        let bytes = client_source_bytes(&req.uri)?;
+        let _permit = acquire_client_devnull_permit()?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(vec![0_u8; bytes]))))
     }
 }
 
@@ -1177,6 +1211,32 @@ mod tests {
             .expect("stream at the byte limit should succeed");
 
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn client_source_requires_a_bounded_positive_size() {
+        let valid = format!("/rustfs/admin/v3/speedtest/client/devnull?bytes={CLIENT_DEVNULL_SOURCE_MAX_BYTES}")
+            .parse::<Uri>()
+            .expect("valid URI");
+        assert_eq!(
+            client_source_bytes(&valid).expect("size at the limit should succeed"),
+            usize::try_from(CLIENT_DEVNULL_SOURCE_MAX_BYTES).expect("source limit fits usize")
+        );
+
+        for invalid in [
+            "/rustfs/admin/v3/speedtest/client/devnull",
+            "/rustfs/admin/v3/speedtest/client/devnull?bytes=0",
+            "/rustfs/admin/v3/speedtest/client/devnull?bytes=invalid",
+        ] {
+            let uri = invalid.parse::<Uri>().expect("valid URI");
+            assert!(client_source_bytes(&uri).is_err(), "{invalid} must fail");
+        }
+
+        let oversized = format!("/rustfs/admin/v3/speedtest/client/devnull?bytes={}", CLIENT_DEVNULL_SOURCE_MAX_BYTES + 1)
+            .parse::<Uri>()
+            .expect("valid URI");
+        let err = client_source_bytes(&oversized).expect_err("oversized source request must fail");
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod logs;
+mod perf_client;
 mod perf_drive;
 mod profile_cpu;
 mod profile_memory;
@@ -31,6 +32,13 @@ mod trace_replay;
 pub use logs::{
     CaptureMode, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent, LogCaptureError, LogCaptureRequest, LogProvenance,
     SavedLogExport, SignedLogExport, export_logs, save_signed_log_export,
+};
+pub use perf_client::{
+    CLIENT_CAPABILITY, CLIENT_SCHEMA_VERSION, ClientDiagnosticResult, ClientMeasurement, ClientOperation, ClientOutcome,
+    ClientPerformanceData, ClientPerformanceError, ClientPerformanceRequest, ClientProbe, ClientProbeError, ClientProbeFuture,
+    ClientProbeMeasurement, ClientProvenance, ClientReasonCode, ClientTargetParameters, ClientTargetReasonCode,
+    ClientTargetResult, ClientTargetUnits, HttpClientProbe, LocalClientConsent, SavedClientExport, SignedClientExport,
+    measure_client, read_protected_client_credential, save_signed_client_export, sign_client_export, validate_client_limits,
 };
 pub use perf_drive::{
     DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DriveDiagnosticResult, DriveMeasurement, DriveOutcome, DrivePerformanceData,

@@ -51,7 +51,9 @@ mod config_test;
 
 // Re-export public types
 pub use cli::{CommandResult, InfoOpts, InfoType};
-pub use cli::{ConnectDrivePerformanceOpts, ConnectPerformanceCommands};
+pub use cli::{
+    ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,
+};
 pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
 pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
