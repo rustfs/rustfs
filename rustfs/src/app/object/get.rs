@@ -3620,7 +3620,6 @@ impl DefaultObjectUsecase {
         queue_status: &concurrency::IoQueueStatus,
         concurrent_requests: usize,
         part_number: Option<usize>,
-        versioned: bool,
         lifecycle: GetObjectBodyLifecycle,
         resume: F,
     ) -> S3Result<GetObjectOutputContext>
@@ -3678,17 +3677,7 @@ impl DefaultObjectUsecase {
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
-        let output_version_id = if versioned {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let output_version_id = read_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
         let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
@@ -4181,7 +4170,6 @@ impl DefaultObjectUsecase {
                 &queue_status,
                 concurrent_requests,
                 part_number,
-                opts.versioned,
                 lifecycle,
                 |info| {
                     Some(get_object_resume_control(GetObjectResumeContext::new(
@@ -4426,17 +4414,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let version_id = read_response_version_id(info.version_id);
 
         let output = GetObjectAttributesOutput {
             checksum,
@@ -10639,7 +10617,6 @@ mod tests {
                 &queue_status,
                 1,
                 None,
-                false,
                 GetObjectBodyLifecycle::disabled(),
                 |_| panic!("a buffered output must not initialize streaming resume state"),
             )

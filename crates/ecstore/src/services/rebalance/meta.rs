@@ -1,3 +1,4 @@
+use super::worker::{rebalance_max_attempts, retry_rebalance_metadata_access};
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, Error, GetObjectReader, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
     ObjectInfo, ObjectOptions, PutObjReader, REBAL_META_FMT, REBAL_META_NAME, REBAL_META_VER,
@@ -100,7 +101,10 @@ impl RebalanceMeta {
                 PutObjectReader = PutObjReader,
             >,
     {
-        let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
+        let (data, _) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+            read_config_with_metadata(Arc::clone(&store), REBAL_META_NAME, &opts)
+        })
+        .await?;
         if data.is_empty() {
             debug!(
                 event = EVENT_REBALANCE_STATE,
