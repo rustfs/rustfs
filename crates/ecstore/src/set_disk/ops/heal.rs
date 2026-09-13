@@ -3340,6 +3340,372 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards() {
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use tokio::io::AsyncReadExt;
+
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-bitrot";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        let payload: Vec<u8> = (0..4113)
+            .map(|index| u8::try_from(index % 251).expect("payload byte"))
+            .collect();
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let object_options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for parity in [false, true] {
+            for corrupt_prefix in [false, true] {
+                let object = format!("parity-{parity}-prefix-{corrupt_prefix}.bin");
+                set.put_object(bucket, &object, &mut PutObjReader::from_vec(payload.clone()), &object_options)
+                    .await
+                    .expect("full-fanout PUT should persist every inline shard");
+
+                let mut target = None;
+                for (disk_index, disk) in disks.iter().enumerate() {
+                    let metadata = disk
+                        .read_version("", bucket, &object, "", &read_options)
+                        .await
+                        .expect("inline metadata should be readable");
+                    let target_shard = if parity { metadata.erasure.data_blocks + 1 } else { 1 };
+                    if metadata.erasure.index == target_shard {
+                        target = Some((disk_index, metadata));
+                        break;
+                    }
+                }
+                let (disk_index, original_meta) = target.expect("requested data/parity shard should exist");
+                let original_inline = original_meta.data.as_ref().expect("object should be inline");
+                let metadata_path = temp_dirs[disk_index]
+                    .path()
+                    .join(bucket)
+                    .join(&object)
+                    .join(STORAGE_FORMAT_FILE);
+                let mut damaged_raw = tokio::fs::read(&metadata_path).await.expect("physical xl.meta should exist");
+                let offsets: Vec<_> = damaged_raw
+                    .windows(original_inline.len())
+                    .enumerate()
+                    .filter_map(|(offset, bytes)| (bytes == original_inline.as_ref()).then_some(offset))
+                    .collect();
+                assert_eq!(offsets.len(), 1, "inline shard must have a unique physical byte range");
+                let bitflip_offset = if corrupt_prefix { 0 } else { original_inline.len() - 1 };
+                damaged_raw[offsets[0] + bitflip_offset] ^= 1;
+                tokio::fs::write(&metadata_path, &damaged_raw)
+                    .await
+                    .expect("only the encoded inline shard should be damaged");
+                let damaged_meta = disks[disk_index]
+                    .read_version("", bucket, &object, "", &read_options)
+                    .await
+                    .expect("payload corruption must leave metadata parseable");
+                assert!(damaged_meta.equals(&original_meta));
+                assert_eq!(damaged_meta.version_id, original_meta.version_id);
+                assert_eq!(damaged_meta.data_dir, original_meta.data_dir);
+                assert_ne!(damaged_meta.data, original_meta.data);
+
+                for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                    let (result, error) = set
+                        .heal_object(
+                            bucket,
+                            &object,
+                            "",
+                            &HealOpts {
+                                no_lock: true,
+                                scan_mode,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("inline heal should complete");
+                    assert!(error.is_none(), "inline heal should remain recoverable: {error:?}");
+                    let deep = scan_mode == HealScanMode::Deep;
+                    assert_eq!(result.drives_healed(), Some(usize::from(deep)), "{object}: {scan_mode:?}");
+                    assert_eq!(result.after.drives[disk_index].state, DriveState::Ok.to_string());
+                    if deep {
+                        assert_eq!(result.before.drives[disk_index].state, DriveState::Corrupt.to_string());
+                        let repaired = disks[disk_index]
+                            .read_version("", bucket, &object, "", &read_options)
+                            .await
+                            .expect("repaired physical shard should be readable");
+                        assert_eq!(repaired.data, original_meta.data, "heal must restore the exact encoded shard");
+                        assert_eq!(repaired.version_id, original_meta.version_id);
+                        assert_eq!(repaired.data_dir, original_meta.data_dir);
+                    }
+
+                    for (range, expected) in [
+                        (None, payload.as_slice()),
+                        (
+                            Some(HTTPRangeSpec {
+                                start: 113,
+                                end: 1023,
+                                is_suffix_length: false,
+                            }),
+                            &payload[113..1024],
+                        ),
+                    ] {
+                        let mut reader = set
+                            .get_object_reader(bucket, &object, range, Default::default(), &object_options)
+                            .await
+                            .expect("redundant shards should serve full and range reads");
+                        let mut body = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut body)
+                            .await
+                            .expect("GET should finish without truncation");
+                        assert_eq!(body, expected);
+                    }
+                    if !deep {
+                        assert_eq!(
+                            tokio::fs::read(&metadata_path)
+                                .await
+                                .expect("damaged shard should remain on disk"),
+                            damaged_raw,
+                            "successful GET and normal heal do not prove the damaged shard was repaired"
+                        );
+                    }
+                }
+
+                let (healthy, error) = set
+                    .heal_object(
+                        bucket,
+                        &object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("healthy inline object should pass a second deep scan");
+                assert!(error.is_none());
+                assert_eq!(healthy.drives_healed(), Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_preserves_quorum_and_dry_run_boundaries() {
+        for corrupt_shards in [2, 3] {
+            let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "deep-heal-inline-quorum";
+            let object = "object.bin";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("test bucket should be created");
+            }
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x71; 4113]),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("all inline shards should be committed");
+            let read_options = ReadOptions {
+                read_data: true,
+                ..Default::default()
+            };
+            let mut originals = Vec::new();
+            let mut damaged_files = Vec::new();
+            for disk_index in 0..corrupt_shards {
+                let metadata = disks[disk_index]
+                    .read_version("", bucket, object, "", &read_options)
+                    .await
+                    .expect("source shard should be readable");
+                let inline = metadata.data.expect("source shard should be inline");
+                let path = temp_dirs[disk_index]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE);
+                let mut raw = tokio::fs::read(&path).await.expect("physical metadata should exist");
+                let offsets: Vec<_> = raw
+                    .windows(inline.len())
+                    .enumerate()
+                    .filter_map(|(offset, bytes)| (bytes == inline.as_ref()).then_some(offset))
+                    .collect();
+                assert_eq!(offsets.len(), 1, "shard byte range must be unique");
+                raw[offsets[0] + inline.len() - 1] ^= 1;
+                tokio::fs::write(&path, &raw).await.expect("inline shard should be damaged");
+                originals.push(inline);
+                damaged_files.push((path, raw));
+            }
+            let opts = HealOpts {
+                no_lock: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            };
+            let (dry_run, error) = set
+                .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..opts })
+                .await
+                .expect("dry-run should report inline corruption");
+            assert!(error.is_none());
+            assert_eq!(dry_run.drives_healed(), Some(0));
+            for (disk_index, (path, raw)) in damaged_files.iter().enumerate() {
+                assert_eq!(dry_run.after.drives[disk_index].state, DriveState::Corrupt.to_string());
+                assert_eq!(tokio::fs::read(path).await.expect("dry-run should preserve metadata"), *raw);
+            }
+
+            let (result, error) = set
+                .heal_object(bucket, object, "", &opts)
+                .await
+                .expect("heal should report its outcome");
+            if corrupt_shards == 2 {
+                assert!(error.is_none(), "exact read quorum should reconstruct: {error:?}");
+                assert_eq!(result.drives_healed(), Some(2));
+                for (disk_index, original) in originals.iter().enumerate() {
+                    let repaired = disks[disk_index]
+                        .read_version("", bucket, object, "", &read_options)
+                        .await
+                        .expect("reconstructed shard should be persisted");
+                    assert_eq!(repaired.data.as_ref(), Some(original));
+                }
+            } else {
+                assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+                assert_eq!(result.drives_healed(), Some(0));
+                for (path, raw) in damaged_files {
+                    assert_eq!(
+                        tokio::fs::read(path)
+                            .await
+                            .expect("unrecoverable evidence must remain on disk"),
+                        raw
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_rejects_unsupported_algorithms() {
+        use crate::set_disk::disks_with_all_parts;
+        use rustfs_filemeta::ChecksumInfo;
+        use rustfs_utils::HashAlgorithm;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-algorithm";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x71; 4113]),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("inline fixture should be committed");
+        let mut metadata = Vec::new();
+        for disk in &disks {
+            metadata.push(
+                disk.read_version(
+                    "",
+                    bucket,
+                    object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("inline metadata should decode"),
+            );
+        }
+        let latest = metadata[1].clone();
+        let mut online: Vec<_> = disks.into_iter().map(Some).collect();
+        for algorithm in [
+            HashAlgorithm::SHA256,
+            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::BLAKE2b512,
+        ] {
+            metadata[0].erasure.checksums = vec![ChecksumInfo {
+                part_number: 1,
+                algorithm,
+                ..Default::default()
+            }];
+            for mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let result = disks_with_all_parts(
+                    &mut online,
+                    &mut metadata,
+                    &[None, None, None, None],
+                    &latest,
+                    false,
+                    bucket,
+                    object,
+                    mode,
+                )
+                .await;
+                if mode == HealScanMode::Deep {
+                    assert_eq!(
+                        result.expect_err("unverifiable inline data must not become healthy"),
+                        DiskError::BitrotHashAlgoInvalid
+                    );
+                } else {
+                    let (by_disk, _) = result.expect("normal scan should retain presence-only behavior");
+                    assert_eq!(by_disk[&0], vec![crate::disk::CHECK_PART_SUCCESS]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_accepts_persisted_empty_objects() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-inline-empty";
+        let object = "empty.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(Vec::new()),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("empty object should be committed");
+        let mut originals = Vec::new();
+        for dir in &temp_dirs {
+            let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            originals.push((path.clone(), tokio::fs::read(path).await.expect("empty object metadata should exist")));
+        }
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty object should pass deep heal");
+        assert!(error.is_none());
+        assert_eq!(result.drives_healed(), Some(0));
+        for (path, raw) in originals {
+            assert_eq!(tokio::fs::read(path).await.expect("healthy metadata should remain on disk"), raw);
+        }
+    }
+
+    #[tokio::test]
     async fn replacement_target_readback_checks_the_requested_historical_version() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "replacement-target-readback-versioned";

@@ -1763,7 +1763,8 @@ impl HealManager {
         request: HealRequest,
         mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, true, Some(mrf_notice_target))
+        let preserve_alias = mrf_notice_target.kind != rustfs_common::mrf_channel::MrfKind::PartialWrite;
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, Some(mrf_notice_target))
             .await
     }
 
@@ -1996,12 +1997,19 @@ impl HealManager {
             // HS-06: under the minio_error overlap policy an exact duplicate
             // admin start reports the typed AlreadyRunning rejection instead
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
-            let admission =
-                if request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError {
-                    HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
-                } else {
-                    Self::duplicate_admission_for_request(&request, &config)
-                };
+            let admission = if (request.source == HealRequestSource::Admin
+                && config.overlap_policy == HealOverlapPolicy::MinioError)
+                || (duplicate_state != "queued"
+                    && mrf_notice_target
+                        .as_ref()
+                        .is_some_and(|target| target.kind == rustfs_common::mrf_channel::MrfKind::PartialWrite))
+            {
+                // A running/retrying task may have observed the object before
+                // this write committed. Its receipt cannot prove the new lease.
+                HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+            } else {
+                Self::duplicate_admission_for_request(&request, &config)
+            };
             if matches!(admission, HealAdmissionResult::Merged)
                 && let Some(target) = mrf_notice_target
             {

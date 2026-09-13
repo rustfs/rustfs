@@ -16,12 +16,14 @@
 //!
 //! Producers on error paths (read decode failure, scanner metadata
 //! corruption, partial-write recovery) hand a lightweight [`MrfIntent`] to the
-//! heal crate through a global bounded channel. Delivery is strictly
+//! heal crate through a global bounded channel. Hint delivery is strictly
 //! non-blocking: `try_send_mrf_intent` never awaits and drops the intent
 //! (counting it) when the channel is full or uninitialized — losing one heal
 //! hint is always preferred over stalling an IO path. Durable replay of
 //! unconsumed intents is the consumer's job (see `rustfs-heal`
-//! `heal::mrf_queue`), mirroring MinIO's `.heal/mrf/list.bin`.
+//! `heal::mrf_queue`), mirroring MinIO's `.heal/mrf/list.bin`. Committed partial
+//! writes use a separate bounded channel and await a checkpoint receipt from
+//! [`persist_partial_write_intent`]; ordinary complete writes do not use it.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -33,7 +35,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 /// Bounded capacity of the global MRF channel. Backpressure is resolved by
@@ -90,7 +92,7 @@ pub struct MrfIntent {
     pub attempts: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MrfDurableRepairAnchor {
     pub kind: MrfKind,
     pub bucket: Arc<str>,
@@ -224,6 +226,85 @@ impl MrfIntent {
 }
 
 static GLOBAL_MRF_SENDER: OnceLock<mpsc::Sender<MrfIntent>> = OnceLock::new();
+
+static GLOBAL_DURABLE_MRF_SENDER: OnceLock<mpsc::Sender<MrfDurableSubmission>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MrfDurableAdmissionError {
+    #[error("MRF delivery is disabled")]
+    Disabled,
+    #[error("MRF durable consumer is unavailable")]
+    Unavailable,
+    #[error("MRF responsibility capacity is exhausted")]
+    Full,
+    #[error("MRF responsibility identity is invalid or oversized")]
+    InvalidIdentity,
+    #[error("MRF responsibility checkpoint could not be persisted")]
+    Persistence,
+    #[error("MRF durable admission timed out; responsibility may still be retained")]
+    Timeout,
+}
+
+/// A committed partial write awaiting a durable checkpoint, separate from the
+/// best-effort read/scanner channel. Dropping the reply does not cancel repair.
+pub struct MrfDurableSubmission {
+    pub intent: MrfIntent,
+    pub response: oneshot::Sender<Result<(), MrfDurableAdmissionError>>,
+}
+
+pub fn init_durable_mrf_channel() -> Result<mpsc::Receiver<MrfDurableSubmission>, &'static str> {
+    let (sender, receiver) = mpsc::channel(MRF_CHANNEL_CAPACITY);
+    GLOBAL_DURABLE_MRF_SENDER
+        .set(sender)
+        .map_err(|_| "MRF durable channel sender already initialized")?;
+    Ok(receiver)
+}
+
+/// Wait for checkpoint publication only on a committed partial-write path.
+/// Every write gets a fresh lease: a previous repair of the same unversioned
+/// key cannot discharge a later overwrite. An error is not durable admission.
+pub async fn persist_partial_write_intent(
+    bucket: &str,
+    object: &str,
+    version_id: Option<Uuid>,
+    scope: MrfScope,
+) -> Result<(), MrfDurableAdmissionError> {
+    if !mrf_delivery_enabled() {
+        return Err(MrfDurableAdmissionError::Disabled);
+    }
+    if bucket.is_empty()
+        || object.is_empty()
+        || bucket.len() > MRF_MAX_IDENTITY_COMPONENT
+        || object.len() > MRF_MAX_IDENTITY_COMPONENT
+    {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
+    let sender = GLOBAL_DURABLE_MRF_SENDER.get().ok_or(MrfDurableAdmissionError::Unavailable)?;
+    let mut intent = MrfIntent {
+        bucket: Arc::from(bucket),
+        object: Arc::from(object),
+        version_id: canonical_version(version_id),
+        kind: MrfKind::PartialWrite,
+        scope: Some(scope),
+        lease: None,
+        enqueued_at_ms: unix_now_ms(),
+        attempts: 0,
+    };
+    if try_rearm_mrf_replay_intent(&mut intent) != MrfIngressResult::Enqueued {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
+    let (response, receipt) = oneshot::channel();
+    sender
+        .try_send(MrfDurableSubmission { intent, response })
+        .map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => MrfDurableAdmissionError::Full,
+            mpsc::error::TrySendError::Closed(_) => MrfDurableAdmissionError::Unavailable,
+        })?;
+    tokio::time::timeout(Duration::from_secs(10), receipt)
+        .await
+        .map_err(|_| MrfDurableAdmissionError::Timeout)?
+        .map_err(|_| MrfDurableAdmissionError::Unavailable)?
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MrfIdentityKey {
@@ -1010,4 +1091,33 @@ mod tests {
         assert!(take_mrf_verified_repair_events_for("verified-bucket-a").is_empty());
         assert_eq!(take_mrf_verified_repair_events_for("verified-bucket-b").len(), 1);
     }
+}
+#[tokio::test]
+async fn partial_write_durable_admission_waits_for_persistence_and_renews_lease() {
+    let mut receiver = init_durable_mrf_channel().expect("isolated test should initialize durable channel");
+    let scope = MrfScope {
+        pool_index: 2,
+        set_index: 3,
+    };
+    let first = tokio::spawn(async move { persist_partial_write_intent("bucket", "object", None, scope).await });
+    let submission = receiver.recv().await.expect("first submission should arrive");
+    let first_lease = submission.intent.lease;
+    assert!(!first.is_finished(), "channel delivery alone must not acknowledge durable ownership");
+    submission
+        .response
+        .send(Err(MrfDurableAdmissionError::Persistence))
+        .expect("producer should await receipt");
+    assert_eq!(first.await.expect("producer should complete"), Err(MrfDurableAdmissionError::Persistence));
+    let second = tokio::spawn(async move { persist_partial_write_intent("bucket", "object", None, scope).await });
+    let submission = receiver.recv().await.expect("replacement submission should arrive");
+    assert_ne!(
+        first_lease, submission.intent.lease,
+        "an overwrite must not reuse the previous proof identity"
+    );
+    assert_eq!(submission.intent.scope, Some(scope));
+    submission
+        .response
+        .send(Ok(()))
+        .expect("second producer should await receipt");
+    assert_eq!(second.await.expect("second producer should complete"), Ok(()));
 }

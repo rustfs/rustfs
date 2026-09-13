@@ -2139,6 +2139,47 @@ async fn test_submit_heal_request_returns_merged_for_active_duplicate() {
 }
 
 #[tokio::test]
+async fn partial_write_mrf_does_not_attach_to_running_snapshot() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+    let original = HealRequest::object("partial-bucket".to_owned(), "object".to_owned(), None);
+    let task = Arc::new(HealTask::from_request(original, storage));
+    manager.active_heals.lock().await.insert(task.id.clone(), task.clone());
+    let result = manager
+        .submit_mrf_heal_request_with_receipt(
+            HealRequest::object("partial-bucket".to_owned(), "object".to_owned(), None),
+            Arc::from("partial-bucket"),
+            Arc::from("object"),
+            None,
+        )
+        .await
+        .expect("partial-write duplicate should return an admission decision");
+    assert_eq!(result.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    assert!(
+        lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets)
+            .get(&task.id)
+            .is_none(),
+        "a repair that already started cannot prove a later write"
+    );
+    manager.active_heals.lock().await.clear();
+    let queued = HealRequest::object("partial-bucket".to_owned(), "object".to_owned(), None);
+    let queued_id = queued.id.clone();
+    manager.submit_heal_request(queued).await.expect("fresh task should queue");
+    let result = manager
+        .submit_mrf_heal_request_with_receipt(
+            HealRequest::object("partial-bucket".to_owned(), "object".to_owned(), None),
+            Arc::from("partial-bucket"),
+            Arc::from("object"),
+            None,
+        )
+        .await
+        .expect("queued duplicate should return a decision");
+    assert_eq!(result.result, HealAdmissionResult::Merged);
+    assert_eq!(result.task_id, queued_id);
+    assert_eq!(lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets)[&queued_id].len(), 1);
+}
+
+#[tokio::test]
 async fn test_active_duplicate_token_can_query_and_cancel_original_task() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
