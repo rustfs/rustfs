@@ -21,6 +21,7 @@ mod perf_object;
 mod profile_cpu;
 mod profile_memory;
 mod profile_threads;
+mod receipt_delivery;
 mod schedule;
 mod top_api;
 mod top_disk;
@@ -83,6 +84,7 @@ pub use profile_cpu::{
 };
 pub use profile_memory::export_memory_profile;
 pub use profile_threads::{capture_thread_profile, export_thread_profile};
+pub(crate) use receipt_delivery::{DiagnosticReceiptDelivery, DiagnosticReceiptSender};
 pub use schedule::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,

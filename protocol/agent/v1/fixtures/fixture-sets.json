@@ -56,7 +56,7 @@
     {
       "name": "diagnostic-scheduler",
       "status": "populated",
-      "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and local execution receipts."
+      "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and outbound Connect-visible execution receipts."
     },
     {
       "name": "offline-enrollment",
