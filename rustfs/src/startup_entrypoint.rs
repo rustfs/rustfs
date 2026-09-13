@@ -984,6 +984,7 @@ async fn execute_connect_site_replication_performance(options: ConnectSiteReplic
     let request = SiteReplicationPerformanceRequest {
         organization_name: options.organization,
         cluster_name: options.cluster,
+        destination_cluster_name: options.destination_cluster,
         device_name: options.device,
         run_uid: options.run_uid,
         artifact_uid: options.artifact_uid,
