@@ -39,14 +39,11 @@ use profile_cpu::{
 };
 use profile_memory::{AllocationProfileSource, export_memory_profile, export_memory_profile_from, parse_allocator_stats};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use zip::ZipArchive;
 
-static TEST_PROFILE_LOCK: Mutex<()> = Mutex::new(());
-
-fn profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_PROFILE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+static TEST_PROFILE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
@@ -116,7 +113,7 @@ fn archive_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u
 
 #[tokio::test]
 async fn real_mimalloc_profile_produces_a_signed_three_file_export() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let key = connect::DeviceIdentity::generate();
     let export = export_memory_profile(&request(), &key, &CancellationToken::new())
         .await
@@ -124,7 +121,7 @@ async fn real_mimalloc_profile_produces_a_signed_three_file_export() {
     assert!(export.archive_bytes.len() <= profile_cpu::MAX_ARCHIVE_BYTES);
     assert_eq!(export.archive_sha256, hex(&Sha256::digest(&export.archive_bytes)));
 
-    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes.clone())).expect("profile archive");
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes)).expect("profile archive");
     assert_eq!(archive.len(), 3);
     let envelope_bytes = archive_entry(&mut archive, "envelope.json");
     let signature_bytes = archive_entry(&mut archive, "envelope.sig");
@@ -165,7 +162,7 @@ async fn real_mimalloc_profile_produces_a_signed_three_file_export() {
 
 #[tokio::test]
 async fn memory_profile_reports_counter_reset_and_cancellation_without_an_artifact() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let first = Box::leak(stats(100, 10).into_boxed_str());
     let second = Box::leak(stats(90, 11).into_boxed_str());
     let source = SequenceSource::new(first, second);
@@ -192,7 +189,7 @@ async fn memory_profile_reports_counter_reset_and_cancellation_without_an_artifa
 
 #[tokio::test]
 async fn memory_profile_uses_only_bounded_allocator_aggregates() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let first = Box::leak(stats(1_000, 20).into_boxed_str());
     let second = Box::leak(stats(1_250, 24).into_boxed_str());
     let source = SequenceSource::new(first, second);
@@ -211,7 +208,7 @@ async fn memory_profile_uses_only_bounded_allocator_aggregates() {
 
 #[tokio::test]
 async fn memory_profile_allows_only_one_collector_at_a_time() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let first = Box::leak(stats(100, 10).into_boxed_str());
     let second = Box::leak(stats(120, 12).into_boxed_str());
     let source = SequenceSource::new(first, second);
@@ -234,7 +231,7 @@ async fn memory_profile_allows_only_one_collector_at_a_time() {
 
 #[tokio::test]
 async fn signed_export_is_private_no_clobber_and_cancel_safe() {
-    let _guard = profile_test_lock();
+    let _guard = TEST_PROFILE_LOCK.lock().await;
     let first = Box::leak(stats(100, 10).into_boxed_str());
     let second = Box::leak(stats(150, 12).into_boxed_str());
     let source = SequenceSource::new(first, second);

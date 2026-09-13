@@ -397,8 +397,7 @@ pub(crate) async fn export_logs_from(
         reason_code: LogReasonCode::Complete,
         duration_millis: u64::try_from(started.elapsed().as_millis())
             .unwrap_or(u64::MAX)
-            .max(1)
-            .min(30_000),
+            .clamp(1, 30_000),
         provenance: request.provenance.clone(),
         coverage: Coverage {
             requested_units: 1,

@@ -24,7 +24,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64_simd::URL_SAFE_NO_PAD;
@@ -37,10 +36,11 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey as _;
 use sha2::{Digest as _, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use zip::ZipArchive;
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64
@@ -100,7 +100,7 @@ fn archive_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u
 
 #[tokio::test]
 async fn batch_capture_exports_only_allow_listed_fields_in_a_signed_artifact() {
-    let _guard = TEST_LOCK.lock().expect("test lock");
+    let _guard = TEST_LOCK.lock().await;
     let mut request = request(CaptureMode::Batch);
     request.duration = Duration::from_secs(2);
     let first_timestamp = timestamp(request.produced_at_unix - 1, 0);
@@ -130,7 +130,7 @@ async fn batch_capture_exports_only_allow_listed_fields_in_a_signed_artifact() {
     assert_eq!(export.dropped_event_count, 0);
     assert_eq!(export.archive_sha256, hex(&Sha256::digest(&export.archive_bytes)));
 
-    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes.clone())).expect("logs archive");
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes)).expect("logs archive");
     assert_eq!(archive.len(), 3);
     let envelope_bytes = archive_entry(&mut archive, "envelope.json");
     let signature_bytes = archive_entry(&mut archive, "envelope.sig");
@@ -176,7 +176,7 @@ async fn batch_capture_exports_only_allow_listed_fields_in_a_signed_artifact() {
 
 #[tokio::test]
 async fn batch_capture_drops_unknown_malformed_oversized_and_excess_events() {
-    let _guard = TEST_LOCK.lock().expect("test lock");
+    let _guard = TEST_LOCK.lock().await;
     let mut request = request(CaptureMode::Batch);
     request.duration = Duration::from_secs(2);
     request.max_events = 1;
@@ -206,7 +206,7 @@ async fn batch_capture_drops_unknown_malformed_oversized_and_excess_events() {
 
 #[tokio::test]
 async fn live_capture_tails_new_events_and_honors_cancellation() {
-    let _guard = TEST_LOCK.lock().expect("test lock");
+    let _guard = TEST_LOCK.lock().await;
     let (directory, source) = source("");
     let key = connect::DeviceIdentity::generate();
     let mut request = request(CaptureMode::Live);
@@ -240,7 +240,7 @@ async fn live_capture_tails_new_events_and_honors_cancellation() {
 
 #[tokio::test]
 async fn consent_limits_and_source_boundary_fail_closed() {
-    let _guard = TEST_LOCK.lock().expect("test lock");
+    let _guard = TEST_LOCK.lock().await;
     let (directory, source) = source(&line("2026-09-12T12:00:00Z", "INFO", "http_startup_endpoints", "safe"));
     let key = connect::DeviceIdentity::generate();
     let mut denied = request(CaptureMode::Batch);
@@ -274,7 +274,7 @@ async fn consent_limits_and_source_boundary_fail_closed() {
 
 #[tokio::test]
 async fn local_export_is_private_no_clobber_and_cancel_safe() {
-    let _guard = TEST_LOCK.lock().expect("test lock");
+    let _guard = TEST_LOCK.lock().await;
     let (_directory, source) = source(&line("2026-09-12T12:00:00Z", "INFO", "http_startup_endpoints", "safe"));
     let key = connect::DeviceIdentity::generate();
     let export = export_logs_from(&request(CaptureMode::Batch), &key, &CancellationToken::new(), &source)
