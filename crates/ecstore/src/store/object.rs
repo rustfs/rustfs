@@ -2056,6 +2056,9 @@ fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, Stri
             local_tier_free_version_id = Some(version_id);
             continue;
         }
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_BUCKET_INCARNATION_ID) {
+            continue;
+        }
 
         let canonical_suffix = [
             rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
@@ -7108,6 +7111,24 @@ mod tests {
 
         Arc::make_mut(&mut target.user_defined).insert(key, "arn=FAILED;".to_string());
         assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_ignores_target_bucket_incarnation_fence() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
     }
 
     #[test]
