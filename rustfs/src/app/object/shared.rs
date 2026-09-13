@@ -372,8 +372,9 @@ pub(super) fn resolve_bucket_default_sse(
 ///   bucket whose metadata document is absent — `ConfigNotFound`, so a cold
 ///   cache and a missing bucket are never turned into a refusal, and the write
 ///   still fails later with its own `NoSuchBucket`;
-/// * blob present but unparseable — deterministic, so retrying cannot help;
-///   surfaces as `InternalError` until an operator repairs or removes it;
+/// * blob present but unparseable — the typed unreadable-config refusal,
+///   surfaced as `ServiceUnavailable` naming the bucket and config until an
+///   operator repairs or removes it (rustfs/backlog#1734);
 /// * the metadata read itself failed (namespace lock, quorum, disk, an
 ///   uninitialized metadata system) — transient, and the typed error maps to
 ///   the retryable `ServiceUnavailable`.
@@ -943,7 +944,7 @@ impl DefaultObjectUsecase {
 pub(crate) async fn object_lock_checks_required(bucket: &str) -> bool {
     get_bucket_metadata(bucket)
         .await
-        .map_or(true, |metadata| metadata.object_locking())
+        .map_or(true, |metadata| metadata.object_lock_checks_required())
 }
 
 pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
