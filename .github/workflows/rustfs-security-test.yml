@@ -18,9 +18,8 @@ on:
   workflow_dispatch:
     inputs:
       rustfs_version:
-        description: 'RustFS release tag to test. Leave empty for nightly.'
+        description: 'RustFS release tag to test (leave empty to use the latest nightly deb)'
         required: false
-        default: ''
       package_url:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
@@ -145,6 +144,8 @@ jobs:
 
       - name: Run security suite
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
         continue-on-error: true
         env:
           REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
@@ -181,9 +182,30 @@ jobs:
           TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
           set -euo pipefail
+          LOG_FILE="${SECURITY_ARTIFACTS_DIR}/suite.log"
           RESULT=failure
           if [ "${TEST_OUTCOME}" = "success" ] && [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
             RESULT=success
+          fi
+
+          # Product gate: failing cases keep the run green — they are reported
+          # below and tracked in rustfs/backlog. Only harness/environment
+          # breakdowns turn the workflow red. The suite log lines carry ANSI
+          # color escapes both before and after the verdict tag
+          # (e.g. "\e[1;31m[FAIL]\e[0m STS-105 ..."), so the pattern allows
+          # any number of escapes on each side of it.
+          ESC=$'\033'
+          VERDICTS_TOTAL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[(PASS|FAIL|UNSUPPORTED)\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_FAIL="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[FAIL\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_TOTAL=$(( ${VERDICTS_TOTAL:-0} + 0 )); VERDICTS_FAIL=$(( ${VERDICTS_FAIL:-0} + 0 ))
+          VERDICTS_PASS=$(( VERDICTS_TOTAL - VERDICTS_FAIL ))
+          VERDICTS_SKIPPED="$(grep -cE "^(${ESC}\[[0-9;]*m)*\[SKIP\](${ESC}\[[0-9;]*m)* [A-Z]" "${LOG_FILE}" 2>/dev/null || true)"
+          VERDICTS_SKIPPED=$(( ${VERDICTS_SKIPPED:-0} + 0 ))
+          HARNESS_OK=0
+          if [ "${TEST_OUTCOME}" = "success" ]; then
+            HARNESS_OK=1
+          elif [ "${TEST_OUTCOME}" = "failure" ] && [ "${VERDICTS_TOTAL}" -gt 0 ] && [ "${VERDICTS_PASS}" -ge 1 ]; then
+            HARNESS_OK=1
           fi
           {
             echo "# RustFS security test report"
@@ -197,16 +219,19 @@ jobs:
             echo ""
             # The dashboard prioritizes case rows over the step outcome.
             # Keep partial case results in the artifact when the suite fails.
-            if [ "${RESULT}" = "success" ]; then
+            if [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
               cat "${SECURITY_ARTIFACTS_DIR}/suite-report.md"
-            elif [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
-              echo "The suite did not complete successfully. See suite-report.md in this run's artifact for diagnostics."
+              echo ""
+            fi
+            if [ "${VERDICTS_SKIPPED}" -gt 0 ]; then
+              echo "- Product result: ${VERDICTS_PASS} passed, ${VERDICTS_FAIL} failed, ${VERDICTS_SKIPPED} skipped (failing cases are tracked in rustfs/backlog)"
             else
-              echo "The suite did not produce a non-empty report."
+              echo "- Product result: ${VERDICTS_PASS} passed, ${VERDICTS_FAIL} failed (failing cases are tracked in rustfs/backlog)"
             fi
           } > "${SECURITY_ARTIFACTS_DIR}/report.md"
           cat "${SECURITY_ARTIFACTS_DIR}/report.md" >> "${GITHUB_STEP_SUMMARY}"
-          [ "${RESULT}" = "success" ]
+          # Red only for harness/environment breakdowns; case failures stay green.
+          [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
         if: ${{ always() && steps.evidence.outcome == 'success' }}
@@ -240,65 +265,54 @@ jobs:
           fi
           rm -f "${B64_FILE}"
 
-      - name: File failure issue in rustfs/backlog
-        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
+      - name: Manage backlog issues (dedup / label / auto-close)
+        # Replaces the old per-run failure filing. One entry point that:
+        # - dedups by signal: failing cases are matched against open backlog
+        #   issues by label (category + case ID); covered cases become a
+        #   comment on the existing issue, only uncovered cases file a new one
+        # - labels new issues (functional-test, category, case IDs, env)
+        # - closes fixed issues after a fully green run
+        # - never files or closes on cancelled runs
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           SUITE: 'security'
           SUITE_LABEL: 'Security'
-          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/report.md
-          LOG_FILE: ''
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
-          EXISTING="$(gh issue list -R rustfs/backlog --state all \
-            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
-          if [ -n "${EXISTING}" ]; then
-            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found in auto-testing checkout; skipping"
             exit 0
           fi
-          redact() {
-            sed -E \
-              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
-              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
-          }
-          BODY_FILE="$(mktemp)"
-          {
-            echo "The **${SUITE_LABEL}** functional suite failed."
-            echo ""
-            echo "- Suite: \`${SUITE}\`"
-            echo "- Run: ${RUN_URL}"
-            echo "- Trigger: ${GITHUB_EVENT_NAME}"
-            echo "- Date: $(date -u +%Y-%m-%d)"
-            echo ""
-            echo "## Report (errors and symptoms)"
-            echo ""
-            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
-              redact < "${REPORT_FILE}"
-            elif [ -s "${LOG_FILE:-}" ]; then
-              echo "(report file missing; log tail below)"
-              echo ""
-              tail -n 200 "${LOG_FILE}" | redact
-            else
-              echo "(no report or log file was produced)"
-            fi
-          } | head -c 55000 > "${BODY_FILE}"
-          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
-          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test; then
-            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          PACKAGE_SOURCE=""
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          echo "filed backlog issue for suite ${SUITE}"
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
+            --outcome "${{ steps.test.outcome }}" \
+            --report-file "${SECURITY_ARTIFACTS_DIR}/report.md" \
+            --log "${SECURITY_ARTIFACTS_DIR}/suite.log" \
+            --run-url "${RUN_URL}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${{ github.event_name }}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload report and logs
         if: ${{ always() && steps.evidence.outcome == 'success' }}
