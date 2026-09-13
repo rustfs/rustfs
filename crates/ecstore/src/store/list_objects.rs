@@ -9728,7 +9728,7 @@ mod test {
         );
         let corrupt = MetaCacheEntry {
             name: entry.name.clone(),
-            metadata: vec![0xff].into(),
+            metadata: vec![0xff],
             ..Default::default()
         };
         for copies in [11, 12, 15] {

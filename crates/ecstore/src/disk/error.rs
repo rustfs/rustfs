@@ -897,8 +897,12 @@ mod tests {
 
     #[test]
     fn retired_marker_deferral_survives_disk_and_storage_clones() {
-        let disk = DiskError::retired_marker_deferred("missing retirement record").clone();
-        let storage = crate::error::StorageError::from(disk).clone();
+        let original = DiskError::retired_marker_deferred("missing retirement record");
+        let disk = original.clone();
+        let storage = crate::error::StorageError::from(disk);
+        let cloned = storage.clone();
+        assert!(cloned.is_retired_marker_deferred());
+        assert!(crate::error::StorageError::from(original).is_retired_marker_deferred());
         assert!(storage.is_retired_marker_deferred());
         assert!(!crate::error::StorageError::other(storage.to_string()).is_retired_marker_deferred());
         assert!(!crate::error::StorageError::FileVersionNotFound.is_retired_marker_deferred());
