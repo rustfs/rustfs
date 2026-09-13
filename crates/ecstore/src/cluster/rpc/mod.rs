@@ -17,6 +17,7 @@ pub(crate) mod client;
 pub(crate) mod context_propagation;
 pub(crate) mod http_auth;
 pub(crate) mod internode_data_transport;
+mod network_probe;
 pub(crate) mod peer_rest_client;
 pub(crate) mod peer_s3_client;
 pub(crate) mod remote_disk;
@@ -45,6 +46,10 @@ pub use http_auth::{
 #[cfg(test)]
 pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
 pub use internode_data_transport::build_internode_data_transport_from_env;
+pub use network_probe::{
+    MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient, NetworkPeerProbeError,
+    NetworkPeerProbeMeasurement, NetworkPeerTarget,
+};
 pub(crate) use peer_rest_client::TierConfigReloadOutcome;
 pub use peer_rest_client::{
     KMS_SIGNAL_SUBSYSTEM, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
