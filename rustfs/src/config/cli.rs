@@ -248,6 +248,8 @@ pub struct ConnectPerformanceOpts {
 pub enum ConnectPerformanceCommands {
     /// Measure bounded client-to-deployment transfer performance
     Client(Box<ConnectClientPerformanceOpts>),
+    /// Measure bounded S3 object throughput in a dedicated temporary namespace
+    Object(Box<ConnectObjectPerformanceOpts>),
     /// Measure generated-file write and warm page-cache read performance
     Drive(Box<ConnectDrivePerformanceOpts>),
 }
@@ -339,6 +341,111 @@ pub struct ConnectClientPerformanceOpts {
     /// Client transfer operation
     #[arg(long, value_enum)]
     pub operation: ConnectClientPerformanceOperation,
+
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Stable opaque alias for the deployment target
+    #[arg(long = "target-alias", default_value = "deployment-1", value_parser = NonEmptyStringValueParser::new())]
+    pub target_alias: String,
+
+    /// Confirm this explicit local L1 diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectObjectPerformanceOperation {
+    Get,
+    Put,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectObjectPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// RustFS deployment endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Optional PEM root certificate for the deployment endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: Option<PathBuf>,
+
+    /// Optional explicit HTTP(S) proxy without embedded credentials
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub proxy: Option<String>,
+
+    /// Owner-readable file containing the S3 access key
+    #[arg(long = "access-key-file")]
+    pub access_key_file: PathBuf,
+
+    /// Owner-readable file containing the S3 secret key
+    #[arg(long = "secret-key-file")]
+    pub secret_key_file: PathBuf,
+
+    /// Optional owner-readable file containing an S3 session token
+    #[arg(long = "session-token-file")]
+    pub session_token_file: Option<PathBuf>,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.object@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Object transfer operation
+    #[arg(long, value_enum)]
+    pub operation: ConnectObjectPerformanceOperation,
 
     /// Generated transfer size in bytes
     #[arg(long = "traffic-bytes", default_value_t = 65_536)]
@@ -1096,6 +1203,8 @@ pub enum CommandResult {
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
     ConnectClientPerformance(ConnectClientPerformanceOpts),
+    /// Consent-bound S3 object performance export
+    ConnectObjectPerformance(ConnectObjectPerformanceOpts),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export

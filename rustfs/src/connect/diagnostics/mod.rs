@@ -15,6 +15,7 @@
 mod logs;
 mod perf_client;
 mod perf_drive;
+mod perf_object;
 mod profile_cpu;
 mod profile_memory;
 mod profile_threads;
@@ -45,6 +46,15 @@ pub use perf_drive::{
     DrivePerformanceError, DrivePerformanceRequest, DriveProvenance, DriveReadMode, DriveReasonCode, DriveTargetParameters,
     DriveTargetReasonCode, DriveTargetResult, DriveTargetUnits, LocalDriveConsent, SavedDriveExport, SignedDriveExport,
     measure_drive, save_signed_drive_export, sign_drive_export, validate_drive_limits,
+};
+pub use perf_object::{
+    LocalObjectConsent, MAX_OBJECT_BANDWIDTH_BYTES_PER_SECOND, MAX_OBJECT_DURATION, MAX_OBJECT_RESULT_BYTES,
+    MAX_OBJECT_TRAFFIC_BYTES, OBJECT_CAPABILITY, OBJECT_SCHEMA_VERSION, OBJECT_TOOL_ID, ObjectDiagnosticResult,
+    ObjectMeasurement, ObjectOperation, ObjectOutcome, ObjectPerformanceData, ObjectPerformanceError, ObjectPerformanceRequest,
+    ObjectProbe, ObjectProbeError, ObjectProbeFuture, ObjectProbeMeasurement, ObjectProvenance, ObjectReasonCode,
+    ObjectTargetParameters, ObjectTargetReasonCode, ObjectTargetResult, ObjectTargetUnits, S3ObjectProbe, SavedObjectExport,
+    SignedObjectExport, measure_object, read_protected_object_credential, save_signed_object_export, sign_object_export,
+    validate_object_limits,
 };
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,

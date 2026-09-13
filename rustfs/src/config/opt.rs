@@ -149,6 +149,7 @@ impl Opt {
                 ConnectCommands::Performance(opts) => match opts.command {
                     ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(*opts)),
                     ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
+                    ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
                 },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
                 ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
