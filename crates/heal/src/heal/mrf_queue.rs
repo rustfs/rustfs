@@ -14,29 +14,21 @@
 
 //! Mission Repair Feed (MRF) queue, journal, and consumer.
 //!
-//! Intents arriving on the global channel (see `rustfs_common::mrf_channel`)
-//! are buffered in a bounded in-memory queue, translated into prioritized
-//! heal requests, and — while they are not yet accepted by the heal manager —
-//! mirrored into a durable journal so a crash or restart can replay them.
-//! This is the RustFS counterpart of MinIO's `.heal/mrf/list.bin` replay,
-//! layered on top of (not replacing) read-repair and scanner heal.
-//!
-//! Durability model: the journal is a snapshot of the *unaccepted* pending
-//! set, rewritten on a group-commit cadence (every flush interval or flush
-//! threshold new intents). A rewrite is atomic at the record level only — a
-//! torn tail simply truncates during replay because every record carries its
-//! own CRC32. Neither ingress nor manager admission is a durable ownership
-//! receipt. The last flush window can be lost. Read-repair can rediscover a
-//! failed read; the scanner retains bounded, expiring retry hints. Partial
-//! writes also use a best-effort in-memory fast path, not a durable successor.
-//! These mechanisms must not be reported as verified repair completion.
-//! The partial-write caller's restart-survival requirement remains unmet by
-//! admission alone; a verified durable handoff is still required.
+//! Read/scanner hints retain their bounded best-effort admission semantics.
+//! Committed partial writes await checkpoint publication and remain in the
+//! snapshot after manager admission. Failure, deferral and retry exhaustion
+//! cannot discharge them; only an exact storage-verified proof may do so.
+//! Both paths share the existing committed snapshot format and legacy mirrors.
+//! Replay retains partial-write intents for live retries when a member is
+//! still offline at startup. A lost proof causes another repair, not deletion.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
-use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfDurableRepairAnchor, MrfIngressResult, MrfIntent};
+use rustfs_common::mrf_channel::{
+    MRF_MAX_ATTEMPTS, MrfDurableAdmissionError, MrfDurableRepairAnchor, MrfDurableSubmission, MrfIngressResult, MrfIntent,
+    MrfKind,
+};
 use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -46,8 +38,10 @@ use uuid::Uuid;
 
 use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
 
-/// Read-only inspection of committed MRF checkpoints. The legacy consumer
-/// remains unchanged until ownership-aware replay is deployed.
+mod partial_write;
+use partial_write::PartialWrites;
+
+/// Committed checkpoint publication, inspection and owner-scoped cleanup.
 pub mod snapshot;
 
 /// Journal location inside the metadata bucket, following the resume-state
@@ -520,6 +514,7 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
 
 struct MrfRuntime {
     queue: MrfQueue,
+    partial_writes: PartialWrites,
     config: MrfConsumerConfig,
     checkpoint_owner: Uuid,
     next_checkpoint_sequence: u64,
@@ -550,10 +545,41 @@ struct MrfRuntime {
 }
 
 impl MrfRuntime {
+    fn adopt_replayed_partial_writes(&mut self, intents: Vec<MrfIntent>) {
+        // The decoded checkpoint bounds replay; live admission subsequently
+        // shares these limits with the ordinary pending queue.
+        self.queue.capacity = self.queue.capacity.saturating_add(intents.len());
+        self.queue.byte_budget = self
+            .queue
+            .byte_budget
+            .saturating_add(intents.iter().map(PartialWrites::cost).sum::<usize>());
+        for intent in intents {
+            if self.admit_partial_write(intent).is_err() {
+                self.retain_replay_journal = true;
+            }
+        }
+        // The executable record now owns replay retention and proof matching.
+        // Keeping a second anchor would leak the startup checkpoint when a
+        // later write replaces this lease before its old proof arrives.
+        let adopted_leases: HashSet<_> = self.partial_writes.intents().filter_map(|intent| intent.lease).collect();
+        self.durable_replay_anchors
+            .retain(|anchor| anchor.kind != MrfKind::PartialWrite || !adopted_leases.contains(&anchor.lease));
+    }
+
+    fn admit_partial_write(&mut self, intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+        self.partial_writes.admit(
+            intent,
+            self.queue.capacity.saturating_sub(self.queue.depth()),
+            self.queue.byte_budget.saturating_sub(self.queue.bytes()),
+        )?;
+        self.dirty = true;
+        Ok(())
+    }
+
     fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
         let mut authoritative = Vec::new();
         let mut legacy = Vec::new();
-        for intent in self.queue.intents() {
+        for intent in self.queue.intents().chain(self.partial_writes.intents()) {
             let scoped_identity =
                 !matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::MetadataCorruption) && intent.scope.is_some();
             if !encode_intent(intent, &mut authoritative) {
@@ -566,7 +592,7 @@ impl MrfRuntime {
         (authoritative, legacy)
     }
 
-    async fn flush(&mut self) {
+    async fn flush(&mut self) -> bool {
         let (authoritative, legacy) = self.snapshot();
         let (committed_persisted, committed_on_disk) = if authoritative.is_empty() {
             (true, false)
@@ -616,13 +642,16 @@ impl MrfRuntime {
         // non-empty queue used to provide.
         if persisted {
             self.dirty = false;
+            self.partial_writes.mark_persisted();
         }
         self.journal_on_disk |= committed_on_disk || authoritative_persisted || legacy_persisted;
+        persisted
     }
 
     /// Drain pending intents into the heal manager until it is full, the
     /// queue empties, or attempts are exhausted.
     async fn dispatch(&mut self, manager: &HealManager) {
+        self.partial_writes.dispatch(manager, &self.config).await;
         if let Some(until) = self.backoff_until {
             if tokio::time::Instant::now() < until {
                 return;
@@ -630,6 +659,16 @@ impl MrfRuntime {
             self.backoff_until = None;
         }
         while let Some(mut intent) = self.queue.pop_front() {
+            if intent.kind == MrfKind::PartialWrite {
+                if self.admit_partial_write(intent.clone()).is_err() {
+                    self.queue.push_back(intent);
+                    break;
+                }
+                if self.flush().await {
+                    self.partial_writes.dispatch(manager, &self.config).await;
+                }
+                continue;
+            }
             // Leaving the pending set (consumed or re-queued with a bumped
             // attempts counter) changes the encoded snapshot; mark it dirty
             // either way.
@@ -667,12 +706,12 @@ impl MrfRuntime {
                 }
             }
         }
-        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth()));
-        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes()));
+        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
+        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
     }
 
     fn retained_replay_journal(&self) -> bool {
-        self.retain_replay_journal || !self.durable_replay_anchors.is_empty()
+        self.retain_replay_journal || !self.durable_replay_anchors.is_empty() || self.partial_writes.depth() > 0
     }
 
     fn replay_cleanup_to_delete(&self) -> Option<ReplayCleanup> {
@@ -715,22 +754,24 @@ impl MrfRuntime {
     }
 
     fn discharge_durable_replay_anchors(&mut self) {
-        if self.durable_replay_anchors.is_empty() {
-            return;
-        }
-        let mut buckets: Vec<Arc<str>> = self
+        let mut anchors: Vec<_> = self
             .durable_replay_anchors
             .iter()
-            .map(|anchor| anchor.bucket.clone())
+            .chain(self.partial_writes.anchors())
+            .cloned()
             .collect();
+        if anchors.is_empty() {
+            return;
+        }
+        let mut buckets: Vec<Arc<str>> = anchors.iter().map(|anchor| anchor.bucket.clone()).collect();
         buckets.sort_unstable();
         buckets.dedup();
         for bucket in buckets {
-            rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(
-                bucket.as_ref(),
-                &mut self.durable_replay_anchors,
-            );
+            rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(bucket.as_ref(), &mut anchors);
         }
+        let remaining: HashSet<_> = anchors.into_iter().collect();
+        self.durable_replay_anchors.retain(|anchor| remaining.contains(anchor));
+        self.dirty |= self.partial_writes.retain_unproven(&remaining);
     }
 }
 
@@ -748,8 +789,10 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
         );
         return;
     }
-    let receiver = match rustfs_common::mrf_channel::init_mrf_channel() {
-        Ok(receiver) => receiver,
+    let (receiver, durable_receiver) = match rustfs_common::mrf_channel::init_mrf_channel().and_then(|receiver| {
+        rustfs_common::mrf_channel::init_durable_mrf_channel().map(|durable_receiver| (receiver, durable_receiver))
+    }) {
+        Ok(receivers) => receivers,
         Err(err) => {
             tracing::warn!(
                 target: "rustfs::heal::mrf",
@@ -760,7 +803,7 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
         }
     };
     tokio::spawn(async move {
-        run_mrf_consumer(manager, receiver).await;
+        run_mrf_consumer(manager, receiver, durable_receiver).await;
     });
     tracing::info!(target: "rustfs::heal::mrf", "MRF intent consumer started");
 }
@@ -783,6 +826,7 @@ struct ReplayOutcome {
     journal_on_disk: bool,
     retain_journal_for_replay: bool,
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
+    partial_writes: Vec<MrfIntent>,
     cleanup: Option<ReplayCleanup>,
     next_checkpoint_sequence: u64,
 }
@@ -870,6 +914,7 @@ async fn replay_into(
                 journal_on_disk: false,
                 retain_journal_for_replay: false,
                 durable_replay_anchors: Vec::new(),
+                partial_writes: Vec::new(),
                 cleanup: None,
                 next_checkpoint_sequence: 1,
             };
@@ -885,6 +930,7 @@ async fn replay_into(
                 journal_on_disk: true,
                 retain_journal_for_replay: true,
                 durable_replay_anchors: Vec::new(),
+                partial_writes: Vec::new(),
                 cleanup: None,
                 next_checkpoint_sequence: 1,
             };
@@ -918,6 +964,7 @@ async fn replay_into(
     let mut rearm_incomplete = false;
     let mut accepted_without_durable_anchor = false;
     let mut durable_replay_anchors = Vec::new();
+    let mut partial_writes = Vec::new();
     for intent in intents {
         let result = queue.try_push_typed(intent.clone());
         match result {
@@ -942,6 +989,16 @@ async fn replay_into(
                 rearm_incomplete = true;
                 *backoff_until = Some(tokio::time::Instant::now());
                 break;
+            }
+            if intent.kind == MrfKind::PartialWrite {
+                // Preserve the executable record as well as its proof anchor:
+                // a target that is still offline during replay needs live retries.
+                if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+                    durable_replay_anchors.push(anchor);
+                }
+                let _ = submit_mrf_heal_request(manager, &intent).await;
+                partial_writes.push(intent);
+                continue;
             }
             match submit_mrf_heal_request(manager, &intent).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
@@ -985,7 +1042,7 @@ async fn replay_into(
         rearm_incomplete,
         queue.depth(),
         accepted_without_durable_anchor,
-        durable_replay_anchors.len(),
+        durable_replay_anchors.len() + partial_writes.len(),
     );
     let retain_journal_for_replay = rearm_incomplete || accepted_without_durable_anchor;
     let journal_on_disk = if must_retain_journal {
@@ -998,6 +1055,7 @@ async fn replay_into(
         journal_on_disk,
         retain_journal_for_replay,
         durable_replay_anchors,
+        partial_writes,
         cleanup: journal_on_disk.then_some(cleanup),
         next_checkpoint_sequence,
     }
@@ -1005,9 +1063,14 @@ async fn replay_into(
 
 /// Replay the journal, then keep draining the channel into the heal manager
 /// while persisting the pending snapshot.
-async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receiver<MrfIntent>) {
+async fn run_mrf_consumer(
+    manager: Arc<HealManager>,
+    mut receiver: mpsc::Receiver<MrfIntent>,
+    mut durable_receiver: mpsc::Receiver<MrfDurableSubmission>,
+) {
     let config = MrfConsumerConfig::default();
     let mut runtime = MrfRuntime {
+        partial_writes: PartialWrites::default(),
         queue: MrfQueue::new(config.queue_capacity, config.journal_max_bytes),
         config: config.clone(),
         checkpoint_owner: Uuid::new_v4(),
@@ -1030,17 +1093,38 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     runtime.durable_replay_anchors = replay.durable_replay_anchors;
     runtime.replay_cleanup = replay.cleanup;
     runtime.next_checkpoint_sequence = replay.next_checkpoint_sequence;
+    runtime.adopt_replayed_partial_writes(replay.partial_writes);
     // Anything still pending (e.g. the manager was full and backoff armed)
     // must be re-persisted by the next flush before replay can delete the
     // startup anchor.
-    runtime.dirty = runtime.queue.depth() > 0;
+    runtime.dirty = runtime.queue.depth() > 0 || runtime.partial_writes.depth() > 0;
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut batch: Vec<MrfIntent> = Vec::with_capacity(runtime.config.replay_batch);
+    let mut durable_batch = Vec::with_capacity(runtime.config.replay_batch);
 
     loop {
         tokio::select! {
+            received = durable_receiver.recv_many(&mut durable_batch, runtime.config.replay_batch) => {
+                if received == 0 {
+                    return;
+                }
+                let mut responses = Vec::with_capacity(received);
+                for submission in durable_batch.drain(..) {
+                    match runtime.admit_partial_write(submission.intent) {
+                        Ok(()) => responses.push(submission.response),
+                        Err(err) => { let _ = submission.response.send(Err(err)); }
+                    }
+                }
+                if !responses.is_empty() {
+                    let persisted = runtime.flush().await;
+                    for response in responses {
+                        let _ = response.send(if persisted { Ok(()) } else { Err(MrfDurableAdmissionError::Persistence) });
+                    }
+                }
+                runtime.dispatch(manager.as_ref()).await;
+            }
             received = receiver.recv_many(&mut batch, runtime.config.replay_batch) => {
                 if received == 0 {
                     // Channel closed: flush once more unless the snapshot is
@@ -1057,6 +1141,21 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     return;
                 }
                 for intent in batch.drain(..) {
+                    if intent.kind == MrfKind::PartialWrite {
+                        if runtime.admit_partial_write(intent.clone()).is_err() {
+                            rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                            counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
+                        }
+                        continue;
+                    }
+                    if !runtime.queue.pending_keys.contains(&queue_key(&intent))
+                        && (runtime.queue.depth() + runtime.partial_writes.depth() >= runtime.queue.capacity
+                            || runtime.queue.bytes() + runtime.partial_writes.bytes() + intent.estimated_bytes() > runtime.queue.byte_budget)
+                    {
+                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
+                        continue;
+                    }
                     match runtime.queue.try_push_typed(intent.clone()) {
                         MrfQueuePushResult::Enqueued => {
                             runtime.new_since_flush += 1;
@@ -1067,6 +1166,9 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                         }
                     }
                 }
+                if runtime.dirty && runtime.partial_writes.depth() > 0 {
+                    runtime.flush().await;
+                }
                 runtime.dispatch(manager.as_ref()).await;
                 if runtime.new_since_flush >= runtime.config.flush_threshold {
                     runtime.flush().await;
@@ -1076,7 +1178,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                 runtime.discharge_durable_replay_anchors();
                 match tick_action(
                     runtime.dirty,
-                    runtime.queue.depth(),
+                    runtime.queue.depth() + runtime.partial_writes.depth(),
                     runtime.journal_on_disk,
                     runtime.retained_replay_journal(),
                 ) {
@@ -1101,7 +1203,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     }
                     TickAction::Idle => {}
                 }
-                gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(runtime.queue.depth()));
+                gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(runtime.queue.depth() + runtime.partial_writes.depth()));
             }
         }
     }
@@ -1295,6 +1397,7 @@ mod tests {
 
         let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue,
             config,
             checkpoint_owner: Uuid::new_v4(),
@@ -1393,6 +1496,7 @@ mod tests {
             set_index: 13,
         });
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue: MrfQueue::new(4, usize::MAX),
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
@@ -1984,6 +2088,7 @@ mod tests {
             sequence: 17,
         };
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue: MrfQueue::new(2, usize::MAX),
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
@@ -2033,6 +2138,7 @@ mod tests {
     #[test]
     fn runtime_cleanup_defaults_to_legacy_for_runtime_written_journals() {
         let runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue: MrfQueue::new(2, usize::MAX),
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
@@ -2080,6 +2186,7 @@ mod tests {
         assert!(write_journal(MRF_JOURNAL_PATH, &runtime_payload).await);
 
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue: MrfQueue::new(2, usize::MAX),
             config,
             checkpoint_owner: Uuid::new_v4(),
@@ -2112,6 +2219,51 @@ mod tests {
         );
         assert_eq!(read_journal(MRF_SCOPED_JOURNAL_PATH).await, None);
         assert_eq!(read_journal(MRF_JOURNAL_PATH).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn partial_write_replay_without_bucket_identity_keeps_retryable_record() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_replay_missing_identity")
+            .build()
+            .await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
+        let config = MrfConsumerConfig::default();
+        let mut replay_intent = intent("unavailable-bucket", "object", 0);
+        replay_intent.kind = MrfKind::PartialWrite;
+        replay_intent.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        });
+        snapshot::publish_committed_snapshot(
+            &journal_disks().await,
+            Uuid::new_v4(),
+            1,
+            &encoded_payload(&replay_intent),
+            config.journal_max_bytes,
+        )
+        .await
+        .expect("publish checkpoint before the bucket identity is available");
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let replay = replay_into(&manager, &mut queue, &mut None).await;
+        assert!(
+            replay.durable_replay_anchors.is_empty(),
+            "unavailable identity cannot supply a proof anchor"
+        );
+        assert_eq!(replay.partial_writes.len(), 1, "the record must remain executable for later retries");
+        assert!(replay.journal_on_disk, "missing proof must retain the startup checkpoint");
+        assert!(
+            !replay.retain_journal_for_replay,
+            "temporary identity unavailability must not pin the checkpoint after a later verified repair"
+        );
+        assert!(
+            snapshot::inspect_local_committed_snapshot(config.journal_max_bytes)
+                .await
+                .expect("inspect retained checkpoint")
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2182,6 +2334,7 @@ mod tests {
 
         let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue,
             config,
             checkpoint_owner: Uuid::new_v4(),
@@ -2386,6 +2539,7 @@ mod tests {
         let compat = intent("rollback-bucket", "v1-compatible-object", 0);
 
         let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
             queue: MrfQueue::new(4, usize::MAX),
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),

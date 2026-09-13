@@ -4189,10 +4189,72 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+        use rustfs_common::mrf_channel::{
+            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,
+        };
+
+        if !mrf_delivery_enabled() {
+            return false;
+        }
+        let identity = (|| {
+            let version = version_id
+                .filter(|value| !value.is_empty())
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?;
+            let scope = MrfScope {
+                pool_index: u32::try_from(self.pool_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+                set_index: u32::try_from(self.set_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+            };
+            Ok::<_, MrfDurableAdmissionError>((version, scope))
+        })();
+        let result = match identity {
+            Ok((version, scope)) => persist_partial_write_intent(bucket, object, version, scope).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                tracing::trace!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "mrf_durably_admitted",
+                    bucket,
+                    object,
+                    version_id,
+                    pool_index = self.pool_index,
+                    set_index = self.set_index,
+                    "Partial write repair responsibility persisted"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "mrf_durable_admission_failed",
+                    bucket, object, version_id, pool_index = self.pool_index, set_index = self.set_index,
+                    error = %error,
+                    "Partial write repair falling back to the heal channel"
+                );
+                false
+            }
+        }
+    }
+
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
         request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) {
+        if let Some(object) = request.object_prefix.as_deref()
+            && self
+                .persist_partial_write(&request.bucket, object, request.object_version_id.as_deref())
+                .await
+        {
+            return;
+        }
         #[cfg(test)]
         {
             let capture = self
