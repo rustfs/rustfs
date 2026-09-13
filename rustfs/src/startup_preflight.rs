@@ -26,6 +26,7 @@ const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
 const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
 const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
+const EVENT_BUCKET_CONFIG_PARSE_MODE_SELECTED: &str = "bucket_config_parse_mode_selected";
 
 #[derive(Debug)]
 pub(crate) enum StartupServerPreflightError {
@@ -66,6 +67,15 @@ pub(crate) async fn init_startup_server_preflight(
     init_license(config.license.clone());
     init_startup_observability(config.obs_endpoint.clone()).await?;
     log_external_prefix_compat_report(env_compat_report);
+    let parse_mode = crate::storage_api::startup::init::validate_bucket_config_parse_mode_env()
+        .map_err(|err| StartupServerPreflightError::Other(Error::other(err)))?;
+    info!(
+        event = EVENT_BUCKET_CONFIG_PARSE_MODE_SELECTED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        mode = parse_mode.as_str(),
+        "Bucket config parse mode selected"
+    );
     init_startup_runtime_foundation(config)
         .await
         .map_err(StartupServerPreflightError::Other)

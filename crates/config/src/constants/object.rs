@@ -116,6 +116,16 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// How object writes treat a bucket whose stored versioning configuration
+/// cannot be parsed: `permissive` writes as if unversioned (the historical
+/// behavior, recorded by metrics and an error log) and `strict` refuses the
+/// write with 503. Paths that already refuse an unreadable configuration do
+/// so in both modes. Any other value fails startup.
+pub const ENV_BUCKET_CONFIG_PARSE_MODE: &str = "RUSTFS_BUCKET_CONFIG_PARSE_MODE";
+
+/// Default bucket config parse mode.
+pub const DEFAULT_BUCKET_CONFIG_PARSE_MODE: &str = "permissive";
+
 /// Request writing the complete remote-tier version state into object metadata.
 ///
 /// This remains ineffective until

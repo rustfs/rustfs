@@ -4188,7 +4188,7 @@ mod tests {
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
@@ -4269,7 +4269,7 @@ mod tests {
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, "archive.tar", &ObjectOptions::default())
             .await

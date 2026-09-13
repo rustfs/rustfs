@@ -5594,7 +5594,7 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 /// object-lock protection is never skipped because of a metadata lookup miss.
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(crate) fn object_lock_delete_check_required(bucket_meta: Option<&crate::bucket::metadata::BucketMetadata>) -> bool {
-    bucket_meta.is_none_or(|meta| meta.object_locking())
+    bucket_meta.is_none_or(|meta| meta.object_lock_checks_required())
 }
 
 fn restore_expiry_snapshot_matches(obj_info: &ObjectInfo, opts: &ObjectOptions) -> bool {
@@ -11994,6 +11994,15 @@ mod tests {
     #[test]
     fn test_object_lock_delete_check_required_fails_closed_without_metadata() {
         assert!(object_lock_delete_check_required(None));
+    }
+
+    /// rustfs/backlog#1734: stored Object Lock bytes that cannot be parsed
+    /// mean the lock state is unknown, not absent; the check must stay on.
+    #[test]
+    fn test_object_lock_delete_check_required_fails_closed_on_unreadable_lock_config() {
+        let mut bm = crate::bucket::metadata::BucketMetadata::new("unreadable-lock-bucket");
+        bm.object_lock_config_xml = b"<ObjectLockConfiguration>".to_vec();
+        assert!(object_lock_delete_check_required(Some(&bm)));
     }
 
     #[test]
