@@ -49,6 +49,11 @@
       "purpose": "Bounded performance.siteReplication@1 aggregate results, destination-confirmation semantics, and rejection of operational secrets and unresolved target controls."
     },
     {
+      "name": "telemetry",
+      "status": "populated",
+      "purpose": "Consent-bound telemetry.record@1, telemetry.otlp@1, and telemetry.replay@1 producer results, resource limits, redaction boundaries, cancellation, and signed local exports."
+    },
+    {
       "name": "diagnostic-scheduler",
       "status": "populated",
       "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and local execution receipts."
