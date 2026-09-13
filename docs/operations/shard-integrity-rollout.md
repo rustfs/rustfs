@@ -59,6 +59,12 @@ integrity receipt.
 Use the heal item's before/after drives and actual repaired-drive count to
 observe ordinary recovery. Strong outcome counters may remain unknown/skipped
 because object identity is unproven; that is distinct from execution progress.
+MRF likewise retains durable legacy repair obligations after physical recovery
+when no independent verification receipt can discharge them. An idle attempt
+queue does not imply that these persistent obligations have been cleared.
+Partial-write MRF replay uses Deep verification so a protected object's repair
+can discharge its obligation after verifying the payload. This adds full-object
+read work to those background attempts, including healthy replay targets.
 Normal presence scans likewise cannot certify protected payloads. Local Heal
 of transitioned objects checks metadata without reading the tier payload, so it
 does not issue a payload-integrity receipt even if a descriptor remains. An

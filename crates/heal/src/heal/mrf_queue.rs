@@ -456,7 +456,7 @@ fn warn_mrf_journal_write(err: &super::DiskError) {
 
 /// Translate an intent into the prioritized heal request the issue specifies:
 /// decode failures go Urgent ECDecode, metadata corruption goes High
-/// Metadata, partial writes go Normal object heal.
+/// Metadata, partial writes go Normal-priority object heal with Deep verification.
 pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
     let bucket = intent.bucket.to_string();
     let object = intent.object.to_string();
@@ -484,6 +484,11 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
         ),
     };
     let mut options = HealOptions::default();
+    if matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::PartialWrite) {
+        // Presence-only repair cannot discharge a protected object's durable
+        // obligation. Verify payloads even after new protection is disabled.
+        options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Deep;
+    }
     if !matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::MetadataCorruption)
         && let Some(scope) = intent.scope
     {
@@ -2716,5 +2721,6 @@ mod tests {
         });
         assert!(matches!(partial.heal_type, HealType::Object { .. }));
         assert_eq!(partial.priority, HealPriority::Normal);
+        assert_eq!(partial.options.scan_mode, rustfs_heal_contracts::heal_channel::HealScanMode::Deep);
     }
 }

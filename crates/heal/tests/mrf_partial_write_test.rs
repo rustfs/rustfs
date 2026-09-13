@@ -180,6 +180,8 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
         [
             ("RUSTFS_HEAL_MRF_ENABLE", Some("true")),
             ("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", Some("false")),
+            ("RUSTFS_SHARD_INTEGRITY_WRITE", Some("false")),
+            ("RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED", Some("false")),
         ],
         async {
             let root = tempfile::tempdir().expect("test directory should be created");
@@ -315,14 +317,21 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
             );
             assert!(
                 wait_until(|| async {
-                    inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
-                        .await
-                        .expect("cleanup snapshot must validate")
-                        .is_none()
+                    let snapshot = manager.operations_snapshot().await;
+                    snapshot.queue_length == 0 && snapshot.active_tasks == 0
                 })
                 .await,
-                "verified repair must release durable responsibility"
+                "legacy repair attempts must finish without inventing verification"
             );
+            assert!(snapshot_contains("new.bin").await);
+            assert!(snapshot_contains("versioned.bin").await);
+            manager.stop().await.expect("test manager should stop");
+            let before_purge = inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
+                .await
+                .expect("legacy checkpoint must validate")
+                .expect("unverified legacy responsibility must remain")
+                .payload()
+                .to_vec();
             // Deleting an existing marker by VersionId removes a version; it
             // must not create a new partial-write repair responsibility.
             for path in &env.disk_paths[12..] {
@@ -348,12 +357,14 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
                 )
                 .await
                 .expect("explicit marker purge should retain quorum");
-            assert!(
+            assert_eq!(
                 inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
                     .await
-                    .expect("purge must not create a checkpoint")
-                    .is_none(),
-                "a physical marker purge must not be admitted as a marker creation repair"
+                    .expect("purge checkpoint must validate")
+                    .expect("existing legacy checkpoint must remain")
+                    .payload(),
+                before_purge,
+                "a physical marker purge must not add a marker creation repair"
             );
             for (path, disk) in env.disk_paths[12..].iter().zip(&all[12..]) {
                 tokio::fs::remove_file(path).await.expect("remove purge outage sentinel");
@@ -363,7 +374,6 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
                 disk.reset_health_for_store_init_retry();
             }
             *set.disks.write().await = all.iter().cloned().map(Some).collect();
-            manager.stop().await.expect("test manager should stop");
         },
     )
     .await;
@@ -393,6 +403,15 @@ fn partial_write_crash_fixture() {
 
 #[tokio::test]
 async fn partial_write_sigkill_replay_rearms_and_repairs() {
+    partial_write_sigkill_replay_scenario(true).await;
+}
+
+#[tokio::test]
+async fn legacy_sigkill_replay_repairs_without_releasing_unverified_responsibility() {
+    partial_write_sigkill_replay_scenario(false).await;
+}
+
+async fn partial_write_sigkill_replay_scenario(protected: bool) {
     use std::process::{Command, Stdio};
     let root = tempfile::tempdir().expect("crash test directory");
     let log = std::fs::File::create(root.path().join("child.log")).expect("child log");
@@ -401,6 +420,8 @@ async fn partial_write_sigkill_replay_rearms_and_repairs() {
         .env("RUSTFS_TEST_PARTIAL_WRITE_CRASH_ROOT", root.path())
         .env("RUSTFS_HEAL_MRF_ENABLE", "true")
         .env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false")
+        .env("RUSTFS_SHARD_INTEGRITY_WRITE", protected.to_string())
+        .env("RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED", protected.to_string())
         .stdout(Stdio::from(log.try_clone().expect("clone child log")))
         .stderr(Stdio::from(log))
         .spawn()
@@ -434,15 +455,27 @@ async fn partial_write_sigkill_replay_rearms_and_repairs() {
         "replayed responsibility must heal the returning member"
     );
     assert_payload(&env, "partial-crash", "crash.bin", None, b"durable partial write across SIGKILL").await;
-    assert!(
-        wait_until(|| async {
-            inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
-                .await
-                .expect("valid checkpoint")
-                .is_none()
-        })
-        .await,
-        "replayed responsibility must be released only after verified repair"
-    );
+    if protected {
+        assert!(
+            wait_until(|| async {
+                inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
+                    .await
+                    .expect("valid checkpoint")
+                    .is_none()
+            })
+            .await,
+            "replayed responsibility must be released only after verified repair"
+        );
+    } else {
+        assert!(
+            wait_until(|| async {
+                let snapshot = manager.operations_snapshot().await;
+                snapshot.queue_length == 0 && snapshot.active_tasks == 0
+            })
+            .await,
+            "legacy replay attempts must finish"
+        );
+        assert!(snapshot_contains("crash.bin").await, "unverified legacy responsibility must remain");
+    }
     manager.stop().await.expect("restarted manager should stop");
 }

@@ -3795,7 +3795,7 @@ impl SetDisks {
             let part_integrity = if let Some(integrity) = integrity {
                 Some(if is_inline_buffer {
                     integrity.set_inline_metadata(&mut fi)?;
-                    integrity.part.clone()
+                    integrity.part
                 } else {
                     integrity
                         .write(
