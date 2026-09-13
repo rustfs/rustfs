@@ -1478,7 +1478,6 @@ mod tests {
                 consent_uid: "019e3ae0-0000-7000-8000-000000000015".to_owned(),
                 policy_revision: 7,
                 expires_at_unix: now + 120,
-                nonce: [0x6b; 32],
                 confirmed: true,
                 nonce: [0x6b; 32],
             },
