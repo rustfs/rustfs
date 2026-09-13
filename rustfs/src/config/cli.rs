@@ -127,8 +127,599 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Read the persisted deployment inventory and collect an approved environment summary
+    Inventory(ConnectInventoryOpts),
+    /// Run an explicitly approved, bounded local performance measurement
+    Performance(ConnectPerformanceOpts),
     /// Capture a consent-bound local profile and write a signed export
     Profile(ConnectProfileOpts),
+    /// Capture allow-listed local log events and write a signed export
+    Logs(ConnectLogsOpts),
+    /// Record, forward, or replay consent-bound telemetry
+    Telemetry(ConnectTelemetryOpts),
+    /// Capture a consent-bound local top snapshot
+    Top(ConnectTopOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInventoryOpts {
+    #[command(subcommand)]
+    pub command: ConnectInventoryCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectInventoryCommands {
+    /// Collect the bounded inventory.environment@1 summary
+    Environment(ConnectEnvironmentInventoryOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectEnvironmentInventoryOpts {
+    /// Directory containing the persisted Connect inventory
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// Negotiated environment schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated environment capability
+    #[arg(long, default_value = "inventory.environment@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Maximum collection time in seconds
+    #[arg(long = "timeout-seconds", default_value_t = 30)]
+    pub timeout_seconds: u64,
+    /// Confirm this explicit local L1 inventory operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTopOpts {
+    #[command(subcommand)]
+    pub command: ConnectTopCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectTopCommands {
+    /// Capture API activity when an approved typed source is available
+    Api(ConnectTopCaptureOpts),
+    /// Capture process disk I/O on supported platforms
+    Disk(ConnectTopCaptureOpts),
+    /// Capture lock activity when an approved typed source is available
+    Locks(ConnectTopCaptureOpts),
+    /// Capture internode network traffic
+    Net(ConnectTopCaptureOpts),
+    /// Capture RPC activity when an approved typed source is available
+    Rpc(ConnectTopCaptureOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTopCaptureOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this capture
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Diagnostic run expiry as UTC Unix seconds
+    #[arg(long = "run-expires-at")]
+    pub run_expires_at_unix: i64,
+    /// Monotonic sampling window in milliseconds
+    #[arg(long = "window-millis", default_value_t = 1_000)]
+    pub window_millis: u64,
+    /// Signed export validity in seconds
+    #[arg(long = "export-validity-seconds", default_value_t = 300)]
+    pub export_validity_seconds: u64,
+    /// Confirm this explicit local L3 diagnostic operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectPerformanceOpts {
+    #[command(subcommand)]
+    pub command: ConnectPerformanceCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectPerformanceCommands {
+    /// Measure bounded client-to-deployment transfer performance
+    Client(Box<ConnectClientPerformanceOpts>),
+    /// Measure bounded S3 object throughput in a dedicated temporary namespace
+    Object(Box<ConnectObjectPerformanceOpts>),
+    /// Measure generated-file write and warm page-cache read performance
+    Drive(Box<ConnectDrivePerformanceOpts>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectClientPerformanceOperation {
+    Get,
+    Put,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectClientPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// RustFS deployment endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Optional PEM root certificate for the deployment endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: Option<PathBuf>,
+
+    /// Optional explicit HTTP(S) proxy without embedded credentials
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub proxy: Option<String>,
+
+    /// Owner-readable file containing the S3 access key
+    #[arg(long = "access-key-file")]
+    pub access_key_file: PathBuf,
+
+    /// Owner-readable file containing the S3 secret key
+    #[arg(long = "secret-key-file")]
+    pub secret_key_file: PathBuf,
+
+    /// Optional owner-readable file containing an S3 session token
+    #[arg(long = "session-token-file")]
+    pub session_token_file: Option<PathBuf>,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.client@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Client transfer operation
+    #[arg(long, value_enum)]
+    pub operation: ConnectClientPerformanceOperation,
+
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Stable opaque alias for the deployment target
+    #[arg(long = "target-alias", default_value = "deployment-1", value_parser = NonEmptyStringValueParser::new())]
+    pub target_alias: String,
+
+    /// Confirm this explicit local L1 diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectObjectPerformanceOperation {
+    Get,
+    Put,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectObjectPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// RustFS deployment endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Optional PEM root certificate for the deployment endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: Option<PathBuf>,
+
+    /// Optional explicit HTTP(S) proxy without embedded credentials
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub proxy: Option<String>,
+
+    /// Owner-readable file containing the S3 access key
+    #[arg(long = "access-key-file")]
+    pub access_key_file: PathBuf,
+
+    /// Owner-readable file containing the S3 secret key
+    #[arg(long = "secret-key-file")]
+    pub secret_key_file: PathBuf,
+
+    /// Optional owner-readable file containing an S3 session token
+    #[arg(long = "session-token-file")]
+    pub session_token_file: Option<PathBuf>,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.object@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Object transfer operation
+    #[arg(long, value_enum)]
+    pub operation: ConnectObjectPerformanceOperation,
+
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Stable opaque alias for the deployment target
+    #[arg(long = "target-alias", default_value = "deployment-1", value_parser = NonEmptyStringValueParser::new())]
+    pub target_alias: String,
+
+    /// Confirm this explicit local L1 diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectDrivePerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Existing approved directory in which to create task-owned scratch state
+    #[arg(long = "scratch-dir")]
+    pub scratch_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.drive@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Generated scratch payload size in bytes
+    #[arg(long = "scratch-bytes", default_value_t = 32_768)]
+    pub scratch_bytes: u64,
+
+    /// Individual read/write block size in bytes
+    #[arg(long = "block-bytes", default_value_t = 4_096)]
+    pub block_bytes: u64,
+
+    /// Confirm this explicit local diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryOpts {
+    #[command(subcommand)]
+    pub command: ConnectTelemetryCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectTelemetryCommands {
+    /// Capture process-local telemetry when an approved typed source is available
+    Record(ConnectTelemetryRecordOpts),
+    /// Forward an OTLP protobuf batch from stdin to a customer-approved collector
+    Otlp(ConnectTelemetryOtlpOpts),
+    /// Replay reviewed trace JSON read from stdin and write a signed export
+    Replay(ConnectTelemetryReplayOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryArtifactOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this operation
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Confirm this explicit local L3 telemetry operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryRecordOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
+
+    /// Capture duration in milliseconds
+    #[arg(long = "duration-millis")]
+    pub duration_millis: u64,
+
+    /// Maximum exported span count
+    #[arg(long = "max-spans", default_value_t = 1_024)]
+    pub max_spans: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryOtlpOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
+
+    /// Customer-approved OTLP/HTTP traces endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Forward timeout in milliseconds
+    #[arg(long = "timeout-millis")]
+    pub timeout_millis: u64,
+
+    /// Environment variable containing the local Authorization header value
+    #[arg(long = "authorization-env", value_parser = NonEmptyStringValueParser::new())]
+    pub authorization_env: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectTelemetryReplayOpts {
+    #[command(flatten)]
+    pub artifact: ConnectTelemetryArtifactOpts,
+}
+
+/// `connect logs` options.
+#[derive(Args, Clone)]
+pub struct ConnectLogsOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Capture the recent configured log window or tail new events
+    #[arg(long, value_enum, default_value = "batch")]
+    pub mode: ConnectLogsMode,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "logs.capture@1")]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this capture
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Batch lookback or live capture duration in milliseconds
+    #[arg(long = "duration-millis")]
+    pub duration_millis: u64,
+
+    /// Maximum exported event count
+    #[arg(long = "max-events", default_value_t = 1_024)]
+    pub max_events: usize,
+
+    /// Confirm this explicit local L3 log capture
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectLogsMode {
+    Batch,
+    Live,
 }
 
 /// `connect profile` options.
@@ -606,8 +1197,22 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Explicit local Connect environment inventory command
+    ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
+    /// Consent-bound local Connect drive performance export
+    ConnectDrivePerformance(ConnectDrivePerformanceOpts),
+    /// Consent-bound client-to-deployment performance export
+    ConnectClientPerformance(ConnectClientPerformanceOpts),
+    /// Consent-bound S3 object performance export
+    ConnectObjectPerformance(ConnectObjectPerformanceOpts),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
+    /// Consent-bound local Connect log export
+    ConnectLogs(ConnectLogsOpts),
+    /// Consent-bound local Connect telemetry operation
+    ConnectTelemetry(ConnectTelemetryCommands),
+    /// Consent-bound local Connect top operation
+    ConnectTop(ConnectTopCommands),
 }
 
 /// Create default ServerOpts from environment variables
@@ -647,7 +1252,7 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ConnectCommands, InspectCommands, preprocess_args_for_legacy};
+    use super::{Cli, Commands, ConnectCommands, ConnectInventoryCommands, InspectCommands, preprocess_args_for_legacy};
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
@@ -788,6 +1393,44 @@ mod tests {
     }
 
     #[test]
+    fn connect_environment_inventory_requires_explicit_l1_acknowledgement() {
+        let error = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+        ])
+        .err()
+        .expect("unacknowledged L1 inventory must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l1"));
+
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--acknowledge-l1",
+        ])
+        .expect("acknowledged environment inventory parses");
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Inventory(inventory) = connect.command else {
+            panic!("inventory command expected");
+        };
+        let ConnectInventoryCommands::Environment(environment) = inventory.command;
+        assert_eq!(environment.schema_version, 1);
+        assert_eq!(environment.capability, "inventory.environment@1");
+        assert_eq!(environment.timeout_seconds, 30);
+        assert!(environment.acknowledge_l1);
+    }
+
+    #[test]
     fn connect_profile_requires_explicit_l3_acknowledgement() {
         let arguments = [
             "rustfs",
@@ -824,7 +1467,86 @@ mod tests {
             "--sample-period-micros",
             "1000",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("an incomplete unacknowledged profile must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("an incomplete unacknowledged profile must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l3"));
+    }
+
+    #[test]
+    fn connect_logs_requires_explicit_l3_acknowledgement() {
+        let arguments = [
+            "rustfs",
+            "connect",
+            "logs",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--output",
+            "/tmp/logs.zip",
+            "--organization",
+            "organizations/019e3ae0-0000-7000-8000-000000000001",
+            "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002/clusterDevices/019e3ae0-0000-7000-8000-000000000003",
+            "--run-uid",
+            "019e3ae0-0000-7000-8000-000000000004",
+            "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000005",
+            "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000006",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "4102444800",
+            "--expires-at",
+            "4102444700",
+            "--duration-millis",
+            "1000",
+        ];
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged log capture must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l3"));
+    }
+
+    #[test]
+    fn connect_telemetry_record_requires_explicit_l3_acknowledgement() {
+        let arguments = [
+            "rustfs",
+            "connect",
+            "telemetry",
+            "record",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--output",
+            "/tmp/telemetry.zip",
+            "--organization",
+            "organizations/019e3ae0-0000-7000-8000-000000000001",
+            "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000001/clusters/019e3ae0-0000-7000-8000-000000000002/clusterDevices/019e3ae0-0000-7000-8000-000000000003",
+            "--run-uid",
+            "019e3ae0-0000-7000-8000-000000000004",
+            "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000005",
+            "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000006",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "4102444800",
+            "--expires-at",
+            "4102444700",
+            "--duration-millis",
+            "10",
+        ];
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged telemetry capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }

@@ -18,7 +18,10 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ConnectCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{
+    Cli, CommandResult, Commands, ConnectCommands, ConnectInventoryCommands, ConnectPerformanceCommands, ServerOpts,
+    default_server_opts, preprocess_args_for_legacy,
+};
 use crate::apply_external_env_compat;
 use CommandResult::Server;
 use clap::Parser;
@@ -140,7 +143,18 @@ impl Opt {
             Some(Commands::Connect(opts)) => match opts.command {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
+                ConnectCommands::Inventory(opts) => match opts.command {
+                    ConnectInventoryCommands::Environment(opts) => Ok(CommandResult::ConnectEnvironmentInventory(opts)),
+                },
+                ConnectCommands::Performance(opts) => match opts.command {
+                    ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(*opts)),
+                    ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
+                    ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
+                },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
+                ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
+                ConnectCommands::Telemetry(opts) => Ok(CommandResult::ConnectTelemetry(opts.command)),
+                ConnectCommands::Top(opts) => Ok(CommandResult::ConnectTop(opts.command)),
             },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {

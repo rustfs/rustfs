@@ -375,6 +375,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/speedtest/net"),
         admin_route(Method::POST, "/v3/speedtest/site"),
         admin_route(Method::POST, "/v3/speedtest/client/devnull"),
+        admin_route(Method::GET, "/v3/speedtest/client/devnull"),
         admin_route(Method::GET, "/debug/tls/status"),
         admin_route(Method::POST, "/v3/kms/create-key"),
         admin_route(Method::POST, "/v3/kms/key/create"),

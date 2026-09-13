@@ -103,7 +103,7 @@ fn collect_window<'a>(
     sample_period: Duration,
     cancel: &'a CancellationToken,
     source: &'a dyn AllocationProfileSource,
-) -> Pin<Box<dyn Future<Output = Result<(AllocationSnapshot, AllocationSnapshot), ProfileError>> + Send + 'a>> {
+) -> AllocationWindowFuture<'a> {
     Box::pin(async move {
         let before = source.snapshot()?;
         tokio::select! {
@@ -114,6 +114,9 @@ fn collect_window<'a>(
         Ok((before, after))
     })
 }
+
+type AllocationWindowFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(AllocationSnapshot, AllocationSnapshot), ProfileError>> + Send + 'a>>;
 
 pub(crate) fn parse_allocator_stats(stats: &str) -> Result<AllocationSnapshot, ProfileError> {
     if stats.is_empty() || stats.len() > MAX_ALLOCATOR_STATS_BYTES {

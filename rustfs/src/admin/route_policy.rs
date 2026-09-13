@@ -812,6 +812,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HEALTH_INFO,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/speedtest/client/devnull",
+        HEALTH_INFO,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA, RouteRiskLevel::High),
     // MinIO-compatible profiling / trace endpoints.
     admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
