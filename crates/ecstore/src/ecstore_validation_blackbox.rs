@@ -374,9 +374,9 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     let mut heal_rx = rustfs_heal_contracts::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
 
-    // Ordinary PUTs use the same admission channel as read repair. A single
-    // rename target failure still satisfies write quorum, so the committed
-    // version must be queued for convergence without delaying the PUT ACK.
+    // Without a durable MRF consumer, partial PUTs fall back to the heal
+    // admission channel and wait for its receipt before acknowledging the write.
+    // Drive the test receiver alongside the PUT so neither waits on the other.
     let (_put_dirs, put_set) = make_local_set_disks(4, 2).await;
     let put_bucket = "bb-put-partial-convergence";
     let put_object = "object.bin";
@@ -389,42 +389,33 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         disks[0].take()
     };
     let mut put_reader = PutObjReader::from_vec(vec![0x42; BLOCK_SIZE_V2 + 1024]);
-    let committed = put_set
-        .put_object(
-            put_bucket,
-            put_object,
-            &mut put_reader,
-            &ObjectOptions {
-                no_lock: true,
-                versioned: true,
-                ..Default::default()
+    let (committed, request) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            async {
+                put_set
+                    .put_object(
+                        put_bucket,
+                        put_object,
+                        &mut put_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("partial ordinary PUT should succeed at write quorum")
             },
+            receive_matching_heal(&mut heal_rx, put_bucket, put_object),
         )
-        .await
-        .expect("partial ordinary PUT should succeed at write quorum");
+    })
+    .await
+    .expect("partial ordinary PUT and repair admission should complete together");
     let committed_version = committed
         .version_id
         .expect("versioned PUT should return a version id")
         .to_string();
 
-    let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            match heal_rx.recv().await.expect("heal channel should stay open") {
-                HealChannelCommand::Start { request, response_tx }
-                    if request.bucket == put_bucket && request.object_prefix.as_deref() == Some(put_object) =>
-                {
-                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-                    break request;
-                }
-                HealChannelCommand::Start { response_tx, .. } => {
-                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("partial ordinary PUT should enqueue convergence heal");
     assert_eq!(request.object_version_id.as_deref(), Some(committed_version.as_str()));
     assert_eq!(request.pool_index, Some(0));
     assert_eq!(request.set_index, Some(0));

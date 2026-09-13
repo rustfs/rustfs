@@ -31,12 +31,12 @@ impl FileMeta {
     pub fn read_format_versions(buf: &[u8]) -> Result<(u16, u16, u8, u8)> {
         let (buf, major, minor) = Self::check_xl2_v1(buf)?;
         if buf.len() < 5 {
-            return Err(Error::other("insufficient data for metadata length prefix"));
+            return Err(Error::FileCorrupt);
         }
         let (mut size_buf, buf) = buf.split_at(5);
-        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf).map_err(|_| Error::FileCorrupt)?;
         if buf.len() < bin_len as usize {
-            return Err(Error::other("insufficient data for metadata"));
+            return Err(Error::FileCorrupt);
         }
         let (meta, _) = buf.split_at(bin_len as usize);
         let (_, header_ver, meta_ver, _) = Self::decode_xl_headers(meta)?;
@@ -74,26 +74,26 @@ impl FileMeta {
         }
 
         if buf.len() < 5 {
-            return Err(Error::other("insufficient data for meta length"));
+            return Err(Error::FileCorrupt);
         }
 
         let (mut size_buf, buf) = buf.split_at(5);
 
         // Get meta data, buf = crc + data
-        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf).map_err(|_| Error::FileCorrupt)?;
 
         if buf.len() < bin_len as usize {
-            return Ok((&[], &[]));
+            return Err(Error::FileCorrupt);
         }
         let (meta, buf) = buf.split_at(bin_len as usize);
 
         if buf.len() < 5 {
-            return Err(Error::other("insufficient data for CRC"));
+            return Err(Error::FileCorrupt);
         }
         let (mut crc_buf, inline_data) = buf.split_at(5);
 
         // crc check
-        let crc = rmp::decode::read_u32(&mut crc_buf)?;
+        let crc = rmp::decode::read_u32(&mut crc_buf).map_err(|_| Error::FileCorrupt)?;
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
         if crc != meta_crc {
@@ -119,13 +119,13 @@ impl FileMeta {
     // Fixed u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
         if buf.len() < 5 {
-            return Err(Error::other("insufficient data for bytes header"));
+            return Err(Error::FileCorrupt);
         }
 
         let (mut size_buf, remaining) = buf.split_at(5);
 
         // Get meta data, buf = crc + data
-        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf).map_err(|_| Error::FileCorrupt)?;
 
         Ok((bin_len, remaining))
     }
@@ -137,12 +137,14 @@ impl FileMeta {
         // check version, buf = buf[8..]
         let (buf, _, _) = Self::check_xl2_v1(buf)?;
 
+        // These bytes have already been read. Invalid framing is deterministic
+        // metadata damage; preserve FileCorrupt so quorum-backed heal can repair it.
         if buf.len() < 5 {
             error!(
                 "insufficient data for metadata length prefix: expected at least 5 bytes, got {}",
                 buf.len()
             );
-            return Err(Error::other("insufficient data for metadata length prefix"));
+            return Err(Error::FileCorrupt);
         }
 
         let (mut size_buf, buf) = buf.split_at(5);
@@ -150,25 +152,25 @@ impl FileMeta {
         // Get meta data, buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf).map_err(|e| {
             error!("failed to read binary length for metadata: {}", e);
-            Error::other(format!("failed to read binary length for metadata: {e}"))
+            Error::FileCorrupt
         })?;
 
         if buf.len() < bin_len as usize {
             error!("insufficient data for metadata: expected {} bytes, got {} bytes", bin_len, buf.len());
-            return Err(Error::other("insufficient data for metadata"));
+            return Err(Error::FileCorrupt);
         }
         let (meta, buf) = buf.split_at(bin_len as usize);
 
         if buf.len() < 5 {
             error!("insufficient data for CRC: expected 5 bytes, got {} bytes", buf.len());
-            return Err(Error::other("insufficient data for CRC"));
+            return Err(Error::FileCorrupt);
         }
         let (mut crc_buf, buf) = buf.split_at(5);
 
         // crc check
         let crc = rmp::decode::read_u32(&mut crc_buf).map_err(|e| {
             error!("failed to read CRC value: {}", e);
-            Error::other(format!("failed to read CRC value: {e}"))
+            Error::FileCorrupt
         })?;
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
