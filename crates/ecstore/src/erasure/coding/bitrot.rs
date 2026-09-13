@@ -102,6 +102,7 @@ pin_project! {
         chunks: Vec<bytes::Bytes>,
         skip_verify: bool,
         last_verify_duration: Duration,
+        integrity: Option<crate::io_support::shard_integrity::ShardVerifier>,
     }
 }
 
@@ -119,11 +120,30 @@ where
             chunks: Vec::new(),
             skip_verify,
             last_verify_duration: Duration::ZERO,
+            integrity: None,
         }
     }
 
     pub(crate) fn last_verify_duration(&self) -> Duration {
         self.last_verify_duration
+    }
+
+    pub(crate) fn integrity_proof(&self) -> Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>> {
+        self.integrity
+            .as_ref()
+            .map(crate::io_support::shard_integrity::ShardVerifier::proof)
+    }
+
+    pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) -> std::io::Result<()> {
+        if self.hash_algo != HashAlgorithm::HighwayHash256S {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported protected shard framing",
+            ));
+        }
+        self.integrity = Some(verifier);
+        self.skip_verify = false;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -152,6 +172,9 @@ where
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(data).await?;
+        }
         out.copy_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)
@@ -263,6 +286,18 @@ where
     ///
     /// On return `out.len()` has grown by exactly the returned count.
     pub async fn read_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+        let start = out.len();
+        let count = self.read_appending_frame(out, want).await?;
+        if let Some(integrity) = &mut self.integrity
+            && let Err(error) = integrity.verify(&out[start..]).await
+        {
+            out.truncate(start);
+            return Err(error);
+        }
+        Ok(count)
+    }
+
+    async fn read_appending_frame(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
         use bytes::BufMut as _;
         use tokio::io::AsyncReadExt as _;
 
@@ -768,6 +803,7 @@ impl AsyncWrite for CustomWriter {
 pub struct BitrotWriterWrapper {
     bitrot_writer: BitrotWriter<CustomWriter>,
     writer_type: WriterType,
+    integrity: Option<crate::io_support::shard_integrity::ShardVerifier>,
 }
 
 /// Enum to track the type of writer we're using
@@ -801,12 +837,20 @@ impl BitrotWriterWrapper {
         Self {
             bitrot_writer: BitrotWriter::new(writer, shard_size, checksum_algo),
             writer_type,
+            integrity: None,
         }
     }
 
     /// Write data to the bitrot writer
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(buf).await?;
+        }
         self.bitrot_writer.write(buf).await
+    }
+
+    pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) {
+        self.integrity = Some(verifier);
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {

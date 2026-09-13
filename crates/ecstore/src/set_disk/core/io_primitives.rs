@@ -924,7 +924,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
     responses: &[Option<Vec<ObjectPartInfo>>],
     read_quorum: usize,
 ) -> disk::error::Result<ObjectPartInfo> {
-    let mut part_quorum: HashMap<(&str, usize, usize, i64), (usize, &ObjectPartInfo)> = HashMap::new();
+    let mut part_quorum = HashMap::new();
     let mut present_count = 0usize;
     let mut missing_count = 0usize;
     let mut transient_error_count = 0usize;
@@ -943,7 +943,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         if !parts[part_idx].etag.is_empty() {
             present_count += 1;
             let part = &parts[part_idx];
-            let key = (part.etag.as_str(), part.number, part.size, part.actual_size);
+            let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
             let (count, _) = part_quorum.entry(key).or_insert((0, part));
             *count += 1;
             continue;
@@ -1420,6 +1420,40 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 }
 
 impl BitrotReaderSetup {
+    pub(in crate::set_disk) fn bind_integrity(
+        &mut self,
+        expected: Option<&rustfs_filemeta::shard_integrity::PartIntegrity>,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        first_stripe: usize,
+    ) -> std::io::Result<()> {
+        use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+        let Some(expected) = expected else { return Ok(()) };
+        let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+        for (index, reader) in self.readers.iter_mut().enumerate() {
+            if let Some(reader) = reader {
+                let advanced = self.deferred_stripe_handles[index]
+                    .as_ref()
+                    .map(DeferredReaderStripeHandle::integrity_position);
+                reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first_stripe, advanced)?)?;
+            }
+            if let Some(reopen) = self.deferred_reopeners[index].take() {
+                let proof = Arc::clone(&proof);
+                self.deferred_reopeners[index] = Some(Arc::new(move |stripe| {
+                    let mut reader = reopen(stripe)?;
+                    let first = first_stripe.checked_add(stripe)?;
+                    reader
+                        .set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first, None).ok()?)
+                        .ok()?;
+                    Some(reader)
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
@@ -5698,6 +5732,8 @@ impl SetDisks {
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         self.recover_part_transaction(dst_object, write_quorum).await?;
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        let integrity = part.integrity.map(Arc::new);
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5711,12 +5747,39 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
             let dst_object = dst_object.clone();
             let meta = meta.clone();
+            let integrity = integrity.clone();
             async move {
                 let disk = disk?;
-                Some(
-                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
-                        .await,
-                )
+                let prepared = disk
+                    .prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                    .await;
+                if let Err(error) = prepared {
+                    return Some(Err(error));
+                }
+                if let Some(integrity) = integrity {
+                    let Some((directory, _)) = dst_object.rsplit_once('/') else {
+                        return Some(Err(DiskError::FileCorrupt));
+                    };
+                    let path = format!("{directory}/{}", integrity.file_name());
+                    // Older peers may return Ok from PreparePart without moving
+                    // the index. They must not enter the protected write quorum.
+                    let result = async {
+                        let mut reader = disk
+                            .read_file_stream(&dst_bucket, &path, 0, rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE)
+                            .await?;
+                        let mut header = [0; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header)
+                            .await
+                            .map_err(DiskError::from)?;
+                        if header != integrity.index_header() {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    return Some(result);
+                }
+                Some(Ok(()))
             }
         });
         let prepare_results = join_all(prepare_tasks).await;

@@ -903,6 +903,26 @@ impl HealTask {
         true
     }
 
+    async fn skip_retired_marker_error(&self, err: &Error) -> bool {
+        if !matches!(err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+            return false;
+        }
+        if let Some(identity) = self.single_object_identity() {
+            let mut outcome = self.outcome.write().await;
+            outcome.attempt_failed();
+            outcome.record(HealObjectOutcome {
+                identity,
+                disposition: HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::RetiredMarkerProof,
+                    retry_not_before: None,
+                },
+                detail: Some(err.to_string()),
+            });
+        }
+        self.progress.write().await.update_stage(3, 3);
+        true
+    }
+
     async fn skip_dangling_delete_grace_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::is_dangling_delete_grace_error(err) {
             return false;

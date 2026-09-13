@@ -762,10 +762,12 @@ mod absence_receipt_regressions {
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.counters.processed, 3);
         assert_eq!(outcome.counters.healed, 1, "completed cleanup must be repaired: {outcome:?}");
-        assert_eq!(outcome.counters.unchanged, 2);
-        assert_eq!(outcome.counters.unknown, 0);
+        // Exact historical absence has its own proof. The two live legacy
+        // versions remain readable but carry no independent payload receipt.
+        assert_eq!(outcome.counters.unchanged, 0);
+        assert_eq!(outcome.counters.unknown, 2);
         assert_eq!(outcome.counters.failed, 0);
-        assert_eq!(outcome.counters.skipped, 0);
+        assert_eq!(outcome.counters.skipped, 2);
         assert_versions(&store, bucket, &old, &current).await;
     }
 

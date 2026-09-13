@@ -94,7 +94,7 @@ fn verified_object_receipt(
     item: &HealResultItem,
     bucket_incarnation_id: Uuid,
 ) -> Option<HealObjectReceipt> {
-    if opts.dry_run {
+    if opts.dry_run || !item.integrity_verified {
         return None;
     }
     let resolved_version = Uuid::from_bytes(item.resolved_version_id?);
@@ -1210,7 +1210,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             } else {
                 None
             }
-        } else if error.is_none() && !opts.dry_run {
+        } else if error.is_none() && !opts.dry_run && item.integrity_verified {
             self.ecstore
                 .bucket_incarnation_id(bucket)
                 .await
@@ -1666,7 +1666,7 @@ mod tests {
     };
 
     #[test]
-    fn object_receipt_requires_resolved_version_evidence() {
+    fn object_receipt_requires_integrity_and_resolved_version_evidence() {
         use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
         use rustfs_madmin::heal_commands::HealDriveInfo;
         let incarnation = Uuid::new_v4();
@@ -1674,6 +1674,7 @@ mod tests {
         let latest = Uuid::new_v4();
         let options = HealOpts::default();
         let mut item = HealResultItem {
+            integrity_verified: true,
             version_id: null.clone(),
             resolved_version_id: Some(*latest.as_bytes()),
             ..Default::default()
@@ -1711,6 +1712,13 @@ mod tests {
                 .disposition,
             HealObjectDisposition::Repaired
         );
+        item.integrity_verified = false;
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "the exact version cannot certify unverified shard integrity"
+        );
+        assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+        item.integrity_verified = true;
         item.resolved_version_id = None;
         assert!(
             verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),

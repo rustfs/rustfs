@@ -577,6 +577,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+            Disk::Remote(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
@@ -1175,6 +1182,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_file_durable(&self, _src_volume: &str, _src_path: &str, _dst_volume: &str, _dst_path: &str) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn prepare_part_transaction(
         &self,
@@ -1508,6 +1518,10 @@ pub struct DeleteOptions {
     #[serde(default)]
     pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+    /// Full marker precondition checked under the actual metadata mutation lease.
+    /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1796,6 +1810,7 @@ mod tests {
             undo_write: true,
             undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
+            expected_delete_marker: None,
         };
 
         assert!(opts.recursive);

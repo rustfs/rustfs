@@ -47,6 +47,7 @@ mod storage_api;
 
 use storage_api::integration::{
     BucketOperations, ECStore, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _,
+    ShardIntegrityWriteMode,
 };
 
 /// 256 KiB + change: large enough to be stored as non-inline erasure shards
@@ -103,6 +104,7 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
     let mut reader = PutObjReader::from_vec(data.to_vec());
     let opts = ObjectOptions {
         versioned: true,
+        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
         ..Default::default()
     };
     let info = (**ecstore)
@@ -118,7 +120,15 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
 async fn put_unversioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
-        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            },
+        )
         .await
         .expect("unversioned put_object failed");
     wait_for_put_tail(ecstore, bucket, object).await;
@@ -146,8 +156,8 @@ fn object_dir(disk: &Path, bucket: &str, object: &str) -> PathBuf {
     disk.join(bucket).join(object)
 }
 
-/// Count `part.*` data-shard files two levels below the object dir
-/// (`<object>/<data-uuid>/part.N`). One data dir per non-delete-marker version.
+/// Count `part.N` data-shard files two levels below the object dir, excluding
+/// integrity indexes. One data dir per non-delete-marker version.
 fn count_part_files(obj_dir: &Path) -> usize {
     if !obj_dir.exists() {
         return 0;
@@ -157,7 +167,14 @@ fn count_part_files(obj_dir: &Path) -> usize {
         .max_depth(2)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part."))
+                    .is_some_and(|number| number.parse::<usize>().is_ok())
+        })
         .count()
 }
 
@@ -346,8 +363,16 @@ mod serial_tests {
                     .await
                     .expect("heal exact version");
                 assert!(healed.error.is_none(), "exact version repair failed: {:?}", healed.error);
-                let receipt = healed.receipt.expect("exact version repair must produce a receipt");
-                assert_eq!(receipt.identity.version_id, item.version_id);
+                if item.is_delete_marker {
+                    assert!(!healed.item.integrity_verified);
+                    assert!(healed.receipt.is_none(), "delete markers carry no shard-integrity proof");
+                } else {
+                    assert!(healed.item.integrity_verified);
+                    let receipt = healed
+                        .receipt
+                        .expect("verified exact data version repair must produce a receipt");
+                    assert_eq!(receipt.identity.version_id, item.version_id);
+                }
                 assert_eq!(
                     healed.item.resolved_version_id,
                     Some(
@@ -494,7 +519,22 @@ mod serial_tests {
                 .expect("an omitted selector must still heal latest");
             assert!(latest_result.error.is_none());
             assert_eq!(latest_result.item.object_size, latest_data.len());
-            assert!(latest_result.receipt.is_some());
+            assert!(latest_result.receipt.is_none(), "a normal scan cannot certify payload integrity");
+            let verified_latest = storage
+                .heal_object_with_receipt(
+                    &bucket,
+                    object,
+                    None,
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("deep heal of latest");
+            assert!(verified_latest.error.is_none());
+            assert_eq!(verified_latest.item.object_size, latest_data.len());
+            assert!(verified_latest.receipt.is_some(), "a deep scan can certify the exact latest version");
             for (version, data) in &versions {
                 assert_eq!(&read_version(&ecstore, &bucket, object, version).await, data);
             }
