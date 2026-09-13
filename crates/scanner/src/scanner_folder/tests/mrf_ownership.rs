@@ -219,6 +219,7 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
 struct NoticeStorage {
     calls: std::sync::Mutex<HashMap<String, u32>>,
     retry_started: tokio::sync::Notify,
+    bucket_incarnation_id: Uuid,
 }
 
 #[async_trait::async_trait]
@@ -234,6 +235,9 @@ impl HealStorageAPI for NoticeStorage {
             name: bucket.to_string(),
             ..Default::default()
         }))
+    }
+    async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
+        Ok(Some(self.bucket_incarnation_id))
     }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
@@ -315,13 +319,23 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
     }
     // The production ingress channel is a process singleton; isolation keeps
     // its receiver and lease generations independent from other scanner tests.
+    // Partial writes require a committed journal and a complete bucket identity
+    // before the real consumer may dispatch them.
+    let journal_root = tempfile::tempdir().expect("MRF journal fixture");
+    let _journal_env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(journal_root.path())
+        .build()
+        .await;
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     let bucket = format!("mrf-ownership-{}", Uuid::new_v4());
     scanner.new_cache.info.name = bucket.clone();
     scanner.update_cache.info.name = bucket.clone();
     scanner.heal_object_select = 1;
-    let storage = Arc::new(NoticeStorage::default());
+    let storage = Arc::new(NoticeStorage {
+        bucket_incarnation_id: Uuid::new_v4(),
+        ..Default::default()
+    });
     let manager = Arc::new(HealManager::new(
         storage.clone(),
         Some(HealConfig {
