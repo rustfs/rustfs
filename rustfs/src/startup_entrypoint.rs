@@ -302,13 +302,13 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
     use crate::connect::{
         LocalOtlpHeaders, LocallyReviewedTraceArtifact, MAX_OTLP_BODY_BYTES, MAX_TELEMETRY_RESULT_BYTES, OtlpBatch,
         RecordedTrace, TelemetryDiagnosticResult, TelemetryProducerError, TelemetryTool, TraceRecordLimits, analyze_trace,
-        export_trace_otlp_result, record_diagnostic_result, record_trace_bus, replay_trace_result,
+        export_trace_otlp_result, record_diagnostic_result, replay_trace_result, request_local_trace_capture,
     };
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     match command {
         ConnectTelemetryCommands::Record(options) => {
-            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            let (key, request, _consent) = telemetry_context(&options.artifact)?;
             request.validate().map_err(Error::other)?;
             if options.duration_millis == 0
                 || options.duration_millis > 30_000
@@ -319,8 +319,9 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
             }
             let cancel = CancellationToken::new();
             let started = Instant::now();
-            let capture = record_trace_bus(
-                consent,
+            let capture = request_local_trace_capture(
+                &options.artifact.state_dir,
+                options.artifact.consent_expires_at_unix,
                 TraceRecordLimits {
                     duration: Duration::from_millis(options.duration_millis),
                     max_spans: options.max_spans,
@@ -342,7 +343,7 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
                     let result = record_diagnostic_result(&request, capture, started.elapsed());
                     save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
                 }
-                Err(TelemetryProducerError::SourceUnavailable) => {
+                Err(crate::connect::LocalTraceCaptureError::Producer(TelemetryProducerError::SourceUnavailable)) => {
                     let result = TelemetryDiagnosticResult::<RecordedTrace>::unsupported(
                         &request,
                         TelemetryTool::Record,

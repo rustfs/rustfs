@@ -33,6 +33,11 @@ mod trace_analysis;
 mod trace_otlp;
 mod trace_record;
 mod trace_replay;
+#[cfg(unix)]
+mod trace_runtime;
+#[cfg(not(unix))]
+#[path = "trace_runtime_unsupported.rs"]
+mod trace_runtime;
 
 pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
@@ -123,3 +128,6 @@ pub use trace_record::{
     record_diagnostic_result, record_trace, record_trace_bus, save_signed_telemetry_export,
 };
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
+pub(crate) use trace_runtime::{
+    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+};

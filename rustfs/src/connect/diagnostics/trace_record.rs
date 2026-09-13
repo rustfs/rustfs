@@ -133,14 +133,14 @@ pub struct RecordedTrace {
     pub dropped_span_count: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TraceRecordCompletion {
     Complete,
     LimitExceeded,
     SourceUnavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceRecordCapture {
     pub data: RecordedTrace,
     pub completion: TraceRecordCompletion,

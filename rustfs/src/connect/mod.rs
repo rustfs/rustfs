@@ -114,6 +114,9 @@ pub use diagnostics::{
     TopRpcData, capture_top_api, capture_top_disk, capture_top_locks, capture_top_net, capture_top_rpc, evaluate_disk_window,
     evaluate_network_window, save_signed_top_export, sign_top_export,
 };
+pub(crate) use diagnostics::{
+    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+};
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
     EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, collect_environment,
