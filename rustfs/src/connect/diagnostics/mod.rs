@@ -15,6 +15,7 @@
 mod logs;
 mod perf_client;
 mod perf_drive;
+mod perf_network;
 mod perf_object;
 mod profile_cpu;
 mod profile_memory;
@@ -46,6 +47,18 @@ pub use perf_drive::{
     DrivePerformanceError, DrivePerformanceRequest, DriveProvenance, DriveReadMode, DriveReasonCode, DriveTargetParameters,
     DriveTargetReasonCode, DriveTargetResult, DriveTargetUnits, LocalDriveConsent, SavedDriveExport, SignedDriveExport,
     measure_drive, save_signed_drive_export, sign_drive_export, validate_drive_limits,
+};
+pub use perf_network::{
+    LocalNetworkConsent, MAX_ARCHIVE_BYTES as MAX_NETWORK_ARCHIVE_BYTES,
+    MAX_BANDWIDTH_BYTES_PER_SECOND as MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND,
+    MAX_DECOMPRESSED_BYTES as MAX_NETWORK_DECOMPRESSED_BYTES, MAX_ENVELOPE_BYTES as MAX_NETWORK_ENVELOPE_BYTES,
+    MAX_NETWORK_DURATION, MAX_OPERATIONS as MAX_NETWORK_OPERATIONS, MAX_PEERS as MAX_NETWORK_PEERS,
+    MAX_RESULT_BYTES as MAX_NETWORK_RESULT_BYTES, MAX_TRAFFIC_BYTES as MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY,
+    NETWORK_SCHEMA_VERSION, NETWORK_TOOL_ID, NetworkCoverage, NetworkDiagnosticResult, NetworkMeasurement, NetworkOutcome,
+    NetworkPeerHarness, NetworkPeerResult, NetworkPerformanceData, NetworkPerformanceError, NetworkPerformanceRequest,
+    NetworkProvenance, NetworkReasonCode, PeerProbeError, PeerProbeFuture, PeerProbeMeasurement, PeerReasonCode,
+    SavedNetworkExport, SignedNetworkExport, measure_network, measure_network_with_harness, save_signed_network_export,
+    sign_network_export,
 };
 pub use perf_object::{
     LocalObjectConsent, MAX_OBJECT_BANDWIDTH_BYTES_PER_SECOND, MAX_OBJECT_DURATION, MAX_OBJECT_RESULT_BYTES,
