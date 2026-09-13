@@ -79,7 +79,6 @@ pub(crate) async fn init_startup_runtime_services(
 ) -> Result<StartupServiceRuntime> {
     init_kms_system(config, store.clone()).await?;
 
-    let optional_runtimes = init_optional_runtime_services().await?;
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
     let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
     let inventory_drives = heartbeat_config
@@ -91,6 +90,9 @@ pub(crate) async fn init_startup_runtime_services(
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
     let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+
+    // TFTP validates its fixed service-account credentials against IAM at startup.
+    let optional_runtimes = init_optional_runtime_services().await?;
 
     // Audit initialization requires the AppContext (server config + object store)
     // which is published by ensure_startup_after_iam inside init_iam_runtime.

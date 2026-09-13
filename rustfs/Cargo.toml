@@ -64,10 +64,11 @@ ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 sftp = ["rustfs-protocols/sftp"]
+tftp = ["rustfs-protocols/tftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "tftp", "pyroscope", "gcs"]
 e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
