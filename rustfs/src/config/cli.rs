@@ -127,6 +127,8 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Read the persisted deployment inventory and collect an approved environment summary
+    Inventory(ConnectInventoryOpts),
     /// Run an explicitly approved, bounded local performance measurement
     Performance(ConnectPerformanceOpts),
     /// Capture a consent-bound local profile and write a signed export
@@ -137,6 +139,37 @@ pub enum ConnectCommands {
     Telemetry(ConnectTelemetryOpts),
     /// Capture a consent-bound local top snapshot
     Top(ConnectTopOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInventoryOpts {
+    #[command(subcommand)]
+    pub command: ConnectInventoryCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectInventoryCommands {
+    /// Collect the bounded inventory.environment@1 summary
+    Environment(ConnectEnvironmentInventoryOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectEnvironmentInventoryOpts {
+    /// Directory containing the persisted Connect inventory
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// Negotiated environment schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated environment capability
+    #[arg(long, default_value = "inventory.environment@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Maximum collection time in seconds
+    #[arg(long = "timeout-seconds", default_value_t = 30)]
+    pub timeout_seconds: u64,
+    /// Confirm this explicit local L1 inventory operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
 }
 
 #[derive(Args, Clone)]
@@ -215,6 +248,8 @@ pub struct ConnectPerformanceOpts {
 pub enum ConnectPerformanceCommands {
     /// Measure bounded client-to-deployment transfer performance
     Client(Box<ConnectClientPerformanceOpts>),
+    /// Measure bounded S3 object throughput in a dedicated temporary namespace
+    Object(Box<ConnectObjectPerformanceOpts>),
     /// Measure generated-file write and warm page-cache read performance
     Drive(Box<ConnectDrivePerformanceOpts>),
 }
@@ -306,6 +341,111 @@ pub struct ConnectClientPerformanceOpts {
     /// Client transfer operation
     #[arg(long, value_enum)]
     pub operation: ConnectClientPerformanceOperation,
+
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+
+    /// Stable opaque alias for the deployment target
+    #[arg(long = "target-alias", default_value = "deployment-1", value_parser = NonEmptyStringValueParser::new())]
+    pub target_alias: String,
+
+    /// Confirm this explicit local L1 diagnostic operation
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectObjectPerformanceOperation {
+    Get,
+    Put,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectObjectPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// RustFS deployment endpoint
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// Optional PEM root certificate for the deployment endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: Option<PathBuf>,
+
+    /// Optional explicit HTTP(S) proxy without embedded credentials
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub proxy: Option<String>,
+
+    /// Owner-readable file containing the S3 access key
+    #[arg(long = "access-key-file")]
+    pub access_key_file: PathBuf,
+
+    /// Owner-readable file containing the S3 secret key
+    #[arg(long = "secret-key-file")]
+    pub secret_key_file: PathBuf,
+
+    /// Optional owner-readable file containing an S3 session token
+    #[arg(long = "session-token-file")]
+    pub session_token_file: Option<PathBuf>,
+
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.object@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+
+    /// Object transfer operation
+    #[arg(long, value_enum)]
+    pub operation: ConnectObjectPerformanceOperation,
 
     /// Generated transfer size in bytes
     #[arg(long = "traffic-bytes", default_value_t = 65_536)]
@@ -1057,10 +1197,14 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Explicit local Connect environment inventory command
+    ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
     ConnectClientPerformance(ConnectClientPerformanceOpts),
+    /// Consent-bound S3 object performance export
+    ConnectObjectPerformance(ConnectObjectPerformanceOpts),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export
@@ -1108,7 +1252,7 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ConnectCommands, InspectCommands, preprocess_args_for_legacy};
+    use super::{Cli, Commands, ConnectCommands, ConnectInventoryCommands, InspectCommands, preprocess_args_for_legacy};
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
@@ -1249,6 +1393,44 @@ mod tests {
     }
 
     #[test]
+    fn connect_environment_inventory_requires_explicit_l1_acknowledgement() {
+        let error = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+        ])
+        .err()
+        .expect("unacknowledged L1 inventory must fail");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--acknowledge-l1"));
+
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--acknowledge-l1",
+        ])
+        .expect("acknowledged environment inventory parses");
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Inventory(inventory) = connect.command else {
+            panic!("inventory command expected");
+        };
+        let ConnectInventoryCommands::Environment(environment) = inventory.command;
+        assert_eq!(environment.schema_version, 1);
+        assert_eq!(environment.capability, "inventory.environment@1");
+        assert_eq!(environment.timeout_seconds, 30);
+        assert!(environment.acknowledge_l1);
+    }
+
+    #[test]
     fn connect_profile_requires_explicit_l3_acknowledgement() {
         let arguments = [
             "rustfs",
@@ -1285,7 +1467,9 @@ mod tests {
             "--sample-period-micros",
             "1000",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("an incomplete unacknowledged profile must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("an incomplete unacknowledged profile must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }
@@ -1321,7 +1505,9 @@ mod tests {
             "--duration-millis",
             "1000",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("unacknowledged log capture must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged log capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }
@@ -1358,7 +1544,9 @@ mod tests {
             "--duration-millis",
             "10",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("unacknowledged telemetry capture must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged telemetry capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }

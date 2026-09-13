@@ -904,10 +904,15 @@ impl DiagnosticProbeCapabilities {
                 "object PUT/GET benchmark harness is not implemented",
                 Some("/rustfs/admin/v3/speedtest/object"),
             ),
-            inter_node_netperf: unsupported(
-                "inter-node traffic benchmark harness is not implemented",
-                Some("/rustfs/admin/v3/speedtest/net"),
-            ),
+            inter_node_netperf: DiagnosticProbeCapability {
+                status: CapabilityStatus::supported()
+                    .with_reason("actively measures bounded authenticated traffic to every remote cluster peer"),
+                mode: "active_inter_node_probe",
+                route: Some("/rustfs/admin/v3/speedtest/net"),
+                max_bytes: Some(super::diagnostics::NETWORK_PROBE_MAX_BYTES),
+                max_duration_secs: Some(super::diagnostics::NETWORK_PROBE_MAX_DURATION.as_secs()),
+                max_concurrency: Some(super::diagnostics::NETWORK_PROBE_MAX_CONCURRENCY),
+            },
             site_speedtest: unsupported(
                 "site traffic benchmark harness is not implemented",
                 Some("/rustfs/admin/v3/speedtest/site"),
@@ -1421,10 +1426,23 @@ mod tests {
             response.diagnostic_probes.client_devnull.max_concurrency,
             Some(super::super::diagnostics::CLIENT_DEVNULL_MAX_CONCURRENCY)
         );
+        assert_eq!(response.diagnostic_probes.inter_node_netperf.status.state, CapabilityState::Supported);
+        assert_eq!(response.diagnostic_probes.inter_node_netperf.mode, "active_inter_node_probe");
+        assert_eq!(
+            response.diagnostic_probes.inter_node_netperf.max_bytes,
+            Some(super::super::diagnostics::NETWORK_PROBE_MAX_BYTES)
+        );
+        assert_eq!(
+            response.diagnostic_probes.inter_node_netperf.max_duration_secs,
+            Some(super::super::diagnostics::NETWORK_PROBE_MAX_DURATION.as_secs())
+        );
+        assert_eq!(
+            response.diagnostic_probes.inter_node_netperf.max_concurrency,
+            Some(super::super::diagnostics::NETWORK_PROBE_MAX_CONCURRENCY)
+        );
         for probe in [
             &response.diagnostic_probes.inspect_archive,
             &response.diagnostic_probes.object_speedtest,
-            &response.diagnostic_probes.inter_node_netperf,
             &response.diagnostic_probes.site_speedtest,
             &response.diagnostic_probes.site_replication_netperf,
         ] {

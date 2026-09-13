@@ -12,14 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod connect {
-    pub use rustfs::connect::DeviceIdentity;
-}
-
-#[allow(dead_code)]
-#[path = "../src/connect/diagnostics/perf_network.rs"]
-mod perf_network;
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
@@ -32,11 +24,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use p256::pkcs8::DecodePublicKey as _;
-use perf_network::{
-    LocalNetworkConsent, MAX_NETWORK_DURATION, MAX_TRAFFIC_BYTES, NETWORK_CAPABILITY, NetworkOutcome, NetworkPeerHarness,
-    NetworkPerformanceError, NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PeerProbeError, PeerProbeFuture,
-    PeerProbeMeasurement, PeerReasonCode, measure_network, measure_network_with_harness, save_signed_network_export,
-    sign_network_export,
+use rustfs::connect::{
+    DeviceIdentity, LocalNetworkConsent, MAX_NETWORK_DURATION, MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY, NetworkOutcome,
+    NetworkPeerHarness, NetworkPerformanceError, NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PeerProbeError,
+    PeerProbeFuture, PeerProbeMeasurement, PeerReasonCode, measure_network, measure_network_with_harness,
+    save_signed_network_export, sign_network_export,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -144,10 +136,64 @@ async fn unused_address() -> SocketAddr {
     address
 }
 
-#[test]
-fn native_network_source_is_explicitly_unsupported() {
+#[tokio::test]
+async fn real_rustfs_peer_accepts_authenticated_payload_and_attributes_disconnect() {
+    use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+    use rustfs_ecstore::api::disk::Endpoint;
+    use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use rustfs_ecstore::api::rpc::{NetworkPeerProbeClient, NetworkPeerProbeError};
+
+    let _guard = TEST_HARNESS_LOCK.lock().await;
+    let port = match find_available_port() {
+        Ok(port) => port,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("find free port: {error}"),
+    };
+    let server = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port}"))
+        .access_key("network-probe-access")
+        .secret_key("network-probe-secret")
+        .build()
+        .await
+        .expect("start real RustFS peer");
+    let mut local = Endpoint::try_from("http://127.0.0.1:1/local").expect("local endpoint");
+    local.is_local = true;
+    let remote_url = format!("{}/remote", server.endpoint());
+    let mut remote = Endpoint::try_from(remote_url.as_str()).expect("remote endpoint");
+    remote.is_local = false;
+    let topology = EndpointServerPools::from(vec![PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: 2,
+        endpoints: Endpoints::from(vec![local, remote]),
+        cmd_line: String::new(),
+        platform: String::new(),
+    }]);
+    let client = NetworkPeerProbeClient::from_endpoint_pools(&topology);
+    assert_eq!(client.targets()[0].alias, "peer-1");
+    let measurement = client
+        .probe("peer-1", 65_536, Duration::from_secs(2), &CancellationToken::new())
+        .await
+        .expect("authenticated RustFS peer probe");
+    assert_eq!(measurement.transferred_bytes, 65_536);
+    assert!(!measurement.duration.is_zero());
+    assert!(!measurement.latency.is_zero());
+
+    server.shutdown().await;
+    assert_eq!(
+        client
+            .probe("peer-1", 65_536, Duration::from_secs(2), &CancellationToken::new())
+            .await,
+        Err(NetworkPeerProbeError::Unreachable)
+    );
+}
+
+#[tokio::test]
+async fn native_network_source_is_explicitly_unsupported_without_runtime_topology() {
     let request = request(1);
-    let measurement = measure_network(&request, &CancellationToken::new()).expect("typed unsupported result");
+    let measurement = measure_network(&request, &CancellationToken::new())
+        .await
+        .expect("typed unsupported result");
     assert_eq!(measurement.result.outcome(), NetworkOutcome::Unsupported);
     assert_eq!(measurement.result.reason_code(), NetworkReasonCode::SourceUnavailable);
     assert!(measurement.result.data().is_none());
@@ -164,7 +210,7 @@ fn native_network_source_is_explicitly_unsupported() {
     assert_eq!(value["provenance"]["executableSha256"], "d".repeat(64));
 
     assert!(matches!(
-        sign_network_export(&request, &measurement, &connect::DeviceIdentity::generate(), &CancellationToken::new()),
+        sign_network_export(&request, &measurement, &DeviceIdentity::generate(), &CancellationToken::new()),
         Err(NetworkPerformanceError::InvalidRequest)
     ));
 }
@@ -269,7 +315,7 @@ async fn short_transfer_cannot_be_reported_as_a_successful_benchmark() {
 async fn invalid_and_over_budget_requests_fail_before_peer_io() {
     let harness = CountingHarness(AtomicUsize::new(0));
     let mut over_traffic = request(1);
-    over_traffic.traffic_bytes_per_peer = MAX_TRAFFIC_BYTES + 1;
+    over_traffic.traffic_bytes_per_peer = MAX_NETWORK_TRAFFIC_BYTES + 1;
     assert!(matches!(
         measure_network_with_harness(&over_traffic, &harness, &CancellationToken::new()).await,
         Err(NetworkPerformanceError::LimitExceeded)
@@ -351,11 +397,11 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
         .expect("successful controlled result");
     assert_eq!(peer.await.expect("peer task"), 4_096);
     assert_eq!(measurement.result.outcome(), NetworkOutcome::Succeeded);
-    let identity = connect::DeviceIdentity::generate();
+    let identity = DeviceIdentity::generate();
     let export = sign_network_export(&request, &measurement, &identity, &CancellationToken::new()).expect("signed export");
-    assert!(export.result_json.len() <= perf_network::MAX_RESULT_BYTES);
-    assert!(export.envelope_json.len() <= perf_network::MAX_ENVELOPE_BYTES);
-    assert!(export.archive_bytes.len() <= perf_network::MAX_ARCHIVE_BYTES);
+    assert!(export.result_json.len() <= rustfs::connect::MAX_NETWORK_RESULT_BYTES);
+    assert!(export.envelope_json.len() <= rustfs::connect::MAX_NETWORK_ENVELOPE_BYTES);
+    assert!(export.archive_bytes.len() <= rustfs::connect::MAX_NETWORK_ARCHIVE_BYTES);
     assert_eq!(export.archive_sha256, hex(&Sha256::digest(&export.archive_bytes)));
     let mut archive = zip::ZipArchive::new(Cursor::new(&export.archive_bytes)).expect("three-file archive");
     assert_eq!(archive.len(), 3);

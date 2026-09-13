@@ -36,6 +36,10 @@ pub(crate) mod inspect {
 }
 
 pub(crate) mod cluster {
+    pub(crate) mod network_probe {
+        pub(crate) use crate::storage::storage_api::ecstore_rpc::{NetworkPeerProbeClient, NetworkPeerProbeError};
+    }
+
     pub(crate) mod contract {
         pub(crate) mod capability {
             #[cfg(test)]

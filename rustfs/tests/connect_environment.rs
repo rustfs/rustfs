@@ -14,6 +14,17 @@
 
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
+use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use rustfs::connect::{
+    CredentialStore, HeartbeatConfig, IdentityStore, InventorySchedule, InventoryStatus, spawn_inventory_runtime,
+};
 use rustfs::connect::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
     EnvironmentFilesystemType, InventorySnapshot, MAX_ENVIRONMENT_DURATION, collect_environment,
@@ -98,4 +109,76 @@ async fn environment_collection_emits_only_the_closed_identifier_free_schema() {
 
     println!("inventory.environment actual output: {encoded}");
     assert!(matches!(serialized, Value::Object(_)));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn production_binary_collects_environment_from_persisted_inventory() {
+    let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe tempdir");
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state root");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state root");
+    let config = HeartbeatConfig::new(
+        "",
+        Vec::new(),
+        IdentityStore::new(state.join("identity")),
+        CredentialStore::new(state.join("credential")),
+        state.join("heartbeat/state.json"),
+    );
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_inventory_runtime(Some(config), InventorySchedule::default(), &shutdown, || {
+        std::future::ready(Ok(inventory()))
+    })
+    .expect("state-only inventory runtime")
+    .expect("configured inventory runtime");
+    let mut status = runtime.status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(&*status.borrow(), InventoryStatus::Unchanged { .. }) {
+                break;
+            }
+            status.changed().await.expect("inventory runtime remains active");
+        }
+    })
+    .await
+    .expect("persisted inventory timeout");
+    runtime.shutdown().await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rustfs"))
+        .args([
+            "connect",
+            "inventory",
+            "environment",
+            "--state-dir",
+            state.to_str().expect("UTF-8 state path"),
+            "--acknowledge-l1",
+        ])
+        .output()
+        .expect("run production RustFS binary");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let actual: Value = serde_json::from_slice(&output.stdout).expect("environment JSON output");
+    assert_eq!(actual["nodeCount"], 2);
+    assert_eq!(actual["driveCount"], 8);
+    assert_eq!(actual.as_object().expect("environment object").len(), 4);
+
+    for (argument, value, expected) in [
+        ("--schema-version", "0", "inventory_environment_unsupported_version"),
+        ("--capability", "inventory.environment@2", "inventory_environment_unsupported_capability"),
+    ] {
+        let rejected = Command::new(env!("CARGO_BIN_EXE_rustfs"))
+            .args([
+                "connect",
+                "inventory",
+                "environment",
+                "--state-dir",
+                state.to_str().expect("UTF-8 state path"),
+                "--acknowledge-l1",
+                argument,
+                value,
+            ])
+            .output()
+            .expect("run incompatible production command");
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(expected));
+    }
 }

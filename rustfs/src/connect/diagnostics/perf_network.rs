@@ -13,12 +13,6 @@
 // limitations under the License.
 
 //! Consent-bound inter-node network performance results.
-//!
-//! RustFS does not yet expose a controlled inter-node performance harness.
-//! [`measure_network`] therefore emits an explicit `UNSUPPORTED` result. The
-//! injected harness boundary exists so a real RustFS peer adapter can be wired
-//! without weakening validation, budgets, cancellation, attribution, or the
-//! frozen Connect result contract.
 
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
@@ -40,6 +34,7 @@ use uuid::{Uuid, Variant, Version};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::connect::DeviceIdentity;
+use crate::storage_api::cluster::network_probe::{NetworkPeerProbeClient, NetworkPeerProbeError as NativePeerProbeError};
 
 pub const NETWORK_SCHEMA_VERSION: u16 = 1;
 pub const NETWORK_TOOL_ID: &str = "performance.network";
@@ -285,6 +280,26 @@ pub trait NetworkPeerHarness: Send + Sync {
     fn probe<'a>(&'a self, peer_alias: &'a str, traffic_bytes: u64, cancel: &'a CancellationToken) -> PeerProbeFuture<'a>;
 }
 
+struct RuntimeNetworkPeerHarness {
+    client: NetworkPeerProbeClient,
+}
+
+impl NetworkPeerHarness for RuntimeNetworkPeerHarness {
+    fn probe<'a>(&'a self, peer_alias: &'a str, traffic_bytes: u64, cancel: &'a CancellationToken) -> PeerProbeFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .probe(peer_alias, traffic_bytes, MAX_NETWORK_DURATION, cancel)
+                .await
+                .map(|measurement| PeerProbeMeasurement {
+                    transferred_bytes: measurement.transferred_bytes,
+                    duration: measurement.duration,
+                    latency: measurement.latency,
+                })
+                .map_err(map_native_probe_error)
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedNetworkExport {
     pub artifact_uid: String,
@@ -337,7 +352,7 @@ pub enum NetworkPerformanceError {
 }
 
 /// Return the current native capability state without generating test traffic.
-pub fn measure_network(
+pub async fn measure_network(
     request: &NetworkPerformanceRequest,
     cancel: &CancellationToken,
 ) -> Result<NetworkMeasurement, NetworkPerformanceError> {
@@ -346,14 +361,33 @@ pub fn measure_network(
         return Ok(terminal_measurement(request, NetworkOutcome::Cancelled, NetworkReasonCode::Cancelled));
     }
 
-    // Existing admin speedtest and site-netperf handlers both state that no
-    // distributed peer traffic harness is wired. Client devnull is a different
-    // tool and must not be presented as inter-node evidence.
-    Ok(terminal_measurement(
-        request,
-        NetworkOutcome::Unsupported,
-        NetworkReasonCode::SourceUnavailable,
-    ))
+    let Some(endpoint_pools) = crate::runtime_sources::current_endpoints_handle() else {
+        return Ok(terminal_measurement(
+            request,
+            NetworkOutcome::Unsupported,
+            NetworkReasonCode::SourceUnavailable,
+        ));
+    };
+    let harness = RuntimeNetworkPeerHarness {
+        client: NetworkPeerProbeClient::from_endpoint_pools(&endpoint_pools),
+    };
+    let aliases = harness
+        .client
+        .targets()
+        .into_iter()
+        .map(|target| target.alias)
+        .collect::<Vec<_>>();
+    if aliases.is_empty() {
+        return Ok(terminal_measurement(
+            request,
+            NetworkOutcome::Unsupported,
+            NetworkReasonCode::SourceUnavailable,
+        ));
+    }
+    if aliases != request.peer_aliases {
+        return Err(NetworkPerformanceError::InvalidRequest);
+    }
+    measure_network_with_harness(request, &harness, cancel).await
 }
 
 pub async fn measure_network_with_harness(
@@ -738,6 +772,17 @@ fn peer_reason(error: PeerProbeError) -> PeerReasonCode {
         PeerProbeError::TimedOut => PeerReasonCode::TimedOut,
         PeerProbeError::ProtocolFailure => PeerReasonCode::ProtocolFailure,
         PeerProbeError::Cancelled => PeerReasonCode::Cancelled,
+    }
+}
+
+fn map_native_probe_error(error: NativePeerProbeError) -> PeerProbeError {
+    match error {
+        NativePeerProbeError::Cancelled => PeerProbeError::Cancelled,
+        NativePeerProbeError::Unreachable => PeerProbeError::Unreachable,
+        NativePeerProbeError::TimedOut => PeerProbeError::TimedOut,
+        NativePeerProbeError::UnknownPeer | NativePeerProbeError::LimitExceeded | NativePeerProbeError::ProtocolFailure => {
+            PeerProbeError::ProtocolFailure
+        }
     }
 }
 

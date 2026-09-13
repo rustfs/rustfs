@@ -28,7 +28,7 @@ use profile_cpu::{
     LocalProfileConsent, ProfileCaptureRequest, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode,
     THREAD_PROFILE_CAPABILITY, ThreadProfileScope,
 };
-use profile_threads::capture_thread_profile;
+use profile_threads::{capture_thread_profile, export_thread_profile};
 use tokio_util::sync::CancellationToken;
 
 fn request() -> ProfileCaptureRequest {
@@ -60,6 +60,7 @@ fn request() -> ProfileCaptureRequest {
 
 #[test]
 fn tokio_and_native_thread_scopes_remain_explicitly_unsupported() {
+    let key = connect::DeviceIdentity::generate();
     for scope in [ThreadProfileScope::TokioRuntime, ThreadProfileScope::NativeThreads] {
         let result = capture_thread_profile(&request(), scope, &CancellationToken::new()).expect("unsupported result");
         assert_eq!(result.outcome(), ProfileOutcome::Unsupported);
@@ -69,6 +70,11 @@ fn tokio_and_native_thread_scopes_remain_explicitly_unsupported() {
         assert_eq!(json["toolId"], "profile.threads");
         assert_eq!(json["capability"], "profile.threads@1");
         assert!(json["data"].is_null());
+
+        let export = export_thread_profile(&request(), scope, &key, &CancellationToken::new()).expect("unsupported export");
+        assert_eq!(export.tool.id(), "profile.threads");
+        assert_eq!(export.outcome, ProfileOutcome::Unsupported);
+        assert_eq!(export.reason_code, ProfileReasonCode::UnsupportedTool);
     }
 }
 

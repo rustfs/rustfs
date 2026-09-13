@@ -35,8 +35,10 @@ fn encoded_batch(span_count: usize) -> Vec<u8> {
 }
 
 fn encoded_named_batch(name_length: usize) -> Vec<u8> {
-    let mut span = Span::default();
-    span.name = "x".repeat(name_length);
+    let span = Span {
+        name: "x".repeat(name_length),
+        ..Default::default()
+    };
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             scope_spans: vec![ScopeSpans {
