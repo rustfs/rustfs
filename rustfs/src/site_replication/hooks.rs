@@ -1384,9 +1384,17 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
             continue;
         };
 
+        // Only a target this pass itself derived earlier is updated in place:
+        // the same ARN, or the same peer under an older ARN shape (legacy
+        // `arn:rustfs:` / regional) recognisable by the site-replication
+        // service account and the same-name target bucket. An operator's
+        // bucket-level target that happens to point at the peer (different
+        // target bucket and credentials) is left alone and the site target
+        // is added next to it; replacing it silently orphaned the operator's
+        // replication rule (rustfs/backlog#2489, MinIO `getRemoteARN` parity).
         if let Some(index) = targets.iter().position(|existing| {
             existing.target_type == BucketTargetType::ReplicationService
-                && (bucket_target_matches_peer(existing, peer) || existing.arn == target.arn)
+                && (existing.arn == target.arn || is_site_replication_owned_target(existing, &target, peer, state))
         }) {
             let existing = targets[index].clone();
             target.path = existing.path;
@@ -1412,6 +1420,24 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
     }
 
     Ok(BucketTargets { targets })
+}
+
+/// A stored target that site replication derived for `peer` under an older
+/// ARN shape: it names the same-name target bucket and carries the site
+/// replication service account. Operator targets never match — their target
+/// bucket or credentials differ — so reconciliation cannot take them over.
+fn is_site_replication_owned_target(
+    existing: &BucketTarget,
+    derived: &BucketTarget,
+    peer: &PeerInfo,
+    state: &SiteReplicationState,
+) -> bool {
+    bucket_target_matches_peer(existing, peer)
+        && existing.target_bucket == derived.target_bucket
+        && existing
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_key == state.service_account_access_key)
 }
 
 /// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
