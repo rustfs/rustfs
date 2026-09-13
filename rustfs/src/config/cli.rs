@@ -949,6 +949,23 @@ pub enum ConnectLicenseCommands {
     Verify(ConnectLicenseArtifactOpts),
     /// Verify and display the installed license for one deployment and service
     Show(ConnectLicenseScopeOpts),
+    /// Check Connect and install an operator-approved replacement license
+    Renew(ConnectLicenseRenewOpts),
+}
+
+/// Online renewal transport plus local trust and scope pins.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRenewOpts {
+    /// HTTPS Connect agent API base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
 }
 
 /// Trust and scope pins shared by service-license commands.
@@ -1356,7 +1373,10 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ConnectCommands, ConnectInventoryCommands, InspectCommands, preprocess_args_for_legacy};
+    use super::{
+        Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, InspectCommands,
+        preprocess_args_for_legacy,
+    };
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
@@ -1460,6 +1480,49 @@ mod tests {
         assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
         assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));
         assert!(register.token_file.is_none());
+    }
+
+    #[test]
+    fn connect_license_renew_requires_transport_and_scope_pins() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "license",
+            "renew",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--public-key-file",
+            "/etc/rustfs/connect-license.pub",
+            "--key-id",
+            "aabbcc",
+            "--issuer",
+            "connect",
+            "--audience",
+            "rustfs",
+            "--organization",
+            "organizations/018cc251-f400-7000-8000-000000000003",
+            "--deployment",
+            "organizations/018cc251-f400-7000-8000-000000000003/clusters/018cc251-f400-7000-8000-000000000004",
+            "--service-code",
+            "SUPPORT",
+        ])
+        .expect("connect license renew arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::License(license) = connect.command else {
+            panic!("connect license command expected");
+        };
+        let ConnectLicenseCommands::Renew(renew) = license.command else {
+            panic!("connect license renew command expected");
+        };
+        assert_eq!(renew.endpoint, "https://connect.example/agent/");
+        assert_eq!(renew.scope.service_code, "SUPPORT");
     }
 
     #[test]

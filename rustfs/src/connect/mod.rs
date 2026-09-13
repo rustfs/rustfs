@@ -35,6 +35,7 @@ pub mod identity;
 pub mod identity_store;
 pub mod inventory;
 pub mod license;
+pub mod license_renewal;
 pub mod offline;
 pub mod registration;
 pub mod registration_bootstrap;
@@ -125,6 +126,7 @@ pub use license::{
     LICENSE_DOMAIN_SEPARATION_TAG, LicenseArtifactError, LicenseArtifactStatus, LicenseClaims, LicenseReport,
     LicenseVerificationContext, apply_license_artifact, inspect_installed_license, verify_license_artifact,
 };
+pub use license_renewal::{LicenseRenewalClient, LicenseRenewalError, LicenseRenewalOutcome};
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};
 pub use registration_bootstrap::{RegistrationBootstrapError, RegistrationBootstrapResult, register_from_protected_input};
