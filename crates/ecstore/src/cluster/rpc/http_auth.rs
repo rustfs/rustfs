@@ -3012,6 +3012,7 @@ mod tests {
     fn rename_data_mutation_contract_binds_method_nonce_and_body() {
         ensure_test_rpc_secret();
         let message = rustfs_protos::proto_gen::node_service::RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "http://node-a:9000/data/rustfs0".to_string(),
             src_volume: ".rustfs.sys/multipart".to_string(),
             src_path: "uploads/object".to_string(),

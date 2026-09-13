@@ -76,6 +76,16 @@ pub struct HealStorageObjectResult {
     pub receipt: Option<HealObjectReceipt>,
 }
 
+fn incarnation_storage_error(bucket: &str, expected: Uuid, error: StorageError) -> Error {
+    match error {
+        StorageError::BucketNotFound(_) => Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected: Some(expected),
+        },
+        error => Error::Storage(error),
+    }
+}
+
 impl From<(HealResultItem, Option<Error>)> for HealStorageObjectResult {
     fn from((item, error): (HealResultItem, Option<Error>)) -> Self {
         Self {
@@ -397,6 +407,46 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(None)
     }
 
+    /// Admission must use authoritative metadata, not an outcome cache.
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        self.bucket_incarnation_id(bucket)
+            .await?
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            })
+    }
+
+    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Option<Uuid>) -> Result<()> {
+        let stale = || Error::StaleBucketIncarnation {
+            bucket: bucket.to_owned(),
+            expected,
+        };
+        let expected = expected.filter(|id| !id.is_nil()).ok_or_else(stale)?;
+        match self.admit_bucket_incarnation(bucket).await {
+            Ok(current) if current == expected => Ok(()),
+            Ok(_) | Err(Error::StaleBucketIncarnation { .. }) => Err(stale()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Implementations must retain the bucket lifecycle fence through storage mutation.
+    async fn heal_bucket_at_incarnation(&self, _bucket: &str, _expected: Uuid, _opts: &HealOpts) -> Result<HealResultItem> {
+        Err(Error::other("storage does not support incarnation-bound bucket healing"))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _expected: Uuid,
+        _opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        Err(Error::other("storage does not support incarnation-bound object healing"))
+    }
+
     /// Heal object using ecstore
     async fn heal_object(
         &self,
@@ -656,6 +706,70 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        match self.ecstore.bucket_incarnation_id_from_disk(bucket).await {
+            Ok(id) if !id.is_nil() => Ok(id),
+            Ok(_) | Err(StorageError::BucketNotFound(_)) => Err(Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            }),
+            Err(error) => Err(Error::Storage(error)),
+        }
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.ecstore
+            .heal_bucket_at_incarnation(bucket, expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let (item, error) = self
+            .ecstore
+            .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+        let error = error.map(Error::Storage);
+        let receipt = if error.is_none()
+            && !opts.dry_run
+            && item
+                .after
+                .drives
+                .iter()
+                .all(|drive| drive.state == DriveState::Ok.to_string())
+        {
+            item.drives_reported()
+                .zip(item.drives_healed())
+                .map(|(_, healed)| HealObjectReceipt {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        version_id: version_id.map(ToOwned::to_owned),
+                        bucket_incarnation_id: Some(expected),
+                        pool_index: opts.pool,
+                        set_index: opts.set,
+                    },
+                    disposition: if healed > 0 {
+                        HealObjectDisposition::Repaired
+                    } else {
+                        HealObjectDisposition::VerifiedHealthy
+                    },
+                })
+        } else {
+            None
+        };
+        Ok(HealStorageObjectResult { item, error, receipt })
+    }
+
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
         debug!(
             target: "rustfs::heal::storage",

@@ -18,6 +18,9 @@ operators should start with:
 | [Replication object size limits](operations/replication-object-size-limits.md) | Multipart routing, large-object limits, and retry characteristics. |
 | [Replication outbound transport](operations/replication-outbound-transport.md) | Integrity headers, generic target behavior, and transport knobs. |
 
+For persisted administrator bucket tasks and bucket recreation, see
+[Bucket heal recovery](operations/bucket-heal-recovery.md).
+
 Other runbooks remain grouped by filename in [`operations/`](operations/);
 architecture pages link to the relevant runbook where a cross-boundary
 procedure is required.

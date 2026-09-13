@@ -2071,11 +2071,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
+        // Scoped heal must drain directory creation before releasing its lifecycle owner.
+        let timeout = if crate::store::bucket_heal_scope(volume).is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "make_volume",
             DiskMetricMutation::Write,
             || async { self.disk.make_volume(volume).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
@@ -2223,21 +2229,39 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "delete_data_dir",
             DiskMetricMutation::Delete,
             || async { self.disk.delete_data_dir(volume, path, opts).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        let scope = crate::store::bucket_heal_scope(volume);
+        if let Some(scope) = &scope {
+            scope.check()?;
+        }
+        let timeout = if scope.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
         self.track_disk_health_mutation(
             "write_metadata",
             DiskMetricMutation::Write,
             || async { self.disk.write_metadata(org_volume, volume, path, fi).await },
-            get_max_timeout_duration(),
+            timeout,
         )
         .await
     }

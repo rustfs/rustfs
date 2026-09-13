@@ -475,6 +475,7 @@ impl SetDisks {
         targets: &[String],
     ) -> disk::error::Result<bool> {
         let disks = self.get_disks_internal().await;
+
         let mut target_disks = Vec::with_capacity(targets.len());
 
         for target in targets {
@@ -674,6 +675,10 @@ impl SetDisks {
         );
 
         let disks = self.get_disks_internal().await;
+        let bucket_heal_scope = crate::store::bucket_heal_scope(bucket);
+        if let Some(scope) = &bucket_heal_scope {
+            scope.check()?;
+        }
 
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
@@ -1451,6 +1456,9 @@ impl SetDisks {
                         let mut healed_disks = vec![None; out_dated_disks.len()];
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
+                                if let Some(scope) = &bucket_heal_scope {
+                                    scope.check()?;
+                                }
                                 rename_attempts += 1;
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;

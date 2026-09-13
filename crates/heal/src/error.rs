@@ -54,6 +54,9 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
+    StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
+
     /// The current page already exhausted its local retry budget. Retrying
     /// the enclosing bucket would replay pages whose results were counted.
     #[error("Heal listing failed for bucket {bucket}: {source}")]
@@ -98,7 +101,7 @@ impl Error {
     /// catches errors whose typed identity was destroyed upstream.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
-            Error::TaskCancelled | Error::TaskTimeout => false,
+            Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /

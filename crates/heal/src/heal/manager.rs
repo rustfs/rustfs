@@ -521,6 +521,7 @@ fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key:
 
 fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
     request.heal_type == task.heal_type
+        && request.bucket_incarnation_id == task.bucket_incarnation_id
         && request.options == task.options
         && request.priority == task.priority
         && request.source == task.source
@@ -530,6 +531,7 @@ fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
 
 fn request_matches_request(request: &HealRequest, existing: &HealRequest) -> bool {
     request.heal_type == existing.heal_type
+        && request.bucket_incarnation_id == existing.bucket_incarnation_id
         && request.options == existing.options
         && request.priority == existing.priority
         && request.source == existing.source
@@ -1782,7 +1784,7 @@ impl HealManager {
 
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
         &self,
-        request: HealRequest,
+        mut request: HealRequest,
         preserve_alias: bool,
         accept_same_request_id_replay: bool,
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
@@ -1808,6 +1810,13 @@ impl HealManager {
         } else {
             Vec::new()
         };
+
+        if source == HealRequestSource::Admin
+            && let HealType::Bucket { bucket } = &request.heal_type
+            && request.bucket_incarnation_id.is_none()
+        {
+            request.bucket_incarnation_id = Some(self.storage.admit_bucket_incarnation(bucket).await?);
+        }
 
         let config = self.config.read().await;
         let dedup_key = PriorityHealQueue::make_dedup_key(&request);

@@ -17,6 +17,20 @@ use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
 use std::collections::HashSet;
 
+fn bucket_incarnations() -> &'static std::sync::Mutex<HashMap<String, Option<Uuid>>> {
+    static IDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Uuid>>>> = std::sync::OnceLock::new();
+    IDS.get_or_init(Default::default)
+}
+
+pub(super) fn test_bucket_incarnation(bucket: &str) -> Option<Uuid> {
+    bucket_incarnations()
+        .lock()
+        .expect("bucket incarnation fixture")
+        .get(bucket)
+        .copied()
+        .unwrap_or(Some(Uuid::from_u128(42)))
+}
+
 #[cfg(unix)]
 struct RestoreDirectoryMode {
     path: std::path::PathBuf,
@@ -93,6 +107,9 @@ fn root_request() -> HealRequest {
 fn admin_request(heal_type: HealType) -> HealRequest {
     let mut request = HealRequest::new(heal_type, HealOptions::default(), HealPriority::High);
     request.source = HealRequestSource::Admin;
+    if let HealType::Bucket { bucket } = &request.heal_type {
+        request.bucket_incarnation_id = test_bucket_incarnation(bucket);
+    }
     request
 }
 
@@ -1416,7 +1433,7 @@ async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
         let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read root record");
         let mut value: serde_json::Value = serde_json::from_slice(&original).expect("record JSON");
         match kind {
-            "schema" => value["schema"] = 3.into(),
+            "schema" => value["schema"] = 4.into(),
             "identity" => value["task_id"] = valid.id.clone().into(),
             "option" => value["options"]["future_delete_mode"] = true.into(),
             "no_lock" => value["options"]["no_lock"] = true.into(),
@@ -1653,4 +1670,175 @@ async fn root_recovery_terminal_timeout_updates_only_existing_journal_before_sec
             "durable={durable}"
         );
     }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_recovery_retires_old_owner_and_admits_successor() {
+    let (_temp, disk) = recovery_disk().await;
+    let bucket = format!("incarnation-replay-{}", Uuid::new_v4());
+    let old = Uuid::new_v4();
+    let new = Uuid::new_v4();
+    bucket_incarnations()
+        .lock()
+        .expect("fixture")
+        .insert(bucket.clone(), Some(old));
+    let manager = recovery_manager(vec![disk.clone()]);
+    let mut request = HealRequest::bucket(bucket.clone());
+    request.source = HealRequestSource::Admin;
+    request.options.recursive = true;
+    let token = request.id.clone();
+    manager
+        .submit_heal_request_with_receipt(request)
+        .await
+        .expect("admit original bucket");
+    let pending = manager.root_recovery.pending().await.expect("read admission");
+    assert_eq!(pending[0].bucket_incarnation_id, Some(old));
+    let original = disk
+        .read_all(RUSTFS_META_BUCKET, &format!("root-heal-{token}.json"))
+        .await
+        .expect("raw admission");
+    drop(manager);
+
+    let same = recovery_manager(vec![disk.clone()]);
+    same.replay_root_heals().await.expect("same generation restart");
+    let restored = same
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .next()
+        .expect("restored owner")
+        .clone();
+    assert_eq!(restored.id, token);
+    assert_eq!(restored.bucket_incarnation_id, Some(old));
+    assert!(restored.options.recursive);
+    let retry = HealTask::from_request(restored, Arc::new(MockStorage)).retry_request();
+    assert_eq!(retry.bucket_incarnation_id, Some(old));
+    drop(same);
+
+    bucket_incarnations()
+        .lock()
+        .expect("fixture")
+        .insert(bucket.clone(), Some(new));
+    let restarted = recovery_manager(vec![disk.clone()]);
+    restarted.replay_root_heals().await.expect("retire obsolete admission");
+    assert_eq!(restarted.heal_queue.lock().await.len(), 0);
+    assert!(matches!(restarted.get_task_status(&token).await.expect("old token remains queryable"),
+        HealTaskStatus::Failed { error } if error.starts_with("stale_bucket_incarnation:")));
+    let mut fresh = HealRequest::bucket(bucket.clone());
+    fresh.source = HealRequestSource::Admin;
+    let receipt = restarted
+        .submit_heal_request_with_receipt(fresh)
+        .await
+        .expect("new generation admission");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    assert_ne!(receipt.task_id, token);
+    assert_eq!(
+        restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .next()
+            .expect("new owner")
+            .bucket_incarnation_id,
+        Some(new)
+    );
+
+    // A terminal receipt must dominate a duplicate old journal after another crash.
+    disk.write_all(RUSTFS_META_BUCKET, &format!("root-heal-{token}.json"), original)
+        .await
+        .expect("restore old bytes");
+    let again = recovery_manager(vec![disk]);
+    again.replay_root_heals().await.expect("restart with duplicate old bytes");
+    assert!(again.heal_queue.lock().await.requests().all(|request| request.id != token));
+    assert!(matches!(
+        again.get_task_status(&token).await.expect("terminal persists"),
+        HealTaskStatus::Failed { .. }
+    ));
+    bucket_incarnations().lock().expect("fixture").remove(&bucket);
+}
+
+#[tokio::test]
+async fn bucket_incarnation_legacy_admissions_are_queryable_without_rebinding() {
+    for identity in [None, Some(Uuid::nil())] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let request = admin_request(HealType::Bucket {
+            bucket: format!("legacy-{}", Uuid::new_v4()),
+        });
+        manager
+            .root_recovery
+            .persist(&request)
+            .await
+            .expect("capture server admission");
+        let path = format!("root-heal-{}.json", request.id);
+        let bytes = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read JSON");
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).expect("decode JSON");
+        if let Some(id) = identity {
+            legacy["bucket_incarnation_id"] = serde_json::json!(id);
+        } else {
+            legacy["schema"] = 2.into();
+            legacy.as_object_mut().expect("root record").remove("bucket_incarnation_id");
+        }
+        disk.write_all(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&legacy).expect("legacy bytes").into())
+            .await
+            .expect("legacy journal");
+        let restarted = recovery_manager(vec![disk]);
+        restarted.replay_root_heals().await.expect("retire unsafe legacy task");
+        assert_eq!(restarted.heal_queue.lock().await.len(), 0);
+        assert!(matches!(restarted.get_task_status(&request.id).await.expect("legacy token"),
+            HealTaskStatus::Failed { error } if error.starts_with("stale_bucket_incarnation:")));
+    }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_queued_and_retrying_work_does_not_rebind() {
+    for successor in [None, Some(Uuid::new_v4())] {
+        let bucket = format!("queued-incarnation-{}", Uuid::new_v4());
+        let old = Uuid::new_v4();
+        bucket_incarnations()
+            .lock()
+            .expect("fixture")
+            .insert(bucket.clone(), Some(old));
+        let request = admin_request(HealType::Bucket { bucket: bucket.clone() });
+        let retry = HealTask::from_request(request.clone(), Arc::new(MockStorage)).retry_request();
+        bucket_incarnations()
+            .lock()
+            .expect("fixture")
+            .insert(bucket.clone(), successor);
+        for pending in [request, retry] {
+            let task = HealTask::from_request(pending, Arc::new(MockStorage));
+            let error = task.execute().await.expect_err("obsolete generation cannot execute");
+            assert!(matches!(error, Error::StaleBucketIncarnation { expected: Some(id), .. } if id == old));
+            assert!(!error.is_recoverable_heal(), "never retry against a successor");
+            assert_eq!(task.get_outcome().await.counters.processed, 0);
+        }
+        bucket_incarnations().lock().expect("fixture").remove(&bucket);
+    }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_metadata_failure_defers_replay_without_retiring_owner() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let request = admin_request(HealType::Bucket {
+        bucket: format!("incarnation-metadata-unavailable-{}", Uuid::new_v4()),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("accepted responsibility");
+    assert!(matches!(manager.replay_root_heals().await, Err(Error::Storage(EcstoreError::SlowDown))));
+    assert_eq!(manager.root_recovery.pending().await.expect("pending owner").len(), 1);
+    assert!(
+        manager
+            .root_recovery
+            .completed(&request.id)
+            .await
+            .expect("terminal lookup")
+            .is_none()
+    );
+    assert!(manager.heal_queue.lock().await.requests().next().is_none());
 }

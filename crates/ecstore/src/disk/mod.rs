@@ -372,6 +372,14 @@ impl DiskAPI for Disk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Disk::Local(local_disk) = self {
+                return local_disk
+                    .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, Some(scope))
+                    .await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
@@ -620,6 +628,12 @@ impl DiskAPI for Disk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Self::Local(disk) = self {
+                return disk.delete_with_namespace_owner(volume, path, opt, Some(scope)).await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete(volume, path, opt).await,
             Disk::Remote(remote_disk) => remote_disk.delete(volume, path, opt).await,
@@ -799,7 +813,13 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+        let Some(scope) = crate::store::bucket_heal_scope(dst_volume) else {
+            return self
+                .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+                .await;
+        };
+        scope.check()?;
+        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, Some(scope))
             .await
     }
 

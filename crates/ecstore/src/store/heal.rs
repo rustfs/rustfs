@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::core::pools::{POOL_META_NAME, load_pool_meta_identity_observing};
+use crate::disk::{self, error::DiskError};
 use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
@@ -27,6 +28,34 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+
+/// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
+pub(crate) struct BucketHealScope {
+    pub(crate) bucket: String,
+    pub(crate) incarnation: uuid::Uuid,
+    pub(crate) store: Arc<ECStore>,
+    fence: super::BucketIncarnationFenceGuard,
+}
+
+impl BucketHealScope {
+    pub(crate) fn check(&self) -> disk::error::Result<()> {
+        if self.fence.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        Ok(())
+    }
+}
+
+tokio::task_local! {
+    static BUCKET_HEAL_SCOPE: Arc<BucketHealScope>;
+}
+
+pub(crate) fn bucket_heal_scope(bucket: &str) -> Option<Arc<BucketHealScope>> {
+    BUCKET_HEAL_SCOPE
+        .try_with(|scope| (scope.bucket == bucket).then(|| scope.clone()))
+        .ok()
+        .flatten()
+}
 
 fn invalid_heal_pool_index(pool_idx: usize, pool_count: usize) -> Error {
     StorageError::InvalidArgument(
@@ -93,6 +122,92 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    pub(super) async fn run_bucket_heal_at_incarnation<T, F, Fut>(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>, String, HealOpts) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        if expected.is_nil() || self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other(
+                "incarnation-bound bucket heal requires a valid identity and namespace locking",
+            ));
+        }
+        // Lock order: bucket lifecycle, then bucket/object and capacity locks used by healing.
+        let fence = self.acquire_bucket_incarnation_fence(bucket, expected).await?;
+        let scope = Arc::new(BucketHealScope {
+            bucket: bucket.to_owned(),
+            incarnation: expected,
+            store: self.clone(),
+            fence,
+        });
+        let store = self.clone();
+        let bucket = bucket.to_owned();
+        let opts = *opts;
+        // Dropping a caller's cancellation/timeout waiter must not release the lifecycle
+        // owner while a storage operation is still committing.
+        tokio::spawn(BUCKET_HEAL_SCOPE.scope(scope.clone(), async move {
+            scope.check().map_err(Error::from)?;
+            let result = operation(store, bucket, opts).await;
+            scope.check().map_err(Error::from)?;
+            result
+        }))
+        .await
+        .map_err(|error| Error::other(format!("bucket heal owner task failed: {error}")))?
+    }
+
+    pub async fn heal_bucket_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealResultItem> {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store.heal_bucket(&bucket, &opts).await
+        })
+        .await
+    }
+
+    pub async fn heal_local_bucket_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+        fenced_pools: Vec<usize>,
+        pools: Option<Vec<usize>>,
+    ) -> Result<HealResultItem> {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            let peer =
+                crate::cluster::rpc::peer_s3_client::LocalPeerS3Client::new_with_instance_ctx(None, pools, store.ctx.clone());
+            crate::cluster::rpc::peer_s3_client::PeerS3Client::heal_bucket_with_fence(&peer, &bucket, &opts, &fenced_pools)
+                .await
+                .map_err(Error::from)
+        })
+        .await
+    }
+
+    pub async fn heal_object_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        let object = object.to_owned();
+        let version_id = version_id.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store.heal_object(&bucket, &object, &version_id, &opts).await
+        })
+        .await
+    }
+
     async fn acquire_heal_format_fence(
         &self,
     ) -> Result<(
@@ -808,6 +923,240 @@ mod tests {
         )
         .await
         .expect("minimal pool should build")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bucket_incarnation_heal_preserves_successor_shards_and_allows_fresh_repair() {
+        let (_root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-incarnation-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("original bucket");
+        let old = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("original identity");
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("normal bucket deletion");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("same-name successor");
+        let new = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("successor identity");
+        assert_ne!(old, new);
+        let object = "successor-version";
+        let version = Uuid::new_v4().to_string();
+        let set = store.pools[0].get_disks(0);
+        let mut reader = PutObjReader::from_vec(vec![17; 512 * 1024]);
+        set.put_object(
+            &bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(version.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write successor version");
+        let missing = set.disks.read().await[0].clone().expect("missing target");
+        let healthy = set.disks.read().await[1].clone().expect("healthy target");
+        missing
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove one successor shard");
+        let baseline = healthy
+            .read_all(&bucket, &format!("{object}/xl.meta"))
+            .await
+            .expect("healthy baseline");
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(0),
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+            ..Default::default()
+        };
+        // Positive control for the original bug: name-only healing repairs the successor.
+        let (_, error) = store
+            .heal_object(&bucket, object, &version, &opts)
+            .await
+            .expect("unbound control");
+        assert!(error.is_none());
+        assert!(missing.read_xl(&bucket, object, false).await.is_ok());
+        missing
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore the same missing-shard condition");
+        let fi = healthy
+            .read_version("", &bucket, object, &version, &Default::default())
+            .await
+            .expect("successor metadata");
+        let disk_ref = healthy.endpoint().to_string();
+        assert!(
+            store
+                .write_local_metadata_at_incarnation(&disk_ref, (&bucket, object), fi.clone(), old)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_local_path_at_incarnation(
+                    &disk_ref,
+                    (&bucket, object),
+                    DeleteOptions {
+                        recursive: true,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                    old
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_local_version_at_incarnation(
+                    &disk_ref,
+                    (&bucket, object),
+                    fi.clone(),
+                    false,
+                    DeleteOptions::default(),
+                    old
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .rename_local_data_at_incarnation(&disk_ref, (&bucket, object), &fi, (&bucket, "stale-destination"), old)
+                .await
+                .is_err()
+        );
+        assert!(store.heal_bucket_at_incarnation(&bucket, old, &opts).await.is_err());
+        assert!(
+            store
+                .heal_object_at_incarnation(&bucket, object, &version, old, &opts)
+                .await
+                .is_err()
+        );
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_err(),
+            "obsolete admission must not publish a shard"
+        );
+        assert_eq!(
+            healthy
+                .read_all(&bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("healthy after stale heal"),
+            baseline
+        );
+        store
+            .heal_bucket_at_incarnation(&bucket, new, &opts)
+            .await
+            .expect("fresh bucket metadata repair");
+        let (_, error) = store
+            .heal_object_at_incarnation(&bucket, object, &version, new, &opts)
+            .await
+            .expect("new admission repair");
+        assert!(error.is_none(), "new admission must repair independently: {error:?}");
+        assert!(
+            missing.read_xl(&bucket, object, false).await.is_ok(),
+            "new admission publishes the missing shard"
+        );
+        store
+            .write_local_metadata_at_incarnation(&disk_ref, (&bucket, object), fi.clone(), new)
+            .await
+            .expect("fresh target metadata");
+        store
+            .delete_local_version_at_incarnation(&disk_ref, (&bucket, object), fi, false, DeleteOptions::default(), new)
+            .await
+            .expect("fresh target version cleanup");
+        healthy
+            .write_all(&bucket, "fresh-cleanup/data", bytes::Bytes::from_static(b"temporary"))
+            .await
+            .expect("cleanup fixture");
+        store
+            .delete_local_path_at_incarnation(
+                &disk_ref,
+                (&bucket, "fresh-cleanup"),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+                new,
+            )
+            .await
+            .expect("fresh target path cleanup");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bucket_incarnation_heal_owner_survives_cancelled_waiter() {
+        let (_root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-owner-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let identity = store.bucket_incarnation_id_from_disk(&bucket).await.expect("identity");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let worker_store = store.clone();
+        let worker_bucket = bucket.clone();
+        let waiter = tokio::spawn(async move {
+            worker_store
+                .run_bucket_heal_at_incarnation(&worker_bucket, identity, &HealOpts::default(), |_, _, _| async move {
+                    started_tx.send(()).expect("announce held generation");
+                    release_rx.await.expect("release commit");
+                    drained_tx.send(()).expect("announce drain");
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.expect("operation acquired generation fence");
+        waiter.abort();
+        assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+        let writer_store = store.clone();
+        let writer_bucket = bucket.clone();
+        let mut writer = Box::pin(writer_store.acquire_bucket_lifecycle_write_lock(&writer_bucket));
+        assert!(
+            futures::poll!(&mut writer).is_pending(),
+            "cancellation must not release the live operation's generation"
+        );
+        release_tx.send(()).expect("finish operation");
+        drained_rx.await.expect("physical operation drains");
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .expect("writer resumes after drain")
+            .expect("lifecycle writer");
+        drop(guard);
+        shutdown.cancel();
     }
 
     async fn minimal_heal_store() -> ECStore {

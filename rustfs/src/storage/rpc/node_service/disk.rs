@@ -70,14 +70,23 @@ impl LocalMutationTarget {
         fi: &FileInfo,
         destination: (&str, &str),
         scanner_token: Option<Uuid>,
+        bucket_incarnation: Option<Uuid>,
     ) -> Result<RenameDataResp, DiskError> {
         match self {
             Self::Ready(store) => {
+                if let Some(expected) = bucket_incarnation {
+                    return store
+                        .rename_local_data_at_incarnation(disk_ref, source, fi, destination, expected)
+                        .await;
+                }
                 store
                     .rename_local_data(disk_ref, source, fi, destination, scanner_token)
                     .await
             }
             Self::Bootstrap(target) => {
+                if bucket_incarnation.is_some() {
+                    return Err(DiskError::other("incarnation-bound rename requires a ready storage instance"));
+                }
                 target
                     .rename_local_data(disk_ref, source, fi, destination, scanner_token)
                     .await
@@ -727,6 +736,15 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        if !request.get_ref().bucket_incarnation_id.is_empty()
+            && !request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD")
+        {
+            return Err(Status::permission_denied("incarnation-bound delete requires a body-bound digest"));
+        }
         verify_disk_mutation_digest(
             &request,
             rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
@@ -753,7 +771,25 @@ impl NodeService {
                 }));
             }
         };
-        let result = if opts.undo_write {
+        let result = if !request.bucket_incarnation_id.is_empty() {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            store
+                .delete_local_version_at_incarnation(
+                    &request.disk,
+                    (&request.volume, &request.path),
+                    file_info,
+                    request.force_del_marker,
+                    opts,
+                    expected,
+                )
+                .await
+        } else if opts.undo_write {
             if request.force_del_marker {
                 Err(DiskError::other("undo_write cannot force a delete marker"))
             } else {
@@ -984,6 +1020,24 @@ impl NodeService {
             "write_metadata",
         )?;
         let request = request.into_inner();
+        if !request.bucket_incarnation_id.is_empty() {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            let value = decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo")
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let result = store
+                .write_local_metadata_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
+                .await;
+            return Ok(Response::new(WriteMetadataResponse {
+                success: result.is_ok(),
+                error: result.err().map(Into::into),
+            }));
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
@@ -1257,7 +1311,7 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() || !request.get_ref().bucket_incarnation_id.is_empty() {
             let has_body_digest = request
                 .metadata()
                 .get("x-rustfs-content-sha256")
@@ -1274,6 +1328,20 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
+        let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
+            None
+        } else {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            if !request.scanner_publication_lease_token.is_empty() {
+                return Err(Status::invalid_argument(
+                    "heal incarnation and scanner publication lease cannot be combined",
+                ));
+            }
+            Some(expected)
+        };
         #[cfg(feature = "e2e-test-hooks")]
         super::rename_target_capture_test_hook::wait(&target, &request).await;
         let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
@@ -1307,6 +1375,7 @@ impl NodeService {
                 &decoded_file_info.value,
                 (&request.dst_volume, &request.dst_path),
                 scanner_publication_lease_token,
+                bucket_incarnation,
             )
             .await;
         #[cfg(feature = "e2e-test-hooks")]
@@ -1661,6 +1730,27 @@ impl NodeService {
         }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
+        if !request.bucket_incarnation_id.is_empty() {
+            if !request.scanner_publication_lease_token.is_empty() {
+                return Err(Status::invalid_argument("heal incarnation and scanner lease cannot be combined"));
+            }
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            let value = serde_json::from_str::<DeleteOptions>(&request.options)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let result = store
+                .delete_local_path_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
+                .await;
+            return Ok(Response::new(DeleteResponse {
+                success: result.is_ok(),
+                error: result.err().map(Into::into),
+            }));
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
                 Ok(options) => options,
