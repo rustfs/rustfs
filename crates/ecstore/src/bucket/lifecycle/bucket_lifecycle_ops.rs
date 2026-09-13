@@ -84,16 +84,14 @@ use rustfs_config::{
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
+    is_restored_object_on_disk,
 };
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    Timestamp,
-};
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5177,7 +5175,7 @@ pub async fn put_restore_opts(
         metadata_keys::RESTORE.to_string(),
         RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+            restore_expiry_date: Some(restore_expiry),
         }
         .to_string(),
     );

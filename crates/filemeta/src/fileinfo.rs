@@ -23,7 +23,6 @@ use rustfs_utils::http::{
     contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
     starts_with_ignore_ascii_case,
 };
-use s3s::dto::{RestoreStatus, Timestamp};
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
@@ -1359,6 +1358,18 @@ pub struct FilesInfo {
     pub is_truncated: bool,
 }
 
+/// Parsed restore status of a restored object: the value persisted under
+/// [`metadata_keys::RESTORE`]. filemeta owns this type so the persisted format
+/// does not depend on an HTTP library DTO (backlog#1735 A3c); the field names
+/// match the former `s3s::dto::RestoreStatus` so the rendered bytes are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreStatus {
+    /// `ongoing-request`; `None` reads as not in progress.
+    pub is_restore_in_progress: Option<bool>,
+    /// `expiry-date`; required to render a finished restore.
+    pub restore_expiry_date: Option<OffsetDateTime>,
+}
+
 pub trait RestoreStatusOps {
     fn expiry(&self) -> Option<OffsetDateTime>;
     fn on_going(&self) -> bool;
@@ -1372,7 +1383,7 @@ impl RestoreStatusOps for RestoreStatus {
         if self.on_going() {
             return None;
         }
-        self.restore_expiry_date.clone().map(OffsetDateTime::from)
+        self.restore_expiry_date
     }
 
     fn on_going(&self) -> bool {
@@ -1398,9 +1409,7 @@ impl RestoreStatusOps for RestoreStatus {
         }
         format!(
             "ongoing-request=\"false\", expiry-date=\"{}\"",
-            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
-                .format(&Rfc3339)
-                .unwrap()
+            self.restore_expiry_date.unwrap().format(&Rfc3339).unwrap()
         )
     }
 
@@ -1410,9 +1419,7 @@ impl RestoreStatusOps for RestoreStatus {
         }
         format!(
             "ongoing-request=\"false\", expiry-date=\"{}\"",
-            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
-                .format(&RFC1123)
-                .unwrap()
+            self.restore_expiry_date.unwrap().format(&RFC1123).unwrap()
         )
     }
 }
@@ -1473,7 +1480,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             let expiry = parse_restore_expiry_date(expiry_tokens[1].trim_matches('"'))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
-                restore_expiry_date: Some(Timestamp::from(expiry)),
+                restore_expiry_date: Some(expiry),
             });
         }
         _ => (),
@@ -2740,12 +2747,53 @@ mod tests {
     fn restore_status_round_trips_through_both_formats() {
         let status = RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(datetime!(2030-06-15 07:08:09 UTC))),
+            restore_expiry_date: Some(datetime!(2030-06-15 07:08:09 UTC)),
         };
         for rendered in [RestoreStatusOps::to_string(&status), status.to_string2()] {
             let parsed = parse_restore_obj_status(&rendered).unwrap_or_else(|e| panic!("{rendered} must parse: {e}"));
             assert_eq!(parsed.expiry(), Some(datetime!(2030-06-15 07:08:09 UTC)), "{rendered}");
         }
+    }
+
+    /// backlog#1735 A3c: filemeta's own `RestoreStatus` must persist the same
+    /// bytes the s3s DTO did. The restore value in the pre-`metadata_keys`
+    /// fixture was rendered by the s3s-backed writer; parsing and rendering it
+    /// again must reproduce it exactly.
+    #[test]
+    fn restore_status_rerenders_pre_module_fixture_bytes() {
+        let fi = crate::FileMeta::load(&crate::test_data::create_pre_metadata_keys_xlmeta().expect("decode fixture hex"))
+            .expect("load fixture xl.meta")
+            .into_fileinfo("bucket", "object", "0b1e5a3a-1735-4a3a-8000-00000000a3a0", false, false, false)
+            .expect("fixture version to FileInfo");
+        let stored = fi.metadata.get(metadata_keys::RESTORE).expect("fixture restore value");
+        assert_eq!(stored, "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"");
+
+        let parsed = parse_restore_obj_status(stored).expect("fixture restore value parses");
+        assert_eq!(
+            parsed,
+            RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(datetime!(9999-01-01 00:00:00 UTC)),
+            }
+        );
+        assert_eq!(RestoreStatusOps::to_string(&parsed), *stored);
+        assert_eq!(
+            parsed.to_string2(),
+            "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\""
+        );
+
+        let ongoing = RestoreStatus {
+            is_restore_in_progress: Some(true),
+            restore_expiry_date: Some(datetime!(2030-06-15 07:08:09 UTC)),
+        };
+        assert_eq!(RestoreStatusOps::to_string(&ongoing), "ongoing-request=\"true\"");
+        assert_eq!(
+            parse_restore_obj_status("ongoing-request=\"true\"").expect("in-progress form parses"),
+            RestoreStatus {
+                is_restore_in_progress: Some(true),
+                restore_expiry_date: None,
+            }
+        );
     }
 
     /// A restored object migrated from MinIO must still be recognised as

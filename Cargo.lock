@@ -9906,7 +9906,6 @@ dependencies = [
  "rmp-serde",
  "rustfs-config",
  "rustfs-utils",
- "s3s",
  "serde",
  "serde_json",
  "tempfile",
