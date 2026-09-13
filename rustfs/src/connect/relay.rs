@@ -18,7 +18,7 @@
 //! accepts success only from a receipt signed by the preconfigured destination.
 
 use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use reqwest::{Client, StatusCode, Url, header};
 use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,8 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_AUTHENTICATION_BYTES: u64 = 8 * 1024;
 const MAX_PUBLIC_KEY_BYTES: u64 = 256;
+const MAX_PRIVATE_KEY_BYTES: u64 = 256;
+const MAX_RELAY_ENVELOPE_BYTES: usize = MAX_RELAY_ARTIFACT_BYTES * 2 + 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -129,7 +131,7 @@ pub struct RelayReceiptPayload {
     pub received_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct RelayReceiptSignature {
@@ -138,7 +140,7 @@ struct RelayReceiptSignature {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SignedRelayReceipt {
     payload: String,
@@ -149,6 +151,69 @@ struct SignedRelayReceipt {
 pub struct TrustedReceiptSigner {
     key_id: String,
     verifying_key: VerifyingKey,
+}
+
+#[derive(Clone)]
+pub struct DestinationReceiptSigner {
+    key_id: String,
+    signing_key: SigningKey,
+}
+
+impl DestinationReceiptSigner {
+    pub fn new(key_id: String, seed: [u8; 32]) -> Result<Self, RelayError> {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let actual_key_id = hex_lower(&Sha256::digest(signing_key.verifying_key().as_bytes()));
+        if !is_sha256(&key_id) || key_id != actual_key_id {
+            return Err(RelayError::ReceiptTrustInvalid);
+        }
+        Ok(Self { key_id, signing_key })
+    }
+
+    pub fn from_private_key_file(path: &Path, key_id: String) -> Result<Self, RelayError> {
+        let encoded = read_protected_bytes(path, MAX_PRIVATE_KEY_BYTES)?;
+        let encoded = std::str::from_utf8(&encoded)
+            .map_err(|_| RelayError::ReceiptTrustInvalid)?
+            .trim();
+        let seed = decode_canonical_base64url(encoded).ok_or(RelayError::ReceiptTrustInvalid)?;
+        let seed: [u8; 32] = seed.try_into().map_err(|_| RelayError::ReceiptTrustInvalid)?;
+        Self::new(key_id, seed)
+    }
+
+    pub(crate) fn sign(
+        &self,
+        envelope: &RelayEnvelope,
+        producer: RelayParty,
+        outcome: RelayReceiptOutcome,
+        received_at: String,
+    ) -> Result<Vec<u8>, RelayError> {
+        let payload = RelayReceiptPayload {
+            format_version: RELAY_RECEIPT_FORMAT.to_owned(),
+            protocol_version: envelope.protocol_version.clone(),
+            transfer_uid: envelope.transfer_uid.clone(),
+            material_kind: envelope.material_kind,
+            direction: envelope.direction,
+            artifact_sha256: envelope.artifact.sha256.clone(),
+            producer,
+            destination: envelope.destination.clone(),
+            outcome,
+            received_at,
+        };
+        let payload = serde_json::to_vec(&payload).map_err(|_| RelayError::ReceiptEncoding)?;
+        let mut signed = Vec::with_capacity(RELAY_RECEIPT_DOMAIN_SEPARATION_TAG.len() + 1 + payload.len());
+        signed.extend_from_slice(RELAY_RECEIPT_DOMAIN_SEPARATION_TAG.as_bytes());
+        signed.push(0);
+        signed.extend_from_slice(&payload);
+        let signature = self.signing_key.sign(&signed).to_bytes();
+        serde_json::to_vec(&SignedRelayReceipt {
+            payload: URL_SAFE_NO_PAD.encode_to_string(&payload),
+            signature: RelayReceiptSignature {
+                algorithm: "Ed25519".to_owned(),
+                key_id: self.key_id.clone(),
+                value: URL_SAFE_NO_PAD.encode_to_string(signature),
+            },
+        })
+        .map_err(|_| RelayError::ReceiptEncoding)
+    }
 }
 
 impl TrustedReceiptSigner {
@@ -207,6 +272,10 @@ pub enum RelayError {
     ApprovalRequired,
     #[error("the relay envelope could not be encoded")]
     EnvelopeEncoding,
+    #[error("the relay envelope is malformed")]
+    EnvelopeInvalid,
+    #[error("the relay artifact digest does not match the exact decoded bytes")]
+    ArtifactDigestMismatch,
     #[error("the destination receipt trust configuration is invalid")]
     ReceiptTrustInvalid,
     #[error("the destination receipt is malformed")]
@@ -217,6 +286,8 @@ pub enum RelayError {
     ReceiptSignatureInvalid,
     #[error("the destination receipt does not bind this transfer")]
     ReceiptMismatch,
+    #[error("the destination receipt could not be encoded")]
+    ReceiptEncoding,
     #[error("delivery produced no verified receipt after three attempts")]
     DeliveryUnknown,
     #[error("the relay control API rejected delivery with HTTP {0}")]
@@ -451,6 +522,36 @@ where
     Ok(PreparedRelay { review, envelope })
 }
 
+pub fn decode_relay_envelope(envelope_bytes: &[u8]) -> Result<(RelayEnvelope, Vec<u8>), RelayError> {
+    if envelope_bytes.is_empty() || envelope_bytes.len() > MAX_RELAY_ENVELOPE_BYTES {
+        return Err(RelayError::EnvelopeInvalid);
+    }
+    let envelope: RelayEnvelope = serde_json::from_slice(envelope_bytes).map_err(|_| RelayError::EnvelopeInvalid)?;
+    if envelope.format_version != RELAY_ENVELOPE_FORMAT
+        || envelope.protocol_version != "v1"
+        || validate_transfer_uid(&envelope.transfer_uid).is_err()
+        || validate_route(envelope.material_kind, &envelope.asserted_producer, &envelope.destination).is_err()
+        || envelope.direction != direction_for(envelope.material_kind)
+        || envelope.artifact.encoding != "base64"
+        || !is_sha256(&envelope.artifact.sha256)
+    {
+        return Err(RelayError::EnvelopeInvalid);
+    }
+    let artifact_bytes = BASE64_STANDARD
+        .decode_to_vec(envelope.artifact.bytes.as_bytes())
+        .map_err(|_| RelayError::EnvelopeInvalid)?;
+    if artifact_bytes.is_empty()
+        || artifact_bytes.len() > MAX_RELAY_ARTIFACT_BYTES
+        || BASE64_STANDARD.encode_to_string(&artifact_bytes) != envelope.artifact.bytes
+    {
+        return Err(RelayError::InvalidArtifact);
+    }
+    if hex_lower(&Sha256::digest(&artifact_bytes)) != envelope.artifact.sha256 {
+        return Err(RelayError::ArtifactDigestMismatch);
+    }
+    Ok((envelope, artifact_bytes))
+}
+
 pub fn verify_receipt(
     receipt_bytes: &[u8],
     envelope: &RelayEnvelope,
@@ -498,12 +599,16 @@ fn validate_route(
     }
     let valid = match material_kind {
         RelayMaterialKind::OfflineEnrollmentResponse | RelayMaterialKind::DiagnosticBundleManifest => {
-            asserted_producer.party_type == "DEVICE" && asserted_producer.key_id.is_some() && destination.party_type == "CONNECT"
+            asserted_producer.party_type == "DEVICE"
+                && asserted_producer.key_id.is_some()
+                && destination.party_type == "CONNECT"
+                && destination.key_id.is_none()
         }
         RelayMaterialKind::ServiceLicense => {
             asserted_producer.party_type == "CONNECT_LICENSE_ISSUER"
                 && asserted_producer.key_id.is_some()
                 && destination.party_type == "CLUSTER"
+                && destination.key_id.is_none()
         }
     };
     valid.then_some(()).ok_or(RelayError::UnsupportedMaterial)

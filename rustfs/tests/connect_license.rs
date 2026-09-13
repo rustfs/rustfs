@@ -19,8 +19,10 @@ use std::process::Command;
 use base64_simd::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rustfs::connect::{
-    LICENSE_DOMAIN_SEPARATION_TAG, LicenseArtifactStatus, LicenseClaims, LicenseVerificationContext, apply_license_artifact,
-    inspect_installed_license, verify_license_artifact,
+    DestinationReceiptSigner, LICENSE_DOMAIN_SEPARATION_TAG, LicenseArtifactStatus, LicenseClaims, LicenseVerificationContext,
+    RelayMaterialKind, RelayReceiptOutcome, ServiceLicenseRelayError, TrustedReceiptSigner, apply_license_artifact,
+    decode_relay_envelope, export_service_license_relay, inspect_installed_license, receive_service_license_relay,
+    verify_license_artifact,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,6 +38,7 @@ const OTHER_ORGANIZATION_DEPLOYMENT: &str =
 const ISSUER: &str = "test-connect-issuer";
 const AUDIENCE: &str = "test-rustfs-cluster";
 const SERVICE: &str = "SUPPORT";
+const RELAY_TRANSFER_UID: &str = "0198f3a1-a300-7c30-8c33-223344556677";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -313,6 +316,197 @@ fn rustfs_cli_runs_verify_import_and_show_with_structured_json() {
     assert_eq!(foreign_json["installed"], false);
 }
 
+#[cfg(unix)]
+#[test]
+fn rustfs_cli_relay_preserves_signed_bytes_and_returns_a_bound_destination_receipt() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let license_key = SigningKey::from_bytes(&[42; 32]);
+    let license_public_key = license_key.verifying_key().to_bytes();
+    let license_key_id = hex_simd::encode_to_string(Sha256::digest(license_public_key), hex_simd::AsciiCase::Lower);
+    let receipt_key = SigningKey::from_bytes(&[43; 32]);
+    let receipt_public_key = receipt_key.verifying_key().to_bytes();
+    let receipt_key_id = hex_simd::encode_to_string(Sha256::digest(receipt_public_key), hex_simd::AsciiCase::Lower);
+    let temporary = TempDir::new().expect("create temp directory");
+    let artifact_bytes = signed_artifact(
+        &license_key,
+        claims(
+            &license_key_id,
+            2,
+            "018cc251-f400-7000-8000-000000000002",
+            "018cc251-f400-7000-8000-000000000001",
+        ),
+    );
+    let artifact = write_artifact(temporary.path(), "license.json", &artifact_bytes);
+    let public_key = write_artifact(temporary.path(), "license.pub", &URL_SAFE_NO_PAD.encode_to_string(license_public_key));
+    let receipt_seed = write_artifact(
+        temporary.path(),
+        "receipt.seed",
+        &URL_SAFE_NO_PAD.encode_to_string(receipt_key.to_bytes()),
+    );
+    fs::set_permissions(&receipt_seed, fs::Permissions::from_mode(0o600)).expect("protect receipt seed");
+    let envelope_path = temporary.path().join("service-license.relay.json");
+    let source_state = temporary.path().join("source-state");
+    let destination_state = temporary.path().join("destination-state");
+
+    let export = relay_export_cli(&artifact, &envelope_path, &public_key, &source_state, &license_key_id, true);
+    assert!(
+        export.status.success(),
+        "relay export failed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let review: Value = serde_json::from_slice(&export.stdout).expect("relay review must be JSON");
+    assert_eq!(review["review"]["materialKind"], "SERVICE_LICENSE");
+    assert_eq!(review["review"]["destination"]["name"], DEPLOYMENT);
+    assert_eq!(review["license"]["expireTime"], "2099-01-01T00:00:00Z");
+    assert_eq!(fs::metadata(&envelope_path).unwrap().permissions().mode() & 0o777, 0o600);
+    let envelope_bytes = fs::read(&envelope_path).expect("read relay envelope");
+    let (envelope, relayed_artifact) = decode_relay_envelope(&envelope_bytes).expect("decode relay envelope");
+    assert_eq!(relayed_artifact, artifact_bytes.as_bytes());
+    assert_eq!(envelope.material_kind, RelayMaterialKind::ServiceLicense);
+    assert_eq!(envelope.asserted_producer.name, ISSUER);
+
+    let rejected = relay_import_cli(
+        &envelope_path,
+        &receipt_seed,
+        &public_key,
+        &destination_state,
+        &license_key_id,
+        &receipt_key_id,
+        false,
+    );
+    assert!(!rejected.status.success(), "relay import without review acknowledgement must fail");
+
+    let imported = relay_import_cli(
+        &envelope_path,
+        &receipt_seed,
+        &public_key,
+        &destination_state,
+        &license_key_id,
+        &receipt_key_id,
+        true,
+    );
+    assert!(
+        imported.status.success(),
+        "relay import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let receipt_trust = TrustedReceiptSigner::new(receipt_key_id.clone(), receipt_public_key).expect("trust destination key");
+    let receipt = rustfs::connect::relay::verify_receipt(&imported.stdout, &envelope, &receipt_trust)
+        .expect("destination receipt must bind the exact transfer");
+    assert_eq!(receipt.outcome, RelayReceiptOutcome::Applied);
+    assert_eq!(receipt.transfer_uid, RELAY_TRANSFER_UID);
+    assert_eq!(Some(receipt.artifact_sha256.as_str()), review["review"]["artifactSha256"].as_str());
+    assert_eq!(receipt.producer, envelope.asserted_producer);
+    assert_eq!(receipt.destination, envelope.destination);
+
+    let repeated = relay_import_cli(
+        &envelope_path,
+        &receipt_seed,
+        &public_key,
+        &destination_state,
+        &license_key_id,
+        &receipt_key_id,
+        true,
+    );
+    assert!(
+        repeated.status.success(),
+        "repeated relay import failed: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let duplicate = rustfs::connect::relay::verify_receipt(&repeated.stdout, &envelope, &receipt_trust)
+        .expect("duplicate receipt must remain valid");
+    assert_eq!(duplicate.outcome, RelayReceiptOutcome::Duplicate);
+    assert_eq!(duplicate.received_at, receipt.received_at);
+    assert_eq!(
+        inspect_installed_license(
+            &destination_state,
+            &LicenseVerificationContext::new(
+                license_public_key,
+                license_key_id,
+                ISSUER.to_owned(),
+                AUDIENCE.to_owned(),
+                ORGANIZATION.to_owned(),
+                DEPLOYMENT.to_owned(),
+                SERVICE.to_owned(),
+                1_800_000_000,
+            )
+            .expect("test context"),
+        )
+        .expect("relayed license must be installed")
+        .license
+        .map(|license| license.sequence),
+        Some(2)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn service_license_relay_rejects_transfer_uid_reuse_before_replacing_the_license() {
+    let license_key = SigningKey::from_bytes(&[44; 32]);
+    let public_key = license_key.verifying_key().to_bytes();
+    let key_id = hex_simd::encode_to_string(Sha256::digest(public_key), hex_simd::AsciiCase::Lower);
+    let context = LicenseVerificationContext::new(
+        public_key,
+        key_id.clone(),
+        ISSUER.to_owned(),
+        AUDIENCE.to_owned(),
+        ORGANIZATION.to_owned(),
+        DEPLOYMENT.to_owned(),
+        SERVICE.to_owned(),
+        1_800_000_000,
+    )
+    .expect("test context");
+    let temporary = TempDir::new().expect("create temp directory");
+    let source_state = temporary.path().join("source-state");
+    let destination_state = temporary.path().join("destination-state");
+    let first_artifact = write_artifact(
+        temporary.path(),
+        "first.json",
+        &signed_artifact(
+            &license_key,
+            claims(&key_id, 2, "018cc251-f400-7000-8000-000000000002", "018cc251-f400-7000-8000-000000000001"),
+        ),
+    );
+    let replacement_artifact = write_artifact(
+        temporary.path(),
+        "replacement.json",
+        &signed_artifact(
+            &license_key,
+            claims(&key_id, 3, "018cc251-f400-7000-8000-000000000005", "018cc251-f400-7000-8000-000000000001"),
+        ),
+    );
+    let first_envelope = temporary.path().join("first.relay.json");
+    let replacement_envelope = temporary.path().join("replacement.relay.json");
+    export_service_license_relay(&first_artifact, &first_envelope, RELAY_TRANSFER_UID, &source_state, &context, true)
+        .expect("export first license");
+    export_service_license_relay(
+        &replacement_artifact,
+        &replacement_envelope,
+        RELAY_TRANSFER_UID,
+        &source_state,
+        &context,
+        true,
+    )
+    .expect("export replacement license");
+    let receipt_key = SigningKey::from_bytes(&[45; 32]);
+    let receipt_key_id =
+        hex_simd::encode_to_string(Sha256::digest(receipt_key.verifying_key().to_bytes()), hex_simd::AsciiCase::Lower);
+    let receipt_signer = DestinationReceiptSigner::new(receipt_key_id, receipt_key.to_bytes()).expect("destination signer");
+    receive_service_license_relay(&first_envelope, &destination_state, &context, &receipt_signer, true)
+        .expect("install first license");
+    let conflict = receive_service_license_relay(&replacement_envelope, &destination_state, &context, &receipt_signer, true)
+        .expect_err("one transfer UID cannot identify different bytes");
+    assert!(matches!(conflict, ServiceLicenseRelayError::TransferConflict));
+    assert_eq!(
+        inspect_installed_license(&destination_state, &context)
+            .expect("first license must remain installed")
+            .license
+            .map(|license| license.sequence),
+        Some(2)
+    );
+}
+
 fn claims(key_id: &str, sequence: u64, license_uid: &str, grant_uid: &str) -> LicenseClaims {
     LicenseClaims {
         purpose: "RUSTFS_CONNECT_SERVICE_LICENSE".to_owned(),
@@ -384,4 +578,75 @@ fn cli_for_deployment(
         .args(["--service-code", SERVICE])
         .output()
         .expect("run rustfs-cli")
+}
+
+#[cfg(unix)]
+fn relay_export_cli(
+    artifact: &Path,
+    envelope: &Path,
+    public_key: &Path,
+    state: &Path,
+    key_id: &str,
+    acknowledge_reviewed: bool,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustfs-cli"));
+    command
+        .args(["connect", "license", "relay-export", "--artifact"])
+        .arg(artifact)
+        .arg("--envelope")
+        .arg(envelope)
+        .args(["--transfer-uid", RELAY_TRANSFER_UID]);
+    license_scope_args(&mut command, public_key, state, key_id);
+    if acknowledge_reviewed {
+        command.arg("--acknowledge-reviewed");
+    }
+    command.output().expect("run relay export")
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn relay_import_cli(
+    envelope: &Path,
+    receipt_seed: &Path,
+    public_key: &Path,
+    state: &Path,
+    key_id: &str,
+    receipt_key_id: &str,
+    acknowledge_reviewed: bool,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustfs-cli"));
+    command
+        .args(["connect", "license", "relay-import", "--envelope"])
+        .arg(envelope)
+        .arg("--receipt-signing-key-file")
+        .arg(receipt_seed)
+        .args(["--receipt-key-id", receipt_key_id]);
+    license_scope_args(&mut command, public_key, state, key_id);
+    if acknowledge_reviewed {
+        command.arg("--acknowledge-reviewed");
+    }
+    command.output().expect("run relay import")
+}
+
+#[cfg(unix)]
+fn license_scope_args(command: &mut Command, public_key: &Path, state: &Path, key_id: &str) {
+    command
+        .arg("--state-dir")
+        .arg(state)
+        .arg("--public-key-file")
+        .arg(public_key)
+        .args([
+            "--key-id",
+            key_id,
+            "--issuer",
+            ISSUER,
+            "--audience",
+            AUDIENCE,
+            "--organization",
+            ORGANIZATION,
+            "--deployment",
+            DEPLOYMENT,
+            "--service-code",
+            SERVICE,
+        ]);
 }

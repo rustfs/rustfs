@@ -1361,10 +1361,11 @@ async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> 
         ConnectLicenseCommands::Import(options) | ConnectLicenseCommands::Verify(options) => &options.scope,
         ConnectLicenseCommands::Show(options) => options,
         ConnectLicenseCommands::Renew(options) => &options.scope,
+        ConnectLicenseCommands::RelayExport(options) => &options.scope,
+        ConnectLicenseCommands::RelayImport(options) => &options.scope,
     };
-    let context = license_context(scope);
     if let ConnectLicenseCommands::Renew(options) = &command {
-        let context = context.map_err(Error::other)?;
+        let context = license_context(scope).map_err(Error::other)?;
         let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
         let mut config = HeartbeatConfig::new(
             &options.endpoint,
@@ -1392,12 +1393,49 @@ async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> 
         }
         return Ok(());
     }
+    if let ConnectLicenseCommands::RelayExport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let exported = crate::connect::export_service_license_relay(
+            &options.artifact,
+            &options.envelope,
+            &options.transfer_uid,
+            &scope.state_dir,
+            &context,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        println!("{}", serde_json::to_string(&exported).map_err(Error::other)?);
+        return Ok(());
+    }
+    if let ConnectLicenseCommands::RelayImport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let signer = crate::connect::DestinationReceiptSigner::from_private_key_file(
+            &options.receipt_signing_key_file,
+            options.receipt_key_id.clone(),
+        )
+        .map_err(Error::other)?;
+        let received = crate::connect::receive_service_license_relay(
+            &options.envelope,
+            &scope.state_dir,
+            &context,
+            &signer,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        std::io::stdout().write_all(&received.receipt_bytes)?;
+        std::io::stdout().write_all(b"\n")?;
+        return Ok(());
+    }
+    let context = license_context(scope);
     let report = match context {
         Ok(context) => match &command {
             ConnectLicenseCommands::Import(options) => apply_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Verify(options) => verify_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Show(_) => inspect_installed_license(&scope.state_dir, &context),
             ConnectLicenseCommands::Renew(_) => unreachable!("renewal is handled before local license commands"),
+            ConnectLicenseCommands::RelayExport(_) | ConnectLicenseCommands::RelayImport(_) => {
+                unreachable!("relay commands are handled before local license commands")
+            }
         }
         .unwrap_or_else(|error| {
             let installed = matches!(&command, ConnectLicenseCommands::Show(_))

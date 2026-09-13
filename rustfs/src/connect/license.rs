@@ -279,9 +279,18 @@ pub fn apply_license_artifact(
     state_directory: &Path,
     context: &LicenseVerificationContext,
 ) -> Result<LicenseReport, LicenseArtifactError> {
+    let artifact_bytes = read_license_artifact_file(artifact_path)?;
+    apply_license_bytes(&artifact_bytes, state_directory, context)
+}
+
+pub(super) fn apply_license_bytes(
+    artifact_bytes: &[u8],
+    state_directory: &Path,
+    context: &LicenseVerificationContext,
+) -> Result<LicenseReport, LicenseArtifactError> {
     fs::create_dir_all(state_directory).map_err(|source| state_io(state_directory, source))?;
     let _lock = lock_state(state_directory)?;
-    let candidate = validate_artifact(read_artifact(artifact_path)?, context, true)?;
+    let candidate = validate_artifact(parse_artifact(artifact_bytes)?, context, true)?;
     let state_path = state_path(state_directory, context);
 
     if let Some(current) = load_installed(&state_path, context)? {
@@ -300,7 +309,16 @@ pub fn verify_license_artifact(
     state_directory: &Path,
     context: &LicenseVerificationContext,
 ) -> Result<LicenseReport, LicenseArtifactError> {
-    let candidate = validate_artifact(read_artifact(artifact_path)?, context, true)?;
+    let artifact_bytes = read_license_artifact_file(artifact_path)?;
+    verify_license_bytes(&artifact_bytes, state_directory, context)
+}
+
+pub(super) fn verify_license_bytes(
+    artifact_bytes: &[u8],
+    state_directory: &Path,
+    context: &LicenseVerificationContext,
+) -> Result<LicenseReport, LicenseArtifactError> {
+    let candidate = validate_artifact(parse_artifact(artifact_bytes)?, context, true)?;
     let state_path = state_path(state_directory, context);
     if let Some(current) = load_installed(&state_path, context)?
         && matches!(compare_sequence(&candidate, &current)?, SequenceDecision::Idempotent)
@@ -468,9 +486,18 @@ fn parse_timestamp(value: &str) -> Result<i64, LicenseArtifactError> {
         .map_err(|_| failure(LicenseArtifactStatus::InvalidArtifact, "the license timestamp is invalid"))
 }
 
-fn read_artifact(path: &Path) -> Result<LicenseArtifact, LicenseArtifactError> {
-    let bytes = read_bounded_regular_file(path, MAX_ARTIFACT_BYTES, LicenseArtifactStatus::InvalidArtifact, "license artifact")?;
-    serde_json::from_slice(&bytes).map_err(|_| failure(LicenseArtifactStatus::InvalidArtifact, "the license artifact is invalid"))
+pub(super) fn read_license_artifact_file(path: &Path) -> Result<Vec<u8>, LicenseArtifactError> {
+    read_bounded_regular_file(path, MAX_ARTIFACT_BYTES, LicenseArtifactStatus::InvalidArtifact, "license artifact")
+}
+
+fn parse_artifact(bytes: &[u8]) -> Result<LicenseArtifact, LicenseArtifactError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(failure(
+            LicenseArtifactStatus::InvalidArtifact,
+            format!("the license artifact must be no larger than {MAX_ARTIFACT_BYTES} bytes"),
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|_| failure(LicenseArtifactStatus::InvalidArtifact, "the license artifact is invalid"))
 }
 
 fn read_bounded_regular_file(
