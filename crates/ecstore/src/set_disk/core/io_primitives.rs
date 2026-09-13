@@ -5979,6 +5979,20 @@ impl SetDisks {
         data_errs_by_part: &HashMap<usize, Vec<usize>>,
         opts: ObjectOptions,
     ) -> disk::error::Result<FileInfo> {
+        self.delete_if_dangling_with_proof(bucket, object, meta_arr, errs, data_errs_by_part, opts)
+            .await
+            .map(|(metadata, _)| metadata)
+    }
+
+    pub(in crate::set_disk) async fn delete_if_dangling_with_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        meta_arr: &[FileInfo],
+        errs: &[Option<DiskError>],
+        data_errs_by_part: &HashMap<usize, Vec<usize>>,
+        opts: ObjectOptions,
+    ) -> disk::error::Result<(FileInfo, bool)> {
         let (m, can_heal) = is_object_dangling(meta_arr, errs, data_errs_by_part);
 
         if !can_heal {
@@ -6065,11 +6079,17 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut futures = Vec::with_capacity(disks.len());
-        for disk_op in disks.iter() {
+        for (disk_index, disk_op) in disks.iter().enumerate() {
+            #[cfg(not(test))]
+            let _ = disk_index;
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
             futures.push(async move {
+                #[cfg(test)]
+                if let Some(error) = crate::set_disk::ops::heal::injected_dangling_delete_error(&bucket, &object, disk_index) {
+                    return Err(error);
+                }
                 if let Some(disk) = disk_op {
                     disk.delete_version(&bucket, &object, fi, false, DeleteOptions::default())
                         .await
@@ -6080,6 +6100,7 @@ impl SetDisks {
         }
 
         let results = join_all(futures).await;
+        let mut all_deleted = !results.is_empty();
         let mut delete_errs = Vec::with_capacity(results.len());
         for (index, result) in results.into_iter().enumerate() {
             let key = format!("ddisk-{index}");
@@ -6093,6 +6114,7 @@ impl SetDisks {
                     delete_errs.push(None);
                 }
                 Err(e) => {
+                    all_deleted &= matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound);
                     tags.insert(key, e.to_string());
                     if already_absent || matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound) {
                         delete_errs.push(None);
@@ -6112,7 +6134,30 @@ impl SetDisks {
             return Err(err);
         }
 
-        Ok(m)
+        // Quorum success alone may leave the only stale replica behind. The
+        // proof uses the same disk snapshot as deletion and exact-version reads.
+        let absent = if all_deleted {
+            match Self::read_all_fileinfo(
+                &disks,
+                "",
+                bucket,
+                object,
+                opts.version_id.as_deref().unwrap_or(""),
+                false,
+                false,
+                false,
+            )
+            .await
+            {
+                Ok((_, after)) => after
+                    .iter()
+                    .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound))),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        Ok((m, absent))
     }
 
     fn reduce_delete_prefix_results(results: Vec<disk::error::Result<()>>, write_quorum: usize) -> disk::error::Result<()> {

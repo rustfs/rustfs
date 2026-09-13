@@ -420,6 +420,7 @@ pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
 mod heal;
 pub(crate) use heal::bucket_heal_scope;
+pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
 mod init;

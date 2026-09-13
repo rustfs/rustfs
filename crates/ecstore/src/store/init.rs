@@ -3002,33 +3002,36 @@ mod tests {
                             .expect("rebind the same remote destination after restart");
                     }
                     let set = store.pools[0].get_disks_by_key(object);
+                    // A deferred first cleanup must retain its durable owner
+                    // until a later recovery scan can retry the operation.
+                    backend.set_remove_failure(true);
                     ExpiryState::resize_workers(1, Arc::clone(&store)).await;
                     let recovered = recover_tier_free_versions(Arc::clone(&store), 100, None, None)
                         .await
                         .expect("recover persisted cleanup owner");
                     assert!(recovered.enqueued >= 1);
-                    tokio::time::timeout(Duration::from_secs(30), async {
-                        loop {
-                            let versions = set
-                                .load_file_info_versions_exact(&bucket, object)
-                                .await
-                                .expect("read cleanup progress")
-                                .expect("new object must survive cleanup");
-                            if versions
-                                .versions
-                                .iter()
-                                .chain(versions.free_versions.iter())
-                                .all(|fi| !fi.tier_free_version())
-                            {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await
-                    .expect("cleanup must converge");
+                    wait_for_expiry_workers_idle(&store).await;
+                    assert!(backend.contains(&remote).await, "failed cleanup must retain remote bytes");
+                    assert_eq!(backend.remove_count().await, removed_before);
+                    backend.set_remove_failure(false);
+                    // This fixture starts expiry workers without the runtime's
+                    // recovery loop, so drive its durable rescan explicitly.
+                    wait_for_tier_free_version_recovery(Arc::clone(&store), &backend, removed_before + 1).await;
+                    let versions = set
+                        .load_file_info_versions_exact(&bucket, object)
+                        .await
+                        .expect("read cleanup progress")
+                        .expect("new object must survive cleanup");
+                    assert!(
+                        versions
+                            .versions
+                            .iter()
+                            .chain(versions.free_versions.iter())
+                            .all(|fi| !fi.tier_free_version()),
+                        "cleanup must remove its owner: {state:?}, suspended={suspended}, copy={self_copy}"
+                    );
                     assert!(!backend.contains(&remote).await);
-                    assert_eq!(backend.remove_count().await, removed_before + 1, "one remote DELETE per owner");
+                    assert_eq!(backend.remove_count().await, removed_before + 1, "one successful remote DELETE per owner");
                     assert_eq!(backend.remove_versions().await.last(), Some(&(remote.clone(), version.to_string())));
                     let mut reader = store
                         .get_object_reader(&bucket, object, None, HeaderMap::new(), &options)
