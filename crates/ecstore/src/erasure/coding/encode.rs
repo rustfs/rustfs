@@ -1785,8 +1785,8 @@ mod tests {
             let erasure = Arc::new(Erasure::new(2, 2, 64));
             let result = match path {
                 "direct" => erasure.encode_single_block_non_inline(reader, &mut writers, 2).await,
-                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false).await,
-                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true).await,
+                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false, None).await,
+                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true, None).await,
                 "batched" => erasure.encode_batched(reader, &mut writers, 2).await,
                 _ => unreachable!(),
             };
