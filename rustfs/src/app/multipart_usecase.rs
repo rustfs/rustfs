@@ -1933,18 +1933,21 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
             _ => continue,
         };
         if !seen.insert(name.clone()) {
-            return Err(s3_error!(InvalidRequest, "Duplicate checksum query parameter"));
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Duplicate checksum query parameter"));
         }
         if let Some(header) = req.headers.get(name.as_ref())
             && header.as_bytes() != value.as_bytes()
         {
-            return Err(s3_error!(InvalidRequest, "Conflicting checksum header and query parameter"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "Conflicting checksum header and query parameter",
+            ));
         }
-        let header =
-            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InvalidArgument, "Invalid checksum query parameter"))?;
+        let header = http::HeaderValue::from_str(&value)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?;
         req.headers.insert(
             http::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid checksum query parameter"))?,
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?,
             header,
         );
         if let Some(field) = field {
