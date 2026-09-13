@@ -267,12 +267,17 @@ type Runner = Arc<dyn Fn(CancellationToken) -> RunFuture + Send + Sync>;
 
 pub struct DiagnosticScheduleRuntime {
     status: watch::Receiver<DiagnosticScheduleStatus>,
+    receipts: watch::Receiver<Option<DiagnosticReceipt>>,
     task: JoinHandle<()>,
 }
 
 impl DiagnosticScheduleRuntime {
     pub fn status(&self) -> watch::Receiver<DiagnosticScheduleStatus> {
         self.status.clone()
+    }
+
+    pub(crate) fn receipts(&self) -> watch::Receiver<Option<DiagnosticReceipt>> {
+        self.receipts.clone()
     }
 
     pub async fn shutdown(self) {
@@ -331,15 +336,20 @@ fn spawn_schedule(
     runner: Runner,
 ) -> DiagnosticScheduleRuntime {
     let (status_tx, status_rx) = watch::channel(DiagnosticScheduleStatus::Waiting);
+    let (receipt_tx, receipt_rx) = watch::channel(None);
     let task = tokio::spawn(async move {
-        if let Err(error) = run_collection_schedule(&store, &mut policies, &shutdown, &runner, &status_tx).await {
+        if let Err(error) = run_collection_schedule(&store, &mut policies, &shutdown, &runner, &status_tx, &receipt_tx).await {
             let _ = status_tx.send(DiagnosticScheduleStatus::Failed {
                 reason: error.to_string(),
             });
         }
         let _ = status_tx.send(DiagnosticScheduleStatus::Stopped);
     });
-    DiagnosticScheduleRuntime { status: status_rx, task }
+    DiagnosticScheduleRuntime {
+        status: status_rx,
+        receipts: receipt_rx,
+        task,
+    }
 }
 
 async fn run_collection_schedule(
@@ -348,8 +358,12 @@ async fn run_collection_schedule(
     shutdown: &CancellationToken,
     runner: &Runner,
     status: &watch::Sender<DiagnosticScheduleStatus>,
+    receipts: &watch::Sender<Option<DiagnosticReceipt>>,
 ) -> Result<(), DiagnosticScheduleError> {
     let mut state = store.read().await?;
+    if state.last_receipt.is_some() {
+        let _ = receipts.send(state.last_receipt.clone());
+    }
     if let Some(started_at) = state.active_interval_started_at.take() {
         let receipt = receipt(
             state.policy_revision.unwrap_or_default(),
@@ -363,6 +377,7 @@ async fn run_collection_schedule(
         state.last_receipt = Some(receipt.clone());
         store.write(state.clone()).await?;
         let _ = status.send(DiagnosticScheduleStatus::Receipt(receipt));
+        let _ = receipts.send(state.last_receipt.clone());
     }
 
     loop {
@@ -550,6 +565,7 @@ async fn run_collection_schedule(
         state.last_receipt = Some(receipt.clone());
         store.write(state.clone()).await?;
         let _ = status.send(DiagnosticScheduleStatus::Receipt(receipt));
+        let _ = receipts.send(state.last_receipt.clone());
     }
     Ok(())
 }
