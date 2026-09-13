@@ -350,10 +350,27 @@ where
     Ok(())
 }
 
+/// Returns true when a legacy IAM listing cannot start because the source
+/// volume is missing or the cluster has not yet reached read quorum.
+///
+/// Fresh distributed nodes call this during startup while peers are still
+/// formatting. Treating those listing failures as fatal crashes the node,
+/// which then drops quorum for everyone else. Nothing has been copied yet,
+/// so skipping is safe: record-level migration errors still fail closed.
+fn legacy_iam_source_listing_is_absent(err: &Error) -> bool {
+    is_err_strict_volume_not_found(err) || matches!(err, Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _))
+}
+
+fn should_skip_absent_legacy_iam_listing(total_migrated: usize, err: &Error) -> bool {
+    total_migrated == 0 && legacy_iam_source_listing_is_absent(err)
+}
+
 /// Migrates IAM config from legacy meta bucket `config/iam/` to RustFS meta bucket.
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
-/// An absent legacy bucket is a no-op; migration errors prevent startup readiness.
+/// An absent legacy bucket, or a listing that cannot reach read quorum before
+/// any record is copied, is a no-op. Record-level migration errors still
+/// prevent startup readiness.
 pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>) -> Result<()>
 where
     S: ListOperations<
@@ -398,7 +415,7 @@ where
             .await
         {
             Ok(r) => r,
-            Err(err) if is_err_strict_volume_not_found(&err) => return Ok(()),
+            Err(err) if should_skip_absent_legacy_iam_listing(total_migrated, &err) => return Ok(()),
             Err(err) => return Err(err),
         };
 
@@ -507,6 +524,44 @@ mod tests {
             Error::from(MigrationMetadataError::Empty("record".into())),
             Error::from(MigrationMetadataError::Incompatible("record".into())),
             "different migration failures must remain distinguishable"
+        );
+    }
+
+    #[test]
+    fn iam_legacy_listing_read_quorum_is_absent_not_fatal() {
+        use super::{Error, MigrationMetadataError, legacy_iam_source_listing_is_absent};
+
+        assert!(legacy_iam_source_listing_is_absent(&Error::VolumeNotFound));
+        assert!(legacy_iam_source_listing_is_absent(&Error::BucketNotFound(".minio.sys".into())));
+        assert!(legacy_iam_source_listing_is_absent(&Error::ErasureReadQuorum));
+        assert!(legacy_iam_source_listing_is_absent(&Error::InsufficientReadQuorum(
+            ".minio.sys".into(),
+            "config/iam/".into()
+        )));
+        assert!(
+            !legacy_iam_source_listing_is_absent(&Error::from(MigrationMetadataError::Empty("config/iam/format.json".into()))),
+            "record-level corruption must stay fatal after listing starts"
+        );
+        assert!(
+            !legacy_iam_source_listing_is_absent(&Error::from(MigrationMetadataError::Incompatible(
+                "config/iam/format.json".into()
+            ))),
+            "incompatible legacy records must stay fatal after listing starts"
+        );
+    }
+
+    #[test]
+    fn iam_legacy_listing_quorum_skip_requires_no_copied_records() {
+        use super::{Error, should_skip_absent_legacy_iam_listing};
+
+        let quorum = Error::InsufficientReadQuorum(".minio.sys".into(), "config/iam/".into());
+        assert!(
+            should_skip_absent_legacy_iam_listing(0, &quorum),
+            "first-page quorum failure must stay a no-op"
+        );
+        assert!(
+            !should_skip_absent_legacy_iam_listing(1, &quorum),
+            "a later page must fail closed after any record was copied"
         );
     }
 

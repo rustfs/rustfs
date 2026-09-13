@@ -483,8 +483,18 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
     let error = register_from_protected_input(&server.endpoint, &wrong_root, &wrong_ca_state, Some(&token))
         .await
         .expect_err("wrong CA must fail TLS");
-    assert!(matches!(error, RegistrationBootstrapError::Exchange));
+    assert!(
+        matches!(error, RegistrationBootstrapError::TlsPeer),
+        "wrong CA must map to the sanitized TLS peer variant, not a generic exchange: {error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Connect TLS peer certificate validation failed; verify the endpoint and configured root CA"
+    );
+    assert_sanitized_error(&error, &[TOKEN_SECRET, REMOTE_REASON]);
     assert!(!wrong_ca_state.join("credential/device.crt.json").exists());
+    assert!(!wrong_ca_state.join("credential/registration.pending.json").exists());
+    assert_no_staging_files(&wrong_ca_state);
 }
 
 #[cfg(unix)]
