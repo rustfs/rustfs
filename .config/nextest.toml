@@ -155,6 +155,16 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_.*|suspended_.*decommission.*)$/)'
 test-group = 'ecstore-serial-flaky'
 
+# The tier overwrite cleanup-owner matrix restarts a real 4-disk store, drives
+# free-version recovery through lifecycle expiry workers, and intentionally
+# holds a failed remote DELETE inside the worker deadline. It passes standalone,
+# but under a saturated nextest run the global worker-idle observer can race that
+# deadline. Serialize it with the other ECStore lifecycle recovery fixtures; no
+# retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
 # init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
 # OnceLock state that serial_test's #[serial] cannot protect across nextest's
@@ -324,6 +334,10 @@ test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_.*|suspended_.*decommission.*)$/)'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
