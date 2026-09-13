@@ -629,8 +629,9 @@ impl DefaultMultipartUsecase {
         let mut opts = get_complete_multipart_upload_opts_with_replication_authorization(&req.headers, replication_authorized)
             .map_err(ApiError::from)?;
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
+        let (versioned, version_suspended) = BucketVersioningSys::write_state(&bucket, &key)
+            .await
+            .map_err(ApiError::from)?;
         opts.versioned = versioned;
         opts.version_suspended = version_suspended;
         let capacity_scope_token = Uuid::new_v4();

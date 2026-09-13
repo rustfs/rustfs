@@ -152,8 +152,8 @@ enum BucketMetadataAuthority {
 }
 
 pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMetadata) -> Result<ObjectLockConfigState> {
-    if bm.object_lock_config.is_none() && !bm.object_lock_config_xml.is_empty() {
-        return Err(Error::other("persisted bucket Object Lock configuration is invalid"));
+    if let Some(raw_len) = bm.xml_config_unreadable_len(super::metadata::OBJECT_LOCK_CONFIG) {
+        return Err(unreadable_config_error(&bm.name, super::metadata::OBJECT_LOCK_CONFIG, raw_len));
     }
 
     if let Some(config) = bm.object_lock_config.clone() {
@@ -1865,6 +1865,7 @@ impl BucketMetadataSys {
         drop(map);
         let removed_fabricated = self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.insert(bucket.to_string(), ()).await;
+        super::config_parse_mode::forget_bucket_config_parse_state(bucket);
         if removed {
             BucketTargetSys::get().delete(bucket).await;
             clear_bucket_durability(bucket);
@@ -1962,8 +1963,8 @@ impl BucketMetadataSys {
         // from nothing; persisting that destroys the only copy of the stored
         // bytes. Only the rewritten config is checked: `update_config` carries
         // every other raw config through unchanged.
-        if bm.xml_config_unreadable(config_file) {
-            return Err(unreadable_config_error(bucket, config_file));
+        if let Some(raw_len) = bm.xml_config_unreadable_len(config_file) {
+            return Err(unreadable_config_error(bucket, config_file, raw_len));
         }
 
         let data = mutate(&bm)?;
@@ -2207,12 +2208,11 @@ impl BucketMetadataSys {
             }
         };
 
-        if !bm.versioning_config_xml.is_empty() && bm.versioning_config.is_none() {
-            Err(Error::other("persisted bucket versioning configuration is invalid"))
-        } else if let Some(config) = &bm.versioning_config {
-            Ok((config.clone(), bm.versioning_config_updated_at))
-        } else {
-            Ok((VersioningConfiguration::default(), bm.versioning_config_updated_at))
+        match ConfigState::of(&bm.versioning_config_xml, &bm.versioning_config)
+            .require(bucket, super::metadata::BUCKET_VERSIONING_CONFIG)?
+        {
+            Some(config) => Ok((config.clone(), bm.versioning_config_updated_at)),
+            None => Ok((VersioningConfiguration::default(), bm.versioning_config_updated_at)),
         }
     }
 
@@ -2221,8 +2221,8 @@ impl BucketMetadataSys {
             return Ok(false);
         };
 
-        if metadata.versioning_config.is_none() && !metadata.versioning_config_xml.is_empty() {
-            return Err(Error::other("persisted bucket versioning configuration is invalid"));
+        if let Some(raw_len) = metadata.xml_config_unreadable_len(super::metadata::BUCKET_VERSIONING_CONFIG) {
+            return Err(unreadable_config_error(bucket, super::metadata::BUCKET_VERSIONING_CONFIG, raw_len));
         }
 
         Ok(metadata.versioning_config.is_none() && metadata.versioning_config_xml.is_empty())
@@ -2292,12 +2292,11 @@ impl BucketMetadataSys {
     pub async fn get_public_access_block_config(&self, bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if !bm.public_access_block_config_xml.is_empty() && bm.public_access_block_config.is_none() {
-            Err(Error::other("persisted bucket public access block configuration is invalid"))
-        } else if let Some(config) = &bm.public_access_block_config {
-            Ok((config.clone(), bm.public_access_block_config_updated_at))
-        } else {
-            Err(Error::ConfigNotFound)
+        match ConfigState::of(&bm.public_access_block_config_xml, &bm.public_access_block_config)
+            .require(bucket, super::metadata::BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)?
+        {
+            Some(config) => Ok((config.clone(), bm.public_access_block_config_updated_at)),
+            None => Err(Error::ConfigNotFound),
         }
     }
 
@@ -2587,28 +2586,24 @@ impl BucketMetadataSys {
 
     pub async fn get_notification_config(&self, bucket: &str) -> Result<Option<NotificationConfiguration>> {
         let bm = match self.get_config(bucket).await {
-            Ok((bm, _)) => bm.notification_config.clone(),
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    None
-                } else {
-                    return Err(err);
-                }
-            }
+            Ok((bm, _)) => bm,
+            Err(Error::ConfigNotFound) => return Ok(None),
+            Err(err) => return Err(err),
         };
 
-        Ok(bm)
+        // Unreadable must not read as "no notification configured": that
+        // would silently drop the bucket's event rules.
+        Ok(ConfigState::of(&bm.notification_config_xml, &bm.notification_config)
+            .require(bucket, super::metadata::BUCKET_NOTIFICATION_CONFIG)?
+            .cloned())
     }
 
     pub async fn get_sse_config(&self, bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if !bm.encryption_config_xml.is_empty() && bm.sse_config.is_none() {
-            Err(Error::other("persisted bucket encryption configuration is invalid"))
-        } else if let Some(config) = &bm.sse_config {
-            Ok((config.clone(), bm.encryption_config_updated_at))
-        } else {
-            Err(Error::ConfigNotFound)
+        match ConfigState::of(&bm.encryption_config_xml, &bm.sse_config).require(bucket, super::metadata::BUCKET_SSECONFIG)? {
+            Some(config) => Ok((config.clone(), bm.encryption_config_updated_at)),
+            None => Err(Error::ConfigNotFound),
         }
     }
 
@@ -3938,9 +3933,88 @@ mod tests {
         assert_ne!(err, Error::ConfigNotFound, "unreadable lifecycle must not read as absent");
 
         // The genuinely absent case still reads as absent.
-        let absent_bucket = "absent-tagging-read";
+        let absent_bucket = "absent-tagging-read-control";
         persist_bucket_with_raw_config(&sys, &dirs, absent_bucket, BUCKET_TAGGING_CONFIG, b"").await;
         assert_eq!(sys.get_tagging_config(absent_bucket).await.expect_err("absent"), Error::ConfigNotFound);
+    }
+
+    /// rustfs/backlog#1734: the configs that gate object writes and deletes
+    /// (versioning, Object Lock, default encryption) and the notification
+    /// config must refuse with the typed unreadable-config error, so the S3
+    /// layer can answer 503 with the bucket and config named instead of a
+    /// generic 500, and notification setup can isolate the one bucket.
+    #[tokio::test]
+    async fn unreadable_gating_configs_refuse_with_the_typed_error() {
+        use crate::bucket::metadata::{BUCKET_VERSIONING_CONFIG, unreadable_config_refusal};
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+
+        // `update_config` validates some configs on write, so the corrupt
+        // bytes go straight into the raw fields, as a damaged object would.
+        let persist_corrupt = |bucket: &'static str, corrupt: fn(&mut BucketMetadata)| {
+            for dir in &dirs {
+                std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should be created");
+            }
+            let mut bm = BucketMetadata::new(bucket);
+            corrupt(&mut bm);
+            sys.persist_new_and_set(bm)
+        };
+
+        persist_corrupt("unreadable-versioning", |bm| {
+            bm.versioning_config_xml = b"<VersioningConfiguration><Status>".to_vec();
+        })
+        .await
+        .expect("corrupt versioning should persist");
+        let err = sys
+            .get_versioning_config("unreadable-versioning")
+            .await
+            .expect_err("unreadable versioning must not read as a value");
+        let refusal = unreadable_config_refusal(&err).unwrap_or_else(|| panic!("expected a typed refusal, got {err}"));
+        assert_eq!(refusal.config_file, BUCKET_VERSIONING_CONFIG);
+        assert_eq!(refusal.raw_len, b"<VersioningConfiguration><Status>".len());
+
+        persist_corrupt("unreadable-lock", |bm| bm.object_lock_config_xml = b"<ObjectLockConfiguration>".to_vec())
+            .await
+            .expect("corrupt Object Lock should persist");
+        let err = sys
+            .get_object_lock_config_state("unreadable-lock")
+            .await
+            .expect_err("unreadable Object Lock must not read as a value");
+        assert!(unreadable_config_refusal(&err).is_some(), "{err}");
+
+        persist_corrupt("unreadable-sse", |bm| {
+            bm.encryption_config_xml = b"<ServerSideEncryptionConfiguration>".to_vec();
+        })
+        .await
+        .expect("corrupt encryption should persist");
+        let err = sys
+            .get_sse_config("unreadable-sse")
+            .await
+            .expect_err("unreadable encryption must not read as a value");
+        assert!(unreadable_config_refusal(&err).is_some(), "{err}");
+
+        persist_corrupt("unreadable-notify", |bm| {
+            bm.notification_config_xml = b"<NotificationConfiguration>".to_vec();
+        })
+        .await
+        .expect("corrupt notification should persist");
+        let err = sys
+            .get_notification_config("unreadable-notify")
+            .await
+            .expect_err("unreadable notification must not read as \"no notification configured\"");
+        assert!(unreadable_config_refusal(&err).is_some(), "{err}");
+
+        // Absent stays absent.
+        persist_corrupt("absent-notification-read", |_| {})
+            .await
+            .expect("plain bucket should persist");
+        assert!(
+            sys.get_notification_config("absent-notification-read")
+                .await
+                .expect("absent")
+                .is_none()
+        );
     }
 
     /// A tagging rewrite through `update_config_with` (the Swift metadata

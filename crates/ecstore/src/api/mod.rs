@@ -170,9 +170,15 @@ pub mod bucket {
             BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG,
             BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, ConfigState,
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
-            table_catalog_path_hash,
+            table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+    }
+
+    pub mod config_parse_mode {
+        pub use crate::bucket::config_parse_mode::{
+            BucketConfigParseMode, bucket_config_parse_mode, validate_bucket_config_parse_mode_env,
+        };
     }
 
     pub mod durability {

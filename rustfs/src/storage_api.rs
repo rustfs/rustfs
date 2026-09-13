@@ -83,6 +83,11 @@ pub(crate) mod error {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::UnreadableBucketConfig;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
+        is_unreadable_config_error, unreadable_config_refusal,
+    };
     pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataError;
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataFailure;
@@ -326,6 +331,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,
             process_topic_configurations,
