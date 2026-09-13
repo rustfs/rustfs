@@ -137,7 +137,7 @@ async fn async_main() -> Result<()> {
             println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
             return Ok(());
         }
-        CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectLicense(command) => return execute_connect_license(command).await,
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
@@ -1336,19 +1336,53 @@ fn enabled_build_features() -> Vec<String> {
     features
 }
 
-fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
-    use crate::connect::{apply_license_artifact, inspect_installed_license, verify_license_artifact};
+async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
+    use crate::connect::{
+        CredentialStore, HeartbeatConfig, IdentityStore, LicenseRenewalClient, LicenseRenewalOutcome, ProxyConfig,
+        apply_license_artifact, inspect_installed_license, verify_license_artifact,
+    };
 
     let scope = match &command {
         ConnectLicenseCommands::Import(options) | ConnectLicenseCommands::Verify(options) => &options.scope,
         ConnectLicenseCommands::Show(options) => options,
+        ConnectLicenseCommands::Renew(options) => &options.scope,
     };
     let context = license_context(scope);
+    if let ConnectLicenseCommands::Renew(options) = &command {
+        let context = context.map_err(Error::other)?;
+        let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+        let mut config = HeartbeatConfig::new(
+            &options.endpoint,
+            root_ca_pem,
+            IdentityStore::new(scope.state_dir.join("identity")),
+            CredentialStore::new(scope.state_dir.join("credential")),
+            scope.state_dir.join("heartbeat/state.json"),
+        );
+        config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+        let outcome = LicenseRenewalClient::new(config)
+            .map_err(Error::other)?
+            .renew_installed(&scope.state_dir, &context)
+            .await
+            .map_err(Error::other)?;
+        match outcome {
+            LicenseRenewalOutcome::Requested => println!("{{\"status\":\"REQUESTED\"}}"),
+            LicenseRenewalOutcome::Pending { replacement_license_uid } => println!(
+                "{}",
+                serde_json::json!({
+                    "status": "PENDING",
+                    "replacementLicenseUid": replacement_license_uid,
+                })
+            ),
+            LicenseRenewalOutcome::Installed(report) => print_license_report(&report)?,
+        }
+        return Ok(());
+    }
     let report = match context {
         Ok(context) => match &command {
             ConnectLicenseCommands::Import(options) => apply_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Verify(options) => verify_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Show(_) => inspect_installed_license(&scope.state_dir, &context),
+            ConnectLicenseCommands::Renew(_) => unreachable!("renewal is handled before local license commands"),
         }
         .unwrap_or_else(|error| {
             let installed = matches!(&command, ConnectLicenseCommands::Show(_))
