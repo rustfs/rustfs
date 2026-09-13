@@ -122,6 +122,13 @@ fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
     }
 }
 
+fn heal_control_status_error(status: tonic::Status) -> Error {
+    if status.code() == tonic::Code::InvalidArgument {
+        return Error::InvalidArgument("heal".to_string(), "control".to_string(), status.message().to_owned());
+    }
+    Error::from(status)
+}
+
 /// Decode a control-plane response failure. Peers at or above the typed
 /// `ControlPlaneErrorCode` change (backlog#1845) carry a machine-readable
 /// discriminant beside the legacy `error_info` string; prefer it, then fall
@@ -1831,7 +1838,11 @@ impl PeerRestClient {
         });
         request.set_timeout(rustfs_protos::heal_control_execution_timeout());
         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-        let response = client.heal_control(request).await?.into_inner();
+        let response = client
+            .heal_control(request)
+            .await
+            .map_err(heal_control_status_error)?
+            .into_inner();
         if !response.success {
             return Err(Error::other(
                 response
@@ -2846,6 +2857,7 @@ mod tests {
     use super::*;
     use crate::config::com::STORAGE_CLASS_SUB_SYS;
     use crate::disk::error::DiskError;
+
     use crate::disk::error_reduce::reduce_errs;
     use crate::layout::{disks_layout::DisksLayout, endpoints::SetupType};
     use rustfs_config::{ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_STARTUP_TOPOLOGY_WAIT_MODE};
@@ -2855,6 +2867,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn heal_selector_rpc_error_preserves_invalid_argument_without_retry() {
+        let err = heal_control_status_error(tonic::Status::invalid_argument("heal pool index 99 is out of range"));
+        assert!(matches!(&err, Error::InvalidArgument(_, _, message) if message == "heal pool index 99 is out of range"));
+        assert!(heal_control_retry_action(&err, false, false).is_none());
+        assert!(!PeerRestClient::is_network_like_error(&err));
+
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let err = heal_control_status_error(tonic::Status::new(code, "invalid selector"));
+            assert!(!matches!(err, Error::InvalidArgument(..)), "classify by code, not message");
+            let Error::Io(io_error) = &err else {
+                panic!("non-argument RPC failures must retain their typed transport status: {err:?}");
+            };
+            assert_eq!(
+                embedded_tonic_status(io_error)
+                    .expect("transport status should be preserved")
+                    .code(),
+                code
+            );
+        }
+    }
 
     #[test]
     fn control_plane_failure_prefers_typed_not_initialized_code() {
