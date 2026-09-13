@@ -1740,6 +1740,7 @@ mod tests {
     use std::future::Future as _;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
