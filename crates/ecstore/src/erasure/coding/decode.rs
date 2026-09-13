@@ -591,6 +591,7 @@ pub(crate) struct ParallelReader<R> {
     // never consumes the unopened reader reserved for a later stripe.
     deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
     stripe_index: usize,
+    integrity: Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
 }
 }
 
@@ -782,6 +783,7 @@ where
             .map(|index| !demand_bound_lockstep || index < e.data_shards)
             .collect();
         ParallelReader {
+            integrity: readers.iter().flatten().find_map(BitrotReader::integrity_proof),
             readers,
             offset,
             shard_size,
@@ -1968,11 +1970,7 @@ where
             .get(idx)
             .and_then(|handle| handle.as_ref())
             .is_some_and(|handle| handle.advance_stripes(stripe_index));
-        if advanced
-            && self.readers[idx]
-                .as_mut()
-                .is_some_and(|reader| reader.advance_unopened_blocks(stripe_index).is_ok())
-        {
+        if advanced {
             self.engaged[idx] = true;
             true
         } else {
@@ -2002,11 +2000,28 @@ where
     R: crate::erasure::coding::ShardSource,
 {
     async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
+        let stripe = self.offset.checked_div(self.shard_size);
         let mut state = self
             .stripe_state
             .take()
             .unwrap_or_else(|| Box::new(StripeReadState::with_slot_count(self.readers.len(), self.data_shards)));
         self.read_into_state(&mut state).await;
+        if state.can_decode()
+            && let Some(proof) = &self.integrity
+        {
+            let result = match stripe {
+                Some(stripe) => proof.reconstruction_proof(stripe, state.shards_mut()).await,
+                None => Err(io::Error::new(ErrorKind::InvalidData, "invalid integrity stripe offset")),
+            };
+            match result {
+                Ok(proof) => state.integrity = proof,
+                Err(_) => {
+                    let (shards, errors) = state.parts_mut();
+                    shards.iter_mut().for_each(|shard| *shard = None);
+                    errors.fill(Some(Error::FileCorrupt));
+                }
+            }
+        }
         state
     }
 
@@ -2340,6 +2355,8 @@ impl Erasure {
         ret_err: &mut Option<std::io::Error>,
         stage_metrics_enabled: bool,
         require_surplus_source: bool,
+        integrity: Option<&std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
+        request_offset: usize,
     ) -> StripeFlow
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -2377,6 +2394,20 @@ impl Erasure {
         // missing data shard and an extra source shard was available, verify
         // the reconstructed data against that source before streaming bytes.
         let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let proof = if let Some(integrity) = integrity {
+            match integrity
+                .reconstruction_proof((request_offset + *written) / self.block_size, shards)
+                .await
+            {
+                Ok(proof) => proof,
+                Err(error) => {
+                    *ret_err = Some(error);
+                    return StripeFlow::Stop;
+                }
+            }
+        } else {
+            None
+        };
         let decode_result = if require_surplus_source {
             self.decode_data_with_reconstruction_verification_for_lockstep(shards)
         } else {
@@ -2401,6 +2432,12 @@ impl Erasure {
         }
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
+        if let Some(proof) = proof
+            && let Err(error) = proof.verify(shards)
+        {
+            *ret_err = Some(error);
+            return StripeFlow::Stop;
+        }
         let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let n = match write_data_blocks(writer, shards, self.data_shards, block_offset, block_length).await {
             Ok(n) => {
@@ -2514,6 +2551,8 @@ impl Erasure {
         .with_deferred_parity_handles(deferred_handles)
         .with_deferred_parity_reopeners(deferred_reopeners);
 
+        let integrity = reader.integrity.clone();
+
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
 
@@ -2619,6 +2658,8 @@ impl Erasure {
                                 &mut ret_err,
                                 stage_metrics_enabled,
                                 require_surplus_source,
+                                integrity.as_ref(),
+                                offset,
                             );
                             tokio::pin!(read_fut);
                             tokio::pin!(emit_fut);
@@ -2667,6 +2708,8 @@ impl Erasure {
                                 &mut ret_err,
                                 stage_metrics_enabled,
                                 reader.demand_bound_lockstep,
+                                integrity.as_ref(),
+                                offset,
                             )
                             .await
                         {
@@ -2708,6 +2751,8 @@ impl Erasure {
                         &mut ret_err,
                         stage_metrics_enabled,
                         reader.demand_bound_lockstep,
+                        integrity.as_ref(),
+                        offset,
                     )
                     .await
                 {
@@ -2897,8 +2942,7 @@ mod tests {
                     hash_algo.clone(),
                     false,
                     false,
-                )
-                .expect("valid deferred reader geometry");
+                );
                 readers.push(Some(reader));
                 handles[i] = Some(handle);
             }

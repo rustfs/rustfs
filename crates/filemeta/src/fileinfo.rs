@@ -34,10 +34,8 @@ use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
-pub const BITROT_CONTEXT_SUFFIX: &str = "bitrot-context-v1";
-pub const BITROT_PART_ID_PREFIX: &str = "bitrot-part-id-v1-";
 
-const MAX_ERASURE_SHARDS: usize = 16;
+pub(crate) const MAX_ERASURE_SHARDS: usize = 16;
 const MAX_FILEINFO_PARTS: usize = 10_000;
 const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
 const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
@@ -59,7 +57,7 @@ const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
 const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
     pub etag: String,
     pub number: usize,
@@ -71,9 +69,28 @@ pub struct ObjectPartInfo {
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
     pub error: Option<String>,
-    /// Immutable identity of this encoded part, including multipart replacements.
     #[serde(default)]
-    pub bitrot_id: Option<Uuid>,
+    pub integrity: Option<crate::shard_integrity::PartIntegrity>,
+}
+
+impl Serialize for ObjectPartInfo {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Named fields let release readers ignore optional extensions. Appending
+        // a ninth element to the old positional array makes those readers fail.
+        let mut map = serializer.serialize_map(Some(8 + usize::from(self.integrity.is_some())))?;
+        map.serialize_entry("etag", &self.etag)?;
+        map.serialize_entry("number", &self.number)?;
+        map.serialize_entry("size", &self.size)?;
+        map.serialize_entry("actual_size", &self.actual_size)?;
+        map.serialize_entry("mod_time", &self.mod_time)?;
+        map.serialize_entry("index", &self.index)?;
+        map.serialize_entry("checksums", &self.checksums)?;
+        map.serialize_entry("error", &self.error)?;
+        if let Some(integrity) = &self.integrity {
+            map.serialize_entry("integrity", integrity)?;
+        }
+        map.end()
+    }
 }
 
 impl ObjectPartInfo {
@@ -644,7 +661,11 @@ impl<'de> Deserialize<'de> for FileInfo {
             }
         }
 
-        deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)
+        let mut file = deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)?;
+        if !file.parts.is_empty() {
+            file.hydrate_shard_integrity().map_err(de::Error::custom)?;
+        }
+        Ok(file)
     }
 }
 
@@ -728,103 +749,6 @@ pub(crate) fn is_valid_distribution(distribution: &[usize], n: usize) -> bool {
 }
 
 impl FileInfo {
-    pub fn uses_bound_bitrot(&self) -> Result<bool> {
-        if !contains_key_str(&self.metadata, BITROT_CONTEXT_SUFFIX) {
-            return Ok(false);
-        }
-        match get_consistent_str(&self.metadata, BITROT_CONTEXT_SUFFIX) {
-            Some("1") => Ok(true),
-            _ => Err(Error::FileCorrupt),
-        }
-    }
-
-    pub fn enable_bound_bitrot(&mut self) {
-        insert_str(&mut self.metadata, BITROT_CONTEXT_SUFFIX, "1".to_string());
-    }
-
-    pub fn clear_bitrot_metadata(&mut self) {
-        self.metadata.retain(|key, _| {
-            !has_internal_suffix(key, BITROT_CONTEXT_SUFFIX)
-                && !rustfs_utils::http::strip_internal_prefix_preserving_case(key)
-                    .is_some_and(|suffix| starts_with_ignore_ascii_case(suffix, BITROT_PART_ID_PREFIX))
-        });
-    }
-
-    pub fn set_bitrot_part_identity(&mut self, part_number: usize, identity: Uuid) {
-        self.enable_bound_bitrot();
-        insert_str(&mut self.metadata, &format!("{BITROT_PART_ID_PREFIX}{part_number}"), identity.to_string());
-    }
-
-    pub fn bitrot_part_identity(&self, part_number: usize) -> Result<Option<Uuid>> {
-        if !self.uses_bound_bitrot()? {
-            return Ok(None);
-        }
-        let value =
-            get_consistent_str(&self.metadata, &format!("{BITROT_PART_ID_PREFIX}{part_number}")).ok_or(Error::FileCorrupt)?;
-        Uuid::parse_str(value)
-            .ok()
-            .filter(|id| !id.is_nil())
-            .map(Some)
-            .ok_or(Error::FileCorrupt)
-    }
-
-    /// Validate all persisted descriptors in one pass, including shallow reads.
-    /// Repeated case-insensitive lookups would be quadratic for 10,000 parts.
-    pub fn validate_bitrot_parts(&self, part_numbers: &[usize]) -> Result<()> {
-        if !self.uses_bound_bitrot()? {
-            return Ok(());
-        }
-        if part_numbers.len() > MAX_FILEINFO_PARTS {
-            return Err(Error::FileCorrupt);
-        }
-        let mut identities = HashMap::with_capacity(part_numbers.len());
-        for (key, value) in &self.metadata {
-            let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key)
-                .filter(|suffix| starts_with_ignore_ascii_case(suffix, BITROT_PART_ID_PREFIX))
-            else {
-                continue;
-            };
-            let number = &suffix[BITROT_PART_ID_PREFIX.len()..];
-            let part = number.parse::<usize>().map_err(|_| Error::FileCorrupt)?;
-            if part == 0
-                || part > MAX_FILEINFO_PARTS
-                || part.to_string() != number
-                || Uuid::parse_str(value).ok().is_none_or(|id| id.is_nil())
-                || identities.insert(part, value).is_some_and(|previous| previous != value)
-            {
-                return Err(Error::FileCorrupt);
-            }
-        }
-        if part_numbers.iter().any(|number| !identities.contains_key(number)) {
-            return Err(Error::FileCorrupt);
-        }
-        Ok(())
-    }
-
-    /// Returns a part domain; disk/reader setup then binds the coding index.
-    pub fn bitrot_algorithm(&self, part_number: usize) -> Result<HashAlgorithm> {
-        if let Some(identity) = self.bitrot_part_identity(part_number)? {
-            return Ok(HashAlgorithm::bound_bitrot(identity.as_bytes()));
-        }
-        let algorithm = self.erasure.get_checksum_info(part_number).algorithm;
-        Ok(if self.uses_legacy_checksum && algorithm == HashAlgorithm::HighwayHash256S {
-            HashAlgorithm::HighwayHash256SLegacy
-        } else {
-            algorithm
-        })
-    }
-
-    pub fn preserve_bitrot_metadata(&self, target: &mut HashMap<String, String>) {
-        for (key, value) in &self.metadata {
-            if has_internal_suffix(key, BITROT_CONTEXT_SUFFIX)
-                || rustfs_utils::http::strip_internal_prefix_preserving_case(key)
-                    .is_some_and(|suffix| starts_with_ignore_ascii_case(suffix, BITROT_PART_ID_PREFIX))
-            {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    }
-
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
         let indices = {
             let cardinality = data_blocks + parity_blocks;
@@ -1184,7 +1108,6 @@ impl FileInfo {
         checksums: Option<HashMap<String, String>>,
     ) {
         let part = ObjectPartInfo {
-            bitrot_id: None,
             etag,
             number: num,
             size: part_size,
@@ -1193,6 +1116,7 @@ impl FileInfo {
             index,
             checksums,
             error: None,
+            integrity: None,
         };
 
         for p in self.parts.iter_mut() {
@@ -2267,7 +2191,6 @@ mod tests {
             proptest::option::of(small_string_strategy()),
         )
             .prop_map(|(etag, number, size, actual_size, mod_time, index, checksums, error)| ObjectPartInfo {
-                bitrot_id: None,
                 etag,
                 number,
                 size,
@@ -2276,6 +2199,7 @@ mod tests {
                 index,
                 checksums,
                 error,
+                integrity: None,
             })
     }
 
@@ -2471,7 +2395,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             parts: vec![ObjectPartInfo {
-                bitrot_id: None,
                 etag: "part-etag".to_string(),
                 number: 18,
                 size: 19,
@@ -2484,6 +2407,7 @@ mod tests {
                         .collect(),
                 ),
                 error: Some("part-error".to_string()),
+                integrity: None,
             }],
             erasure: ErasureInfo {
                 algorithm: "erasure-algorithm".to_string(),

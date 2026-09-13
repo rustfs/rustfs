@@ -1536,9 +1536,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             drop(admission_guard);
         }
 
-        let bitrot_id = fi.uses_bound_bitrot()?.then(Uuid::new_v4);
-        let write_checksum_algo =
-            bitrot_id.map_or(HashAlgorithm::HighwayHash256S, |id| HashAlgorithm::bound_bitrot(id.as_bytes()));
         let result: Result<PartInfo> = async {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
@@ -1547,7 +1544,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let mut writers = Vec::with_capacity(shuffle_disks.len());
             let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for (index, disk_op) in shuffle_disks.iter().enumerate() {
+            for disk_op in shuffle_disks.iter() {
                 if let Some(disk) = disk_op {
                     let writer = match create_bitrot_writer(
                         false,
@@ -1556,7 +1553,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         &tmp_part_path,
                         erasure.shard_file_size(data.size()),
                         erasure.shard_size(),
-                        write_checksum_algo.for_coding_index(index + 1),
+                        HashAlgorithm::HighwayHash256S,
                     )
                     .await
                     {
@@ -1629,7 +1626,22 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             };
             let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let (reader, w_size) = match write_path {
+            let upload_suffix = rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY;
+            let protected_upload = rustfs_utils::http::get_consistent_str(&fi.metadata, upload_suffix) == Some("1");
+            if rustfs_utils::http::contains_key_str(&fi.metadata, upload_suffix) && !protected_upload {
+                return Err(DiskError::FileCorrupt.into());
+            }
+            let (reader, w_size, integrity) = if protected_upload {
+                use crate::erasure::coding::encode::IntegrityEncodeMode;
+                let mode = match write_path {
+                    SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                    SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                    SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
+                };
+                let (reader, size, _, integrity) = Arc::clone(&erasure).encode_protected(stream, &mut writers, write_quorum, part_id, mode).await?;
+                (reader, size, Some(integrity))
+            } else {
+                let (reader, w_size) = match write_path {
                 SmallWritePath::SingleBlockNonInline => {
                     Arc::clone(&erasure)
                         .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
@@ -1639,6 +1651,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await?
                 }
                 SmallWritePath::Inline | SmallWritePath::Pipeline => Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await?,
+            };
+
+                (reader, w_size, None)
             };
 
             if let Some(stage_start) = encode_stage_start {
@@ -1677,6 +1692,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 )))?;
             }
 
+            let part_integrity = if let Some(integrity) = integrity {
+                Some(integrity.write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_part).await?)
+            } else { None };
+            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                return Err(Error::ErasureWriteQuorum);
+            }
+
             let index_op = data
                 .stream
                 .try_get_index()
@@ -1702,7 +1724,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let checksums = data.as_hash_reader().content_crc();
 
             let part_info = ObjectPartInfo {
-                bitrot_id,
                 etag: etag.clone(),
                 number: part_id,
                 size: w_size,
@@ -1710,6 +1731,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 actual_size,
                 index: index_op,
                 checksums: if checksums.is_empty() { None } else { Some(checksums) },
+                integrity: part_integrity,
                 ..Default::default()
             };
 
@@ -1726,7 +1748,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     None,
                     BitrotSelfVerifyTarget {
                         operation: "put_object_part",
-                        checksum_algo: &write_checksum_algo,
                         bucket,
                         object,
                         part_number: Some(part_id),
@@ -2091,6 +2112,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let disks = disks.clone();
 
         let mut user_defined = opts.user_defined.clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY,
+            "1".to_owned(),
+        );
         rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
         if !opts.data_movement {
             rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD);
@@ -2190,8 +2217,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         for f in parts_metadatas.iter_mut() {
             f.metadata = user_defined.clone();
-            f.clear_bitrot_metadata();
-            f.enable_bound_bitrot();
             f.mod_time = Some(mod_time);
             f.fresh = true;
         }
@@ -2525,7 +2550,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        let bound_upload = fi.uses_bound_bitrot()?;
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 let mapped_err = complete_multipart_part_error(uploaded_parts[i].part_num, err, bucket, object);
@@ -2587,10 +2611,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 part.index.clone(),
                 part.checksums.clone(),
             );
-            if bound_upload {
-                let identity = part.bitrot_id.filter(|id| !id.is_nil()).ok_or(Error::PartMissingOrCorrupt)?;
-                fi.set_bitrot_part_identity(part.number, identity);
-            }
+            let inserted = fi
+                .parts
+                .iter_mut()
+                .find(|entry| entry.number == part.number)
+                .ok_or(Error::FileCorrupt)?;
+            inserted.integrity.clone_from(&part.integrity);
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);
@@ -2960,6 +2986,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 Err(err) => return Err(err),
             }
         }
+
+        if rustfs_utils::http::contains_key_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+            && (rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+                != Some("1")
+                || fi.parts.iter().any(|part| part.integrity.is_none()))
+        {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY);
+        fi.persist_shard_integrity()?;
 
         for meta in parts_metadatas.iter_mut() {
             if meta.has_valid_erasure_geometry() {
@@ -5367,7 +5403,16 @@ mod tests {
             upload_path,
             upload_meta.data_dir.expect("multipart upload should have a data directory")
         );
-        let retry_meta = Bytes::from_static(b"interrupted retry metadata");
+        let retry_meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: 23,
+                etag: "interrupted-retry".to_owned(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("valid legacy retry metadata"),
+        );
 
         for (index, disk) in disk_stores.iter().enumerate().take(3) {
             let retry_path = format!("{}/part.1", Uuid::new_v4());
@@ -5435,7 +5480,16 @@ mod tests {
                 &src_path,
                 RUSTFS_META_MULTIPART_BUCKET,
                 &dst_path,
-                Bytes::from_static(b"retry metadata"),
+                Bytes::from(
+                    ObjectPartInfo {
+                        number: 1,
+                        size: 9,
+                        etag: "retry".to_owned(),
+                        ..Default::default()
+                    }
+                    .marshal_msg()
+                    .expect("valid legacy part metadata"),
+                ),
                 3,
                 None,
             )

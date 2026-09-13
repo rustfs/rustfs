@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use rustfs_heal::heal::{
     outcome::HealObjectDisposition,
     storage::{ECStoreHealStorage, HealStorageAPI},
@@ -25,7 +27,7 @@ use storage_api::integration::{DiskAPI, ObjectIO, ObjectOptions, PutObjReader, R
 
 #[tokio::test]
 #[serial]
-async fn receipt_requires_identity_verification_even_for_normal_sweeps() {
+async fn receipt_requires_independent_deep_verification() {
     let root = tempfile::tempdir().expect("receipt fixture");
     let env = TestECStoreEnv::builder()
         .base_dir(root.path())
@@ -95,7 +97,7 @@ async fn receipt_requires_identity_verification_even_for_normal_sweeps() {
                 retained.push((target_path, original));
             }
         }
-        let result = storage
+        let normal = storage
             .heal_object_with_receipt(
                 bucket,
                 &object,
@@ -103,6 +105,20 @@ async fn receipt_requires_identity_verification_even_for_normal_sweeps() {
                 &HealOpts {
                     no_lock: true,
                     scan_mode: HealScanMode::Normal,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("normal presence scan");
+        assert!(normal.receipt.is_none(), "a presence scan cannot certify payload integrity");
+        let result = storage
+            .heal_object_with_receipt(
+                bucket,
+                &object,
+                None,
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
                     ..Default::default()
                 },
             )

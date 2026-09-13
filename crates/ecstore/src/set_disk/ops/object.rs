@@ -2430,8 +2430,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // requests do not pay for part and transform scans they cannot use.
         let read_path_plan = ReadPathPlan::new(&object_info, fi);
 
-        self.verify_unbound_payload(bucket, object, fi).await?;
-
         // Inline data fast path: skip duplex pipe for small inline objects.
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
@@ -2448,7 +2446,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
-            let checksum_algo = fi.bitrot_algorithm(fi.parts[0].number)?;
+            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
                 && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
@@ -3457,6 +3461,7 @@ impl SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if let Some(eval_metadata) = &opts.eval_metadata {
             merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
         }
@@ -3495,8 +3500,6 @@ impl SetDisks {
         // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
-        let bitrot_id = Uuid::new_v4();
-        let write_checksum_algo = HashAlgorithm::bound_bitrot(bitrot_id.as_bytes());
 
         fi.version_id = {
             if let Some(ref vid) = opts.version_id {
@@ -3554,7 +3557,9 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned)
+                && put_object_size >= 0
+                && usize::try_from(put_object_size).is_ok_and(|size| size <= erasure.block_size);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -3585,10 +3590,8 @@ impl SetDisks {
             } else {
                 let writer_futs: Vec<_> = shuffle_disks
                     .iter()
-                    .enumerate()
-                    .map(|(index, disk_op)| {
+                    .map(|disk_op| {
                         let tmp_obj = tmp_object.clone();
-                        let checksum_algo = write_checksum_algo.for_coding_index(index + 1);
                         async move {
                             if let Some(disk) = disk_op
                                 && disk.is_online().await
@@ -3600,7 +3603,7 @@ impl SetDisks {
                                     &tmp_obj,
                                     shard_file_size,
                                     shard_size,
-                                    checksum_algo,
+                                    HashAlgorithm::HighwayHash256S,
                                 )
                                 .await
                                 {
@@ -3677,48 +3680,16 @@ impl SetDisks {
             };
 
             let encode_stage_start = collect_stage_timing.then(Instant::now);
-            let mut inline_shards = None;
-            let (reader, w_size) = match write_path {
-                SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_shards_with_size_hint(stream, small_size_hint, &write_checksum_algo)
-                    .await
-                {
-                    Ok((r, w, shards)) => {
-                        inline_shards = Some(shards);
-                        (r, w)
-                    }
-                    Err(e) => {
-                        error!("encode_inline_small err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
-                    .await
-                {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode_single_block_non_inline err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::PipelineBatchedLarge => {
-                    match Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await {
-                        Ok((r, w)) => (r, w),
-                        Err(e) => {
-                            error!("encode_batched err {:?}", e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-                SmallWritePath::Pipeline => match Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
+            use crate::erasure::coding::encode::IntegrityEncodeMode;
+            let mode = match write_path {
+                SmallWritePath::Inline => IntegrityEncodeMode::Inline(small_size_hint),
+                SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let (reader, w_size, inline_shards, integrity) = Arc::clone(&erasure)
+                .encode_protected(stream, &mut writers, write_quorum, 1, mode)
+                .await?;
             let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
             let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
             if let Some(encode_elapsed) = encode_elapsed {
@@ -3820,9 +3791,32 @@ impl SetDisks {
                 )));
             }
 
+            let part_integrity = if is_inline_buffer {
+                integrity.set_inline_metadata(&mut fi)?;
+                integrity.part.clone()
+            } else {
+                integrity
+                    .write(
+                        &mut shuffle_disks,
+                        bucket,
+                        RUSTFS_META_TMP_BUCKET,
+                        &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
+                    )
+                    .await?
+            };
+            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                return Err(Error::ErasureWriteQuorum);
+            }
+            if let Some(inline_proof) =
+                rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY)
+            {
+                insert_str(
+                    &mut user_defined,
+                    rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+                    inline_proof.to_owned(),
+                );
+            }
             fi.metadata = user_defined;
-            fi.clear_bitrot_metadata();
-            fi.set_bitrot_part_identity(1, bitrot_id);
             if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
                 // Every disk must publish the same cleanup owner alongside a
                 // replaced null version. This transient key is not persisted
@@ -3834,6 +3828,8 @@ impl SetDisks {
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
             fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
+            fi.parts[0].integrity = Some(part_integrity);
+            fi.persist_shard_integrity()?;
             if opts.data_movement {
                 fi.set_data_moved();
             }
@@ -3891,7 +3887,6 @@ impl SetDisks {
                     },
                     BitrotSelfVerifyTarget {
                         operation: "put_object",
-                        checksum_algo: &write_checksum_algo,
                         bucket,
                         object,
                         part_number: None,
@@ -7616,13 +7611,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None
         };
         let mut replacement_metadata = (*src_info.user_defined).clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut replacement_metadata);
+        for suffix in [
+            rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+            rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+        ] {
+            if rustfs_utils::http::contains_key_str(&fi.metadata, suffix) {
+                let value = rustfs_utils::http::get_consistent_str(&fi.metadata, suffix).ok_or(Error::FileCorrupt)?;
+                rustfs_utils::http::insert_str(&mut replacement_metadata, suffix, value.to_owned());
+            }
+        }
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }
         if let Some(etag) = &src_info.etag {
             replacement_metadata.insert("etag".to_owned(), etag.clone());
         }
-        fi.preserve_bitrot_metadata(&mut replacement_metadata);
         fi.metadata = replacement_metadata.clone();
 
         let mod_time = OffsetDateTime::now_utc();
@@ -9253,7 +9257,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        self.verify_unbound_payload(bucket, object, &fi).await?;
         let expected_size = u64::try_from(fi.size).map_err(|_| StorageError::FileCorrupt)?;
         let (pr, pw) = tokio::io::duplex(fi.erasure.block_size);
         let consumed = Arc::new(AtomicU64::new(0));
@@ -10292,7 +10295,7 @@ mod object_encryption_resolver_wiring_tests {
 }
 
 #[cfg(test)]
-pub(in crate::set_disk) mod hermetic_set_disks_support {
+pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
@@ -10363,7 +10366,7 @@ pub(in crate::set_disk) mod hermetic_set_disks_support {
 
     /// Pool-parameterized variant of [`hermetic_set_disks_isolated`] with the
     /// same isolation contract.
-    pub(in crate::set_disk) async fn hermetic_set_disks_for_pool_with_default_parity_isolated(
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity_isolated(
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
@@ -11369,10 +11372,7 @@ mod inline_put_commit_path_tests {
                 Cursor::new(inline_data.clone()),
                 inline_data.len(),
                 logical_shard_size,
-                file_info
-                    .bitrot_algorithm(1)
-                    .expect("persisted part domain")
-                    .for_coding_index(file_info.erasure.index),
+                HashAlgorithm::HighwayHash256S,
                 erasure.shard_size(),
             )
             .await

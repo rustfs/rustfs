@@ -1832,7 +1832,6 @@ impl ObjectInfo {
             .parts
             .iter()
             .map(|part| ObjectPartInfo {
-                bitrot_id: part.bitrot_id,
                 etag: part.etag.clone(),
                 index: part.index.clone(),
                 size: part.size,
@@ -1841,6 +1840,7 @@ impl ObjectInfo {
                 checksums: part.checksums.clone(),
                 number: part.number,
                 error: part.error.clone(),
+                integrity: part.integrity.clone(),
             })
             .collect::<Vec<_>>();
 

@@ -14,13 +14,13 @@
 
 use super::super::{
     Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
-    Error, FileInfo, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos, LOG_SUBSYSTEM_SET_DISK,
-    ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result, SLASH_SEPARATOR, SetDisks,
-    StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader, create_bitrot_writer, debug, disk,
-    disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata, formats_match_reference_slots,
-    get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix, heal_bucket_local_on_disks, is_object_dir_dangling,
-    join_all, load_format_erasure_all, path_join_buf, save_format_file, should_heal_object_on_disk, stat_all_dirs, to_object_err,
-    warn,
+    Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
+    LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
+    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
+    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
+    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
+    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
 };
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
@@ -813,6 +813,10 @@ impl SetDisks {
                 match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
                     Ok(mut latest_meta) => {
                         Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
+                        let protected =
+                            !latest_meta.parts.is_empty() && latest_meta.parts.iter().all(|part| part.integrity.is_some());
+                        result.integrity_verified =
+                            protected && opts.scan_mode == HealScanMode::Deep && !read_repair_uses_shared_lock;
                         trace!(
                             event = EVENT_SET_DISK_HEAL,
                             component = LOG_COMPONENT_ECSTORE,
@@ -826,8 +830,6 @@ impl SetDisks {
                             state = "canonical_metadata_selected",
                             "Set disk canonical object metadata selected"
                         );
-
-                        self.verify_unbound_payload(bucket, object, &latest_meta).await?;
 
                         let (data_errs_by_disk, data_errs_by_part) = disks_with_all_parts(
                             &mut online_disks,
@@ -918,7 +920,31 @@ impl SetDisks {
                             });
                         }
 
+                        if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
+                            result.detail = "Legacy object has no independent shard commitment; verification and automatic repair are deferred".to_owned();
+                            return Ok((result, None));
+                        }
+
                         if disks_to_heal_count == 0 {
+                            if result.integrity_verified && !opts.dry_run {
+                                match crate::io_support::shard_integrity::restore_proof_replicas(
+                                    &latest_meta,
+                                    &disks,
+                                    bucket,
+                                    object,
+                                )
+                                .await
+                                {
+                                    Ok(repaired) if repaired > 0 => {
+                                        result.detail = format!("Restored {repaired} independent integrity indexes")
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        result.integrity_verified = false;
+                                        return Ok((result, Some(error)));
+                                    }
+                                }
+                            }
                             // The object is already healthy: no disk needs healing.
                             // This is the common case for the very objects PR #4356
                             // targets — a valid `xl.meta` plus a leaked pre-#3510
@@ -1201,6 +1227,15 @@ impl SetDisks {
                             let mut writer_failure_warned = false;
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
+                                use crate::io_support::shard_integrity::{PartProofReader, PreparedIntegrity, ShardVerifier};
+                                let proof = part
+                                    .integrity
+                                    .as_ref()
+                                    .map(|part| {
+                                        PartProofReader::new(part.clone(), &parts_metadata, &latest_disks, bucket, object)
+                                    })
+                                    .transpose()
+                                    .map_err(DiskError::from)?;
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
                                 let use_mmap_read = object_mmap_read_enabled();
 
@@ -1228,7 +1263,14 @@ impl SetDisks {
                                     }
 
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
-                                        let checksum_algo = metadata.bitrot_algorithm(part.number)?.for_coding_index(index + 1);
+                                        let checksum_info = metadata.erasure.get_checksum_info(part.number);
+                                        let checksum_algo = if metadata.uses_legacy_checksum
+                                            && checksum_info.algorithm == HashAlgorithm::HighwayHash256S
+                                        {
+                                            HashAlgorithm::HighwayHash256SLegacy
+                                        } else {
+                                            checksum_info.algorithm
+                                        };
 
                                         match create_bitrot_reader(
                                             metadata.data.as_deref(),
@@ -1244,7 +1286,15 @@ impl SetDisks {
                                         )
                                         .await
                                         {
-                                            Ok(Some(reader)) => {
+                                            Ok(Some(mut reader)) => {
+                                                if let Some(proof) = &proof {
+                                                    reader
+                                                        .set_integrity(
+                                                            ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
+                                                                .map_err(DiskError::from)?,
+                                                        )
+                                                        .map_err(DiskError::from)?;
+                                                }
                                                 readers.push(Some(reader));
                                             }
                                             Ok(None) => {
@@ -1287,7 +1337,7 @@ impl SetDisks {
                                                 ]),
                                                 erasure.shard_file_size(part.size as i64),
                                                 erasure.shard_size(),
-                                                latest_meta.bitrot_algorithm(part.number)?.for_coding_index(index + 1),
+                                                HashAlgorithm::HighwayHash256S,
                                             )
                                             .await
                                         };
@@ -1303,6 +1353,13 @@ impl SetDisks {
                                                 continue;
                                             }
                                         };
+                                        let mut writer = writer;
+                                        if let Some(proof) = &proof {
+                                            writer.set_integrity(
+                                                ShardVerifier::new(std::sync::Arc::clone(proof), index, 0, None)
+                                                    .map_err(DiskError::from)?,
+                                            );
+                                        }
                                         writers.push(Some(writer));
                                     } else {
                                         writers.push(None);
@@ -1342,6 +1399,26 @@ impl SetDisks {
                                     return Err(e);
                                 }
                                 // close_bitrot_writers(&mut writers).await?;
+                                if !is_inline_buffer && let Some(proof) = &proof {
+                                    let before = out_dated_disks.iter().filter(|disk| disk.is_some()).count();
+                                    let proof_result = async {
+                                        PreparedIntegrity::copy_from(proof)
+                                            .await?
+                                            .write(
+                                                &mut out_dated_disks,
+                                                bucket,
+                                                RUSTFS_META_TMP_BUCKET,
+                                                &format!("{tmp_id}/{dst_data_dir}"),
+                                            )
+                                            .await
+                                    }
+                                    .await;
+                                    if let Err(error) = proof_result {
+                                        let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                        return Err(error.into());
+                                    }
+                                    disks_to_heal_count -= before - out_dated_disks.iter().filter(|disk| disk.is_some()).count();
+                                }
 
                                 for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
                                     if disk_op.is_none() {
@@ -1364,6 +1441,13 @@ impl SetDisks {
                                         part.index.clone(),
                                         part.checksums.clone(),
                                     );
+                                    if let Some(updated) = parts_metadata[index]
+                                        .parts
+                                        .iter_mut()
+                                        .find(|updated| updated.number == part.number)
+                                    {
+                                        updated.integrity.clone_from(&part.integrity);
+                                    }
                                     if is_inline_buffer {
                                         if let Some(writer) = writers[index].take() {
                                             // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
@@ -1539,6 +1623,15 @@ impl SetDisks {
                             ));
                         }
 
+                        if result.integrity_verified
+                            && let Err(error) =
+                                crate::io_support::shard_integrity::restore_proof_replicas(&latest_meta, &disks, bucket, object)
+                                    .await
+                        {
+                            result.integrity_verified = false;
+                            return Ok((result, Some(error)));
+                        }
+
                         // The object is healthy here; sweep any data dirs left behind
                         // by pre-#3510 unversioned overwrites, which the dangling paths
                         // above never touch (issues #3231, #3191). Best effort — a
@@ -1642,6 +1735,11 @@ impl SetDisks {
         let Some(candidate) = candidates.first().copied() else {
             return Ok(false);
         };
+        // A minority metadata copy cannot establish the independent commitment.
+        // Legacy self-checks also cannot authorize automatic metadata repair.
+        if candidates.len() < candidate.erasure.data_blocks || candidate.parts.iter().any(|part| part.integrity.is_none()) {
+            return Ok(false);
+        }
         let identity = Self::file_info_quorum_hash(candidate);
         if candidates
             .iter()
@@ -1675,6 +1773,26 @@ impl SetDisks {
             return Ok(false);
         }
 
+        let mut proof_files = parts_metadata.to_vec();
+        for (index, file) in proof_files.iter_mut().enumerate() {
+            if matches!(
+                errs.get(index).and_then(Option::as_ref),
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            ) {
+                *file = candidate.clone();
+                file.erasure.index = candidate.erasure.distribution[index];
+            }
+        }
+        let mut verified = (0..candidate.parts.len())
+            .map(|part| (part, vec![crate::disk::CHECK_PART_UNKNOWN; disks.len()]))
+            .collect();
+        crate::io_support::shard_integrity::verify_deep_parts(&proof_files, disks, candidate, bucket, object, &mut verified)
+            .await?;
+        let verified_disk = |index: usize| verified.values().all(|parts| parts.get(index) == Some(&CHECK_PART_SUCCESS));
+        if (0..disks.len()).filter(|index| verified_disk(*index)).count() < candidate.erasure.data_blocks {
+            return Ok(false);
+        }
+
         let mut wrote = 0usize;
         for (index, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else {
@@ -1684,7 +1802,7 @@ impl SetDisks {
                 errs.get(index).and_then(Option::as_ref),
                 Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
             );
-            if !metadata_absent {
+            if !metadata_absent || !verified_disk(index) {
                 continue;
             }
             let Some(&shard_index) = candidate.erasure.distribution.get(index) else {
@@ -3619,10 +3737,6 @@ mod heal_result_report_tests {
                 .expect("inline metadata should decode"),
             );
         }
-        // This probe targets legacy whole-file algorithms, independently of bound-v1.
-        for file in &mut metadata {
-            file.clear_bitrot_metadata();
-        }
         let latest = metadata[1].clone();
         let mut online: Vec<_> = disks.into_iter().map(Some).collect();
         for algorithm in [
@@ -5299,7 +5413,7 @@ mod shard_identity_tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn bound_bitrot_heal_rejects_complete_donor_shards_ec12_4() {
+    async fn shard_integrity_heal_rejects_complete_donor_shards_ec12_4() {
         let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(16, 0, 4).await;
         let bucket = "donor-shard-identity";
         for disk in &disks {
@@ -5387,7 +5501,10 @@ mod shard_identity_tests {
                     .expect("replace the complete shard without changing metadata");
                 if replace_descriptor {
                     let mut altered = target_meta[target_slot].clone();
-                    donor_meta[donor_slot].preserve_bitrot_metadata(&mut altered.metadata);
+                    let suffix = rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY;
+                    let descriptor = rustfs_utils::http::get_consistent_str(&donor_meta[donor_slot].metadata, suffix)
+                        .expect("donor descriptor");
+                    rustfs_utils::http::insert_str(&mut altered.metadata, suffix, descriptor.to_owned());
                     disks[target_slot]
                         .write_metadata("", bucket, &target, altered)
                         .await
@@ -5496,7 +5613,7 @@ mod shard_identity_tests {
     }
 
     #[tokio::test]
-    async fn bound_bitrot_inline_donor_repair_and_late_external_get() {
+    async fn shard_integrity_inline_donor_repair_and_late_external_get() {
         let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
         let bucket = "bound-inline-and-late";
         for disk in &disks {
@@ -5614,7 +5731,7 @@ mod shard_identity_tests {
     }
 
     #[tokio::test]
-    async fn bound_bitrot_legacy_requires_target_digest_not_only_parity_consistency() {
+    async fn shard_integrity_legacy_requires_target_digest_not_only_parity_consistency() {
         let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
         let bucket = "legacy-shard-authority";
         for disk in &disks {
@@ -5651,7 +5768,10 @@ mod shard_identity_tests {
                     legacy.extend_from_slice(rustfs_utils::HashAlgorithm::HighwayHash256S.hash_encode(payload).as_ref());
                     legacy.extend_from_slice(payload);
                 }
-                fi.clear_bitrot_metadata();
+                rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut fi.metadata);
+                for part in &mut fi.parts {
+                    part.integrity = None;
+                }
                 tokio::fs::write(&path, legacy).await.expect("legacy framing");
                 disk.write_metadata("", bucket, object, fi.clone())
                     .await
@@ -5678,12 +5798,19 @@ mod shard_identity_tests {
                 .await
                 .expect("install a complete parity-consistent foreign codeword");
         }
-        assert!(
-            set.get_object_reader(bucket, "target", None, Default::default(), &options)
-                .await
-                .is_err(),
-            "foreign codeword must fail its target ETag"
-        );
+        // Compatibility keeps legacy GET semantics. A complete foreign codeword
+        // remains an explicit residual risk until a trusted source rewrites it.
+        let mut legacy = set
+            .get_object_reader(bucket, "target", None, Default::default(), &options)
+            .await
+            .expect("legacy GET remains available");
+        let mut foreign = Vec::new();
+        legacy
+            .stream
+            .read_to_end(&mut foreign)
+            .await
+            .expect("legacy donor is internally consistent");
+        assert_ne!(foreign, expected);
         for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
             let heal = set
                 .heal_object(
@@ -5697,15 +5824,15 @@ mod shard_identity_tests {
                     },
                 )
                 .await;
-            assert!(
-                heal.as_ref().map_or(true, |(_, error)| error.is_some()),
-                "legacy proof must not bless or rewrite a foreign codeword, including normal repair"
-            );
+            let (result, error) = heal.expect("legacy scan");
+            assert!(error.is_none(), "legacy scan remains observable");
+            assert!(!result.integrity_verified, "a foreign codeword must not be certified");
+            assert_eq!(result.drives_healed(), Some(0), "legacy scan must not rewrite data");
         }
     }
 
     #[tokio::test]
-    async fn bound_bitrot_multipart_replacement_and_metadata_copy_preserve_identity() {
+    async fn shard_integrity_multipart_replacement_and_metadata_copy_preserve_identity() {
         use crate::set_disk::{CompletePart, RUSTFS_META_MULTIPART_BUCKET, SetDisks};
         use rustfs_filemeta::ObjectPartInfo;
 
@@ -5792,8 +5919,14 @@ mod shard_identity_tests {
             .read_version("", bucket, object, "", &ReadOptions::default())
             .await
             .expect("completed descriptor");
-        assert_ne!(original.bitrot_part_identity(2).expect("new identity"), old_meta.bitrot_id);
-        assert_ne!(original.bitrot_part_identity(1).unwrap(), original.bitrot_part_identity(2).unwrap());
+        assert_ne!(
+            original.parts[1].integrity.as_ref().map(|proof| proof.generation),
+            old_meta.integrity.as_ref().map(|proof| proof.generation)
+        );
+        assert_ne!(
+            original.parts[0].integrity.as_ref().map(|proof| proof.generation),
+            original.parts[1].integrity.as_ref().map(|proof| proof.generation)
+        );
         let final_path = dirs[0]
             .path()
             .join(bucket)
@@ -5835,7 +5968,7 @@ mod shard_identity_tests {
             .await
             .expect("copied descriptor");
         for part in [1, 2] {
-            assert_eq!(copied.bitrot_part_identity(part).unwrap(), original.bitrot_part_identity(part).unwrap());
+            assert_eq!(copied.parts[part - 1].integrity, original.parts[part - 1].integrity);
         }
         let expected = [first, second].concat();
         for version in [None, original.version_id.map(|id| id.to_string())] {
@@ -5868,6 +6001,145 @@ mod shard_identity_tests {
                 let mut actual = Vec::new();
                 reader.stream.read_to_end(&mut actual).await.expect("verified multipart body");
                 assert_eq!(actual, expected_bytes);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn shard_integrity_index_repair_preserves_payload_and_metadata() {
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "integrity-index-repair";
+        let object = "target";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket");
+        }
+        let expected = vec![0x6a; 2 * 1024 * 1024 + 123];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(expected.clone()), &opts)
+            .await
+            .expect("PUT");
+        let mut snapshots = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            let info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("metadata");
+            let root = dir.path().join(bucket).join(object);
+            let data = root.join(info.data_dir.expect("data dir").to_string());
+            let proof = data.join(info.parts[0].integrity.as_ref().expect("commitment").file_name());
+            snapshots.push((
+                data.join("part.1"),
+                tokio::fs::read(data.join("part.1")).await.expect("payload"),
+                root.join("xl.meta"),
+                tokio::fs::read(root.join("xl.meta")).await.expect("xl.meta"),
+                proof.clone(),
+                tokio::fs::read(proof).await.expect("index"),
+            ));
+        }
+        tokio::fs::remove_file(&snapshots[0].4).await.expect("missing index");
+        let mut bad = snapshots[1].5.clone();
+        bad[70] ^= 1;
+        tokio::fs::write(&snapshots[1].4, bad).await.expect("corrupt index");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &opts)
+            .await
+            .expect("GET with proof fallback");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("verified fallback body");
+        assert_eq!(body, expected);
+        let (healed, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("index repair");
+        assert!(error.is_none(), "{error:?}");
+        assert!(healed.integrity_verified);
+        for ((path, payload, meta_path, meta, proof_path, proof), (disk, dir)) in snapshots.iter().zip(disks.iter().zip(&dirs)) {
+            assert_eq!(tokio::fs::read(path).await.expect("payload"), *payload);
+            assert_eq!(tokio::fs::read(meta_path).await.expect("metadata"), *meta);
+            assert_eq!(tokio::fs::read(proof_path).await.expect("restored proof"), *proof);
+            let relative = proof_path.strip_prefix(dir.path().join(bucket)).expect("relative proof path");
+            disk.delete(bucket, relative.to_str().expect("proof path"), crate::disk::DeleteOptions::default())
+                .await
+                .expect("lose all independent proofs");
+        }
+        // All missing proofs cannot be recreated by trusting the surviving
+        // payload's self-contained bitrot checksum.
+        if let Ok(mut reader) = set.get_object_reader(bucket, object, None, Default::default(), &opts).await {
+            let mut body = Vec::new();
+            assert!(reader.stream.read_to_end(&mut body).await.is_err());
+        }
+        if let Ok((result, error)) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            assert!(error.is_some() || !result.integrity_verified);
+        }
+        for (path, payload, meta_path, meta, proof_path, _) in snapshots {
+            assert_eq!(tokio::fs::read(path).await.expect("retained payload"), payload);
+            assert_eq!(tokio::fs::read(meta_path).await.expect("retained metadata"), meta);
+            assert!(!proof_path.exists(), "no proof minted from unverified payload");
+        }
+    }
+    #[tokio::test]
+    async fn shard_integrity_empty_and_no_parity_objects_remain_usable() {
+        for parity in [0, 2] {
+            let (_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, parity).await;
+            let bucket = "integrity-empty-no-parity";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("bucket");
+            }
+            for size in [0, 1, 1024 * 1024 + 123] {
+                let object = format!("target-{size}");
+                let expected = vec![0x51; size];
+                let opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+                set.put_object(bucket, &object, &mut PutObjReader::from_vec(expected.clone()), &opts)
+                    .await
+                    .expect("PUT");
+                let mut reader = set
+                    .get_object_reader(bucket, &object, None, Default::default(), &opts)
+                    .await
+                    .expect("GET");
+                let mut body = Vec::new();
+                reader.stream.read_to_end(&mut body).await.expect("body");
+                assert_eq!(body, expected);
+                let (result, error) = set
+                    .heal_object(
+                        bucket,
+                        &object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("Deep scan");
+                assert!(error.is_none(), "{parity} {size}: {error:?}");
+                assert!(result.integrity_verified);
             }
         }
     }

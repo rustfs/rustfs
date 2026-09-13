@@ -695,7 +695,12 @@ impl SetDisks {
 
         let erasure = erasure_cache.get_for_file_info(fi)?;
 
-        let checksum_algo = fi.bitrot_algorithm(part.number)?;
+        let checksum_info = fi.erasure.get_checksum_info(part.number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
 
         if fi.data.is_some() {
@@ -720,6 +725,15 @@ impl SetDisks {
                 skip_verify_bitrot,
             )
             .await?;
+            if let Some(expected) = part.integrity.as_ref() {
+                use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+                let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+                for (index, reader) in readers.iter_mut().enumerate() {
+                    if let Some(reader) = reader {
+                        reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, 0, None)?)?;
+                    }
+                }
+            }
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -772,6 +786,7 @@ impl SetDisks {
             erasure.data_shards,
         )
         .await;
+        reader_setup.bind_integrity(part.integrity.as_ref(), &files, &disks, bucket, object, 0)?;
         let reader_setup_elapsed = reader_setup_stage_start.elapsed();
         rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -968,11 +983,12 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_algo = multipart_part_checksum_algo(&fi, part_number)?;
+            let checksum_algo = multipart_part_checksum_algo(&fi, part_number);
             let read_length = till_offset.saturating_sub(read_offset);
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
             let sync_spec = PartReaderSetupSpec {
+                integrity: fi.parts[current_part].integrity.clone(),
                 part_number,
                 read_offset,
                 read_length,
@@ -1027,10 +1043,11 @@ impl SetDisks {
                 let next_size = fi.parts[next_part].size;
                 let next_length = next_size.min(remaining_after_current);
                 let spec = PartReaderSetupSpec {
+                    integrity: fi.parts[next_part].integrity.clone(),
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
-                    checksum_algo: multipart_part_checksum_algo(&fi, next_number)?,
+                    checksum_algo: multipart_part_checksum_algo(&fi, next_number),
                 };
                 let files = Arc::clone(&files);
                 let disks = Arc::clone(&disks);
@@ -1632,7 +1649,12 @@ impl SetDisks {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
-        let checksum_algo = fi.bitrot_algorithm(part_number)?;
+        let checksum_info = fi.erasure.get_checksum_info(part_number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
         let use_mmap_read = object_mmap_read_enabled();
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
         let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
@@ -1647,7 +1669,7 @@ impl SetDisks {
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
-        let reader_setup = create_bitrot_readers_until_quorum_with_preference(
+        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference(
             files,
             disks,
             bucket,
@@ -1671,6 +1693,12 @@ impl SetDisks {
             }),
         )
         .await;
+        let expected = fi
+            .parts
+            .iter()
+            .find(|part| part.number == part_number)
+            .and_then(|part| part.integrity.as_ref());
+        reader_setup.bind_integrity(expected, files, disks, bucket, object, part_offset / erasure.block_size)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
@@ -1763,6 +1791,7 @@ impl SetDisks {
 
 /// Per-part parameters for a multipart bitrot reader setup.
 struct PartReaderSetupSpec {
+    integrity: Option<rustfs_filemeta::shard_integrity::PartIntegrity>,
     part_number: usize,
     read_offset: usize,
     read_length: usize,
@@ -1771,8 +1800,13 @@ struct PartReaderSetupSpec {
 
 /// Resolve the bitrot checksum algorithm for one part, honoring the legacy
 /// HighwayHash flag.
-fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> Result<HashAlgorithm> {
-    Ok(fi.bitrot_algorithm(part_number)?)
+fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
+    let checksum_info = fi.erasure.get_checksum_info(part_number);
+    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    }
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
@@ -1899,7 +1933,7 @@ async fn setup_multipart_part_readers(
     metrics_size_bucket: &'static str,
 ) -> (BitrotReaderSetup, Duration) {
     let started = Instant::now();
-    let setup = create_bitrot_readers_until_quorum_with_preference(
+    let mut setup = create_bitrot_readers_until_quorum_with_preference(
         files,
         disks,
         bucket,
@@ -1923,6 +1957,13 @@ async fn setup_multipart_part_readers(
         }),
     )
     .await;
+    if setup
+        .bind_integrity(spec.integrity.as_ref(), files, disks, bucket, object, spec.read_offset / shard_size)
+        .is_err()
+    {
+        setup = BitrotReaderSetup::new(disks.len());
+        setup.errors.fill(Some(DiskError::FileCorrupt));
+    }
     (setup, started.elapsed())
 }
 

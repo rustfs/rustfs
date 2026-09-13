@@ -844,6 +844,44 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn rename_file_with_durability(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        durable: bool,
+    ) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(RenameFileRequest {
+                    durable,
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+
+                let response = client.rename_file(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                if durable && !response.durability_applied {
+                    return Err(DiskError::MethodNotAllowed);
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
@@ -3401,30 +3439,13 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(RenameFileRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                });
-                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, false)
+            .await
+    }
 
-                let response = client.rename_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, true)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

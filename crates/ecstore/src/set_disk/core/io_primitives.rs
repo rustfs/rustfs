@@ -738,9 +738,11 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     let Ok(object_size) = usize::try_from(candidate.size) else {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     };
-    let checksum_algo = match candidate.bitrot_algorithm(part.number) {
-        Ok(algo) => algo,
-        Err(_) => return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    let checksum_info = candidate.erasure.get_checksum_info(part.number);
+    let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
     };
     let read_length = inline_erasure_shard_file_offset(
         0,
@@ -941,7 +943,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         if !parts[part_idx].etag.is_empty() {
             present_count += 1;
             let part = &parts[part_idx];
-            let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.bitrot_id);
+            let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
             let (count, _) = part_quorum.entry(key).or_insert((0, part));
             *count += 1;
             continue;
@@ -1418,6 +1420,40 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 }
 
 impl BitrotReaderSetup {
+    pub(in crate::set_disk) fn bind_integrity(
+        &mut self,
+        expected: Option<&rustfs_filemeta::shard_integrity::PartIntegrity>,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        first_stripe: usize,
+    ) -> std::io::Result<()> {
+        use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+        let Some(expected) = expected else { return Ok(()) };
+        let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+        for (index, reader) in self.readers.iter_mut().enumerate() {
+            if let Some(reader) = reader {
+                let advanced = self.deferred_stripe_handles[index]
+                    .as_ref()
+                    .map(DeferredReaderStripeHandle::integrity_position);
+                reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first_stripe, advanced)?)?;
+            }
+            if let Some(reopen) = self.deferred_reopeners[index].take() {
+                let proof = Arc::clone(&proof);
+                self.deferred_reopeners[index] = Some(Arc::new(move |stripe| {
+                    let mut reader = reopen(stripe)?;
+                    let first = first_stripe.checked_add(stripe)?;
+                    reader
+                        .set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first, None).ok()?)
+                        .ok()?;
+                    Some(reader)
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
@@ -1583,7 +1619,6 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
         return;
     }
 
-    let checksum_algo = checksum_algo.for_coding_index(idx + 1);
     let inline_data = files[idx].data.clone();
     let data_dir = files[idx].data_dir.unwrap_or_default();
     let disk = disks[idx].as_ref();
@@ -1637,7 +1672,7 @@ fn deferred_reader_reopener(
     let bucket = bucket.to_owned();
     let path = path.to_owned();
     Arc::new(move |stripe_index| {
-        let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data.clone(),
             disk.clone(),
             &bucket,
@@ -1648,9 +1683,8 @@ fn deferred_reader_reopener(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-        )
-        .ok()?;
-        (handle.advance_stripes(stripe_index) && reader.advance_unopened_blocks(stripe_index).is_ok()).then_some(reader)
+        );
+        handle.advance_stripes(stripe_index).then_some(reader)
     })
 }
 
@@ -1690,7 +1724,6 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             continue;
         }
 
-        let checksum_algo = checksum_algo.for_coding_index(idx + 1);
         let inline_data = files[idx].data.clone();
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
@@ -1709,7 +1742,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 use_mmap_read,
             )
         });
-        let (reader, stripe_handle) = match create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
             bucket,
@@ -1720,13 +1753,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                setup.apply_reader_result(idx, Err(error));
-                continue;
-            }
-        };
+        );
         setup.retain_deferred_reader(idx, reader, stripe_handle);
         setup.deferred_reopeners[idx] = reopener;
     }
@@ -1750,7 +1777,6 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             continue;
         }
 
-        let checksum_algo = checksum_algo.for_coding_index(idx + 1);
         let inline_data = files[idx].data.clone();
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
@@ -1769,7 +1795,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 use_mmap_read,
             )
         });
-        let (reader, stripe_handle) = match create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
             bucket,
@@ -1780,13 +1806,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                setup.apply_reader_result(idx, Err(error));
-                continue;
-            }
-        };
+        );
         setup.readers[idx] = Some(reader);
         setup.deferred_stripe_handles[idx] = Some(stripe_handle);
         setup.deferred_reopeners[idx] = reopener;
@@ -1862,7 +1882,6 @@ async fn try_create_bitrot_readers_via_batch_pread(
     use crate::disk::local::batch_shard_pread;
     use std::io::Cursor;
 
-    let block_offset = read_offset.checked_div(shard_size)?;
     let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
     if adj_len > object_mmap_read_max_length() {
         return None;
@@ -1898,11 +1917,10 @@ async fn try_create_bitrot_readers_via_batch_pread(
                 let reader = BitrotReader::new(
                     ShardReader::InMemory(Cursor::new(bytes.clone())),
                     shard_size,
-                    checksum_algo.for_coding_index(*idx + 1),
+                    checksum_algo.clone(),
                     skip_verify_bitrot,
-                )
-                .with_block_offset(block_offset);
-                setup.apply_reader_result(*idx, reader.map(Some).map_err(DiskError::from));
+                );
+                setup.apply_reader_result(*idx, Ok(Some(reader)));
             }
             Err(e) => {
                 setup.apply_reader_result(*idx, Err(e.clone()));
@@ -1973,7 +1991,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let disk = disk_op.as_ref();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let checksum_algo = checksum_algo.for_coding_index(idx + 1);
+        let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
             let result = create_bitrot_reader_from_bytes_with_stage_metrics(
@@ -5714,6 +5732,8 @@ impl SetDisks {
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         self.recover_part_transaction(dst_object, write_quorum).await?;
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        let integrity = part.integrity.map(Arc::new);
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5727,12 +5747,39 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
             let dst_object = dst_object.clone();
             let meta = meta.clone();
+            let integrity = integrity.clone();
             async move {
                 let disk = disk?;
-                Some(
-                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
-                        .await,
-                )
+                let prepared = disk
+                    .prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                    .await;
+                if let Err(error) = prepared {
+                    return Some(Err(error));
+                }
+                if let Some(integrity) = integrity {
+                    let Some((directory, _)) = dst_object.rsplit_once('/') else {
+                        return Some(Err(DiskError::FileCorrupt));
+                    };
+                    let path = format!("{directory}/{}", integrity.file_name());
+                    // Older peers may return Ok from PreparePart without moving
+                    // the index. They must not enter the protected write quorum.
+                    let result = async {
+                        let mut reader = disk
+                            .read_file_stream(&dst_bucket, &path, 0, rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE)
+                            .await?;
+                        let mut header = [0; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header)
+                            .await
+                            .map_err(DiskError::from)?;
+                        if header != integrity.index_header() {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    return Some(result);
+                }
+                Some(Ok(()))
             }
         });
         let prepare_results = join_all(prepare_tasks).await;
@@ -7670,7 +7717,6 @@ mod tests {
             false,
             false,
         )
-        .expect("valid deferred reader geometry")
     }
 
     #[test]
@@ -12026,7 +12072,6 @@ mod tests {
         let mut valid = read_part_test_part(1, "winner");
         valid.size = 100;
         valid.actual_size = 90;
-        valid.bitrot_id = Some(Uuid::from_u128(1));
         let mut wrong_etag = valid.clone();
         wrong_etag.etag = "loser".to_string();
         let mut wrong_number = valid.clone();
@@ -12035,15 +12080,12 @@ mod tests {
         wrong_size.size = 50;
         let mut wrong_actual_size = valid.clone();
         wrong_actual_size.actual_size = 40;
-        let mut wrong_identity = valid.clone();
-        wrong_identity.bitrot_id = Some(Uuid::from_u128(2));
 
         for (field, corrupted) in [
             ("etag", wrong_etag),
             ("number", wrong_number),
             ("size", wrong_size),
             ("actual_size", wrong_actual_size),
-            ("bitrot_id", wrong_identity),
         ] {
             let responses = vec![Some(vec![corrupted]), Some(vec![valid.clone()]), Some(vec![valid.clone()])];
             let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
@@ -12053,26 +12095,7 @@ mod tests {
             assert_eq!(part.number, 1, "{field}");
             assert_eq!(part.size, 100, "{field}");
             assert_eq!(part.actual_size, 90, "{field}");
-            assert_eq!(part.bitrot_id, valid.bitrot_id, "{field}");
         }
-    }
-
-    #[test]
-    fn bound_bitrot_part_identity_must_reach_quorum_after_identical_retry() {
-        let mut old = read_part_test_part(1, "same-etag");
-        old.bitrot_id = Some(Uuid::from_u128(1));
-        let mut new = old.clone();
-        new.bitrot_id = Some(Uuid::from_u128(2));
-        let responses = vec![Some(vec![old]), Some(vec![new.clone()]), None];
-        assert!(resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2).is_err());
-        let mut responses = responses;
-        responses[2] = Some(vec![new.clone()]);
-        assert_eq!(
-            resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
-                .expect("new encoding identity reaches quorum")
-                .bitrot_id,
-            new.bitrot_id
-        );
     }
 
     #[test]
@@ -13267,69 +13290,5 @@ mod tests {
             "all disks must be flagged corrupt"
         );
         assert!(infos.iter().all(|fi| !fi.is_valid()), "no half-corrupt FileInfo may be returned");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bound_bitrot_batch_pread_retains_coding_index_and_range_block() {
-        use crate::object_api::{ObjectOptions, PutObjReader};
-        use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated;
-        use crate::storage_api_contracts::object::ObjectIO as _;
-
-        let (_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
-        let bucket = "bound-batch-pread";
-        let object = "range";
-        for disk in &disks {
-            disk.make_volume(bucket).await.expect("fixture bucket");
-        }
-        set.put_object(
-            bucket,
-            object,
-            &mut PutObjReader::from_vec(vec![0x37; 3 * 1024 * 1024]),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("bound source object");
-        let mut files = Vec::new();
-        for disk in &disks {
-            files.push(
-                disk.read_version("", bucket, object, "", &ReadOptions::default())
-                    .await
-                    .expect("source metadata"),
-            );
-        }
-        let fi = files[0].clone();
-        let disks = disks.into_iter().map(Some).collect::<Vec<_>>();
-        let (disks, files) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
-        let shard_size = fi.erasure.shard_size();
-        let mut setup = super::try_create_bitrot_readers_via_batch_pread(
-            &files,
-            &disks,
-            bucket,
-            object,
-            1,
-            shard_size,
-            shard_size,
-            shard_size,
-            fi.bitrot_algorithm(1).expect("part identity"),
-            true,
-        )
-        .await
-        .expect("local batch pread path");
-        for (index, reader) in setup.readers.iter_mut().enumerate() {
-            let mut bytes = vec![0; shard_size];
-            reader
-                .as_mut()
-                .expect("batch reader")
-                .read(&mut bytes)
-                .await
-                .expect("verify ranged bound frame");
-            if index < fi.erasure.data_blocks {
-                assert_eq!(bytes, vec![0x37; shard_size]);
-            }
-        }
     }
 }

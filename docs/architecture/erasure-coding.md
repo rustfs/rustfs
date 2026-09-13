@@ -49,7 +49,7 @@ Two codec backends exist, selected per object from its metadata (never a runtime
 - **Modern backend** — Reed–Solomon over **GF(2⁸)** using `rustfs-erasure-codec` (a RustFS fork of `reed-solomon-erasure` v8, `Cargo.toml`), imported as `reed_solomon_erasure::galois_8::ReedSolomon` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)). Vandermonde generator matrix; algorithm string `"rs-vandermonde"` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)). The GF(2⁸) field bounds total shards per set far above the geometry cap of 16 (§2). Used for **all new writes** — and, because MinIO uses the same `rs-vandermonde` GF(2⁸) scheme, for **all MinIO-migrated objects** too.
 - **Legacy backend** — Reed–Solomon over **GF(2¹⁶)** using `reed-solomon-simd` v3.1 (`Cargo.toml`), imported at [erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs). Used **only** to read and heal objects written in **RustFS's own older ("main branch") format** — the `rmp_serde`-serialized layout detected by `uses_legacy_checksum` (see §11). This backend is **not** MinIO-compatible; MinIO-migrated data is decoded by the modern GF(2⁸) backend above (see [minio-file-format-compat.md](minio-file-format-compat.md)). The backend is chosen per object from its metadata (`uses_legacy_checksum`), never by a runtime toggle.
 
-The RS geometry and legacy π-key HighwayHash frames match MinIO. New writes use the RustFS bound-v1 bitrot format (§5), which requires a reader that understands its integrity domain; it is not readable by older RustFS or MinIO binaries. See [minio-file-format-compat.md](minio-file-format-compat.md) for the legacy format contract and §11.1 for the upgrade boundary.
+Industry alignment (all confirmed in code): byte-oriented RS over GF(2⁸) with a Vandermonde matrix, 1 MiB erasure block, and HighwayHash-256 bitrot checksums with a π-derived key — the same family and defaults MinIO uses. This is what makes byte-level `xl.meta` interoperability with MinIO possible (see [minio-file-format-compat.md](minio-file-format-compat.md)).
 
 Where the code lives: the erasure engine is owned by `crates/ecstore/src/erasure/` and is crate-private; the `xl.meta` model is owned by `crates/filemeta`. See [ecstore-layout-boundary.md](ecstore-layout-boundary.md).
 
@@ -147,15 +147,71 @@ distribution[i-1] = 1 + ((start + i) % N)   for i in 1..=N   // a cyclic rotatio
 
 ## 5. Bitrot protection
 
-Each new shard is verified against an immutable identity in the target object's quorum-selected metadata. A self-contained checksum alone cannot distinguish an intact donor shard from the intended shard (backlog#2497).
+Each shard file is self-verifying against silent disk corruption.
 
-- **INVARIANT — bound-v1 domain.** PUT and each replacement UploadPart generate a fresh UUID. `HashAlgorithm::bound_bitrot` derives a part key as SHA-256 of `rustfs/bitrot/part/v1` followed by a NUL byte and the UUID's 16 bytes. `for_coding_index` derives the shard key as SHA-256 of `rustfs/bitrot/shard/v1`, NUL, the part key bytes, and the one-based coding index in ASCII decimal. HighwayHash-256 hashes the zero-based block number as eight little-endian bytes followed by the payload, using that shard key interpreted as four little-endian u64 words ([hash.rs](../../crates/utils/src/hash.rs)). These public domains detect misplaced intact frames; they are not authentication against an attacker able to recompute hashes or replace quorum metadata.
-- **INVARIANT — immutable part identity.** `bitrot-context-v1=1` and `bitrot-part-id-v1-<part-number>=<UUID>` are persisted under both internal prefixes in `MetaSys`. Missing, nil, conflicting, or unsupported bound descriptors are corruption. Heal and metadata-only COPY retain these identities even if VersionId, object path, or DataDir changes. Fresh PUT and UploadPart never inherit another payload's identity. Staging `ObjectPartInfo.bitrot_id` is an optional trailing field; old positional part metadata remains decodable ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)).
-- **INVARIANT — interleaved layout.** All three streaming Highway variants use `[32-byte hash][data]` per block. `bitrot_shard_file_size = size.div_ceil(shard_size) * 32 + size`; bound-v1 adds no bytes to a shard frame ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)). Non-streaming algorithms still require their separate whole-file layout.
-- **INVARIANT — verify before use.** A bound `BitrotReader` always verifies, including when a caller requests `skip_verify`. A mismatch returns `InvalidData` before the block is exposed; truncation returns `UnexpectedEof`. Range, deferred parity, and reopened readers retain the original part-relative block position. Inline direct writes and reads use the same coding-index domain as external shards.
-- Legacy files retain `HighwayHash256S` (π-derived key) or, when `uses_legacy_checksum`, `HighwayHash256SLegacy` (key `[3,4,2,1]`). `FileInfo::bitrot_algorithm` resolves the format before any disk-specific binding. Unbound payloads additionally require the proof in §11.1; local frame checks alone cannot authorize a healthy receipt.
+- **INVARIANT — hash algorithm.** The production bitrot hash is `HighwayHash256S` (streaming HighwayHash-256, 32-byte digest), the default of `HashAlgorithm` ([hash.rs](../../crates/utils/src/hash.rs)); `ErasureInfo::get_checksum_info` defaults an unspecified part to `HighwayHash256S` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)). Legacy files recorded as `HighwayHash256S` are verified with the legacy fixed-key variant `HighwayHash256SLegacy` (key `[3,4,2,1]`), selected on read when `fi.uses_legacy_checksum` ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs)). The modern key is the π-derived `MAGIC_HIGHWAY_HASH256_KEY` ([hash.rs](../../crates/utils/src/hash.rs)).
+- **INVARIANT — on-disk shard layout is interleaved `[hash][data]` per block.** `BitrotWriter::write` prepends `hash_algo.hash_encode(block)` before each block, written in one vectored write ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)). On-disk shard file size — `bitrot_shard_file_size(size, shard_size, algo)` ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)): for the two streaming Highway variants `= size.div_ceil(shard_size) * 32 + size` (one 32-byte hash per block); for any other algorithm (whole-file bitrot) `= size`.
+- **INVARIANT — verify before use.** `BitrotReader` reads `[hash][data]` in one pass, recomputes the hash, and returns `InvalidData "bitrot hash mismatch"` on mismatch; the data is handed to the caller **only after** verification passes. A short/truncated shard returns `UnexpectedEof` even under `skip_verify` ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)).
+- Only the streaming interleaved layout is written/verified; it is self-consistent only for `HighwayHash256S` / `HighwayHash256SLegacy`. The default resolving to `HighwayHash256S` is load-bearing (backlog#959, documented at [bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)).
 
 ---
+
+### 5.1 Independent shard commitments
+
+New PUTs and newly initiated multipart uploads retain `CSumAlgo = 1` and the
+existing `[HighwayHash256][shard]` frames. An optional independent SHA-256
+commitment protects against replacing a complete frame with a same-length donor
+frame whose self-contained checksum is valid (backlog#2497).
+
+The commitment describes an immutable part generation, with a random UUID,
+part number, exact encoded length, erasure geometry, codec mode, stripe count,
+and Merkle root. Each leaf commits to the ordered SHA-256 digests of **all**
+encoded shards in one stripe. Payload digests include generation, part, stripe,
+coding index, length, and geometry. The root also commits to the final part size.
+A valid metadata quorum selects the expected root; neither RS consistency nor
+an intact adjacent HighwayHash checksum establishes the root.
+
+The dual-prefix internal `shard-integrity-v1` metadata value encodes a canonical
+Base64 table: a 32-byte header and 64 bytes per part, up to 10,000 sorted unique
+parts. The same table is stored under both internal prefixes. Readers reject a
+malformed, conflicting, or incomplete descriptor instead of treating it as
+legacy metadata. Each external part has an immutable
+`part.N.integrity.<generation UUID>` sidecar, replicated on every participating
+disk. Its 64-byte header is followed by stripe records containing all shard
+digests and a Merkle path. An inline object stores the small proof under the
+dual-prefix `shard-integrity-inline-v1` key.
+
+GET authenticates a stripe record against the selected root, then verifies each
+source shard before decoding or emitting bytes. Reconstructed data is also
+checked against its expected digest. Range reads fetch only the proof records
+for touched stripes; deferred parity readers retain their exact stripe position.
+A missing or corrupt index replica can use another authenticated replica. Deep
+Heal verifies at the coordinator, including data returned by older disk servers,
+and restores missing indexes only from proofs matching the existing root. It
+never mints a new commitment from suspect stored bytes. Index-only repair leaves
+payload and `xl.meta` bytes unchanged and requires acknowledged durable publish.
+
+Writes publish the payload and proof on the same write quorum. UploadPart uses
+a fresh generation for each replacement, includes that generation and root in
+part-metadata quorum selection, and publishes its index before the existing
+part transaction switches data and metadata. Settlement removes only the
+obsolete generation; rollback retains the old index. Interrupted preparation
+can leave unreferenced files until the upload directory is reclaimed. Ordinary
+metadata COPY preserves commitments; an actual re-encode creates new ones.
+
+Digest/index builders spill above a 1 MiB buffer limit, and request readers keep
+a bounded stripe cache. For EC 12+4, a 5 GiB part with 1 MiB stripes has a
+4,751,424-byte index on each disk (about 1.42% of logical data across 16 disks).
+The maximum descriptor is 853,376 Base64 bytes per prefix, about 1.63 MiB for
+both copies. These are format bounds, not measured throughput guarantees.
+
+Legacy objects retain their existing GET behavior and therefore their residual
+complete-donor substitution risk. Without an independent commitment, Heal does
+not certify payload integrity or automatically reconstruct legacy data. Normal
+presence scans do not issue strong integrity receipts even for protected
+objects. Only a completed exclusive Deep scan/repair with authenticated sources
+can do so. See the [upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
+for mixed-version and migration constraints.
 
 ## 6. On-disk format (`xl.meta`)
 
@@ -202,7 +258,6 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 - `ID` / `DDir` are **16 raw UUID bytes**; nil ⇒ `None` on decode, `None` ⇒ 16 zero bytes on write.
 - `MTime` is **unix-nanos** sint. The `MTime` key is **always written** — both `MetaObject` (V2Obj) and `MetaDeleteMarker` (DelObj) emit it unconditionally — and a `None` mod_time is encoded as `0` (`UNIX_EPOCH` nanos), **not** omitted. Round-trip safety is enforced on the **decode** side: `UNIX_EPOCH` ⇒ `None` on read, so a `None` never resurfaces as `Some(epoch)`. (The only mod-time field actually omitted-when-`None` on write is the legacy `StatInfo.ModTime`, a different field.)
 - `EcDist` is an **array** of per-shard slot values (not a bin blob). V2Obj does **not** store per-part bitrot checksums (only legacy V1 does).
-- `CSumAlgo=2` (`BoundHighwayHash`) selects bound-v1; `CSumAlgo=1` remains the unbound Highway format. The selector and bound marker must agree. Part identities are common `MetaSys` fields and participate in the metadata quorum hash; they are not disk-local `ErasureInfo.checksums` entries.
 - `PartETags` / `PartASizes` / `MetaSys` / `MetaUsr` are written as msgpack nil when empty; **a reader must treat nil and empty identically**. `PartIdx` is omitted entirely when empty.
 - Part arrays are **parallel and index-aligned**: when parts are materialized (the `all_parts` decode path), `PartNums` / `PartSizes` / `PartASizes` must be equal length (mismatch ⇒ `FileCorrupt`, because indexing would panic or miscompute Content-Length/Range); `PartETags` / `PartIdx` are soft-guarded (applied only if length matches, empty index ⇒ None). When parts are not materialized the arrays are not cross-checked.
 - **INVARIANT — negative `part.actual_size` is a valid sentinel** for "compressed, actual size unknown" ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)); it is carried verbatim and must not be rejected on decode (see §11).
@@ -213,7 +268,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 
 ### 6.4 `ErasureInfo` and geometry on disk
 
-`ErasureInfo` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)): `algorithm` (`"rs-vandermonde"` for RS), `data_blocks` (=`EcM`), `parity_blocks` (=`EcN`), `block_size` (=`EcBSize`), `index` (=`EcIndex`), `distribution: Vec<usize>` (=`EcDist`), `checksums: Vec<ChecksumInfo>` (empty for V2Obj). On write, `From<FileInfo>` records `ReedSolomon` and selects `BoundHighwayHash` when the bound marker is present, otherwise `HighwayHash`.
+`ErasureInfo` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)): `algorithm` (`"rs-vandermonde"` for RS), `data_blocks` (=`EcM`), `parity_blocks` (=`EcN`), `block_size` (=`EcBSize`), `index` (=`EcIndex`), `distribution: Vec<usize>` (=`EcDist`), `checksums: Vec<ChecksumInfo>` (empty for V2Obj). On write, `From<FileInfo>` hardcodes `ReedSolomon` + `HighwayHash` algo enums.
 
 ### 6.5 Internal metadata keys (dual prefix)
 
@@ -254,7 +309,7 @@ Version-aware heal ([set_disk/ops/heal.rs](../../crates/ecstore/src/set_disk/ops
 
 - **INVARIANT — reconstructability.** Heal refuses when `meta_to_heal_count > parity_blocks` (relaxed only if a quorum etag exists) or when any part loses more than `parity_blocks` shards.
 - **INVARIANT — geometry match.** `latest_meta.erasure.distribution.len()` must equal the online-disk, outdated-disk, and parts-metadata counts, else heal refuses ("backend disks manually modified"). A real object missing `data_dir` is `FileCorrupt`.
-- **Data-safety guard (backlog#920).** If data shards survive on ≥ `data_blocks` disks, regenerate the missing `xl.meta` from a valid FileInfo and re-drive heal rather than dangling-delete; torn writes (< `data_blocks`) fall through to dangling-delete handling.
+- **Data-safety guard (backlog#920).** If an independent commitment has a matching metadata quorum and authenticated data survives on ≥ `data_blocks` disks, regenerate the missing `xl.meta` and re-drive heal rather than dangling-delete; torn writes (< `data_blocks`) fall through to dangling-delete handling.
 - Healed shards are written to the outdated disks, each recording `erasure.index = slot + 1`, then `rename_data` to final. Heal admission / scanner budget is owned by [placement-repair-invariants.md](placement-repair-invariants.md).
 
 ---
@@ -295,18 +350,6 @@ Structural, geometry, and version guards legitimately **fail closed**, and turni
 
 ---
 
-### 11.1 Bound-v1 upgrade and legacy payload proof
-
-This is a storage-format upgrade. Upgrade the entire serving and healing fleet together before accepting new writes. Older RustFS and MinIO binaries cannot read bound-v1 payloads; a binary rollback after new writes is unsafe. Preserve a reader capable of bound-v1, or migrate the data through a verified logical read and rewrite before downgrading. Merely removing the marker or changing `CSumAlgo` is not a migration.
-
-Legacy metadata remains decodable. Before GET exposes unbound local bytes, before a local transition uploads them, and before either normal or deep Heal accepts them, `SetDisks::verify_unbound_payload` requires every source member to match target metadata, verifies every local frame, checks RS data/parity consistency, and compares the reconstructed plaintext against each target part's MD5 ETag ([bitrot_identity.rs](../../crates/ecstore/src/set_disk/bitrot_identity.rs)). A complete foreign codeword passes RS consistency but fails the target digest. No identity is backfilled from unverified shards and no legacy bytes are rewritten by this proof.
-
-The current legacy proof deliberately rejects missing source members, zero-parity layouts, encrypted or compressed payloads, and absent or opaque part ETags. Such objects require verified recovery or migration before upgrade; the read returns an error instead of making an unsupported integrity claim. This is an availability and compatibility change, including for otherwise healthy transformed legacy objects. In-progress uploads created by an old binary remain unbound when completed.
-
-Legacy reads perform a full-object verification pass before the normal read, including for ranges, so disk traffic is amplified. Bound-v1 adds two metadata entries per part plus two format-marker entries, SHA-256 domain derivation at part/shard setup, and an eight-byte block prefix to each HighwayHash computation. Batch-pread retains the coding index and part-relative block position. Measure throughput and range latency for the deployment's workload before rollout.
-
-`ECStoreHealStorage::heal_object_with_receipt` promotes non-dry-run requests to deep verification: `VerifiedHealthy` and `Repaired` receipts cannot be based only on a presence scan ([storage.rs](../../crates/heal/src/heal/storage.rs)). This adds verification I/O to normal receipt-producing sweeps. The request's quorum and durability requirements are unchanged.
-
 ## 12. Invariants checklist (the frozen contract)
 
 Do not change any of the following without a format-version bump, a read path for the old value, a migration story, and a real-sample compatibility test (§13):
@@ -321,7 +364,7 @@ Algorithm
 - Modern RS over GF(2⁸) (`rs-vandermonde`) for new writes; legacy GF(2¹⁶) for old files, selected by `uses_legacy_checksum`.
 - `block_size = 1 MiB` (`BLOCK_SIZE_V2`), stored per version.
 - Shard-size formulas: modern `div_ceil`; legacy `(div_ceil + 1) & !1`. Final block zero-padded before encode.
-- New bitrot frames bind immutable part UUID, coding index, and block position; legacy keys remain decodable subject to §11.1. Interleaved `[hash][data]` per block; `bitrot_shard_file_size = ceil(size/shard_size)*32 + size`; verify before use.
+- Bitrot `HighwayHash256S` (legacy key variant for old files); interleaved `[hash][data]` per block; `bitrot_shard_file_size = ceil(size/shard_size)*32 + size`; verify before use.
 
 On-disk format
 - Container: `"XL2 "`, LE major/minor `1`/`3`, bin32(BE-len) meta, `0xce`+BE-u32 xxh64(seed 0) CRC, trailing inline blob.

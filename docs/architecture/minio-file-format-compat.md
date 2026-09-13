@@ -5,8 +5,6 @@
 
 This is an interop contract, not a plan. Migration is one-way (MinIO to RustFS). Erasure-coding internals are owned by [erasure-coding.md](erasure-coding.md); this document owns the interop claim, the fixture evidence, and the out-of-scope list.
 
-The bound-v1 shard-identity change adds a runtime integrity gate beyond the format and decryption capabilities listed below. Unbound legacy GET and Heal require all source members, consistent parity, and plaintext part MD5 ETags. Compressed or encrypted legacy payloads, including MinIO SSE under `rio-v2`, currently fail this gate even when their metadata and keys are decodable. New RustFS bound-v1 writes are incompatible with older readers. These rollout and recovery limits are part of the contract in [erasure-coding.md §11.1](erasure-coding.md#111-bound-v1-upgrade-and-legacy-payload-proof).
-
 ## Scope Matrix By Build Variant
 
 Build variants are the `rustfs` crate features in `rustfs/Cargo.toml`: `default`, `full`, and `rio-v2` (which enables `rustfs-ecstore/rio-v2` and pulls in `crates/rio-v2`). `rio-v2` is absent from both `default` and `full`.
@@ -148,3 +146,45 @@ Not fixture-proven: transitioned `xl.meta`; CORS, public-access-block, and bucke
 - Any change to `crates/filemeta` or `crates/ecstore/src/bucket` metadata encoding is a storage-format change and follows the migration and readiness contracts in [README.md](README.md) and the ecstore layout boundary rules.
 - Do not bump a Version Anchor without a read path for the prior value; see [erasure-coding.md](erasure-coding.md) for the accept-older, reject-newer rule.
 - `.github/workflows/ci.yml`, `.github/workflows/cache-warm.yml`, and `ARCHITECTURE.md` cite the [rio-v2 variant lifecycle](#rio-v2-variant-lifecycle) heading; keep it when editing this file.
+
+## Independent integrity upgrade contract
+
+The optional shard-integrity extension preserves the release checksum algorithm
+and payload framing. It does not bump XL container/header/metadata versions.
+`ObjectPartInfo` extensions use named MessagePack fields; older eight-field
+readers can ignore the new field, and new readers still decode old positional
+arrays. This is a decoder compatibility claim, not certification of arbitrary
+mixed-version write, repair, tiering, or downgrade workflows.
+
+| Workflow | Contract |
+|---|---|
+| New reader, old object | Existing reads remain available; independent donor-substitution protection is absent until a trusted rewrite. |
+| Old reader, new object | Existing checksum/frame and metadata decoders remain usable; old readers do not enforce the independent proof. |
+| New coordinator, old disk server | GET/Deep verification runs at the coordinator. A protected UploadPart requires a write quorum that publishes its index. An old RenameFile response cannot acknowledge durable index repair. |
+| Old write/repair coordinator | Unsupported for protected data: it may omit, discard, or preserve stale integrity metadata. Finish the coordinator rollout before enabling writes or repair. |
+| Pre-upgrade in-progress multipart upload | Remains legacy when completed. Reinitiate and reupload from a trusted source to obtain protection. |
+| New multipart upload completed by an old coordinator | Unsupported; a retained upload marker without a completed descriptor fails validation. |
+| Full downgrade after protected writes | No blanket guarantee; preserve a snapshot and validate read, write, repair, COPY, and multipart behavior before considering a downgrade. |
+
+For a maintenance-window rollout, stop writes and automated repair, upgrade all
+coordinators and disk servers, then resume writes and run Deep verification on
+new objects. There is no automatic migration of existing payloads and no need
+to rewrite them merely to preserve reading. To protect legacy objects, compare
+against a separately trusted source or end-to-end digest and rewrite/reupload
+through upgraded coordinators. Recomputing a hash from existing suspect shards,
+or agreeing RS parity alone, does not establish their original identity.
+
+Normal scans and unproven legacy scans cannot produce `VerifiedHealthy` or
+`Repaired` integrity receipts. Legacy automatic data repair is deferred; this
+availability tradeoff must be considered before rollout. Retain trusted backups
+for legacy recovery. These commitments protect against misplaced or corrupted
+shards under an authoritative metadata quorum; they are not signatures against
+an attacker who can replace that quorum too.
+
+The public MinIO source inspected at
+[`7aac2a2`](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/bitrot-streaming.go)
+uses adjacent streaming HighwayHash checksums. Its
+[XL metadata codec](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/xl-storage-format-v2.go)
+does not establish the independent part-generation commitment described here.
+This source comparison does not claim a live MinIO donor-shard reproduction or
+behavior of proprietary MinIO editions.

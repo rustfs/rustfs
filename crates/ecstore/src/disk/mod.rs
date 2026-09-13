@@ -577,6 +577,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+            Disk::Remote(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
@@ -1175,6 +1182,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_file_durable(&self, _src_volume: &str, _src_path: &str, _dst_volume: &str, _dst_path: &str) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn prepare_part_transaction(
         &self,

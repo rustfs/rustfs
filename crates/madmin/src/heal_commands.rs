@@ -36,6 +36,10 @@ const DRIVE_STATE_OK: &str = "ok";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
+    /// Only the coordinator's authenticated full scan may set this. Transported
+    /// or old-peer results default to unproven and cannot advance heal receipts.
+    #[serde(skip)]
+    pub integrity_verified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]

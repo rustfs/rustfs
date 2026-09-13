@@ -219,11 +219,14 @@ message RenameFileRequest {
   string src_path = 3;
   string dst_volume = 4;
   string dst_path = 5;
+  // Apply the destination's payload/metadata durability policy before success.
+  bool durable = 6;
 }
 
 message RenameFileResponse {
   bool success = 1;
   optional Error error = 2;
+  bool durability_applied = 3;
 }
 
 message WriteRequest {
