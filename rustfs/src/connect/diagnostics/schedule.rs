@@ -370,10 +370,10 @@ async fn run_collection_schedule(
             break;
         }
         let policy = policies.borrow().clone();
-        if let Err(error) = policy.validate() {
-            if policy.should_run() {
-                return Err(error);
-            }
+        if let Err(error) = policy.validate()
+            && policy.should_run()
+        {
+            return Err(error);
         }
         if !policy.should_run() {
             state.next_due_at = None;

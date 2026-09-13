@@ -257,18 +257,19 @@ async fn execute_connect_logs(options: ConnectLogsOpts) -> Result<()> {
         ),
     };
     let cancel = tokio_util::sync::CancellationToken::new();
-    let capture = export_logs(&request, &key, &cancel);
-    tokio::pin!(capture);
-    let export = tokio::select! {
-        biased;
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(Error::other)?;
-            cancel.cancel();
-            return Err(Error::other("log collection cancelled"));
+    let export = {
+        let capture = export_logs(&request, &key, &cancel);
+        tokio::pin!(capture);
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return Err(Error::other("log collection cancelled"));
+            }
+            result = capture.as_mut() => result.map_err(Error::other)?,
         }
-        result = capture.as_mut() => result.map_err(Error::other)?,
     };
-    drop(capture);
     let output = options.output;
     let writer_cancel = cancel.clone();
     let mut writer = tokio::task::spawn_blocking(move || save_signed_log_export(&output, &export, &writer_cancel));
@@ -1047,41 +1048,42 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
         ),
     };
     let cancel = tokio_util::sync::CancellationToken::new();
-    let capture = async {
-        match options.tool {
-            ConnectProfileTool::Cpu => {
-                if options.thread_scope.is_some() {
-                    return Err(Error::other("--thread-scope is valid only for the threads profile"));
+    let export = {
+        let capture = async {
+            match options.tool {
+                ConnectProfileTool::Cpu => {
+                    if options.thread_scope.is_some() {
+                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                    }
+                    export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
                 }
-                export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
-            }
-            ConnectProfileTool::Memory => {
-                if options.thread_scope.is_some() {
-                    return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                ConnectProfileTool::Memory => {
+                    if options.thread_scope.is_some() {
+                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                    }
+                    export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
                 }
-                export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
+                ConnectProfileTool::Threads => {
+                    let scope = match options.thread_scope {
+                        Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
+                        Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
+                        None => return Err(Error::other("--thread-scope is required for the threads profile")),
+                    };
+                    export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+                }
             }
-            ConnectProfileTool::Threads => {
-                let scope = match options.thread_scope {
-                    Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
-                    Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
-                    None => return Err(Error::other("--thread-scope is required for the threads profile")),
-                };
-                export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+        };
+        tokio::pin!(capture);
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return Err(Error::other("profile collection cancelled"));
             }
+            result = capture.as_mut() => result?,
         }
     };
-    tokio::pin!(capture);
-    let export = tokio::select! {
-        biased;
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(Error::other)?;
-            cancel.cancel();
-            return Err(Error::other("profile collection cancelled"));
-        }
-        result = capture.as_mut() => result?,
-    };
-    drop(capture);
     let tool = export.tool;
     let outcome = export.outcome;
     let reason_code = export.reason_code;

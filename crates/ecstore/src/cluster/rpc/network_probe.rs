@@ -306,7 +306,7 @@ mod tests {
 
         let wrong_version = PingResponse {
             version: 2,
-            ..valid.clone()
+            body: valid.body,
         };
         assert_eq!(validate_ping_response(&wrong_version), Err(NetworkPeerProbeError::ProtocolFailure));
         let malformed = PingResponse {
