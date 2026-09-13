@@ -48,6 +48,10 @@ allow-git = [
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/rustfs/s3s.git",
+    # RustFS Gateway HTTP boundary behind RUSTFS_S3_STACK=gateway (rustfs/backlog#1752),
+    # pinned to one reviewed git rev for every gateway crate.
+    # owner: rustfs-maintainers  review: 2026-12
+    "https://github.com/rustfs/gateway.git",
 ]
 
 [bans]

@@ -30,6 +30,7 @@ use crate::server::{
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     ssec_transport::SsecTransportLayer,
+    stack::{GatewayFront, S3StackService},
     strip_valid_port_suffix,
     tls_material::{
         TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
@@ -199,6 +200,7 @@ const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
 const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
 const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
+const EVENT_S3_STACK_SELECTED: &str = "s3_stack_selected";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
 const EVENT_CONNECTION_CAP_STATE: &str = "connection_cap_state";
@@ -1302,6 +1304,34 @@ pub async fn start_http_server(
         b.build()
     };
 
+    // RUSTFS_S3_STACK (rustfs/backlog#1752): `legacy` keeps the s3s service above as the whole S3
+    // entry. `gateway` fronts it with the RustFS Gateway pipeline for the operations
+    // `stack::gateway_operation` classifies and hands it every other request.
+    let s3_service = S3StackService::assemble(config.s3_stack, s3_service, || {
+        let regions = vec![
+            config
+                .region
+                .clone()
+                .unwrap_or_else(|| rustfs_config::RUSTFS_REGION.to_string()),
+            "us-east-1".to_string(),
+        ];
+        let pipeline = storage::gateway::GatewayPipeline::build(
+            storage::ecfs::FS::with_server_ctx(server_ctx.clone()),
+            IAMAuth::with_server_context(config.access_key.clone(), config.secret_key.clone(), server_ctx.clone()),
+            &regions,
+        )?;
+        info!(
+            event = EVENT_S3_STACK_SELECTED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            stack = config.s3_stack.as_str(),
+            gateway_operations = "GetBucketLocation",
+            signing_regions = ?regions,
+            "S3 HTTP stack selected"
+        );
+        Ok(GatewayFront::new(pipeline, s3_host_domains(config)?.unwrap_or_default()))
+    })?;
+
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     // Create compression configuration from environment variables
@@ -1672,7 +1702,7 @@ pub async fn start_http_server(
 #[derive(Clone)]
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    s3_service: S3StackService<S3Service>,
     compression_config: HttpCompressionConfig,
     is_console: bool,
     /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
