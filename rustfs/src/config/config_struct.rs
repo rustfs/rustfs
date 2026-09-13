@@ -26,65 +26,6 @@ use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-/// The environment variable that selects the S3 HTTP stack (rustfs/backlog#1752).
-pub const ENV_RUSTFS_S3_STACK: &str = "RUSTFS_S3_STACK";
-
-/// Which HTTP boundary serves S3 requests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum S3Stack {
-    /// The s3s service, byte-for-byte as before the switch.
-    #[default]
-    Legacy,
-    /// The RustFS Gateway pipeline for the operations it serves, the s3s service for the rest.
-    Gateway,
-}
-
-impl S3Stack {
-    /// Parses the value of [`ENV_RUSTFS_S3_STACK`].
-    ///
-    /// # Errors
-    ///
-    /// Anything other than exactly `legacy` or `gateway`, the empty string included: a typo must
-    /// stop the server instead of silently choosing a stack.
-    pub fn parse(value: &str) -> std::io::Result<Self> {
-        match value {
-            "legacy" => Ok(Self::Legacy),
-            "gateway" => Ok(Self::Gateway),
-            other => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid {ENV_RUSTFS_S3_STACK}={other:?}: expected \"legacy\" or \"gateway\""),
-            )),
-        }
-    }
-
-    /// Reads [`ENV_RUSTFS_S3_STACK`]; unset selects [`S3Stack::Legacy`].
-    ///
-    /// # Errors
-    ///
-    /// A set value that [`S3Stack::parse`] refuses, or one that is not valid Unicode.
-    pub fn from_env() -> std::io::Result<Self> {
-        match std::env::var_os(ENV_RUSTFS_S3_STACK) {
-            None => Ok(Self::Legacy),
-            Some(value) => match value.to_str() {
-                Some(value) => Self::parse(value),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("invalid {ENV_RUSTFS_S3_STACK}: the value is not valid Unicode"),
-                )),
-            },
-        }
-    }
-
-    /// The configuration spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Gateway => "gateway",
-        }
-    }
-}
-
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 static LEGACY_CREDENTIAL_WARNED_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -207,9 +148,6 @@ pub struct Config {
 
     /// Workload profile for adaptive buffer sizing
     pub buffer_profile: String,
-
-    /// S3 HTTP stack (`RUSTFS_S3_STACK`): `legacy` (default) or `gateway`.
-    pub s3_stack: S3Stack,
 }
 
 impl Config {
@@ -241,7 +179,6 @@ impl Config {
             kms_allow_insecure_dev_defaults: false,
             buffer_profile_disable: false,
             buffer_profile: "GeneralPurpose".to_string(),
-            s3_stack: S3Stack::Legacy,
         }
     }
 
@@ -319,8 +256,6 @@ impl Config {
             kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
-            // An invalid or empty value fails startup here instead of choosing a stack.
-            s3_stack: S3Stack::from_env()?,
         })
     }
 
@@ -363,7 +298,6 @@ impl std::fmt::Debug for Config {
             .field("kms_default_key_id", &self.kms_default_key_id)
             .field("kms_allow_insecure_dev_defaults", &self.kms_allow_insecure_dev_defaults)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
-            .field("s3_stack", &self.s3_stack)
             .field("buffer_profile", &self.buffer_profile)
             .finish()
     }
