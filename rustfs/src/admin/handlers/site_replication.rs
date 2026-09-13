@@ -28,7 +28,7 @@ use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
     OperatorRuleContract, assign_site_replication_rule_priorities, merge_incoming_replication_config,
-    replication_target_arn_deployment_id,
+    replication_target_arn_deployment_id, site_replication_rule_deployment_id,
 };
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
@@ -4717,9 +4717,44 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     replication_target_arn_deployment_id(&target.arn)
 }
 
+/// The destination ARNs of the derived rules that `prune_removed_site_replication_rules`
+/// will drop for `removed_deployment_ids`, plus a site-replication `Role`
+/// naming one of them: the targets those ARNs back are the site's own.
+fn removed_site_replication_rule_arns(
+    config: Option<&ReplicationConfiguration>,
+    removed_deployment_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let Some(config) = config else {
+        return HashSet::new();
+    };
+    let mut arns: HashSet<String> = config
+        .rules
+        .iter()
+        .filter(|rule| {
+            replication_rule_deployment_id(rule).is_some_and(|deployment_id| removed_deployment_ids.contains(&deployment_id))
+        })
+        .map(|rule| rule.destination.bucket.clone())
+        .collect();
+    if replication_target_arn_deployment_id(&config.role)
+        .is_some_and(|deployment_id| removed_deployment_ids.contains(&deployment_id))
+    {
+        arns.insert(config.role.clone());
+    }
+    arns
+}
+
+/// Drop the targets site replication itself derived for the removed peers:
+/// those a pruned derived rule names, or the same-name target bucket on the
+/// peer. An operator's bucket-level target to the same site (different
+/// target bucket) carries the peer's deployment id too — it was stamped on
+/// registration — but it is the operator's, and removing the peer from site
+/// replication must not silently end their bucket replication
+/// (rustfs/backlog#2489).
 fn prune_removed_site_replication_bucket_targets(
     existing: BucketTargets,
+    bucket: &str,
     removed_deployment_ids: &HashSet<String>,
+    removed_rule_arns: &HashSet<String>,
 ) -> (BucketTargets, usize) {
     if removed_deployment_ids.is_empty() {
         return (existing, 0);
@@ -4730,7 +4765,9 @@ fn prune_removed_site_replication_bucket_targets(
         .targets
         .into_iter()
         .filter(|target| {
+            let site_owned = removed_rule_arns.contains(&target.arn) || target.target_bucket == bucket;
             target.target_type != BucketTargetType::ReplicationService
+                || !site_owned
                 || bucket_target_deployment_id(target)
                     .map(|deployment_id| !removed_deployment_ids.contains(&deployment_id))
                     .unwrap_or(true)
@@ -5029,10 +5066,17 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let mut removed = 0usize;
 
+    let config = match metadata_sys::get_replication_config(bucket).await {
+        Ok((config, _)) => Some(config),
+        Err(StorageError::ConfigNotFound) => None,
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    let removed_rule_arns = removed_site_replication_rule_arns(config.as_ref(), removed_deployment_ids);
+
     match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => {
             let (updated_targets, removed_targets) =
-                prune_removed_site_replication_bucket_targets(targets, removed_deployment_ids);
+                prune_removed_site_replication_bucket_targets(targets, bucket, removed_deployment_ids, &removed_rule_arns);
             if removed_targets > 0 {
                 let json_targets = serde_json::to_vec(&updated_targets).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}"))
@@ -5047,8 +5091,8 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
-    match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => {
+    if let Some(config) = config {
+        {
             let (updated_config, removed_rules) = prune_removed_site_replication_rules(config, removed_deployment_ids);
             if removed_rules > 0 {
                 if let Some(updated_config) = updated_config {
@@ -5066,8 +5110,6 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
                 removed = removed.saturating_add(removed_rules);
             }
         }
-        Err(StorageError::ConfigNotFound) => {}
-        Err(err) => return Err(ApiError::from(err).into()),
     }
 
     if removed > 0 {
@@ -5456,20 +5498,11 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
             return entry;
         }
     };
-    let mut matching = targets
-        .targets
-        .iter()
-        .filter(|target| target.target_type == BucketTargetType::ReplicationService && bucket_target_matches_peer(target, peer));
-    let Some(target) = matching.next() else {
+    let Some(target) = site_bucket_resync_target_for_peer(bucket, &config, &targets, peer) else {
         entry.status = "failed".to_string();
-        entry.err_detail = "no valid remote target found for peer".to_string();
+        entry.err_detail = "no site replication target found for peer".to_string();
         return entry;
     };
-    if matching.next().is_some() {
-        entry.status = "failed".to_string();
-        entry.err_detail = "multiple remote targets matched peer".to_string();
-        return entry;
-    }
     let (has_arn, existing_object_enabled) = config.has_existing_object_replication(&target.arn);
     if !has_arn || !existing_object_enabled {
         entry.status = "failed".to_string();
@@ -5478,6 +5511,37 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
     }
     entry.target_arn = target.arn.clone();
     entry
+}
+
+/// The bucket target a site resync drives for `peer`: the one the derived
+/// `site-repl-<deployment id>` rule names. Matching targets by peer endpoint
+/// or deployment id also catches an operator's bucket-level target to the
+/// same site (different target bucket and credentials), which either aborted
+/// the bucket as "multiple remote targets matched peer" or drove the resync
+/// into the operator's bucket (rustfs/backlog#2489). Without a derived rule
+/// the site target is recognised by its shape, as MinIO's
+/// `getRemoteARNForPeer` does: the same-name target bucket on the peer.
+fn site_bucket_resync_target_for_peer<'a>(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+    targets: &'a BucketTargets,
+    peer: &PeerInfo,
+) -> Option<&'a BucketTarget> {
+    let replication_targets = || {
+        targets
+            .targets
+            .iter()
+            .filter(|target| target.target_type == BucketTargetType::ReplicationService)
+    };
+    if let Some(arn) = config
+        .rules
+        .iter()
+        .find(|rule| site_replication_rule_deployment_id(rule) == Some(peer.deployment_id.as_str()))
+        .map(|rule| rule.destination.bucket.as_str())
+    {
+        return replication_targets().find(|target| target.arn == arn);
+    }
+    replication_targets().find(|target| target.target_bucket == bucket && bucket_target_matches_peer(target, peer))
 }
 
 /// The persisted replication configuration and bucket targets, bypassing the
@@ -13599,12 +13663,14 @@ mod tests {
                 BucketTarget {
                     arn: "arn:rustfs:replication::removed-dep:photos".to_string(),
                     deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos".to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()
                 },
                 BucketTarget {
                     arn: "arn:rustfs:replication::kept-dep:photos".to_string(),
                     deployment_id: "kept-dep".to_string(),
+                    target_bucket: "photos".to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()
                 },
@@ -13617,7 +13683,8 @@ mod tests {
             ],
         };
 
-        let (updated, removed) = prune_removed_site_replication_bucket_targets(targets, &removed_deployment_ids);
+        let (updated, removed) =
+            prune_removed_site_replication_bucket_targets(targets, "photos", &removed_deployment_ids, &HashSet::new());
 
         assert_eq!(removed, 1);
         assert_eq!(updated.targets.len(), 2);
@@ -13628,6 +13695,107 @@ mod tests {
                 .iter()
                 .any(|target| target.target_type == BucketTargetType::IlmService)
         );
+    }
+
+    /// rustfs/backlog#2489: removing a peer drops the targets the site derived
+    /// for it — by pruned-rule ARN or same-name shape — and leaves an
+    /// operator's bucket-level target to that peer alone even though it
+    /// carries the peer's deployment id.
+    #[test]
+    fn test_prune_removed_site_replication_bucket_targets_keeps_operator_target_to_removed_peer() {
+        let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:rustfs:replication:eu-west-1:removed-dep:photos", 1, "site-repl-removed-dep"),
+                build_site_replication_rule("arn:minio:replication::removed-dep:photos-dst", 9, "operator-rule"),
+            ],
+        };
+        let removed_rule_arns = removed_site_replication_rule_arns(Some(&config), &removed_deployment_ids);
+        assert_eq!(
+            removed_rule_arns,
+            HashSet::from(["arn:rustfs:replication:eu-west-1:removed-dep:photos".to_string()]),
+            "only the derived rule's ARN is the site's"
+        );
+
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:rustfs:replication:eu-west-1:removed-dep:photos".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:minio:replication::removed-dep:photos-dst".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_bucket: "photos-dst".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let (updated, removed) =
+            prune_removed_site_replication_bucket_targets(targets, "photos", &removed_deployment_ids, &removed_rule_arns);
+
+        assert_eq!(removed, 1);
+        assert_eq!(updated.targets.len(), 1);
+        assert_eq!(
+            updated.targets[0].target_bucket, "photos-dst",
+            "the operator target survives the peer removal"
+        );
+    }
+
+    /// rustfs/backlog#2489: the resync manifest picks the derived rule's
+    /// target, never an operator target to the same peer; without a derived
+    /// rule it falls back to the same-name shape.
+    #[test]
+    fn test_site_bucket_resync_target_for_peer_ignores_operator_target() {
+        let peer = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "http://remote.example.com:9000")
+        };
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:minio:replication::7c0c5a1e-operator:photos-dst".to_string(),
+                    deployment_id: "remote".to_string(),
+                    target_bucket: "photos-dst".to_string(),
+                    endpoint: "remote.example.com:9000".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:minio:replication::remote:photos".to_string(),
+                    deployment_id: "remote".to_string(),
+                    target_bucket: "photos".to_string(),
+                    endpoint: "remote.example.com:9000".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:minio:replication::7c0c5a1e-operator:photos-dst", 9, "operator-rule"),
+                build_site_replication_rule("arn:minio:replication::remote:photos", 1, "site-repl-remote"),
+            ],
+        };
+        let picked = site_bucket_resync_target_for_peer("photos", &config, &targets, &peer).expect("site target");
+        assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
+
+        let without_rule = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:minio:replication::7c0c5a1e-operator:photos-dst",
+                9,
+                "operator-rule",
+            )],
+        };
+        let picked = site_bucket_resync_target_for_peer("photos", &without_rule, &targets, &peer).expect("shape fallback");
+        assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
     }
 
     #[test]
