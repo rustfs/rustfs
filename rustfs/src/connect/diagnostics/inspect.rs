@@ -28,9 +28,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
-use rustfs_ecstore::api::bucket::utils::check_valid_bucket_name_strict;
-use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
-use rustfs_ecstore::api::set_disk::file_info_quorum_hash;
 use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_utils::HashAlgorithm;
 use serde::Serialize;
@@ -42,6 +39,7 @@ use uuid::{Uuid, Variant, Version};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::connect::DeviceIdentity;
+use crate::storage_api::inspect::{BitrotReader, Erasure, check_valid_bucket_name_strict, file_info_quorum_hash};
 
 pub const INSPECT_SCHEMA_VERSION: u16 = 1;
 pub const INSPECT_CAPABILITY: &str = "inspect.object@1";
