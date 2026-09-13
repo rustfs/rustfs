@@ -679,6 +679,19 @@ pub fn try_sign_v4(
     .map_err(|failure| failure.error)
 }
 
+pub fn try_sign_v4_headers(
+    parts: request::Parts,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+) -> SignResult<HeaderMap> {
+    let request = request::Request::from_parts(parts, Body::empty());
+    try_sign_v4(request, content_len, access_key_id, secret_access_key, session_token, location)
+        .map(|request| request.into_parts().0.headers)
+}
+
 pub fn sign_v4_trailer(
     req: request::Request<Body>,
     access_key_id: &str,
