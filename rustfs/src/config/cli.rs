@@ -1252,7 +1252,7 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ConnectCommands, InspectCommands, preprocess_args_for_legacy};
+    use super::{Cli, Commands, ConnectCommands, ConnectInventoryCommands, InspectCommands, preprocess_args_for_legacy};
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
@@ -1402,7 +1402,8 @@ mod tests {
             "--state-dir",
             "/var/lib/rustfs/connect",
         ])
-        .expect_err("unacknowledged L1 inventory must fail");
+        .err()
+        .expect("unacknowledged L1 inventory must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l1"));
 
@@ -1466,7 +1467,9 @@ mod tests {
             "--sample-period-micros",
             "1000",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("an incomplete unacknowledged profile must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("an incomplete unacknowledged profile must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }
@@ -1502,7 +1505,9 @@ mod tests {
             "--duration-millis",
             "1000",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("unacknowledged log capture must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged log capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }
@@ -1539,7 +1544,9 @@ mod tests {
             "--duration-millis",
             "10",
         ];
-        let error = Cli::try_parse_from(arguments).expect_err("unacknowledged telemetry capture must fail");
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("unacknowledged telemetry capture must fail");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
         assert!(error.to_string().contains("--acknowledge-l3"));
     }

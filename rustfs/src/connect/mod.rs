@@ -73,6 +73,15 @@ pub use diagnostics::{
     spawn_environment_schedule, validate_client_limits, validate_drive_limits,
 };
 pub use diagnostics::{
+    LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,
+    MAX_NETWORK_DURATION, MAX_NETWORK_ENVELOPE_BYTES, MAX_NETWORK_OPERATIONS, MAX_NETWORK_PEERS, MAX_NETWORK_RESULT_BYTES,
+    MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NETWORK_TOOL_ID, NetworkCoverage,
+    NetworkDiagnosticResult, NetworkMeasurement, NetworkOutcome, NetworkPeerHarness, NetworkPeerResult, NetworkPerformanceData,
+    NetworkPerformanceError, NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PeerProbeError, PeerProbeFuture,
+    PeerProbeMeasurement, PeerReasonCode, SavedNetworkExport, SignedNetworkExport, measure_network, measure_network_with_harness,
+    save_signed_network_export, sign_network_export,
+};
+pub use diagnostics::{
     LocalObjectConsent, MAX_OBJECT_BANDWIDTH_BYTES_PER_SECOND, MAX_OBJECT_DURATION, MAX_OBJECT_RESULT_BYTES,
     MAX_OBJECT_TRAFFIC_BYTES, OBJECT_CAPABILITY, OBJECT_SCHEMA_VERSION, OBJECT_TOOL_ID, ObjectDiagnosticResult,
     ObjectMeasurement, ObjectOperation, ObjectOutcome, ObjectPerformanceData, ObjectPerformanceError, ObjectPerformanceRequest,
