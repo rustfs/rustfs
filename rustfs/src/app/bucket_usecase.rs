@@ -1914,9 +1914,11 @@ impl DefaultBucketUsecase {
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((cfg, _)) => cfg.rules,
-            Err(_) => {
+            Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
+            // An unreadable stored configuration is not an absent one.
+            Err(err) => return Err(ApiError::from(err).into()),
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
