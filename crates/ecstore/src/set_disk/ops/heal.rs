@@ -3545,15 +3545,7 @@ mod heal_result_report_tests {
                 ..Default::default()
             };
             let (dry_run, error) = set
-                .heal_object(
-                    bucket,
-                    object,
-                    "",
-                    &HealOpts {
-                        dry_run: true,
-                        ..opts.clone()
-                    },
-                )
+                .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..opts })
                 .await
                 .expect("dry-run should report inline corruption");
             assert!(error.is_none());

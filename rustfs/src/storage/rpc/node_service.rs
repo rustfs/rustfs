@@ -3438,13 +3438,15 @@ mod tests {
         use rustfs_protos::heal_control::{Admission, Envelope, Outcome, RequestMetadata};
 
         let (manager, mut parent, metadata) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
         parent.force_start = false;
         parent.object_prefix = Some("scope/".to_string());
         let parent_id = parent.id.clone();
         let envelope = Envelope::start(parent.clone(), metadata).expect("parent start");
-        let response = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("admit parent scope");
+        let response =
+            execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+                .await
+                .expect("admit parent scope");
         assert!(
             matches!(decode_transport_start_outcome(&response, &parent_id, metadata.coordinator_epoch),
             Outcome::Start { task_id, admission: Admission::Accepted } if task_id == parent_id)
@@ -3464,10 +3466,14 @@ mod tests {
                 ..metadata
             };
             let envelope = Envelope::start(request, request_metadata).expect("scoped start envelope");
-            let response =
-                execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
-                    .await
-                    .expect("overlap remains a typed admission result across the RPC boundary");
+            let response = execute_heal_control_envelope_with_manager(
+                envelope,
+                metadata.coordinator_epoch,
+                Some(manager.clone()),
+                &endpoints,
+            )
+            .await
+            .expect("overlap remains a typed admission result across the RPC boundary");
             let Outcome::Start { task_id, admission } =
                 decode_transport_start_outcome(&response, &request_id, metadata.coordinator_epoch)
             else {
@@ -3503,9 +3509,10 @@ mod tests {
             },
         )
         .expect("force replacement envelope");
-        let response = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("forceStart replaces the parent and preserves the disjoint scope");
+        let response =
+            execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+                .await
+                .expect("forceStart replaces the parent and preserves the disjoint scope");
         assert!(
             matches!(decode_transport_start_outcome(&response, &replacement_id, metadata.coordinator_epoch),
             Outcome::Start { task_id, admission: Admission::Accepted } if task_id == replacement_id)
