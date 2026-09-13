@@ -41,6 +41,10 @@ struct DanglingDeleteGraceError {
     grace_secs: i64,
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("retired delete marker cleanup deferred: {0}")]
+struct RetiredMarkerDeferred(String);
+
 /// Marks a conditional-file write that failed before its publication rename.
 /// Callers may choose another owner only while this marker is preserved; every
 /// unmarked error remains commit-ambiguous and must fail closed.
@@ -332,6 +336,19 @@ impl DiskError {
     pub(crate) fn clone_dangling_delete_grace(error: &io::Error) -> Option<io::Error> {
         let grace = error.get_ref()?.downcast_ref::<DanglingDeleteGraceError>()?;
         Some(io::Error::new(error.kind(), grace.clone()))
+    }
+
+    pub(crate) fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        Self::other(RetiredMarkerDeferred(reason.into()))
+    }
+
+    pub fn io_error_is_retired_marker_deferred(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|source| source.is::<RetiredMarkerDeferred>())
+    }
+
+    pub(crate) fn clone_retired_marker_deferred(error: &io::Error) -> Option<io::Error> {
+        let deferred = error.get_ref()?.downcast_ref::<RetiredMarkerDeferred>()?;
+        Some(io::Error::other(deferred.clone()))
     }
 
     pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
@@ -685,6 +702,7 @@ impl Clone for DiskError {
             ),
             DiskError::Io(io_error) => DiskError::Io(
                 Self::clone_dangling_delete_grace(io_error)
+                    .or_else(|| Self::clone_retired_marker_deferred(io_error))
                     .or_else(|| rustfs_rio::clone_internode_http_io_error(io_error))
                     .and_then(std::io::Error::into_inner)
                     // The helper derives a kind from the source; Clone must retain the original outer kind.
@@ -876,6 +894,15 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn retired_marker_deferral_survives_disk_and_storage_clones() {
+        let disk = DiskError::retired_marker_deferred("missing retirement record").clone();
+        let storage = crate::error::StorageError::from(disk).clone();
+        assert!(storage.is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::other(storage.to_string()).is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::FileVersionNotFound.is_retired_marker_deferred());
+    }
 
     #[test]
     fn dangling_grace_retry_timing_survives_disk_and_storage_clones() {

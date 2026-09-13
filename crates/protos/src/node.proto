@@ -1210,6 +1210,7 @@ service NodeService {
   rpc BatchReadVersion(BatchReadVersionRequest) returns (BatchReadVersionResponse) {}; // auth-policy: read-only
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {}; // auth-policy: read-only
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
+  rpc DeleteRetiredMarker(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}; // auth-policy: body-bound

@@ -1508,6 +1508,10 @@ pub struct DeleteOptions {
     #[serde(default)]
     pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+    /// Full marker precondition checked under the actual metadata mutation lease.
+    /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1796,6 +1800,7 @@ mod tests {
             undo_write: true,
             undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
+            expected_delete_marker: None,
         };
 
         assert!(opts.recursive);

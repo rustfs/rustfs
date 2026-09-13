@@ -1482,11 +1482,12 @@ impl Sets {
         object: &str,
         version_id: &str,
         opts: &HealOpts,
+        retirement: Option<&crate::bucket::retirement::MarkerRetirementContext<'_>>,
     ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
         let mut absence = None;
         let (item, error) = self
             .get_disks_for_heal_object(object, opts)?
-            .heal_object_with_absence(bucket, object, version_id, opts, &mut absence)
+            .heal_object_with_retirement(bucket, object, version_id, opts, &mut absence, retirement)
             .await?;
         // A caller-owned lock does not expose its lease to this boundary.
         // Keep cleanup unverified when that lease cannot be checked here.

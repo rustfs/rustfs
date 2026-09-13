@@ -5828,6 +5828,25 @@ impl LocalDisk {
             opts,
             namespace_owner,
         } = mutation;
+        if let Some(expected) = opts.expected_delete_marker.as_ref() {
+            let expected_info = expected.into_fileinfo(volume, path, false)?;
+            if force_del_marker
+                || opts.recursive
+                || opts.immediate
+                || opts.undo_write
+                || opts.undo_delete
+                || opts.old_data_dir.is_some()
+                || path.starts_with(SLASH_SEPARATOR)
+                || fi.deleted
+                || fi.mark_deleted
+                || fi.version_id.is_none_or(|id| id.is_nil())
+                || fi.version_id != expected.version_id
+                || expected_info.delete_marker_incarnation().is_none()
+                || !expected_info.is_canonical_delete_marker()
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+        }
         if path.starts_with(SLASH_SEPARATOR) {
             return self
                 .delete_with_namespace_owner(
@@ -5879,6 +5898,23 @@ impl LocalDisk {
         };
 
         let mut meta = FileMeta::load(&buf)?;
+        if let Some(expected) = opts.expected_delete_marker.as_ref() {
+            let Some(version) = meta
+                .versions
+                .iter()
+                .find(|version| version.header.version_id == fi.version_id)
+            else {
+                return Err(DiskError::FileVersionNotFound);
+            };
+            let actual = version.parse_version_meta()?;
+            if actual.version_type != rustfs_filemeta::VersionType::Delete
+                || actual.object.is_some()
+                || actual.legacy_object.is_some()
+                || actual.delete_marker.as_ref() != Some(expected)
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+        }
         let old_dir = meta.delete_version(&fi)?;
         let mut reserved_version_delete = false;
         if let Some(rollback_dir) = rollback_dir {
@@ -16119,6 +16155,114 @@ mod test {
     }
 
     #[tokio::test]
+    async fn retired_marker_condition_preserves_replacements_and_other_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.unwrap());
+        let bucket = "retired-marker-condition";
+        let object = "reused.bin";
+        ensure_test_volume(&disk, bucket).await;
+        let version = Uuid::new_v4();
+        let old_incarnation = Uuid::new_v4();
+        let mut old = FileInfo {
+            name: object.into(),
+            version_id: Some(version),
+            deleted: true,
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        old.set_delete_marker_incarnation(old_incarnation);
+        let condition = rustfs_filemeta::MetaDeleteMarker::from(old.clone());
+        let request = FileInfo {
+            name: object.into(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let options = DeleteOptions {
+            expected_delete_marker: Some(condition),
+            ..Default::default()
+        };
+        let mut unrelated =
+            test_file_info(object, Uuid::new_v4(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"current bytes")));
+        unrelated.set_inline_data();
+        disk.write_metadata("", bucket, object, unrelated.clone()).await.unwrap();
+        disk.write_metadata("", bucket, object, old.clone()).await.unwrap();
+        for replacement in [
+            {
+                let mut current = old.clone();
+                current.set_delete_marker_incarnation(Uuid::new_v4());
+                current
+            },
+            {
+                let mut changed = old.clone();
+                changed.mod_time = Some(changed.mod_time.unwrap() + time::Duration::seconds(1));
+                changed
+            },
+            test_file_info(object, version, Some(Uuid::new_v4()), Some(Bytes::from_static(b"replacement data"))),
+        ] {
+            // The request was formed from the old observation. Publication must
+            // still compare against the metadata present when it obtains the lease.
+            disk.write_metadata("", bucket, object, replacement).await.unwrap();
+            let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let before = fs::read(&path).await.unwrap();
+            assert!(
+                disk.delete_version(bucket, object, request.clone(), false, options.clone())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&path).await.unwrap(),
+                before,
+                "a stale condition must not publish any metadata change"
+            );
+        }
+        disk.write_metadata("", bucket, object, old.clone()).await.unwrap();
+        let lease = os::acquire_metadata_mutation_lease(&disk.get_object_path(bucket, object).unwrap(), None).await;
+        let pending = tokio::spawn({
+            let disk = disk.clone();
+            let request = request.clone();
+            let options = options.clone();
+            async move { disk.delete_version(bucket, object, request, false, options).await }
+        });
+        // Publish a competing generation while owning the actual metadata
+        // lease. The delayed delete must read this replacement after release.
+        let mut replacement = old.clone();
+        replacement.set_delete_marker_incarnation(Uuid::new_v4());
+        disk.write_metadata_with_namespace_owner(bucket, object, replacement, Some(lease.clone()))
+            .await
+            .unwrap();
+        let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let after_replacement = fs::read(&path).await.unwrap();
+        assert!(!pending.is_finished(), "conditional deletion must wait for the metadata lease");
+        drop(lease);
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(fs::read(&path).await.unwrap(), after_replacement);
+        disk.write_metadata("", bucket, object, old).await.unwrap();
+        disk.delete_version(bucket, object, request, false, options)
+            .await
+            .expect("matching retired marker condition");
+        assert!(matches!(
+            disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                .await,
+            Err(DiskError::FileVersionNotFound)
+        ));
+        let retained = disk
+            .read_version(
+                "",
+                bucket,
+                object,
+                &unrelated.version_id.unwrap().to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unrelated new version remains");
+        assert_eq!(retained.data, unrelated.data);
+    }
+
+    #[tokio::test]
     async fn test_delete_version_undo_restores_backup_to_object_root() {
         use tempfile::tempdir;
 
@@ -19393,6 +19537,7 @@ mod test {
             undo_write: false,
             undo_delete: false,
             old_data_dir: None,
+            expected_delete_marker: None,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await

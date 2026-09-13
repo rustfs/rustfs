@@ -1668,7 +1668,14 @@ impl Node for NodeService {
     }
 
     async fn delete_version(&self, request: Request<DeleteVersionRequest>) -> Result<Response<DeleteVersionResponse>, Status> {
-        self.handle_delete_version(request).await
+        self.handle_delete_version(request, false).await
+    }
+
+    async fn delete_retired_marker(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        self.handle_delete_version(request, true).await
     }
 
     async fn delete_versions(&self, request: Request<DeleteVersionsRequest>) -> Result<Response<DeleteVersionsResponse>, Status> {
@@ -2915,9 +2922,10 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 18] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 19] = [
         "renamedata",
         "deleteversion",
+        "deleteretiredmarker",
         "deleteversions",
         "writemetadata",
         "updatemetadata",
@@ -4228,6 +4236,20 @@ mod tests {
         );
         assert_gated!(
             delete_version,
+            DeleteVersionRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                force_del_marker: false,
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            delete_retired_marker,
             DeleteVersionRequest {
                 disk: disk.clone(),
                 volume: "v".into(),
@@ -6528,6 +6550,45 @@ mod tests {
         assert!(!read_response.success);
         assert!(read_response.error.is_some());
         assert!(read_response.raw_file_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_marker_rpc_rejects_missing_or_combined_conditions() {
+        use crate::storage::storage_api::ecstore_disk::DeleteOptions;
+        use rustfs_filemeta::{FileInfo, MetaDeleteMarker};
+        let service = create_test_node_service();
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        for opts in [
+            DeleteOptions::default(),
+            DeleteOptions {
+                undo_write: true,
+                expected_delete_marker: Some(MetaDeleteMarker::from(marker)),
+                ..Default::default()
+            },
+        ] {
+            let mut request = Request::new(DeleteVersionRequest {
+                disk: "invalid-disk-path".into(),
+                volume: "bucket".into(),
+                path: "marker.bin".into(),
+                file_info: serde_json::to_string(&FileInfo::default()).unwrap(),
+                opts: serde_json::to_string(&opts).unwrap(),
+                ..Default::default()
+            });
+            let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).unwrap();
+            set_tonic_canonical_body_digest(&mut request, &body).unwrap();
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .delete_retired_marker(request)
+                .await
+                .expect_err("invalid conditional request must be rejected before disk lookup");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]

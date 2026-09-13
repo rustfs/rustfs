@@ -8139,6 +8139,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 vr.mod_time = goi.mod_time;
             }
 
+            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+                vr.set_delete_marker_incarnation(incarnation);
+            }
+
             let v = {
                 if vers_map.contains_key(&dobj.object_name) {
                     let val = vers_map.get_mut(&dobj.object_name).unwrap();
@@ -8820,6 +8824,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             fi.set_tier_free_version_id(&find_vid.to_string());
 
+            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+                fi.set_delete_marker_incarnation(incarnation);
+            }
+
             fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
                 let vid = Uuid::parse_str(vid.as_str())?;
                 (!opts.version_suspended || !vid.is_nil()).then_some(vid)
@@ -8878,6 +8886,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         dfi.set_tier_free_version_id(&find_vid.to_string());
+
+        if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+            dfi.set_delete_marker_incarnation(incarnation);
+        }
 
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;

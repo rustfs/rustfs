@@ -722,6 +722,15 @@ impl FileMeta {
                 mod_time: fi.mod_time,
                 ..Default::default()
             });
+            if let Some(incarnation) = fi.delete_marker_incarnation()
+                && let Some(marker) = ventry.delete_marker.as_mut()
+            {
+                insert_bytes(
+                    &mut marker.meta_sys,
+                    rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+                    incarnation.to_string().into_bytes(),
+                );
+            }
         }
 
         let mut update_version = false;

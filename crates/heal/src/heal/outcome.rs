@@ -48,6 +48,7 @@ pub struct HealObjectIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum HealDeferredReason {
     DanglingDeleteGrace,
+    RetiredMarkerProof,
     TransientUsageCache,
     TransientExistenceCheck,
     Deadline,

@@ -484,7 +484,7 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.handle_heal_object_with_absence(bucket, object, version_id, opts, &mut None)
+        self.handle_heal_object_with_absence(bucket, object, version_id, opts, &mut None, None)
             .await
     }
 
@@ -507,9 +507,18 @@ impl ECStore {
         // Match object publication: bucket lifecycle before capacity and object
         // namespace locks. Keep the incarnation pinned through proof delivery.
         let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let retirement = crate::bucket::retirement::MarkerRetirementContext {
+            store: crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await,
+            current_incarnation: self
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .ok()
+                .filter(|id| !id.is_nil()),
+            lifecycle_guard: &guard,
+        };
         let mut proofs = None;
         let (item, mut error) = self
-            .handle_heal_object_with_absence(bucket, object, version_id, opts, &mut proofs)
+            .handle_heal_object_with_absence(bucket, object, version_id, opts, &mut proofs, Some(&retirement))
             .await?;
         // Read the authoritative incarnation only for an absence candidate.
         // The lifecycle guard has pinned it throughout the storage operation.
@@ -547,6 +556,7 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
         absence: &mut Option<Vec<crate::set_disk::HealedObjectAbsence>>,
+        retirement: Option<&crate::bucket::retirement::MarkerRetirementContext<'_>>,
     ) -> Result<(HealResultItem, Option<Error>)> {
         trace!(
             event = EVENT_HEAL_OBJECT_STARTED,
@@ -637,7 +647,8 @@ impl ECStore {
                             }
                             #[cfg(test)]
                             crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts).await
+                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                                .await
                         }
                     });
                     let results = join_all(futures).await;
@@ -660,7 +671,8 @@ impl ECStore {
                     move |opts| async move {
                         #[cfg(test)]
                         crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts).await
+                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                            .await
                     },
                 ));
             }

@@ -222,6 +222,8 @@ pub struct ListPathRawOptions {
     pub filter_prefix: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
+    /// Deliver every replica to the partial callback, including matching headers.
+    pub preserve_replica_metadata: bool,
     pub report_not_found: bool,
     pub per_disk_limit: i32,
     pub skip_walkdir_total_timeout: bool,
@@ -254,6 +256,7 @@ impl Clone for ListPathRawOptions {
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
+            preserve_replica_metadata: self.preserve_replica_metadata,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
@@ -918,7 +921,7 @@ async fn list_path_raw_inner(
                 break;
             }
 
-            if agree == readers.len() {
+            if agree == readers.len() && !opts.preserve_replica_metadata {
                 for r in readers.iter_mut() {
                     let _ = r.skip(1).await;
                 }

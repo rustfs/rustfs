@@ -406,6 +406,14 @@ impl StorageError {
     pub fn is_dangling_delete_grace(&self) -> bool {
         matches!(self, StorageError::Io(io_error) if DiskError::io_error_is_dangling_delete_grace(io_error))
     }
+
+    pub fn is_retired_marker_deferred(&self) -> bool {
+        matches!(self, StorageError::Io(error) if DiskError::io_error_is_retired_marker_deferred(error))
+    }
+
+    pub fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        DiskError::retired_marker_deferred(reason).into()
+    }
 }
 
 impl From<HTTPRangeError> for StorageError {
@@ -615,7 +623,9 @@ impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
             StorageError::Io(e) => {
-                if let Some(error) = DiskError::clone_dangling_delete_grace(e) {
+                if let Some(error) =
+                    DiskError::clone_dangling_delete_grace(e).or_else(|| DiskError::clone_retired_marker_deferred(e))
+                {
                     return StorageError::Io(error);
                 }
                 if let Some(context) = self.pool_metadata_failure() {

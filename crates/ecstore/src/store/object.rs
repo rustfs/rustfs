@@ -4737,7 +4737,7 @@ impl ECStore {
         {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if opts.delete_prefix && opts.expected_bucket_incarnation_id.is_none() {
+        if opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
         #[cfg(any(test, feature = "test-util"))]
@@ -5174,6 +5174,9 @@ impl ECStore {
                 objects.as_slice(),
                 StorageError::BucketNotFound(bucket.to_string()),
             );
+        }
+        if opts.expected_bucket_incarnation_id.is_none() {
+            opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
         #[cfg(any(test, feature = "test-util"))]
         if current_bucket_incarnation_id.is_some() {
@@ -8337,6 +8340,292 @@ mod tests {
             .await
             .expect("create the versioned bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_marker_converges_after_bucket_recreation_on_sixteen_disks() {
+        let bucket = "retired-marker-c11";
+        let object = "marker.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (dirs, original) = make_local_set_disks_with_ctx(16, 4, ctx.clone()).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let create = MakeBucketOptions {
+            versioning_enabled: true,
+            ..Default::default()
+        };
+        store.handle_make_bucket(bucket, &create).await.expect("create old bucket");
+        let old_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("old identity");
+        let mut historical = Vec::new();
+        for value in 1..=3 {
+            historical.push(
+                store
+                    .put_object(
+                        bucket,
+                        "history.bin",
+                        &mut PutObjReader::from_vec(vec![value; 4097]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write old version")
+                    .version_id
+                    .unwrap(),
+            );
+        }
+        let marker = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create old marker")
+            .version_id
+            .expect("explicit marker version");
+        assert!(
+            store
+                .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            !crate::bucket::retirement::is_retired(store.clone(), bucket, old_incarnation)
+                .await
+                .unwrap(),
+            "failed bucket deletion cannot publish retirement"
+        );
+        let set = &store.pools[0].disk_set[0];
+        let before = set.disks.read().await.clone();
+        for disk in before.iter().flatten() {
+            let info = disk
+                .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("read original marker");
+            assert_eq!(info.delete_marker_incarnation(), Some(old_incarnation));
+        }
+        // Taking four actual members offline preserves their existing xl.meta.
+        // All deletion/recreation work below goes through the normal store API.
+        for slot in 12..16 {
+            set.disks.write().await[slot] = None;
+        }
+        for version in historical {
+            store
+                .delete_object(
+                    bucket,
+                    "history.bin",
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("delete exact old data version with four drives offline");
+        }
+        store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(marker.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete exact old marker with four drives offline");
+        store
+            .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete empty old bucket");
+        assert!(
+            crate::bucket::retirement::is_retired(store.clone(), bucket, old_incarnation)
+                .await
+                .expect("durable retirement")
+        );
+        store
+            .handle_make_bucket(bucket, &create)
+            .await
+            .expect("recreate same bucket name");
+        let current = store.bucket_incarnation_id_from_disk(bucket).await.expect("new identity");
+        assert_ne!(old_incarnation, current);
+        let mut new_versions = Vec::new();
+        for (key, payload) in [
+            (object, b"new generation reused key".as_slice()),
+            ("new.bin", b"new generation control".as_slice()),
+        ] {
+            let info = store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut PutObjReader::from_vec(payload.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write new generation");
+            new_versions.push((key, info.version_id.unwrap(), payload));
+        }
+        *set.disks.write().await = before.clone();
+        let heal = rustfs_heal_contracts::heal_channel::HealOpts {
+            remove: true,
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+            ..Default::default()
+        };
+        let observed = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list after rejoin");
+        assert_eq!(observed.objects.len(), 2, "stale marker must not contaminate listing");
+        assert!(observed.objects.iter().all(|info| !info.delete_marker));
+        for (key, version, _) in &new_versions {
+            let repaired = store
+                .heal_object_with_proof(bucket, key, &version.to_string(), &heal)
+                .await
+                .expect("heal new generation");
+            assert!(repaired.error.is_none(), "new version heal: {:?}", repaired.error);
+        }
+        let no_remove = store
+            .heal_object_with_proof(
+                bucket,
+                object,
+                &marker.to_string(),
+                &rustfs_heal_contracts::heal_channel::HealOpts { remove: false, ..heal },
+            )
+            .await
+            .expect("inspect marker without removal");
+        assert!(no_remove.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(no_remove.absence.is_none());
+        let dry = store
+            .heal_object_with_proof(
+                bucket,
+                object,
+                &marker.to_string(),
+                &rustfs_heal_contracts::heal_channel::HealOpts { dry_run: true, ..heal },
+            )
+            .await
+            .expect("dry run");
+        assert!(dry.absence.is_none());
+        for disk in before.iter().skip(12).flatten() {
+            assert!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
+        let original_marker = before[12]
+            .as_ref()
+            .unwrap()
+            .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+            .await
+            .unwrap();
+        for stamp in [None, Some(current), Some(Uuid::new_v4())] {
+            for disk in before.iter().skip(12).flatten() {
+                let mut changed = original_marker.clone();
+                changed.metadata.clear();
+                if let Some(stamp) = stamp {
+                    changed.set_delete_marker_incarnation(stamp);
+                }
+                disk.write_metadata("", bucket, object, changed).await.unwrap();
+            }
+            let unresolved = store
+                .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+                .await
+                .unwrap();
+            assert!(
+                unresolved.error.as_ref().is_some_and(Error::is_retired_marker_deferred),
+                "legacy/current/unproven markers must be deferred: {:?}",
+                unresolved.error
+            );
+            assert!(unresolved.absence.is_none());
+            for disk in before.iter().skip(12).flatten() {
+                assert!(
+                    disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                        .await
+                        .is_ok()
+                );
+                disk.write_metadata("", bucket, object, original_marker.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        set.disks.write().await[15] = None;
+        let incomplete = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .unwrap();
+        assert!(incomplete.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(incomplete.absence.is_none(), "offline targets cannot be omitted from a cleanup receipt");
+        set.disks.write().await[15] = before[15].clone();
+        let failure =
+            crate::set_disk::DanglingDeleteFailure::install(bucket, object, 15, crate::disk::error::DiskError::FaultyDisk);
+        let partial = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .unwrap();
+        assert!(partial.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(
+            partial.absence.is_none(),
+            "fifteen successful/absent disks cannot hide one remaining marker"
+        );
+        assert!(
+            before[15]
+                .as_ref()
+                .unwrap()
+                .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .is_ok()
+        );
+        drop(failure);
+        let cleaned = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .expect("cleanup retired marker");
+        assert!(cleaned.error.is_none(), "cleanup error: {:?}", cleaned.error);
+        let proof = cleaned.absence.expect("complete cleanup receipt");
+        assert!(proof.removed);
+        assert_eq!(proof.bucket_incarnation_id, current);
+        for disk in before.iter().flatten() {
+            assert!(matches!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await,
+                Err(crate::disk::error::DiskError::FileVersionNotFound | crate::disk::error::DiskError::FileNotFound)
+            ));
+        }
+        let replay = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .expect("idempotent replay");
+        assert!(replay.error.is_none());
+        assert!(!replay.absence.expect("authoritative absence receipt").removed);
+        for (key, version, payload) in new_versions {
+            let mut reader = store
+                .handle_get_object_reader(
+                    bucket,
+                    key,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("new generation still readable");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read new bytes");
+            assert_eq!(actual, payload);
+        }
+        assert_eq!(dirs.len(), 16);
     }
 
     #[tokio::test]
