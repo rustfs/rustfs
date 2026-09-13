@@ -270,6 +270,29 @@ pub(crate) fn table_data_plane_resource_from_entry(table: TableEntry, warehouse_
     }
 }
 
+pub(crate) fn table_data_plane_resource_from_warehouse_index(
+    index: &TableWarehouseIndexEntry,
+) -> TableCatalogStoreResult<TableDataPlaneResource> {
+    if index.table_bucket.is_empty() || index.table_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid(
+            "warehouse index has an empty table bucket or table id".to_string(),
+        ));
+    }
+    parse_namespace_for_store(&index.namespace)?;
+    parse_table_for_store(&index.table)?;
+    let normalized = normalize_warehouse_object_prefix(&index.warehouse_object_prefix, Some(WAREHOUSE_INDEX_MAX_PREFIX_DEPTH))?;
+    if normalized != index.warehouse_object_prefix {
+        return Err(TableCatalogStoreError::Invalid("warehouse index prefix is not canonical".to_string()));
+    }
+    Ok(TableDataPlaneResource {
+        table_bucket: index.table_bucket.clone(),
+        namespace: index.namespace.clone(),
+        table: index.table.clone(),
+        table_id: index.table_id.clone(),
+        warehouse_object_prefix: index.warehouse_object_prefix.clone(),
+    })
+}
+
 pub(crate) async fn table_data_plane_resource_for_object<S>(
     store: &S,
     bucket: &str,

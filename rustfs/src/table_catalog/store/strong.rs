@@ -2416,26 +2416,32 @@ where
         }
 
         self.hydrate_state().await?;
-        let state = self.state.lock().await;
-        self.require_data_plane_ready_locked(&state, table_bucket)?;
+        let active_resource = {
+            let state = self.state.lock().await;
+            self.require_data_plane_ready_locked(&state, table_bucket)?;
 
-        let Some(bucket_index) = state.warehouse_index.get(table_bucket) else {
-            return Ok(None);
-        };
-
-        for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
-            if let Some(table_key) = bucket_index.get(warehouse_object_prefix) {
-                Self::ensure_identifier_is_unambiguous_locked(&state, table_key)?;
-                let Some(table) = state.tables.get(table_key) else {
-                    continue;
-                };
-                return Ok(Some(table_data_plane_resource_from_entry(
-                    table.clone(),
-                    warehouse_object_prefix.to_string(),
-                )));
+            let mut resource = None;
+            if let Some(bucket_index) = state.warehouse_index.get(table_bucket) {
+                for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
+                    if let Some(table_key) = bucket_index.get(warehouse_object_prefix) {
+                        Self::ensure_identifier_is_unambiguous_locked(&state, table_key)?;
+                        let Some(table) = state.tables.get(table_key) else {
+                            continue;
+                        };
+                        resource = Some(table_data_plane_resource_from_entry(table.clone(), warehouse_object_prefix.to_string()));
+                        break;
+                    }
+                }
             }
+            resource
+        };
+        if active_resource.is_some() {
+            return Ok(active_resource);
         }
-        Ok(None)
+
+        ObjectTableCatalogStore::new(self.object_backend.clone())
+            .resolve_deleted_table_data_plane_resource_from_index(table_bucket, object)
+            .await
     }
 
     async fn resolve_table_metadata_data_plane_resource(
@@ -2674,11 +2680,22 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let key = Self::table_key(table_bucket, &namespace, &table);
+        let dropped = {
+            let state = self.state.lock().await;
+            state.tables.get(&key).cloned().ok_or_else(|| {
+                TableCatalogStoreError::NotFound(format!("table {}/{}/{}", table_bucket, namespace.public_name(), table.as_str()))
+            })?
+        };
+        if dropped.state == TableCatalogEntryState::Active {
+            ObjectTableCatalogStore::new(self.object_backend.clone())
+                .tombstone_table_warehouse_index_for_drop(&dropped, true)
+                .await?;
+        }
         let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
-            if !state.tables.contains_key(&key) {
-                return Err(TableCatalogStoreError::NotFound(format!(
-                    "table {}/{}/{}",
+            if state.tables.get(&key) != Some(&dropped) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table changed while preparing drop: {}/{}/{}",
                     table_bucket,
                     namespace.public_name(),
                     table.as_str()
