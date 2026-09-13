@@ -54,6 +54,7 @@ pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{
     ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,
 };
+pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
 pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
 pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};

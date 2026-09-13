@@ -1,0 +1,58 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "accept-vectors",
+  "description": "Producer vectors for the negotiated inventory.environment@1 summary. The input names source observations used by the RustFS collector; output is the complete identifier-free payload allowed to leave the deployment.",
+  "schemaVersion": 1,
+  "capability": "inventory.environment@1",
+  "vectors": [
+    {
+      "name": "known two-node deployment",
+      "input": {
+        "persistedInventory": { "nodeCount": 2, "driveCount": 8 },
+        "sourceObservation": { "osFamily": "LINUX", "filesystemTypes": ["xfs"] }
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "output": { "nodeCount": 2, "driveCount": 8, "osFamily": "LINUX", "filesystemTypes": ["xfs"] }
+      }
+    },
+    {
+      "name": "secret-like filesystem observations are not exported",
+      "input": {
+        "persistedInventory": { "nodeCount": 2, "driveCount": 8 },
+        "sourceObservation": {
+          "osFamily": "LINUX",
+          "filesystemTypes": ["xfs"],
+          "mountPath": "/srv/synthetic-customer-a",
+          "mountOptions": "rw,password=SYNTHETIC_NOT_A_REAL_SECRET",
+          "deviceLabel": "synthetic-customer-volume",
+          "credential": "SYNTHETIC_NOT_A_REAL_CREDENTIAL"
+        }
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "discarded": ["credential", "deviceLabel", "mountOptions", "mountPath"],
+        "output": { "nodeCount": 2, "driveCount": 8, "osFamily": "LINUX", "filesystemTypes": ["xfs"] }
+      }
+    },
+    {
+      "name": "old schema is rejected before collection",
+      "input": { "schemaVersion": 0, "capability": "inventory.environment@1" },
+      "expected": { "decision": "REJECT", "producerError": "inventory_environment_unsupported_version" }
+    },
+    {
+      "name": "unknown capability is rejected before collection",
+      "input": { "schemaVersion": 1, "capability": "inventory.environment@2" },
+      "expected": { "decision": "REJECT", "producerError": "inventory_environment_unsupported_capability" }
+    },
+    {
+      "name": "missing filesystem source is not replaced with an empty success",
+      "input": {
+        "persistedInventory": { "nodeCount": 2, "driveCount": 8 },
+        "sourceObservation": { "osFamily": "LINUX", "filesystemTypes": [] }
+      },
+      "expected": { "decision": "UNSUPPORTED", "producerError": "inventory_environment_source_unavailable", "output": null }
+    }
+  ]
+}
