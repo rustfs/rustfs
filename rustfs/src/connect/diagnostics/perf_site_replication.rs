@@ -211,6 +211,7 @@ pub struct LocalSiteReplicationConsent {
 pub struct SiteReplicationPerformanceRequest {
     pub organization_name: String,
     pub cluster_name: String,
+    pub destination_cluster_name: String,
     pub device_name: String,
     pub run_uid: String,
     pub artifact_uid: String,
@@ -790,6 +791,10 @@ pub fn sign_site_replication_export(
         expires_at: timestamp(request.expires_at_unix)?,
         nonce: URL_SAFE_NO_PAD.encode_to_string(request.consent.nonce),
         device_key_id: &device_key_id,
+        targets: Targets {
+            source_deployment: &request.cluster_name,
+            destination_deployment: &request.destination_cluster_name,
+        },
         payload: Payload {
             path: RESULT_PATH,
             media_type: "application/json",
@@ -1149,7 +1154,15 @@ struct Envelope<'a> {
     expires_at: String,
     nonce: String,
     device_key_id: &'a str,
+    targets: Targets<'a>,
     payload: Payload<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Targets<'a> {
+    source_deployment: &'a str,
+    destination_deployment: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1361,6 +1374,11 @@ fn resource_names_match(request: &SiteReplicationPerformanceRequest) -> bool {
     let device_prefix = format!("{}/clusterDevices/", request.cluster_name);
     uuid7(organization_uid)
         && request.cluster_name.strip_prefix(&cluster_prefix).is_some_and(uuid7)
+        && request
+            .destination_cluster_name
+            .strip_prefix(&cluster_prefix)
+            .is_some_and(uuid7)
+        && request.destination_cluster_name != request.cluster_name
         && request.device_name.strip_prefix(&device_prefix).is_some_and(uuid7)
 }
 
@@ -1469,6 +1487,7 @@ mod tests {
         SiteReplicationPerformanceRequest {
             organization_name: organization.to_owned(),
             cluster_name: cluster.clone(),
+            destination_cluster_name: format!("{organization}/clusters/019e3ae0-0000-7000-8000-000000000016"),
             device_name: format!("{cluster}/clusterDevices/019e3ae0-0000-7000-8000-000000000012"),
             run_uid: "019e3ae0-0000-7000-8000-000000000013".to_owned(),
             artifact_uid: "019e3ae0-0000-7000-8000-000000000014".to_owned(),
@@ -1547,11 +1566,15 @@ mod tests {
             .expect("signed site replication export");
         let envelope = String::from_utf8(export.envelope_json.clone()).expect("envelope UTF-8");
         let result = String::from_utf8(export.result_json.clone()).expect("result UTF-8");
+        let envelope_value: serde_json::Value = serde_json::from_str(&envelope).expect("envelope JSON");
+        assert_eq!(envelope_value["targets"]["sourceDeployment"], request.cluster_name);
+        assert_eq!(envelope_value["targets"]["destinationDeployment"], request.destination_cluster_name);
         for secret in [
             "source.example",
             "destination.example",
             "connect-replication-scratch",
             "deployment-a",
+            "deployment-b",
         ] {
             assert!(!envelope.contains(secret), "envelope leaked {secret}");
             assert!(!result.contains(secret), "result leaked {secret}");
@@ -1578,6 +1601,25 @@ mod tests {
         ));
         invalid = request();
         invalid.source_deployment_id = invalid.destination_deployment_id.clone();
+        assert!(matches!(
+            measure_site_replication(&invalid, &probe, &CancellationToken::new()).await,
+            Err(SiteReplicationPerformanceError::InvalidRequest)
+        ));
+        invalid = request();
+        invalid.destination_cluster_name = invalid.cluster_name.clone();
+        assert!(matches!(
+            measure_site_replication(&invalid, &probe, &CancellationToken::new()).await,
+            Err(SiteReplicationPerformanceError::InvalidRequest)
+        ));
+        invalid = request();
+        invalid.destination_cluster_name = format!("{}/clusters/not-a-uuid", invalid.organization_name);
+        assert!(matches!(
+            measure_site_replication(&invalid, &probe, &CancellationToken::new()).await,
+            Err(SiteReplicationPerformanceError::InvalidRequest)
+        ));
+        invalid = request();
+        invalid.destination_cluster_name =
+            "organizations/019e3ae0-0000-7000-8000-000000000099/clusters/019e3ae0-0000-7000-8000-000000000016".to_owned();
         assert!(matches!(
             measure_site_replication(&invalid, &probe, &CancellationToken::new()).await,
             Err(SiteReplicationPerformanceError::InvalidRequest)

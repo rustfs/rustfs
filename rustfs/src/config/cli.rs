@@ -403,6 +403,9 @@ pub struct ConnectSiteReplicationPerformanceOpts {
     /// Cluster resource name bound to the export
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub cluster: String,
+    /// Destination cluster resource name bound to the signed target pair
+    #[arg(long = "destination-cluster", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_cluster: String,
     /// Cluster-device resource name bound to the export
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub device: String,
