@@ -34,7 +34,7 @@ use uuid::{Uuid, Variant, Version};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::connect::DeviceIdentity;
-use crate::storage::storage_api::ecstore_rpc::{NetworkPeerProbeClient, NetworkPeerProbeError as NativePeerProbeError};
+use crate::storage_api::cluster::network_probe::{NetworkPeerProbeClient, NetworkPeerProbeError as NativePeerProbeError};
 
 pub const NETWORK_SCHEMA_VERSION: u16 = 1;
 pub const NETWORK_TOOL_ID: &str = "performance.network";
