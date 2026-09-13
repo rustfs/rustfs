@@ -46,8 +46,26 @@ fn deep_heal_task(storage: &Arc<ECStoreHealStorage>, bucket: &str, object: &str,
     )
 }
 
-#[tokio::test]
-async fn deep_heal_rebuilds_truncated_xlmeta_with_authoritative_outcomes() {
+#[test]
+fn deep_heal_rebuilds_truncated_xlmeta_with_authoritative_outcomes() {
+    // Like the torn-minority regression, this real storage scenario composes
+    // deep async futures that exceed libtest's default Linux thread stack.
+    std::thread::Builder::new()
+        .name("deep-heal-truncated-xlmeta".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("deep heal test runtime should build");
+            runtime.block_on(deep_heal_truncated_xlmeta_scenario());
+        })
+        .expect("deep heal test thread should spawn")
+        .join()
+        .expect("deep heal test thread should finish");
+}
+
+async fn deep_heal_truncated_xlmeta_scenario() {
     let temp = tempfile::tempdir().expect("create caller-owned disks");
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .disk_count(16)
