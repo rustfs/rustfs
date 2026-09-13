@@ -126,6 +126,20 @@ pub(crate) mod access_consumer {
     };
 }
 
+/// The s3s names the RustFS Gateway bridge hands to the unchanged app layer
+/// (rustfs/backlog#1752), funneled here so the bridge stays off the direct s3s surface
+/// (`scripts/check_s3s_footprint.sh`).
+pub(crate) mod gateway_bridge_consumer {
+    pub(crate) use super::super::gateway_bridge::GatewayPipeline;
+    #[cfg(test)]
+    pub(crate) use s3s::S3ErrorCode;
+    pub(crate) use s3s::access::S3Access;
+    pub(crate) use s3s::auth::{Credentials, S3Auth};
+    pub(crate) use s3s::dto::GetBucketLocationInput;
+    pub(crate) use s3s::region::Region;
+    pub(crate) use s3s::{Body, HttpError, HttpResponse, S3, S3Error, S3Request};
+}
+
 pub(crate) mod concurrency_consumer {
     #[cfg(test)]
     pub(crate) use super::super::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;

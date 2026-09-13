@@ -275,6 +275,14 @@ impl RustFSServerBuilder {
         self
     }
 
+    /// Select the S3 HTTP stack (default: [`S3Stack::Legacy`](crate::config::S3Stack::Legacy)).
+    ///
+    /// The embedded server does not read `RUSTFS_S3_STACK`; this is its equivalent.
+    pub fn s3_stack(mut self, stack: crate::config::S3Stack) -> Self {
+        self.startup_args.set_s3_stack(stack);
+        self
+    }
+
     /// Add a data volume path.
     ///
     /// If no volumes are added, a temporary directory with a single drive is

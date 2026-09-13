@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{
+    config::S3Stack,
     server::ShutdownHandle,
     startup_lifecycle::{
         EmbeddedStartupGuard, embedded_endpoint_address, log_embedded_server_ready, publish_embedded_startup_ready,
@@ -37,6 +38,7 @@ pub(crate) struct EmbeddedStartupArgs {
     secret_key: String,
     volumes: Vec<String>,
     region: String,
+    s3_stack: S3Stack,
 }
 
 impl EmbeddedStartupArgs {
@@ -47,7 +49,12 @@ impl EmbeddedStartupArgs {
             secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
             volumes: Vec::new(),
             region: rustfs_config::RUSTFS_REGION.to_string(),
+            s3_stack: S3Stack::Legacy,
         }
+    }
+
+    pub(crate) fn set_s3_stack(&mut self, s3_stack: S3Stack) {
+        self.s3_stack = s3_stack;
     }
 
     pub(crate) fn set_address(&mut self, address: String) {
@@ -105,6 +112,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         secret_key,
         volumes,
         region,
+        s3_stack,
     } = args;
     // Build is allowed to fail before irreversible global initialization
     // (for example on temporary I/O or directory setup errors), and in that
@@ -125,12 +133,13 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         bootstrap_instance_ctx()
     };
     let EmbeddedStartupConfig {
-        config,
+        mut config,
         identity,
         temp_dir_guard,
     } = prepare_embedded_startup_config(address, access_key, secret_key, volumes, region)
         .await
         .map_err(init_error)?;
+    config.s3_stack = s3_stack;
 
     init_embedded_runtime_hooks(config.obs_endpoint.clone())
         .await

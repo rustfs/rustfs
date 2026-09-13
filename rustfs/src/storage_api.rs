@@ -169,6 +169,12 @@ pub(crate) mod server {
             pub(crate) type FS = crate::storage::storage_api::FS;
         }
 
+        pub(crate) mod gateway {
+            #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::gateway_bridge_consumer::Body;
+            pub(crate) use crate::storage::storage_api::gateway_bridge_consumer::{GatewayPipeline, HttpError, HttpResponse};
+        }
+
         pub(crate) mod metadata_route {
             pub(crate) fn with_metadata_route<A>(admin: A, host: Option<s3s::host::MultiDomain>) -> impl s3s::route::S3Route
             where
