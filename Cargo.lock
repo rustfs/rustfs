@@ -10571,7 +10571,6 @@ dependencies = [
  "rustfs-tls-runtime",
  "rustfs-utils",
  "rustls-pki-types",
- "s3s",
  "serde",
  "serde_json",
  "sha1 0.11.0",

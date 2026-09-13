@@ -67,6 +67,7 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
+use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
     put_object_body_read_timeout, reject_oversize_single_upload,
@@ -1263,7 +1264,7 @@ impl DefaultMultipartUsecase {
             let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
                 .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1274,7 +1275,7 @@ impl DefaultMultipartUsecase {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
 
-        if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
+        if let Err(err) = reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), size < 0) {
             return Err(ApiError::from(err).into());
         }
         opts.want_checksum = reader.checksum();

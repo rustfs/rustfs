@@ -119,6 +119,9 @@ pub use hardlimit_reader::HardLimitReader;
 mod hash_reader;
 pub use hash_reader::*;
 
+mod trailer;
+pub use trailer::{SharedTrailerSource, TrailerSource, TrailerValue};
+
 mod tee_reader;
 pub use tee_reader::{
     DEFAULT_TEE_MAX_DRAIN_BYTES, TeeDrainLimitExceeded, TeeOptions, TeePrimary, TeeSecondary, TeeStream, tee_reader,
