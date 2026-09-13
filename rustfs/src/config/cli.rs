@@ -1051,6 +1051,10 @@ pub enum ConnectLicenseCommands {
     Show(ConnectLicenseScopeOpts),
     /// Check Connect and install an operator-approved replacement license
     Renew(ConnectLicenseRenewOpts),
+    /// Verify a license and write its reviewed relay envelope (Unix only)
+    RelayExport(ConnectLicenseRelayExportOpts),
+    /// Re-verify and install a reviewed relay envelope, then sign a destination receipt (Unix only)
+    RelayImport(ConnectLicenseRelayImportOpts),
 }
 
 /// Online renewal transport plus local trust and scope pins.
@@ -1113,6 +1117,52 @@ pub struct ConnectLicenseArtifactOpts {
 
     #[command(flatten)]
     pub scope: ConnectLicenseScopeOpts,
+}
+
+/// A verified license artifact exported as an opaque relay envelope.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRelayExportOpts {
+    /// Downloaded signed license artifact to transfer unchanged
+    #[arg(long)]
+    pub artifact: PathBuf,
+
+    /// New owner-only relay envelope file
+    #[arg(long)]
+    pub envelope: PathBuf,
+
+    /// UUIDv7 identifying this exact relay attempt
+    #[arg(long = "transfer-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub transfer_uid: String,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
+
+    /// Confirm the verified issuer, destination, digest, expiry, and license scope were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
+}
+
+/// A cluster-side relay import with a pre-bound destination receipt key.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRelayImportOpts {
+    /// Owner-only service-license relay envelope
+    #[arg(long)]
+    pub envelope: PathBuf,
+
+    /// Owner-only Ed25519 seed for the pre-bound cluster receipt key
+    #[arg(long = "receipt-signing-key-file")]
+    pub receipt_signing_key_file: PathBuf,
+
+    /// SHA-256 key ID of the pre-bound cluster receipt key
+    #[arg(long = "receipt-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub receipt_key_id: String,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
+
+    /// Confirm the verified issuer, destination, digest, expiry, and license scope were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
 }
 
 /// Offline inspection subcommand options

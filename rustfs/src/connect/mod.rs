@@ -35,6 +35,7 @@ pub mod identity;
 pub mod identity_store;
 pub mod inventory;
 pub mod license;
+pub mod license_relay;
 pub mod license_renewal;
 pub mod offline;
 pub mod registration;
@@ -128,14 +129,18 @@ pub use license::{
     LICENSE_DOMAIN_SEPARATION_TAG, LicenseArtifactError, LicenseArtifactStatus, LicenseClaims, LicenseReport,
     LicenseVerificationContext, apply_license_artifact, inspect_installed_license, verify_license_artifact,
 };
+pub use license_relay::{
+    ServiceLicenseRelayError, ServiceLicenseRelayExport, ServiceLicenseRelayReceipt, export_service_license_relay,
+    receive_service_license_relay,
+};
 pub use license_renewal::{LicenseRenewalClient, LicenseRenewalError, LicenseRenewalOutcome};
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};
 pub use registration_bootstrap::{RegistrationBootstrapError, RegistrationBootstrapResult, register_from_protected_input};
 pub use relay::{
-    RelayDirection, RelayError, RelayHttpClient, RelayMaterialKind, RelayParty, RelayReceiptOutcome, RelayReceiptPayload,
-    RelayReview, TrustedReceiptSigner, prepare_approved_artifact, read_protected_relay_artifact,
-    read_protected_relay_authentication,
+    DestinationReceiptSigner, RelayDirection, RelayError, RelayHttpClient, RelayMaterialKind, RelayParty, RelayReceiptOutcome,
+    RelayReceiptPayload, RelayReview, TrustedReceiptSigner, decode_relay_envelope, prepare_approved_artifact,
+    read_protected_relay_artifact, read_protected_relay_authentication,
 };
 pub use report_upload::{MAX_SUPPORT_BUNDLE_BYTES, ReportUploadClient, ReportUploadError, ReportUploadReceipt};
 pub use runtime::{HeartbeatRuntime, InventoryRuntime, spawn_heartbeat_runtime, spawn_inventory_runtime};
