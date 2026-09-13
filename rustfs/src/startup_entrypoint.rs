@@ -17,7 +17,8 @@ use crate::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
         ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
         ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
+        ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -141,6 +142,9 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
+        CommandResult::ConnectSiteReplicationPerformance(options) => {
+            return execute_connect_site_replication_performance(options).await;
+        }
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
@@ -907,6 +911,167 @@ async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpt
     );
     println!("upload=not-performed");
     Ok(())
+}
+
+async fn execute_connect_site_replication_performance(options: ConnectSiteReplicationPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationEndpoint, SiteReplicationOutcome,
+        SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
+        read_protected_site_replication_credential, save_signed_site_replication_export, sign_site_replication_export,
+        validate_site_replication_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    let late_arrival_cleanup = Duration::from_millis(options.late_arrival_cleanup_millis);
+    validate_site_replication_limits(duration, options.traffic_bytes, late_arrival_cleanup).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect site-replication performance requires an enrolled device identity"))?;
+    let source_access_key = read_protected_site_replication_credential(&options.source_access_key_file).map_err(Error::other)?;
+    let source_secret_key = read_protected_site_replication_credential(&options.source_secret_key_file).map_err(Error::other)?;
+    let source_session_token = options
+        .source_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let destination_access_key =
+        read_protected_site_replication_credential(&options.destination_access_key_file).map_err(Error::other)?;
+    let destination_secret_key =
+        read_protected_site_replication_credential(&options.destination_secret_key_file).map_err(Error::other)?;
+    let destination_session_token = options
+        .destination_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let source_ca = read_optional_root_ca(options.source_ca_file.as_deref(), "source")?;
+    let destination_ca = read_optional_root_ca(options.destination_ca_file.as_deref(), "destination")?;
+    let source = SiteReplicationEndpoint::new(
+        options.source_alias.clone(),
+        options.source_deployment_id.clone(),
+        &options.source_endpoint,
+        source_ca.as_deref(),
+        source_access_key,
+        source_secret_key,
+        source_session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let destination = SiteReplicationEndpoint::new(
+        options.destination_alias.clone(),
+        options.destination_deployment_id.clone(),
+        &options.destination_endpoint,
+        destination_ca.as_deref(),
+        destination_access_key,
+        destination_secret_key,
+        destination_session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let probe = S3SiteReplicationProbe::new(source, destination);
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = SiteReplicationPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalSiteReplicationConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            nonce,
+            confirmed: options.acknowledge_l2,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        duration,
+        traffic_bytes: options.traffic_bytes,
+        source_alias: options.source_alias,
+        source_deployment_id: options.source_deployment_id,
+        destination_alias: options.destination_alias,
+        destination_deployment_id: options.destination_deployment_id,
+        scratch_bucket: options.scratch_bucket,
+        late_arrival_cleanup,
+        provenance: SiteReplicationProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_site_replication(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.siteReplication outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+
+    // Measurement cancellation has already completed bounded late-arrival
+    // cleanup. Preserve that terminal result in the signed offline artifact.
+    let writer_cancel = CancellationToken::new();
+    let export = sign_site_replication_export(&request, &measurement, &key, &writer_cancel).map_err(Error::other)?;
+    let output = options.output;
+    let save_cancel = writer_cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || save_signed_site_replication_export(&output, &export, &save_cancel))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    if measurement.result.outcome() != SiteReplicationOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "site-replication performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn read_optional_root_ca(path: Option<&std::path::Path>, label: &str) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::other(format!(
+            "connect site-replication {label} root CA exceeds the 1048576-byte limit"
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
