@@ -344,10 +344,20 @@ jobs:
               echo "Structured report generation failed before producing output (exit ${CASE_GATE_RC})."
             } > "${CASE_TABLE}"
           fi
-          CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
-          CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
-          CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
-          CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
+          # The tier case table carries a "## Case Summary" bullet list
+          # (Total/PASS/FAIL/...); parse the counts from there. Fall back to
+          # the case-ID table rows if the bullets are absent.
+          CASES_FAIL="$(grep -m1 -E '^- FAIL: [0-9]+' "${CASE_TABLE}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+          if [ -n "${CASES_FAIL}" ]; then
+            CASES_PASS="$(grep -m1 -E '^- PASS: [0-9]+' "${CASE_TABLE}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+            CASES_PASS=$(( ${CASES_PASS:-0} + 0 ))
+          else
+            CASES_TOTAL="$(grep -cE '^\| [A-Za-z0-9_.-]+ \| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
+            CASES_FAIL="$(grep -cE '^\| [A-Za-z0-9_.-]+ \| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
+            CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
+            CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
+          fi
+          CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
           {
             echo "# RustFS tier test report"
             echo ""
