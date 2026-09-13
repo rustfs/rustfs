@@ -679,7 +679,7 @@ impl HealTask {
                         if Self::is_dangling_delete_grace_error(&err) {
                             disposition = HealObjectDisposition::Deferred {
                                 reason: HealDeferredReason::DanglingDeleteGrace,
-                                retry_not_before: None,
+                                retry_not_before: err.dangling_delete_retry_not_before(),
                             };
                             telemetry_unknown |= !increment_counter(&mut skipped);
                             warn!(

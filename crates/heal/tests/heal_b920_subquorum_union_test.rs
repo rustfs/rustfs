@@ -577,3 +577,234 @@ mod serial_tests {
         );
     }
 }
+
+mod absence_receipt_regressions {
+    use super::*;
+    use rustfs_heal::heal::outcome::{HealDeferredReason, HealObjectDisposition};
+    use rustfs_heal::heal::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+    use storage_api::integration::{DiskAPI as _, DiskSetSelector, ObjectOperations as _, ReadOptions, StorageAdminApi as _};
+
+    const OBJECT: &str = "history.txt";
+    const CURRENT: &[u8] = b"retained-current-version";
+
+    async fn stale_history(bucket: &str) -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>, String, String) {
+        let (paths, store, storage) = heal_env_n(16).await;
+        create_versioned_bucket(&store, bucket).await;
+        let old = put_versioned(&store, bucket, OBJECT, b"stale-historical-version").await;
+        let current = put_versioned(&store, bucket, OBJECT, CURRENT).await;
+        let target = xl_meta_path(&object_dir(&paths[0], bucket, OBJECT));
+        let stale = std::fs::read(&target).expect("capture both versions before the historical delete");
+        store
+            .delete_object(
+                bucket,
+                OBJECT,
+                ObjectOptions {
+                    version_id: Some(old.clone()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete the exact historical version on every disk");
+        std::fs::write(&target, stale).expect("rejoin one disk retaining the deleted version");
+        let inventory = store
+            .disk_set_inventory(DiskSetSelector::new(0, 0))
+            .await
+            .expect("inspect actual disk inventory");
+        for (index, disk) in inventory.iter().enumerate() {
+            let old_meta = disk
+                .as_ref()
+                .expect("fixture disks must be online")
+                .read_version("", bucket, OBJECT, &old, &ReadOptions::default())
+                .await;
+            assert_eq!(old_meta.is_ok(), index == 0, "only the selected stale disk must retain the old version");
+        }
+        (paths, store, storage, old, current)
+    }
+
+    fn request(bucket: &str, old: &str) -> HealRequest {
+        HealRequest::new(
+            HealType::Object {
+                bucket: bucket.to_owned(),
+                object: OBJECT.to_owned(),
+                version_id: Some(old.to_owned()),
+            },
+            HealOptions {
+                scan_mode: HealScanMode::Deep,
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        )
+    }
+
+    async fn assert_versions(store: &Arc<ECStore>, bucket: &str, old: &str, current: &str) {
+        let inventory = store
+            .disk_set_inventory(DiskSetSelector::new(0, 0))
+            .await
+            .expect("inspect post-heal disks");
+        for disk in inventory.iter().flatten() {
+            assert!(
+                disk.read_version("", bucket, OBJECT, old, &ReadOptions::default())
+                    .await
+                    .is_err_and(|error| matches!(
+                        error,
+                        storage_api::integration::DiskError::FileNotFound
+                            | storage_api::integration::DiskError::FileVersionNotFound
+                    )),
+                "the exact old version must be absent on each physical disk"
+            );
+            let retained = disk
+                .read_version("", bucket, OBJECT, current, &ReadOptions::default())
+                .await
+                .expect("cleanup must retain the current version on every physical disk");
+            assert_eq!(retained.version_id.map(|id| id.to_string()).as_deref(), Some(current));
+            assert_eq!(
+                (retained.erasure.data_blocks, retained.erasure.parity_blocks),
+                (12, 4),
+                "C06 fixture must exercise the production EC12+4 geometry"
+            );
+        }
+        assert_eq!(read_version(store, bucket, OBJECT, current).await, CURRENT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn historical_absence_receipt_repairs_and_replays() {
+        let bucket = "absence-receipt-replay";
+        let (_paths, store, storage, old, current) = stale_history(bucket).await;
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(0),
+            ..deep_heal_opts()
+        };
+        let result = with_dangling_grace_disabled(storage.heal_object_with_receipt(bucket, OBJECT, Some(&old), &opts))
+            .await
+            .expect("historical cleanup should complete");
+        assert!(result.error.is_none(), "cleanup failed: {:?}", result.error);
+        let receipt = result
+            .receipt
+            .expect("committed cleanup must produce a receipt without all drives being OK");
+        assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+        assert_eq!(receipt.identity.bucket, bucket);
+        assert_eq!(receipt.identity.object, OBJECT);
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(old.as_str()));
+        assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
+        assert_eq!(
+            receipt.identity.bucket_incarnation_id,
+            Some(store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity"))
+        );
+        assert!(result.item.after.drives.iter().all(|drive| drive.state == "missing"));
+        assert_versions(&store, bucket, &old, &current).await;
+
+        // Reconstruct the task and storage facade as after a lost response or
+        // task restart. The on-disk absence supplies a new exact no-op proof.
+        let restarted = Arc::new(ECStoreHealStorage::new(store.clone()));
+        let task = HealTask::from_request(request(bucket, &old), restarted);
+        task.execute().await.expect("replayed exact-version heal should complete");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.counters.unchanged, 1);
+        assert_eq!(outcome.counters.healed, 0);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert_eq!(outcome.counters.failed, 0);
+        assert_eq!(outcome.objects.len(), 1);
+        assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::AuthoritativelyAbsent);
+        assert_versions(&store, bucket, &old, &current).await;
+    }
+
+    #[test]
+    #[serial]
+    fn historical_absence_receipt_bucket_outcome_matches_c06() {
+        // The real ECStore initialization and bucket traversal need the debug
+        // server's stack budget, which exceeds libtest's default on Linux.
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("absence-receipt-c06".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("C06 test runtime should build");
+
+                runtime.block_on(historical_absence_receipt_bucket_outcome_matches_c06_inner());
+            })
+            .expect("C06 test thread should spawn")
+            .join()
+            .expect("C06 test thread should finish");
+    }
+
+    async fn historical_absence_receipt_bucket_outcome_matches_c06_inner() {
+        let bucket = "absence-receipt-c06";
+        let (_paths, store, storage, old, current) = stale_history(bucket).await;
+        put_versioned(&store, bucket, "healthy.txt", b"already healthy").await;
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Bucket {
+                    bucket: bucket.to_owned(),
+                },
+                HealOptions {
+                    recursive: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage,
+        );
+        with_dangling_grace_disabled(task.execute())
+            .await
+            .expect("C06 bucket traversal should complete");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 3);
+        assert_eq!(outcome.counters.healed, 1, "completed cleanup must be repaired: {outcome:?}");
+        assert_eq!(outcome.counters.unchanged, 2);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert_eq!(outcome.counters.failed, 0);
+        assert_eq!(outcome.counters.skipped, 0);
+        assert_versions(&store, bucket, &old, &current).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn historical_absence_receipt_grace_and_dry_run_preserve_version() {
+        let bucket = "absence-receipt-grace";
+        let (paths, _store, storage, old, _current) = stale_history(bucket).await;
+        let target = xl_meta_path(&object_dir(&paths[0], bucket, OBJECT));
+        let before = std::fs::read(&target).expect("read pre-heal stale metadata");
+        let result = with_dangling_grace_disabled(storage.heal_object_with_receipt(
+            bucket,
+            OBJECT,
+            Some(&old),
+            &HealOpts {
+                dry_run: true,
+                ..deep_heal_opts()
+            },
+        ))
+        .await
+        .expect("dry run should return a result");
+        assert!(result.receipt.is_none(), "dry run cannot issue a cleanup receipt");
+        assert_eq!(std::fs::read(&target).expect("read dry-run metadata"), before);
+
+        let task = HealTask::from_request(request(bucket, &old), storage);
+        temp_env::async_with_vars([(GRACE_ENV, Some("3600"))], task.execute())
+            .await
+            .expect("grace should defer without failing execution");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.counters.healed, 0);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert!(
+            matches!(outcome.objects[0].disposition, HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::DanglingDeleteGrace, retry_not_before: Some(due),
+        } if due > std::time::SystemTime::now()),
+            "grace must expose its retry deadline: {:?}",
+            outcome.objects
+        );
+        assert_eq!(std::fs::read(&target).expect("read grace-protected metadata"), before);
+    }
+}
