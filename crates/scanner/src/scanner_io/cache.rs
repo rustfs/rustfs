@@ -321,6 +321,13 @@ impl ScannerPublicationExpectation {
     pub(crate) fn same_candidate(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
+        Self {
+            candidate: Arc::new((candidate_digest, coverage_digest)),
+        }
+    }
 }
 
 pub(super) struct ValidatedUsageCandidate {
