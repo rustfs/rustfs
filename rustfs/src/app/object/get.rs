@@ -3703,6 +3703,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            content_language: info.user_defined.get("content-language").cloned(),
             cache_control,
             content_disposition,
             content_range,
@@ -10568,77 +10569,101 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        let mut metadata = HashMap::new();
-        metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
-        metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+        for (content_language, user_language) in [
+            (Some("zh-CN"), None),
+            (None, None),
+            (Some(""), None),
+            (Some("zh-CN"), Some("fr-FR")),
+            (None, Some("fr-FR")),
+        ] {
+            let mut metadata = HashMap::new();
+            metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
+            metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+            if let Some(language) = content_language {
+                metadata.insert("content-language".to_string(), language.to_string());
+            }
+            if let Some(language) = user_language {
+                metadata.insert("x-amz-meta-content-language".to_string(), language.to_string());
+            }
 
-        let info = ObjectInfo {
-            bucket: "test-bucket".to_string(),
-            name: "path/raw".to_string(),
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
+            let info = ObjectInfo {
+                bucket: "test-bucket".to_string(),
+                name: "path/raw".to_string(),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
 
-        let input = GetObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("path/raw".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultObjectUsecase::without_context();
-        let queue_status = concurrency::IoQueueStatus::default();
+            let input = GetObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("path/raw".to_string())
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::GET);
+            let usecase = DefaultObjectUsecase::without_context();
+            let queue_status = concurrency::IoQueueStatus::default();
 
-        let context = usecase
-            .build_get_object_output_context(
-                &req,
-                get_concurrency_manager(),
-                "test-bucket",
-                "path/raw",
-                info.clone(),
-                Some(info),
-                wrap_reader(tokio::io::empty()),
-                Some(Bytes::new()),
-                false,
-                false,
-                true,
-                None,
-                None,
-                None,
-                0,
-                None,
-                "req-output-content-disposition",
-                None,
-                None,
-                None,
-                None,
-                false,
-                Duration::ZERO,
-                0.0,
-                &queue_status,
-                1,
-                None,
-                GetObjectBodyLifecycle::disabled(),
-                |_| panic!("a buffered output must not initialize streaming resume state"),
-            )
-            .await
-            .expect("get object output context");
+            let context = usecase
+                .build_get_object_output_context(
+                    &req,
+                    get_concurrency_manager(),
+                    "test-bucket",
+                    "path/raw",
+                    info.clone(),
+                    Some(info),
+                    wrap_reader(tokio::io::empty()),
+                    Some(Bytes::new()),
+                    false,
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    "req-output-content-disposition",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Duration::ZERO,
+                    0.0,
+                    &queue_status,
+                    1,
+                    None,
+                    GetObjectBodyLifecycle::disabled(),
+                    |_| panic!("a buffered output must not initialize streaming resume state"),
+                )
+                .await
+                .expect("get object output context");
 
-        assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
-        assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("cache-control"))
-        );
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("content-disposition"))
-        );
+            assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
+            assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+            assert_eq!(context.output.content_language.as_deref(), content_language);
+            assert_eq!(
+                context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("content-language"))
+                    .map(String::as_str),
+                user_language,
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("cache-control"))
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("content-disposition"))
+            );
+        }
     }
 
     #[tokio::test]
