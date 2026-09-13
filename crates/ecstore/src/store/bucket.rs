@@ -364,6 +364,19 @@ impl ECStore {
         Ok(pieces.into_guard(bucket, registration.token))
     }
 
+    /// Hold this guard through recursive-delete authorization and mutation so
+    /// writers cannot introduce an unchecked object into the deletion scope.
+    pub async fn lock_bucket_for_recursive_delete(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                String::new(),
+                "Recursive deletion requires namespace locking".to_owned(),
+            ));
+        }
+        self.acquire_bucket_lifecycle_write_lock(bucket).await
+    }
+
     pub(crate) async fn acquire_bucket_lifecycle_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
         let lock = self.new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT).await?;
         lock.get_write_lock(get_lock_acquire_timeout())
