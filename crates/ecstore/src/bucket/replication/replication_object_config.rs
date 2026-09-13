@@ -14,8 +14,8 @@
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
+use super::replication_filemeta_boundary::metadata_keys;
 use crate::bucket::metadata::BucketMetadata;
-use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -332,7 +332,7 @@ impl ReplicationConfig {
         }
 
         let mut user_defined = (*oi.user_defined).clone();
-        user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
+        user_defined.remove(metadata_keys::REPLICATION_STATUS);
 
         let dsc = must_replicate(
             oi.bucket.as_str(),

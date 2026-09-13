@@ -145,7 +145,7 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
     let restore_status = parse_restore_obj_status(
         restored_info
             .user_defined
-            .get(s3s::header::X_AMZ_RESTORE.as_str())
+            .get(rustfs_filemeta::metadata_keys::RESTORE)
             .expect("completed restore header should be present"),
     )
     .expect("completed restore header should parse");

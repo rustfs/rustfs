@@ -1562,8 +1562,7 @@ impl ObjectInfo {
             .user_defined
             .iter()
             .filter(|(key, _)| {
-                !rustfs_utils::http::is_internal_key(key)
-                    && !key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS)
+                !rustfs_utils::http::is_internal_key(key) && !key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS)
             })
             .collect::<Vec<_>>();
         user_metadata.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
@@ -1783,7 +1782,7 @@ impl ObjectInfo {
 
         let mut replication_status = replication_status_from_filemeta(fi.replication_status());
         if replication_status.is_empty()
-            && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS).cloned()
+            && let Some(status) = fi.metadata.get(metadata_keys::REPLICATION_STATUS).cloned()
             && status == ReplicationStatusType::Replica.as_str()
         {
             replication_status = ReplicationStatusType::Replica;
@@ -1811,7 +1810,7 @@ impl ObjectInfo {
 
         let storage_class = Some(
             storageclass::effective_class(
-                fi.metadata.get(AMZ_STORAGE_CLASS).map(String::as_str),
+                fi.metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
                 (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
                     .then_some(fi.transition_tier.as_str()),
             )
@@ -1820,7 +1819,7 @@ impl ObjectInfo {
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
-        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned()
+        if let Some(restore_status) = fi.metadata.get(metadata_keys::RESTORE).cloned()
             && let Ok(restore_status) = parse_restore_obj_status(&restore_status)
         {
             restore_ongoing = restore_status.on_going();
@@ -2725,7 +2724,7 @@ mod tests {
             storageclass::GLACIER,
         ] {
             let fi = FileInfo {
-                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), legacy_label.to_string())]),
                 ..Default::default()
             };
 
@@ -2742,7 +2741,7 @@ mod tests {
     #[test]
     fn from_file_info_preserves_transitioned_tier_storage_class() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             transition_status: TRANSITION_COMPLETE.to_string(),
             ..Default::default()
@@ -2757,7 +2756,7 @@ mod tests {
     #[test]
     fn from_file_info_ignores_a_tier_name_without_a_completed_transition() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: HashMap::from([(metadata_keys::STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             ..Default::default()
         };
