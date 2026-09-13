@@ -32,6 +32,18 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
+/// Encode the resolved local read identity. Storage distinguishes a null
+/// version from an unversioned object by returning a nil UUID instead of None.
+pub(super) fn read_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+    version_id.map(|id| {
+        if id.is_nil() {
+            NULL_VERSION_ID.to_owned()
+        } else {
+            id.to_string()
+        }
+    })
+}
+
 fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
     let code = if version_id.is_some() {
         S3ErrorCode::MethodNotAllowed
