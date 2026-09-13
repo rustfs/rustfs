@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod inspect;
 mod logs;
 mod perf_client;
 mod perf_drive;
@@ -31,6 +32,11 @@ mod trace_otlp;
 mod trace_record;
 mod trace_replay;
 
+pub use inspect::{
+    INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
+    InspectOutcome, InspectProvenance, InspectReason, InspectReasonCode, InspectRequest, InspectRule, InspectRuleOutcome,
+    InspectRun, Reconstruction, SavedInspectExport, SignedInspectExport, export_inspect_summary, save_signed_inspect_export,
+};
 pub use logs::{
     CaptureMode, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent, LogCaptureError, LogCaptureRequest, LogProvenance,
     SavedLogExport, SignedLogExport, export_logs, save_signed_log_export,
