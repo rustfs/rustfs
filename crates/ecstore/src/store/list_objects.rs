@@ -7330,6 +7330,36 @@ mod test {
         }
     }
 
+    fn test_null_version_meta_entry(name: &str, mod_time: time::OffsetDateTime) -> MetaCacheEntry {
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(Uuid::from_u128(0x5678));
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.version_id = None;
+        fi.versioned = false;
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), "null-etag".to_string());
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test metadata should accept null object version");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
     #[test]
     fn fallback_entries_for_object_filters_claimed_physical_disks() {
         let mut entries = FallbackListingEntries::new();
@@ -7738,7 +7768,7 @@ mod test {
                 };
                 let entry = match kind {
                     "deletes" => test_delete_marker_meta_entry(&name, mod_time),
-                    "null" => test_object_meta_entry(&name),
+                    "null" => test_null_version_meta_entry(&name, mod_time),
                     "mixed" => test_object_with_delete_marker_meta_entry(&name, mod_time, mod_time + time::Duration::SECOND),
                     _ => test_object_meta_entry_with_erasure_versions(&name, &[(mod_time, "etag", 2, 2)]),
                 };
