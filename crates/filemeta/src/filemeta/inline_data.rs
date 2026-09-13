@@ -144,7 +144,6 @@ impl FileMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::header::X_AMZ_RESTORE;
     use time::format_description::well_known::Rfc3339;
     use time::{Duration, OffsetDateTime};
 
@@ -170,7 +169,7 @@ mod tests {
             data_dir,
             HashMap::from([
                 ("etag".to_string(), format!("etag-{version_id}")),
-                (X_AMZ_RESTORE.as_str().to_string(), restore_header),
+                (metadata_keys::RESTORE.to_string(), restore_header),
             ]),
         )
     }
