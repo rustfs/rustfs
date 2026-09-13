@@ -282,6 +282,7 @@ fn config_with_stores(
             initial_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(80),
         },
+        proxy: None,
     }
 }
 

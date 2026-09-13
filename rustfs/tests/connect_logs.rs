@@ -91,6 +91,10 @@ fn source(contents: &str) -> (tempfile::TempDir, ConfiguredLogSource) {
     (directory, source)
 }
 
+fn fixture() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/connect-logs-v1.json")).expect("logs fixture JSON")
+}
+
 fn archive_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
     let mut entry = archive.by_name(name).expect("archive entry");
     let mut bytes = Vec::new();
@@ -172,6 +176,56 @@ async fn batch_capture_exports_only_allow_listed_fields_in_a_signed_artifact() {
     public
         .verify(&input, &signature_value)
         .expect("signature over exact envelope bytes");
+}
+
+#[tokio::test]
+async fn protocol_fixture_projects_sensitive_source_fields_to_the_closed_event_shape() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let mut request = request(CaptureMode::Batch);
+    request.duration = Duration::from_secs(2);
+    let timestamp = timestamp(request.produced_at_unix - 1, 0);
+    let source_lines = fixture["sourceEvents"]
+        .as_array()
+        .expect("sourceEvents array")
+        .iter()
+        .map(|event| {
+            let mut event = event.clone();
+            event["timestamp"] = timestamp.clone().into();
+            serde_json::to_string(&event).expect("source event JSON")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_directory, source) = source(&source_lines);
+    let key = connect::DeviceIdentity::generate();
+    let export = export_logs_from(&request, &key, &CancellationToken::new(), &source)
+        .await
+        .expect("signed logs export");
+    assert_eq!(
+        export.event_count,
+        fixture["expectedEventCount"].as_u64().expect("expectedEventCount") as usize
+    );
+    assert_eq!(
+        export.dropped_event_count,
+        fixture["expectedDroppedEventCount"]
+            .as_u64()
+            .expect("expectedDroppedEventCount")
+    );
+
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes)).expect("logs archive");
+    let result_bytes = archive_entry(&mut archive, "result.json");
+    let result: serde_json::Value = serde_json::from_slice(&result_bytes).expect("result JSON");
+    assert_eq!(result["data"]["events"][0]["eventId"], "DRIVE_UNAVAILABLE");
+    assert_eq!(result["data"]["events"][1]["eventId"], "REQUEST_FAILED");
+    assert_eq!(result["data"]["events"][2]["eventId"], "SERVICE_STARTED");
+    let encoded = String::from_utf8(result_bytes).expect("UTF-8 result");
+    for forbidden in fixture["forbiddenExportFragments"]
+        .as_array()
+        .expect("forbiddenExportFragments array")
+    {
+        let forbidden = forbidden.as_str().expect("forbidden fragment");
+        assert!(!encoded.contains(forbidden), "result leaked forbidden material: {forbidden}");
+    }
 }
 
 #[tokio::test]

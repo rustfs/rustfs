@@ -42,7 +42,10 @@ pub mod runtime;
 mod telemetry;
 
 pub use client::{ClientError, ConnectClient, ConnectConfig};
-pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
+pub use config::{
+    ENV_CONNECT_PROXY_BYPASS, ENV_CONNECT_PROXY_PASSWORD_FILE, ENV_CONNECT_PROXY_URL, ENV_CONNECT_PROXY_USERNAME_FILE,
+    HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule, ProxyConfig, ProxyConfigError,
+};
 pub use credential_store::{CredentialStore, DeviceCredential};
 pub use diagnostics::{
     CLIENT_CAPABILITY, CLIENT_SCHEMA_VERSION, CPU_PROFILE_CAPABILITY, CaptureMode, ClientDiagnosticResult, ClientMeasurement,

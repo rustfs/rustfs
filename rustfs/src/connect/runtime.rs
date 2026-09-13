@@ -127,6 +127,7 @@ where
         endpoint: &config.endpoint,
         root_ca_pem: &config.root_ca_pem,
         timeout: config.schedule.timeout,
+        proxy: config.proxy.as_ref(),
     })
     .map_err(rotation_failure)?;
     let identity_store = config.identity_store.clone();
@@ -417,6 +418,10 @@ fn rotation_failure(error: ClientError) -> HeartbeatError {
     match error {
         ClientError::Endpoint => HeartbeatError::Endpoint,
         ClientError::RootCertificate => HeartbeatError::RootCertificate,
+        ClientError::ProxyConfiguration(_) => HeartbeatError::ProxyConfiguration,
+        ClientError::ProxyAuthentication => HeartbeatError::ProxyAuthentication,
+        ClientError::ProxyRejected => HeartbeatError::ProxyRejected,
+        ClientError::TlsPeer => HeartbeatError::TlsPeer,
         ClientError::NotRegistered => HeartbeatError::NotRegistered,
         ClientError::IdentityMissing => HeartbeatError::IdentityMissing,
         ClientError::CredentialExpired | ClientError::CredentialNotYetValid => HeartbeatError::CredentialExpired,
@@ -441,6 +446,10 @@ pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
     match error {
         HeartbeatError::Endpoint => "connect_heartbeat_endpoint",
         HeartbeatError::RootCertificate => "connect_heartbeat_root_certificate",
+        HeartbeatError::ProxyConfiguration => "connect_heartbeat_proxy_configuration",
+        HeartbeatError::ProxyAuthentication => "connect_heartbeat_proxy_authentication",
+        HeartbeatError::ProxyRejected => "connect_heartbeat_proxy_rejected",
+        HeartbeatError::TlsPeer => "connect_heartbeat_tls_peer",
         HeartbeatError::Schedule => "connect_heartbeat_schedule",
         HeartbeatError::NotRegistered => "connect_heartbeat_not_registered",
         HeartbeatError::IdentityMissing => "connect_heartbeat_identity_missing",
