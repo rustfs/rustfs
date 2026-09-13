@@ -3417,6 +3417,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let protect_write = opts.shard_integrity_write_enabled();
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
@@ -3688,7 +3689,7 @@ impl SetDisks {
                 SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
             let (reader, w_size, inline_shards, integrity) = Arc::clone(&erasure)
-                .encode_protected(stream, &mut writers, write_quorum, 1, mode)
+                .encode_with_shard_integrity(stream, &mut writers, write_quorum, 1, mode, protect_write)
                 .await?;
             let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
             let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
@@ -3791,18 +3792,22 @@ impl SetDisks {
                 )));
             }
 
-            let part_integrity = if is_inline_buffer {
-                integrity.set_inline_metadata(&mut fi)?;
-                integrity.part.clone()
+            let part_integrity = if let Some(integrity) = integrity {
+                Some(if is_inline_buffer {
+                    integrity.set_inline_metadata(&mut fi)?;
+                    integrity.part.clone()
+                } else {
+                    integrity
+                        .write(
+                            &mut shuffle_disks,
+                            bucket,
+                            RUSTFS_META_TMP_BUCKET,
+                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
+                        )
+                        .await?
+                })
             } else {
-                integrity
-                    .write(
-                        &mut shuffle_disks,
-                        bucket,
-                        RUSTFS_META_TMP_BUCKET,
-                        &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
-                    )
-                    .await?
+                None
             };
             if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
                 return Err(Error::ErasureWriteQuorum);
@@ -3828,7 +3833,7 @@ impl SetDisks {
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
             fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
-            fi.parts[0].integrity = Some(part_integrity);
+            fi.parts[0].integrity = part_integrity;
             fi.persist_shard_integrity()?;
             if opts.data_movement {
                 fi.set_data_moved();
@@ -7444,7 +7449,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Self-copy with a data reader: write tier data back locally (de-tiering).
             // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
             if let Some(mut put_reader) = src_info.put_object_reader.take() {
-                return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+                let mut put_opts = dst_opts.clone();
+                put_opts.inherit_shard_integrity(src_info);
+                return self.put_object(dst_bucket, dst_object, &mut put_reader, &put_opts).await;
             }
             // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
             // path so the caller gets a disk/quorum error rather than NotImplemented.

@@ -24,3 +24,6 @@ procedure is required.
 
 For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
 drive ownership, snapshot freshness, counter queries, and rolling upgrades.
+
+For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
+activation, legacy repair results, multipart mode changes, and rollback limits.

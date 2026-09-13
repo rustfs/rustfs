@@ -522,52 +522,61 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
-    pub(crate) async fn encode_protected<R>(
+    pub(crate) async fn encode_with_shard_integrity<R>(
         self: Arc<Self>,
         reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
         part_number: usize,
         mode: IntegrityEncodeMode,
-    ) -> std::io::Result<(R, usize, Option<Vec<Bytes>>, PreparedIntegrity)>
+        protected: bool,
+    ) -> std::io::Result<(R, usize, Option<Vec<Bytes>>, Option<PreparedIntegrity>)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(
-            self.data_shards,
-            self.parity_shards,
-            self.block_size,
-            self.uses_legacy_codec(),
-        )
-        .map_err(std::io::Error::other)?;
-        let mut integrity = IntegrityBuilder::new(layout, part_number)?;
+        let mut integrity = if protected {
+            let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(
+                self.data_shards,
+                self.parity_shards,
+                self.block_size,
+                self.uses_legacy_codec(),
+            )
+            .map_err(std::io::Error::other)?;
+            Some(IntegrityBuilder::new(layout, part_number)?)
+        } else {
+            None
+        };
         let (reader, size, inline) = match mode {
             IntegrityEncodeMode::Inline(hint) => {
                 let (reader, size, shards) = self
-                    .encode_inline_shards_with_integrity(reader, hint, Some(&mut integrity))
+                    .encode_inline_shards_with_integrity(reader, hint, integrity.as_mut())
                     .await?;
                 (reader, size, Some(shards))
             }
             IntegrityEncodeMode::SingleBlock(hint) => {
                 let (reader, size) = self
-                    .encode_small_direct(reader, writers, quorum, true, hint, Some(&mut integrity))
+                    .encode_small_direct(reader, writers, quorum, true, hint, integrity.as_mut())
                     .await?;
                 (reader, size, None)
             }
             IntegrityEncodeMode::Streaming => {
                 let (reader, size) = self
-                    .encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest(), Some(&mut integrity))
+                    .encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest(), integrity.as_mut())
                     .await?;
                 (reader, size, None)
             }
             IntegrityEncodeMode::Batched => {
                 let (reader, size) = self
-                    .encode_batched_with_integrity(reader, writers, quorum, Some(&mut integrity))
+                    .encode_batched_with_integrity(reader, writers, quorum, integrity.as_mut())
                     .await?;
                 (reader, size, None)
             }
         };
-        Ok((reader, size, inline, integrity.finish(size).await?))
+        let integrity = match integrity {
+            Some(integrity) => Some(integrity.finish(size).await?),
+            None => None,
+        };
+        Ok((reader, size, inline, integrity))
     }
 
     async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(EncodedBlock, Vec<u8>)> {

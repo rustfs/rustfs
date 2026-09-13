@@ -145,6 +145,16 @@ impl Error {
         }
     }
 
+    pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
+        let after = match self {
+            Self::Storage(error) => error.dangling_delete_retry_after(),
+            Self::Disk(error) => error.dangling_delete_retry_after(),
+            Self::Io(error) => DiskError::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }?;
+        std::time::SystemTime::now().checked_add(after)
+    }
+
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
         match self {
             Error::Storage(err) => err.is_dangling_delete_grace(),

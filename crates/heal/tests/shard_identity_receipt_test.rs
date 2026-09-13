@@ -21,9 +21,76 @@ use rustfs_heal::heal::{
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_test_utils::TestECStoreEnv;
 use serial_test::serial;
+use tokio::io::AsyncReadExt as _;
 
 mod storage_api;
-use storage_api::integration::{DiskAPI, ObjectIO, ObjectOptions, PutObjReader, ReadOptions};
+use storage_api::integration::{DiskAPI, ObjectIO, ObjectOptions, PutObjReader, ReadOptions, ShardIntegrityWriteMode};
+
+#[tokio::test]
+#[serial]
+async fn legacy_repair_reports_execution_without_strong_receipt() {
+    let root = tempfile::tempdir().expect("legacy receipt fixture");
+    let env = TestECStoreEnv::builder()
+        .base_dir(root.path())
+        .prefix("legacy_receipt")
+        .build()
+        .await;
+    let bucket = "legacy-receipt";
+    let object = "missing-shard";
+    env.make_bucket(bucket, false).await;
+    let expected = vec![0x5c; 1024 * 1024 + 37];
+    env.ecstore
+        .put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected.clone()),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy object");
+    let set = env.ecstore.pools[0].get_disks(0);
+    let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+    let meta = disks[0]
+        .read_version("", bucket, object, "", &ReadOptions::default())
+        .await
+        .expect("metadata");
+    tokio::fs::remove_file(
+        env.disk_paths[0]
+            .join(bucket)
+            .join(object)
+            .join(meta.data_dir.expect("external directory").to_string())
+            .join("part.1"),
+    )
+    .await
+    .expect("remove one shard");
+    let result = ECStoreHealStorage::new(env.ecstore.clone())
+        .heal_object_with_receipt(
+            bucket,
+            object,
+            None,
+            &HealOpts {
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy repair");
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.item.drives_healed(), Some(1));
+    assert!(!result.item.integrity_verified);
+    assert!(result.receipt.is_none(), "physical repair does not prove original identity");
+    let mut reader = env
+        .ecstore
+        .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+        .await
+        .expect("read repaired object");
+    let mut actual = Vec::new();
+    reader.stream.read_to_end(&mut actual).await.expect("exact recovered body");
+    assert_eq!(actual, expected);
+}
 
 #[tokio::test]
 #[serial]
@@ -49,6 +116,7 @@ async fn receipt_requires_independent_deep_verification() {
                     name,
                     &mut PutObjReader::from_vec(vec![byte; 1024 * 1024 + 123]),
                     &ObjectOptions {
+                        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
                         no_lock: true,
                         ..Default::default()
                     },

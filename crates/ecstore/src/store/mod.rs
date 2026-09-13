@@ -419,6 +419,7 @@ mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
 mod heal;
+pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
 mod init;

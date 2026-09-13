@@ -10754,6 +10754,7 @@ dependencies = [
  "rustfs-s3-types",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
+ "rustfs-test-utils",
  "rustfs-utils",
  "s3s",
  "serde",

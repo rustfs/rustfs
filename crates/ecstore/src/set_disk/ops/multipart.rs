@@ -1631,30 +1631,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             if rustfs_utils::http::contains_key_str(&fi.metadata, upload_suffix) && !protected_upload {
                 return Err(DiskError::FileCorrupt.into());
             }
-            let (reader, w_size, integrity) = if protected_upload {
-                use crate::erasure::coding::encode::IntegrityEncodeMode;
-                let mode = match write_path {
-                    SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
-                    SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
-                    SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
-                };
-                let (reader, size, _, integrity) = Arc::clone(&erasure).encode_protected(stream, &mut writers, write_quorum, part_id, mode).await?;
-                (reader, size, Some(integrity))
-            } else {
-                let (reader, w_size) = match write_path {
-                SmallWritePath::SingleBlockNonInline => {
-                    Arc::clone(&erasure)
-                        .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
-                        .await?
-                }
-                SmallWritePath::PipelineBatchedLarge => {
-                    Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await?
-                }
-                SmallWritePath::Inline | SmallWritePath::Pipeline => Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await?,
+            use crate::erasure::coding::encode::IntegrityEncodeMode;
+            let mode = match write_path {
+                SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
-
-                (reader, w_size, None)
-            };
+            let (reader, w_size, _, integrity) = Arc::clone(&erasure)
+                .encode_with_shard_integrity(stream, &mut writers, write_quorum, part_id, mode, protected_upload)
+                .await?;
 
             if let Some(stage_start) = encode_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -2091,6 +2076,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         crate::hp_guard!("SetDisks::new_multipart_upload");
+        let protect_upload = opts.shard_integrity_write_enabled();
         let storage_class_config = self.storage_class_config_snapshot();
         let mut _object_lock_guard = None;
 
@@ -2113,11 +2099,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let mut user_defined = opts.user_defined.clone();
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
-        rustfs_utils::http::insert_str(
-            &mut user_defined,
-            rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY,
-            "1".to_owned(),
-        );
+        if protect_upload {
+            rustfs_utils::http::insert_str(
+                &mut user_defined,
+                rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY,
+                "1".to_owned(),
+            );
+        }
         rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
         if !opts.data_movement {
             rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD);

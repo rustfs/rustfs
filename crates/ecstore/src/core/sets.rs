@@ -785,6 +785,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
 
         let put_opts = ObjectOptions {
             user_defined: dst_opts.user_defined.clone(),
+            shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
@@ -1473,6 +1474,28 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
         ctx,
     });
     (temp_dirs, sets)
+}
+
+impl Sets {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
+        let mut absence = None;
+        let (item, error) = self
+            .get_disks_for_heal_object(object, opts)?
+            .heal_object_with_absence(bucket, object, version_id, opts, &mut absence)
+            .await?;
+        // A caller-owned lock does not expose its lease to this boundary.
+        // Keep cleanup unverified when that lease cannot be checked here.
+        if opts.no_lock {
+            absence = None;
+        }
+        Ok((item, error, absence))
+    }
 }
 
 #[cfg(test)]
