@@ -434,14 +434,14 @@ impl S3SiteReplicationProbe {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<SiteReplicationProbeMeasurement, SiteReplicationProbeError> {
-        let object_url = object_url(&self.source.endpoint, &request.scratch_bucket, key, None)?;
+        let source_url = object_url(&self.source.endpoint, &request.scratch_bucket, key, None)?;
         let replication_started = Instant::now();
         // Do not cancel an in-flight PUT: a cancelled request may still commit at
         // the server. Waiting for its bounded response preserves the version ID;
         // the fallback version listing in cleanup also covers a lost response.
         let response = self
             .source
-            .send(Method::PUT, object_url, payload.clone(), deadline, None)
+            .send(Method::PUT, source_url, payload.clone(), deadline, None)
             .await?;
         if !response.status().is_success() {
             return status_error(response.status());
