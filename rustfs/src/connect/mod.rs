@@ -39,6 +39,7 @@ pub mod license_renewal;
 pub mod offline;
 pub mod registration;
 pub mod registration_bootstrap;
+pub mod relay;
 pub mod runtime;
 mod telemetry;
 
@@ -130,4 +131,9 @@ pub use license_renewal::{LicenseRenewalClient, LicenseRenewalError, LicenseRene
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};
 pub use registration_bootstrap::{RegistrationBootstrapError, RegistrationBootstrapResult, register_from_protected_input};
+pub use relay::{
+    RelayDirection, RelayError, RelayHttpClient, RelayMaterialKind, RelayParty, RelayReceiptOutcome, RelayReceiptPayload,
+    RelayReview, TrustedReceiptSigner, prepare_approved_artifact, read_protected_relay_artifact,
+    read_protected_relay_authentication,
+};
 pub use runtime::{HeartbeatRuntime, InventoryRuntime, spawn_heartbeat_runtime, spawn_inventory_runtime};

@@ -127,6 +127,8 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Deliver a reviewed signed artifact through the customer relay (Unix only)
+    Relay(Box<ConnectRelayOpts>),
     /// Read the persisted deployment inventory and collect an approved environment summary
     Inventory(ConnectInventoryOpts),
     /// Run an explicitly approved, bounded local performance measurement
@@ -139,6 +141,61 @@ pub enum ConnectCommands {
     Telemetry(ConnectTelemetryOpts),
     /// Capture a consent-bound local top snapshot
     Top(ConnectTopOpts),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectRelayMaterialKind {
+    OfflineEnrollmentResponse,
+    DiagnosticBundleManifest,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectRelayOpts {
+    /// HTTPS Connect control API base ending in /api/
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+    /// Owner-only file containing the browser Cookie header value
+    #[arg(long = "session-cookie-file")]
+    pub session_cookie_file: PathBuf,
+    /// Owner-only file containing the browser X-XSRF-TOKEN header value
+    #[arg(long = "csrf-token-file")]
+    pub csrf_token_file: PathBuf,
+    /// Organization UUIDv7 used by the approved Connect tenant
+    #[arg(long = "organization-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub organization_uid: String,
+    /// Approval resource UID returned after customer review in Connect
+    #[arg(long = "approval-reference", value_parser = NonEmptyStringValueParser::new())]
+    pub approval_reference: String,
+    /// UUIDv7 identifying this exact relay attempt
+    #[arg(long = "transfer-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub transfer_uid: String,
+    /// Allow-listed signed artifact type accepted by the Connect receiver
+    #[arg(long = "material-kind", value_enum)]
+    pub material_kind: ConnectRelayMaterialKind,
+    /// Owner-only signed artifact wrapper to transfer unchanged
+    #[arg(long)]
+    pub artifact: PathBuf,
+    /// Device or candidate-device resource name shown during review
+    #[arg(long = "producer-name", value_parser = NonEmptyStringValueParser::new())]
+    pub producer_name: String,
+    /// SHA-256 key ID of the device that signed the artifact
+    #[arg(long = "producer-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub producer_key_id: String,
+    /// Owner-only file containing the pinned receipt public key
+    #[arg(long = "receipt-public-key-file")]
+    pub receipt_public_key_file: PathBuf,
+    /// SHA-256 key ID of the pinned Connect receipt key
+    #[arg(long = "receipt-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub receipt_key_id: String,
+    /// Bounded HTTPS request timeout
+    #[arg(long = "timeout-seconds", default_value_t = 30)]
+    pub timeout_seconds: u64,
+    /// Confirm the artifact, producer, destination, digest and classification were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
 }
 
 #[derive(Args, Clone)]
@@ -1316,6 +1373,8 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Customer-operated relay of one reviewed signed artifact
+    ConnectRelay(Box<ConnectRelayOpts>),
     /// Explicit local Connect environment inventory command
     ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
@@ -1374,8 +1433,8 @@ pub fn default_server_opts() -> ServerOpts {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, InspectCommands,
-        preprocess_args_for_legacy,
+        Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, ConnectRelayMaterialKind,
+        InspectCommands, preprocess_args_for_legacy,
     };
     use crate::version;
     use clap::error::ErrorKind;
@@ -1523,6 +1582,27 @@ mod tests {
         };
         assert_eq!(renew.endpoint, "https://connect.example/agent/");
         assert_eq!(renew.scope.service_code, "SUPPORT");
+    }
+
+    #[test]
+    fn connect_relay_requires_protected_authentication_files_and_review() {
+        let cli = Cli::try_parse_from([
+            "rustfs", "connect", "relay", "--endpoint", "https://connect.example/api/", "--ca-file",
+            "/etc/rustfs/connect-ca.pem", "--session-cookie-file", "/run/secrets/connect-cookie", "--csrf-token-file",
+            "/run/secrets/connect-csrf", "--organization-uid", "0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50",
+            "--approval-reference", "0198f3a1-b100-7a10-8a11-001122334455", "--transfer-uid",
+            "0198f3a1-a200-7b20-8b22-112233445566", "--material-kind", "diagnostic-bundle-manifest", "--artifact",
+            "/var/lib/rustfs/relay/manifest.json", "--producer-name",
+            "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50/clusters/0198f3a1-5d00-7b20-9c31-1d2e3f4a5b61/clusterDevices/0198f3a1-6e00-7c30-ad41-2e3f4a5b6c72",
+            "--producer-key-id", "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+            "--receipt-public-key-file", "/etc/rustfs/connect-relay.pub", "--receipt-key-id",
+            "aef7765496addd64bb9fcdd7b61682148622aed4856a7315326faea0aa86d53b", "--acknowledge-reviewed",
+        ])
+        .expect("reviewed relay arguments should parse");
+        let Some(Commands::Connect(connect)) = cli.command else { panic!("connect command expected") };
+        let ConnectCommands::Relay(options) = connect.command else { panic!("relay command expected") };
+        assert_eq!(options.material_kind, ConnectRelayMaterialKind::DiagnosticBundleManifest);
+        assert!(options.acknowledge_reviewed);
     }
 
     #[test]

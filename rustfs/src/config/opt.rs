@@ -143,6 +143,7 @@ impl Opt {
             Some(Commands::Connect(opts)) => match opts.command {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
+                ConnectCommands::Relay(opts) => Ok(CommandResult::ConnectRelay(opts)),
                 ConnectCommands::Inventory(opts) => match opts.command {
                     ConnectInventoryCommands::Environment(opts) => Ok(CommandResult::ConnectEnvironmentInventory(opts)),
                 },

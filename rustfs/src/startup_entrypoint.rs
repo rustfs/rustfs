@@ -17,8 +17,8 @@ use crate::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
         ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
         ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
-        ConnectTopCommands, Opt,
+        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts,
+        ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -138,6 +138,7 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command).await,
+        CommandResult::ConnectRelay(options) => return execute_connect_relay(*options).await,
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
@@ -1074,6 +1075,18 @@ fn read_optional_root_ca(path: Option<&std::path::Path>, label: &str) -> Result<
     Ok(Some(bytes))
 }
 
+fn read_relay_root_ca(path: &std::path::Path) -> Result<Vec<u8>> {
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ROOT_CA_BYTES {
+        return Err(Error::other("connect relay root CA is empty or exceeds the 1048576-byte limit"));
+    }
+    Ok(bytes)
+}
+
 async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
     use crate::connect::{
         DriveOutcome, DrivePerformanceRequest, DriveProvenance, IdentityStore, LocalDriveConsent, measure_drive,
@@ -1397,6 +1410,68 @@ async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> 
     } else {
         Err(Error::other(format!("Connect service license status is {}", report.status)))
     }
+}
+
+async fn execute_connect_relay(options: ConnectRelayOpts) -> Result<()> {
+    use crate::connect::{
+        ProxyConfig, RelayHttpClient, RelayMaterialKind, RelayParty, TrustedReceiptSigner, prepare_approved_artifact,
+        read_protected_relay_artifact, read_protected_relay_authentication,
+    };
+
+    if options.timeout_seconds == 0 || options.timeout_seconds > 300 {
+        return Err(Error::other("relay timeout must be between 1 and 300 seconds"));
+    }
+    let artifact = read_protected_relay_artifact(&options.artifact).map_err(Error::other)?;
+    let root_ca_pem = read_relay_root_ca(&options.ca_file)?;
+    let cookie = read_protected_relay_authentication(&options.session_cookie_file).map_err(Error::other)?;
+    let csrf_token = read_protected_relay_authentication(&options.csrf_token_file).map_err(Error::other)?;
+    let receipt_trust = TrustedReceiptSigner::from_public_key_file(&options.receipt_public_key_file, options.receipt_key_id)
+        .map_err(Error::other)?;
+    let material_kind = match options.material_kind {
+        ConnectRelayMaterialKind::OfflineEnrollmentResponse => RelayMaterialKind::OfflineEnrollmentResponse,
+        ConnectRelayMaterialKind::DiagnosticBundleManifest => RelayMaterialKind::DiagnosticBundleManifest,
+    };
+    let organization_name = format!("organizations/{}", options.organization_uid);
+    let prepared = prepare_approved_artifact(
+        &options.transfer_uid,
+        material_kind,
+        &artifact,
+        RelayParty {
+            party_type: "DEVICE".to_owned(),
+            name: options.producer_name,
+            key_id: Some(options.producer_key_id),
+        },
+        RelayParty {
+            party_type: "CONNECT".to_owned(),
+            name: organization_name,
+            key_id: None,
+        },
+        |_| options.acknowledge_reviewed,
+    )
+    .map_err(Error::other)?;
+    let proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = RelayHttpClient::new(
+        &options.endpoint,
+        &root_ca_pem,
+        &options.organization_uid,
+        options.approval_reference,
+        &cookie,
+        &csrf_token,
+        Duration::from_secs(options.timeout_seconds),
+        proxy.as_ref(),
+    )
+    .map_err(Error::other)?;
+    let delivery = client.deliver(prepared, &receipt_trust).await.map_err(Error::other)?;
+    let receipt: serde_json::Value = serde_json::from_slice(&delivery.receipt_bytes).map_err(Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "attempts": delivery.attempts,
+            "receipt": receipt,
+            "review": delivery.review,
+        })
+    );
+    Ok(())
 }
 
 fn license_context(
