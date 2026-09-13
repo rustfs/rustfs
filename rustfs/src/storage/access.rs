@@ -30,7 +30,7 @@ use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use http::{Extensions, HeaderMap, Uri};
+use http::HeaderMap;
 use metrics::counter;
 use rustfs_iam::{
     error::Error as IamError,
@@ -49,7 +49,6 @@ use rustfs_utils::http::{
     SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
 };
 use s3s::access::{S3Access, S3AccessContext};
-use s3s::auth::Credentials;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -1694,46 +1693,9 @@ fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()
     Ok(())
 }
 
-/// The request facts RustFS's access check reads.
-///
-/// Implemented by the s3s access context and by the gateway bridge (rustfs/backlog#1752), so one
-/// check body serves both stacks and the legacy stack reads exactly what it read before.
-pub(crate) trait AccessCheckContext: Send + Sync {
-    fn credentials(&self) -> Option<&Credentials>;
-    fn uri(&self) -> &Uri;
-    fn headers(&self) -> &HeaderMap;
-    fn extensions_mut(&mut self) -> &mut Extensions;
-    fn operation_name(&self) -> &str;
-}
-
-impl AccessCheckContext for S3AccessContext<'_> {
-    fn credentials(&self) -> Option<&Credentials> {
-        S3AccessContext::credentials(self)
-    }
-
-    fn uri(&self) -> &Uri {
-        S3AccessContext::uri(self)
-    }
-
-    fn headers(&self) -> &HeaderMap {
-        S3AccessContext::headers(self)
-    }
-
-    fn extensions_mut(&mut self) -> &mut Extensions {
-        S3AccessContext::extensions_mut(self)
-    }
-
-    fn operation_name(&self) -> &str {
-        self.s3_op().name()
-    }
-}
-
-impl FS {
-    /// RustFS's request-level access check: credential and session validation, the `ReqInfo`
-    /// and server-context extensions every access hook and app body reads, the presigned
-    /// capability scoping, and the license check. The s3s `S3Access::check` hook and the gateway
-    /// bridge both run it before the operation's own hook.
-    pub(crate) async fn check_request_access<C: AccessCheckContext>(&self, cx: &mut C) -> S3Result<()> {
+#[async_trait::async_trait]
+impl S3Access for FS {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // GHSA-g8w9-qw9q-fghr: a presigned URL only authorises the headers it
         // signed. Reject unsigned `x-amz-*` headers first, before the session
         // token lookup below or any handler reads a request header.
@@ -1805,7 +1767,7 @@ impl FS {
         // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
         // ignore a signed capability query.
         if parse_presigned_put_max_content_length(cx.headers(), cx.uri().query(), verified_presigned)?.is_some()
-            && cx.operation_name() != "PutObject"
+            && cx.s3_op().name() != "PutObject"
         {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -1813,7 +1775,7 @@ impl FS {
             ));
         }
         if parse_presigned_multipart_max_total_object_size(cx.headers(), cx.uri().query(), verified_sigv4)?.is_some()
-            && cx.operation_name() != "CreateMultipartUpload"
+            && cx.s3_op().name() != "CreateMultipartUpload"
         {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -1831,13 +1793,6 @@ impl FS {
         // Verify uniformly here? Or verify separately below?
 
         Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl S3Access for FS {
-    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        self.check_request_access(cx).await
     }
 
     /// Checks whether the CreateBucket request has accesses to the resources.

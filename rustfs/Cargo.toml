@@ -348,7 +348,6 @@ pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s = { workspace = true, features = ["minio"] }
-rustfs-gateway = { workspace = true }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
