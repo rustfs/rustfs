@@ -1968,7 +1968,11 @@ where
             .get(idx)
             .and_then(|handle| handle.as_ref())
             .is_some_and(|handle| handle.advance_stripes(stripe_index));
-        if advanced {
+        if advanced
+            && self.readers[idx]
+                .as_mut()
+                .is_some_and(|reader| reader.advance_unopened_blocks(stripe_index).is_ok())
+        {
             self.engaged[idx] = true;
             true
         } else {
@@ -2893,7 +2897,8 @@ mod tests {
                     hash_algo.clone(),
                     false,
                     false,
-                );
+                )
+                .expect("valid deferred reader geometry");
                 readers.push(Some(reader));
                 handles[i] = Some(handle);
             }

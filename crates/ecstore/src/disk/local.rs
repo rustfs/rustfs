@@ -9111,12 +9111,7 @@ impl DiskAPI for LocalDisk {
         .map_err(DiskError::from)?;
         fi.validate(ValidationMode::RequireErasure)?;
         for (i, part) in fi.parts.iter().enumerate() {
-            let checksum_info = erasure.get_checksum_info(part.number);
-            let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-                HashAlgorithm::HighwayHash256SLegacy
-            } else {
-                checksum_info.algorithm
-            };
+            let checksum_algo = fi.bitrot_algorithm(part.number)?.for_coding_index(erasure.index);
             let part_path = self.io_get_object_path(
                 volume,
                 path_join_buf(&[

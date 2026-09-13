@@ -695,12 +695,7 @@ impl SetDisks {
 
         let erasure = erasure_cache.get_for_file_info(fi)?;
 
-        let checksum_info = fi.erasure.get_checksum_info(part.number);
-        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-            HashAlgorithm::HighwayHash256SLegacy
-        } else {
-            checksum_info.algorithm
-        };
+        let checksum_algo = fi.bitrot_algorithm(part.number)?;
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
 
         if fi.data.is_some() {
@@ -973,7 +968,7 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_algo = multipart_part_checksum_algo(&fi, part_number);
+            let checksum_algo = multipart_part_checksum_algo(&fi, part_number)?;
             let read_length = till_offset.saturating_sub(read_offset);
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
@@ -1035,7 +1030,7 @@ impl SetDisks {
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
-                    checksum_algo: multipart_part_checksum_algo(&fi, next_number),
+                    checksum_algo: multipart_part_checksum_algo(&fi, next_number)?,
                 };
                 let files = Arc::clone(&files);
                 let disks = Arc::clone(&disks);
@@ -1637,12 +1632,7 @@ impl SetDisks {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
-        let checksum_info = fi.erasure.get_checksum_info(part_number);
-        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-            HashAlgorithm::HighwayHash256SLegacy
-        } else {
-            checksum_info.algorithm
-        };
+        let checksum_algo = fi.bitrot_algorithm(part_number)?;
         let use_mmap_read = object_mmap_read_enabled();
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
         let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
@@ -1781,13 +1771,8 @@ struct PartReaderSetupSpec {
 
 /// Resolve the bitrot checksum algorithm for one part, honoring the legacy
 /// HighwayHash flag.
-fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
-    let checksum_info = fi.erasure.get_checksum_info(part_number);
-    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-        HashAlgorithm::HighwayHash256SLegacy
-    } else {
-        checksum_info.algorithm
-    }
+fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> Result<HashAlgorithm> {
+    Ok(fi.bitrot_algorithm(part_number)?)
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {

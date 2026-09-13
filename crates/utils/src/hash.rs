@@ -65,6 +65,11 @@ pub enum HashAlgorithm {
     Md5,
     /// No hash (for testing or unprotected data)
     None,
+    /// Streaming bitrot bound to an immutable part identity and block position.
+    HighwayHash256SBound {
+        key: [u64; 4],
+        block: u64,
+    },
 }
 
 enum HashEncoded {
@@ -102,6 +107,60 @@ fn u8x32_from_u64x4(input: [u64; 4]) -> [u8; 32] {
 }
 
 impl HashAlgorithm {
+    /// Derive a public integrity domain, independently of the mutable object path.
+    pub fn bound_bitrot(identity: &[u8; 16]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"rustfs/bitrot/part/v1\0");
+        hash.update(identity);
+        let key: [u8; 32] = hash.finalize().into();
+        Self::HighwayHash256SBound {
+            key: highway_key_from_bytes(&key),
+            block: 0,
+        }
+    }
+
+    /// Reader setup uses coding order, never physical disk order.
+    pub fn for_coding_index(&self, index: usize) -> Self {
+        match self {
+            Self::HighwayHash256SBound { key, block } => {
+                let mut hash = Sha256::new();
+                hash.update(b"rustfs/bitrot/shard/v1\0");
+                hash.update(u8x32_from_u64x4(*key));
+                hash.update(index.to_string().as_bytes());
+                let key: [u8; 32] = hash.finalize().into();
+                Self::HighwayHash256SBound {
+                    key: highway_key_from_bytes(&key),
+                    block: *block,
+                }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    pub fn is_bound_bitrot(&self) -> bool {
+        matches!(self, Self::HighwayHash256SBound { .. })
+    }
+
+    pub fn set_bitrot_block(&mut self, index: usize) -> std::io::Result<()> {
+        if let Self::HighwayHash256SBound { block, .. } = self {
+            *block = u64::try_from(index).map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    pub fn advance_bitrot_block(&mut self) -> std::io::Result<()> {
+        self.advance_bitrot_blocks(1)
+    }
+
+    pub fn advance_bitrot_blocks(&mut self, count: usize) -> std::io::Result<()> {
+        if let Self::HighwayHash256SBound { block, .. } = self {
+            let count = u64::try_from(count).map_err(std::io::Error::other)?;
+            *block = block
+                .checked_add(count)
+                .ok_or_else(|| std::io::Error::other("bitrot block index overflow"))?;
+        }
+        Ok(())
+    }
     /// Hash the input data and return the hash result as Vec<u8>.
     ///
     /// # Arguments
@@ -137,6 +196,12 @@ impl HashAlgorithm {
                 HashEncoded::Blake2b512(out)
             }
             HashAlgorithm::None => HashEncoded::None,
+            HashAlgorithm::HighwayHash256SBound { key, block } => {
+                let mut hasher = HighwayHasher::new(Key(*key));
+                hasher.append(&block.to_le_bytes());
+                hasher.append(data);
+                HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
+            }
         }
     }
 
@@ -193,6 +258,14 @@ impl HashAlgorithm {
                 HashEncoded::Blake2b512(out)
             }
             HashAlgorithm::None => HashEncoded::None,
+            HashAlgorithm::HighwayHash256SBound { key, block } => {
+                let mut hasher = HighwayHasher::new(Key(*key));
+                hasher.append(&block.to_le_bytes());
+                for slice in slices {
+                    hasher.append(slice);
+                }
+                HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
+            }
         }
     }
 
@@ -210,6 +283,7 @@ impl HashAlgorithm {
             HashAlgorithm::BLAKE2b512 => 64,
             HashAlgorithm::Md5 => 16,
             HashAlgorithm::None => 0,
+            HashAlgorithm::HighwayHash256SBound { .. } => 32,
         }
     }
 }

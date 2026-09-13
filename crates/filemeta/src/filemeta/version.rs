@@ -2026,6 +2026,7 @@ impl From<MetaObjectV1ChecksumInfo> for ChecksumInfo {
 impl From<MetaObjectV1Part> for ObjectPartInfo {
     fn from(value: MetaObjectV1Part) -> Self {
         ObjectPartInfo {
+            bitrot_id: None,
             etag: value.etag,
             number: value.number,
             size: value.size,
@@ -2708,6 +2709,10 @@ impl MetaObject {
             transition_tier,
             ..Default::default()
         };
+        if (self.bitrot_checksum_algo == ChecksumAlgo::BoundHighwayHash) != file_info.uses_bound_bitrot()? {
+            return Err(Error::FileCorrupt);
+        }
+        file_info.validate_bitrot_parts(&self.part_numbers)?;
         if all_parts && include_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
         }
@@ -2889,7 +2894,12 @@ impl From<FileInfo> for MetaObject {
             erasure_block_size: value.erasure.block_size,
             erasure_index: value.erasure.index,
             erasure_dist: value.erasure.distribution.iter().map(|x| *x as u8).collect(),
-            bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+            bitrot_checksum_algo: if rustfs_utils::http::contains_key_str(&value.metadata, crate::fileinfo::BITROT_CONTEXT_SUFFIX)
+            {
+                ChecksumAlgo::BoundHighwayHash
+            } else {
+                ChecksumAlgo::HighwayHash
+            },
             part_numbers: value.parts.iter().map(|v| v.number).collect(),
             part_etags,
             part_sizes: value.parts.iter().map(|v| v.size).collect(),
@@ -3251,6 +3261,7 @@ pub enum ChecksumAlgo {
     #[default]
     Invalid = 0,
     HighwayHash = 1,
+    BoundHighwayHash = 2,
 }
 
 impl ChecksumAlgo {
@@ -3261,11 +3272,13 @@ impl ChecksumAlgo {
         match self {
             ChecksumAlgo::Invalid => 0,
             ChecksumAlgo::HighwayHash => 1,
+            ChecksumAlgo::BoundHighwayHash => 2,
         }
     }
     pub fn from_u8(u: u8) -> Self {
         match u {
             1 => ChecksumAlgo::HighwayHash,
+            2 => ChecksumAlgo::BoundHighwayHash,
             _ => ChecksumAlgo::Invalid,
         }
     }
@@ -5881,5 +5894,120 @@ mod read_xl_meta_sync_equivalence_tests {
             let e = assert_equivalent("read_more-eof", &buf, 5018).await.unwrap_err();
             assert_eq!(e, Error::Unexpected, "short read surfaces as Unexpected");
         }
+    }
+}
+
+#[cfg(test)]
+mod bound_bitrot_tests {
+    use super::{ChecksumAlgo, FileInfo, MetaObject};
+    use crate::fileinfo::{BITROT_CONTEXT_SUFFIX, BITROT_PART_ID_PREFIX};
+    use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, remove_str};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn bound_part() -> FileInfo {
+        let mut fi = FileInfo::new("object", 12, 4);
+        fi.data_dir = Some(Uuid::from_u128(1));
+        fi.version_id = Some(Uuid::from_u128(2));
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10));
+        fi.size = 23;
+        fi.erasure.index = 1;
+        fi.add_object_part(1, "etag".to_string(), 23, fi.mod_time, 23, None, None);
+        fi.set_bitrot_part_identity(1, Uuid::from_u128(3));
+        fi
+    }
+
+    #[test]
+    fn bound_bitrot_context_survives_v2_codec_and_metadata_quorum() {
+        let fi = bound_part();
+        for prefix in [RUSTFS_INTERNAL_PREFIX, MINIO_INTERNAL_PREFIX] {
+            assert_eq!(fi.metadata[&format!("{prefix}{BITROT_CONTEXT_SUFFIX}")], "1");
+            assert_eq!(fi.metadata[&format!("{prefix}{BITROT_PART_ID_PREFIX}1")], Uuid::from_u128(3).to_string());
+        }
+        let expected = fi.bitrot_algorithm(1).expect("part domain");
+        let mut encoded = MetaObject::from(fi);
+        assert_eq!(encoded.bitrot_checksum_algo, ChecksumAlgo::BoundHighwayHash);
+        let signature = encoded.get_signature();
+        for index in 1..=16 {
+            encoded.erasure_index = index;
+            assert_eq!(encoded.get_signature(), signature, "coding index must not split the metadata quorum");
+        }
+        let bytes = encoded.marshal_msg().expect("encode metadata");
+        let mut restored = MetaObject::default();
+        restored.unmarshal_msg(&bytes).expect("decode metadata");
+        let mut roundtrip = restored
+            .into_fileinfo("bucket", "object", true)
+            .expect("read persisted binding");
+        assert_eq!(roundtrip.bitrot_algorithm(1).expect("restored part domain"), expected);
+        roundtrip.data_dir = Some(Uuid::from_u128(99));
+        roundtrip.version_id = Some(Uuid::from_u128(100));
+        roundtrip.name = "metadata-only-copy".to_string();
+        assert_eq!(roundtrip.bitrot_algorithm(1).expect("immutable payload domain"), expected);
+    }
+
+    #[test]
+    fn bound_bitrot_context_rejects_missing_nil_conflicting_and_downgraded_metadata() {
+        let mut fi = bound_part();
+        remove_str(&mut fi.metadata, &format!("{BITROT_PART_ID_PREFIX}1"));
+        assert!(fi.bitrot_algorithm(1).is_err());
+        let mut fi = bound_part();
+        fi.set_bitrot_part_identity(1, Uuid::nil());
+        assert!(fi.bitrot_algorithm(1).is_err());
+        let mut fi = bound_part();
+        fi.metadata
+            .insert(format!("{MINIO_INTERNAL_PREFIX}{BITROT_PART_ID_PREFIX}1"), Uuid::from_u128(4).to_string());
+        assert!(fi.bitrot_algorithm(1).is_err());
+        let mut meta = MetaObject::from(bound_part());
+        meta.bitrot_checksum_algo = ChecksumAlgo::HighwayHash;
+        assert!(
+            meta.into_fileinfo("bucket", "object", true).is_err(),
+            "legacy algorithm must not silently drop an identity binding"
+        );
+        let mut meta = MetaObject::from(bound_part());
+        rustfs_utils::http::remove_bytes(&mut meta.meta_sys, BITROT_CONTEXT_SUFFIX);
+        assert!(meta.into_fileinfo("bucket", "object", true).is_err());
+    }
+
+    #[test]
+    fn bound_bitrot_upload_part_extension_reads_legacy_positional_metadata() {
+        let legacy = (
+            "etag",
+            1usize,
+            23usize,
+            23i64,
+            Option::<OffsetDateTime>::None,
+            Option::<bytes::Bytes>::None,
+            Option::<std::collections::HashMap<String, String>>::None,
+            Option::<String>::None,
+        );
+        let encoded = rmp_serde::to_vec(&legacy).expect("legacy eight-field part");
+        let part = crate::ObjectPartInfo::unmarshal(&encoded).expect("old part metadata remains readable");
+        assert_eq!(part.number, 1);
+        assert!(part.bitrot_id.is_none());
+        let part = crate::ObjectPartInfo {
+            bitrot_id: Some(Uuid::from_u128(9)),
+            ..part
+        };
+        let restored =
+            crate::ObjectPartInfo::unmarshal(&part.marshal_msg().expect("encode part identity")).expect("decode part identity");
+        assert_eq!(restored, part);
+    }
+
+    #[test]
+    fn bound_bitrot_shallow_decode_validates_all_part_identities() {
+        let mut fi = bound_part();
+        fi.parts.clear();
+        for number in 1..=10_000 {
+            fi.add_object_part(number, "etag".to_string(), 23, fi.mod_time, 23, None, None);
+            fi.set_bitrot_part_identity(number, Uuid::from_u128(number as u128));
+        }
+        let meta = MetaObject::from(fi);
+        assert!(meta.into_fileinfo("bucket", "object", false).is_ok());
+        let mut meta = meta;
+        rustfs_utils::http::remove_bytes(&mut meta.meta_sys, &format!("{BITROT_PART_ID_PREFIX}10000"));
+        assert!(
+            meta.into_fileinfo("bucket", "object", false).is_err(),
+            "shallow reads must reject missing last-part binding"
+        );
     }
 }

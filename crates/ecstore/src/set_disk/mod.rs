@@ -857,6 +857,7 @@ where
 
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
+mod bitrot_identity;
 mod core;
 #[cfg(test)]
 pub(crate) use core::io_primitives::disk_call_counters;
@@ -5138,7 +5139,7 @@ async fn build_inline_bitrot_readers(
                 0,
                 read_length,
                 shard_size,
-                checksum_algo.clone(),
+                checksum_algo.for_coding_index(file.erasure.index),
                 skip_verify_bitrot,
                 false,
             )
@@ -5172,7 +5173,7 @@ async fn build_inline_bitrot_readers_from_refs(
                 0,
                 read_length,
                 shard_size,
-                checksum_algo.clone(),
+                checksum_algo.for_coding_index(file.erasure.index),
                 skip_verify_bitrot,
                 false,
             )
@@ -6247,10 +6248,11 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
         return Err(DiskError::FileCorrupt);
     };
     let data = meta.data.as_deref().ok_or(DiskError::FileCorrupt)?;
-    let checksum = meta.erasure.get_checksum_info(part.number);
-    let algo = match checksum.algorithm {
+    let algo = match meta.bitrot_algorithm(part.number)?.for_coding_index(meta.erasure.index) {
         HashAlgorithm::HighwayHash256S if meta.uses_legacy_checksum => HashAlgorithm::HighwayHash256SLegacy,
-        algo @ (HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy) => algo,
+        algo @ (HashAlgorithm::HighwayHash256S
+        | HashAlgorithm::HighwayHash256SLegacy
+        | HashAlgorithm::HighwayHash256SBound { .. }) => algo,
         _ => return Err(DiskError::BitrotHashAlgoInvalid),
     };
     let shard_size = inline_erasure_shard_size(meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
@@ -6332,6 +6334,9 @@ async fn disks_with_all_parts(
     }
 
     let online_disks_len = online_disks.len();
+    let bound_identity = latest_meta
+        .uses_bound_bitrot()?
+        .then(|| SetDisks::file_info_quorum_hash(latest_meta));
 
     // Process meta errors
     for (index, disk_op) in online_disks.iter_mut().enumerate() {
@@ -6345,7 +6350,7 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        let meta = &parts_metadata[index];
+        let meta = &mut parts_metadata[index];
 
         let corrupted = if filter_by_etag {
             latest_meta.get_etag() != meta.get_etag()
@@ -6353,7 +6358,13 @@ async fn disks_with_all_parts(
             !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir)
         };
 
-        if corrupted {
+        // A disk-local descriptor cannot authorize its own donor frames.
+        // Compare bound sources to the selected target metadata before either
+        // local verification or reconstruction can count them as healthy.
+        let bound_identity_mismatch = bound_identity.is_some_and(|identity| {
+            SetDisks::hydrate_selected_fileinfo_part_checksums(meta).is_err() || SetDisks::file_info_quorum_hash(meta) != identity
+        });
+        if corrupted || bound_identity_mismatch {
             debug!(
                 event = EVENT_SET_DISK_HEAL,
                 component = LOG_COMPONENT_ECSTORE,
@@ -6857,6 +6868,7 @@ fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -
         actual_size: ext_part.actual_size,
         index: ext_part.index.clone(),
         checksums: ext_part.checksums.clone(),
+        bitrot_id: ext_part.bitrot_id,
         ..Default::default()
     }
 }

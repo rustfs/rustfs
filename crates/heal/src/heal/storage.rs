@@ -1127,7 +1127,13 @@ impl HealStorageAPI for ECStoreHealStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let (item, error) = self.heal_object(bucket, object, version_id, opts).await?;
+        // A completion receipt requires payload verification, including when
+        // the caller's initial sweep requested only part presence.
+        let mut verified_opts = *opts;
+        if !verified_opts.dry_run {
+            verified_opts.scan_mode = HealScanMode::Deep;
+        }
+        let (item, error) = self.heal_object(bucket, object, version_id, &verified_opts).await?;
         let receipt = if error.is_none() && !opts.dry_run {
             let ok_drive_state = DriveState::Ok.to_string();
             let all_after_drives_ok = item.after.drives.iter().all(|drive| drive.state == ok_drive_state);

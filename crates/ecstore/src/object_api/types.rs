@@ -1832,6 +1832,7 @@ impl ObjectInfo {
             .parts
             .iter()
             .map(|part| ObjectPartInfo {
+                bitrot_id: part.bitrot_id,
                 etag: part.etag.clone(),
                 index: part.index.clone(),
                 size: part.size,

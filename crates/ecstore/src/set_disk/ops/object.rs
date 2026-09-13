@@ -2430,6 +2430,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // requests do not pay for part and transform scans they cannot use.
         let read_path_plan = ReadPathPlan::new(&object_info, fi);
 
+        self.verify_unbound_payload(bucket, object, fi).await?;
+
         // Inline data fast path: skip duplex pipe for small inline objects.
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
@@ -2446,13 +2448,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
-            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
-            let checksum_algo =
-                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
+            let checksum_algo = fi.bitrot_algorithm(fi.parts[0].number)?;
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
                 && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
@@ -3499,6 +3495,8 @@ impl SetDisks {
         // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+        let bitrot_id = Uuid::new_v4();
+        let write_checksum_algo = HashAlgorithm::bound_bitrot(bitrot_id.as_bytes());
 
         fi.version_id = {
             if let Some(ref vid) = opts.version_id {
@@ -3587,8 +3585,10 @@ impl SetDisks {
             } else {
                 let writer_futs: Vec<_> = shuffle_disks
                     .iter()
-                    .map(|disk_op| {
+                    .enumerate()
+                    .map(|(index, disk_op)| {
                         let tmp_obj = tmp_object.clone();
+                        let checksum_algo = write_checksum_algo.for_coding_index(index + 1);
                         async move {
                             if let Some(disk) = disk_op
                                 && disk.is_online().await
@@ -3600,7 +3600,7 @@ impl SetDisks {
                                     &tmp_obj,
                                     shard_file_size,
                                     shard_size,
-                                    HashAlgorithm::HighwayHash256S,
+                                    checksum_algo,
                                 )
                                 .await
                                 {
@@ -3680,7 +3680,7 @@ impl SetDisks {
             let mut inline_shards = None;
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_shards_with_size_hint(stream, small_size_hint)
+                    .encode_inline_shards_with_size_hint(stream, small_size_hint, &write_checksum_algo)
                     .await
                 {
                     Ok((r, w, shards)) => {
@@ -3821,6 +3821,8 @@ impl SetDisks {
             }
 
             fi.metadata = user_defined;
+            fi.clear_bitrot_metadata();
+            fi.set_bitrot_part_identity(1, bitrot_id);
             if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
                 // Every disk must publish the same cleanup owner alongside a
                 // replaced null version. This transient key is not persisted
@@ -3889,6 +3891,7 @@ impl SetDisks {
                     },
                     BitrotSelfVerifyTarget {
                         operation: "put_object",
+                        checksum_algo: &write_checksum_algo,
                         bucket,
                         object,
                         part_number: None,
@@ -7619,6 +7622,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Some(etag) = &src_info.etag {
             replacement_metadata.insert("etag".to_owned(), etag.clone());
         }
+        fi.preserve_bitrot_metadata(&mut replacement_metadata);
         fi.metadata = replacement_metadata.clone();
 
         let mod_time = OffsetDateTime::now_utc();
@@ -9249,6 +9253,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
+        self.verify_unbound_payload(bucket, object, &fi).await?;
         let expected_size = u64::try_from(fi.size).map_err(|_| StorageError::FileCorrupt)?;
         let (pr, pw) = tokio::io::duplex(fi.erasure.block_size);
         let consumed = Arc::new(AtomicU64::new(0));
@@ -10287,7 +10292,7 @@ mod object_encryption_resolver_wiring_tests {
 }
 
 #[cfg(test)]
-pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
+pub(in crate::set_disk) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
@@ -10358,7 +10363,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
 
     /// Pool-parameterized variant of [`hermetic_set_disks_isolated`] with the
     /// same isolation contract.
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity_isolated(
+    pub(in crate::set_disk) async fn hermetic_set_disks_for_pool_with_default_parity_isolated(
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
@@ -11364,7 +11369,10 @@ mod inline_put_commit_path_tests {
                 Cursor::new(inline_data.clone()),
                 inline_data.len(),
                 logical_shard_size,
-                HashAlgorithm::HighwayHash256S,
+                file_info
+                    .bitrot_algorithm(1)
+                    .expect("persisted part domain")
+                    .for_coding_index(file_info.erasure.index),
                 erasure.shard_size(),
             )
             .await

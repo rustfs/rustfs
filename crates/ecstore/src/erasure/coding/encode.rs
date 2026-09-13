@@ -609,6 +609,7 @@ impl Erasure {
         self: Arc<Self>,
         mut reader: R,
         size_hint: usize,
+        checksum_algo: &HashAlgorithm,
     ) -> std::io::Result<(R, usize, Vec<Bytes>)>
     where
         R: AsyncRead + Send + Sync + Unpin,
@@ -623,8 +624,9 @@ impl Erasure {
 
         let block = self.encode_data_owned_block(buf)?;
         let mut inline_shards = Vec::with_capacity(block.shards().len());
-        for shard in block.shards() {
-            let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
+        for (index, shard) in block.shards().enumerate() {
+            let shard_algo = checksum_algo.for_coding_index(index + 1);
+            let hash = shard_algo.hash_encode(shard);
             let mut encoded = BytesMut::with_capacity(hash.as_ref().len() + shard.len());
             encoded.extend_from_slice(hash.as_ref());
             encoded.extend_from_slice(shard);
@@ -2525,7 +2527,7 @@ mod tests {
                 let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
                 let (_reader, total, inline_shards) = erasure
                     .clone()
-                    .encode_inline_shards_with_size_hint(reader, payload.len())
+                    .encode_inline_shards_with_size_hint(reader, payload.len(), &checksum_algo)
                     .await
                     .expect("inline shards should encode");
 
