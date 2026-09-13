@@ -632,7 +632,7 @@ impl HealTask {
         true
     }
 
-    async fn record_deferred_object(&self, reason: HealDeferredReason) {
+    async fn record_deferred_object(&self, reason: HealDeferredReason, retry_not_before: Option<SystemTime>) {
         if let Some(identity) = self.single_object_identity() {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
@@ -640,7 +640,7 @@ impl HealTask {
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason,
-                    retry_not_before: None,
+                    retry_not_before,
                 },
                 detail: None,
             });
@@ -782,7 +782,8 @@ impl HealTask {
     }
 
     async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
-        self.record_deferred_object(HealDeferredReason::TransientExistenceCheck).await;
+        self.record_deferred_object(HealDeferredReason::TransientExistenceCheck, None)
+            .await;
         warn!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_OBJECT_RESULT,
@@ -882,7 +883,8 @@ impl HealTask {
             return false;
         }
 
-        self.record_deferred_object(HealDeferredReason::TransientUsageCache).await;
+        self.record_deferred_object(HealDeferredReason::TransientUsageCache, None)
+            .await;
 
         warn!(
             target: "rustfs::heal::task",
@@ -906,7 +908,8 @@ impl HealTask {
             return false;
         }
 
-        self.record_deferred_object(HealDeferredReason::DanglingDeleteGrace).await;
+        self.record_deferred_object(HealDeferredReason::DanglingDeleteGrace, err.dangling_delete_retry_not_before())
+            .await;
 
         warn!(
             target: "rustfs::heal::task",

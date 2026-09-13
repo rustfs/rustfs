@@ -30,4 +30,5 @@ pub(crate) mod integration {
     pub(crate) use rustfs_storage_api::NamespaceLocking;
     pub(crate) use rustfs_storage_api::ObjectIO;
     pub(crate) use rustfs_storage_api::ObjectOperations;
+    pub(crate) use rustfs_storage_api::{DiskSetSelector, StorageAdminApi};
 }

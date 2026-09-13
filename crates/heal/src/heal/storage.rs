@@ -1127,8 +1127,49 @@ impl HealStorageAPI for ECStoreHealStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let (item, error) = self.heal_object(bucket, object, version_id, opts).await?;
-        let receipt = if error.is_none() && !opts.dry_run {
+        let result = self
+            .ecstore
+            .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
+            .await
+            .map_err(Error::Storage)?;
+        let item = result.item;
+        let error = result.error.map(Error::Storage);
+        let receipt = if let Some(proof) = result.absence {
+            if error.is_none()
+                && !opts.dry_run
+                && proof.bucket == bucket
+                && proof.object == object
+                && proof.version_id == version_id.unwrap_or("")
+                && proof.pool_index == opts.pool
+                && proof.set_index == opts.set
+                && !proof.bucket_incarnation_id.is_nil()
+                && !proof.locations.is_empty()
+                && proof.locations.iter().all(|(pool, set)| {
+                    opts.pool.is_none_or(|expected| expected == *pool) && opts.set.is_none_or(|expected| expected == *set)
+                })
+            {
+                Some(HealObjectReceipt {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: proof.bucket,
+                        object: proof.object,
+                        version_id: version_id.map(ToOwned::to_owned),
+                        bucket_incarnation_id: Some(proof.bucket_incarnation_id),
+                        pool_index: proof.pool_index,
+                        set_index: proof.set_index,
+                    },
+                    // A committed cleanup repaired the stale replica. A replay
+                    // observing an already absent version made no new repair.
+                    disposition: if proof.removed {
+                        HealObjectDisposition::Repaired
+                    } else {
+                        HealObjectDisposition::AuthoritativelyAbsent
+                    },
+                })
+            } else {
+                None
+            }
+        } else if error.is_none() && !opts.dry_run {
             let ok_drive_state = DriveState::Ok.to_string();
             let all_after_drives_ok = item.after.drives.iter().all(|drive| drive.state == ok_drive_state);
             match (
