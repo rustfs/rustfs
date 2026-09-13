@@ -9667,6 +9667,7 @@ dependencies = [
  "hotpath",
  "metrics",
  "smallvec",
+ "thiserror 2.0.20",
  "tokio",
  "tonic",
  "tracing",
