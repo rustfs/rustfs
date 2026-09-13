@@ -35,7 +35,7 @@ use uuid::Uuid;
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
-const MAX_ERASURE_SHARDS: usize = 16;
+pub(crate) const MAX_ERASURE_SHARDS: usize = 16;
 const MAX_FILEINFO_PARTS: usize = 10_000;
 const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
 const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
@@ -57,7 +57,7 @@ const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
 const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
     pub etag: String,
     pub number: usize,
@@ -69,6 +69,28 @@ pub struct ObjectPartInfo {
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub integrity: Option<crate::shard_integrity::PartIntegrity>,
+}
+
+impl Serialize for ObjectPartInfo {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Named fields let release readers ignore optional extensions. Appending
+        // a ninth element to the old positional array makes those readers fail.
+        let mut map = serializer.serialize_map(Some(8 + usize::from(self.integrity.is_some())))?;
+        map.serialize_entry("etag", &self.etag)?;
+        map.serialize_entry("number", &self.number)?;
+        map.serialize_entry("size", &self.size)?;
+        map.serialize_entry("actual_size", &self.actual_size)?;
+        map.serialize_entry("mod_time", &self.mod_time)?;
+        map.serialize_entry("index", &self.index)?;
+        map.serialize_entry("checksums", &self.checksums)?;
+        map.serialize_entry("error", &self.error)?;
+        if let Some(integrity) = &self.integrity {
+            map.serialize_entry("integrity", integrity)?;
+        }
+        map.end()
+    }
 }
 
 impl ObjectPartInfo {
@@ -639,7 +661,11 @@ impl<'de> Deserialize<'de> for FileInfo {
             }
         }
 
-        deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)
+        let mut file = deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)?;
+        if !file.parts.is_empty() {
+            file.hydrate_shard_integrity().map_err(de::Error::custom)?;
+        }
+        Ok(file)
     }
 }
 
@@ -1090,6 +1116,7 @@ impl FileInfo {
             index,
             checksums,
             error: None,
+            integrity: None,
         };
 
         for p in self.parts.iter_mut() {
@@ -2172,6 +2199,7 @@ mod tests {
                 index,
                 checksums,
                 error,
+                integrity: None,
             })
     }
 
@@ -2379,6 +2407,7 @@ mod tests {
                         .collect(),
                 ),
                 error: Some("part-error".to_string()),
+                integrity: None,
             }],
             erasure: ErasureInfo {
                 algorithm: "erasure-algorithm".to_string(),

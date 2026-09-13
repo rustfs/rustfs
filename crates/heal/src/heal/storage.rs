@@ -1169,7 +1169,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             } else {
                 None
             }
-        } else if error.is_none() && !opts.dry_run {
+        } else if error.is_none() && !opts.dry_run && item.integrity_verified {
             let ok_drive_state = DriveState::Ok.to_string();
             let all_after_drives_ok = item.after.drives.iter().all(|drive| drive.state == ok_drive_state);
             match (

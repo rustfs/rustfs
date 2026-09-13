@@ -488,6 +488,7 @@ impl SetDisks {
     }
 
     pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_shard_integrity().map_err(DiskError::from)?;
         fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
         for part in &fi.parts {
             let Some(checksums) = part.checksums.as_ref() else {

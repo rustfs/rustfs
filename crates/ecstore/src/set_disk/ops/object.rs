@@ -3417,6 +3417,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let protect_write = opts.shard_integrity_write_enabled();
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
@@ -3461,6 +3462,7 @@ impl SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if let Some(eval_metadata) = &opts.eval_metadata {
             merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
         }
@@ -3556,7 +3558,9 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned)
+                && put_object_size >= 0
+                && usize::try_from(put_object_size).is_ok_and(|size| size <= erasure.block_size);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -3677,48 +3681,16 @@ impl SetDisks {
             };
 
             let encode_stage_start = collect_stage_timing.then(Instant::now);
-            let mut inline_shards = None;
-            let (reader, w_size) = match write_path {
-                SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_shards_with_size_hint(stream, small_size_hint)
-                    .await
-                {
-                    Ok((r, w, shards)) => {
-                        inline_shards = Some(shards);
-                        (r, w)
-                    }
-                    Err(e) => {
-                        error!("encode_inline_small err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
-                    .await
-                {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode_single_block_non_inline err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::PipelineBatchedLarge => {
-                    match Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await {
-                        Ok((r, w)) => (r, w),
-                        Err(e) => {
-                            error!("encode_batched err {:?}", e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-                SmallWritePath::Pipeline => match Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
+            use crate::erasure::coding::encode::IntegrityEncodeMode;
+            let mode = match write_path {
+                SmallWritePath::Inline => IntegrityEncodeMode::Inline(small_size_hint),
+                SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let (reader, w_size, inline_shards, integrity) = Arc::clone(&erasure)
+                .encode_with_shard_integrity(stream, &mut writers, write_quorum, 1, mode, protect_write)
+                .await?;
             let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
             let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
             if let Some(encode_elapsed) = encode_elapsed {
@@ -3820,6 +3792,35 @@ impl SetDisks {
                 )));
             }
 
+            let part_integrity = if let Some(integrity) = integrity {
+                Some(if is_inline_buffer {
+                    integrity.set_inline_metadata(&mut fi)?;
+                    integrity.part
+                } else {
+                    integrity
+                        .write(
+                            &mut shuffle_disks,
+                            bucket,
+                            RUSTFS_META_TMP_BUCKET,
+                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
+                        )
+                        .await?
+                })
+            } else {
+                None
+            };
+            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                return Err(Error::ErasureWriteQuorum);
+            }
+            if let Some(inline_proof) =
+                rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY)
+            {
+                insert_str(
+                    &mut user_defined,
+                    rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+                    inline_proof.to_owned(),
+                );
+            }
             fi.metadata = user_defined;
             if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
                 // Every disk must publish the same cleanup owner alongside a
@@ -3832,6 +3833,8 @@ impl SetDisks {
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
             fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
+            fi.parts[0].integrity = part_integrity;
+            fi.persist_shard_integrity()?;
             if opts.data_movement {
                 fi.set_data_moved();
             }
@@ -7446,7 +7449,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Self-copy with a data reader: write tier data back locally (de-tiering).
             // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
             if let Some(mut put_reader) = src_info.put_object_reader.take() {
-                return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+                let mut put_opts = dst_opts.clone();
+                put_opts.inherit_shard_integrity(src_info);
+                return self.put_object(dst_bucket, dst_object, &mut put_reader, &put_opts).await;
             }
             // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
             // path so the caller gets a disk/quorum error rather than NotImplemented.
@@ -7613,6 +7618,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None
         };
         let mut replacement_metadata = (*src_info.user_defined).clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut replacement_metadata);
+        for suffix in [
+            rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+            rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+        ] {
+            if rustfs_utils::http::contains_key_str(&fi.metadata, suffix) {
+                let value = rustfs_utils::http::get_consistent_str(&fi.metadata, suffix).ok_or(Error::FileCorrupt)?;
+                rustfs_utils::http::insert_str(&mut replacement_metadata, suffix, value.to_owned());
+            }
+        }
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }

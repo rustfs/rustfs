@@ -17,3 +17,4 @@
 pub(crate) mod bitrot;
 pub(crate) mod compress;
 pub(crate) mod rio;
+pub(crate) mod shard_integrity;

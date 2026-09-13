@@ -2396,6 +2396,20 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.track_disk_health_mutation(
+            "rename_file",
+            DiskMetricMutation::Write,
+            || async {
+                self.disk
+                    .rename_file_durable(src_volume, src_path, dst_volume, dst_path)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn prepare_part_transaction(
         &self,
         src_volume: &str,

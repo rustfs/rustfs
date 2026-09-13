@@ -23,7 +23,7 @@ pub(crate) mod integration {
     pub(crate) use rustfs_ecstore::api::disk::{
         DiskAPI, DiskError, DiskOption, DiskStore, Endpoint, RUSTFS_META_BUCKET, ReadOptions, new_disk,
     };
-    pub(crate) use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
+    pub(crate) use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader, ShardIntegrityWriteMode};
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_storage_api::BucketOperations;
     pub(crate) use rustfs_storage_api::MakeBucketOptions;

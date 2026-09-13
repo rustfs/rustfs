@@ -288,6 +288,9 @@ pub struct RenameFileRequest {
     pub dst_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub dst_path: ::prost::alloc::string::String,
+    /// Apply the destination's payload/metadata durability policy before success.
+    #[prost(bool, tag = "6")]
+    pub durable: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameFileResponse {
@@ -295,6 +298,8 @@ pub struct RenameFileResponse {
     pub success: bool,
     #[prost(message, optional, tag = "2")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bool, tag = "3")]
+    pub durability_applied: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteRequest {

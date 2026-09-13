@@ -785,6 +785,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
 
         let put_opts = ObjectOptions {
             user_defined: dst_opts.user_defined.clone(),
+            shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,

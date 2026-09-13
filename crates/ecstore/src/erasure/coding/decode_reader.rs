@@ -816,6 +816,7 @@ where
     };
     rustfs_io_metrics::record_get_object_reconstruct_outcome(metrics_path, engine.engine_name(), reconstruct_outcome);
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+    state.verify_reconstructed_integrity()?;
 
     if state.shards_mut().len() < engine.data_shards() {
         return Err(io::Error::new(

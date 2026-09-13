@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_heal::heal::{
     outcome::{HealObjectDisposition, HealTraversalCoverage},
@@ -24,7 +26,8 @@ use tokio::io::AsyncReadExt as _;
 
 mod storage_api;
 use storage_api::integration::{
-    DiskAPI as _, DiskError, DiskOption, Endpoint, NamespaceLocking as _, ObjectIO as _, ReadOptions, new_disk,
+    DiskAPI as _, DiskError, DiskOption, Endpoint, NamespaceLocking as _, ObjectIO as _, ReadOptions, ShardIntegrityWriteMode,
+    new_disk,
 };
 
 fn deep_heal_task(storage: &Arc<ECStoreHealStorage>, bucket: &str, object: &str, dry_run: bool) -> HealTask {
@@ -75,6 +78,7 @@ async fn deep_heal_truncated_xlmeta_scenario() {
     let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
     let bucket = "truncated-xlmeta";
     env.make_bucket(bucket, false).await;
+    env.make_bucket("truncated-xlmeta-versioned", true).await;
     let payload = vec![0x7b; 4 * 1024 * 1024];
     let mut endpoint = Endpoint::try_from(env.disk_paths[0].to_str().expect("UTF-8 disk path")).expect("target endpoint");
     endpoint.set_pool_index(0);
@@ -88,13 +92,13 @@ async fn deep_heal_truncated_xlmeta_scenario() {
         ..Default::default()
     };
 
-    for damage in ["length-prefix", "metadata-body", "crc-tail", "versioned"] {
+    for (damage, protected) in ["length-prefix", "metadata-body", "crc-tail", "versioned"]
+        .into_iter()
+        .flat_map(|damage| [false, true].map(|protected| (damage, protected)))
+    {
         let versioned = damage == "versioned";
         let bucket = if versioned { "truncated-xlmeta-versioned" } else { bucket };
-        if versioned {
-            env.make_bucket(bucket, true).await;
-        }
-        let object = format!("{damage}/object.bin");
+        let object = format!("{damage}-{protected}/object.bin");
         let mut reader = PutObjReader::from_vec(payload.clone());
         env.ecstore
             .put_object(
@@ -103,6 +107,11 @@ async fn deep_heal_truncated_xlmeta_scenario() {
                 &mut reader,
                 &ObjectOptions {
                     versioned,
+                    shard_integrity_write_mode: Some(if protected {
+                        ShardIntegrityWriteMode::Protected
+                    } else {
+                        ShardIntegrityWriteMode::Legacy
+                    }),
                     ..Default::default()
                 },
             )
@@ -168,15 +177,26 @@ async fn deep_heal_truncated_xlmeta_scenario() {
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
         assert_eq!(outcome.counters.processed, 1);
-        assert_eq!(outcome.counters.healed, 1, "{damage}: {outcome:?}");
-        assert_eq!(outcome.counters.unknown, 0);
-        assert_eq!(outcome.counters.skipped, 0);
+        // Both modes restore metadata and shards. Only independently verified
+        // payloads authorize a strong repair receipt.
+        assert_eq!(outcome.counters.healed, u64::from(protected), "{damage}: {outcome:?}");
+        assert_eq!(outcome.counters.unknown, u64::from(!protected));
+        assert_eq!(outcome.counters.skipped, u64::from(!protected));
         assert_eq!(outcome.counters.failed, 0);
         assert_eq!(outcome.counters.attempt_failures, 0);
-        assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Repaired);
+        assert_eq!(
+            outcome.objects[0].disposition,
+            if protected {
+                HealObjectDisposition::Repaired
+            } else {
+                HealObjectDisposition::Unknown
+            }
+        );
         assert_eq!(read_error, DiskError::FileCorrupt);
         let results = task.get_result_items().await;
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].drives_healed(), Some(1));
+        assert_eq!(results[0].integrity_verified, protected);
         assert_eq!(results[0].before.drives.len(), 16);
         assert_eq!(results[0].after.drives.len(), 16);
         assert_eq!(results[0].before.drives[0].state, DriveState::Corrupt.to_string());
@@ -217,8 +237,8 @@ async fn deep_heal_truncated_xlmeta_scenario() {
         repeat.execute().await.expect("repeated heal completes");
         let repeat_outcome = repeat.get_outcome().await;
         assert_eq!(repeat_outcome.counters.healed, 0);
-        assert_eq!(repeat_outcome.counters.unchanged, 1);
-        assert_eq!(repeat_outcome.counters.unknown, 0);
+        assert_eq!(repeat_outcome.counters.unchanged, u64::from(protected));
+        assert_eq!(repeat_outcome.counters.unknown, u64::from(!protected));
         assert_eq!(tokio::fs::read(&target_meta).await.expect("read repeated-heal target"), healed_bytes);
         let mut reader = env
             .ecstore
@@ -273,8 +293,9 @@ async fn deep_heal_truncated_xlmeta_scenario() {
                 let outcome = quorum_task.get_outcome().await;
                 if damaged == 4 {
                     result.expect("twelve authoritative members must repair four damaged copies");
-                    assert_eq!(outcome.counters.healed, 1);
-                    assert_eq!(outcome.counters.unknown, 0);
+                    assert_eq!(outcome.counters.healed, u64::from(protected));
+                    assert_eq!(outcome.counters.unknown, u64::from(!protected));
+                    assert_eq!(quorum_task.get_result_items().await[0].drives_healed(), Some(4));
                     assert!(
                         quorum_task.get_result_items().await[0]
                             .after

@@ -882,6 +882,15 @@ pub enum WriteCompletion {
     TailDrained,
 }
 
+/// Storage-owned write mode inherited by physical rewrites. This selects the
+/// destination format; the source reader must still validate every source byte.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardIntegrityWriteMode {
+    Legacy,
+    Protected,
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -942,6 +951,10 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Internal, in-memory protection context. Never populated from S3 metadata.
+    /// None selects the rollout default only for a new write, not for a rewrite.
+    #[doc(hidden)]
+    pub shard_integrity_write_mode: Option<ShardIntegrityWriteMode>,
     /// Durable reservation identity carried only by decommission writes. Other
     /// data-movement users, including rebalance, leave it unset. Keep this
     /// context boxed because `ObjectOptions` is passed by value through deep
@@ -1043,6 +1056,25 @@ pub enum ReplicationStatusWritebackMode {
 }
 
 impl ObjectOptions {
+    pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
+        match self.shard_integrity_write_mode {
+            Some(ShardIntegrityWriteMode::Protected) => true,
+            Some(ShardIntegrityWriteMode::Legacy) => false,
+            None if self.data_movement => false,
+            None => {
+                rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+                    && rustfs_utils::get_env_bool(
+                        rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                        rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    )
+            }
+        }
+    }
+
+    pub(crate) fn inherit_shard_integrity(&mut self, source: &ObjectInfo) {
+        self.shard_integrity_write_mode = Some(source.shard_integrity_write_mode());
+    }
+
     pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
         Self {
             decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
@@ -1438,6 +1470,23 @@ impl Clone for ObjectInfo {
 }
 
 impl ObjectInfo {
+    pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
+        // Any declaration requires protection. Malformed declarations remain
+        // errors in the source reader and must never select the legacy path.
+        if self.parts.iter().any(|part| part.integrity.is_some())
+            || [
+                rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+            ]
+            .iter()
+            .any(|suffix| rustfs_utils::http::contains_key_str(&self.user_defined, suffix))
+        {
+            ShardIntegrityWriteMode::Protected
+        } else {
+            ShardIntegrityWriteMode::Legacy
+        }
+    }
+
     /// Capture the source mutation snapshot used by replication workers when
     /// publishing terminal status. The semantic fingerprint is recomputed at
     /// the storage CAS boundary, so an older writer that preserves an unknown
@@ -1840,6 +1889,7 @@ impl ObjectInfo {
                 checksums: part.checksums.clone(),
                 number: part.number,
                 error: part.error.clone(),
+                integrity: part.integrity.clone(),
             })
             .collect::<Vec<_>>();
 

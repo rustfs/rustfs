@@ -4336,6 +4336,7 @@ impl ECStore {
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
         let mut dst_opts = dst_opts.clone();
+        dst_opts.inherit_shard_integrity(src_info);
         if !is_meta_bucketname(dst_bucket) && dst_opts.expected_bucket_incarnation_id.is_none() {
             dst_opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(dst_bucket).await?);
         }
@@ -4455,6 +4456,7 @@ impl ECStore {
                 let mut put_opts = ObjectOptions {
                     user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
                     versioned: dst_opts.versioned,
+                    shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                     version_id: dst_opts.version_id.clone(),
                     no_lock: dst_opts.no_lock,
                     mod_time: dst_opts.mod_time,
@@ -4493,6 +4495,7 @@ impl ECStore {
                     let mut put_opts = ObjectOptions {
                         user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
                         versioned: dst_opts.versioned,
+                        shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                         version_id: dst_opts.version_id.clone(),
                         no_lock: dst_opts.no_lock,
                         mod_time: dst_opts.mod_time,
@@ -4541,6 +4544,7 @@ impl ECStore {
         let mut put_opts = ObjectOptions {
             user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
             versioned: dst_opts.versioned,
+            shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
             version_id: dst_opts.version_id.clone(),
             no_lock: dst_opts.no_lock,
             mod_time: dst_opts.mod_time,
