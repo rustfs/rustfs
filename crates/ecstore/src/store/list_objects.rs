@@ -2216,7 +2216,7 @@ fn list_objects_paginate(
         }
     }
 
-    if !is_truncated && disk_has_more {
+    if !is_truncated && disk_has_more && !include_version_id {
         let visible_count = objects.len() + prefixes.len();
         let should_truncate = if delimiter.is_none() {
             visible_count > 0
@@ -7312,14 +7312,23 @@ mod test {
 
     fn test_object_meta_entry(name: &str) -> MetaCacheEntry {
         let mut meta = FileMeta::new();
-        meta.add_version(FileInfo {
-            volume: "bucket".to_owned(),
-            name: name.to_owned(),
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), "etag".to_string());
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(Uuid::from_u128(0x1234));
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
             size: 1,
-            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            actual_size: 1,
             ..Default::default()
-        })
-        .expect("test metadata should accept object version");
+        }];
+        fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.metadata = metadata;
+        meta.add_version(fi).expect("test metadata should accept object version");
         let metadata = meta.marshal_msg().expect("test metadata should marshal");
 
         MetaCacheEntry {
@@ -7844,7 +7853,11 @@ mod test {
                     }
                     .expect("version page should list successfully");
                     let page_size = usize::try_from(max_keys).expect("nonnegative page size");
-                    assert_eq!(result.objects.len() + result.prefixes.len(), (10 - page * page_size).min(page_size));
+                    assert_eq!(
+                        result.objects.len() + result.prefixes.len(),
+                        (10 - page * page_size).min(page_size),
+                        "{kind}, layer {layer}, max_keys {max_keys}, page {page}"
+                    );
                     let has_more = page + 1 < expected_pages;
                     assert_eq!(result.is_truncated, has_more, "{kind}, layer {layer}, max_keys {max_keys}, page {page}");
                     assert_eq!(

@@ -2056,7 +2056,7 @@ fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, Stri
             local_tier_free_version_id = Some(version_id);
             continue;
         }
-        if suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_BUCKET_INCARNATION_ID) {
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID) {
             continue;
         }
 
@@ -4270,9 +4270,12 @@ impl ECStore {
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
-        self.pools[idx]
+        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+        let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-            .await
+            .await;
+        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+        result
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -4476,9 +4479,12 @@ impl ECStore {
                         crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                 }
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
-                    self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
-                        .await
+                        .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    result
                 } else {
                     Err(StorageError::InvalidArgument(
                         src_bucket.to_owned(),
@@ -4514,9 +4520,12 @@ impl ECStore {
                         put_opts.decommission_capacity_admission =
                             crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                     }
-                    return self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    return result;
                 }
                 src_info.version_only = true;
                 let capacity_object = dst_object.clone();
@@ -4565,9 +4574,12 @@ impl ECStore {
         }
 
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
-            return self.pools[pool_idx]
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+            let result = self.pools[pool_idx]
                 .put_object(dst_bucket, dst_object_name, put_object_reader, &put_opts)
                 .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            return result;
         }
 
         Err(StorageError::InvalidArgument(
@@ -4819,7 +4831,9 @@ impl ECStore {
                         if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
                             self.select_decommission_capacity_target_pool(owner, 0).await?
                         } else {
-                            self.get_pool_idx_no_lock(bucket, object, 0).await?
+                            self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                                .await
+                                .ok_or(Error::DiskFull)?
                         }
                     }
                 };
