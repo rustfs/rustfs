@@ -4190,10 +4190,72 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+        use rustfs_common::mrf_channel::{
+            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,
+        };
+
+        if !mrf_delivery_enabled() {
+            return false;
+        }
+        let identity = (|| {
+            let version = version_id
+                .filter(|value| !value.is_empty())
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?;
+            let scope = MrfScope {
+                pool_index: u32::try_from(self.pool_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+                set_index: u32::try_from(self.set_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+            };
+            Ok::<_, MrfDurableAdmissionError>((version, scope))
+        })();
+        let result = match identity {
+            Ok((version, scope)) => persist_partial_write_intent(bucket, object, version, scope).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                tracing::trace!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "mrf_durably_admitted",
+                    bucket,
+                    object,
+                    version_id,
+                    pool_index = self.pool_index,
+                    set_index = self.set_index,
+                    "Partial write repair responsibility persisted"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "mrf_durable_admission_failed",
+                    bucket, object, version_id, pool_index = self.pool_index, set_index = self.set_index,
+                    error = %error,
+                    "Partial write repair falling back to the heal channel"
+                );
+                false
+            }
+        }
+    }
+
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
         request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) {
+        if let Some(object) = request.object_prefix.as_deref()
+            && self
+                .persist_partial_write(&request.bucket, object, request.object_version_id.as_deref())
+                .await
+        {
+            return;
+        }
         #[cfg(test)]
         {
             let capture = self
@@ -6180,6 +6242,36 @@ fn join_errs(errs: &[Option<DiskError>]) -> String {
     errs.join(", ")
 }
 
+async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
+    meta.validate_for_metadata_read()?;
+    let [part] = meta.parts.as_slice() else {
+        return Err(DiskError::FileCorrupt);
+    };
+    let data = meta.data.as_deref().ok_or(DiskError::FileCorrupt)?;
+    let checksum = meta.erasure.get_checksum_info(part.number);
+    let algo = match checksum.algorithm {
+        HashAlgorithm::HighwayHash256S if meta.uses_legacy_checksum => HashAlgorithm::HighwayHash256SLegacy,
+        algo @ (HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy) => algo,
+        _ => return Err(DiskError::BitrotHashAlgoInvalid),
+    };
+    let shard_size = inline_erasure_shard_size(meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
+    let part_size =
+        inline_erasure_shard_file_size(part.size, meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
+    // Check framing arithmetic and the physical buffer length before the shared
+    // verifier sizes its scratch buffer from the metadata.
+    let encoded_size = part_size
+        .div_ceil(shard_size)
+        .checked_mul(algo.size())
+        .and_then(|hash_size| part_size.checked_add(hash_size))
+        .ok_or(DiskError::FileCorrupt)?;
+    if encoded_size != data.len() {
+        return Err(DiskError::FileCorrupt);
+    }
+    coding::bitrot_verify(Cursor::new(data), encoded_size, part_size, algo, shard_size)
+        .await
+        .map_err(|_| DiskError::FileCorrupt)
+}
+
 /// disks_with_all_partsv2 is a corrected version based on Go implementation.
 /// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
 /// It also checks if the status of each part (corrupted, missing, ok) in each drive.
@@ -6351,16 +6443,22 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        // Inline data is stored inside xl.meta, so there is no separate part file to
-        // verify here. Treat the shard as present once metadata was read successfully;
-        // object reads/heal will validate the inline shard through the normal bitrot
-        // reader path. Running bitrot_verify directly here can falsely mark small
-        // inline shards corrupt when older metadata has no per-part checksum entries.
+        // Normal scans only check presence. Deep scans must verify inline bytes
+        // before deciding whether reconstruction (and its bitrot readers) is needed.
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
+            let part_status = if scan_mode == HealScanMode::Deep && meta.data.is_some() {
+                match verify_inline_part_bitrot(meta).await {
+                    Ok(()) => CHECK_PART_SUCCESS,
+                    Err(DiskError::FileCorrupt) => CHECK_PART_FILE_CORRUPT,
+                    Err(err) => return Err(err),
+                }
+            } else {
+                CHECK_PART_SUCCESS
+            };
             if let Some(vec) = data_errs_by_part.get_mut(&0)
                 && index < vec.len()
             {
-                vec[index] = CHECK_PART_SUCCESS;
+                vec[index] = part_status;
             }
             continue;
         }
@@ -12469,6 +12567,8 @@ mod tests {
             file.add_object_part(1, "part-etag-inline".to_string(), payload.len(), file.mod_time, file.size, None, None);
             file.set_inline_data();
             file.erasure.index = files.len() + 1;
+            file.erasure.block_size = erasure.block_size;
+            file.uses_legacy_checksum = uses_legacy;
             file.data = Some(Bytes::from(data));
             files.push(file);
         }
@@ -12478,6 +12578,103 @@ mod tests {
 
     async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
         inline_bitrot_files_for_payload_with_mode(payload, false).await
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_checks_current_and_legacy_frames() {
+        let payload = vec![0x7b; 4113];
+        for legacy in [false, true] {
+            let (_, files, _, _) = inline_bitrot_files_for_payload_with_mode(&payload, legacy).await;
+            for mut meta in files {
+                assert!(meta.erasure.checksums.is_empty(), "legacy metadata may omit per-part checksum entries");
+                verify_inline_part_bitrot(&meta)
+                    .await
+                    .expect("healthy data and parity shards should verify");
+                let original = meta.data.clone().expect("fixture should retain inline bytes");
+                for offset in [0, 32, original.len() - 1] {
+                    let mut damaged = original.to_vec();
+                    damaged[offset] ^= 1;
+                    meta.data = Some(Bytes::from(damaged));
+                    assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+                }
+                let mut trailing = original.to_vec();
+                trailing.push(0x7b);
+                for damaged in [Vec::new(), original[..original.len() - 1].to_vec(), trailing] {
+                    meta.data = Some(Bytes::from(damaged));
+                    assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_checks_empty_objects_and_metadata_bounds() {
+        let (_, files, _, _) = inline_bitrot_files_for_payload(b"inline metadata bounds").await;
+        let mut empty = files[0].clone();
+        empty.size = 0;
+        empty.parts[0].size = 0;
+        empty.parts[0].actual_size = 0;
+        empty.data = Some(Bytes::new());
+        verify_inline_part_bitrot(&empty)
+            .await
+            .expect("empty inline objects have no bitrot frames");
+        empty.data = Some(Bytes::from_static(b"unexpected"));
+        assert_eq!(verify_inline_part_bitrot(&empty).await, Err(DiskError::FileCorrupt));
+
+        let mut invalid = files[0].clone();
+        invalid.erasure.block_size = 0;
+        assert_eq!(verify_inline_part_bitrot(&invalid).await, Err(DiskError::FileCorrupt));
+        invalid = files[0].clone();
+        invalid.parts.push(invalid.parts[0].clone());
+        invalid.parts[1].number = 2;
+        assert_eq!(verify_inline_part_bitrot(&invalid).await, Err(DiskError::FileCorrupt));
+
+        let mut oversized = files[0].clone();
+        oversized.erasure.block_size = 2;
+        oversized.size = i64::MAX - 3;
+        oversized.parts[0].size = usize::try_from(oversized.size).expect("64-bit metadata size should fit");
+        oversized
+            .validate_for_metadata_read()
+            .expect("logical shard length should fit metadata bounds");
+        assert_eq!(verify_inline_part_bitrot(&oversized).await, Err(DiskError::FileCorrupt));
+
+        oversized.erasure.block_size = 1 << 40;
+        oversized.size = 1 << 40;
+        oversized.parts[0].size = usize::try_from(oversized.size).expect("64-bit metadata size should fit");
+        oversized
+            .validate_for_metadata_read()
+            .expect("large metadata geometry should remain representable");
+        assert_eq!(verify_inline_part_bitrot(&oversized).await, Err(DiskError::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn deep_heal_inline_bitrot_accepts_pinned_disk_fixtures() {
+        use rustfs_filemeta::test_data::{create_issue_2265_legacy_meta_v2_object_xlmeta, create_issue_2288_legacy_xlmeta};
+
+        for (bytes, size, legacy) in [
+            (create_issue_2288_legacy_xlmeta().expect("pinned meta v1 fixture"), 35, false),
+            (
+                create_issue_2265_legacy_meta_v2_object_xlmeta().expect("pinned meta v2 fixture"),
+                707,
+                true,
+            ),
+        ] {
+            let file_meta = rustfs_filemeta::FileMeta::load(&bytes).expect("historical xl.meta should decode");
+            let mut meta = file_meta
+                .into_fileinfo("bucket", "object", "", true, false, true)
+                .expect("historical object metadata should decode");
+            assert_eq!(meta.size, size);
+            assert_eq!(meta.uses_legacy_checksum, legacy);
+            assert!(meta.inline_data());
+            assert!(meta.data.is_some(), "the production decoder should extract the historical inline value");
+            verify_inline_part_bitrot(&meta)
+                .await
+                .expect("historical inline shard should pass deep verification");
+            let mut damaged = meta.data.as_ref().expect("fixture should be inline").to_vec();
+            *damaged.last_mut().expect("fixture shard should not be empty") ^= 1;
+            meta.data = Some(Bytes::from(damaged));
+            assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+        }
     }
 
     fn disk_ordered_fileinfos(files: &[FileInfo]) -> Vec<FileInfo> {

@@ -4642,8 +4642,7 @@ impl SetDisks {
                     request.object_version_id = committed_version_id
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
-                    let heal_set = commit_set.clone();
-                    tokio::spawn(async move { heal_set.submit_rename_tail_heal(request).await });
+                    commit_set.submit_rename_tail_heal(request).await;
                 }
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
@@ -7825,6 +7824,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         join_all(rollback_futures).await;
         drop(namespace_owner);
+        // An explicit purge can carry deleted=true for the existing marker.
+        // It must not create a repair intent that could reintroduce that marker.
+        if quorum_result.is_ok()
+            && fi.deleted
+            && (fi.mark_deleted || force_del_marker)
+            && !fi.tier_free_version()
+            && version_purge_status_from_filemeta(fi.version_purge_status()) != VersionPurgeStatusType::Complete
+            && errs.iter().any(Option::is_some)
+        {
+            let version_id = fi.version_id.map(|version| version.to_string());
+            let _ = self
+                .add_partial(bucket, object, version_id.as_deref().unwrap_or_default())
+                .await;
+        }
         quorum_result
     }
 
@@ -8936,24 +8949,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        // MRF journal intent: partial-write recovery must survive a restart
-        // (HS-01); the heal request below remains the in-memory fast path.
-        let version_uuid = if version_id.is_empty() {
-            Some(None)
-        } else {
-            uuid::Uuid::try_parse(version_id).ok().map(Some)
-        };
-        if let Some(version_uuid) = version_uuid
-            && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(self.pool_index), u32::try_from(self.set_index))
-        {
-            let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
-            let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
-                rustfs_common::mrf_channel::MrfKind::PartialWrite,
-                bucket,
-                object,
-                version_uuid,
-                Some(scope),
-            );
+        if self.persist_partial_write(bucket, object, Some(version_id)).await {
+            return Ok(());
         }
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
