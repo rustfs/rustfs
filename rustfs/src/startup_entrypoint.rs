@@ -16,8 +16,8 @@ use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
         ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
-        ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
-        ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
+        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -140,6 +140,7 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
+        CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
@@ -758,6 +759,138 @@ async fn execute_connect_client_performance(options: ConnectClientPerformanceOpt
     let output = options.output;
     let writer_cancel = cancel.clone();
     let mut writer = tokio::task::spawn_blocking(move || save_signed_client_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalObjectConsent, ObjectOperation, ObjectOutcome, ObjectPerformanceRequest, ObjectProvenance,
+        S3ObjectProbe, measure_object, read_protected_object_credential, save_signed_object_export, sign_object_export,
+        validate_object_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    let operation = match options.operation {
+        ConnectObjectPerformanceOperation::Get => ObjectOperation::GetObject,
+        ConnectObjectPerformanceOperation::Put => ObjectOperation::PutObject,
+    };
+    validate_object_limits(duration, operation, options.traffic_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect object performance requires an enrolled device identity"))?;
+    let access_key = read_protected_object_credential(&options.access_key_file).map_err(Error::other)?;
+    let secret_key = read_protected_object_credential(&options.secret_key_file).map_err(Error::other)?;
+    let session_token = options
+        .session_token_file
+        .as_deref()
+        .map(read_protected_object_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let root_ca = if let Some(path) = options.ca_file.as_deref() {
+        const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        std::fs::File::open(path)?
+            .take(MAX_ROOT_CA_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+        if bytes.len() > max_bytes {
+            return Err(Error::other("connect object root CA exceeds the 1048576-byte limit"));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let probe = S3ObjectProbe::new(
+        &options.endpoint,
+        root_ca.as_deref(),
+        options.proxy.as_deref(),
+        access_key,
+        secret_key,
+        session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ObjectPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalObjectConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        operation,
+        traffic_bytes: options.traffic_bytes,
+        target_alias: options.target_alias,
+        provenance: ObjectProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_object(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.object outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != ObjectOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "object performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_object_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_object_export(&output, &export, &writer_cancel));
     let receipt = tokio::select! {
         biased;
         signal = tokio::signal::ctrl_c() => {

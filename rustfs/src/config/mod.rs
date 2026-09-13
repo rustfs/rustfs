@@ -57,6 +57,7 @@ pub use cli::{
 pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
 pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
 pub use cli::{ConnectLogsMode, ConnectLogsOpts};
+pub use cli::{ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
 pub use cli::{
     ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
