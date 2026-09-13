@@ -16,7 +16,7 @@ use crate::{
     config::{
         CommandResult, Config, ConnectDrivePerformanceOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode,
         ConnectLogsOpts, ConnectProfileOpts, ConnectProfileTool, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
-        ConnectThreadProfileScope, Opt,
+        ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -140,6 +140,7 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
+        CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
         CommandResult::Server(config) => config,
     };
 
@@ -474,6 +475,135 @@ fn valid_environment_name(value: &str) -> bool {
 fn unix_now() -> Result<i64> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(Error::other)?;
     i64::try_from(duration.as_secs()).map_err(Error::other)
+}
+
+async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
+        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_disk, capture_top_locks,
+        capture_top_net, capture_top_rpc,
+    };
+
+    let (tool_id, options) = match command {
+        ConnectTopCommands::Api(options) => ("top.api", options),
+        ConnectTopCommands::Disk(options) => ("top.disk", options),
+        ConnectTopCommands::Locks(options) => ("top.locks", options),
+        ConnectTopCommands::Net(options) => ("top.net", options),
+        ConnectTopCommands::Rpc(options) => ("top.rpc", options),
+    };
+    let window = Duration::from_millis(options.window_millis);
+    let export_validity = Duration::from_secs(options.export_validity_seconds);
+    if window.is_zero() || window > MAX_TOP_DURATION || export_validity.is_zero() || export_validity > MAX_TOP_EXPORT_VALIDITY {
+        return Err(Error::other("connect_top_limits_invalid"));
+    }
+
+    let identity = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect top requires an enrolled device identity"))?;
+    let request = TopCaptureRequest {
+        scope: TopCaptureScope {
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            policy_revision: options.policy_revision,
+            run_expires_at_unix: options.run_expires_at_unix,
+            executable_sha256: hash_current_executable()?,
+            build_features: enabled_build_features(),
+            consent: LocalTopConsent {
+                uid: options.consent_uid,
+                tool_id: tool_id.to_owned(),
+                classification: TOP_CLASSIFICATION.to_owned(),
+                active: options.acknowledge_l3,
+                expires_at_unix: options.consent_expires_at_unix,
+            },
+        },
+        limits: TopCaptureLimits::default(),
+        window,
+        export_validity,
+    };
+    let cancel = CancellationToken::new();
+    match tool_id {
+        "top.api" => {
+            let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.disk" => {
+            let result = await_top_capture(capture_top_disk(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.locks" => {
+            let result = await_top_capture(capture_top_locks(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.net" => {
+            let result = await_top_capture(capture_top_net(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.rpc" => {
+            let result = await_top_capture(capture_top_rpc(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        _ => unreachable!("closed top command"),
+    }
+}
+
+async fn await_top_capture<T, F>(future: F, cancel: &CancellationToken) -> Result<crate::connect::TopResult<T>>
+where
+    T: serde::Serialize,
+    F: std::future::Future<Output = std::result::Result<crate::connect::TopResult<T>, crate::connect::TopCaptureError>>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            future.await.map_err(Error::other)
+        }
+        result = future.as_mut() => result.map_err(Error::other),
+    }
+}
+
+async fn finish_top_capture<T: serde::Serialize>(
+    request: &crate::connect::TopCaptureRequest,
+    result: crate::connect::TopResult<T>,
+    identity: &crate::connect::DeviceIdentity,
+    output: std::path::PathBuf,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    use crate::connect::{TopOutcome, save_signed_top_export, sign_top_export};
+
+    println!("result={}", serde_json::to_string(&result).map_err(Error::other)?);
+    std::io::stdout().flush()?;
+    if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
+        return Err(Error::other(format!(
+            "top capture ended with {} ({})",
+            result.outcome.as_str(),
+            result.reason_code.as_str()
+        )));
+    }
+
+    let export = sign_top_export(request, &result, identity, cancel).map_err(Error::other)?;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_top_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
 }
 
 async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {

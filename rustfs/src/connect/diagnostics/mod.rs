@@ -18,6 +18,11 @@ mod profile_cpu;
 mod profile_memory;
 mod profile_threads;
 mod schedule;
+mod top_api;
+mod top_disk;
+mod top_locks;
+mod top_net;
+mod top_rpc;
 mod trace_analysis;
 mod trace_otlp;
 mod trace_record;
@@ -45,6 +50,15 @@ pub use schedule::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
 };
+pub use top_api::{
+    LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, SavedTopExport, SignedTopExport, TOP_CLASSIFICATION,
+    TOP_SCHEMA_VERSION, TopApiData, TopApiOperation, TopCaptureError, TopCaptureLimits, TopCaptureRequest, TopCaptureScope,
+    TopCoverage, TopOutcome, TopProvenance, TopReasonCode, TopResult, capture_top_api, save_signed_top_export, sign_top_export,
+};
+pub use top_disk::{DiskCounterSnapshot, TopDiskData, capture_top_disk, evaluate_disk_window};
+pub use top_locks::{TopLocksData, capture_top_locks};
+pub use top_net::{NetworkCounterSnapshot, TopNetData, capture_top_net, evaluate_network_window};
+pub use top_rpc::{TopRpcData, capture_top_rpc};
 pub use trace_analysis::{OperationSummary, TraceAnalysis, TraceAnalysisError, analyze_trace};
 pub use trace_otlp::{
     LocalOtlpHeaders, MAX_OTLP_BODY_BYTES, OtlpBatch, OtlpForwardError, OtlpReceipt, export_trace_otlp, export_trace_otlp_result,

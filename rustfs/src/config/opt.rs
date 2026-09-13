@@ -149,6 +149,7 @@ impl Opt {
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
                 ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
                 ConnectCommands::Telemetry(opts) => Ok(CommandResult::ConnectTelemetry(opts.command)),
+                ConnectCommands::Top(opts) => Ok(CommandResult::ConnectTop(opts.command)),
             },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
