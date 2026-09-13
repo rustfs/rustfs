@@ -95,6 +95,15 @@ impl TelemetryTransport {
     }
 
     pub(crate) async fn post<T: Serialize>(&self, collection: &str, value: &T) -> Result<TelemetryDelivery, TelemetryError> {
+        self.post_expect(collection, value, StatusCode::OK).await
+    }
+
+    pub(crate) async fn post_expect<T: Serialize>(
+        &self,
+        collection: &str,
+        value: &T,
+        expected_status: StatusCode,
+    ) -> Result<TelemetryDelivery, TelemetryError> {
         let mut authenticated = self.authenticated_client().await?;
         let mut refreshed = false;
         loop {
@@ -138,7 +147,7 @@ impl TelemetryTransport {
                     reason: response_reason(response).await,
                 });
             }
-            if status != StatusCode::OK {
+            if status != expected_status {
                 return Ok(TelemetryDelivery::Rejected {
                     status: status.as_u16(),
                     reason: response_reason(response).await,
@@ -149,6 +158,10 @@ impl TelemetryTransport {
                 body: bounded_body(response).await?,
             });
         }
+    }
+
+    pub(crate) fn presigned_client(&self, timeout: Duration) -> Result<Client, TelemetryError> {
+        build_client(&self.roots, timeout, None, self.config.proxy.as_ref()).map_err(credential_recovery_error)
     }
 
     async fn authenticated_client(&self) -> Result<AuthenticatedClient, TelemetryError> {

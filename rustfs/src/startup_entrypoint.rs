@@ -17,8 +17,8 @@ use crate::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
         ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
         ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts,
-        ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts,
+        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -139,6 +139,7 @@ async fn async_main() -> Result<()> {
         }
         CommandResult::ConnectLicense(command) => return execute_connect_license(command).await,
         CommandResult::ConnectRelay(options) => return execute_connect_relay(*options).await,
+        CommandResult::ConnectReportUpload(options) => return execute_connect_report_upload(options).await,
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
@@ -1410,6 +1411,35 @@ async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> 
     } else {
         Err(Error::other(format!("Connect service license status is {}", report.status)))
     }
+}
+
+async fn execute_connect_report_upload(options: ConnectReportUploadOpts) -> Result<()> {
+    use crate::connect::{CredentialStore, HeartbeatConfig, IdentityStore, ProxyConfig, ReportUploadClient};
+
+    let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+    let mut config = HeartbeatConfig::new(
+        &options.endpoint,
+        root_ca_pem,
+        IdentityStore::new(options.state_dir.join("identity")),
+        CredentialStore::new(options.state_dir.join("credential")),
+        options.state_dir.join("heartbeat/state.json"),
+    );
+    config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = ReportUploadClient::new(config, Duration::from_secs(options.upload_timeout_seconds)).map_err(Error::other)?;
+    let cancellation = CancellationToken::new();
+    let upload = client.upload(&options.archive, &cancellation);
+    tokio::pin!(upload);
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancellation.cancel();
+            return Err(Error::other("connect report upload cancelled"));
+        }
+        result = upload.as_mut() => result.map_err(Error::other)?,
+    };
+    println!("{}", serde_json::to_string(&receipt).map_err(Error::other)?);
+    Ok(())
 }
 
 async fn execute_connect_relay(options: ConnectRelayOpts) -> Result<()> {

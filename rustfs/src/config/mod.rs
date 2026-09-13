@@ -61,6 +61,7 @@ pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
 pub use cli::{ConnectRelayMaterialKind, ConnectRelayOpts};
+pub use cli::{ConnectReportCommands, ConnectReportOpts, ConnectReportUploadOpts};
 pub use cli::{
     ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
     ConnectTelemetryReplayOpts,

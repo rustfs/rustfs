@@ -40,6 +40,7 @@ pub mod offline;
 pub mod registration;
 pub mod registration_bootstrap;
 pub mod relay;
+pub mod report_upload;
 pub mod runtime;
 mod telemetry;
 
@@ -136,4 +137,5 @@ pub use relay::{
     RelayReview, TrustedReceiptSigner, prepare_approved_artifact, read_protected_relay_artifact,
     read_protected_relay_authentication,
 };
+pub use report_upload::{MAX_SUPPORT_BUNDLE_BYTES, ReportUploadClient, ReportUploadError, ReportUploadReceipt};
 pub use runtime::{HeartbeatRuntime, InventoryRuntime, spawn_heartbeat_runtime, spawn_inventory_runtime};

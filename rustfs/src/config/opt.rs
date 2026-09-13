@@ -19,8 +19,8 @@
 
 use super::Config;
 use super::cli::{
-    Cli, CommandResult, Commands, ConnectCommands, ConnectInventoryCommands, ConnectPerformanceCommands, ServerOpts,
-    default_server_opts, preprocess_args_for_legacy,
+    Cli, CommandResult, Commands, ConnectCommands, ConnectInventoryCommands, ConnectPerformanceCommands, ConnectReportCommands,
+    ServerOpts, default_server_opts, preprocess_args_for_legacy,
 };
 use crate::apply_external_env_compat;
 use CommandResult::Server;
@@ -144,6 +144,9 @@ impl Opt {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
                 ConnectCommands::Relay(opts) => Ok(CommandResult::ConnectRelay(opts)),
+                ConnectCommands::Report(opts) => match opts.command {
+                    ConnectReportCommands::Upload(opts) => Ok(CommandResult::ConnectReportUpload(opts)),
+                },
                 ConnectCommands::Inventory(opts) => match opts.command {
                     ConnectInventoryCommands::Environment(opts) => Ok(CommandResult::ConnectEnvironmentInventory(opts)),
                 },

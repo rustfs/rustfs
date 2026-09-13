@@ -129,6 +129,8 @@ pub enum ConnectCommands {
     License(ConnectLicenseOpts),
     /// Deliver a reviewed signed artifact through the customer relay (Unix only)
     Relay(Box<ConnectRelayOpts>),
+    /// Upload an explicitly selected support report with the registered device identity
+    Report(ConnectReportOpts),
     /// Read the persisted deployment inventory and collect an approved environment summary
     Inventory(ConnectInventoryOpts),
     /// Run an explicitly approved, bounded local performance measurement
@@ -196,6 +198,44 @@ pub struct ConnectRelayOpts {
     /// Confirm the artifact, producer, destination, digest and classification were reviewed
     #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
     pub acknowledge_reviewed: bool,
+}
+
+/// Support report operations.
+#[derive(Args, Clone)]
+pub struct ConnectReportOpts {
+    #[command(subcommand)]
+    pub command: ConnectReportCommands,
+}
+
+/// Device-authenticated support report operations.
+#[derive(Subcommand, Clone)]
+pub enum ConnectReportCommands {
+    /// Upload one bounded archive through a short-lived object-store authorization
+    Upload(ConnectReportUploadOpts),
+}
+
+/// `connect report upload` options.
+#[derive(Args, Clone)]
+pub struct ConnectReportUploadOpts {
+    /// Connect agent API HTTPS base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used for Connect and its authorized object store
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    /// Directory containing the registered Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Explicitly selected support report archive
+    #[arg(long)]
+    pub archive: PathBuf,
+
+    /// Bounded timeout for each object upload request
+    #[arg(long = "upload-timeout-seconds", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=900))]
+    pub upload_timeout_seconds: u64,
 }
 
 #[derive(Args, Clone)]
@@ -1375,6 +1415,8 @@ pub enum CommandResult {
     ConnectLicense(ConnectLicenseCommands),
     /// Customer-operated relay of one reviewed signed artifact
     ConnectRelay(Box<ConnectRelayOpts>),
+    /// Device-authenticated upload of one support report archive
+    ConnectReportUpload(ConnectReportUploadOpts),
     /// Explicit local Connect environment inventory command
     ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
@@ -1434,7 +1476,7 @@ pub fn default_server_opts() -> ServerOpts {
 mod tests {
     use super::{
         Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, ConnectRelayMaterialKind,
-        InspectCommands, preprocess_args_for_legacy,
+        ConnectReportCommands, InspectCommands, preprocess_args_for_legacy,
     };
     use crate::version;
     use clap::error::ErrorKind;
@@ -1603,6 +1645,59 @@ mod tests {
         let ConnectCommands::Relay(options) = connect.command else { panic!("relay command expected") };
         assert_eq!(options.material_kind, ConnectRelayMaterialKind::DiagnosticBundleManifest);
         assert!(options.acknowledge_reviewed);
+    }
+
+    #[test]
+    fn connect_report_upload_accepts_only_explicit_archive_and_transport_paths() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "report",
+            "upload",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--archive",
+            "/var/lib/rustfs/reports/support.tar.zst",
+        ])
+        .expect("report upload arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Report(report) = connect.command else {
+            panic!("connect report command expected");
+        };
+        let ConnectReportCommands::Upload(upload) = report.command;
+        assert_eq!(upload.endpoint, "https://connect.example/agent/");
+        assert_eq!(upload.archive, std::path::Path::new("/var/lib/rustfs/reports/support.tar.zst"));
+        assert_eq!(upload.upload_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn connect_report_upload_rejects_unbounded_timeout() {
+        let error = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "report",
+            "upload",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--archive",
+            "/var/lib/rustfs/reports/support.tar.zst",
+            "--upload-timeout-seconds",
+            "901",
+        ])
+        .err()
+        .expect("unbounded upload timeout must fail");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]
