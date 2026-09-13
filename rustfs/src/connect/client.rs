@@ -647,7 +647,8 @@ pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configure
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
         let message = error.to_string().to_ascii_lowercase();
-        if message.contains("407") || message.contains("proxy authentication") {
+        if message.contains("407") || message.contains("proxy authentication") || message.contains("proxy authorization required")
+        {
             return Some(TransportFailure::ProxyAuthentication);
         }
         if message.contains("certificate")
@@ -657,7 +658,7 @@ pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configure
         {
             return Some(TransportFailure::TlsPeer);
         }
-        if proxy_configured && message.contains("unsuccessful tunnel") {
+        if proxy_configured && message.contains("tunnel error: unsuccessful") {
             return Some(TransportFailure::ProxyRejected);
         }
         source = error.source();
@@ -720,7 +721,7 @@ pub enum ClientError {
     RootCertificate,
     #[error("Connect proxy configuration is invalid")]
     ProxyConfiguration(#[from] ProxyConfigError),
-    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    #[error("Connect proxy authentication failed; verify the configured proxy credentials")]
     ProxyAuthentication,
     #[error(
         "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
@@ -752,7 +753,7 @@ pub enum ClientError {
     AccessRevoked { status: StatusCode, reason: Option<String> },
     #[error("Connect rejected the request with HTTP {status}; reason={reason:?}")]
     Rejected { status: StatusCode, reason: Option<String> },
-    #[error("Connect remained unavailable after bounded retries; last_status={status:?}")]
+    #[error("Connect availability check failed after bounded retries; last_status={status:?}")]
     Unavailable { status: Option<StatusCode> },
     #[error("Connect response exceeded the 1 MiB credential-response limit")]
     ResponseTooLarge,
