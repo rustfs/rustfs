@@ -82,6 +82,24 @@ async fn legacy_repair_reports_execution_without_strong_receipt() {
     assert_eq!(result.item.drives_healed(), Some(1));
     assert!(!result.item.integrity_verified);
     assert!(result.receipt.is_none(), "physical repair does not prove original identity");
+    let storage = ECStoreHealStorage::new(env.ecstore.clone());
+    let incarnation = storage.admit_bucket_incarnation(bucket).await.expect("bucket admission");
+    let scoped = storage
+        .heal_object_at_incarnation(
+            bucket,
+            object,
+            None,
+            incarnation,
+            &HealOpts {
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("incarnation-bound legacy scan");
+    assert!(scoped.error.is_none(), "{:?}", scoped.error);
+    assert!(!scoped.item.integrity_verified);
+    assert!(scoped.receipt.is_none(), "bucket admission cannot certify legacy shard integrity");
     let mut reader = env
         .ecstore
         .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())

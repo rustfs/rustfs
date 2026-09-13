@@ -48,6 +48,7 @@ message PingResponse {
 message HealBucketRequest {
   string bucket = 1;
   string options = 2;
+  bytes bucket_incarnation_id = 3;
 }
 
 message HealBucketResponse {
@@ -128,6 +129,7 @@ message DeleteRequest {
   // Optional scanner publication lease token. When present, the target binds
   // the complete delete operation to its movement read admission.
   bytes scanner_publication_lease_token = 5;
+  bytes bucket_incarnation_id = 6;
 }
 
 message DeleteResponse {
@@ -305,6 +307,8 @@ message RenameDataRequest {
   // legacy rename request body; a non-empty token is checked at the target's
   // rename linearization point.
   bytes scanner_publication_lease_token = 8;
+  // Required by RenameDataAtIncarnation; never accepted by legacy RenameData.
+  bytes bucket_incarnation_id = 9;
 }
 
 message RenameDataResponse {
@@ -433,6 +437,7 @@ message WriteMetadataRequest {
   string path = 3;
   string file_info = 4;
   bytes file_info_bin = 5;
+  bytes bucket_incarnation_id = 6;
 }
 
 message WriteMetadataResponse {
@@ -494,6 +499,7 @@ message DeleteVersionRequest {
   // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
   bytes file_info_bin = 7;
   bytes opts_bin = 8;
+  bytes bucket_incarnation_id = 9;
 }
 
 message DeleteVersionResponse {
@@ -1174,6 +1180,7 @@ service NodeService {
 /* -------------------------------meta service-------------------------- */
   rpc Ping(PingRequest) returns (PingResponse) {}; // auth-policy: read-only
   rpc HealBucket(HealBucketRequest) returns (HealBucketResponse) {}; // auth-policy: body-bound
+  rpc HealBucketAtIncarnation(HealBucketRequest) returns (HealBucketResponse) {}; // auth-policy: body-bound
   rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {}; // auth-policy: read-only
   rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {}; // auth-policy: body-bound
   rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {}; // auth-policy: read-only
@@ -1184,6 +1191,7 @@ service NodeService {
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
+  rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
@@ -1201,6 +1209,7 @@ service NodeService {
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only
@@ -1209,10 +1218,12 @@ service NodeService {
   rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {}; // auth-policy: body-bound
   rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {}; // auth-policy: read-only
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
+  rpc WriteMetadataAtIncarnation(WriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {}; // auth-policy: read-only
   rpc BatchReadVersion(BatchReadVersionRequest) returns (BatchReadVersionResponse) {}; // auth-policy: read-only
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {}; // auth-policy: read-only
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
+  rpc DeleteVersionAtIncarnation(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteRetiredMarker(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only

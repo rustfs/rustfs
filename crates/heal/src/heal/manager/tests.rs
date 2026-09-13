@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
 mod root_recovery;
+use uuid::Uuid;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -559,6 +560,23 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
 
 #[async_trait::async_trait]
 impl HealStorageAPI for MockStorage {
+    async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
+        if bucket.starts_with("incarnation-metadata-unavailable-") {
+            return Err(Error::Storage(EcstoreError::SlowDown));
+        }
+        root_recovery::test_bucket_incarnation(bucket)
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: None,
+            })
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_bucket(bucket, opts).await
+    }
+
     async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
         Ok(None)
     }

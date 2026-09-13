@@ -310,6 +310,8 @@ pub struct HealRequest {
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    /// Admission identity for an explicit administrator bucket heal. Never rebound on replay.
+    pub bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority
@@ -337,6 +339,7 @@ impl HealRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             heal_type,
+            bucket_incarnation_id: None,
             options,
             priority,
             source: HealRequestSource::Internal,
@@ -401,6 +404,7 @@ pub struct HealTask {
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    pub bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority inherited from the request
@@ -472,6 +476,7 @@ impl HealTask {
         Self {
             id: request.id,
             heal_type: request.heal_type,
+            bucket_incarnation_id: request.bucket_incarnation_id,
             options: request.options,
             priority: request.priority,
             source: request.source,
@@ -502,6 +507,7 @@ impl HealTask {
         HealRequest {
             id: self.id.clone(),
             heal_type: self.heal_type.clone(),
+            bucket_incarnation_id: self.bucket_incarnation_id,
             options: self.options.clone(),
             priority: self.priority,
             source: self.source,

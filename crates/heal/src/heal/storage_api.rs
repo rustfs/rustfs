@@ -29,7 +29,7 @@ pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageEr
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
-    POOL_META_NAME as ECSTORE_POOL_META_NAME,
+    HealObjectStorageResult as EcstoreHealObjectStorageResult, POOL_META_NAME as ECSTORE_POOL_META_NAME,
 };
 use rustfs_storage_api as storage_contracts;
 
@@ -48,6 +48,7 @@ pub(crate) mod owner {
 }
 
 pub(crate) mod storage {
+    pub(crate) use super::EcstoreHealObjectStorageResult;
     pub(crate) use super::storage_contracts::{
         BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
         StorageAdminApi,

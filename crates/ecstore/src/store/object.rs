@@ -8591,7 +8591,7 @@ mod tests {
         );
         drop(failure);
         let cleaned = store
-            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .heal_object_at_incarnation(bucket, object, &marker.to_string(), current, &heal)
             .await
             .expect("cleanup retired marker");
         assert!(cleaned.error.is_none(), "cleanup error: {:?}", cleaned.error);

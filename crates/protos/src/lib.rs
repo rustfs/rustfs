@@ -817,6 +817,9 @@ impl_canonical_mutation_body!(
     |request, body| {
         body.push_str(&request.bucket)?;
         body.push_str(&request.options)?;
+        if !request.bucket_incarnation_id.is_empty() {
+            body.push_bytes(&request.bucket_incarnation_id)?;
+        }
     }
 );
 impl_canonical_mutation_body!(
@@ -995,6 +998,10 @@ pub fn canonical_rename_data_request_body(
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
     }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1010,6 +1017,9 @@ pub fn canonical_delete_version_request_body(
     body.push_str(&request.opts)?;
     body.push_bytes(&request.file_info_bin)?;
     body.push_bytes(&request.opts_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1041,6 +1051,10 @@ pub fn canonical_write_metadata_request_body(
     body.push_str(&request.path)?;
     body.push_str(&request.file_info)?;
     body.push_bytes(&request.file_info_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1079,6 +1093,10 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.options)?;
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
     }
     Ok(body.finish())
 }
@@ -1240,6 +1258,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn rename_data_canonical_body_binds_every_field() {
         let baseline = RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             src_volume: "src-vol".into(),
             src_path: "src-path".into(),
@@ -1260,6 +1279,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
             |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1290,6 +1310,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn delete_version_canonical_body_binds_every_field() {
         let baseline = DeleteVersionRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             volume: "vol".into(),
             path: "path".into(),
@@ -1309,6 +1330,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
             |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
             |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+            |r: &mut DeleteVersionRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1351,6 +1373,7 @@ mod disk_mutation_canonical_tests {
         // Mutating each field in turn and asserting all bodies differ catches a dropped or
         // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
         let write_metadata = WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1364,6 +1387,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut WriteMetadataRequest| r.path = "p2".into(),
             |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
             |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut WriteMetadataRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = write_metadata.clone();
             mutate(&mut request);
@@ -1416,6 +1440,7 @@ mod disk_mutation_canonical_tests {
         assert_all_distinct(&bodies);
 
         let delete = DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1428,6 +1453,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.bucket_incarnation_id = vec![1; 16].into(),
             |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
@@ -1766,7 +1792,7 @@ mod non_disk_mutation_canonical_tests {
 
     #[test]
     fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
-        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
         assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
