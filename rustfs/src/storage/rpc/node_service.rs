@@ -1754,7 +1754,7 @@ impl Node for NodeService {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound delete requires DeleteVersionAtIncarnation"));
         }
-        self.handle_delete_version(request).await
+        self.handle_delete_version(request, false).await
     }
 
     async fn delete_version_at_incarnation(
@@ -1769,7 +1769,14 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_delete_version(request).await
+        self.handle_delete_version(request, false).await
+    }
+
+    async fn delete_retired_marker(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        self.handle_delete_version(request, true).await
     }
 
     async fn delete_versions(&self, request: Request<DeleteVersionsRequest>) -> Result<Response<DeleteVersionsResponse>, Status> {
@@ -3016,13 +3023,14 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 22] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 23] = [
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
         "deleteatincarnation",
         "deleteversionatincarnation",
         "deleteversion",
+        "deleteretiredmarker",
         "deleteversions",
         "writemetadata",
         "updatemetadata",
@@ -4233,6 +4241,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_rename_requires_its_own_authenticated_body_and_success() {
+        let service = make_server();
+        let mut message = RenameFileRequest {
+            disk: "http://node-a:9000/data/rustfs0".to_owned(),
+            src_volume: ".rustfs.sys/tmp".to_owned(),
+            src_path: "integrity-stage/index".to_owned(),
+            dst_volume: "bucket".to_owned(),
+            dst_path: "object/index".to_owned(),
+            durable: false,
+        };
+        let old_body = rustfs_protos::canonical_rename_file_request_body(&message).expect("ordinary rename body");
+        message.durable = true;
+        let mut tampered = Request::new(message.clone());
+        set_tonic_canonical_body_digest(&mut tampered, &old_body).expect("digest");
+        mark_v2_authenticated(&mut tampered);
+        let error = service
+            .rename_file(tampered)
+            .await
+            .expect_err("durability flag must be authenticated");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let body = rustfs_protos::canonical_rename_file_request_body(&message).expect("durable rename body");
+        let mut request = Request::new(message);
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .rename_file(request)
+            .await
+            .expect("valid digest passes the gate")
+            .into_inner();
+        assert!(!response.success, "unknown disk cannot apply the rename");
+        assert!(!response.durability_applied, "failed publication cannot acknowledge durability");
+    }
+
+    #[tokio::test]
     async fn disk_mutation_body_digest_gate_runs_before_disk_lookup() {
         let service = make_server();
 
@@ -4365,6 +4408,21 @@ mod tests {
             rustfs_protos::canonical_delete_version_request_body
         );
         assert_gated!(
+            delete_retired_marker,
+            DeleteVersionRequest {
+                bucket_incarnation_id: Default::default(),
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                force_del_marker: false,
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
             write_metadata_at_incarnation,
             WriteMetadataRequest {
                 bucket_incarnation_id: vec![1; 16].into(),
@@ -4482,6 +4540,7 @@ mod tests {
         assert_gated!(
             rename_file,
             RenameFileRequest {
+                durable: false,
                 disk: disk.clone(),
                 src_volume: "src".into(),
                 src_path: "sp".into(),
@@ -5752,6 +5811,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(RenameFileRequest {
+            durable: false,
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
@@ -6773,6 +6833,99 @@ mod tests {
         assert!(!read_response.success);
         assert!(read_response.error.is_some());
         assert!(read_response.raw_file_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_marker_rpc_rejects_missing_or_combined_conditions() {
+        use crate::storage::storage_api::ecstore_disk::DeleteOptions;
+        use rustfs_filemeta::{FileInfo, MetaDeleteMarker};
+        let service = create_test_node_service();
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        for opts in [
+            DeleteOptions::default(),
+            DeleteOptions {
+                undo_write: true,
+                expected_delete_marker: Some(MetaDeleteMarker::from(marker)),
+                ..Default::default()
+            },
+        ] {
+            let mut request = Request::new(DeleteVersionRequest {
+                disk: "invalid-disk-path".into(),
+                volume: "bucket".into(),
+                path: "marker.bin".into(),
+                file_info: serde_json::to_string(&FileInfo::default()).unwrap(),
+                opts: serde_json::to_string(&opts).unwrap(),
+                ..Default::default()
+            });
+            let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).unwrap();
+            set_tonic_canonical_body_digest(&mut request, &body).unwrap();
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .delete_retired_marker(request)
+                .await
+                .expect_err("invalid conditional request must be rejected before disk lookup");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_marker_rpc_binds_bucket_incarnation() {
+        use crate::storage::storage_api::ecstore_disk::DeleteOptions;
+        use rustfs_filemeta::{FileInfo, MetaDeleteMarker};
+
+        let service = create_test_node_service();
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        let message = DeleteVersionRequest {
+            bucket_incarnation_id: vec![1; 16].into(),
+            volume: "bucket".into(),
+            path: "marker.bin".into(),
+            file_info: serde_json::to_string(&FileInfo::default()).expect("file info"),
+            opts: serde_json::to_string(&DeleteOptions {
+                expected_delete_marker: Some(MetaDeleteMarker::from(marker)),
+                ..Default::default()
+            })
+            .expect("marker precondition"),
+            ..Default::default()
+        };
+        for (identity, digest_identity, expected) in [
+            (vec![1; 16], None, tonic::Code::PermissionDenied),
+            (vec![0; 16], Some(vec![0; 16]), tonic::Code::InvalidArgument),
+            (vec![1; 15], Some(vec![1; 15]), tonic::Code::InvalidArgument),
+            (vec![2; 16], Some(vec![1; 16]), tonic::Code::PermissionDenied),
+            (Vec::new(), Some(vec![1; 16]), tonic::Code::PermissionDenied),
+            (vec![1; 16], Some(vec![1; 16]), tonic::Code::FailedPrecondition),
+        ] {
+            let mut request = Request::new(message.clone());
+            if let Some(digest_identity) = digest_identity {
+                request.get_mut().bucket_incarnation_id = digest_identity.into();
+                let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).expect("canonical body");
+                set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            }
+            // Removing the wire field models a peer predating incarnation support:
+            // its canonical body must reject the new sender's signed identity.
+            request.get_mut().bucket_incarnation_id = identity.into();
+            mark_v2_authenticated(&mut request);
+            assert_eq!(
+                service
+                    .delete_retired_marker(request)
+                    .await
+                    .expect_err("incarnation and marker checks must precede disk mutation")
+                    .code(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

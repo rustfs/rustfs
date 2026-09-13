@@ -1077,6 +1077,20 @@ impl ECStore {
             .await?;
         }
 
+        // Capture the authoritative old identity before its namespace disappears.
+        // Legacy buckets without a stamp cannot produce retirement authority.
+        let retirement = if bucket_exists && bucket_lifecycle_guard.is_some() && !is_meta_bucketname(bucket) {
+            if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
+                crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket)
+                    .await?
+                    .map(|incarnation| (store, incarnation))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let delete_result = await_bucket_namespace_operation(
             bucket_lifecycle_guard.as_ref(),
             bucket,
@@ -1098,6 +1112,27 @@ impl ECStore {
                 }
             }
             return Err(err);
+        }
+
+        if let Some((store, incarnation)) = retirement {
+            let mut record_opts = ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            };
+            if let Some(guard) = bucket_lifecycle_guard.as_ref() {
+                record_opts.add_bucket_lifecycle_lock_guard(guard);
+            }
+            if let Some(guard) = ns_guard.as_ref() {
+                record_opts.add_namespace_lock_guard(guard);
+            }
+            await_bucket_lifecycle_operation(
+                bucket_lifecycle_guard.as_ref(),
+                ns_guard.as_ref(),
+                bucket,
+                "bucket retirement publication",
+                crate::bucket::retirement::commit_retirement(store, bucket, incarnation, &record_opts),
+            )
+            .await?;
         }
 
         self.cleanup_bucket_usage_best_effort(bucket, ns_guard.as_ref()).await;

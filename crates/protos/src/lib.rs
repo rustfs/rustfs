@@ -1157,6 +1157,11 @@ pub fn canonical_rename_file_request_body(
     body.push_str(&request.src_path)?;
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
+    // Preserve the release signature for ordinary renames. An older server
+    // computes a different digest for a durable request and rejects mutation.
+    if request.durable {
+        body.push_bool(true);
+    }
     Ok(body.finish())
 }
 
@@ -1476,6 +1481,7 @@ mod disk_mutation_canonical_tests {
         assert_all_distinct(&bodies);
 
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1484,6 +1490,7 @@ mod disk_mutation_canonical_tests {
         };
         let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
         for mutate in [
+            |r: &mut RenameFileRequest| r.durable = true,
             |r: &mut RenameFileRequest| r.disk = "d2".into(),
             |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
             |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
@@ -1659,9 +1666,27 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn durable_rename_extension_preserves_old_wire_defaults_and_signatures() {
+        use crate::proto_gen::node_service::RenameFileResponse;
+        use prost::Message;
+        // Release wire messages omitted request tag 6 and response tag 3.
+        let mut request =
+            RenameFileRequest::decode(b"\x0a\x01d\x12\x01s\x1a\x01p\x22\x01v\x2a\x01q".as_slice()).expect("release request");
+        assert!(!request.durable);
+        let old_body = b"rustfs-rename-file-request-v1\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\0\x01s\0\0\0\0\0\0\0\x01p\0\0\0\0\0\0\0\x01v\0\0\0\0\0\0\0\x01q";
+        assert_eq!(canonical_rename_file_request_body(&request).expect("body"), old_body);
+        request.durable = true;
+        assert_ne!(canonical_rename_file_request_body(&request).expect("durable body"), old_body);
+        let old_success = RenameFileResponse::decode(b"\x08\x01".as_slice()).expect("release response");
+        assert!(old_success.success);
+        assert!(!old_success.durability_applied, "old success cannot certify durable publication");
+    }
+
+    #[test]
     fn disk_mutation_canonical_domains_are_distinct_per_message() {
         // The same field values must never authenticate one RPC's request as another's.
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),

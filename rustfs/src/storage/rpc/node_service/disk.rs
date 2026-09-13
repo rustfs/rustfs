@@ -735,6 +735,7 @@ impl NodeService {
     pub(super) async fn handle_delete_version(
         &self,
         request: Request<DeleteVersionRequest>,
+        require_marker_condition: bool,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         if !request.get_ref().bucket_incarnation_id.is_empty()
             && !request
@@ -771,6 +772,21 @@ impl NodeService {
                 }));
             }
         };
+        if require_marker_condition && opts.expected_delete_marker.is_none() {
+            return Err(Status::invalid_argument("retired marker deletion requires a marker precondition"));
+        }
+        if opts.expected_delete_marker.is_some()
+            && (request.force_del_marker
+                || opts.undo_write
+                || opts.undo_delete
+                || opts.recursive
+                || opts.immediate
+                || opts.old_data_dir.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "retired marker preconditions cannot be combined with other mutations",
+            ));
+        }
         let result = if !request.bucket_incarnation_id.is_empty() {
             let expected = Uuid::from_slice(&request.bucket_incarnation_id)
                 .ok()
@@ -1448,22 +1464,29 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk
-                .rename_file(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
-                .await
-            {
+            let result = if request.durable {
+                disk.rename_file_durable(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
+                    .await
+            } else {
+                disk.rename_file(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
+                    .await
+            };
+            match result {
                 Ok(_) => Ok(Response::new(RenameFileResponse {
                     success: true,
+                    durability_applied: request.durable,
                     error: None,
                 })),
                 Err(err) => Ok(Response::new(RenameFileResponse {
                     success: false,
+                    durability_applied: false,
                     error: Some(err.into()),
                 })),
             }
         } else {
             Ok(Response::new(RenameFileResponse {
                 success: false,
+                durability_applied: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }

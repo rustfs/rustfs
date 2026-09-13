@@ -866,6 +866,8 @@ mod ctx;
 mod metadata;
 mod ops;
 pub(crate) use ops::bucket::BucketInfoQuorum;
+#[cfg(test)]
+pub(crate) use ops::heal::DanglingDeleteFailure;
 pub(crate) use ops::heal::HealedObjectAbsence;
 
 #[cfg(test)]
@@ -6426,6 +6428,24 @@ async fn disks_with_all_parts(
         }
     }
 
+    if scan_mode == HealScanMode::Deep
+        && !latest_meta.deleted
+        && !latest_meta.is_remote()
+        && latest_meta.parts.iter().any(|part| part.integrity.is_some())
+    {
+        crate::io_support::shard_integrity::verify_deep_parts(
+            parts_metadata,
+            online_disks,
+            latest_meta,
+            bucket,
+            object,
+            &mut data_errs_by_part,
+        )
+        .await?;
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+        return Ok((data_errs_by_disk, data_errs_by_part));
+    }
+
     // Check data for each disk
     for (index, disk) in online_disks.iter().enumerate() {
         if meta_errs[index].is_some() {
@@ -6858,6 +6878,7 @@ fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -
         actual_size: ext_part.actual_size,
         index: ext_part.index.clone(),
         checksums: ext_part.checksums.clone(),
+        integrity: ext_part.integrity.clone(),
         ..Default::default()
     }
 }

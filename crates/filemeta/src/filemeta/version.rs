@@ -2034,6 +2034,7 @@ impl From<MetaObjectV1Part> for ObjectPartInfo {
             index: value.index,
             checksums: value.checksums,
             error: value.error,
+            integrity: None,
         }
     }
 }
@@ -2710,6 +2711,33 @@ impl MetaObject {
         };
         if all_parts && include_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
+        }
+        if !self.part_numbers.is_empty()
+            && rustfs_utils::http::contains_key_str(&file_info.metadata, crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+        {
+            return Err(Error::FileCorrupt);
+        }
+        if let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)? {
+            let layout = crate::shard_integrity::IntegrityLayout::new(
+                self.erasure_m,
+                self.erasure_n,
+                self.erasure_block_size,
+                file_info.uses_legacy_checksum,
+            )?;
+            if commitments.len() != self.part_numbers.len() || commitments.len() != self.part_sizes.len() {
+                return Err(Error::FileCorrupt);
+            }
+            for (i, commitment) in commitments.into_iter().enumerate() {
+                if commitment.layout != layout
+                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != self.part_numbers[i]
+                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != self.part_sizes[i]
+                {
+                    return Err(Error::FileCorrupt);
+                }
+                if all_parts {
+                    file_info.parts[i].integrity = Some(commitment);
+                }
+            }
         }
         Ok(file_info)
     }
