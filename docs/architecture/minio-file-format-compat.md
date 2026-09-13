@@ -5,6 +5,8 @@
 
 This is an interop contract, not a plan. Migration is one-way (MinIO to RustFS). Erasure-coding internals are owned by [erasure-coding.md](erasure-coding.md); this document owns the interop claim, the fixture evidence, and the out-of-scope list.
 
+The bound-v1 shard-identity change adds a runtime integrity gate beyond the format and decryption capabilities listed below. Unbound legacy GET and Heal require all source members, consistent parity, and plaintext part MD5 ETags. Compressed or encrypted legacy payloads, including MinIO SSE under `rio-v2`, currently fail this gate even when their metadata and keys are decodable. New RustFS bound-v1 writes are incompatible with older readers. These rollout and recovery limits are part of the contract in [erasure-coding.md §11.1](erasure-coding.md#111-bound-v1-upgrade-and-legacy-payload-proof).
+
 ## Scope Matrix By Build Variant
 
 Build variants are the `rustfs` crate features in `rustfs/Cargo.toml`: `default`, `full`, and `rio-v2` (which enables `rustfs-ecstore/rio-v2` and pulls in `crates/rio-v2`). `rio-v2` is absent from both `default` and `full`.

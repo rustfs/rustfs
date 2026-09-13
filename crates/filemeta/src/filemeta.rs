@@ -2984,7 +2984,7 @@ mod test {
             // Verify checksum validation logic
             match algo {
                 ChecksumAlgo::Invalid => assert!(!algo.valid()),
-                ChecksumAlgo::HighwayHash => assert!(algo.valid()),
+                ChecksumAlgo::HighwayHash | ChecksumAlgo::BoundHighwayHash => assert!(algo.valid()),
             }
 
             // Verify serialization and deserialization

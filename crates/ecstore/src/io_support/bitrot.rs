@@ -677,6 +677,7 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     let stage_metrics_enabled = stage_metrics.is_some();
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
+    let block_offset = offset.checked_div(shard_size).ok_or(DiskError::FileCorrupt)?;
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
@@ -699,7 +700,9 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     }
 
     let bitrot_reader_init_start = stage_metrics_enabled.then(Instant::now);
-    let reader = reader.map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify));
+    let reader = reader
+        .map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify).with_block_offset(block_offset))
+        .transpose()?;
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.bitrot_reader_init_stage, bitrot_reader_init_start);
     }
@@ -720,7 +723,7 @@ pub fn create_deferred_bitrot_reader(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> BitrotReader<ShardReader> {
+) -> disk::error::Result<BitrotReader<ShardReader>> {
     create_deferred_bitrot_reader_with_stripe_handle(
         inline_data,
         disk,
@@ -733,7 +736,7 @@ pub fn create_deferred_bitrot_reader(
         skip_verify,
         use_mmap_read,
     )
-    .0
+    .map(|(reader, _)| reader)
 }
 
 /// Like [`create_deferred_bitrot_reader`], but also returns a
@@ -751,8 +754,9 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> (BitrotReader<ShardReader>, DeferredReaderStripeHandle) {
+) -> disk::error::Result<(BitrotReader<ShardReader>, DeferredReaderStripeHandle)> {
     let stripe_stride = shard_size + checksum_algo.size();
+    let block_offset = offset.checked_div(shard_size).ok_or(DiskError::FileCorrupt)?;
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let inline_source = inline_data.is_some();
     let source = BitrotReaderSource {
@@ -771,8 +775,9 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
     // The deferred parity reader opens its source lazily, so it cannot hand out an
     // in-memory block up front; it stays on the streaming path. Parity shards are
     // only read when a data shard fails, so the fast path is not needed here.
-    let reader = BitrotReader::new(ShardReader::Stream(Box::new(deferred)), shard_size, checksum_algo, skip_verify);
-    (reader, handle)
+    let reader = BitrotReader::new(ShardReader::Stream(Box::new(deferred)), shard_size, checksum_algo, skip_verify)
+        .with_block_offset(block_offset)?;
+    Ok((reader, handle))
 }
 
 /// Create a new BitrotWriterWrapper based on the provided parameters
@@ -1580,7 +1585,8 @@ mod tests {
             checksum_algo,
             false,
             false,
-        );
+        )
+        .expect("valid deferred reader geometry");
 
         let mut out = [0u8; 4];
         let n = reader.read(&mut out).await.expect("read deferred second shard");
@@ -1622,7 +1628,8 @@ mod tests {
                     algo.clone(),
                     false,
                     false,
-                );
+                )
+                .expect("valid deferred reader geometry");
 
                 assert!(
                     handle.advance_stripes(stripe),
@@ -1674,7 +1681,8 @@ mod tests {
             algo,
             false,
             false,
-        );
+        )
+        .expect("valid deferred reader geometry");
         assert!(handle.advance_stripes(2));
 
         let mut out = [0u8; 4];
@@ -1714,7 +1722,8 @@ mod tests {
             algo,
             false,
             false,
-        );
+        )
+        .expect("valid deferred reader geometry");
 
         let mut out = [0u8; 4];
         reader.read(&mut out).await.expect("first read opens the deferred source");

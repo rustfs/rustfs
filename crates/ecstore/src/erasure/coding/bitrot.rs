@@ -111,6 +111,7 @@ where
 {
     /// Create a new BitrotReader.
     pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
+        let skip_verify = skip_verify && !algo.is_bound_bitrot();
         Self {
             inner,
             hash_algo: algo,
@@ -154,7 +155,17 @@ where
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.copy_from_slice(data);
         self.last_verify_duration = verify;
+        self.hash_algo.advance_bitrot_block()?;
         Ok(want)
+    }
+
+    pub fn with_block_offset(mut self, block: usize) -> std::io::Result<Self> {
+        self.hash_algo.set_bitrot_block(block)?;
+        Ok(self)
+    }
+
+    pub(crate) fn advance_unopened_blocks(&mut self, count: usize) -> std::io::Result<()> {
+        self.hash_algo.advance_bitrot_blocks(count)
     }
 
     /// Shared preamble for [`Self::read`]/[`Self::read_appending`]: reset the
@@ -295,6 +306,7 @@ where
             let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
             out.extend_from_slice(data);
             self.last_verify_duration = verify;
+            self.hash_algo.advance_bitrot_block()?;
             return Ok(want);
         }
 
@@ -367,6 +379,7 @@ where
                 let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, block)?;
                 out.extend_from_slice(data);
                 self.last_verify_duration = verify;
+                self.hash_algo.advance_bitrot_block()?;
                 return Ok(want);
             }
 
@@ -415,6 +428,7 @@ where
                 skip -= start;
                 out.extend_from_slice(&chunk[start..]);
             }
+            self.hash_algo.advance_bitrot_block()?;
             return Ok(want);
         }
 
@@ -425,6 +439,7 @@ where
         let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.extend_from_slice(data);
         self.last_verify_duration = verify;
+        self.hash_algo.advance_bitrot_block()?;
         Ok(want)
     }
 }
@@ -487,8 +502,8 @@ where
         // Interleaved per-block bitrot: prepend the block's hash so the on-disk
         // block is `[hash][data]`. This `size() > 0` condition is broader than
         // the streaming-only condition in `bitrot_shard_file_size`, so it is
-        // only self-consistent for the two streaming Highway variants
-        // (`HighwayHash256S` / `HighwayHash256SLegacy`) — the only algorithms
+        // only self-consistent for the streaming Highway variants
+        // (including bound-v1) — the only algorithms
         // production ever uses here (backlog#959 / ECA-18). For non-streaming
         // algorithms MinIO uses whole-file bitrot with no interleaved hash, so
         // driving one through this writer would produce a file whose length
@@ -506,6 +521,7 @@ where
         }
 
         let n = buf.len();
+        self.hash_algo.advance_bitrot_block()?;
 
         Ok(n)
     }
@@ -584,15 +600,14 @@ where
 /// the *streaming* per-block layout. `BitrotWriter::write` interleaves a hash on
 /// any `hash_algo.size() > 0`, and `bitrot_verify`'s read loop assumes an
 /// interleaved hash per block; both are only consistent with THIS function for
-/// the two streaming Highway variants. That is safe because every production
-/// write path hardcodes `HighwayHash256S` and `ErasureInfo::get_checksum_info`
-/// defaults to `HighwayHash256S` (see the regression tests below and in
-/// rustfs-filemeta). The non-streaming branches of this function exist purely to
+/// the streaming Highway variants, including bound-v1. Production resolves
+/// the algorithm from the part descriptor before binding its coding index.
+/// The non-streaming branches of this function exist purely to
 /// preserve the MinIO formula's whole-file semantics; feeding a non-streaming
 /// algorithm through `BitrotWriter` + `bitrot_verify` is unsupported and would
 /// mismatch this size — do not wire one in without a dedicated whole-file path.
 pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorithm) -> usize {
-    if algo != HashAlgorithm::HighwayHash256S && algo != HashAlgorithm::HighwayHash256SLegacy {
+    if algo != HashAlgorithm::HighwayHash256S && algo != HashAlgorithm::HighwayHash256SLegacy && !algo.is_bound_bitrot() {
         // Non-streaming (whole-file bitrot) algorithms carry no interleaved
         // per-block hashes on disk; the on-disk file is exactly `size` bytes.
         return size;
@@ -607,8 +622,8 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorith
 ///
 /// The read loop below assumes every block on disk is `[hash][data]` (streaming
 /// bitrot). It is therefore only valid for the streaming Highway variants, whose
-/// on-disk length matches `bitrot_shard_file_size` — production always uses
-/// `HighwayHash256S` (backlog#959 / ECA-18). Passing a non-streaming algorithm
+/// on-disk length matches `bitrot_shard_file_size` (including bound-v1).
+/// Passing a non-streaming algorithm
 /// (`SHA256` / `HighwayHash256` / `BLAKE2b512` / `Md5`) is unsupported: MinIO
 /// stores those as whole-file bitrot with no interleaved hash, so the size guard
 /// on the next line would reject a genuinely healthy part. Reading legacy V1
@@ -618,7 +633,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     mut r: R,
     want_size: usize,
     part_size: usize,
-    algo: HashAlgorithm,
+    mut algo: HashAlgorithm,
     mut shard_size: usize,
 ) -> std::io::Result<()> {
     let mut hash_buf = vec![0; algo.size()];
@@ -649,6 +664,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
         }
 
         left -= read;
+        algo.advance_bitrot_block()?;
     }
 
     let mut trailing = [0u8; 1];
@@ -2337,5 +2353,97 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(output, vec![9u8]);
         }
+    }
+}
+
+#[cfg(test)]
+mod bound_bitrot_tests {
+    use super::{BitrotReader, BitrotWriter, bitrot_verify};
+    use bytes::Bytes;
+    use rustfs_utils::HashAlgorithm;
+
+    #[test]
+    fn bound_bitrot_v1_pins_the_persisted_domain_and_digest() {
+        // Pin v1 bytes independently of writer/reader round trips. Changing
+        // this contract requires another format version, not a new fixture.
+        let mut algorithm = HashAlgorithm::bound_bitrot(&[7; 16]).for_coding_index(12);
+        algorithm.set_bitrot_block(7).expect("fixture block index");
+        assert_eq!(
+            algorithm,
+            HashAlgorithm::HighwayHash256SBound {
+                key: [
+                    2725285155311446678,
+                    3611494109709727957,
+                    3569684030272457581,
+                    11706363053771576035
+                ],
+                block: 7,
+            }
+        );
+        let expected = "6ae0878ae0846b37ed4ecbcfcd1213dcc477e3bbf081a77caedc8b78013cbba4";
+        assert_eq!(rustfs_utils::hex(algorithm.hash_encode(b"bound-v1 fixture").as_ref()), expected);
+        assert_eq!(
+            rustfs_utils::hex(algorithm.hash_encode_slices([&b"bound-"[..], &b"v1 fixture"[..]]).as_ref()),
+            expected
+        );
+    }
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn bound_bitrot_frames_bind_identity_coding_index_and_block_position() {
+        let payload = b"abcdefghABCDEFGH01234567";
+        let algorithm = HashAlgorithm::bound_bitrot(&[0x11; 16]).for_coding_index(7);
+        let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), 8, algorithm.clone());
+        for block in payload.chunks(8) {
+            writer.write(block).await.expect("write bound block");
+        }
+        let encoded = writer.into_inner().into_inner();
+        bitrot_verify(Cursor::new(&encoded), encoded.len(), payload.len(), algorithm.clone(), 8)
+            .await
+            .expect("matching immutable identity");
+        for foreign in [
+            HashAlgorithm::bound_bitrot(&[0x22; 16]).for_coding_index(7),
+            HashAlgorithm::bound_bitrot(&[0x11; 16]).for_coding_index(8),
+            HashAlgorithm::HighwayHash256S,
+        ] {
+            assert!(
+                bitrot_verify(Cursor::new(&encoded), encoded.len(), payload.len(), foreign.clone(), 8)
+                    .await
+                    .is_err()
+            );
+            let mut reader = BitrotReader::new(Cursor::new(&encoded), 8, foreign, false);
+            assert!(reader.read(&mut [0; 8]).await.is_err());
+        }
+        let frame_size = 32 + 8;
+        let reordered = [
+            &encoded[frame_size..2 * frame_size],
+            &encoded[..frame_size],
+            &encoded[2 * frame_size..],
+        ]
+        .concat();
+        assert!(
+            bitrot_verify(Cursor::new(&reordered), reordered.len(), payload.len(), algorithm.clone(), 8)
+                .await
+                .is_err()
+        );
+        let mut ranged = BitrotReader::new(Cursor::new(&encoded[frame_size..]), 8, algorithm.clone(), false)
+            .with_block_offset(1)
+            .expect("range starts at block one");
+        let mut block = [0; 8];
+        ranged.read(&mut block).await.expect("verify nonzero range offset");
+        assert_eq!(&block, b"ABCDEFGH");
+        let mut memory = BitrotReader::new(Cursor::new(Bytes::from(encoded.clone())), 8, algorithm.clone(), true);
+        let mut body = Vec::new();
+        for _ in 0..3 {
+            memory.read_appending(&mut body, 8).await.expect("verify memory fast path");
+        }
+        assert_eq!(body, payload);
+        let mut corrupt = encoded;
+        corrupt[32] ^= 1;
+        let mut mandatory = BitrotReader::new(Cursor::new(corrupt), 8, algorithm, true);
+        assert!(
+            mandatory.read(&mut block).await.is_err(),
+            "skip_verify cannot bypass identity-bound protection"
+        );
     }
 }

@@ -1536,6 +1536,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             drop(admission_guard);
         }
 
+        let bitrot_id = fi.uses_bound_bitrot()?.then(Uuid::new_v4);
+        let write_checksum_algo =
+            bitrot_id.map_or(HashAlgorithm::HighwayHash256S, |id| HashAlgorithm::bound_bitrot(id.as_bytes()));
         let result: Result<PartInfo> = async {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
@@ -1544,7 +1547,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let mut writers = Vec::with_capacity(shuffle_disks.len());
             let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
+            for (index, disk_op) in shuffle_disks.iter().enumerate() {
                 if let Some(disk) = disk_op {
                     let writer = match create_bitrot_writer(
                         false,
@@ -1553,7 +1556,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         &tmp_part_path,
                         erasure.shard_file_size(data.size()),
                         erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
+                        write_checksum_algo.for_coding_index(index + 1),
                     )
                     .await
                     {
@@ -1699,6 +1702,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let checksums = data.as_hash_reader().content_crc();
 
             let part_info = ObjectPartInfo {
+                bitrot_id,
                 etag: etag.clone(),
                 number: part_id,
                 size: w_size,
@@ -1722,6 +1726,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     None,
                     BitrotSelfVerifyTarget {
                         operation: "put_object_part",
+                        checksum_algo: &write_checksum_algo,
                         bucket,
                         object,
                         part_number: Some(part_id),
@@ -2185,6 +2190,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         for f in parts_metadatas.iter_mut() {
             f.metadata = user_defined.clone();
+            f.clear_bitrot_metadata();
+            f.enable_bound_bitrot();
             f.mod_time = Some(mod_time);
             f.fresh = true;
         }
@@ -2518,6 +2525,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        let bound_upload = fi.uses_bound_bitrot()?;
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 let mapped_err = complete_multipart_part_error(uploaded_parts[i].part_num, err, bucket, object);
@@ -2579,6 +2587,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 part.index.clone(),
                 part.checksums.clone(),
             );
+            if bound_upload {
+                let identity = part.bitrot_id.filter(|id| !id.is_nil()).ok_or(Error::PartMissingOrCorrupt)?;
+                fi.set_bitrot_part_identity(part.number, identity);
+            }
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);

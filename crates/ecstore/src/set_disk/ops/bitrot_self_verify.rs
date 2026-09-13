@@ -40,6 +40,7 @@ pub(in crate::set_disk::ops) fn drop_failed_writer_disks<D, W>(disks: &mut [Opti
 
 #[derive(Clone, Copy)]
 pub(in crate::set_disk::ops) struct BitrotSelfVerifyTarget<'a> {
+    pub(in crate::set_disk::ops) checksum_algo: &'a HashAlgorithm,
     pub(in crate::set_disk::ops) operation: &'static str,
     pub(in crate::set_disk::ops) bucket: &'a str,
     pub(in crate::set_disk::ops) object: &'a str,
@@ -56,14 +57,14 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
     inline_parts: Option<&[FileInfo]>,
     target: BitrotSelfVerifyTarget<'_>,
 ) -> Result<usize> {
-    let algo = HashAlgorithm::HighwayHash256S;
-    let encoded_shard_size = coding::bitrot_shard_file_size(target.logical_shard_size, target.shard_size, algo.clone());
+    let algo = target.checksum_algo;
+    let encoded_shard_size = coding::bitrot_shard_file_size(target.logical_shard_size, target.shard_size, (*algo).clone());
 
     let results = if let Some(parts) = inline_parts {
         let tasks = disks.iter().enumerate().filter_map(|(index, disk)| {
             let disk = disk.as_ref()?.clone();
             let data = parts.get(index).and_then(|part| part.data.as_ref()).cloned();
-            let algo = algo.clone();
+            let algo = algo.for_coding_index(index + 1);
             Some(async move {
                 let result = match data {
                     Some(data) => coding::bitrot_verify(
@@ -84,7 +85,7 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
     } else {
         let tasks = disks.iter().enumerate().filter_map(|(index, disk)| {
             let disk = disk.as_ref()?.clone();
-            let algo = algo.clone();
+            let algo = algo.for_coding_index(index + 1);
             Some(async move {
                 let result = match disk.read_file(target.volume, target.path).await {
                     Ok(reader) => {
@@ -192,6 +193,7 @@ mod tests {
             &[Some(disk.clone())],
             None,
             BitrotSelfVerifyTarget {
+                checksum_algo: &HashAlgorithm::HighwayHash256S,
                 operation: "put_object",
                 bucket: "bucket",
                 object: "object",
@@ -217,6 +219,7 @@ mod tests {
                 &[Some(disk.clone())],
                 None,
                 BitrotSelfVerifyTarget {
+                    checksum_algo: &HashAlgorithm::HighwayHash256S,
                     operation: "put_object",
                     bucket: "bucket",
                     object: "object",
@@ -244,6 +247,7 @@ mod tests {
             &[Some(disk)],
             None,
             BitrotSelfVerifyTarget {
+                checksum_algo: &HashAlgorithm::HighwayHash256S,
                 operation: "put_object",
                 bucket: "bucket",
                 object: "object",
@@ -279,6 +283,7 @@ mod tests {
                 &disks,
                 Some(&parts),
                 BitrotSelfVerifyTarget {
+                    checksum_algo: &HashAlgorithm::HighwayHash256S,
                     operation: "put_object",
                     bucket: "bucket",
                     object: "inline-object",
