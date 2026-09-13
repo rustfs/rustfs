@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::metadata_keys;
 use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_COMPLETE, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
@@ -23,7 +24,6 @@ use rustfs_utils::http::{
     starts_with_ignore_ascii_case,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
-use s3s::header::X_AMZ_RESTORE;
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
@@ -1482,7 +1482,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+    if let Some(restore_hdr) = meta.get(metadata_keys::RESTORE)
         && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
     {
         return restore_status.on_disk();
@@ -2756,7 +2756,7 @@ mod tests {
     fn minio_restored_object_is_recognised_as_on_disk() {
         let mut meta = HashMap::new();
         meta.insert(
-            X_AMZ_RESTORE.as_str().to_string(),
+            metadata_keys::RESTORE.to_string(),
             "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\"".to_string(),
         );
         assert!(is_restored_object_on_disk(&meta));

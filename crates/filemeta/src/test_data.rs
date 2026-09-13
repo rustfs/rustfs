@@ -171,6 +171,14 @@ pub fn create_minio_large_object_xlmeta() -> Result<Vec<u8>> {
     decode_hex_fixture(include_str!("../tests/fixtures/minio/object_large_bin.xlmeta.hex"))
 }
 
+/// xl.meta for one restored, object-locked object, written by the code that
+/// predates `metadata_keys` with every persisted key taken from its historical
+/// source (`s3s::header` / `rustfs_utils::http`). Never regenerate it: it is
+/// the old-bytes evidence that the key authority stayed byte-identical.
+pub fn create_pre_metadata_keys_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/persisted_metadata_keys_pre_a3a.hex"))
+}
+
 fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
     wr.push(MSGPACK_EXT8);
     wr.push(12);
