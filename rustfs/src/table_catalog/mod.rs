@@ -169,6 +169,7 @@ const WAREHOUSE_INDEX_ROOT: &str = "warehouse-index";
 const WAREHOUSE_INDEX_STATE_FILE: &str = "state.json";
 const TABLE_RENAME_ROOT: &str = "renames";
 const WAREHOUSE_INDEX_MAX_PREFIX_DEPTH: usize = 64;
+const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS: usize = 4096;
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";

@@ -119,6 +119,26 @@ impl Operation for CancelTableCatalogMigrationHandler {
     }
 }
 
+pub struct BackfillTableWarehouseIndexHandler {}
+
+#[async_trait::async_trait]
+impl Operation for BackfillTableWarehouseIndexHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .backfill_table_warehouse_index(&warehouse)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("warehouse-index-backfill", &warehouse, "", "", started, &result);
+        result?;
+        Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
 pub struct ExternalCatalogBridgeHandler {}
 
 #[async_trait::async_trait]

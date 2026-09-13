@@ -21,6 +21,8 @@ mod strong;
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
+pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
+#[cfg(test)]
 pub(super) use strong::{
     STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
     StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,

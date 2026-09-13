@@ -21,6 +21,24 @@ use std::sync::Arc;
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]
+fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
+    let objects = vec![
+        "catalog/table-1/table-entry.json".to_string(),
+        "catalog/namespace.json".to_string(),
+        "catalog/table-2/table-entry.json".to_string(),
+    ];
+
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(objects, false, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
+    );
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(vec!["catalog/table-entry.json".to_string()], true, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
+    );
+}
+
+#[test]
 fn catalog_lock_authority_failures_are_typed_as_unavailable() {
     for error in [
         rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
@@ -4489,7 +4507,26 @@ async fn table_data_plane_resource_scans_when_a_ready_index_entry_is_missing() {
         .expect("the table scan must retain table-aware protection");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(
+                RUSTFS_META_BUCKET,
+                &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"),
+            )
+            .await
+            .expect("repaired warehouse index lookup should succeed")
+            .is_some(),
+        "the bounded scan should repair the missing index"
+    );
+
+    backend.reset_call_counts().await;
+    let indexed = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("repaired warehouse index lookup should succeed")
+        .expect("repaired warehouse index should retain table-aware protection");
+    assert_eq!(indexed.table, "orders");
+    assert_eq!(backend.list_call_count().await, 0);
 }
 
 #[tokio::test]
@@ -5119,7 +5156,7 @@ async fn table_data_plane_resource_falls_back_to_scan_without_index_state() {
         .expect("legacy table entry should resolve");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
     assert!(store.warehouse_index_ready(bucket).await.unwrap());
 
     backend.reset_call_counts().await;
