@@ -26,6 +26,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
+pub(super) mod admin_overlap;
 mod root_recovery;
 mod running_mainline;
 
@@ -3073,17 +3074,16 @@ async fn overlap_policy_minio_error_rejects_same_and_containing_paths() {
 }
 
 #[tokio::test]
-async fn overlap_policy_default_merge_keeps_today_semantics() {
+async fn overlap_policy_default_merge_rejects_nested_admin_but_preserves_scanner_admission() {
     let manager = manager_with_policy(HealOverlapPolicy::Merge);
     insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
 
-    // Different-dedup-key overlap still merges under the default policy:
-    // the nested path dedups to its own key but nothing rejects it.
+    // A different key must not create a second owner of an admin range.
     let nested = manager
         .submit_heal_request(admin_prefix_request("bucket-a", "logs/app/"))
         .await
         .expect("admission must decide");
-    assert_eq!(nested, HealAdmissionResult::Accepted, "default policy must not reject overlaps");
+    assert_eq!(nested, HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths));
 
     // Non-admin sources never get overlap rejections even under minio_error.
     let manager = manager_with_policy(HealOverlapPolicy::MinioError);

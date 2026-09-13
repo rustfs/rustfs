@@ -505,7 +505,16 @@ impl HealManager {
                                     return;
                                 }
 
+                                #[cfg(test)]
+                                tests::admin_overlap::pause_before_retry_queue(&retry_request_id).await;
                                 let mut queue = retry_heal_queue.lock().await;
+                                let mut retrying = retrying_heals_for_spawn.lock().await;
+                                // Cancellation may win after the backoff checks but
+                                // before queue acquisition. Keep ownership through
+                                // publication so a cancelled retry cannot reappear.
+                                if retry_cancel_token.is_cancelled() || !retrying.contains_key(&retry_request_id) {
+                                    return;
+                                }
                                 let admission_decision =
                                     Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
                                 let admission = admission_decision.result;
@@ -525,7 +534,8 @@ impl HealManager {
                                         // matching operations_snapshot's lock order.
                                         #[cfg(test)]
                                         pause_retry_ownership_transition(&retry_request_id, true).await;
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
                                         drop(queue);
                                         if let (Some(displaced_task_id), Some(displaced_terminal)) =
@@ -565,7 +575,8 @@ impl HealManager {
                                     HealAdmissionResult::Merged => {
                                         let merged_task_id =
                                             queue.queued_request_id_for_dedup_key(&retry_key).map(ToOwned::to_owned);
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         drop(queue);
                                         if let Some(merged_task_id) = merged_task_id {
                                             move_mrf_repair_notice_targets(

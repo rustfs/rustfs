@@ -435,10 +435,21 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     pub(super) fn make_dedup_key(request: &HealRequest) -> String {
-        let base = Self::make_dedup_key_for_type(&request.heal_type);
-        match (&request.heal_type, request.options.set_key()) {
-            (HealType::Object { .. } | HealType::ECDecode { .. }, Some(scope)) => format!("{base}:scope:{scope}"),
-            _ => base,
+        Self::make_dedup_key_for_scope(&request.heal_type, &request.options)
+    }
+
+    pub(super) fn make_dedup_key_for_scope(heal_type: &HealType, options: &HealOptions) -> String {
+        let base = Self::make_dedup_key_for_type(heal_type);
+        // Erasure-set keys already encode pool/set and are also queried by
+        // automatic replacement admission through contains_erasure_set.
+        if matches!(heal_type, HealType::ErasureSet { .. }) {
+            return base;
+        }
+        match heal_scope_indices(heal_type, options) {
+            (None, None) => base,
+            // A distinct leading tag cannot alias an unscoped S3 key that
+            // happens to contain the scope suffix as literal object bytes.
+            (pool, set) => format!("scope:{pool:?}:{set:?}:{base}"),
         }
     }
 

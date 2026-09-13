@@ -3310,6 +3310,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_control_admin_overlap_receipts_preserve_token_and_conflict_reason() {
+        use rustfs_protos::heal_control::{Admission, Envelope, Outcome, RequestMetadata};
+
+        let (manager, mut parent, metadata) = heal_start_retry_fixture();
+        parent.force_start = false;
+        parent.object_prefix = Some("scope/".to_string());
+        let parent_id = parent.id.clone();
+        let envelope = Envelope::start(parent.clone(), metadata).expect("parent start");
+        let response = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
+            .await
+            .expect("admit parent scope");
+        assert!(
+            matches!(decode_transport_start_outcome(&response, &parent_id, metadata.coordinator_epoch),
+            Outcome::Start { task_id, admission: Admission::Accepted } if task_id == parent_id)
+        );
+
+        for (prefix, expected) in [
+            ("scope/", Admission::Merged),
+            ("scope/child/", Admission::DroppedOverlappingPaths),
+            ("other/", Admission::Accepted),
+        ] {
+            let mut request = parent.clone();
+            request.id = Uuid::new_v4().to_string();
+            request.object_prefix = Some(prefix.to_string());
+            let request_id = request.id.clone();
+            let request_metadata = RequestMetadata {
+                nonce: *Uuid::new_v4().as_bytes(),
+                ..metadata
+            };
+            let envelope = Envelope::start(request, request_metadata).expect("scoped start envelope");
+            let response =
+                execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
+                    .await
+                    .expect("overlap remains a typed admission result across the RPC boundary");
+            let Outcome::Start { task_id, admission } =
+                decode_transport_start_outcome(&response, &request_id, metadata.coordinator_epoch)
+            else {
+                panic!("start must return an admission receipt")
+            };
+            assert_eq!(admission, expected, "prefix={prefix}");
+            assert_eq!(
+                task_id,
+                if expected == Admission::Accepted {
+                    request_id
+                } else {
+                    parent_id.clone()
+                }
+            );
+        }
+        assert_eq!(manager.operations_snapshot().await.queue_length, 2);
+        assert_eq!(
+            manager
+                .get_task_status(&parent_id)
+                .await
+                .expect("rejected child preserves parent"),
+            rustfs_heal::heal::task::HealTaskStatus::Pending
+        );
+
+        parent.id = Uuid::new_v4().to_string();
+        parent.force_start = true;
+        let replacement_id = parent.id.clone();
+        let envelope = Envelope::start(
+            parent,
+            RequestMetadata {
+                nonce: *Uuid::new_v4().as_bytes(),
+                ..metadata
+            },
+        )
+        .expect("force replacement envelope");
+        let response = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
+            .await
+            .expect("forceStart replaces the parent and preserves the disjoint scope");
+        assert!(
+            matches!(decode_transport_start_outcome(&response, &replacement_id, metadata.coordinator_epoch),
+            Outcome::Start { task_id, admission: Admission::Accepted } if task_id == replacement_id)
+        );
+        assert_ne!(replacement_id, parent_id);
+        assert_eq!(manager.operations_snapshot().await.queue_length, 2);
+    }
+
+    #[tokio::test]
     async fn heal_start_retry_new_forced_request_is_a_distinct_start() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let first_id = request.id.clone();
