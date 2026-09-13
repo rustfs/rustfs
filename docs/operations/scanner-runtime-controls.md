@@ -178,12 +178,27 @@ The reset does not delete metadata files by hand and does not publish an authori
 |---|---|
 | data movement | wait for decommission or rebalance to leave the scanner metadata path, then retry |
 | invalid scanner cycle state | run `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}` first |
+| scanner leader lock is busy | retry with an async recovery intent or wait for the current leader to restart/release the lock |
+
+When a running scanner leader already holds `leader.lock`, submit a durable async recovery intent instead of repeatedly calling the synchronous reset:
+
+```json
+{
+  "mode": "full-rebuild",
+  "async": true,
+  "idempotency_key": "<stable-operator-request-id>"
+}
+```
+
+The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
+
+A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must run as a full scan until an authoritative usage snapshot replaces the marker.
 
 ## Cleanup With The Scanner Disabled
 
 With `RUSTFS_SCANNER_ENABLED=false`, startup makes one controlled attempt to finish a previously persisted cycle reset whose validated recovery marker is already `cleanup-pending`. This is metadata cleanup only: it does not start the ordinary scanner loop, scan namespaces, accept a new reset request, or automatically perform a usage-state `full-rebuild`. Missing, merely `blocked`, unknown-version, unknown-phase, or corrupt markers do not authorize an automatic reset.
 
-The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. The v3 reset routes remain synchronous and return their existing successful HTTP 200 responses; no asynchronous HTTP 202 acceptance is introduced.
+The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. Cycle-state reset remains a synchronous HTTP 200 operation; usage-state reset also supports the async recovery-intent form described above.
 
 The startup probe is cancellation-aware and uses the existing cache persistence I/O timeout. Shutdown waits only for the existing server shutdown timeout. If the cleanup task cannot join in that window, the `scanner_cleanup_not_joined` warning means completion is unconfirmed, not drained. The task is not force-aborted or force-unlocked while its runtime remains alive; it retains its existing namespace/admission guards, and durable marker/fence state remains authoritative. Inspect status before retrying. This does not establish a hard deadline for an unresponsive storage operation or prove that I/O has drained when the process or runtime subsequently exits. Task-ownership timeout tests are not storage fsync, commit-tail, or process-crash durability evidence.
 
