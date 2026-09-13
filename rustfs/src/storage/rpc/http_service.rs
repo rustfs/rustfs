@@ -36,6 +36,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
+use rustfs_common::trace_bus::{TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
@@ -415,7 +416,9 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
         record_internode_rpc_error(operation);
-        return *response;
+        let response = *response;
+        emit_internode_rpc_telemetry(started_at, response.status());
+        return response;
     }
 
     let method = req.method().clone();
@@ -461,8 +464,18 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
             started_at.elapsed(),
         );
     }
+    emit_internode_rpc_telemetry(started_at, response.status());
 
     response
+}
+
+fn emit_internode_rpc_telemetry(started_at: Instant, status: StatusCode) {
+    let status = if status.is_success() {
+        TelemetryTraceStatus::Ok
+    } else {
+        TelemetryTraceStatus::Error
+    };
+    telemetry_trace_emit(|| TelemetryTraceEvent::new(TelemetryTraceOperation::InternalRpc, started_at.elapsed(), status));
 }
 
 fn internode_http_operation(path: &str) -> Option<&'static str> {
@@ -1759,6 +1772,21 @@ mod tests {
             .expect("local disk should be created");
         disk.make_volume("bucket").await.expect("test volume should be created");
         (disk, dir)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internode_rpc_telemetry_publishes_only_the_classified_outcome() {
+        let mut subscription = rustfs_common::trace_bus::subscribe_telemetry_trace_events();
+
+        super::emit_internode_rpc_telemetry(std::time::Instant::now(), StatusCode::FORBIDDEN);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("telemetry event should arrive")
+            .expect("telemetry source should remain open");
+        assert_eq!(event.operation, rustfs_common::trace_bus::TelemetryTraceOperation::InternalRpc);
+        assert_eq!(event.status, rustfs_common::trace_bus::TelemetryTraceStatus::Error);
     }
 
     #[tokio::test]
