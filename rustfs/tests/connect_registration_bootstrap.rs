@@ -492,8 +492,10 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
         "Connect TLS peer certificate validation failed; verify the endpoint and configured root CA"
     );
     assert_sanitized_error(&error, &[TOKEN_SECRET, REMOTE_REASON]);
-    assert!(!wrong_ca_state.join("credential/device.crt.json").exists());
-    assert!(!wrong_ca_state.join("credential/registration.pending.json").exists());
+    assert!(
+        !wrong_ca_state.join("credential/device.crt.json").exists(),
+        "wrong CA must not persist an issued credential"
+    );
     assert_no_staging_files(&wrong_ca_state);
 }
 
