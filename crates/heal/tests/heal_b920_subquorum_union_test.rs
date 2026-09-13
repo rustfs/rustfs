@@ -714,9 +714,31 @@ mod absence_receipt_regressions {
         assert_versions(&store, bucket, &old, &current).await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[serial]
-    async fn historical_absence_receipt_bucket_outcome_matches_c06() {
+    fn historical_absence_receipt_bucket_outcome_matches_c06() {
+        // The real ECStore initialization and bucket traversal need the debug
+        // server's stack budget, which exceeds libtest's default on Linux.
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("absence-receipt-c06".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("C06 test runtime should build");
+
+                runtime.block_on(historical_absence_receipt_bucket_outcome_matches_c06_inner());
+            })
+            .expect("C06 test thread should spawn")
+            .join()
+            .expect("C06 test thread should finish");
+    }
+
+    async fn historical_absence_receipt_bucket_outcome_matches_c06_inner() {
         let bucket = "absence-receipt-c06";
         let (_paths, store, storage, old, current) = stale_history(bucket).await;
         put_versioned(&store, bucket, "healthy.txt", b"already healthy").await;
