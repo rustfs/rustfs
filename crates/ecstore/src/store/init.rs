@@ -3135,6 +3135,51 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn unfinished_multipart_upload_is_not_copy_source_readable() {
+        let temp_dir = tempfile::tempdir().expect("create unfinished multipart copy store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "unfinished-multipart-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("unfinished-multipart-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let payload = vec![0xCD; 273];
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for unfinished multipart copy source");
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload);
+        store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage unfinished multipart source part");
+
+        let source_err = match store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(_) => panic!("an uncompleted multipart upload must not be readable as a CopyObject source"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                source_err,
+                StorageError::ObjectNotFound(_, _) | StorageError::FileNotFound | StorageError::VersionNotFound(_, _, _)
+            ),
+            "unexpected unfinished multipart source error: {source_err:?}"
+        );
+
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn pool_metadata_preflight_recovery_preserves_single_and_multi_pool_public_mutations() {

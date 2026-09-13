@@ -255,6 +255,9 @@ mod copy_object_version_restore_test;
 mod copy_object_checksum_test;
 
 #[cfg(test)]
+mod multipart_copy_readiness_test;
+
+#[cfg(test)]
 mod ssec_copy_test;
 
 #[cfg(test)]
