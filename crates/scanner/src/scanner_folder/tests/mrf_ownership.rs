@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use super::*;
-use crate::storage_api::EcstoreHealResultItem as HealItem;
+use crate::storage_api::owner::{EcstoreHealResultItem as HealItem, ecstore_init_local_disks};
 use crate::storage_api::scanner_io::BucketInfo;
+use crate::{EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::mrf_channel::{
     MrfIngressResult, MrfKind, MrfScope, note_mrf_repaired, take_mrf_repaired_events_for, try_send_mrf_intent_typed,
 };
@@ -235,6 +236,9 @@ impl HealStorageAPI for NoticeStorage {
             ..Default::default()
         }))
     }
+    async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
+        Ok(Some(Uuid::from_u128(1)))
+    }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }
@@ -317,6 +321,22 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
     // its receiver and lease generations independent from other scanner tests.
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+    // Partial writes must checkpoint to a registered local disk and bind to
+    // the fixture's bucket incarnation before the consumer can dispatch them.
+    let mut endpoint = Endpoint::try_from(scanner.root.as_str()).expect("journal disk endpoint");
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
+    ecstore_init_local_disks(EndpointServerPools::from(vec![PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: 1,
+        endpoints: Endpoints::from(vec![endpoint]),
+        cmd_line: "mrf-ownership-test".to_string(),
+        platform: String::new(),
+    }]))
+    .await
+    .expect("register the isolated consumer's journal disk");
     let bucket = format!("mrf-ownership-{}", Uuid::new_v4());
     scanner.new_cache.info.name = bucket.clone();
     scanner.update_cache.info.name = bucket.clone();

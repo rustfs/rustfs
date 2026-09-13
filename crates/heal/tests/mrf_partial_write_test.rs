@@ -27,7 +27,9 @@ use tokio::io::AsyncReadExt;
 
 mod storage_api;
 use storage_api::endpoint_index::{EndpointServerPools, Endpoints, init_local_disks};
-use storage_api::integration::{DiskAPI, DiskStore, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, ReadOptions};
+use storage_api::integration::{
+    DiskAPI, DiskStore, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
+};
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -47,11 +49,14 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
         .await
         .expect("initial responsibility must commit");
     assert!(snapshot_contains("old.bin").await);
-    for path in &env.disk_paths {
-        tokio::fs::rename(path, path.with_extension("offline"))
+    // Linux disks retain a directory descriptor for their root, so fault the
+    // metadata volume inside that root instead of replacing the root pathname.
+    for disk_path in &env.disk_paths {
+        let path = disk_path.join(RUSTFS_META_BUCKET);
+        tokio::fs::rename(&path, path.with_extension("offline"))
             .await
-            .expect("detach journal disk");
-        tokio::fs::write(path, b"unwritable journal root")
+            .expect("detach journal volume");
+        tokio::fs::write(&path, b"unwritable journal volume")
             .await
             .expect("prevent journal writes");
     }
@@ -60,11 +65,12 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
         Err(MrfDurableAdmissionError::Persistence),
         "failed checkpoint publication must not be acknowledged as durable success"
     );
-    for path in &env.disk_paths {
-        tokio::fs::remove_file(path).await.expect("remove journal fault");
-        tokio::fs::rename(path.with_extension("offline"), path)
+    for disk_path in &env.disk_paths {
+        let path = disk_path.join(RUSTFS_META_BUCKET);
+        tokio::fs::remove_file(&path).await.expect("remove journal fault");
+        tokio::fs::rename(path.with_extension("offline"), &path)
             .await
-            .expect("restore journal disk");
+            .expect("restore journal volume");
     }
     for disk in env.ecstore.pools[0].get_disks(0).disks.read().await.iter().flatten() {
         disk.reset_health_for_store_init_retry();
