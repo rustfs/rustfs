@@ -2139,6 +2139,94 @@ mod test {
         }
     }
 
+    #[test]
+    fn truncated_xlmeta_framing_is_file_corrupt() {
+        let buf = FileMeta::default()
+            .marshal_msg()
+            .expect("serialize metadata without inline data");
+        FileMeta::load(&buf).expect("complete metadata must decode");
+        for cut in 0..buf.len() {
+            assert_eq!(
+                FileMeta::load(&buf[..cut]).expect_err("every incomplete metadata frame must fail"),
+                Error::FileCorrupt,
+                "truncation at byte {cut} must remain repairable"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_xlmeta_index_and_format_reads_are_file_corrupt() {
+        let buf = FileMeta::default()
+            .marshal_msg()
+            .expect("serialize metadata without inline data");
+        FileMeta::is_indexed_meta(&buf).expect("complete indexed metadata must decode");
+        FileMeta::read_format_versions(&buf).expect("complete format header must decode");
+        for cut in 0..buf.len() {
+            assert_eq!(
+                FileMeta::is_indexed_meta(&buf[..cut]).expect_err("incomplete index must fail"),
+                Error::FileCorrupt,
+                "index truncation at byte {cut}"
+            );
+            if cut < buf.len() - 5 {
+                assert_eq!(
+                    FileMeta::read_format_versions(&buf[..cut]).expect_err("incomplete metadata block must fail"),
+                    Error::FileCorrupt,
+                    "format truncation at byte {cut}"
+                );
+            }
+        }
+        for cut in 0..5 {
+            assert_eq!(
+                FileMeta::read_bytes_header(&buf[8..8 + cut]).expect_err("incomplete bin32 prefix must fail"),
+                Error::FileCorrupt
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_xlmeta_framing_is_file_corrupt() {
+        let original = FileMeta::default()
+            .marshal_msg()
+            .expect("serialize metadata without inline data");
+        for offset in [8, original.len() - 5] {
+            let mut buf = original.clone();
+            buf[offset] = 0xc0; // nil cannot encode a bin length or a CRC integer.
+            assert_eq!(FileMeta::load(&buf).expect_err("invalid framing marker"), Error::FileCorrupt);
+            assert_eq!(
+                FileMeta::is_indexed_meta(&buf).expect_err("invalid index framing marker"),
+                Error::FileCorrupt
+            );
+            if offset == 8 {
+                assert_eq!(
+                    FileMeta::read_format_versions(&buf).expect_err("invalid format framing marker"),
+                    Error::FileCorrupt
+                );
+                assert_eq!(
+                    FileMeta::read_bytes_header(&buf[8..]).expect_err("invalid bin framing marker"),
+                    Error::FileCorrupt
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_xlmeta_versions_are_not_classified_as_corruption() {
+        let mut buf = FileMeta::default().marshal_msg().expect("serialize metadata");
+        buf[4..6].copy_from_slice(&(XL_FILE_VERSION_MAJOR + 1).to_le_bytes());
+        assert_ne!(FileMeta::load(&buf).expect_err("unsupported file version"), Error::FileCorrupt);
+        for (header_ver, meta_ver) in [
+            (XL_HEADER_VERSION + 1, XL_META_VERSION),
+            (XL_HEADER_VERSION, XL_META_VERSION + 1),
+        ] {
+            let mut meta = Vec::new();
+            rmp::encode::write_uint(&mut meta, u64::from(header_ver)).expect("write header version");
+            rmp::encode::write_uint(&mut meta, u64::from(meta_ver)).expect("write metadata version");
+            rmp::encode::write_uint(&mut meta, 0).expect("write empty version count");
+            let buf = build_xl_buffer(&meta);
+            assert_ne!(FileMeta::load(&buf).expect_err("unsupported schema version"), Error::FileCorrupt);
+        }
+    }
+
     /// Regression test for rustfs/rustfs#2715: a corrupted version count in
     /// xl.meta must yield a decode error instead of sizing a huge allocation
     /// from the bogus count (which aborts the whole process).

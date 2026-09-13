@@ -10720,6 +10720,30 @@ mod tests {
         assert_eq!(reason, Some(DiskError::FileCorrupt));
     }
 
+    #[test]
+    fn metadata_io_failures_never_authorize_heal_overwrite() {
+        let meta = FileInfo::default();
+        let io_errors = [
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "metadata access denied"),
+            std::io::Error::other("transient metadata read failure"),
+        ];
+        let mut errors: Vec<_> = io_errors
+            .into_iter()
+            .map(|error| DiskError::from(rustfs_filemeta::Error::Io(error)))
+            .collect();
+        #[cfg(unix)]
+        errors.push(DiskError::from(rustfs_filemeta::Error::Io(std::io::Error::from_raw_os_error(libc::EIO))));
+        errors.push(DiskError::Timeout);
+        for error in errors {
+            assert_ne!(error, DiskError::FileCorrupt);
+            let (heal, metadata, reason) =
+                should_heal_object_on_disk(&Some(error.clone()), &[CHECK_PART_FILE_CORRUPT], &meta, &meta);
+            assert!(!heal, "an I/O failure must not authorize overwriting metadata: {error}");
+            assert!(!metadata);
+            assert_eq!(reason, Some(error));
+        }
+    }
+
     #[tokio::test]
     async fn test_get_disks_info_preserves_runtime_state_for_suspect_and_offline_disks() {
         let format = FormatV3::new(1, 3);
