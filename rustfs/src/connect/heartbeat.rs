@@ -395,6 +395,16 @@ pub enum HeartbeatError {
     Endpoint,
     #[error("Connect heartbeat root CA configuration is invalid")]
     RootCertificate,
+    #[error("Connect heartbeat proxy configuration is invalid")]
+    ProxyConfiguration,
+    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error("Connect heartbeat schedule is invalid")]
     Schedule,
     #[error("RustFS is not registered with Connect")]
@@ -455,6 +465,10 @@ impl From<TelemetryError> for HeartbeatError {
         match error {
             TelemetryError::Endpoint => Self::Endpoint,
             TelemetryError::RootCertificate => Self::RootCertificate,
+            TelemetryError::ProxyConfiguration => Self::ProxyConfiguration,
+            TelemetryError::ProxyAuthentication => Self::ProxyAuthentication,
+            TelemetryError::ProxyRejected => Self::ProxyRejected,
+            TelemetryError::TlsPeer => Self::TlsPeer,
             TelemetryError::Schedule => Self::Schedule,
             TelemetryError::NotRegistered => Self::NotRegistered,
             TelemetryError::IdentityMissing => Self::IdentityMissing,

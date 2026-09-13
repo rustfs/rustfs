@@ -22,6 +22,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::config::{ProxyConfig, ProxyConfigError};
 use super::credential_store::{
     CompletedRegistration, CredentialLock, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration,
     PendingRotation,
@@ -46,6 +47,7 @@ pub struct ConnectConfig<'a> {
     pub endpoint: &'a str,
     pub root_ca_pem: &'a [u8],
     pub timeout: Duration,
+    pub proxy: Option<&'a ProxyConfig>,
 }
 
 pub struct ConnectClient {
@@ -54,6 +56,7 @@ pub struct ConnectClient {
     root_certificates: Vec<CertificateDer<'static>>,
     client: Client,
     timeout: Duration,
+    proxy: Option<ProxyConfig>,
 }
 
 pub(crate) enum RotationAttempt {
@@ -106,13 +109,14 @@ impl ConnectClient {
             return Err(ClientError::RootCertificate);
         }
 
-        let client = build_client(&root_certificates, config.timeout, None)?;
+        let client = build_client(&root_certificates, config.timeout, None, config.proxy)?;
         Ok(Self {
             endpoint,
             roots,
             root_certificates,
             client,
             timeout: config.timeout,
+            proxy: config.proxy.cloned(),
         })
     }
 
@@ -327,7 +331,7 @@ impl ConnectClient {
         identity_pem.push(b'\n');
         identity_pem.extend_from_slice(private_key.as_bytes());
         let tls_identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| ClientError::IdentityCertificate)?;
-        let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity))?;
+        let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity), self.proxy.as_ref())?;
         let path = format!("clusterDevices/{}:rotateCredential", credential.uid);
         let url = self.url(&path)?;
         let response = match self.send_once(StatusCode::OK, client.post(url).json(&body)).await? {
@@ -474,6 +478,7 @@ impl ConnectClient {
         F: FnMut() -> reqwest::RequestBuilder,
     {
         let mut last_status = None;
+        let mut last_transport_failure = None;
         for attempt in 0..MAX_ATTEMPTS {
             match request().send().await {
                 Ok(response) if response.status() == success => return decode_response(response).await,
@@ -499,12 +504,15 @@ impl ConnectClient {
                     return Err(ClientError::Rejected { status, reason });
                 }
                 Err(error) if !error.is_timeout() && !error.is_connect() => return Err(ClientError::Transport(error)),
-                Err(_) => {}
+                Err(error) => last_transport_failure = classify_transport_failure(&error, self.proxy.is_some()),
             }
 
             if attempt + 1 < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
             }
+        }
+        if let Some(failure) = last_transport_failure {
+            return Err(failure.into());
         }
         Err(ClientError::Unavailable { status: last_status })
     }
@@ -513,6 +521,9 @@ impl ConnectClient {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if error.is_timeout() || error.is_connect() => {
+                if let Some(failure) = classify_transport_failure(&error, self.proxy.is_some()) {
+                    return Err(failure.into());
+                }
                 return Ok(SingleRequest::Unavailable {
                     status: None,
                     retry_after: None,
@@ -600,24 +611,65 @@ fn retry_after(headers: &header::HeaderMap, now: DateTime<Utc>) -> Option<Durati
     })
 }
 
-fn build_client(
+pub(crate) fn build_client(
     roots: &[CertificateDer<'static>],
     timeout: Duration,
     identity: Option<reqwest::Identity>,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<Client, ClientError> {
     let certificates = roots
         .iter()
         .map(|root| reqwest::Certificate::from_der(root.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut builder = Client::builder()
+        .no_proxy()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .tls_certs_only(certificates);
+    if let Some(proxy) = proxy {
+        builder = proxy.apply(builder)?;
+    }
     if let Some(identity) = identity {
         builder = builder.identity(identity);
     }
     builder.build().map_err(ClientError::Transport)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TransportFailure {
+    ProxyAuthentication,
+    ProxyRejected,
+    TlsPeer,
+}
+
+pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configured: bool) -> Option<TransportFailure> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("407") || message.contains("proxy authentication") {
+            return Some(TransportFailure::ProxyAuthentication);
+        }
+        if message.contains("certificate")
+            || message.contains("unknown issuer")
+            || message.contains("invalid peer")
+            || message.contains("not valid for")
+        {
+            return Some(TransportFailure::TlsPeer);
+        }
+        source = error.source();
+    }
+    proxy_configured.then_some(TransportFailure::ProxyRejected)
+}
+
+impl From<TransportFailure> for ClientError {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::ProxyAuthentication => Self::ProxyAuthentication,
+            TransportFailure::ProxyRejected => Self::ProxyRejected,
+            TransportFailure::TlsPeer => Self::TlsPeer,
+        }
+    }
 }
 
 async fn decode_response(mut response: reqwest::Response) -> Result<CredentialResponse, ClientError> {
@@ -663,6 +715,16 @@ pub enum ClientError {
     Endpoint,
     #[error("Connect root CA configuration is invalid")]
     RootCertificate,
+    #[error("Connect proxy configuration is invalid")]
+    ProxyConfiguration(#[from] ProxyConfigError),
+    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error(
         "Connect registration has a pending attempt for a different token; restore the original protected token configuration"
     )]
