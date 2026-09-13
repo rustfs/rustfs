@@ -58,7 +58,10 @@ cd "$(dirname "$0")/.."
 # 1589 -> 1588 on 2026-09-08: the GA blocker set (rustfs/backlog#2366) added
 # three invocation lines to the endpoint-refresh paths and folded the five
 # copies of the concurrent-change error into one constructor, netting -1.
-S3S_IMPORT_FILES_BASELINE=213
+# 213 -> 212 on 2026-09-14: rustfs/backlog#1735 A4 moved rio's trailer
+# handle behind rustfs_rio::TrailerSource; the only adapter imports s3s through
+# the app storage_api shim, so crates/rio no longer references s3s.
+S3S_IMPORT_FILES_BASELINE=212
 S3_ERROR_LINES_BASELINE=1588
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*

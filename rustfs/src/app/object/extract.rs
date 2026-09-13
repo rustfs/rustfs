@@ -19,6 +19,7 @@ use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecis
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
+use crate::app::trailer_adapter::trailer_source;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 
@@ -2140,7 +2141,7 @@ impl DefaultObjectUsecase {
         let mut archive_reader =
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
-        if let Err(err) = archive_reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+        if let Err(err) = archive_reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
             return Err(ApiError::from(err).into());
         }
 
