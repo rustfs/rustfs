@@ -16,10 +16,14 @@
 //! Admin snapshots and metric exporters share these counters. The older
 //! operation counter counts handler entries and is not an HTTP denominator.
 
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
+};
 use rustfs_s3_ops::S3Operation;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
+use std::time::Instant;
 
 const METRIC: &str = "rustfs_s3_http_requests_total";
 const METHODS: [&str; 10] = [
@@ -110,6 +114,7 @@ pub(crate) fn observe_s3_http_operation(op: S3Operation) {
 pub struct S3HttpRequestGuard {
     method: usize,
     operation: usize,
+    telemetry_started_at: Option<Instant>,
     finished: bool,
 }
 
@@ -122,6 +127,7 @@ impl S3HttpRequestGuard {
         Self {
             method: METHODS.iter().position(|known| *known == method).unwrap_or(METHODS.len() - 1),
             operation: UNKNOWN_OPERATION,
+            telemetry_started_at: (telemetry_trace_subscriber_count() != 0).then(Instant::now),
             finished: false,
         }
     }
@@ -151,8 +157,26 @@ impl S3HttpRequestGuard {
     fn finish(&mut self, outcome: usize) {
         if !self.finished {
             COUNTERS.record(self.method, self.operation, outcome);
+            if let Some((started_at, operation)) = self.telemetry_started_at.take().zip(telemetry_operation(self.operation)) {
+                let status = if outcome == 1 {
+                    TelemetryTraceStatus::Ok
+                } else {
+                    TelemetryTraceStatus::Error
+                };
+                telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, started_at.elapsed(), status));
+            }
             self.finished = true;
         }
+    }
+}
+
+fn telemetry_operation(index: usize) -> Option<TelemetryTraceOperation> {
+    match S3Operation::ALL.get(index)? {
+        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
+        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
+        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
+        _ => None,
     }
 }
 
@@ -171,6 +195,32 @@ mod tests {
     use super::*;
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
+
+    #[test]
+    fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {
+        assert_eq!(
+            telemetry_operation(S3Operation::GetObject.metric_index()),
+            Some(TelemetryTraceOperation::GetObject)
+        );
+        assert_eq!(
+            telemetry_operation(S3Operation::PutObject.metric_index()),
+            Some(TelemetryTraceOperation::PutObject)
+        );
+        assert_eq!(
+            telemetry_operation(S3Operation::HeadObject.metric_index()),
+            Some(TelemetryTraceOperation::HeadObject)
+        );
+        assert_eq!(
+            telemetry_operation(S3Operation::ListObjects.metric_index()),
+            Some(TelemetryTraceOperation::ListObjects)
+        );
+        assert_eq!(
+            telemetry_operation(S3Operation::ListObjectsV2.metric_index()),
+            Some(TelemetryTraceOperation::ListObjects)
+        );
+        assert_eq!(telemetry_operation(S3Operation::DeleteObject.metric_index()), None);
+        assert_eq!(telemetry_operation(UNKNOWN_OPERATION), None);
+    }
 
     #[test]
     fn outcome_counters_distinguish_partial_and_complete_write_failure() {
