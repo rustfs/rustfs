@@ -5,7 +5,7 @@
   "schemaVersion": 1,
   "capability": "performance.siteReplication@1",
   "classification": "L2",
-  "description": "Contract-only performance.siteReplication@1 result vectors. They do not enable or advertise a producer. Results contain only aggregate destination-confirmed measurements; endpoint URLs, credentials, CA material or paths, scratch bucket names, object/version identifiers, and cleanup controls are forbidden.",
+  "description": "Performance.siteReplication@1 result vectors for the bounded native producer. Results contain only aggregate destination-confirmed measurements; endpoint URLs, credentials, CA material or paths, scratch bucket names, object/version identifiers, and cleanup controls are forbidden.",
   "fixture": "reject-vectors",
   "vectors": [
     {

@@ -50,6 +50,7 @@ mod snapshot;
 mod config_test;
 
 // Re-export public types
+pub use cli::ConnectSiteReplicationPerformanceOpts;
 pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{
     ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,

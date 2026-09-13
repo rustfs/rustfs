@@ -250,8 +250,110 @@ pub enum ConnectPerformanceCommands {
     Client(Box<ConnectClientPerformanceOpts>),
     /// Measure bounded S3 object throughput in a dedicated temporary namespace
     Object(Box<ConnectObjectPerformanceOpts>),
+    /// Measure bounded destination-confirmed site-replication performance
+    SiteReplication(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Measure generated-file write and warm page-cache read performance
     Drive(Box<ConnectDrivePerformanceOpts>),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectSiteReplicationPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// Source RustFS deployment endpoint
+    #[arg(long = "source-endpoint", value_parser = NonEmptyStringValueParser::new())]
+    pub source_endpoint: String,
+    /// Destination RustFS deployment endpoint
+    #[arg(long = "destination-endpoint", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_endpoint: String,
+    /// Optional PEM root certificate for the source endpoint
+    #[arg(long = "source-ca-file")]
+    pub source_ca_file: Option<PathBuf>,
+    /// Optional PEM root certificate for the destination endpoint
+    #[arg(long = "destination-ca-file")]
+    pub destination_ca_file: Option<PathBuf>,
+    /// Owner-readable file containing the source S3 access key
+    #[arg(long = "source-access-key-file")]
+    pub source_access_key_file: PathBuf,
+    /// Owner-readable file containing the source S3 secret key
+    #[arg(long = "source-secret-key-file")]
+    pub source_secret_key_file: PathBuf,
+    /// Optional owner-readable file containing a source S3 session token
+    #[arg(long = "source-session-token-file")]
+    pub source_session_token_file: Option<PathBuf>,
+    /// Owner-readable file containing the destination S3 access key
+    #[arg(long = "destination-access-key-file")]
+    pub destination_access_key_file: PathBuf,
+    /// Owner-readable file containing the destination S3 secret key
+    #[arg(long = "destination-secret-key-file")]
+    pub destination_secret_key_file: PathBuf,
+    /// Optional owner-readable file containing a destination S3 session token
+    #[arg(long = "destination-session-token-file")]
+    pub destination_session_token_file: Option<PathBuf>,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.siteReplication@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 5_000)]
+    pub duration_millis: u64,
+    /// Stable opaque alias for the source deployment
+    #[arg(long = "source-alias", value_parser = NonEmptyStringValueParser::new())]
+    pub source_alias: String,
+    /// Source deployment identifier from site-replication configuration
+    #[arg(long = "source-deployment-id", value_parser = NonEmptyStringValueParser::new())]
+    pub source_deployment_id: String,
+    /// Stable opaque alias for the destination deployment
+    #[arg(long = "destination-alias", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_alias: String,
+    /// Destination deployment identifier from site-replication configuration
+    #[arg(long = "destination-deployment-id", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_deployment_id: String,
+    /// Existing versioned bucket dedicated to disposable performance objects
+    #[arg(long = "scratch-bucket", value_parser = NonEmptyStringValueParser::new())]
+    pub scratch_bucket: String,
+    /// Bounded cleanup window for versions that arrive after cancellation
+    #[arg(long = "late-arrival-cleanup-millis", default_value_t = 1_000)]
+    pub late_arrival_cleanup_millis: u64,
+    /// Confirm this explicit local L2 diagnostic operation
+    #[arg(long = "acknowledge-l2", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l2: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1205,6 +1307,8 @@ pub enum CommandResult {
     ConnectClientPerformance(ConnectClientPerformanceOpts),
     /// Consent-bound S3 object performance export
     ConnectObjectPerformance(ConnectObjectPerformanceOpts),
+    /// Consent-bound site-replication performance export
+    ConnectSiteReplicationPerformance(ConnectSiteReplicationPerformanceOpts),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export

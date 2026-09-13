@@ -150,6 +150,9 @@ impl Opt {
                     ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(*opts)),
                     ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
                     ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
+                    ConnectPerformanceCommands::SiteReplication(opts) => {
+                        Ok(CommandResult::ConnectSiteReplicationPerformance(*opts))
+                    }
                 },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
                 ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
