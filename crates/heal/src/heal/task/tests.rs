@@ -529,6 +529,49 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn retired_marker_is_deferred_for_bucket_and_single_object_tasks() {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .unwrap()
+            .insert("object-a".into(), VecDeque::from([MockHealObjectOutcome::RetiredMarkerDeferred]));
+        let bucket = bucket_task(storage);
+        let object = HealTask::from_request(
+            HealRequest::object("bucket-a".into(), "marker.bin".into(), Some(Uuid::new_v4().to_string())),
+            Arc::new(MockStorage {
+                heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetiredMarkerDeferred)),
+                ..Default::default()
+            }),
+        );
+        for task in [&bucket, &object] {
+            task.execute().await.expect("unproven marker permits traversal completion");
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.counters.failed, 0);
+            assert_eq!(outcome.counters.healed, 0);
+            let deferred = outcome
+                .objects
+                .iter()
+                .find(|item| {
+                    matches!(
+                        item.disposition,
+                        HealObjectDisposition::Deferred {
+                            reason: HealDeferredReason::RetiredMarkerProof,
+                            ..
+                        }
+                    )
+                })
+                .expect("typed deferral");
+            assert!(
+                deferred
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.contains("no committed retirement record"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn grace_single_object_is_completed_but_deferred() {
         let storage = Arc::new(MockStorage {
             heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::DanglingGraceDeferred)),
@@ -1755,6 +1798,7 @@ enum MockHealObjectOutcome {
     OkWithReadQuorum,
     ErrOther(&'static str),
     DanglingGraceDeferred,
+    RetiredMarkerDeferred,
     UnavailableDrive(DriveState),
     RetryableReadQuorum,
     RetryableSlowDown,
@@ -1884,6 +1928,10 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
+                )),
                 MockHealObjectOutcome::DanglingGraceDeferred => Ok((
                     HealResultItem::default(),
                     Some(Error::Disk(DiskError::other(
@@ -1926,6 +1974,10 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
+                )),
                 MockHealObjectOutcome::DanglingGraceDeferred => Ok((
                     HealResultItem::default(),
                     Some(Error::Disk(DiskError::other(

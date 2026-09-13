@@ -1475,6 +1475,29 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
     (temp_dirs, sets)
 }
 
+impl Sets {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        retirement: Option<&crate::bucket::retirement::MarkerRetirementContext<'_>>,
+    ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
+        let mut absence = None;
+        let (item, error) = self
+            .get_disks_for_heal_object(object, opts)?
+            .heal_object_with_retirement(bucket, object, version_id, opts, &mut absence, retirement)
+            .await?;
+        // A caller-owned lock does not expose its lease to this boundary.
+        // Keep cleanup unverified when that lease cannot be checked here.
+        if opts.no_lock {
+            absence = None;
+        }
+        Ok((item, error, absence))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

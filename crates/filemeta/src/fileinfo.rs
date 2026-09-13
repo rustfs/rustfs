@@ -1180,6 +1180,27 @@ impl FileInfo {
         insert_str(&mut self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH, epoch.to_string());
     }
 
+    /// Bind a newly created delete marker to the destination bucket generation.
+    pub fn set_delete_marker_incarnation(&mut self, incarnation: Uuid) {
+        if self.deleted && !incarnation.is_nil() {
+            insert_str(
+                &mut self.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+                incarnation.to_string(),
+            );
+        }
+    }
+
+    /// Legacy, malformed, or conflicting stamps cannot authorize marker cleanup.
+    pub fn delete_marker_incarnation(&self) -> Option<Uuid> {
+        if !self.deleted || self.tier_free_version() {
+            return None;
+        }
+        get_consistent_str(&self.metadata, rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|id| !id.is_nil())
+    }
+
     pub fn object_transaction_epoch(&self) -> Result<Option<Uuid>> {
         if !contains_key_str(&self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH) {
             return Ok(None);

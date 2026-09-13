@@ -866,6 +866,9 @@ mod ctx;
 mod metadata;
 mod ops;
 pub(crate) use ops::bucket::BucketInfoQuorum;
+#[cfg(test)]
+pub(crate) use ops::heal::DanglingDeleteFailure;
+pub(crate) use ops::heal::HealedObjectAbsence;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;

@@ -726,6 +726,7 @@ impl NodeService {
     pub(super) async fn handle_delete_version(
         &self,
         request: Request<DeleteVersionRequest>,
+        require_marker_condition: bool,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         verify_disk_mutation_digest(
             &request,
@@ -753,6 +754,21 @@ impl NodeService {
                 }));
             }
         };
+        if require_marker_condition && opts.expected_delete_marker.is_none() {
+            return Err(Status::invalid_argument("retired marker deletion requires a marker precondition"));
+        }
+        if opts.expected_delete_marker.is_some()
+            && (request.force_del_marker
+                || opts.undo_write
+                || opts.undo_delete
+                || opts.recursive
+                || opts.immediate
+                || opts.old_data_dir.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "retired marker preconditions cannot be combined with other mutations",
+            ));
+        }
         let result = if opts.undo_write {
             if request.force_del_marker {
                 Err(DiskError::other("undo_write cannot force a delete marker"))

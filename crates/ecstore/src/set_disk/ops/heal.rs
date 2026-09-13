@@ -22,6 +22,15 @@ use super::super::{
     heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
     should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
 };
+use crate::bucket::retirement::MarkerRetirementContext;
+
+#[derive(Clone, Copy)]
+struct ExplicitVersionHeal<'a> {
+    opts: &'a HealOpts,
+    allow_regeneration: bool,
+    retirement: Option<&'a MarkerRetirementContext<'a>>,
+}
+
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
@@ -35,6 +44,14 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
 const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Exact set-local absence, established while the object mutation lock is held.
+#[derive(Debug)]
+pub(crate) struct HealedObjectAbsence {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub removed: bool,
+}
 
 fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
     match error {
@@ -351,7 +368,7 @@ fn injected_dangling_check_parts_error(bucket: &str, object: &str, disk_index: u
 }
 
 #[cfg(test)]
-struct DanglingDeleteFailure {
+pub(crate) struct DanglingDeleteFailure {
     key: DanglingDeleteFailureKey,
 }
 
@@ -369,7 +386,7 @@ fn dangling_delete_failures() -> &'static std::sync::Mutex<DanglingDeleteFailure
 
 #[cfg(test)]
 impl DanglingDeleteFailure {
-    fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
         let key = (bucket.to_string(), object.to_string(), disk_index);
         let previous = dangling_delete_failures()
             .lock()
@@ -391,7 +408,7 @@ impl Drop for DanglingDeleteFailure {
 }
 
 #[cfg(test)]
-fn injected_dangling_delete_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
+pub(in crate::set_disk) fn injected_dangling_delete_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
     dangling_delete_failures()
         .lock()
         .expect("dangling delete failure registry should not poison")
@@ -541,6 +558,7 @@ impl SetDisks {
             .all(|committed| committed))
     }
 
+    #[cfg(test)]
     #[tracing::instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(in crate::set_disk) async fn heal_object(
         &self,
@@ -549,7 +567,18 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, true)).await
+        Box::pin(self.heal_object_with_explicit_version_regen(
+            bucket,
+            object,
+            version_id,
+            ExplicitVersionHeal {
+                opts,
+                allow_regeneration: true,
+                retirement: None,
+            },
+            &mut None,
+        ))
+        .await
     }
 
     async fn read_repair_commit_fingerprint(
@@ -659,9 +688,14 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         version_id: &str,
-        opts: &HealOpts,
-        allow_explicit_version_regen: bool,
+        run: ExplicitVersionHeal<'_>,
+        absence: &mut Option<HealedObjectAbsence>,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
+        let ExplicitVersionHeal {
+            opts,
+            allow_regeneration: allow_explicit_version_regen,
+            retirement,
+        } = run;
         trace!(
             event = EVENT_SET_DISK_HEAL,
             component = LOG_COMPONENT_ECSTORE,
@@ -1025,7 +1059,7 @@ impl SetDisks {
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             return match self
-                                .delete_if_dangling(
+                                .delete_if_dangling_with_proof(
                                     bucket,
                                     object,
                                     &parts_metadata,
@@ -1038,12 +1072,18 @@ impl SetDisks {
                                 )
                                 .await
                             {
-                                Ok(m) => {
-                                    let mut t_errs = Vec::with_capacity(errs.len());
-                                    for _ in 0..errs.len() {
-                                        t_errs.push(None);
+                                Ok((m, absent)) => {
+                                    if absent {
+                                        *absence = Some(HealedObjectAbsence {
+                                            pool_index: self.pool_index,
+                                            set_index: self.set_index,
+                                            removed: true,
+                                        });
                                     }
-                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, None))
+                                    Ok((
+                                        self.dangling_heal_result(m, &errs, bucket, object, version_id, absent).await,
+                                        (!absent).then_some(DiskError::ErasureWriteQuorum),
+                                    ))
                                 }
                                 Err(err) => {
                                     error!(
@@ -1556,13 +1596,49 @@ impl SetDisks {
                 }
             }
             Err(err) => {
+                if let Some(retirement) = retirement
+                    && parts_metadata
+                        .iter()
+                        .zip(&errs)
+                        .any(|(info, error)| error.is_none() && info.is_canonical_delete_marker())
+                {
+                    let cleanup = match Self::retired_marker_candidate(&parts_metadata, &errs) {
+                        Ok(marker) => {
+                            self.remove_retired_marker(retirement, bucket, object, marker, opts, &disks)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let absent = cleanup.is_ok();
+                    let item = self
+                        .dangling_heal_result(FileInfo::default(), &errs, bucket, object, version_id, absent)
+                        .await;
+                    if absent {
+                        *absence = Some(HealedObjectAbsence {
+                            pool_index: self.pool_index,
+                            set_index: self.set_index,
+                            removed: true,
+                        });
+                    }
+                    return Ok((item, cleanup.err()));
+                }
                 if allow_explicit_version_regen
                     && !version_id.is_empty()
                     && self
                         .try_regenerate_explicit_version_meta(bucket, object, version_id, &parts_metadata, &errs, &disks)
                         .await?
                 {
-                    return Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, false)).await;
+                    return Box::pin(self.heal_object_with_explicit_version_regen(
+                        bucket,
+                        object,
+                        version_id,
+                        ExplicitVersionHeal {
+                            allow_regeneration: false,
+                            ..run
+                        },
+                        absence,
+                    ))
+                    .await;
                 }
 
                 if opts.dry_run {
@@ -1587,7 +1663,7 @@ impl SetDisks {
 
                 let data_errs_by_part = HashMap::new();
                 match self
-                    .delete_if_dangling(
+                    .delete_if_dangling_with_proof(
                         bucket,
                         object,
                         &parts_metadata,
@@ -1600,7 +1676,19 @@ impl SetDisks {
                     )
                     .await
                 {
-                    Ok(m) => Ok((self.default_heal_result(m, &errs, bucket, object, version_id).await, None)),
+                    Ok((m, absent)) => {
+                        if absent {
+                            *absence = Some(HealedObjectAbsence {
+                                pool_index: self.pool_index,
+                                set_index: self.set_index,
+                                removed: true,
+                            });
+                        }
+                        Ok((
+                            self.dangling_heal_result(m, &errs, bucket, object, version_id, absent).await,
+                            (!absent).then_some(DiskError::ErasureWriteQuorum),
+                        ))
+                    }
                     Err(cleanup_err) => Ok((
                         self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                             .await,
@@ -1609,6 +1697,119 @@ impl SetDisks {
                 }
             }
         }
+    }
+
+    fn retired_marker_candidate(
+        metadata: &[FileInfo],
+        errors: &[Option<DiskError>],
+    ) -> disk::error::Result<rustfs_filemeta::MetaDeleteMarker> {
+        let mut candidate = None;
+        for (info, error) in metadata.iter().zip(errors) {
+            match error {
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound) => continue,
+                Some(_) => return Err(DiskError::retired_marker_deferred("not every replica is readable")),
+                None => {}
+            }
+            if !info.is_canonical_delete_marker() || info.delete_marker_incarnation().is_none() {
+                return Err(DiskError::retired_marker_deferred("marker has no trustworthy bucket incarnation"));
+            }
+            let marker = rustfs_filemeta::MetaDeleteMarker::from(info.clone());
+            if candidate.as_ref().is_some_and(|previous| previous != &marker) {
+                return Err(DiskError::retired_marker_deferred("surviving marker identities conflict"));
+            }
+            candidate = Some(marker);
+        }
+        candidate.ok_or_else(|| DiskError::retired_marker_deferred("no exact marker candidate"))
+    }
+
+    async fn remove_retired_marker(
+        &self,
+        context: &MarkerRetirementContext<'_>,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        opts: &HealOpts,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
+        let defer = DiskError::retired_marker_deferred;
+        if opts.dry_run || !opts.remove {
+            return Err(defer("cleanup requires remove=true and dry_run=false"));
+        }
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(defer("every target disk must be online"));
+        }
+        let incarnation = marker.into_fileinfo(bucket, object, false)?.delete_marker_incarnation();
+        let Some(old) = incarnation else { return Err(defer("marker incarnation is unavailable")) };
+        let Some(current) = context.current_incarnation else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        if old == current || context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("current generation or lost bucket lifecycle fence"));
+        }
+        let Some(store) = context.store.as_ref() else {
+            return Err(defer("retirement owner is unavailable"));
+        };
+        match crate::bucket::retirement::is_retired(store.clone(), bucket, old).await {
+            Ok(true) => {}
+            Ok(false) => return Err(defer("no committed bucket retirement record")),
+            Err(error) => return Err(DiskError::retired_marker_deferred(format!("retirement read failed: {error}"))),
+        }
+        let Some(version) = marker.version_id.filter(|id| !id.is_nil()) else {
+            return Err(defer("cleanup requires an explicit non-null version"));
+        };
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        let request = FileInfo {
+            volume: bucket.to_owned(),
+            name: object.to_owned(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let results = join_all(disks.iter().enumerate().map(|(disk_index, disk)| {
+            let request = request.clone();
+            let marker = marker.clone();
+            async move {
+                if let Some(error) = injected_dangling_delete_error(bucket, object, disk_index) {
+                    return Err(error);
+                }
+                let Some(disk) = disk else { return Err(DiskError::DiskNotFound) };
+                disk.delete_version(
+                    bucket,
+                    object,
+                    request,
+                    false,
+                    DeleteOptions {
+                        expected_delete_marker: Some(marker),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        }))
+        .await;
+        for result in results {
+            if let Err(error) = result
+                && !matches!(error, DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            {
+                return Err(DiskError::retired_marker_deferred(format!("conditional marker deletion failed: {error}")));
+            }
+        }
+        let (_, errors) = Self::read_all_fileinfo(disks, "", bucket, object, &version.to_string(), false, false, false).await?;
+        let selected = self.get_disks_internal().await;
+        let same_targets = selected.len() == disks.len() && selected.iter().zip(disks).all(|(current, original)| {
+            matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
+        });
+        if context.lifecycle_guard.is_lock_lost()
+            || !same_targets
+            || !errors
+                .iter()
+                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+        {
+            return Err(defer("complete marker absence could not be verified under the original fence"));
+        }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(())
     }
 
     async fn try_regenerate_explicit_version_meta(
@@ -2465,95 +2666,8 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self
-                .new_ns_lock(bucket, object)
-                .await
-                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?)
-        } else {
-            None
-        };
-
-        if has_suffix(object, SLASH_SEPARATOR) {
-            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
-            return Ok((result, err.map(|e| e.into())));
-        }
-
-        // The inner heal and missing-object report read the registry again;
-        // release this snapshot guard before a topology writer can queue between reads.
-        let disks = self.get_disks_internal().await;
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
+        self.heal_object_with_absence(bucket, object, version_id, opts, &mut None)
             .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if DiskError::is_all_not_found(&errs) {
-            debug!(
-                event = EVENT_SET_DISK_HEAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                bucket,
-                object,
-                version_id,
-                state = "missing_object_skipped",
-                "Set disk heal skipped missing object"
-            );
-            let err = if !version_id.is_empty() {
-                Error::FileVersionNotFound
-            } else {
-                Error::FileNotFound
-            };
-            if version_id.is_empty()
-                && (opts.remove || opts.dry_run)
-                && let Some(cleanup) = self
-                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
-                    .await
-                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
-            {
-                let mut result = self
-                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
-                    .await;
-                result.detail = format!(
-                    "metadata-less data directories matched={}, removed={}, dry_run={}",
-                    cleanup.matched, cleanup.removed, opts.dry_run
-                );
-                let err = cleanup.first_error.map(Error::from).or(Some(err));
-                return Ok((result, err));
-            }
-            return Ok((
-                self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
-                    .await,
-                Some(err),
-            ));
-        }
-
-        // Heal the object.
-        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
-        let mut inner_opts = *opts;
-        inner_opts.no_lock = true;
-        let (result, err) = self
-            .heal_object(bucket, object, version_id, &inner_opts)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if let Some(err) = err.as_ref() {
-            match err {
-                &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
-                    // Instead of returning an error when a bitrot error is detected
-                    // during a normal heal scan, heal again with bitrot flag enabled.
-                    inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self
-                        .heal_object(bucket, object, version_id, &inner_opts)
-                        .await
-                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-                    return Ok((result, err.map(|e| e.into())));
-                }
-                _ => {}
-            }
-        }
-        Ok((result, err.map(|e| e.into())))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2627,6 +2741,182 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         }
 
         Ok(())
+    }
+}
+
+impl SetDisks {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<HealedObjectAbsence>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_object_with_retirement(bucket, object, version_id, opts, absence, None)
+            .await
+    }
+
+    pub(crate) async fn heal_object_with_retirement(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<HealedObjectAbsence>,
+        retirement: Option<&MarkerRetirementContext<'_>>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        *absence = None;
+        let _write_lock_guard = if !opts.no_lock {
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
+        } else {
+            None
+        };
+
+        if has_suffix(object, SLASH_SEPARATOR) {
+            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
+            return Ok((result, err.map(|e| e.into())));
+        }
+
+        // The inner heal and missing-object report read the registry again;
+        // release this snapshot guard before a topology writer can queue between reads.
+        let disks = self.get_disks_internal().await;
+        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        if DiskError::is_all_not_found(&errs) {
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                version_id,
+                state = "missing_object_skipped",
+                "Set disk heal skipped missing object"
+            );
+            let err = if !version_id.is_empty() {
+                Error::FileVersionNotFound
+            } else {
+                Error::FileNotFound
+            };
+            if version_id.is_empty()
+                && (opts.remove || opts.dry_run)
+                && let Some(cleanup) = self
+                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
+            {
+                let mut result = self
+                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
+                    .await;
+                result.detail = format!(
+                    "metadata-less data directories matched={}, removed={}, dry_run={}",
+                    cleanup.matched, cleanup.removed, opts.dry_run
+                );
+                let err = cleanup.first_error.map(Error::from).or(Some(err));
+                return Ok((result, err));
+            }
+            let result = self
+                .default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
+                .await;
+            // Check the lease after the final await before publishing the proof.
+            if !opts.dry_run
+                && !version_id.is_empty()
+                && !disks.is_empty()
+                && disks.iter().all(Option::is_some)
+                && errs
+                    .iter()
+                    .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+                && !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
+                *absence = Some(HealedObjectAbsence {
+                    pool_index: self.pool_index,
+                    set_index: self.set_index,
+                    removed: false,
+                });
+            }
+            return Ok((result, Some(err)));
+        }
+
+        // Heal the object.
+        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
+        let mut inner_opts = *opts;
+        inner_opts.no_lock = true;
+        let (result, err) = self
+            .heal_object_with_explicit_version_regen(
+                bucket,
+                object,
+                version_id,
+                ExplicitVersionHeal {
+                    opts: &inner_opts,
+                    allow_regeneration: true,
+                    retirement,
+                },
+                absence,
+            )
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+        if let Some(err) = err.as_ref() {
+            match err {
+                &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
+                    // Instead of returning an error when a bitrot error is detected
+                    // during a normal heal scan, heal again with bitrot flag enabled.
+                    inner_opts.scan_mode = HealScanMode::Deep;
+                    let (result, err) = self
+                        .heal_object_with_explicit_version_regen(
+                            bucket,
+                            object,
+                            version_id,
+                            ExplicitVersionHeal {
+                                opts: &inner_opts,
+                                allow_regeneration: true,
+                                retirement,
+                            },
+                            absence,
+                        )
+                        .await
+                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                    if _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                        *absence = None;
+                    }
+                    return Ok((result, err.map(|e| e.into())));
+                }
+                _ => {}
+            }
+        }
+        if _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            *absence = None;
+        }
+        Ok((result, err.map(|e| e.into())))
+    }
+}
+
+impl SetDisks {
+    async fn dangling_heal_result(
+        &self,
+        metadata: FileInfo,
+        errs: &[Option<DiskError>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        absent: bool,
+    ) -> HealResultItem {
+        let mut item = self.default_heal_result(metadata, errs, bucket, object, version_id).await;
+        if absent {
+            for drive in &mut item.after.drives {
+                drive.state = DriveState::Missing.to_string();
+            }
+        }
+        item
     }
 }
 
@@ -4627,6 +4917,71 @@ mod heal_result_report_tests {
             ),
             "the delete guard must not propagate metadata"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dangling_absence_proof_rejects_failed_stale_replica_and_accepts_retry() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "dangling-absence-partial-delete";
+            let object = "history.txt";
+            let (_temp_dirs, set, disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+            let version = Uuid::new_v4();
+            let disk = disks[0].as_ref().expect("stale disk must be online");
+            let mut metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("load stale inline metadata");
+            metadata.version_id = Some(version);
+            disk.write_metadata("", bucket, object, metadata)
+                .await
+                .expect("seed exact stale historical version");
+            let opts = HealOpts {
+                no_lock: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            };
+            let failure = DanglingDeleteFailure::install(bucket, object, 0, DiskError::FaultyDisk);
+            let mut proof = None;
+            let (_, error) = set
+                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .await
+                .expect("heal should return a per-object failure");
+            assert!(
+                error.is_some(),
+                "three absent slots meeting write quorum cannot hide the failed stale slot"
+            );
+            assert!(proof.is_none(), "partial cleanup must not produce an absence proof");
+            assert!(
+                disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .is_ok(),
+                "the failed historical version must remain for retry"
+            );
+            drop(failure);
+            let (result, error) = set
+                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .await
+                .expect("retry should execute cleanup");
+            assert!(error.is_none(), "retry should complete: {error:?}");
+            let receipt = proof.take().expect("successful exact cleanup must produce proof");
+            assert!(receipt.removed);
+            assert_eq!((receipt.pool_index, receipt.set_index), (set.pool_index, set.set_index));
+            assert!(
+                result
+                    .after
+                    .drives
+                    .iter()
+                    .all(|drive| drive.state == DriveState::Missing.to_string())
+            );
+            let (_, _) = set
+                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .await
+                .expect("already absent replay should execute");
+            assert!(!proof.expect("exact already-absent replay must remain provable").removed);
+        })
+        .await;
     }
 
     #[tokio::test]

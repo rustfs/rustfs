@@ -28,6 +28,27 @@ const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
 
+/// Storage-owned proof for the exact version and every selected erasure location.
+/// This is an in-process result, never reconstructed from admin drive telemetry.
+#[derive(Debug)]
+pub struct HealObjectAbsenceProof {
+    pub bucket: String,
+    pub object: String,
+    pub version_id: String,
+    pub bucket_incarnation_id: Uuid,
+    pub pool_index: Option<usize>,
+    pub set_index: Option<usize>,
+    pub locations: Vec<(usize, usize)>,
+    pub removed: bool,
+}
+
+#[derive(Debug)]
+pub struct HealObjectStorageResult {
+    pub item: HealResultItem,
+    pub error: Option<Error>,
+    pub absence: Option<HealObjectAbsenceProof>,
+}
+
 fn invalid_heal_pool_index(pool_idx: usize, pool_count: usize) -> Error {
     StorageError::InvalidArgument(
         "heal".to_string(),
@@ -463,6 +484,80 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        self.handle_heal_object_with_absence(bucket, object, version_id, opts, &mut None, None)
+            .await
+    }
+
+    pub async fn heal_object_with_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        if opts.dry_run || opts.no_lock || version_id.is_empty() || super::utils::is_reserved_or_invalid_bucket(bucket, false) {
+            let (item, error) = self.handle_heal_object(bucket, object, version_id, opts).await?;
+            return Ok(HealObjectStorageResult {
+                item,
+                error,
+                absence: None,
+            });
+        }
+
+        // Match object publication: bucket lifecycle before capacity and object
+        // namespace locks. Keep the incarnation pinned through proof delivery.
+        let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let retirement = crate::bucket::retirement::MarkerRetirementContext {
+            store: crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await,
+            current_incarnation: self
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .ok()
+                .filter(|id| !id.is_nil()),
+            lifecycle_guard: &guard,
+        };
+        let mut proofs = None;
+        let (item, mut error) = self
+            .handle_heal_object_with_absence(bucket, object, version_id, opts, &mut proofs, Some(&retirement))
+            .await?;
+        // Read the authoritative incarnation only for an absence candidate.
+        // The lifecycle guard has pinned it throughout the storage operation.
+        let incarnation = if proofs.is_some() && !guard.is_lock_lost() {
+            self.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .ok()
+                .filter(|id| !id.is_nil())
+        } else {
+            None
+        };
+        let absence = match (incarnation, proofs) {
+            (Some(incarnation), Some(proofs)) if !guard.is_lock_lost() => Some(HealObjectAbsenceProof {
+                bucket: bucket.to_owned(),
+                object: object.to_owned(),
+                version_id: version_id.to_owned(),
+                bucket_incarnation_id: incarnation,
+                pool_index: opts.pool,
+                set_index: opts.set,
+                removed: proofs.iter().any(|proof| proof.removed),
+                locations: proofs.into_iter().map(|proof| (proof.pool_index, proof.set_index)).collect(),
+            }),
+            _ => None,
+        };
+        if absence.is_some() {
+            error = None;
+        }
+        Ok(HealObjectStorageResult { item, error, absence })
+    }
+
+    async fn handle_heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        absence: &mut Option<Vec<crate::set_disk::HealedObjectAbsence>>,
+        retirement: Option<&crate::bucket::retirement::MarkerRetirementContext<'_>>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
         trace!(
             event = EVENT_HEAL_OBJECT_STARTED,
             component = LOG_COMPONENT_ECSTORE,
@@ -476,7 +571,9 @@ impl ECStore {
         );
         let object = encode_dir_object(object);
 
+        *absence = None;
         let pools = self.get_pools_for_heal_object(opts)?;
+        let requested_pool_count = pools.len();
         if let Some(set_idx) = opts.set {
             for pool in &pools {
                 if set_idx >= pool.disk_set.len() {
@@ -550,7 +647,8 @@ impl ECStore {
                             }
                             #[cfg(test)]
                             crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                            pool.heal_object(bucket, &pool_object, version_id, &opts).await
+                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                                .await
                         }
                     });
                     let results = join_all(futures).await;
@@ -573,19 +671,29 @@ impl ECStore {
                     move |opts| async move {
                         #[cfg(test)]
                         crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                        pool.heal_object(bucket, &pool_object, version_id, &opts).await
+                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                            .await
                     },
                 ));
             }
             join_all(futures).await
         };
 
+        let mut proofs = Vec::with_capacity(requested_pool_count);
         let mut errs = Vec::with_capacity(self.pools.len());
         let mut ress = Vec::with_capacity(self.pools.len());
 
         for res in results.into_iter() {
             match res {
-                Ok((result, err)) => {
+                Ok((result, err, proof)) => {
+                    if let Some(proof) = proof
+                        && (err.is_none()
+                            || err
+                                .as_ref()
+                                .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err)))
+                    {
+                        proofs.push(proof);
+                    }
                     let mut result = result;
                     result.object = decode_dir_object(&result.object);
                     ress.push(result);
@@ -596,6 +704,12 @@ impl ECStore {
                     ress.push(HealResultItem::default());
                 }
             }
+        }
+
+        // Absence in one pool cannot discharge a responsibility covering other
+        // pools, including skipped decommission sources or failed lookups.
+        if requested_pool_count > 0 && proofs.len() == requested_pool_count {
+            *absence = Some(proofs);
         }
 
         for (idx, err) in errs.iter().enumerate() {
@@ -1088,6 +1202,40 @@ mod tests {
         .expect("multi-pool test store should initialize");
         metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         (temp_dir, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn absence_proof_requires_every_selected_pool() {
+        let (_temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("absence-scope-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket in both pools");
+        let version = Uuid::new_v4().to_string();
+        let result = store
+            .heal_object_with_proof(&bucket, "history.txt", &version, &HealOpts::default())
+            .await
+            .expect("exact absence lookup should complete across both pools");
+        assert!(result.error.is_none());
+        let proof = result.absence.expect("all selected pools proved the exact version absent");
+        assert_eq!(proof.locations, vec![(0, 0), (1, 0)]);
+        assert_eq!((proof.pool_index, proof.set_index), (None, None));
+        assert_eq!(proof.bucket, bucket);
+        assert_eq!(proof.version_id, version);
+        assert!(!proof.removed, "already absent versions do not count as another cleanup");
+
+        store.pool_meta.write().await.pools[1].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+        let partial = store
+            .heal_object_with_proof(&bucket, "history.txt", &version, &HealOpts::default())
+            .await
+            .expect("unscoped heal should retain its legacy suspended-pool behavior");
+        assert!(partial.absence.is_none(), "an uninspected suspended pool prevents global absence proof");
+        shutdown.cancel();
     }
 
     fn heal_test_format_path(temp_dir: &tempfile::TempDir, pool_index: usize, disk_index: usize) -> std::path::PathBuf {
