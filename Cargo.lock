@@ -9588,6 +9588,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "s3s",
+ "s3s-sigv4",
  "serde",
  "serde_json",
  "serde_urlencoded",
