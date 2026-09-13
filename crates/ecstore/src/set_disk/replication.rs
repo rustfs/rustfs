@@ -18,9 +18,8 @@ use super::{
 };
 use crate::bucket::lifecycle::lifecycle;
 use crate::core::pools::DecommissionCapacityAdmission;
-use rustfs_filemeta::RestoreStatusOps;
 use rustfs_filemeta::metadata_keys;
-use s3s::dto::{RestoreStatus, Timestamp};
+use rustfs_filemeta::{RestoreStatus, RestoreStatusOps};
 #[cfg(all(test, feature = "test-util"))]
 use std::sync::Arc;
 
@@ -216,7 +215,7 @@ impl SetDisks {
             metadata_keys::RESTORE.to_string(),
             RestoreStatus {
                 is_restore_in_progress: Some(false),
-                restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                restore_expiry_date: Some(restore_expiry),
             }
             .to_string(),
         );

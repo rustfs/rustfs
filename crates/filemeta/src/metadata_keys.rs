@@ -128,8 +128,9 @@ mod tests {
     }
 
     /// Migration-period cross-check: the constants must equal the historical
-    /// sources callers used before this module existed. Drop the `s3s` half
-    /// together with filemeta's `s3s` dependency.
+    /// `rustfs_utils` sources callers used before this module existed. The
+    /// `s3s::header` half was dropped with filemeta's `s3s` dependency (A3c);
+    /// `PINNED` and the pre-module fixture keep pinning those bytes.
     #[test]
     fn persisted_metadata_keys_match_their_historical_sources() {
         use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
@@ -137,18 +138,6 @@ mod tests {
             AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_RESTORE,
             AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS,
         };
-        use s3s::header::{
-            X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE,
-            X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_STORAGE_CLASS,
-        };
-
-        assert_eq!(OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str());
-        assert_eq!(OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_MODE.as_str());
-        assert_eq!(OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
-        assert_eq!(RESTORE, X_AMZ_RESTORE.as_str());
-        assert_eq!(SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION.as_str());
-        assert_eq!(STORAGE_CLASS, X_AMZ_STORAGE_CLASS.as_str());
-
         assert_eq!(OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
         assert_eq!(OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER);
         assert_eq!(OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
