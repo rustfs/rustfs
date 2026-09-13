@@ -159,7 +159,7 @@ impl ECStore {
             result
         }))
         .await
-        .map_err(|error| Error::other(format!("bucket heal owner task failed: {error}")))?
+        .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
     }
 
     pub async fn heal_bucket_at_incarnation(
