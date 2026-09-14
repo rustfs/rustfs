@@ -202,7 +202,9 @@ pub mod bucket {
     }
 
     pub mod migration {
-        pub use crate::bucket::migration::{LegacyBlobDecryptFn, try_migrate_bucket_metadata, try_migrate_iam_config};
+        pub use crate::bucket::migration::{
+            LegacyBlobDecryptFn, migration_startup_error, try_migrate_bucket_metadata, try_migrate_iam_config,
+        };
     }
 
     pub mod object_lock {

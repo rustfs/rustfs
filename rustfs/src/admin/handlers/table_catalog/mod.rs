@@ -2515,6 +2515,11 @@ fn normalize_table_credential_object_prefix(object_prefix: &str) -> S3Result<Str
     if object_prefix.is_empty() {
         return Err(s3_error!(InvalidRequest, "table credential scope prefix is empty"));
     }
+    if crate::table_catalog::is_reserved_table_object_key(object_prefix) {
+        return Err(S3Error::from(ApiError::invalid_request(
+            "table credential scope overlaps the reserved table catalog prefix",
+        )));
+    }
     if object_prefix.contains('\\') {
         return Err(s3_error!(
             InvalidRequest,

@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+pub(crate) const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 pub(crate) const RETRY_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A reconciler reports its own failures; the outcome carries no value because neither

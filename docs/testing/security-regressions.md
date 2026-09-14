@@ -25,9 +25,9 @@ Every fixed RustFS GitHub Security Advisory maps to at least one named regressio
 | Layer | Command | Lane | Guard |
 | --- | --- | --- | --- |
 | Unit and crate tests (`ghsa_r5qv_*`, the m77q pins, `ghsa_5354_*`, `ghsa_3ppv_*`, `ghsa_6r96_*`, `ghsa_v9cp_*`, `ghsa_g3vq_*`, `ghsa_g8w9_*`) | `cargo nextest run --profile ci --all --exclude e2e_test` | every PR, `Test and Lint` (required) | none needed; the workspace pass runs every unit and crate test |
-| S3-API negative-auth e2e (`negative_sigv4_test`, `presigned_negative_test`, `admin_auth_test`) | `cargo nextest run --profile e2e-smoke -p e2e_test` | every PR, `End-to-End Tests` (report-only) | `scripts/check_security_smoke_count.sh` with the floor in `.config/security-smoke-floor.txt`, run in the `e2e-tests` job; fails when a rename drops one of these modules out of the smoke filter |
-| Other S3 e2e guards (`anonymous_access_test`) | `cargo nextest run --profile e2e-smoke -p e2e_test` | every PR, `End-to-End Tests` (report-only) | `scripts/check_test_wiring.py --check-profile e2e-smoke` digest |
-| Protocol e2e (`protocols::test_protocol_core_suite`, GHSA-3p3x) | `RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo nextest run -j 1 --profile e2e-protocols -p e2e_test` | nightly, `e2e-replication-nightly.yml` job `protocols-nightly`; not PR-gated | `scripts/check_test_wiring.py --check-profile e2e-protocols` digest |
+| S3-API negative-auth e2e (`negative_sigv4_test`, `presigned_negative_test`, `admin_auth_test`) | `python3 scripts/e2e_binary.py build --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test` | every PR, `End-to-End Tests` (report-only) | `scripts/check_security_smoke_count.sh` with the floor in `.config/security-smoke-floor.txt`, run in the `e2e-tests` job; fails when a rename drops one of these modules out of the smoke filter |
+| Other S3 e2e guards (`anonymous_access_test`) | same build and run as the row above | every PR, `End-to-End Tests` (report-only) | `scripts/check_test_wiring.py --check-profile e2e-smoke` digest |
+| Protocol e2e (`protocols::test_protocol_core_suite`, GHSA-3p3x) | `python3 scripts/e2e_binary.py build --features ftps,webdav,sftp`, then `python3 scripts/e2e_binary.py run --features ftps,webdav,sftp -- cargo nextest run -j 1 --profile e2e-protocols -p e2e_test` | nightly, `e2e-replication-nightly.yml` job `protocols-nightly`; not PR-gated | `scripts/check_test_wiring.py --check-profile e2e-protocols` digest |
 
 Notes:
 

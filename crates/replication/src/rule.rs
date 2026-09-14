@@ -22,6 +22,10 @@ pub trait ReplicationRuleExt {
 }
 
 impl ReplicationRuleExt for ReplicationRule {
+    /// The rule's key prefix: `Filter.Prefix`, else `Filter.And.Prefix`, else
+    /// the deprecated top-level `Prefix` of a V1 rule written without a
+    /// `<Filter>` (backlog#2367 C-2). A rule that carries both keeps AWS's
+    /// precedence: the `<Filter>` is authoritative.
     fn prefix(&self) -> &str {
         if let Some(filter) = &self.filter {
             if let Some(prefix) = &filter.prefix {
@@ -32,7 +36,7 @@ impl ReplicationRuleExt for ReplicationRule {
                 ""
             }
         } else {
-            ""
+            self.prefix.as_deref().unwrap_or("")
         }
     }
 

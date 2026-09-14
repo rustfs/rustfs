@@ -243,9 +243,10 @@ run_quick_e2e_steps() {
     return
   fi
 
-  run_step "e2e-reliability-disk-fault" cargo test --package e2e_test reliability_disk_fault_test -- --nocapture
-  run_step "e2e-heal-erasure-disk-rebuild" cargo test --package e2e_test heal_erasure_disk_rebuild_test -- --nocapture
-  run_step "e2e-namespace-lock-quorum" cargo test --package e2e_test namespace_lock_quorum_test -- --nocapture
+  run_step "build-e2e-server" python3 scripts/e2e_binary.py build
+  run_step "e2e-reliability-disk-fault" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test reliability_disk_fault_test -- --nocapture
+  run_step "e2e-heal-erasure-disk-rebuild" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test heal_erasure_disk_rebuild_test -- --nocapture
+  run_step "e2e-namespace-lock-quorum" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test namespace_lock_quorum_test -- --nocapture
 }
 
 run_quick_profile() {
@@ -313,15 +314,15 @@ write_blackbox_matrix() {
 
 	  {
 	    printf 'profile\tscenario\tgate\tcommand\tfixture_env\tstatus\n'
-	    printf 'quick\tsingle-node disk fault read/write\tblack-box\tcargo test --package e2e_test reliability_disk_fault_test -- --nocapture\tnone\t%s\n' "$e2e_status"
-	    printf 'quick\theal degraded erasure disk rebuild\tblack-box\tcargo test --package e2e_test heal_erasure_disk_rebuild_test -- --nocapture\tnone\t%s\n' "$e2e_status"
-	    printf 'quick\tnamespace lock quorum under EC ops\tblack-box\tcargo test --package e2e_test namespace_lock_quorum_test -- --nocapture\tnone\t%s\n' "$e2e_status"
+	    printf 'quick\tsingle-node disk fault read/write\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test reliability_disk_fault_test -- --nocapture\tnone\t%s\n' "$e2e_status"
+	    printf 'quick\theal degraded erasure disk rebuild\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test heal_erasure_disk_rebuild_test -- --nocapture\tnone\t%s\n' "$e2e_status"
+	    printf 'quick\tnamespace lock quorum under EC ops\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test namespace_lock_quorum_test -- --nocapture\tnone\t%s\n' "$e2e_status"
 	    printf 'full\tlegacy bitrot read fixture restore\tfixture\tcargo test -p rustfs-ecstore --test legacy_bitrot_read_test -- --nocapture\tRUSTFS_LEGACY_TEST_ROOT,RUSTFS_LEGACY_TEST_DISK\t%s\n' "$legacy_status"
 	    printf 'full\tMinIO generated encrypted read and negative restore fixture\tfixture\tcargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored --nocapture\tRUSTFS_MINIO_FIXTURE_ROOT,RUSTFS_MINIO_STATIC_KMS_KEY_B64\t%s\n' "$minio_status"
 	    printf 'full\tS3 multipart range versioning delete subset\tblack-box\tenv TESTEXPR=\"multipart or range or versioning or delete\" DEPLOY_MODE=build MAXFAIL=0 ./scripts/s3-tests/run.sh\tnone\t%s\n' "$s3_status"
-	    printf 'destructive\tdistributed cluster concurrency\tblack-box\tcargo test --package e2e_test cluster_concurrency_test -- --nocapture\tnone\t%s\n' "$destructive_status"
-	    printf 'destructive\tstale multipart cleanup cluster\tblack-box\tcargo test --package e2e_test stale_multipart_cleanup_cluster_test -- --nocapture\tnone\t%s\n' "$destructive_status"
-	    printf 'destructive\tdelete marker migration semantics\tblack-box\tcargo test --package e2e_test delete_marker_migration_semantics_test -- --nocapture\tnone\t%s\n' "$destructive_status"
+	    printf 'destructive\tdistributed cluster concurrency\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test cluster_concurrency_test -- --nocapture\tnone\t%s\n' "$destructive_status"
+	    printf 'destructive\tstale multipart cleanup cluster\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test stale_multipart_cleanup_cluster_test -- --nocapture\tnone\t%s\n' "$destructive_status"
+	    printf 'destructive\tdelete marker migration semantics\tblack-box\tpython3 scripts/e2e_binary.py run -- cargo test --package e2e_test delete_marker_migration_semantics_test -- --nocapture\tnone\t%s\n' "$destructive_status"
 	  } >"$BLACKBOX_MATRIX"
 }
 
@@ -566,9 +567,9 @@ run_destructive_profile() {
     return
   fi
 
-  run_step "e2e-cluster-concurrency" cargo test --package e2e_test cluster_concurrency_test -- --nocapture
-  run_step "e2e-stale-multipart-cleanup-cluster" cargo test --package e2e_test stale_multipart_cleanup_cluster_test -- --nocapture
-  run_step "e2e-delete-marker-migration-semantics" cargo test --package e2e_test delete_marker_migration_semantics_test -- --nocapture
+  run_step "e2e-cluster-concurrency" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test cluster_concurrency_test -- --nocapture
+  run_step "e2e-stale-multipart-cleanup-cluster" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test stale_multipart_cleanup_cluster_test -- --nocapture
+  run_step "e2e-delete-marker-migration-semantics" python3 scripts/e2e_binary.py run -- cargo test --package e2e_test delete_marker_migration_semantics_test -- --nocapture
 }
 
 run_fuzz_profile() {

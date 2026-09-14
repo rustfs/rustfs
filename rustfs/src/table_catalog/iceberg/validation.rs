@@ -69,6 +69,11 @@ fn warehouse_object_prefix_from_location(
             "table warehouse location must be inside the table bucket".to_string(),
         ));
     }
+    if is_reserved_table_object_key(object_prefix.strip_suffix('/').unwrap_or(object_prefix)) {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location overlaps the reserved table catalog prefix".to_string(),
+        ));
+    }
     normalize_warehouse_object_prefix(object_prefix, max_prefix_depth)
 }
 

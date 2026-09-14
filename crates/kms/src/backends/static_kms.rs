@@ -335,7 +335,7 @@ impl KmsBackend for StaticKmsBackend {
         if key_name == self.key_id {
             return Err(KmsError::key_already_exists(&self.key_id));
         }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot create new keys"))
+        Err(KmsError::unsupported_capability("static", "create_key"))
     }
 
     async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
@@ -405,14 +405,14 @@ impl KmsBackend for StaticKmsBackend {
         if request.key_id != self.key_id {
             return Err(KmsError::key_not_found(&request.key_id));
         }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot delete keys"))
+        Err(KmsError::unsupported_capability("static", "delete_key"))
     }
 
     async fn cancel_key_deletion(&self, request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse> {
         if request.key_id != self.key_id {
             return Err(KmsError::key_not_found(&request.key_id));
         }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot cancel key deletion"))
+        Err(KmsError::unsupported_capability("static", "cancel_key_deletion"))
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -654,7 +654,7 @@ mod tests {
     async fn test_create_key_returns_error_for_other_keys() {
         let (backend, _key_id, _key) = create_test_backend().await;
 
-        // Creating any other key should return invalid operation (read-only)
+        // Creating any other key is a capability the read-only backend lacks.
         let result = KmsBackendTrait::create_key(
             &backend,
             CreateKeyRequest {
@@ -663,9 +663,8 @@ mod tests {
             },
         )
         .await;
-        assert!(result.is_err());
-        let err_msg = result.expect_err("should be Err").to_string();
-        assert!(err_msg.contains("read-only") || err_msg.contains("cannot create"));
+        let error = result.expect_err("should be Err");
+        assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "got {error:?}");
     }
 
     #[tokio::test]
@@ -778,7 +777,8 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(result.expect_err("should be Err").to_string().contains("read-only"));
+        let error = result.expect_err("should be Err");
+        assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "got {error:?}");
     }
 
     #[tokio::test]

@@ -117,7 +117,8 @@ use s3s::dto::{
     PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
     PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
-    ReplicationConfiguration, ServerSideEncryption, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
+    ReplicationConfiguration, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
+    VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -2233,6 +2234,8 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
+        validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
+
         // When SSE-KMS is set without a specific key ID, populate the default
         // KMS key so that GetBucketEncryption responses include it. Clients like
         // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
@@ -2997,6 +3000,46 @@ impl DefaultBucketUsecase {
     }
 }
 
+/// Refuse a default-encryption configuration the write path could not honour
+/// as written. `bucket_default_write_sse` falls back to AES256 for any
+/// algorithm it does not know, so storing one would make GetBucketEncryption
+/// advertise a scheme no object is encrypted under. s3s parses `SSEAlgorithm`
+/// as an open string, so the schema check has to happen here.
+fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfiguration) -> S3Result<()> {
+    if config.rules.is_empty() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::MalformedXML,
+            "ServerSideEncryptionConfiguration must contain at least one Rule".to_string(),
+        ));
+    }
+    for rule in &config.rules {
+        let Some(by_default) = rule.apply_server_side_encryption_by_default.as_ref() else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::MalformedXML,
+                "Rule must contain ApplyServerSideEncryptionByDefault".to_string(),
+            ));
+        };
+        let names_kms_key = by_default.kms_master_key_id.as_deref().is_some_and(|id| !id.is_empty());
+        match by_default.sse_algorithm.as_str() {
+            ServerSideEncryption::AWS_KMS => {}
+            ServerSideEncryption::AES256 if names_kms_key => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "KMSMasterKeyID can only be specified when SSEAlgorithm is aws:kms".to_string(),
+                ));
+            }
+            ServerSideEncryption::AES256 => {}
+            other => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    format!("SSEAlgorithm {other} is not supported; expected AES256 or aws:kms"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3005,7 +3048,8 @@ mod tests {
     use s3s::dto::{
         BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
         NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
-        ServerSideEncryptionConfiguration, Tag, Transition, TransitionStorageClass,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
+        TransitionStorageClass,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3018,6 +3062,59 @@ mod tests {
             .find(|snapshot| snapshot.op == op.as_str())
             .map(|snapshot| snapshot.total)
             .unwrap_or_default()
+    }
+
+    fn sse_config(rules: Vec<ServerSideEncryptionRule>) -> ServerSideEncryptionConfiguration {
+        ServerSideEncryptionConfiguration { rules }
+    }
+
+    fn sse_rule(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionRule {
+        ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from(algorithm.to_string()),
+                kms_master_key_id: kms_key_id.map(|id| id.to_string()),
+            }),
+            blocked_encryption_types: None,
+            bucket_key_enabled: None,
+        }
+    }
+
+    /// The stored configuration must be one the write path honours as written:
+    /// only AES256 and aws:kms exist, and a key id belongs to aws:kms alone.
+    #[test]
+    fn put_bucket_encryption_refuses_configurations_the_write_path_cannot_honour() {
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None)])).expect("AES256 is valid");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("aws:kms", Some("bucket-key"))]))
+            .expect("aws:kms with a key is valid");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("aws:kms", None)]))
+            .expect("aws:kms without a key is valid (the default key is filled in)");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", Some(""))]))
+            .expect("an empty key id on AES256 is how some clients spell 'none'");
+
+        let unknown = validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES128", None)]))
+            .expect_err("AES128 is not an algorithm this server encrypts with");
+        assert_eq!(*unknown.code(), S3ErrorCode::MalformedXML);
+
+        let misplaced = validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", Some("bucket-key"))]))
+            .expect_err("a key id only makes sense for aws:kms");
+        assert_eq!(*misplaced.code(), S3ErrorCode::InvalidArgument);
+
+        let empty = validate_bucket_encryption_configuration(&sse_config(Vec::new())).expect_err("no rule, no default");
+        assert_eq!(*empty.code(), S3ErrorCode::MalformedXML);
+
+        let bare_rule = validate_bucket_encryption_configuration(&sse_config(vec![ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: None,
+            blocked_encryption_types: None,
+            bucket_key_enabled: None,
+        }]))
+        .expect_err("a rule without ApplyServerSideEncryptionByDefault configures nothing");
+        assert_eq!(*bare_rule.code(), S3ErrorCode::MalformedXML);
+
+        // A second rule is checked too, so a malformed one cannot hide behind a valid first rule.
+        let second_bad =
+            validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None), sse_rule("garbage", None)]))
+                .expect_err("every rule is validated");
+        assert_eq!(*second_bad.code(), S3ErrorCode::MalformedXML);
     }
 
     #[tokio::test]
@@ -5033,9 +5130,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        // A well-formed rule, so the request reaches the store lookup instead
+        // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(ServerSideEncryptionConfiguration::default())
+            .server_side_encryption_configuration(sse_config(vec![sse_rule("AES256", None)]))
             .build()
             .unwrap();
 
