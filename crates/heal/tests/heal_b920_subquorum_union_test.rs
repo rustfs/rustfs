@@ -774,7 +774,10 @@ mod absence_receipt_regressions {
             .await
             .expect("C06 bucket traversal should complete");
         let outcome = task.get_outcome().await;
-        assert_eq!(outcome.counters.processed, 3);
+        assert_eq!(
+            outcome.counters.processed, 3,
+            "bucket traversal must process each fixture version once: {outcome:?}"
+        );
         assert_eq!(outcome.counters.healed, 1, "completed cleanup must be repaired: {outcome:?}");
         // Exact historical absence has its own proof. The two live legacy
         // versions remain readable but carry no independent payload receipt.
