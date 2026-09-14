@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
           scripts/ci/check_connect_profile_cpu_artifact.sh \
             binary/rustfs "$SOURCE_SHA" "$BINARY_SHA256" \
-            profile-cpu-runtime-evidence.json profile-cpu.zip
+            profile-cpu-runtime-evidence.json profile-cpu.zip profile-cpu-bundle.zip
 
       - name: Bind workflow and artifact provenance
         shell: bash
@@ -138,5 +138,6 @@ jobs:
           path: |
             profile-cpu-runtime-evidence.json
             profile-cpu.zip
+            profile-cpu-bundle.zip
           retention-days: 14
           if-no-files-found: error

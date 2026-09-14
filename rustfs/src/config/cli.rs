@@ -143,6 +143,87 @@ pub enum ConnectCommands {
     Telemetry(ConnectTelemetryOpts),
     /// Capture a consent-bound local top snapshot
     Top(ConnectTopOpts),
+    /// Inspect one local object and write a signed integrity summary
+    Inspect(ConnectInspectOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInspectOpts {
+    #[command(subcommand)]
+    pub command: ConnectInspectCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectInspectCommands {
+    /// Inspect one object's local erasure metadata and shards
+    Object(ConnectInspectObjectOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInspectObjectOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this inspection
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    /// Drive root containing the object's local erasure state; repeat for every local drive
+    #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
+    pub paths: Vec<PathBuf>,
+    /// Bucket containing the object
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub bucket: String,
+    /// Object key to inspect
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub object: String,
+    /// Optional exact object version UUID
+    #[arg(long = "version-id", value_parser = NonEmptyStringValueParser::new())]
+    pub version_id: Option<String>,
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated producer capability
+    #[arg(long, default_value = "inspect.object@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 30_000)]
+    pub duration_millis: u64,
+    /// Maximum bytes read from local metadata and shards
+    #[arg(long = "max-read-bytes", default_value_t = 268_435_456)]
+    pub max_read_bytes: u64,
+    /// Maximum working memory in bytes
+    #[arg(long = "max-memory-bytes", default_value_t = 67_108_864)]
+    pub max_memory_bytes: u64,
+    /// Confirm this explicit local L3 diagnostic operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1488,6 +1569,8 @@ pub enum CommandResult {
     ConnectTelemetry(ConnectTelemetryCommands),
     /// Consent-bound local Connect top operation
     ConnectTop(ConnectTopCommands),
+    /// Consent-bound local object integrity export
+    ConnectInspect(ConnectInspectObjectOpts),
 }
 
 /// Create default ServerOpts from environment variables
