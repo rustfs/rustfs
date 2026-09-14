@@ -38,6 +38,7 @@ use crate::bucket::object_lock::objectlock_sys::{
 use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
 use crate::bucket::versioning::VersioningApi;
 use crate::core::pools::{DecommissionCapacityAdmission, DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
+use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{
     NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
@@ -1035,6 +1036,7 @@ pub(crate) struct ObjectLockDiagGuard {
     owner: Option<String>,
     mode: ObjectLockDiagMode,
     acquired_at: Instant,
+    _attempt: ObjectLockAttempt,
 }
 
 impl ObjectLockDiagGuard {
@@ -1058,7 +1060,13 @@ impl ObjectLockDiagGuard {
             owner,
             mode,
             acquired_at: Instant::now(),
+            _attempt: ObjectLockAttempt::default(),
         }
+    }
+
+    fn with_attempt(mut self, attempt: ObjectLockAttempt) -> Self {
+        self._attempt = attempt;
+        self
     }
 
     pub(crate) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
@@ -2974,10 +2982,11 @@ impl ECStore {
         if matches!(op, "delete_object" | "delete_objects") {
             notify_delete_namespace_pending(bucket);
         }
-        let guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|err| Self::map_namespace_lock_error(bucket, object, "write", err))?;
+        let timeout = get_lock_acquire_timeout();
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", timeout);
+        let result = ns_lock.get_write_lock(timeout).await;
+        attempt.observe(&result);
+        let guard = result.map_err(|err| Self::map_namespace_lock_error(bucket, object, "write", err))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         log_object_lock_acquire_if_slow(
             op,
@@ -2997,7 +3006,8 @@ impl ECStore {
             diag_enabled.then(|| object.to_string()),
             owner,
             ObjectLockDiagMode::Write,
-        ))
+        )
+        .with_attempt(attempt))
     }
 
     async fn acquire_object_write_lock_if_needed(
@@ -3104,10 +3114,11 @@ impl ECStore {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
-        let guard = ns_lock
-            .get_read_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
+        let timeout = get_lock_acquire_timeout();
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, opts.version_id.as_deref(), &ns_lock, "read", timeout);
+        let result = ns_lock.get_read_lock(timeout).await;
+        attempt.observe(&result);
+        let guard = result.map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         log_object_lock_acquire_if_slow(
             op,
@@ -3121,15 +3132,18 @@ impl ECStore {
         opts.no_lock = true;
         opts.metadata_cache_safe = true;
 
-        Ok(Some(ObjectLockDiagGuard::new(
-            guard,
-            diag_enabled,
-            op,
-            diag_enabled.then(|| bucket.to_string()),
-            diag_enabled.then(|| object.to_string()),
-            owner,
-            ObjectLockDiagMode::Read,
-        )))
+        Ok(Some(
+            ObjectLockDiagGuard::new(
+                guard,
+                diag_enabled,
+                op,
+                diag_enabled.then(|| bucket.to_string()),
+                diag_enabled.then(|| object.to_string()),
+                owner,
+                ObjectLockDiagMode::Read,
+            )
+            .with_attempt(attempt),
+        ))
     }
 
     /// Publish a native scanner replica without allowing stale pool selection
@@ -8429,6 +8443,145 @@ mod tests {
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_diagnostics_report_historical_get_blocked_by_put_commit() {
+        use crate::diagnostics::object_lock::tests::CapturedLockEvents;
+        use crate::object_api::WriteCompletion;
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use tracing::{Instrument, instrument::WithSubscriber};
+
+        let capture = CapturedLockEvents::default();
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
+            ],
+            async {
+                let bucket = "historical-get-lock-diagnostics";
+                let object = "object.bin";
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, ctx.clone()).await;
+                let store = new_prepared_reader_test_store_with_ctx(&[original], ctx).await;
+                let set = store.pools[0].get_disks_by_key(object);
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+                let opts = ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                let mut versions = Vec::new();
+                for value in [0x11, 0x22, 0x33] {
+                    let info = set
+                        .put_object(bucket, object, &mut PutObjReader::from_vec(vec![value; 8193]), &opts)
+                        .await
+                        .expect("seed version");
+                    versions.push((info.version_id.expect("explicit seed version"), value));
+                }
+
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+                let put_set = set.clone();
+                let put = tokio::spawn(
+                    async move {
+                        put_set
+                            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x44; 8193]), &opts)
+                            .await
+                    }
+                    .instrument(tracing::info_span!("request", request_id = "diagnostic-put"))
+                    .with_current_subscriber(),
+                );
+                barrier.wait_until_paused().await;
+
+                let historical_version = versions[0].0.to_string();
+                let result = store
+                    .prepare_get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            version_id: Some(historical_version.clone()),
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .instrument(tracing::info_span!("request", request_id = "diagnostic-get"))
+                    .await;
+                assert!(
+                    matches!(result, Err(StorageError::Lock(rustfs_lock::LockError::Timeout { .. }))),
+                    "a held PUT commit must preserve the typed GET lock timeout"
+                );
+                let rows = capture.rows();
+                let failure = rows
+                    .iter()
+                    .find(|row| row["fields"]["op"] == "prepare_get_object" && row["fields"]["state"] == "failed")
+                    .expect("failed GET acquisition must be observable before error propagation");
+                assert_eq!(failure["fields"]["requested_version_id"], historical_version);
+                assert_eq!(failure["fields"]["failure"], "timeout");
+                assert_eq!(failure["fields"]["timeout_ms"], 1000);
+                assert!(failure["fields"]["acquire_ms"].as_u64().expect("wait duration") >= 1000);
+                assert!(
+                    failure["spans"]
+                        .as_array()
+                        .expect("request spans")
+                        .iter()
+                        .any(|span| span["request_id"] == "diagnostic-get")
+                );
+                let put_acquired = rows
+                    .iter()
+                    .rev()
+                    .find(|row| row["fields"]["op"] == "put_object_commit" && row["fields"]["state"] == "acquired")
+                    .expect("PUT lock holder event");
+                assert_ne!(put_acquired["fields"]["lock_attempt_id"], failure["fields"]["lock_attempt_id"]);
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row["fields"]["lock_attempt_id"] == put_acquired["fields"]["lock_attempt_id"]
+                            && row["fields"]["state"] == "guard_dropped"),
+                    "a paused commit still owns the lock"
+                );
+
+                barrier.release();
+                let new_version = put
+                    .await
+                    .expect("PUT task")
+                    .expect("new version commits")
+                    .version_id
+                    .expect("new version id");
+                versions.push((new_version, 0x44));
+                for (version_id, value) in versions {
+                    let prepared = store
+                        .prepare_get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                version_id: Some(version_id.to_string()),
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("every acknowledged version remains readable");
+                    assert_eq!(prepared.object_info().version_id, Some(version_id));
+                    let mut reader = prepared.into_reader().await.expect("open historical body");
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("read complete version body");
+                    assert_eq!(body, vec![value; 8193]);
+                }
+            }
+            .with_subscriber(capture.subscriber()),
+        )
+        .await;
     }
 
     async fn multipool_version_test_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {

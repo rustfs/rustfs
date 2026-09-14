@@ -23,6 +23,8 @@ use super::super::{
     should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
 };
 use crate::bucket::retirement::MarkerRetirementContext;
+use crate::diagnostics::object_lock::ObjectLockAttempt;
+use crate::set_disk::{ObjectLockDiagGuard, is_object_lock_diag_enabled};
 
 #[derive(Clone, Copy)]
 struct ExplicitVersionHeal<'a> {
@@ -71,33 +73,51 @@ fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
 static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-struct ReadRepairCommitPause {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadRepairPausePhase {
+    Data,
+    Commit,
+}
+
+#[cfg(test)]
+struct ReadRepairPause {
     bucket: String,
     object: String,
+    phase: ReadRepairPausePhase,
     arrived: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
-static READ_REPAIR_COMMIT_PAUSES: std::sync::Mutex<Vec<ReadRepairCommitPause>> = std::sync::Mutex::new(Vec::new());
+static READ_REPAIR_PAUSES: std::sync::Mutex<Vec<ReadRepairPause>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-struct ReadRepairCommitPauseScope {
+struct ReadRepairPauseScope {
     bucket: String,
     object: String,
+    phase: ReadRepairPausePhase,
 }
 
 #[cfg(test)]
-impl ReadRepairCommitPauseScope {
+impl ReadRepairPauseScope {
     fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        Self::install_at(bucket, object, ReadRepairPausePhase::Commit)
+    }
+
+    fn install_at(
+        bucket: &str,
+        object: &str,
+        phase: ReadRepairPausePhase,
+    ) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
         let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        READ_REPAIR_COMMIT_PAUSES
+        READ_REPAIR_PAUSES
             .lock()
             .expect("read-repair commit pause registry should not poison")
-            .push(ReadRepairCommitPause {
+            .push(ReadRepairPause {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
+                phase,
                 arrived: arrived.clone(),
                 release: release.clone(),
             });
@@ -105,6 +125,7 @@ impl ReadRepairCommitPauseScope {
             Self {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
+                phase,
             },
             arrived,
             release,
@@ -113,22 +134,28 @@ impl ReadRepairCommitPauseScope {
 }
 
 #[cfg(test)]
-impl Drop for ReadRepairCommitPauseScope {
+impl Drop for ReadRepairPauseScope {
     fn drop(&mut self) {
-        READ_REPAIR_COMMIT_PAUSES
+        READ_REPAIR_PAUSES
             .lock()
             .expect("read-repair commit pause registry should not poison")
-            .retain(|pause| pause.bucket != self.bucket || pause.object != self.object);
+            .retain(|pause| {
+                let keep = pause.bucket != self.bucket || pause.object != self.object || pause.phase != self.phase;
+                if !keep {
+                    pause.release.notify_one();
+                }
+                keep
+            });
     }
 }
 
 #[cfg(test)]
-async fn pause_read_repair_before_commit(bucket: &str, object: &str) {
-    let pause = READ_REPAIR_COMMIT_PAUSES
+async fn pause_read_repair(bucket: &str, object: &str, phase: ReadRepairPausePhase) {
+    let pause = READ_REPAIR_PAUSES
         .lock()
         .expect("read-repair commit pause registry should not poison")
         .iter()
-        .find(|pause| pause.bucket == bucket && pause.object == object)
+        .find(|pause| pause.bucket == bucket && pause.object == object && pause.phase == phase)
         .map(|pause| (pause.arrived.clone(), pause.release.clone()));
     if let Some((arrived, release)) = pause {
         arrived.notify_one();
@@ -614,21 +641,37 @@ impl SetDisks {
         &self,
         bucket: &str,
         object: &str,
+        version_id: &str,
         kind: HealObjectLockKind,
-    ) -> disk::error::Result<rustfs_lock::NamespaceLockGuard> {
+        op: &'static str,
+    ) -> disk::error::Result<ObjectLockDiagGuard> {
         let ns_lock = self
             .new_ns_lock(bucket, object)
             .await
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        let timeout = get_lock_acquire_timeout();
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, Some(version_id), &ns_lock, kind.as_str(), timeout);
         let lock_result = match kind {
-            HealObjectLockKind::Read => ns_lock.get_read_lock(get_lock_acquire_timeout()).await,
-            HealObjectLockKind::Write => ns_lock.get_write_lock(get_lock_acquire_timeout()).await,
+            HealObjectLockKind::Read => ns_lock.get_read_lock(timeout).await,
+            HealObjectLockKind::Write => ns_lock.get_write_lock(timeout).await,
         };
-        lock_result.map_err(|e| {
+        attempt.observe(&lock_result);
+        let guard = lock_result.map_err(|e| {
             self.map_namespace_lock_error(bucket, object, kind.as_str(), e)
                 .narrow_to_disk()
                 .unwrap_or_else(DiskError::other)
-        })
+        })?;
+        let enabled = is_object_lock_diag_enabled();
+        Ok(ObjectLockDiagGuard::new(
+            guard,
+            enabled,
+            op,
+            enabled.then(|| bucket.to_owned()),
+            enabled.then(|| object.to_owned()),
+            enabled.then(|| ns_lock.owner().to_owned()),
+            kind.as_str(),
+        )
+        .with_attempt(attempt))
     }
 
     async fn acquire_revalidated_read_repair_commit_lock(
@@ -638,13 +681,13 @@ impl SetDisks {
         object: &str,
         version_id: &str,
         expected_fingerprint: ReadRepairCommitFingerprint,
-    ) -> disk::error::Result<Option<rustfs_lock::NamespaceLockGuard>> {
+    ) -> disk::error::Result<Option<ObjectLockDiagGuard>> {
         #[cfg(test)]
-        pause_read_repair_before_commit(bucket, object).await;
+        pause_read_repair(bucket, object, ReadRepairPausePhase::Commit).await;
 
         let write_lock_wait_start = std::time::Instant::now();
         let guard = self
-            .acquire_heal_object_lock(bucket, object, HealObjectLockKind::Write)
+            .acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "read_repair_commit")
             .await?;
         let write_lock_wait_ms = u64::try_from(write_lock_wait_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -729,7 +772,7 @@ impl SetDisks {
         // take the write lock only for the final verify-and-rename fence.
         let mut _read_repair_read_lock_guard = if read_repair_uses_shared_lock {
             let guard = self
-                .acquire_heal_object_lock(bucket, object, HealObjectLockKind::Read)
+                .acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Read, "read_repair_data")
                 .await?;
             debug!(
                 event = EVENT_SET_DISK_HEAL,
@@ -746,11 +789,16 @@ impl SetDisks {
             None
         };
 
+        #[cfg(test)]
+        if read_repair_uses_shared_lock {
+            pause_read_repair(bucket, object, ReadRepairPausePhase::Data).await;
+        }
+
         // Bound, not `_`: this guard must live to the end of the scope. A bare
         // `_` would drop it here and release the namespace write lock.
         let _write_lock_guard = if !opts.no_lock && !read_repair_uses_shared_lock {
             Some(
-                self.acquire_heal_object_lock(bucket, object, HealObjectLockKind::Write)
+                self.acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "heal_object")
                     .await?,
             )
         } else {
@@ -3060,7 +3108,7 @@ impl SetDisks {
 mod heal_result_report_tests {
     use super::{
         DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
-        ReadRepairCommitPauseScope, SetDisks, heal_writer_error_summary,
+        ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
     };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
     use crate::disk::endpoint::Endpoint;
@@ -5651,7 +5699,7 @@ mod heal_result_report_tests {
             .await
             .expect("shard damage should force read-repair data work");
 
-        let (_pause, arrived, release) = ReadRepairCommitPauseScope::install(bucket, object);
+        let (_pause, arrived, release) = ReadRepairPauseScope::install(bucket, object);
         let heal_set = set.clone();
         let heal_task = tokio::spawn(async move {
             heal_set
@@ -5691,6 +5739,183 @@ mod heal_result_report_tests {
             .await
             .expect("object must remain readable after stale read-repair abort");
         assert_eq!(final_info.etag, overwrite.etag);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_diagnostics_distinguish_read_repair_from_queued_put() {
+        use crate::diagnostics::object_lock::tests::CapturedLockEvents;
+        use crate::object_api::WriteCompletion;
+        use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use tokio::io::AsyncReadExt;
+        use tracing::{Instrument, instrument::WithSubscriber};
+
+        let capture = CapturedLockEvents::default();
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
+                // Keep the writer queued across the reader's complete acquire budget.
+                (rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("5000")),
+            ],
+            async {
+                let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+                let bucket = "read-repair-lock-diagnostics";
+                let object = "object.bin";
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+                let opts = ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                let size = 1024 * 1024;
+                let original = set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x11; size]), &opts)
+                    .await
+                    .expect("seed historical version")
+                    .version_id
+                    .expect("historical version id");
+                let newest = set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x22; size]), &opts)
+                    .await
+                    .expect("seed current version")
+                    .version_id
+                    .expect("current version id");
+                let metadata = disks[3]
+                    .read_version("", bucket, object, &original.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("historical shard metadata");
+                let missing = dirs[3]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(metadata.data_dir.expect("non-inline data directory").to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing).await.expect("damage one historical shard");
+
+                let (_pause, arrived, release) =
+                    ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::Data);
+                let heal_set = set.clone();
+                let heal = tokio::spawn(
+                    async move {
+                        heal_set
+                            .heal_object(
+                                bucket,
+                                object,
+                                &original.to_string(),
+                                &HealOpts {
+                                    read_repair: true,
+                                    scan_mode: HealScanMode::Deep,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    }
+                    .instrument(tracing::info_span!("heal_task", task_id = "diagnostic-read-repair"))
+                    .with_current_subscriber(),
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                    .await
+                    .expect("read-repair must own its shared data-phase lock");
+
+                // A second reader can enter before there is a queued writer.
+                let namespace = set.new_ns_lock(bucket, object).await.expect("reader namespace");
+                drop(
+                    namespace
+                        .get_read_lock(std::time::Duration::from_secs(1))
+                        .await
+                        .expect("shared reconstruction alone permits readers"),
+                );
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let put_set = set.clone();
+                let put = tokio::spawn(
+                    async move {
+                        put_set
+                            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x33; size]), &opts)
+                            .await
+                    }
+                    .with_current_subscriber(),
+                );
+                barrier.wait_until_paused().await;
+                barrier.release_and_wait_until_namespace_pending().await;
+                assert!(!barrier.namespace_acquired(), "PUT must still be waiting behind read-repair");
+
+                let result = set
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        http::HeaderMap::new(),
+                        &ObjectOptions {
+                            version_id: Some(original.to_string()),
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(crate::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. }))),
+                    "a queued writer must block the later historical reader"
+                );
+                assert!(!barrier.namespace_acquired(), "GET can time out before PUT owns the lock");
+                let rows = capture.rows();
+                let shared = rows
+                    .iter()
+                    .find(|row| row["fields"]["op"] == "read_repair_data" && row["fields"]["state"] == "acquired")
+                    .expect("read-repair shared holder event");
+                assert_eq!(shared["fields"]["requested_version_id"], original.to_string());
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row["fields"]["lock_attempt_id"] == shared["fields"]["lock_attempt_id"]
+                            && row["fields"]["state"] == "guard_dropped")
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row["fields"]["mode"] == "read" && row["fields"]["failure"] == "timeout"),
+                    "failed reader acquisition must be retained"
+                );
+
+                release.notify_one();
+                let added = put
+                    .await
+                    .expect("PUT task")
+                    .expect("queued PUT commits")
+                    .version_id
+                    .expect("added version id");
+                let (_, error) = heal.await.expect("read-repair task").expect("read-repair operation");
+                assert!(
+                    error.is_none(),
+                    "unchanged historical version should heal after the writer completes: {error:?}"
+                );
+                assert!(tokio::fs::try_exists(&missing).await.expect("repaired shard path"));
+                for (version, value) in [(original, 0x11), (newest, 0x22), (added, 0x33)] {
+                    let mut reader = set
+                        .get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            http::HeaderMap::new(),
+                            &ObjectOptions {
+                                version_id: Some(version.to_string()),
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read each acknowledged version");
+                    assert_eq!(reader.object_info.version_id, Some(version));
+                    let mut body = Vec::new();
+                    reader.stream.read_to_end(&mut body).await.expect("complete version body");
+                    assert_eq!(body, vec![value; size]);
+                }
+            }
+            .with_subscriber(capture.subscriber()),
+        )
+        .await;
     }
 
     // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
