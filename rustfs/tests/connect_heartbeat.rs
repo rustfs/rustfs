@@ -28,8 +28,8 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use rustfs::connect::{
-    CoarseNodeSummary, CredentialStore, DeviceCredential, ENVIRONMENT_CAPABILITY, HeartbeatConfig, HeartbeatSchedule,
-    HeartbeatStatus, IdentityStore, spawn_heartbeat_runtime,
+    CONNECT_DIAGNOSTIC_CAPABILITIES, CoarseNodeSummary, CredentialStore, DeviceCredential, ENVIRONMENT_CAPABILITY,
+    HeartbeatConfig, HeartbeatSchedule, HeartbeatStatus, IdentityStore, spawn_heartbeat_runtime,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -532,7 +532,32 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
     assert_eq!(ENVIRONMENT_CAPABILITY, "inventory.environment@1");
     assert_eq!(
         request["capabilities"],
-        json!(["heartbeat", "diagnostics.policy.v1", "inventory.environment@1"])
+        json!([
+            "heartbeat",
+            "diagnostics.policy.v1",
+            "inventory.environment@1",
+            "performance.client@1",
+            "performance.drive@1",
+            "performance.object@1",
+            "performance.siteReplication@1",
+            "logs.capture@1",
+            "profile.cpu@1",
+            "profile.memory@1",
+            "profile.threads@1",
+            "telemetry.record@1",
+            "telemetry.otlp@1",
+            "telemetry.replay@1",
+            "top.api@1",
+            "top.disk@1",
+            "top.locks@1",
+            "top.net@1",
+            "top.rpc@1",
+            "inspect.object@1"
+        ])
+    );
+    assert_eq!(
+        request["capabilities"].as_array().expect("capabilities").len(),
+        CONNECT_DIAGNOSTIC_CAPABILITIES.len() + 3
     );
     assert_eq!(request["coarseNodeSummary"], json!({"total": 8, "healthy": 7, "degraded": 1}));
     assert_ne!(request["clientTime"], "2038-01-19T03:14:07Z");

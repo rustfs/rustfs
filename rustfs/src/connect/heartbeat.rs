@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
-use super::diagnostics::{DiagnosticCollectionPolicy, DiagnosticJobEnvelope};
+use super::diagnostics::{CONNECT_DIAGNOSTIC_CAPABILITIES, DiagnosticCollectionPolicy, DiagnosticJobEnvelope};
 use super::environment::ENVIRONMENT_CAPABILITY;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
@@ -109,7 +109,9 @@ impl PendingHeartbeat {
                         ENVIRONMENT_CAPABILITY,
                         "jobs",
                         super::diagnostics::CPU_PROFILE_CAPABILITY,
-                    ])
+                    ]
+                || self.capabilities == heartbeat_capabilities(false)
+                || self.capabilities == heartbeat_capabilities(true))
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)
@@ -256,15 +258,7 @@ impl HeartbeatStateStore {
         if state.next_sequence > MAX_SEQUENCE {
             return Err(HeartbeatError::SequenceExhausted);
         }
-        let mut capabilities = vec![
-            "heartbeat".to_owned(),
-            DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
-            ENVIRONMENT_CAPABILITY.to_owned(),
-        ];
-        if self.job_capable {
-            capabilities.push("jobs".to_owned());
-            capabilities.push(super::diagnostics::CPU_PROFILE_CAPABILITY.to_owned());
-        }
+        let capabilities = heartbeat_capabilities(self.job_capable);
         let pending = PendingHeartbeat {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             request_id: Uuid::new_v4().to_string(),
@@ -327,6 +321,23 @@ impl HeartbeatStateStore {
         }
         result
     }
+}
+
+fn heartbeat_capabilities(job_capable: bool) -> Vec<String> {
+    let mut capabilities = vec![
+        "heartbeat".to_owned(),
+        DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
+        ENVIRONMENT_CAPABILITY.to_owned(),
+    ];
+    if job_capable {
+        capabilities.push("jobs".to_owned());
+    }
+    capabilities.extend(
+        CONNECT_DIAGNOSTIC_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned()),
+    );
+    capabilities
 }
 
 fn parent(path: &Path) -> Result<&Path, HeartbeatError> {
