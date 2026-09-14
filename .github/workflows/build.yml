@@ -406,12 +406,21 @@ jobs:
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            # All cross targets in the matrix are Linux; zigbuild handles them.
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin rustfs
-          else
-            cargo build --release --target ${{ matrix.target }} -p rustfs --bin rustfs
+          BINARY_NAMES=(rustfs)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_NAMES+=(rustfs-cli)
           fi
+
+          # Build one binary at a time so release LTO links cannot exhaust a
+          # self-hosted runner by running concurrently.
+          for binary in "${BINARY_NAMES[@]}"; do
+            if [[ "${{ matrix.cross }}" == "true" ]]; then
+              # All cross targets in the matrix are Linux; zigbuild handles them.
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+            else
+              cargo build --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+            fi
+          done
 
       - name: Create release package
         id: package
@@ -498,16 +507,23 @@ jobs:
             BINARY_NAME="rustfs"
           fi
 
-          # Verify the binary exists before packaging
-          if [[ ! -f "$BINARY_NAME" ]]; then
-            echo "❌ Binary $BINARY_NAME not found in $(pwd)"
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              dir
-            else
-              ls -la
-            fi
-            exit 1
+          BINARY_FILES=("$BINARY_NAME")
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_FILES+=("rustfs-cli")
           fi
+
+          # Verify the binaries exist before packaging
+          for binary in "${BINARY_FILES[@]}"; do
+            if [[ ! -f "$binary" ]]; then
+              echo "❌ Binary $binary not found in $(pwd)"
+              if [[ "${{ matrix.platform }}" == "windows" ]]; then
+                dir
+              else
+                ls -la
+              fi
+              exit 1
+            fi
+          done
 
           # Universal packaging function
           package_zip() {
@@ -526,8 +542,12 @@ jobs:
           }
 
           # Create the zip package
-          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
-          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          echo "Start packaging: ${BINARY_FILES[*]} -> ../../../${PACKAGE_NAME}.zip"
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            zip "../../../${PACKAGE_NAME}.zip" "${BINARY_FILES[@]}"
+          else
+            package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          fi
 
           cd ../../..
 
@@ -600,6 +620,28 @@ jobs:
           fi
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
+
+      - name: Verify packaged Linux CLI
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_file="${{ steps.package.outputs.package_file }}"
+          archive_members="$(unzip -Z1 "$package_file" | sort)"
+          expected_members=$'rustfs\nrustfs-cli'
+          if [[ "$archive_members" != "$expected_members" ]]; then
+            echo "Linux package must contain exactly rustfs and rustfs-cli" >&2
+            printf '%s\n' "$archive_members" >&2
+            exit 1
+          fi
+
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            cli_dir="$(mktemp -d)"
+            trap 'rm -rf "$cli_dir"' EXIT
+            unzip -q "$package_file" rustfs-cli -d "$cli_dir"
+            "$cli_dir/rustfs-cli" --help >/dev/null
+          fi
 
       - name: Verify packaged console
         if: matrix.target == 'x86_64-unknown-linux-gnu'
