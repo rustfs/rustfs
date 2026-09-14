@@ -436,6 +436,13 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
+    /// Whether the explicitly scoped replacement set owns its pool's metadata.
+    /// Backends must use authoritative placement, not treat missing shards as
+    /// evidence that metadata is unnecessary. Unknown placement fails closed.
+    fn replacement_pool_metadata_required(&self, _opts: &HealOpts) -> Result<bool> {
+        Err(Error::other("replacement pool metadata placement is unsupported"))
+    }
+
     /// Read target-specific physical evidence for one replacement version.
     ///
     /// This is only used by automatic replacement healing after the normal
@@ -1265,6 +1272,18 @@ impl HealStorageAPI for ECStoreHealStorage {
             .heal_replacement_format(dry_run, pool_index, set_index, targets)
             .await
             .map(|(result, error)| (result, error.map(Error::Storage)))
+            .map_err(Error::Storage)
+    }
+
+    fn replacement_pool_metadata_required(&self, opts: &HealOpts) -> Result<bool> {
+        let pool_index = opts
+            .pool
+            .ok_or_else(|| Error::other("replacement pool metadata placement is missing pool scope"))?;
+        let set_index = opts
+            .set
+            .ok_or_else(|| Error::other("replacement pool metadata placement is missing set scope"))?;
+        self.ecstore
+            .replacement_pool_metadata_required(pool_index, set_index)
             .map_err(Error::Storage)
     }
 

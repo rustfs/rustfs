@@ -27,3 +27,10 @@ pub(crate) mod integration {
     pub(crate) use rustfs_storage_api::ObjectIO;
     pub(crate) use rustfs_storage_api::ObjectOperations;
 }
+
+#[allow(unused_imports)]
+pub(crate) mod pool_metadata {
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
+    pub(crate) use rustfs_ecstore::api::disk::{HEALING_MARKER_PATH, RUSTFS_META_BUCKET};
+    pub(crate) use rustfs_ecstore::api::storage::POOL_META_NAME;
+}
