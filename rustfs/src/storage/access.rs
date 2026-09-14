@@ -3020,7 +3020,7 @@ mod tests {
         list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions,
         merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
         post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, request_object_store,
-        require_owned_reserved_table_object, retention_write_requested, secondary_tag_hint_action, table_data_plane_admin_action,
+        require_owned_reserved_table_object, retention_write_requested, table_data_plane_admin_action,
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action,
     };
