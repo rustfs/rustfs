@@ -388,6 +388,14 @@ ignored = ["hotpath", "rustfs"]
 #   CARGO_PROFILE_DEV_DEBUG=full cargo build
 debug = "line-tables-only"
 
+# To further speed up the process, completely disable debug information for dependencies.
+[profile.dev.package."*"]
+debug = false
+# When you really need to debug, you can enable full debugging information using the `--profile debugging` option.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
 [profile.release]
 opt-level = 3
 lto = "thin"

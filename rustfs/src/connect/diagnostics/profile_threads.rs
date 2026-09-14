@@ -73,12 +73,12 @@ pub fn capture_thread_profile(
         let deadline = started.checked_add(request.duration).ok_or(ProfileError::LimitExceeded)?;
         let data = collect_native_thread_states(cancel, deadline)?;
         check_cancel(cancel)?;
-        return Ok(ProfileResult::succeeded(
+        Ok(ProfileResult::succeeded(
             request,
             ProfileTool::Threads,
             started.elapsed(),
             ProfileData::Threads(data),
-        ));
+        ))
     }
 }
 

@@ -214,7 +214,6 @@ aws-smithy-types = { workspace = true }
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
-serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true, optional = true }
 google-cloud-auth = { workspace = true, optional = true }
 faster-hex = { workspace = true }

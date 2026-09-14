@@ -61,8 +61,17 @@ cd "$(dirname "$0")/.."
 # 213 -> 212 on 2026-09-14: rustfs/backlog#1735 A4 moved rio's trailer
 # handle behind rustfs_rio::TrailerSource; the only adapter imports s3s through
 # the app storage_api shim, so crates/rio no longer references s3s.
-S3S_IMPORT_FILES_BASELINE=209
-S3_ERROR_LINES_BASELINE=1588
+# 209 -> 210 and 1588 -> 1592 on 2026-09-14: #7785 landed the gateway key
+# inventory admin handler (rustfs/src/admin/handlers/gateway_key_inventory.rs)
+# for the RUSTFS_S3_STACK switch after the baselines were verified, leaving
+# this guard red on main (measured 210/1592). The handler follows the house
+# admin convention whose Operation::call signature is s3s-typed
+# (S3Request/S3Result), so it cannot route through a non-s3s seam until the
+# s3gate admin migration replaces the admin router (rustfs/backlog#1677 F1);
+# no local refactor can shed the file-level import. Admit the measured
+# growth: +1 direct-s3s admin file, +4 s3_error! invocation lines.
+S3S_IMPORT_FILES_BASELINE=210
+S3_ERROR_LINES_BASELINE=1592
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;

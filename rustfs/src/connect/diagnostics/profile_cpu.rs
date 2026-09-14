@@ -307,6 +307,7 @@ pub struct ThreadProfileData {
 }
 
 impl ThreadProfileData {
+    #[cfg(target_os = "linux")]
     pub(super) fn native(states: Vec<ThreadStateCount>) -> Self {
         Self {
             scope: ThreadProfileScope::NativeThreads,
@@ -332,6 +333,7 @@ pub struct ThreadStateCount {
 }
 
 impl ThreadStateCount {
+    #[cfg(target_os = "linux")]
     pub(super) const fn new(state: ThreadState, thread_count: u64) -> Self {
         Self { state, thread_count }
     }
@@ -395,6 +397,17 @@ impl ProfileResult {
         }
     }
 
+    #[cfg(all(
+        feature = "pyroscope",
+        any(
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn partial(request: &ProfileCaptureRequest, tool: ProfileTool, duration: Duration, data: ProfileData) -> Self {
         Self {
             schema_version: PROFILE_SCHEMA_VERSION,
@@ -514,7 +527,7 @@ pub async fn capture_cpu_profile(
         } else {
             ProfileResult::partial(request, ProfileTool::Cpu, elapsed, ProfileData::Cpu(data))
         };
-        return Ok(outcome);
+        Ok(outcome)
     }
 
     #[cfg(not(all(
@@ -722,7 +735,7 @@ mod local_cpu {
 
         #[test]
         fn summary_uses_nonce_bound_ids_and_excludes_raw_symbols() {
-            let raw_symbol = "rustfs_ecstore::disk::read_object";
+            let raw_symbol = "rustfs::storage::disk::read_object";
             let mut first = Accumulator::new([7; 32]);
             first
                 .record_stack([raw_symbol].into_iter(), 9)

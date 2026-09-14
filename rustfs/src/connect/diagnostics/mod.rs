@@ -37,6 +37,27 @@ mod trace_record;
 mod trace_replay;
 #[cfg(unix)]
 mod trace_runtime;
+
+/// Exact signed diagnostic producers dispatched by the `rustfs connect` CLI.
+pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
+    perf_client::CLIENT_CAPABILITY,
+    perf_drive::DRIVE_CAPABILITY,
+    perf_object::OBJECT_CAPABILITY,
+    perf_site_replication::SITE_REPLICATION_CAPABILITY,
+    logs::LOGS_CAPABILITY,
+    profile_cpu::CPU_PROFILE_CAPABILITY,
+    profile_cpu::MEMORY_PROFILE_CAPABILITY,
+    profile_cpu::THREAD_PROFILE_CAPABILITY,
+    trace_record::TELEMETRY_RECORD_CAPABILITY,
+    trace_record::TELEMETRY_OTLP_CAPABILITY,
+    trace_record::TELEMETRY_REPLAY_CAPABILITY,
+    top_api::TOP_API_CAPABILITY,
+    top_disk::TOP_DISK_CAPABILITY,
+    top_locks::TOP_LOCKS_CAPABILITY,
+    top_net::TOP_NET_CAPABILITY,
+    top_rpc::TOP_RPC_CAPABILITY,
+    inspect::INSPECT_CAPABILITY,
+];
 #[cfg(not(unix))]
 #[path = "trace_runtime_unsupported.rs"]
 mod trace_runtime;
@@ -91,12 +112,12 @@ pub use perf_object::{
 pub use perf_site_replication::{
     LocalSiteReplicationConsent, MAX_SITE_REPLICATION_DURATION, MAX_SITE_REPLICATION_TRAFFIC_BYTES, S3SiteReplicationProbe,
     SITE_REPLICATION_CAPABILITY, SITE_REPLICATION_SCHEMA_VERSION, SITE_REPLICATION_TOOL_ID, SavedSiteReplicationExport,
-    SignedSiteReplicationExport, SiteReplicationDiagnosticResult, SiteReplicationEndpoint, SiteReplicationMeasurement,
-    SiteReplicationOutcome, SiteReplicationPerformanceData, SiteReplicationPerformanceError, SiteReplicationPerformanceRequest,
-    SiteReplicationProbe, SiteReplicationProbeError, SiteReplicationProbeFuture, SiteReplicationProbeMeasurement,
-    SiteReplicationProvenance, SiteReplicationReasonCode, SiteReplicationTargetReasonCode, SiteReplicationTargetResult,
-    measure_site_replication, read_protected_site_replication_credential, save_signed_site_replication_export,
-    sign_site_replication_export, validate_site_replication_limits,
+    SignedSiteReplicationExport, SiteReplicationCredentials, SiteReplicationDiagnosticResult, SiteReplicationEndpoint,
+    SiteReplicationMeasurement, SiteReplicationOutcome, SiteReplicationPerformanceData, SiteReplicationPerformanceError,
+    SiteReplicationPerformanceRequest, SiteReplicationProbe, SiteReplicationProbeError, SiteReplicationProbeFuture,
+    SiteReplicationProbeMeasurement, SiteReplicationProvenance, SiteReplicationReasonCode, SiteReplicationTargetReasonCode,
+    SiteReplicationTargetResult, measure_site_replication, read_protected_site_replication_credential,
+    save_signed_site_replication_export, sign_site_replication_export, validate_site_replication_limits,
 };
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
@@ -113,14 +134,15 @@ pub use schedule::{
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
 };
 pub use top_api::{
-    LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, SavedTopExport, SignedTopExport, TOP_CLASSIFICATION,
-    TOP_SCHEMA_VERSION, TopApiData, TopApiOperation, TopCaptureError, TopCaptureLimits, TopCaptureRequest, TopCaptureScope,
-    TopCoverage, TopOutcome, TopProvenance, TopReasonCode, TopResult, capture_top_api, save_signed_top_export, sign_top_export,
+    LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, SavedTopExport, SignedTopExport, TOP_API_CAPABILITY,
+    TOP_CLASSIFICATION, TOP_SCHEMA_VERSION, TopApiData, TopApiOperation, TopCaptureError, TopCaptureLimits, TopCaptureRequest,
+    TopCaptureScope, TopCoverage, TopOutcome, TopProvenance, TopReasonCode, TopResult, capture_top_api, save_signed_top_export,
+    sign_top_export,
 };
-pub use top_disk::{DiskCounterSnapshot, TopDiskData, capture_top_disk, evaluate_disk_window};
-pub use top_locks::{TopLocksData, capture_top_locks, evaluate_lock_snapshot};
-pub use top_net::{NetworkCounterSnapshot, TopNetData, capture_top_net, evaluate_network_window};
-pub use top_rpc::{TopRpcData, capture_top_rpc};
+pub use top_disk::{DiskCounterSnapshot, TOP_DISK_CAPABILITY, TopDiskData, capture_top_disk, evaluate_disk_window};
+pub use top_locks::{TOP_LOCKS_CAPABILITY, TopLocksData, capture_top_locks, evaluate_lock_snapshot};
+pub use top_net::{NetworkCounterSnapshot, TOP_NET_CAPABILITY, TopNetData, capture_top_net, evaluate_network_window};
+pub use top_rpc::{TOP_RPC_CAPABILITY, TopRpcData, capture_top_rpc};
 pub use trace_analysis::{OperationSummary, TraceAnalysis, TraceAnalysisError, analyze_trace};
 pub use trace_otlp::{
     LocalOtlpHeaders, MAX_OTLP_BODY_BYTES, OtlpBatch, OtlpForwardError, OtlpReceipt, export_trace_otlp, export_trace_otlp_result,
