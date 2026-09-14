@@ -207,14 +207,22 @@ impl CompletedHealStatus {
     }
 
     pub(super) async fn snapshot(task: &HealTask, status: HealTaskStatus) -> Self {
-        let seqed_items = task.get_seqed_result_items().await;
-        let (next_seq, min_seq) = task.result_seq_cursors();
+        let (seqed_items, (next_seq, min_seq)) = {
+            // Freeze the window and its cursors together while a cancelled
+            // worker may still append its last result.
+            let items = task.result_items.read().await;
+            (items.iter().cloned().collect(), task.result_seq_cursors())
+        };
+        let mut outcome = task.get_outcome().await;
+        if status == HealTaskStatus::Cancelled {
+            outcome.finish(Some(crate::heal::outcome::HealAbortReason::Cancelled));
+        }
         let mut snapshot = Self {
             heal_type: task.heal_type.clone(),
             options: task.options.clone(),
             status,
             progress: Some(task.get_progress().await),
-            outcome: Some(Arc::new(task.get_outcome().await)),
+            outcome: Some(Arc::new(outcome)),
             retained_bytes: std::sync::OnceLock::new(),
             result_items_truncated: task.result_items_truncated(),
             completed_at: SystemTime::now(),
