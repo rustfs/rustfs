@@ -176,6 +176,30 @@ pub async fn start_kms(
     Ok(())
 }
 
+/// Stop the running KMS service via admin API, keeping its configuration so
+/// `start_kms` can bring it back.
+pub async fn stop_kms(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = kms_admin_request(
+        base_url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/stop",
+        Some("{}"),
+        access_key,
+        secret_key,
+    )
+    .await?;
+    let response: serde_json::Value = serde_json::from_str(&response)?;
+    if response["success"] != true {
+        return Err(format!("KMS stop failed: {}", response["message"].as_str().unwrap_or("unknown error")).into());
+    }
+    info!("KMS stopped successfully");
+    Ok(())
+}
+
 /// Get KMS status via admin API
 pub async fn get_kms_status(
     base_url: &str,
@@ -325,7 +349,7 @@ pub async fn create_default_key(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let create_key_body = serde_json::json!({
-        "key_usage": "ENCRYPT_DECRYPT",
+        "key_usage": "EncryptDecrypt",
         "description": "Default key for e2e testing"
     })
     .to_string();

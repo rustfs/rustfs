@@ -15,6 +15,7 @@
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, object_store_from_req};
+use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -51,6 +52,16 @@ pub struct AccountInfo {
 }
 
 pub struct AccountInfoHandler {}
+
+#[derive(Debug, Serialize)]
+struct AccountInfoResponse {
+    #[serde(flatten)]
+    account: rustfs_madmin::AccountInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+}
 
 pub fn register_account_info_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -242,6 +253,7 @@ impl Operation for AccountInfoHandler {
         let policy_str = serde_json::to_string(&effective_policy)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
 
+        let (username, email) = oidc_profile_fields(&cred);
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
             server: StorageAdminApi::backend_info(store.as_ref()).await,
@@ -288,8 +300,12 @@ impl Operation for AccountInfoHandler {
             }
         }
 
-        let data = serde_json::to_vec(&account_info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+        let data = serde_json::to_vec(&AccountInfoResponse {
+            account: account_info,
+            username,
+            email,
+        })
+        .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -304,6 +320,25 @@ mod tests {
     use rustfs_madmin::BackendInfo;
     use rustfs_policy::policy::BucketPolicy;
     use s3s::dto::{Destination, ReplicationRule};
+
+    #[test]
+    fn accountinfo_response_adds_optional_oidc_display_fields() {
+        let mut response = AccountInfoResponse {
+            account: rustfs_madmin::AccountInfo::default(),
+            username: Some("oidc-user".to_string()),
+            email: Some("oidc-user@example.test".to_string()),
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize accountinfo response");
+        assert_eq!(value["username"], "oidc-user");
+        assert_eq!(value["email"], "oidc-user@example.test");
+
+        response.username = None;
+        response.email = None;
+        let legacy_shape = serde_json::to_value(&response).expect("serialize accountinfo response without OIDC fields");
+        assert!(!legacy_shape.as_object().unwrap().contains_key("username"));
+        assert!(!legacy_shape.as_object().unwrap().contains_key("email"));
+    }
 
     #[test]
     fn test_account_info_structure() {
