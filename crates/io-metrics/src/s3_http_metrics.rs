@@ -16,14 +16,17 @@
 //! Admin snapshots and metric exporters share these counters. The older
 //! operation counter counts handler entries and is not an HTTP denominator.
 
-use rustfs_common::trace_bus::{
-    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
-};
 use rustfs_s3_ops::S3Operation;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Receives a finished external request's first dispatched operation, its
+/// latency, and whether it produced a 2xx response. The server injects this
+/// so the leaf metrics crate never depends on a trace-bus implementation.
+pub type S3HttpCompletionObserver = fn(S3Operation, Duration, bool);
+pub type S3HttpCompletionObserverEnabled = fn() -> bool;
 
 const METRIC: &str = "rustfs_s3_http_requests_total";
 const METHODS: [&str; 10] = [
@@ -32,6 +35,7 @@ const METHODS: [&str; 10] = [
 const OUTCOMES: [&str; 8] = ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown", "service_error", "cancelled"];
 const UNKNOWN_OPERATION: usize = S3Operation::ALL.len();
 static COUNTERS: LazyLock<HttpOutcomeCounters> = LazyLock::new(HttpOutcomeCounters::new);
+static COMPLETION_OBSERVER: OnceLock<(S3HttpCompletionObserverEnabled, S3HttpCompletionObserver)> = OnceLock::new();
 
 tokio::task_local! {
     static CURRENT_OPERATION: Cell<usize>;
@@ -114,7 +118,7 @@ pub(crate) fn observe_s3_http_operation(op: S3Operation) {
 pub struct S3HttpRequestGuard {
     method: usize,
     operation: usize,
-    telemetry_started_at: Option<Instant>,
+    completion: Option<(S3HttpCompletionObserver, Instant)>,
     finished: bool,
 }
 
@@ -127,9 +131,18 @@ impl S3HttpRequestGuard {
         Self {
             method: METHODS.iter().position(|known| *known == method).unwrap_or(METHODS.len() - 1),
             operation: UNKNOWN_OPERATION,
-            telemetry_started_at: (telemetry_trace_subscriber_count() != 0).then(Instant::now),
+            completion: COMPLETION_OBSERVER
+                .get()
+                .and_then(|(enabled, observer)| enabled().then_some((*observer, Instant::now()))),
             finished: false,
         }
+    }
+
+    /// Report the request to `observer` when it finishes with a dispatched S3
+    /// operation. Latency is measured from this call.
+    pub fn with_completion_observer(mut self, observer: S3HttpCompletionObserver) -> Self {
+        self.completion = Some((observer, Instant::now()));
+        self
     }
 
     /// Attribute existing operation instrumentation without changing S3
@@ -157,27 +170,16 @@ impl S3HttpRequestGuard {
     fn finish(&mut self, outcome: usize) {
         if !self.finished {
             COUNTERS.record(self.method, self.operation, outcome);
-            if let Some((started_at, operation)) = self.telemetry_started_at.take().zip(telemetry_operation(self.operation)) {
-                let status = if outcome == 1 {
-                    TelemetryTraceStatus::Ok
-                } else {
-                    TelemetryTraceStatus::Error
-                };
-                telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, started_at.elapsed(), status));
+            if let Some(((observer, started_at), operation)) = self.completion.take().zip(S3Operation::ALL.get(self.operation)) {
+                observer(*operation, started_at.elapsed(), outcome == 1);
             }
             self.finished = true;
         }
     }
 }
 
-fn telemetry_operation(index: usize) -> Option<TelemetryTraceOperation> {
-    match S3Operation::ALL.get(index)? {
-        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
-        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
-        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
-        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
-        _ => None,
-    }
+pub fn install_s3_http_completion_observer(enabled: S3HttpCompletionObserverEnabled, observer: S3HttpCompletionObserver) {
+    let _ = COMPLETION_OBSERVER.set((enabled, observer));
 }
 
 impl Drop for S3HttpRequestGuard {
@@ -197,29 +199,29 @@ mod tests {
     use metrics_util::debugging::DebuggingRecorder;
 
     #[test]
-    fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {
+    fn completion_observer_sees_each_dispatched_request_once() {
+        static SEEN: std::sync::Mutex<Vec<(S3Operation, bool)>> = std::sync::Mutex::new(Vec::new());
+        fn observe(operation: S3Operation, _duration: Duration, succeeded: bool) {
+            SEEN.lock().expect("observer log").push((operation, succeeded));
+        }
+
+        let mut ok = S3HttpRequestGuard::new("GET").with_completion_observer(observe);
+        ok.in_scope(|| observe_s3_http_operation(S3Operation::GetObject));
+        ok.response(200);
+        drop(ok);
+
+        let mut failed = S3HttpRequestGuard::new("PUT").with_completion_observer(observe);
+        failed.in_scope(|| observe_s3_http_operation(S3Operation::PutObject));
+        failed.response(503);
+
+        // Rejected before S3 dispatch: counted, but there is no operation to report.
+        let mut undispatched = S3HttpRequestGuard::new("GET").with_completion_observer(observe);
+        undispatched.service_error();
+
         assert_eq!(
-            telemetry_operation(S3Operation::GetObject.metric_index()),
-            Some(TelemetryTraceOperation::GetObject)
+            *SEEN.lock().expect("observer log"),
+            [(S3Operation::GetObject, true), (S3Operation::PutObject, false)]
         );
-        assert_eq!(
-            telemetry_operation(S3Operation::PutObject.metric_index()),
-            Some(TelemetryTraceOperation::PutObject)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::HeadObject.metric_index()),
-            Some(TelemetryTraceOperation::HeadObject)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::ListObjects.metric_index()),
-            Some(TelemetryTraceOperation::ListObjects)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::ListObjectsV2.metric_index()),
-            Some(TelemetryTraceOperation::ListObjects)
-        );
-        assert_eq!(telemetry_operation(S3Operation::DeleteObject.metric_index()), None);
-        assert_eq!(telemetry_operation(UNKNOWN_OPERATION), None);
     }
 
     #[test]

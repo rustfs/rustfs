@@ -93,7 +93,7 @@ impl Destination {
 }
 
 impl RelayTransport for Destination {
-    fn deliver(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    fn deliver(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, RelayError> {
         let envelope: RelayEnvelope = serde_json::from_slice(bytes).unwrap();
         let key = envelope.replay_key();
         if self
@@ -101,7 +101,7 @@ impl RelayTransport for Destination {
             .get(&envelope.transfer_uid)
             .is_some_and(|existing| existing != &key)
         {
-            return Err(());
+            return Err(RelayError::Transport);
         }
         self.transfers
             .entry(envelope.transfer_uid.clone())
@@ -209,7 +209,7 @@ fn transfer_uid_reuse_with_different_material_conflicts() {
     let destination = party("CONNECT", "organizations/o", false);
     let signing_key = SigningKey::from_bytes(&[12; 32]);
     let mut relay_destination = Destination::new(signing_key, false);
-    let first = envelope(b"first", producer.clone(), destination.clone());
+    let first = envelope(b"first", producer, destination);
     assert!(relay_destination.deliver(&serde_json::to_vec(&first).unwrap()).is_ok());
     assert!(relay_destination.deliver(&serde_json::to_vec(&first).unwrap()).is_ok());
     let mut conflicting = first;
