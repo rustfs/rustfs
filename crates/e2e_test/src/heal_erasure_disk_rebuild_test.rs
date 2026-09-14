@@ -1418,6 +1418,21 @@ mod tests {
             "replacement target must retain only its preformatted topology identity"
         );
 
+        // A multi-set pool can route a successful outage PUT away from the
+        // replacement drive. Identify its set through a witnessed baseline.
+        let target_set_peer_drives = cluster
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(node_index, _)| *node_index != 1)
+            .flat_map(|(_, node)| node.data_dirs.iter().map(PathBuf::from))
+            .filter(|drive| object_metadata_exists_on_disk(drive, bucket, &expected_manifests[0].key))
+            .collect::<Vec<_>>();
+        assert!(
+            !outage_target_manifest_required || !target_set_peer_drives.is_empty(),
+            "the replacement erasure set must retain an online baseline shard"
+        );
+
         let outage_payload_seed = 0xf1;
         let max_outage_write_attempts = topology.total_drives().max(1);
         let mut outage_key = None;
@@ -1438,6 +1453,18 @@ mod tests {
             .await;
             match put_result {
                 Ok(Ok(_)) => {
+                    if outage_target_manifest_required
+                        && !target_set_peer_drives
+                            .iter()
+                            .any(|drive| object_metadata_exists_on_disk(drive, bucket, &candidate_key))
+                    {
+                        timeout(
+                            Duration::from_secs(30),
+                            clients[2].delete_object().bucket(bucket).key(&candidate_key).send(),
+                        )
+                        .await??;
+                        continue;
+                    }
                     outage_key = Some(candidate_key);
                     break;
                 }
@@ -1464,6 +1491,14 @@ mod tests {
                 .into());
             }
         };
+
+        assert!(
+            !outage_target_manifest_required
+                || target_set_peer_drives
+                    .iter()
+                    .any(|drive| object_metadata_exists_on_disk(drive, bucket, &outage_key)),
+            "outage object {outage_key} belongs to a different erasure set than the replacement drive"
+        );
 
         let mut outage_peer_erasure_indices = HashSet::new();
         if !outage_write_deferred_until_rejoin {
