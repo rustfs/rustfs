@@ -137,7 +137,7 @@ pub(crate) enum Delivery {
     Accepted {
         server_time: String,
         diagnostic_collection_policy: DiagnosticCollectionPolicy,
-        diagnostic_job: Option<DiagnosticJobEnvelope>,
+        diagnostic_job: Option<Box<DiagnosticJobEnvelope>>,
     },
     Retry {
         retry_after: Option<Duration>,
@@ -185,7 +185,7 @@ impl HeartbeatSender {
                 Ok(Delivery::Accepted {
                     server_time: accepted.server_time,
                     diagnostic_collection_policy: policy,
-                    diagnostic_job: accepted.diagnostic_job,
+                    diagnostic_job: accepted.diagnostic_job.map(Box::new),
                 })
             }
             TelemetryDelivery::Retry { retry_after } => Ok(Delivery::Retry { retry_after }),

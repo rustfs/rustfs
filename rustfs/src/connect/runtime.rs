@@ -228,7 +228,7 @@ where
                     backoff = schedule.initial_backoff;
                     let _ = policy_tx.send(diagnostic_collection_policy);
                     if let (Some(runtime), Some(job)) = (&diagnostic_job_runtime, diagnostic_job) {
-                        runtime.offer(job, &task_shutdown);
+                        runtime.offer(*job, &task_shutdown);
                     }
                     let _ = status_tx.send(HeartbeatStatus::Online { server_time });
                     schedule.cadence.saturating_add(jitter(schedule.jitter))

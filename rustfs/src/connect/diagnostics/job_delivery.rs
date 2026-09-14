@@ -639,9 +639,7 @@ mod tests {
             )),
             artifact_sha256: Some("a".repeat(64)),
         };
-        store
-            .save(&job_id, &JobState::Uploaded(uploaded.clone()))
-            .expect("uploaded state");
+        store.save(&job_id, &JobState::Uploaded(uploaded)).expect("uploaded state");
         let loaded = match store.load(&job_id).expect("load state") {
             Some(JobState::Uploaded(result)) => result,
             _ => panic!("uploaded state expected"),

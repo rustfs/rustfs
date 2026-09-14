@@ -155,7 +155,7 @@ impl TrustedDiagnosticJobSigner {
             }
             let mut options = fs::OpenOptions::new();
             options.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            let mut file = options.open(path).map_err(|_| DiagnosticJobError::TrustInvalid)?;
+            let file = options.open(path).map_err(|_| DiagnosticJobError::TrustInvalid)?;
             let opened = file.metadata().map_err(|_| DiagnosticJobError::TrustInvalid)?;
             if !opened.is_file()
                 || opened.uid() != rustix::process::geteuid().as_raw()
