@@ -307,6 +307,7 @@ pub struct ThreadProfileData {
 }
 
 impl ThreadProfileData {
+    #[cfg(target_os = "linux")]
     pub(super) fn native(states: Vec<ThreadStateCount>) -> Self {
         Self {
             scope: ThreadProfileScope::NativeThreads,
@@ -332,6 +333,7 @@ pub struct ThreadStateCount {
 }
 
 impl ThreadStateCount {
+    #[cfg(target_os = "linux")]
     pub(super) const fn new(state: ThreadState, thread_count: u64) -> Self {
         Self { state, thread_count }
     }
