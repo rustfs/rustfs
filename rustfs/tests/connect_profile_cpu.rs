@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, ProfileCaptureRequest, ProfileError, ProfileOutcome,
-    ProfileProvenance, ProfileReasonCode, capture_cpu_profile,
+    ProfileProvenance, capture_cpu_profile,
 };
 use tokio_util::sync::CancellationToken;
 

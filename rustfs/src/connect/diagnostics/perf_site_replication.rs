@@ -33,6 +33,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1336,7 +1337,7 @@ fn list_versions_url(endpoint: &Url, bucket: &str, key: &str) -> Result<Url, Sit
 fn encode_path(value: &str) -> String {
     value
         .split('/')
-        .map(|segment| form_urlencoded::byte_serialize(segment.as_bytes()).collect::<String>())
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).into_owned())
         .collect::<Vec<_>>()
         .join("/")
 }
