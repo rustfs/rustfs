@@ -1632,12 +1632,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Err(err)) => {
-                    // Typed relocation errors (the codec read path delivers them
-                    // in-band) mean rebalance/decommission removed the pinned
-                    // object data mid-stream: reopen and continue instead of
-                    // failing the download. The error is only intercepted before
-                    // the committed body length has been fully delivered.
-                    if self.emitted < self.expected && is_object_relocation_error(&err) && self.resume.is_some() {
+                    // Typed relocation errors and bounded short EOF errors both
+                    // mean the committed body stopped before Content-Length was
+                    // delivered. Reopen the same object/version at the emitted
+                    // offset when resume is attached; if reopen cannot prove the
+                    // same identity, it fails closed with this trigger error.
+                    if self.emitted < self.expected
+                        && (is_object_relocation_error(&err) || is_resumable_short_eof_error(&err))
+                        && self.resume.is_some()
+                    {
                         self.begin_resume(err);
                         continue;
                     }
@@ -1954,6 +1957,13 @@ fn is_object_relocation_error(err: &std::io::Error) -> bool {
         Some(StorageError::Io(source)) => source.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
+}
+
+fn is_resumable_short_eof_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::UnexpectedEof
+        || err
+            .get_ref()
+            .is_some_and(|source| source.downcast_ref::<rustfs_rio::IncompleteBody>().is_some())
 }
 
 pub(crate) fn object_seek_support_threshold() -> usize {
@@ -8055,6 +8065,46 @@ mod tests {
             .read_to_end(&mut out)
             .await
             .expect("a resumed body must deliver the full committed content");
+
+        assert_eq!(out, b"hello world");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn get_object_streaming_reader_resumes_after_short_eof_error() {
+        use tokio::io::AsyncReadExt;
+
+        // The remote-disk path can retire a peer stream with an UnexpectedEof
+        // once its bounded fresh-open recovery is exhausted. The S3 body still
+        // has enough identity to reopen the object and continue from the bytes
+        // already sent to the client.
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
+            assert_eq!(emitted, 6, "resume must reopen at the emitted offset");
+            Ok(FailAtEndReader::new(b"world", None))
+        });
+        let mut reader = GetObjectStreamingReader::new(
+            FailAtEndReader::new(
+                b"hello ",
+                Some(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "remote read ended before requested length",
+                )),
+            ),
+            "test-bucket",
+            "remote-eof-object",
+            "req-resume-remote-eof",
+            None,
+            11,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        );
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("a short EOF from a retired remote shard must resume the committed body");
 
         assert_eq!(out, b"hello world");
         assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
