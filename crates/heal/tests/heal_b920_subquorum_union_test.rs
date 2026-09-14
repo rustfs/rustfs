@@ -803,9 +803,29 @@ mod absence_receipt_regressions {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[serial]
-    async fn historical_absence_receipt_grace_and_dry_run_preserve_version() {
+    fn historical_absence_receipt_grace_and_dry_run_preserve_version() {
+        // Match the debug server's stack budget for composed real-storage heal futures.
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("absence-receipt-grace".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("grace test runtime should build");
+                runtime.block_on(historical_absence_receipt_grace_and_dry_run_preserve_version_inner());
+            })
+            .expect("grace test thread should spawn")
+            .join()
+            .expect("grace test thread should finish");
+    }
+
+    async fn historical_absence_receipt_grace_and_dry_run_preserve_version_inner() {
         let bucket = "absence-receipt-grace";
         let (paths, _store, storage, old, _current) = stale_history(bucket).await;
         let target = xl_meta_path(&object_dir(&paths[0], bucket, OBJECT));
