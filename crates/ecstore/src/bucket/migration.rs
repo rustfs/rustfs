@@ -356,7 +356,8 @@ where
 /// An absent legacy bucket is a no-op; migration errors prevent startup readiness.
 pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>) -> Result<()>
 where
-    S: ListOperations<
+    S: BucketOperations<Error = crate::error::Error>
+        + ListOperations<
             Error = crate::error::Error,
             ListObjectsV2Info = ListObjectsV2Info,
             ListObjectVersionsInfo = ListObjectVersionsInfo,
@@ -381,6 +382,24 @@ where
             DeletedObject = DeletedObject,
         >,
 {
+    // Older peers abort walk_dir streams when the legacy volume is absent,
+    // which loses the typed not-found error before listing quorum resolution.
+    // Stat the namespace first; only a confirmed missing volume skips migration.
+    match store
+        .get_bucket_info(
+            MIGRATING_META_BUCKET,
+            &BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if is_err_strict_volume_not_found(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    }
+
     let opts = ObjectOptions {
         max_parity: true,
         no_lock: true,
