@@ -409,11 +409,13 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "kms-test", "storage": "storage-test", "s3-compat": "s3-compat-test",
         "upgrade": "upgrade-test", "replication": "replication-test", "heal": "heal-test",
         "tier": "tier-test", "pool-expand": "pool-expansion-test", "performance": "performance-test",
+        "table": "table-test",
     }
     DIRECT_TESTS = {
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
+        "table": "Run table suite",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
@@ -702,7 +704,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
     def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
         extra = {
             "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
-            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"],
             "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
                             "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
         }
@@ -920,3 +922,28 @@ emit_step_result() {
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TableSuiteTests(unittest.TestCase):
+    """Contract tests for the S3 Tables (Iceberg REST Catalog) suite workflow."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_workflow_wiring(self) -> None:
+        source = (self.ROOT / ".github/workflows/rustfs-table-test.yml").read_text()
+        self.assertIn("group: rustfs-shared-functional-tests", source)
+        self.assertIn("runs-on: smoke-testing", source)
+        # New gate semantics: case failures stay green, harness breakdowns red.
+        self.assertRegex(source, r"(?m)^        continue-on-error: true")
+        self.assertIn("# Red only for harness/environment breakdowns; case failures stay green.", source)
+        self.assertIn("HARNESS_OK", source)
+        self.assertIn("Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed", source)
+        self.assertIn('python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}"', source)
+        # Case rows come from the shared generator (ANSI-tolerant parser).
+        # Issue manager, dashboard upload and artifacts use the shared contract.
+        self.assertIn("--suite table --category table", source)
+        self.assertIn("functional-reports/${SUITE}/${DATE}.md", source)
+        self.assertIn("rustfs-table-test-${{ github.run_id }}-${{ github.run_attempt }}", source)
+        # The suite is invoked with the product smoke script for TBL-101.
+        self.assertIn("--smoke-script", source)
+        self.assertIn("scripts/table-catalog/pyiceberg_smoke.py", source)
