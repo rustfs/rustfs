@@ -1323,9 +1323,9 @@ pub(in crate::set_disk) struct BitrotReaderSetup {
     /// readers. The lockstep GET decode uses them to open a parity shard
     /// aligned to the stripe where a data shard failed (backlog#923).
     pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
-    /// Factories for a fresh, stripe-aligned parity reader. CopySource hedges
-    /// use these disposable readers so an abandoned hedge leaves the original
-    /// deferred reserve untouched.
+    /// Factories for fresh, stripe-aligned readers. CopySource uses disposable
+    /// parity readers; multi-stripe GETs can recover a previously hedged slot
+    /// when another disk subsequently fails.
     pub(in crate::set_disk) deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
@@ -1714,9 +1714,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // reopener. Otherwise a recovered slow data read can cancel and consume
     // the only parity reserve needed by a later degraded stripe.
     let demand_bound_lockstep = crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
+    let preserve_hedged_readers = !demand_bound_lockstep && read_length > shard_size;
 
     for idx in 0..disks.len() {
-        if setup.attempted[idx] {
+        if setup.attempted[idx] && (!preserve_hedged_readers || setup.readers[idx].is_none()) {
             continue;
         }
 
@@ -1728,7 +1729,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = demand_bound_lockstep.then(|| {
+        let reopener = (demand_bound_lockstep || preserve_hedged_readers).then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -1742,6 +1743,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 use_mmap_read,
             )
         });
+        setup.deferred_reopeners[idx] = reopener;
+        if setup.attempted[idx] {
+            continue;
+        }
         let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
@@ -1755,7 +1760,6 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             use_mmap_read,
         );
         setup.retain_deferred_reader(idx, reader, stripe_handle);
-        setup.deferred_reopeners[idx] = reopener;
     }
 
     // With the data-shards-only lockstep gate on (backlog#923), the GET decode
