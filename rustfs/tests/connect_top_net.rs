@@ -188,6 +188,7 @@ fn top_network_export_is_bounded_redacted_and_signed_over_exact_envelope_bytes()
     let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("envelope");
     assert_eq!(envelope["toolId"], "top.net");
     assert_eq!(envelope["classification"], "L3");
+    assert_eq!(envelope["producedAt"].as_str().expect("producedAt").len(), 20);
     assert_eq!(envelope["payload"]["path"], "result.json");
     assert_eq!(envelope["payload"]["sha256"], export.result_sha256);
     let result_text = String::from_utf8_lossy(&export.result_json);

@@ -471,7 +471,11 @@ pub fn sign_top_export<T: Serialize>(
         classification: TOP_CLASSIFICATION,
         consent_uid: &request.scope.consent.uid,
         policy_revision: request.scope.policy_revision,
-        produced_at: now.format(&Rfc3339).map_err(|_| TopCaptureError::Serialization)?,
+        produced_at: now
+            .replace_nanosecond(0)
+            .map_err(|_| TopCaptureError::Serialization)?
+            .format(&Rfc3339)
+            .map_err(|_| TopCaptureError::Serialization)?,
         expires_at: OffsetDateTime::from_unix_timestamp(expires_at_unix)
             .map_err(|_| TopCaptureError::Expired)?
             .format(&Rfc3339)
