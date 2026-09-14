@@ -21,6 +21,9 @@ operators should start with:
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
+For historical GET timeouts during PUT or Heal, see
+[Object lock contention diagnostics](operations/object-lock-contention.md).
+
 Other runbooks remain grouped by filename in [`operations/`](operations/);
 architecture pages link to the relevant runbook where a cross-boundary
 procedure is required.

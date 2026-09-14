@@ -62,6 +62,7 @@ use crate::diagnostics::get::{
     classify_storage_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
     reduce_write_quorum_errs,
@@ -364,6 +365,7 @@ struct ObjectLockDiagGuard {
     owner: Option<String>,
     mode: &'static str,
     acquired_at: Instant,
+    _attempt: ObjectLockAttempt,
 }
 
 impl ObjectLockDiagGuard {
@@ -385,7 +387,13 @@ impl ObjectLockDiagGuard {
             owner,
             mode,
             acquired_at: Instant::now(),
+            _attempt: ObjectLockAttempt::default(),
         }
+    }
+
+    fn with_attempt(mut self, attempt: ObjectLockAttempt) -> Self {
+        self._attempt = attempt;
+        self
     }
 
     /// Whether the underlying namespace lock's heartbeat has observed a
@@ -855,6 +863,7 @@ where
     GET_OBJECT_READ_CANCELLATION.scope(cancellation, future).await
 }
 
+#[cfg(not(test))]
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
@@ -2299,14 +2308,22 @@ fn map_put_object_commit_lock_acquire_error(
 }
 
 pub fn is_object_lock_diag_enabled() -> bool {
-    *OBJECT_LOCK_DIAG_ENABLED.get_or_init(|| {
+    let read_enabled = || {
         let enabled = rustfs_utils::get_env_bool(
             rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE,
             rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_ENABLE,
         );
         record_object_lock_diag_enabled(enabled);
         enabled
-    })
+    };
+    #[cfg(test)]
+    {
+        read_enabled()
+    }
+    #[cfg(not(test))]
+    {
+        *OBJECT_LOCK_DIAG_ENABLED.get_or_init(read_enabled)
+    }
 }
 
 pub fn get_object_lock_diag_slow_acquire_threshold() -> Duration {
@@ -4372,10 +4389,11 @@ impl SetDisks {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
-        let guard = ns_lock
-            .get_read_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
+        let timeout = get_lock_acquire_timeout();
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "read", timeout);
+        let result = ns_lock.get_read_lock(timeout).await;
+        attempt.observe(&result);
+        let guard = result.map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(op, bucket, object, "read", owner.as_deref(), acquire_start.elapsed(), diag_enabled);
         Ok(ObjectLockDiagGuard::new(
@@ -4386,7 +4404,8 @@ impl SetDisks {
             diag_enabled.then(|| object.to_string()),
             owner,
             "read",
-        ))
+        )
+        .with_attempt(attempt))
     }
 
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
@@ -4395,13 +4414,10 @@ impl SetDisks {
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
-        let guard = resolve_put_object_commit_lock_acquire_result(
-            self,
-            op,
-            bucket,
-            object,
-            ns_lock.get_write_lock(acquire_timeout).await,
-        )?;
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", acquire_timeout);
+        let result = ns_lock.get_write_lock(acquire_timeout).await;
+        attempt.observe(&result);
+        let guard = resolve_put_object_commit_lock_acquire_result(self, op, bucket, object, result)?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -4421,7 +4437,8 @@ impl SetDisks {
             diag_enabled.then(|| object.to_string()),
             owner,
             "write",
-        ))
+        )
+        .with_attempt(attempt))
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -4437,25 +4454,22 @@ impl SetDisks {
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
+        let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", acquire_timeout);
         let acquire = ns_lock.get_write_lock(acquire_timeout);
         tokio::pin!(acquire);
         let mut on_pending = Some(on_pending);
-        let guard = resolve_put_object_commit_lock_acquire_result(
-            self,
-            op,
-            bucket,
-            object,
-            futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
-                std::task::Poll::Pending => {
-                    if let Some(on_pending) = on_pending.take() {
-                        on_pending();
-                    }
-                    std::task::Poll::Pending
+        let result = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+            std::task::Poll::Pending => {
+                if let Some(on_pending) = on_pending.take() {
+                    on_pending();
                 }
-                std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
-            })
-            .await,
-        )?;
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+        })
+        .await;
+        attempt.observe(&result);
+        let guard = resolve_put_object_commit_lock_acquire_result(self, op, bucket, object, result)?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -4475,7 +4489,8 @@ impl SetDisks {
             diag_enabled.then(|| object.to_string()),
             owner,
             "write",
-        ))
+        )
+        .with_attempt(attempt))
     }
 
     #[allow(clippy::too_many_arguments)]
