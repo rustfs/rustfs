@@ -112,6 +112,42 @@ fn catalog_storage_quorum_failures_are_typed_as_unavailable() {
 }
 
 #[test]
+fn catalog_storage_retryable_lock_failures_are_typed_as_unavailable() {
+    for error in [
+        rustfs_lock::LockError::timeout("catalog", StdDuration::from_secs(5)),
+        rustfs_lock::LockError::network("peer unavailable", std::io::Error::other("peer unavailable")),
+        rustfs_lock::LockError::already_locked("catalog", "another-node"),
+        rustfs_lock::LockError::InsufficientNodes {
+            required: 3,
+            available: 1,
+        },
+        rustfs_lock::LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+        rustfs_lock::LockError::QueueFull {
+            message: "lock queue is full".to_string(),
+        },
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", StorageError::Lock(error)),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    for error in [
+        rustfs_lock::LockError::internal("lock backend failure"),
+        rustfs_lock::LockError::configuration("invalid lock configuration"),
+        rustfs_lock::LockError::resource_not_found("catalog"),
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", StorageError::Lock(error)),
+            TableCatalogStoreError::Internal(_)
+        );
+    }
+}
+
+#[test]
 fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
     assert!(is_reserved_table_object_key(".rustfs-table"));
     assert!(is_reserved_table_object_key(".rustfs-table/"));
