@@ -195,7 +195,7 @@ pub struct ConnectInspectObjectOpts {
     #[arg(long = "expires-at")]
     pub expires_at_unix: i64,
     /// Drive root containing the object's local erasure state; repeat for every local drive
-    #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
+    #[arg(long = "path", required = true)]
     pub paths: Vec<PathBuf>,
     /// Bucket containing the object
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]

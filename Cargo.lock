@@ -9589,6 +9589,7 @@ dependencies = [
  "rustfs-trusted-proxies",
  "rustfs-utils",
  "rustfs-zip",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "s3s",
