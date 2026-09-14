@@ -93,7 +93,7 @@ impl Destination {
 }
 
 impl RelayTransport for Destination {
-    fn deliver(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    fn deliver(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, RelayError> {
         let envelope: RelayEnvelope = serde_json::from_slice(bytes).unwrap();
         let key = envelope.replay_key();
         if self
@@ -101,7 +101,7 @@ impl RelayTransport for Destination {
             .get(&envelope.transfer_uid)
             .is_some_and(|existing| existing != &key)
         {
-            return Err(());
+            return Err(RelayError::Transport);
         }
         self.transfers
             .entry(envelope.transfer_uid.clone())

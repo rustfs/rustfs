@@ -1475,11 +1475,11 @@ pub enum CommandResult {
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
-    ConnectClientPerformance(ConnectClientPerformanceOpts),
+    ConnectClientPerformance(Box<ConnectClientPerformanceOpts>),
     /// Consent-bound S3 object performance export
     ConnectObjectPerformance(ConnectObjectPerformanceOpts),
     /// Consent-bound site-replication performance export
-    ConnectSiteReplicationPerformance(ConnectSiteReplicationPerformanceOpts),
+    ConnectSiteReplicationPerformance(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export

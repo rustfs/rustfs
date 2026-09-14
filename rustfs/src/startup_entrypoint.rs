@@ -141,11 +141,11 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectRelay(options) => return execute_connect_relay(*options).await,
         CommandResult::ConnectReportUpload(options) => return execute_connect_report_upload(options).await,
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
-        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
+        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(*options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
         CommandResult::ConnectSiteReplicationPerformance(options) => {
-            return execute_connect_site_replication_performance(options).await;
+            return execute_connect_site_replication_performance(*options).await;
         }
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,

@@ -1565,7 +1565,7 @@ mod tests {
         let export = sign_site_replication_export(&request, &measured, &DeviceIdentity::generate(), &CancellationToken::new())
             .expect("signed site replication export");
         let envelope = String::from_utf8(export.envelope_json.clone()).expect("envelope UTF-8");
-        let result = String::from_utf8(export.result_json.clone()).expect("result UTF-8");
+        let result = String::from_utf8(export.result_json).expect("result UTF-8");
         let envelope_value: serde_json::Value = serde_json::from_str(&envelope).expect("envelope JSON");
         assert_eq!(envelope_value["targets"]["sourceDeployment"], request.cluster_name);
         assert_eq!(envelope_value["targets"]["destinationDeployment"], request.destination_cluster_name);

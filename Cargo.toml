@@ -380,7 +380,6 @@ insta = { version = "1.48" }
 
 [workspace.metadata.cargo-shear]
 ignored = ["hotpath", "rustfs"]
-ignored-paths = ["crates/e2e_test/src/**"]
 
 [profile.dev]
 # Full debuginfo roughly doubles compile+link time and produces multi-GB

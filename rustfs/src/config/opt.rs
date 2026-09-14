@@ -151,11 +151,11 @@ impl Opt {
                     ConnectInventoryCommands::Environment(opts) => Ok(CommandResult::ConnectEnvironmentInventory(opts)),
                 },
                 ConnectCommands::Performance(opts) => match opts.command {
-                    ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(*opts)),
+                    ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(opts)),
                     ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
                     ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
                     ConnectPerformanceCommands::SiteReplication(opts) => {
-                        Ok(CommandResult::ConnectSiteReplicationPerformance(*opts))
+                        Ok(CommandResult::ConnectSiteReplicationPerformance(opts))
                     }
                 },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
