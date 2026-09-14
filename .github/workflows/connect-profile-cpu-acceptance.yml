@@ -154,6 +154,7 @@ jobs:
             make -C connect-harness e2e-connected E2E_SCENARIO=profile
 
       - name: Bind workflow and artifact provenance
+        if: ${{ always() && hashFiles('profile-service-job-evidence.json') != '' }}
         shell: bash
         env:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
@@ -175,6 +176,7 @@ jobs:
           mv profile-service-job-evidence.bound.json profile-service-job-evidence.json
 
       - name: Upload acceptance evidence
+        if: ${{ always() && hashFiles('profile-service-job-evidence.json') != '' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: connect-profile-cpu-evidence-${{ github.run_id }}
