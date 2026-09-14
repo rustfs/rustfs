@@ -51,6 +51,8 @@ const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validat
 const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
 const EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER: &str = "presigned_unsigned_amz_header";
+const EVENT_SIGV4_UNSIGNED_AMZ_HEADER: &str = "sigv4_unsigned_amz_header";
+const EVENT_SIGV4_UNSUPPORTED_ALGORITHM: &str = "sigv4_unsupported_algorithm";
 
 /// RustFS-specific query capability for a single presigned PutObject request.
 pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
@@ -1032,6 +1034,99 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
     None
 }
 
+pub(crate) const UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE: &str = "Unsupported SigV4 authorization algorithm";
+
+/// Request-envelope `x-amz-*` headers a header-signed SigV4 request may carry
+/// without listing them in `SignedHeaders`, matching the upstream verifier.
+///
+/// `x-amz-content-sha256` is bound through the canonical request's payload
+/// hash. The aws-chunked framing headers are added around an already signed
+/// request and are only read after verification to decode the body; none of
+/// them selects a different operation.
+const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
+    "x-amz-content-sha256",
+    "x-amz-decoded-content-length",
+    "x-amz-trailer",
+    "x-amz-checksum-algorithm",
+];
+
+/// GHSA-xm99-m3gq-83g8: reject `x-amz-*` request headers that the request's
+/// SigV4 signature does not cover, for both SigV4 authentication forms.
+///
+/// The upstream verifier only proves that the headers named in `SignedHeaders`
+/// match; every other `x-amz-*` header still reaches the handlers. Anyone who
+/// captures one header-signed `PutObject` could replay it with an unsigned
+/// `x-amz-copy-source` and turn it into a `CopyObject` that runs with the
+/// signer's permissions, reading any object the signer can read. AWS S3 rejects
+/// unsigned `x-amz-*` headers on header-signed requests as well as presigned
+/// ones.
+///
+/// Every signed-header list the request carries must cover every `x-amz-*`
+/// header, so an `Authorization` header can never widen a presigned URL and a
+/// query can never widen a header signature. The header is parsed with the
+/// verifier's own parser so both sides read the same `SignedHeaders` list, and
+/// the algorithm token is pinned because the verifier accepts any token there.
+/// A header the parser rejects never authenticates as SigV4 upstream, but one
+/// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
+/// `x-amz-*` header itself; JWT and anonymous requests carry no SigV4 list.
+pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+    reject_unsigned_amz_headers_on_presigned_request(header, query)?;
+
+    for value in header.get_all(http::header::AUTHORIZATION) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let authorization = match s3s_sigv4::AuthorizationV4::parse(value) {
+            Ok(authorization) => authorization,
+            Err(_) if value.starts_with(SIGN_V4_ALGORITHM) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::AccessDenied,
+                    "Invalid SigV4 authorization header".to_owned(),
+                ));
+            }
+            Err(_) => continue,
+        };
+        if authorization.algorithm != SIGN_V4_ALGORITHM {
+            warn!(
+                event = EVENT_SIGV4_UNSUPPORTED_ALGORITHM,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_REQUEST,
+                reason = "unsupported_algorithm",
+                "SigV4 request rejected"
+            );
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE.to_owned(),
+            ));
+        }
+        for name in header.keys() {
+            // `HeaderName` is already lowercase; the verifier looks signed
+            // names up case-insensitively, so compare them the same way.
+            let name = name.as_str();
+            if !name.starts_with("x-amz-")
+                || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
+                || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
+                || authorization
+                    .signed_headers
+                    .iter()
+                    .any(|signed_name| signed_name.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            warn!(
+                event = EVENT_SIGV4_UNSIGNED_AMZ_HEADER,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_REQUEST,
+                reason = "unsigned_amz_header",
+                header = name,
+                "SigV4 request rejected"
+            );
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// `x-amz-*` request headers a SigV4 presigned request may carry without
 /// listing them in `X-Amz-SignedHeaders`.
 ///
@@ -1057,10 +1152,9 @@ pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in
 /// check mirrors that at the access boundary, before any handler reads a
 /// header.
 ///
-/// Only query-string SigV4 requests are checked. SigV2 canonicalises every
+/// This helper checks query-string SigV4 requests. SigV2 canonicalises every
 /// `x-amz-*` header into the string to sign, so adding one there already breaks
-/// the signature, and a header-signed SigV4 request is sent by the credential
-/// holder itself, so an unsigned header there is not a delegation bypass.
+/// the signature. The outer guard checks header-signed SigV4 requests.
 ///
 /// Detection keys on the query, not on the derived [`AuthType`], because the
 /// upstream verifier dispatches to the presigned path whenever the query
@@ -2129,6 +2223,147 @@ mod tests {
         // SigV2 presigned URLs sign every `x-amz-*` header in the string to sign.
         let sigv2_query = "AWSAccessKeyId=test&Expires=1893456000&Signature=abc";
         reject_unsigned_amz_headers_on_presigned_request(&headers, Some(sigv2_query)).unwrap();
+    }
+
+    fn header_sigv4_authorization(algorithm: &str, signed_headers: &str) -> HeaderValue {
+        format!(
+            "{algorithm} Credential=test/20260827/us-east-1/s3/aws4_request, SignedHeaders={signed_headers}, Signature={}",
+            "0".repeat(64)
+        )
+        .parse()
+        .expect("authorization header")
+    }
+
+    fn header_sigv4_headers(signed_headers: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", header_sigv4_authorization(SIGN_V4_ALGORITHM, signed_headers));
+        headers.insert("x-amz-date", HeaderValue::from_static("20260827T000000Z"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
+        headers
+    }
+
+    fn assert_unsigned_headers_denied(result: S3Result<()>) {
+        let error = result.expect_err("unsigned x-amz header must be denied");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
+    }
+
+    /// GHSA-xm99-m3gq-83g8: a header-signed SigV4 request must not carry an
+    /// `x-amz-*` header its `SignedHeaders` list leaves out. An unsigned
+    /// `x-amz-copy-source` turned a replayed PutObject into a CopyObject.
+    #[test]
+    fn ghsa_xm99_header_sigv4_rejects_unsigned_x_amz_headers() {
+        for name in [
+            "x-amz-copy-source",
+            "x-amz-copy-source-range",
+            "x-amz-tagging",
+            "x-amz-meta-owner",
+            "x-amz-metadata-directive",
+            "x-amz-security-token",
+            "x-amz-server-side-encryption",
+        ] {
+            let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-date");
+            headers.insert(name, HeaderValue::from_static("injected"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, Some("tagging")));
+        }
+
+        // `x-amz-date` is read by the verifier, but it is not exempt here.
+        let headers = header_sigv4_headers("host;x-amz-content-sha256");
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+    }
+
+    #[test]
+    fn ghsa_xm99_header_sigv4_accepts_signed_or_exempt_x_amz_headers() {
+        // The payload hash is bound through the canonical request's payload
+        // field, the aws-chunked framing headers wrap an already signed
+        // request, and CloudFront stamps `x-amz-cf-id` after the client signs.
+        let mut headers = header_sigv4_headers("host;x-amz-date");
+        headers.insert("x-amz-cf-id", HeaderValue::from_static("cdn-request"));
+        headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
+        headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
+        headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("CRC32"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("envelope headers and CDN id are exempt");
+
+        // The exemption is by exact name, not by prefix.
+        headers.insert("x-amz-sdk-checksum-algorithm", HeaderValue::from_static("CRC32"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+
+        let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-copy-source;x-amz-date");
+        headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("signed copy source is allowed");
+
+        // The verifier looks signed names up case-insensitively.
+        let headers = header_sigv4_headers("Host;X-Amz-Content-Sha256;X-Amz-Date");
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("mixed-case signed names are allowed");
+    }
+
+    /// The verifier accepts any algorithm token in the Authorization header, so
+    /// swapping it must not move the request out of this check.
+    #[test]
+    fn ghsa_xm99_header_sigv4_rejects_unsupported_algorithm_token() {
+        for algorithm in ["OTHER", "aws4-hmac-sha256", "AWS4-ECDSA-P256-SHA256"] {
+            let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-date");
+            headers.insert(
+                "authorization",
+                header_sigv4_authorization(algorithm, "host;x-amz-content-sha256;x-amz-date"),
+            );
+            let error = reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
+                .expect_err("non-SigV4 algorithm token must be denied");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(error.message(), Some(UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE));
+
+            headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+            reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
+                .expect_err("algorithm token cannot smuggle an unsigned copy source");
+        }
+
+        let mut headers = header_sigv4_headers("host");
+        headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 invalid"));
+        let error =
+            reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect_err("malformed SigV4 header must fail closed");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    /// Every SigV4 signed-header list present must cover every `x-amz-*`
+    /// header: neither auth form can widen the other.
+    #[test]
+    fn ghsa_xm99_header_and_query_signatures_cannot_widen_each_other() {
+        let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-copy-source;x-amz-date");
+        headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+        let presigned = "X-Amz-Signature=test&X-Amz-SignedHeaders=host";
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, Some(presigned)));
+
+        let headers_signing_less = {
+            let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-date");
+            headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+            headers
+        };
+        let presigned_copy = "X-Amz-Signature=test&X-Amz-SignedHeaders=host%3Bx-amz-copy-source%3Bx-amz-date";
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers_signing_less, Some(presigned_copy)));
+
+        // A duplicate Authorization header is checked entry by entry.
+        let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-copy-source;x-amz-date");
+        headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+        headers.append(
+            "authorization",
+            header_sigv4_authorization(SIGN_V4_ALGORITHM, "host;x-amz-content-sha256;x-amz-date"),
+        );
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+    }
+
+    #[test]
+    fn ghsa_xm99_check_ignores_sigv2_jwt_and_anonymous_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("anonymous auth is handled downstream");
+
+        for authorization in ["AWS key:signature", "Bearer token"] {
+            headers.insert("authorization", HeaderValue::from_static(authorization));
+            reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
+                .expect("non-SigV4 authorization carries no signed-header list");
+        }
     }
 
     #[test]

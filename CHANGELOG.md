@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Header-signed SigV4 requests honour only signed headers** (GHSA-xm99-m3gq-83g8): a request authenticated with a SigV4 `Authorization` header that carries an `x-amz-*` request header not listed in its `SignedHeaders` is now rejected with `403 AccessDenied` ("There were headers present in the request which were not signed"), matching AWS S3 and the presigned rule from GHSA-g8w9-qw9q-fghr. Previously anyone holding one header-signed `PutObject` request could add an unsigned `x-amz-copy-source` and turn it into a `CopyObject` that ran with the signer's permissions, copying any object the signer could read into the target. An `Authorization` header whose algorithm token is not `AWS4-HMAC-SHA256` is now rejected instead of being verified as SigV4. The request-envelope headers `x-amz-content-sha256`, `x-amz-decoded-content-length`, `x-amz-trailer` and `x-amz-checksum-algorithm` (the same set the upstream `s3s` fix exempts) and `x-amz-cf-id` (CloudFront) remain tolerated unsigned; AWS SDKs and RustFS's own signers already sign every other `x-amz-*` header. SigV2, JWT and anonymous requests are unchanged.
+
 ### Replication
 
 - Object Lock replication PUTs now carry a required integrity header, fixing target rejection introduced by the plain-payload default ([#7097](https://github.com/rustfs/rustfs/pull/7097)). This changes the default outbound request for locked objects but adds no persisted format.
