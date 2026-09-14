@@ -82,6 +82,10 @@ pub use diagnostics::{
     validate_drive_limits,
 };
 pub use diagnostics::{
+    DIAGNOSTIC_JOB_SIGNATURE_DOMAIN, DiagnosticJobEnvelope, DiagnosticJobError, DiagnosticJobExecution, DiagnosticJobLimits,
+    DiagnosticJobParameters, DiagnosticJobTarget, TrustedDiagnosticJobSigner, VerifiedDiagnosticJob, execute_diagnostic_job,
+};
+pub use diagnostics::{
     LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,
     MAX_NETWORK_DURATION, MAX_NETWORK_ENVELOPE_BYTES, MAX_NETWORK_OPERATIONS, MAX_NETWORK_PEERS, MAX_NETWORK_RESULT_BYTES,
     MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NETWORK_TOOL_ID, NetworkCoverage,

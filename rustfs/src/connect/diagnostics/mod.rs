@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod inspect;
+mod job;
 mod logs;
 mod perf_client;
 mod perf_drive;
@@ -43,6 +44,10 @@ pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
     InspectOutcome, InspectProvenance, InspectReason, InspectReasonCode, InspectRequest, InspectRule, InspectRuleOutcome,
     InspectRun, Reconstruction, SavedInspectExport, SignedInspectExport, export_inspect_summary, save_signed_inspect_export,
+};
+pub use job::{
+    DIAGNOSTIC_JOB_SIGNATURE_DOMAIN, DiagnosticJobEnvelope, DiagnosticJobError, DiagnosticJobExecution, DiagnosticJobLimits,
+    DiagnosticJobParameters, DiagnosticJobTarget, TrustedDiagnosticJobSigner, VerifiedDiagnosticJob, execute_diagnostic_job,
 };
 pub use logs::{
     CaptureMode, LOGS_CAPABILITY, LOGS_SCHEMA_VERSION, LocalLogConsent, LogCaptureError, LogCaptureRequest, LogProvenance,
