@@ -93,6 +93,30 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 
+/// Build the versioned listing options used by recursive object walks.
+///
+/// `list_path_result` normally derives these scan bounds before dispatching to
+/// a disk. Versioned walks call `list_path` directly, so they must establish the
+/// same base directory and child-prefix filter at this boundary.
+fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOptions) -> ListPathOptions {
+    let mut list_options = ListPathOptions {
+        bucket,
+        prefix: prefix.to_owned(),
+        marker: opts.marker.clone(),
+        limit: i32::try_from(opts.limit).unwrap_or(i32::MAX),
+        ask_disks: opts.ask_disks.clone(),
+        incl_deleted: true,
+        recursive: true,
+        versioned: true,
+        walkdir_timeout: opts.walkdir_timeout,
+        walkdir_stall_timeout: opts.walkdir_stall_timeout,
+        ..Default::default()
+    };
+    list_options.base_dir = base_dir_from_prefix(prefix);
+    list_options.set_filter();
+    list_options
+}
+
 struct ListObjectVersionsInput<'a> {
     bucket: &'a str,
     prefix: &'a str,
@@ -6587,26 +6611,8 @@ impl SetDisks {
             .instrument(tracing::Span::current()),
         );
 
-        let limit = i32::try_from(opts.limit).unwrap_or(i32::MAX);
-        let list_result = self
-            .list_path(
-                rx,
-                ListPathOptions {
-                    bucket: bucket_name_for_list,
-                    prefix: prefix.to_owned(),
-                    marker: opts.marker.clone(),
-                    limit,
-                    ask_disks: opts.ask_disks.clone(),
-                    incl_deleted: true,
-                    recursive: true,
-                    versioned: true,
-                    walkdir_timeout: opts.walkdir_timeout,
-                    walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                    ..Default::default()
-                },
-                entry_tx,
-            )
-            .await;
+        let list_options = recursive_walk_list_path_options(bucket_name_for_list, prefix, &opts);
+        let list_result = self.list_path(rx, list_options, entry_tx).await;
 
         let _ = result_task.await;
 
@@ -7197,7 +7203,7 @@ mod test {
         normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
         parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
         persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
-        persistent_key_only_index_health, persistent_key_only_index_matches_provider,
+        persistent_key_only_index_health, persistent_key_only_index_matches_provider, recursive_walk_list_path_options,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
         resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, select_list_index_provider_source_mode,
         select_list_index_source_mode, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
@@ -7220,6 +7226,24 @@ mod test {
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn recursive_walk_list_options_scope_scan_to_requested_prefix() {
+        let options =
+            recursive_walk_list_path_options("bucket".to_owned(), "photos/2026/000001.jpg", &super::WalkOptions::default());
+
+        assert_eq!(options.base_dir, "photos/2026/");
+        assert_eq!(options.filter_prefix.as_deref(), Some("000001.jpg"));
+
+        let directory_options =
+            recursive_walk_list_path_options("bucket".to_owned(), "photos/2026/", &super::WalkOptions::default());
+        assert_eq!(directory_options.base_dir, "photos/2026/");
+        assert_eq!(directory_options.filter_prefix, None);
+
+        let object_options = recursive_walk_list_path_options("bucket".to_owned(), "object.jpg", &super::WalkOptions::default());
+        assert_eq!(object_options.base_dir, "");
+        assert_eq!(object_options.filter_prefix.as_deref(), Some("object.jpg"));
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {
