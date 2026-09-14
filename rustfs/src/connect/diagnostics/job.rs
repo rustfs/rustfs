@@ -31,15 +31,16 @@ use uuid::{Uuid, Variant, Version};
 
 use super::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, LocalTopConsent, MAX_TOP_EXPORT_VALIDITY, PROFILE_SCHEMA_VERSION,
-    ProfileCaptureRequest, ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_SCHEMA_VERSION, TopApiOperation,
-    TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api,
-    encode_signed_profile_export, sign_top_export,
+    ProfileCaptureRequest, ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION,
+    TopApiOperation, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api,
+    capture_top_locks, encode_signed_profile_export, sign_top_export,
 };
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
 const TOP_API_JOB_TYPE: &str = "top.api";
+const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
 pub const DIAGNOSTIC_JOB_SIGNATURE_DOMAIN: &[u8] = b"rustfs-connect-agent-job-v1\0";
 const MAX_JOB_LIFETIME_SECONDS: i64 = 1_800;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
@@ -48,11 +49,14 @@ const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CPU_MILLIS: u64 = 30_000;
 const MAX_TOP_API_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_API_MEMORY_BYTES: u64 = 1_048_576;
+const MAX_TOP_LOCKS_CPU_MILLIS: u64 = 5_000;
+const MIN_TOP_LOCKS_MEMORY_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
     ProfileCpu,
     TopApi,
+    TopLocks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +389,12 @@ impl DiagnosticJobEnvelope {
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
+        if kind == DiagnosticJobKind::TopLocks
+            && (self.limits.max_cpu_millis > MAX_TOP_LOCKS_CPU_MILLIS
+                || self.limits.max_memory_bytes < MIN_TOP_LOCKS_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
         Ok(())
     }
 
@@ -397,6 +407,11 @@ impl DiagnosticJobEnvelope {
                 if capability == TOP_API_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
             {
                 Ok(DiagnosticJobKind::TopApi)
+            }
+            (TOP_LOCKS_JOB_TYPE, [capability], version)
+                if capability == TOP_LOCKS_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
+            {
+                Ok(DiagnosticJobKind::TopLocks)
             }
             _ => Err(DiagnosticJobError::Unsupported),
         }
@@ -417,6 +432,7 @@ pub async fn execute_diagnostic_job(
     match envelope.kind()? {
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, identity, provenance, cancel).await,
+        DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
     }
 }
 
@@ -506,6 +522,69 @@ async fn execute_top_api_job(
     let result = capture_top_api(&request, TopApiOperation::GetObject, cancel)
         .await
         .map_err(top_capture_failure)?;
+    let outcome = result.outcome.as_str().to_owned();
+    let reason = result.reason_code.as_str().to_owned();
+    if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome,
+            reason,
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = sign_top_export(&request, &result, identity, cancel).map_err(top_export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome,
+        reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+async fn execute_top_locks_job(
+    envelope: DiagnosticJobEnvelope,
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = TopCaptureRequest {
+        scope: TopCaptureScope {
+            organization_name: envelope.organization_name,
+            cluster_name: envelope.cluster_name,
+            device_name: envelope.device_name,
+            run_uid: envelope.job_id.clone(),
+            artifact_uid: envelope.parameters.artifact_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            run_expires_at_unix: expire.timestamp(),
+            executable_sha256: provenance.executable_sha256().to_owned(),
+            build_features: provenance.build_features().to_vec(),
+            consent: LocalTopConsent {
+                uid: envelope.parameters.consent_uid,
+                tool_id: TOP_LOCKS_JOB_TYPE.to_owned(),
+                classification: TOP_CLASSIFICATION.to_owned(),
+                active: true,
+                expires_at_unix: consent_expire.timestamp(),
+            },
+        },
+        limits: TopCaptureLimits {
+            max_duration_millis: envelope.parameters.duration_millis,
+            max_working_memory_bytes: envelope.limits.max_memory_bytes,
+            max_cpu_millis: envelope.limits.max_cpu_millis,
+            ..TopCaptureLimits::default()
+        },
+        window: Duration::from_millis(envelope.parameters.duration_millis),
+        export_validity: MAX_TOP_EXPORT_VALIDITY,
+    };
+    let result = capture_top_locks(&request, cancel).await.map_err(top_capture_failure)?;
     let outcome = result.outcome.as_str().to_owned();
     let reason = result.reason_code.as_str().to_owned();
     if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
@@ -677,6 +756,32 @@ mod tests {
 
         let mut mismatched = top.clone();
         mismatched.required_capabilities = vec![CPU_PROFILE_CAPABILITY.to_owned()];
+        assert_eq!(
+            signer.verify(&mismatched, &target(&mismatched), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Unsupported)
+        );
+
+        let mut unbounded = top;
+        unbounded.limits.max_cpu_millis += 1;
+        assert_eq!(
+            signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_bounded_top_locks_capability_pair() {
+        let mut top = envelope();
+        top.job_type = TOP_LOCKS_JOB_TYPE.to_owned();
+        top.required_capabilities = vec![TOP_LOCKS_CAPABILITY.to_owned()];
+        top.limits.max_cpu_millis = MAX_TOP_LOCKS_CPU_MILLIS;
+        let (top, signer) = signed_envelope(top);
+        signer
+            .verify(&top, &target(&top), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid top.locks job");
+
+        let mut mismatched = top.clone();
+        mismatched.required_capabilities = vec![TOP_API_CAPABILITY.to_owned()];
         assert_eq!(
             signer.verify(&mismatched, &target(&mismatched), "2030-01-01T00:00:10Z".parse().expect("time")),
             Err(DiagnosticJobError::Unsupported)
