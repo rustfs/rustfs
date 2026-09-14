@@ -2609,7 +2609,7 @@ impl MetaObject {
                 continue;
             }
 
-            if k == AMZ_STORAGE_CLASS && v == "STANDARD" {
+            if k == metadata_keys::STORAGE_CLASS && v == "STANDARD" {
                 continue;
             }
 
@@ -2621,7 +2621,7 @@ impl MetaObject {
                 continue;
             }
 
-            if k.eq_ignore_ascii_case(AMZ_STORAGE_CLASS) && v == b"STANDARD" {
+            if k.eq_ignore_ascii_case(metadata_keys::STORAGE_CLASS) && v == b"STANDARD" {
                 continue;
             }
 
@@ -2641,7 +2641,7 @@ impl MetaObject {
 
             let st = v.composite_replication_status();
             if !st.is_empty() {
-                metadata.insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), st.to_string());
+                metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), st.to_string());
             }
         }
 
@@ -2734,9 +2734,9 @@ impl MetaObject {
     }
 
     pub fn remove_restore_hdrs(&mut self) {
-        self.meta_user.remove(X_AMZ_RESTORE.as_str());
-        self.meta_user.remove(AMZ_RESTORE_EXPIRY_DAYS);
-        self.meta_user.remove(AMZ_RESTORE_REQUEST_DATE);
+        self.meta_user.remove(metadata_keys::RESTORE);
+        self.meta_user.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
+        self.meta_user.remove(metadata_keys::RESTORE_REQUEST_DATE);
         remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
         remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_WORKER_LOCK);
     }

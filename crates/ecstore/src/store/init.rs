@@ -5665,7 +5665,7 @@ mod tests {
                             metadata_acknowledged_target,
                             &ObjectOptions {
                                 eval_metadata: Some(HashMap::from([(
-                                    s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                                    rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                                     s3s::dto::ObjectLockLegalHoldStatus::OFF.to_string(),
                                 )])),
                                 ..target_version_opts.clone()
@@ -5694,7 +5694,7 @@ mod tests {
                     assert_eq!(
                         metadata_acknowledged
                             .user_defined
-                            .get(s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+                            .get(rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
                             .map(String::as_str),
                         Some("OFF")
                     );
@@ -5724,9 +5724,9 @@ mod tests {
                         ("governance-target.bin", s3s::dto::ObjectLockRetentionMode::GOVERNANCE),
                     ] {
                         let retained_metadata = HashMap::from([
-                            (s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), mode.to_string()),
+                            (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string()),
                             (
-                                s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                                rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                                 retain_until.clone(),
                             ),
                         ]);
@@ -12441,7 +12441,7 @@ mod tests {
                 .await
                 .expect("restored transitioned source should remain readable");
             assert!(
-                restored.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                restored.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE),
                 "restore completion metadata must be present before the delete regression"
             );
         }
@@ -16748,11 +16748,11 @@ mod tests {
                 &ObjectOptions {
                     user_defined: HashMap::from([
                         (
-                            s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(),
                             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                         ),
                         (
-                            s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                             "2099-01-01T00:00:00Z".to_string(),
                         ),
                     ]),

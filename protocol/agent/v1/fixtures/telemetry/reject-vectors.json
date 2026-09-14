@@ -1,0 +1,28 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "telemetry",
+  "schemaVersion": 1,
+  "classification": "L3",
+  "fixture": "reject-vectors",
+  "vectors": [
+    {"id": "telemetry.consent.missing", "stage": "REQUEST", "input": {"acknowledgeL3": false}, "expected": {"accepted": false, "reason": "CONSENT_REQUIRED", "artifactCreated": false}},
+    {"id": "telemetry.consent.expired", "stage": "REQUEST", "input": {"consentExpiresAt": "2026-09-11T23:59:59Z", "producedAt": "2026-09-12T00:00:00Z"}, "expected": {"accepted": false, "reason": "CONSENT_EXPIRED", "artifactCreated": false}},
+    {"id": "telemetry.record.duration-zero", "stage": "REQUEST", "input": {"durationMillis": 0, "maxSpans": 1}, "expected": {"accepted": false, "reason": "INVALID_DURATION", "artifactCreated": false}},
+    {"id": "telemetry.record.duration-over-limit", "stage": "REQUEST", "input": {"durationMillis": 30001, "maxSpans": 1}, "expected": {"accepted": false, "reason": "INVALID_DURATION", "artifactCreated": false}},
+    {"id": "telemetry.record.spans-zero", "stage": "REQUEST", "input": {"durationMillis": 1, "maxSpans": 0}, "expected": {"accepted": false, "reason": "INVALID_SPAN_LIMIT", "artifactCreated": false}},
+    {"id": "telemetry.record.spans-over-limit", "stage": "REQUEST", "input": {"durationMillis": 1, "maxSpans": 1025}, "expected": {"accepted": false, "reason": "INVALID_SPAN_LIMIT", "artifactCreated": false}},
+    {"id": "telemetry.record.stopped", "stage": "CAPTURE", "input": {"cancelled": true}, "expected": {"accepted": false, "reason": "CANCELLED", "artifactCreated": false}},
+    {"id": "telemetry.record.source-unavailable-with-data", "stage": "RESULT", "input": {"outcome": "UNSUPPORTED", "reasonCode": "UNSUPPORTED_TOOL", "data": {"spans": [], "droppedSpanCount": 0}}, "expected": {"accepted": false, "reason": "INVALID_OUTCOME_DATA", "artifactCreated": false}},
+    {"id": "telemetry.record.header-field", "stage": "RESULT", "input": {"data": {"spans": [{"operation": "GET_OBJECT", "durationMicros": 1, "status": "OK", "authorization": "SYNTHETIC_FORBIDDEN_SECRET"}], "droppedSpanCount": 0}}, "expected": {"accepted": false, "reason": "UNKNOWN_FIELD", "artifactCreated": false}},
+    {"id": "telemetry.record.customer-name-field", "stage": "RESULT", "input": {"data": {"spans": [{"operation": "GET_OBJECT", "durationMicros": 1, "status": "OK", "objectName": "SYNTHETIC_FORBIDDEN_OBJECT"}], "droppedSpanCount": 0}}, "expected": {"accepted": false, "reason": "UNKNOWN_FIELD", "artifactCreated": false}},
+    {"id": "telemetry.otlp.remote-plaintext", "stage": "REQUEST", "input": {"endpoint": "http://collector.example/v1/traces"}, "expected": {"accepted": false, "reason": "INVALID_ENDPOINT", "artifactCreated": false}},
+    {"id": "telemetry.otlp.body-over-limit", "stage": "REQUEST", "input": {"bodySizeBytes": 1048577}, "expected": {"accepted": false, "reason": "INVALID_BATCH", "artifactCreated": false}},
+    {"id": "telemetry.otlp.credential-in-receipt", "stage": "RESULT", "input": {"data": {"acceptedSpanCount": 1, "rejectedSpanCount": 0, "exportedBytes": 128, "authorization": "SYNTHETIC_FORBIDDEN_SECRET"}}, "expected": {"accepted": false, "reason": "UNKNOWN_FIELD", "artifactCreated": false}},
+    {"id": "telemetry.replay.unreviewed", "stage": "REQUEST", "input": {"locallyReviewed": false}, "expected": {"accepted": false, "reason": "INVALID_INPUT", "artifactCreated": false}},
+    {"id": "telemetry.replay.input-over-limit", "stage": "REQUEST", "input": {"inputSizeBytes": 262145}, "expected": {"accepted": false, "reason": "INVALID_INPUT", "artifactCreated": false}},
+    {"id": "telemetry.export.unsigned", "stage": "EXPORT", "input": {"members": ["envelope.json", "result.json"]}, "expected": {"accepted": false, "reason": "SIGNATURE_REQUIRED", "artifactCreated": false}},
+    {"id": "telemetry.export.tampered", "stage": "EXPORT", "input": {"payloadDigestMatches": false}, "expected": {"accepted": false, "reason": "DIGEST_MISMATCH", "artifactCreated": false}},
+    {"id": "telemetry.export.archive-over-limit", "stage": "EXPORT", "input": {"archiveSizeBytes": 524289}, "expected": {"accepted": false, "reason": "LIMIT_EXCEEDED", "artifactCreated": false}},
+    {"id": "telemetry.export.existing-output", "stage": "EXPORT", "input": {"outputExists": true}, "expected": {"accepted": false, "reason": "ALREADY_EXISTS", "artifactCreated": false}}
+  ]
+}

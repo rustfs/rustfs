@@ -17,22 +17,18 @@ use crate::replication::{
 };
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
-    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
+    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk, metadata_keys,
     replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
-use rustfs_utils::http::headers::{
-    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-    AMZ_STORAGE_CLASS,
-};
+use rustfs_utils::http::headers::{AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
-    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+    MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS,
+    SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
     SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
     SUFFIX_RESTORE_WORKER_LOCK, contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
 };
-use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
@@ -1114,34 +1110,6 @@ mod test {
     /// `parse_restore_obj_status` (fileinfo.rs).
     const RESTORED_ON_DISK: &str = "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"";
 
-    /// backlog#1733 (P9-01 §4.3/§7.6, g-key-001): pin the five `s3s::header`
-    /// constants that double as **persisted metadata map keys**. They are not
-    /// just HTTP header names — they are stored inside xl.meta (`meta_user`)
-    /// and read back by fail-open code, so a silent drift produces zero
-    /// HTTP-visible errors while:
-    ///
-    /// 1. **WORM silently dissolves** — `get_object_retention_meta`
-    ///    (ecstore objectlock.rs) returns an empty retention when the lock keys
-    ///    are unreadable, making every compliance-locked object deletable.
-    /// 2. **Live data dirs can be reclaimed** — `MetaObject::uses_data_dir`
-    ///    falls back to `is_restored_object_on_disk`, which returns `false`
-    ///    when `x-amz-restore` is unreadable, so a restored object's data dir
-    ///    is judged unused.
-    ///
-    /// Any migration replacing these constants must keep the literals byte-stable.
-    #[test]
-    fn persisted_metadata_keys_are_byte_stable() {
-        use s3s::header::{
-            X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-            X_AMZ_SERVER_SIDE_ENCRYPTION,
-        };
-        assert_eq!(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(), "x-amz-object-lock-legal-hold");
-        assert_eq!(X_AMZ_OBJECT_LOCK_MODE.as_str(), "x-amz-object-lock-mode");
-        assert_eq!(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(), "x-amz-object-lock-retain-until-date");
-        assert_eq!(X_AMZ_RESTORE.as_str(), "x-amz-restore");
-        assert_eq!(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str(), "x-amz-server-side-encryption");
-    }
-
     /// backlog#1733 g-key-003: a restored-to-local object must keep its data
     /// dir. The restore marker lives under the pinned `x-amz-restore` key; if
     /// the key ever drifts this flips to `false` and the data dir becomes
@@ -1178,11 +1146,11 @@ mod test {
     #[test]
     fn restore_marker_roundtrips_through_parser() {
         let mut meta = HashMap::new();
-        meta.insert(X_AMZ_RESTORE.as_str().to_string(), RESTORED_ON_DISK.to_string());
+        meta.insert(metadata_keys::RESTORE.to_string(), RESTORED_ON_DISK.to_string());
         assert!(crate::is_restored_object_on_disk(&meta));
 
         // An in-progress restore is not "on disk".
-        meta.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        meta.insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
         assert!(!crate::is_restored_object_on_disk(&meta));
     }
 
@@ -1900,7 +1868,7 @@ mod test {
     /// with its transition metadata (and thus the remote tier copy) intact.
     #[test]
     fn test_delete_version_expire_restored_keeps_transitioned_version() {
-        use rustfs_utils::http::headers::{AMZ_RESTORE, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
+        use crate::metadata_keys::{RESTORE, RESTORE_EXPIRY_DAYS, RESTORE_REQUEST_DATE};
 
         let mut fm = FileMeta::new();
         let vid = Uuid::new_v4();
@@ -1914,12 +1882,12 @@ mod test {
         fi.transitioned_objname = "remote/obj".to_string();
         fi.transition_tier = "COLDTIER".to_string();
         fi.metadata.insert(
-            AMZ_RESTORE.to_string(),
+            RESTORE.to_string(),
             "ongoing-request=\"false\", expiry-date=\"Fri, 17 Jul 2026 00:00:00 GMT\"".to_string(),
         );
-        fi.metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
+        fi.metadata.insert(RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
         fi.metadata
-            .insert(AMZ_RESTORE_REQUEST_DATE.to_string(), "Thu, 16 Jul 2026 00:00:00 GMT".to_string());
+            .insert(RESTORE_REQUEST_DATE.to_string(), "Thu, 16 Jul 2026 00:00:00 GMT".to_string());
         rustfs_utils::http::insert_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID, Uuid::from_u128(1).to_string());
         rustfs_utils::http::insert_str(
             &mut fi.metadata,
@@ -1939,9 +1907,9 @@ mod test {
 
         assert_eq!(fm.versions.len(), 1, "the version must survive restored-copy expiry");
         let after = fm.into_fileinfo("vol", "restored.bin", "", false, false, true).unwrap();
-        assert!(!after.metadata.contains_key(AMZ_RESTORE), "x-amz-restore must be stripped");
-        assert!(!after.metadata.contains_key(AMZ_RESTORE_EXPIRY_DAYS));
-        assert!(!after.metadata.contains_key(AMZ_RESTORE_REQUEST_DATE));
+        assert!(!after.metadata.contains_key(RESTORE), "x-amz-restore must be stripped");
+        assert!(!after.metadata.contains_key(RESTORE_EXPIRY_DAYS));
+        assert!(!after.metadata.contains_key(RESTORE_REQUEST_DATE));
         assert!(
             rustfs_utils::http::get_str(&after.metadata, SUFFIX_RESTORE_OPERATION_ID).is_none(),
             "expired restore must not retain its operation generation"

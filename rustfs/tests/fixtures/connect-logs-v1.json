@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "capability": "logs.capture@1",
+  "sourceEvents": [
+    {
+      "level": "WARN",
+      "event": "drive_unavailable",
+      "component": "connect",
+      "subsystem": "inventory",
+      "offline_drive_count": 1,
+      "drive_path": "/srv/customer-a/data",
+      "endpoint": "https://storage.customer-a.example.invalid"
+    },
+    {
+      "level": "ERROR",
+      "event": "rpc_request_failed",
+      "authorization": "Bearer SYNTHETIC_TOKEN_123",
+      "cookie": "session=SYNTHETIC_SESSION_123",
+      "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+      "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "kms_secret": "SYNTHETIC_KMS_SECRET_123",
+      "private_key": "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_PRIVATE_KEY_BYTES\n-----END PRIVATE KEY-----"
+    },
+    {
+      "level": "INFO",
+      "event": "http_startup_endpoints",
+      "message": "first line\n/private/customer/path\nthird line"
+    },
+    {
+      "level": "ERROR",
+      "event": "unreviewed_future_event",
+      "message": "SYNTHETIC_UNKNOWN_EVENT_SECRET"
+    }
+  ],
+  "expectedEventCount": 3,
+  "expectedDroppedEventCount": 1,
+  "forbiddenExportFragments": [
+    "message",
+    "drive_path",
+    "/srv/customer-a/data",
+    "endpoint",
+    "storage.customer-a.example.invalid",
+    "authorization",
+    "SYNTHETIC_TOKEN_123",
+    "cookie",
+    "SYNTHETIC_SESSION_123",
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "SYNTHETIC_KMS_SECRET_123",
+    "PRIVATE KEY",
+    "SYNTHETIC_PRIVATE_KEY_BYTES",
+    "/private/customer/path",
+    "SYNTHETIC_UNKNOWN_EVENT_SECRET"
+  ]
+}

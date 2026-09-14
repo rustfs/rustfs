@@ -29,7 +29,11 @@ use profile_cpu::{
     THREAD_PROFILE_CAPABILITY, ThreadProfileScope,
 };
 use profile_threads::{capture_thread_profile, export_thread_profile};
+#[cfg(target_os = "linux")]
+use std::io::{Cursor, Read as _};
 use tokio_util::sync::CancellationToken;
+#[cfg(target_os = "linux")]
+use zip::ZipArchive;
 
 fn request() -> ProfileCaptureRequest {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64;
@@ -58,24 +62,84 @@ fn request() -> ProfileCaptureRequest {
     }
 }
 
-#[test]
-fn tokio_and_native_thread_scopes_remain_explicitly_unsupported() {
+#[tokio::test]
+async fn tokio_thread_scope_remains_explicitly_unsupported() {
     let key = connect::DeviceIdentity::generate();
-    for scope in [ThreadProfileScope::TokioRuntime, ThreadProfileScope::NativeThreads] {
-        let result = capture_thread_profile(&request(), scope, &CancellationToken::new()).expect("unsupported result");
-        assert_eq!(result.outcome(), ProfileOutcome::Unsupported);
-        assert_eq!(result.reason_code(), ProfileReasonCode::UnsupportedTool);
-        assert!(result.data().is_none(), "unsupported scope must not publish zero state counts");
-        let json = serde_json::to_value(result).expect("result JSON");
-        assert_eq!(json["toolId"], "profile.threads");
-        assert_eq!(json["capability"], "profile.threads@1");
-        assert!(json["data"].is_null());
+    let result = capture_thread_profile(&request(), ThreadProfileScope::TokioRuntime, &CancellationToken::new())
+        .expect("unsupported result");
+    assert_eq!(result.outcome(), ProfileOutcome::Unsupported);
+    assert_eq!(result.reason_code(), ProfileReasonCode::UnsupportedTool);
+    assert!(result.data().is_none(), "unsupported scope must not publish zero state counts");
+    let json = serde_json::to_value(result).expect("result JSON");
+    assert_eq!(json["toolId"], "profile.threads");
+    assert_eq!(json["capability"], "profile.threads@1");
+    assert!(json["data"].is_null());
 
-        let export = export_thread_profile(&request(), scope, &key, &CancellationToken::new()).expect("unsupported export");
-        assert_eq!(export.tool.id(), "profile.threads");
-        assert_eq!(export.outcome, ProfileOutcome::Unsupported);
-        assert_eq!(export.reason_code, ProfileReasonCode::UnsupportedTool);
+    let export = export_thread_profile(&request(), ThreadProfileScope::TokioRuntime, &key, &CancellationToken::new())
+        .await
+        .expect("unsupported export");
+    assert_eq!(export.tool.id(), "profile.threads");
+    assert_eq!(export.outcome, ProfileOutcome::Unsupported);
+    assert_eq!(export.reason_code, ProfileReasonCode::UnsupportedTool);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_thread_scope_exports_bounded_redacted_state_counts() {
+    let key = connect::DeviceIdentity::generate();
+    let result = capture_thread_profile(&request(), ThreadProfileScope::NativeThreads, &CancellationToken::new())
+        .expect("native thread result");
+    assert_eq!(result.outcome(), ProfileOutcome::Succeeded);
+    assert_eq!(result.reason_code(), ProfileReasonCode::Complete);
+    let json = serde_json::to_value(result).expect("result JSON");
+    assert_eq!(json["data"]["scope"], "NATIVE_THREADS");
+    let states = json["data"]["states"].as_array().expect("thread states");
+    assert_eq!(states.len(), 4);
+    assert!(states.iter().all(|state| state["threadCount"].as_u64().is_some()));
+    assert!(states.iter().map(|state| state["threadCount"].as_u64().unwrap()).sum::<u64>() > 0);
+    let encoded = serde_json::to_string(&json).expect("encoded result");
+    for forbidden in ["/proc/", "task/", "worker", "secret", "stack", "address", "threadId"] {
+        assert!(!encoded.contains(forbidden), "result leaked forbidden material: {forbidden}");
     }
+
+    let export = export_thread_profile(&request(), ThreadProfileScope::NativeThreads, &key, &CancellationToken::new())
+        .await
+        .expect("native thread export");
+    assert_eq!(export.outcome, ProfileOutcome::Succeeded);
+    assert!(export.archive_bytes.len() <= profile_cpu::MAX_ARCHIVE_BYTES);
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes)).expect("profile archive");
+    let mut result = String::new();
+    archive
+        .by_name("result.json")
+        .expect("profile result")
+        .read_to_string(&mut result)
+        .expect("read profile result");
+    assert!(result.contains("\"scope\":\"NATIVE_THREADS\""));
+    for forbidden in ["/proc/", "task/", "worker", "secret", "stack", "address", "threadId"] {
+        assert!(!result.contains(forbidden), "archive leaked forbidden material: {forbidden}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_thread_scope_honors_the_monotonic_deadline() {
+    let mut expired = request();
+    expired.duration = Duration::from_nanos(1);
+    expired.sample_period = Duration::from_nanos(1);
+    assert!(matches!(
+        capture_thread_profile(&expired, ThreadProfileScope::NativeThreads, &CancellationToken::new()),
+        Err(ProfileError::TimedOut)
+    ));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn native_thread_scope_is_explicitly_unsupported_off_linux() {
+    let result = capture_thread_profile(&request(), ThreadProfileScope::NativeThreads, &CancellationToken::new())
+        .expect("unsupported result");
+    assert_eq!(result.outcome(), ProfileOutcome::Unsupported);
+    assert_eq!(result.reason_code(), ProfileReasonCode::UnsupportedPlatform);
+    assert!(result.data().is_none());
 }
 
 #[test]

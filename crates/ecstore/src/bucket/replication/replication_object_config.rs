@@ -14,8 +14,8 @@
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
+use super::replication_filemeta_boundary::metadata_keys;
 use crate::bucket::metadata::BucketMetadata;
-use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -179,9 +179,11 @@ fn replication_config_from_metadata(metadata: &BucketMetadata) -> Result<Option<
 }
 
 fn delete_request_snapshot_from_metadata(metadata: Arc<BucketMetadata>) -> Result<DeleteReplicationConfigSnapshot> {
-    if !metadata.versioning_config_xml.is_empty() && metadata.versioning_config.is_none() {
-        return Err(super::replication_error_boundary::Error::other(
-            "persisted bucket versioning configuration is invalid",
+    if let Some(raw_len) = metadata.xml_config_unreadable_len(crate::bucket::metadata::BUCKET_VERSIONING_CONFIG) {
+        return Err(crate::bucket::metadata::unreadable_config_error(
+            &metadata.name,
+            crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            raw_len,
         ));
     }
 
@@ -332,7 +334,7 @@ impl ReplicationConfig {
         }
 
         let mut user_defined = (*oi.user_defined).clone();
-        user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
+        user_defined.remove(metadata_keys::REPLICATION_STATUS);
 
         let dsc = must_replicate(
             oi.bucket.as_str(),

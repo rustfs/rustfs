@@ -101,6 +101,10 @@ pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};
 pub use observability::{
     MemorySamplingState, ObservabilitySnapshot, ObservabilitySnapshotProvider, PlatformSupport, UserspaceProfilingCapability,
 };
+/// Object-metadata keys persisted in xl.meta `meta_user`. filemeta owns the
+/// on-disk spelling; contract consumers that read or write persisted object
+/// metadata (lifecycle object-lock checks) take the keys from here.
+pub use rustfs_filemeta::metadata_keys;
 pub use topology::{
     DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot,
     TopologySnapshotProvider,
