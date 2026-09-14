@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM;
+use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
 use thiserror::Error;
 
 use super::heal::{DiskError, EcstoreError};
@@ -129,6 +131,7 @@ impl Error {
                     return true;
                 }
                 err.is_quorum_error()
+                    || matches!(err, EcstoreError::Io(error) if is_recoverable_internode_error(error))
                     || matches!(
                         err,
                         EcstoreError::DiskNotFound
@@ -153,10 +156,11 @@ impl Error {
                         | DiskError::FaultyRemoteDisk
                         | DiskError::FaultyDisk
                         | DiskError::RemoteClientUnavailable(_)
-                ) || is_recoverable_heal_error_message(&err.to_string())
+                ) || matches!(err, DiskError::Io(error) if is_recoverable_internode_error(error))
+                    || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
-            Error::Io(err) => is_recoverable_heal_error_message(&err.to_string()),
+            Error::Io(err) => is_recoverable_internode_error(err) || is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
     }
@@ -182,6 +186,18 @@ impl Error {
             _ => false,
         }
     }
+}
+
+fn is_recoverable_internode_error(error: &std::io::Error) -> bool {
+    let Some(error) = error.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) else {
+        return false;
+    };
+    // A restarting peer can return 500 after admitting a shard upload. Heal
+    // can replay that write within its existing object and task retry budgets.
+    // Other operations retain the transport's normal retry classification.
+    error.kind().is_retryable()
+        || (error.context().operation() == Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+            && matches!(error.kind(), InternodeHttpErrorKind::HttpStatus(status) if matches!(status.as_u16(), 409 | 500)))
 }
 
 /// Documented substring fallback for errors that reach heal with their typed
@@ -233,6 +249,79 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn internode_transport_errors_keep_their_recovery_classification() {
+        use rustfs_rio::{InternodeHttpErrorKind as Kind, new_test_internode_http_io_error};
+        for (kind, expected) in [
+            (Kind::ConnectionReset, true),
+            (Kind::BodyStreamAborted, true),
+            (Kind::DnsResolutionFailed, true),
+            (Kind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR), true),
+            (Kind::HttpStatus(http::StatusCode::CONFLICT), true),
+            (Kind::HttpStatus(http::StatusCode::SERVICE_UNAVAILABLE), true),
+            (Kind::HttpStatus(http::StatusCode::FORBIDDEN), false),
+            (Kind::HttpStatus(http::StatusCode::BAD_REQUEST), false),
+            (Kind::HttpStatus(http::StatusCode::NOT_FOUND), false),
+            (Kind::Unknown, false),
+        ] {
+            for error in [
+                Error::Io(new_test_internode_http_io_error(kind)),
+                Error::Disk(DiskError::from(new_test_internode_http_io_error(kind))),
+                Error::Storage(EcstoreError::from(DiskError::from(new_test_internode_http_io_error(kind)))),
+            ] {
+                assert_eq!(error.is_recoverable_heal(), expected, "{error:?}");
+            }
+        }
+        let text = "internode http status 500 Internal Server Error: PUT /rustfs/rpc/put_file_stream_v1";
+        assert!(!Error::Io(std::io::Error::other(text)).is_recoverable_heal());
+        assert!(!Error::other(text).is_recoverable_heal());
+        for error in [DiskError::FileCorrupt, DiskError::DiskFull, DiskError::FileAccessDenied] {
+            assert!(!Error::Disk(error).is_recoverable_heal());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_http_500_is_not_a_retryable_heal_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind fixture");
+            let address = listener.local_addr().expect("fixture address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = [0_u8; 4096];
+                let mut read = 0;
+                loop {
+                    let count = stream.read(&mut request[read..]).await.expect("request headers");
+                    assert!(count > 0, "request ended before headers");
+                    read += count;
+                    if request[..read].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(read < request.len(), "request exceeds fixture budget");
+                }
+                stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("write response");
+            });
+            let error = match rustfs_rio::HttpReader::new(
+                format!("http://{address}/rustfs/rpc/read_file_stream"),
+                http::Method::GET,
+                http::HeaderMap::new(),
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("HTTP 500 must fail the read"),
+                Err(error) => Error::Storage(EcstoreError::from(DiskError::from(error))),
+            };
+            server.await.expect("fixture completed");
+            assert!(!error.is_recoverable_heal(), "{error:?}");
+        })
+        .await
+        .expect("fixture completed within its budget");
+    }
 
     #[test]
     fn incomplete_target_rename_is_recoverable() {
