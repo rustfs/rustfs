@@ -14,10 +14,9 @@
 
 //! Bounded profile result and signed local export primitives.
 //!
-//! RustFS currently has no reviewed local CPU symbol catalogue or in-process
-//! sampler. [`capture_cpu_profile`] therefore returns an explicit, typed
-//! unsupported result. It never substitutes Pyroscope delivery state, raw
-//! symbol strings, or zero samples for a local CPU measurement.
+//! The optional Pyroscope pprof backend supplies an on-demand process sampler.
+//! Raw frames stay local: the exported summary contains nonce-bound symbol IDs
+//! and counts only, never symbol text, paths, addresses, or thread metadata.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Write as _};
@@ -396,6 +395,21 @@ impl ProfileResult {
         }
     }
 
+    fn partial(request: &ProfileCaptureRequest, tool: ProfileTool, duration: Duration, data: ProfileData) -> Self {
+        Self {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            run_uid: request.run_uid.clone(),
+            tool_id: tool,
+            capability: tool.capability(),
+            outcome: ProfileOutcome::Partial,
+            reason_code: ProfileReasonCode::LimitExceeded,
+            duration_millis: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).min(30_000),
+            provenance: request.provenance.clone(),
+            coverage: ProfileCoverage::complete_window(),
+            data: Some(data),
+        }
+    }
+
     pub(super) fn unsupported(request: &ProfileCaptureRequest, tool: ProfileTool, reason_code: ProfileReasonCode) -> Self {
         Self {
             schema_version: PROFILE_SCHEMA_VERSION,
@@ -469,23 +483,294 @@ pub enum ProfileError {
     DurabilityAfterCommit(#[source] std::io::Error),
 }
 
-pub fn capture_cpu_profile(request: &ProfileCaptureRequest, cancel: &CancellationToken) -> Result<ProfileResult, ProfileError> {
+pub async fn capture_cpu_profile(
+    request: &ProfileCaptureRequest,
+    cancel: &CancellationToken,
+) -> Result<ProfileResult, ProfileError> {
     request.validate(ProfileTool::Cpu, unix_now()?)?;
     check_cancel(cancel)?;
 
-    // The only existing CPU profiler exports to Pyroscope and does not provide
-    // a reviewed local symbol-id catalogue. Publishing samples here would turn
-    // unreviewed process symbols into L3 evidence or invent their mapping.
+    #[cfg(all(
+        feature = "pyroscope",
+        any(
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    {
+        let _lease = CollectorLease::acquire()?;
+        let owned_request = request.clone();
+        let owned_cancel = cancel.clone();
+        let (data, elapsed) = tokio::task::spawn_blocking(move || local_cpu::collect(&owned_request, &owned_cancel))
+            .await
+            .map_err(|_| ProfileError::CollectionFailed)??;
+        check_cancel(cancel)?;
+        let outcome = if data.dropped_sample_count == 0 {
+            ProfileResult::succeeded(request, ProfileTool::Cpu, elapsed, ProfileData::Cpu(data))
+        } else {
+            ProfileResult::partial(request, ProfileTool::Cpu, elapsed, ProfileData::Cpu(data))
+        };
+        return Ok(outcome);
+    }
+
+    #[cfg(not(all(
+        feature = "pyroscope",
+        any(
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    )))]
     Ok(ProfileResult::unsupported(request, ProfileTool::Cpu, ProfileReasonCode::UnsupportedTool))
 }
 
-pub fn export_cpu_profile(
+pub async fn export_cpu_profile(
     request: &ProfileCaptureRequest,
     key: &DeviceIdentity,
     cancel: &CancellationToken,
 ) -> Result<SignedProfileExport, ProfileError> {
-    let result = capture_cpu_profile(request, cancel)?;
+    let result = capture_cpu_profile(request, cancel).await?;
     encode_signed_profile_export(request, &result, key, cancel)
+}
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(
+        all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod local_cpu {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use pyroscope::backend::{BackendConfig, PprofConfig, ReportData, pprof_backend};
+    use sha2::{Digest as _, Sha256};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{CpuProfileData, CpuProfileSample, ProfileCaptureRequest, ProfileError, check_cancel, hex_lower};
+
+    const SYMBOL_DOMAIN: &[u8] = b"rustfs-connect-cpu-symbol-v1\0";
+    const MAX_SAMPLE_RATE_HZ: u32 = 100;
+    const MAX_STACK_RECORDS: usize = 65_536;
+    const MAX_SAMPLES: u64 = 65_536;
+    const MAX_UNIQUE_SYMBOLS: usize = 4_096;
+    const MAX_OUTPUT_SYMBOLS: usize = 256;
+    const MAX_SYMBOL_BYTES: usize = 4_096;
+
+    pub(super) fn collect(
+        request: &ProfileCaptureRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(CpuProfileData, Duration), ProfileError> {
+        let sample_period_micros = u64::try_from(request.sample_period.as_micros()).map_err(|_| ProfileError::LimitExceeded)?;
+        let sample_rate = 1_000_000_u64
+            .checked_div(sample_period_micros)
+            .ok_or(ProfileError::LimitExceeded)?;
+        let sample_rate = u32::try_from(sample_rate).map_err(|_| ProfileError::LimitExceeded)?;
+        if sample_rate == 0 || sample_rate > MAX_SAMPLE_RATE_HZ {
+            return Err(ProfileError::LimitExceeded);
+        }
+
+        let started = Instant::now();
+        let deadline = started.checked_add(request.duration).ok_or(ProfileError::LimitExceeded)?;
+        let mut backend = pprof_backend(PprofConfig { sample_rate }, BackendConfig::default())
+            .initialize()
+            .map_err(|_| ProfileError::SourceUnavailable)?;
+
+        let report_result =
+            wait_for_window(deadline, cancel).and_then(|()| backend.report().map_err(|_| ProfileError::CollectionFailed));
+        let shutdown_result = backend.shutdown().map_err(|_| ProfileError::CollectionFailed);
+        let batch = report_result?;
+        shutdown_result?;
+        let ReportData::Reports(reports) = batch.data else {
+            return Err(ProfileError::SourceUnavailable);
+        };
+
+        let mut accumulator = Accumulator::new(request.nonce);
+        for report in reports {
+            for (stack, count) in report.data {
+                accumulator.record_stack(stack.frames.iter().filter_map(|frame| frame.name.as_deref()), count)?;
+            }
+        }
+        let actual_period_micros = 1_000_000_u64
+            .checked_div(u64::from(sample_rate))
+            .ok_or(ProfileError::LimitExceeded)?;
+        Ok((accumulator.finish(actual_period_micros)?, started.elapsed()))
+    }
+
+    fn wait_for_window(deadline: Instant, cancel: &CancellationToken) -> Result<(), ProfileError> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+        loop {
+            check_cancel(cancel)?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+        }
+    }
+
+    struct Accumulator {
+        nonce: [u8; 32],
+        samples: HashMap<String, u64>,
+        stack_records: usize,
+        accepted_sample_count: u64,
+        dropped_sample_count: u64,
+    }
+
+    impl Accumulator {
+        fn new(nonce: [u8; 32]) -> Self {
+            Self {
+                nonce,
+                samples: HashMap::new(),
+                stack_records: 0,
+                accepted_sample_count: 0,
+                dropped_sample_count: 0,
+            }
+        }
+
+        fn record_stack<'a>(&mut self, symbols: impl Iterator<Item = &'a str>, count: usize) -> Result<(), ProfileError> {
+            self.stack_records = self.stack_records.checked_add(1).ok_or(ProfileError::LimitExceeded)?;
+            let count = u64::try_from(count).map_err(|_| ProfileError::LimitExceeded)?;
+            if self.stack_records > MAX_STACK_RECORDS {
+                return self.drop_samples(count);
+            }
+            let accepted_count = count.min(MAX_SAMPLES.saturating_sub(self.accepted_sample_count));
+            self.drop_samples(count.saturating_sub(accepted_count))?;
+            if accepted_count == 0 {
+                return Ok(());
+            }
+            self.accepted_sample_count = self
+                .accepted_sample_count
+                .checked_add(accepted_count)
+                .ok_or(ProfileError::LimitExceeded)?;
+            let symbol = symbols
+                .into_iter()
+                .find(|symbol| !symbol.is_empty() && symbol.len() <= MAX_SYMBOL_BYTES)
+                .unwrap_or("<unresolved>");
+            let symbol_id = symbol_id(&self.nonce, symbol);
+            if !self.samples.contains_key(&symbol_id) && self.samples.len() >= MAX_UNIQUE_SYMBOLS {
+                return self.drop_samples(accepted_count);
+            }
+            let samples = self.samples.entry(symbol_id).or_default();
+            *samples = samples.checked_add(accepted_count).ok_or(ProfileError::LimitExceeded)?;
+            Ok(())
+        }
+
+        fn drop_samples(&mut self, count: u64) -> Result<(), ProfileError> {
+            self.dropped_sample_count = self
+                .dropped_sample_count
+                .checked_add(count)
+                .ok_or(ProfileError::LimitExceeded)?;
+            Ok(())
+        }
+
+        fn finish(self, sample_period_micros: u64) -> Result<CpuProfileData, ProfileError> {
+            let mut samples = self
+                .samples
+                .into_iter()
+                .map(|(symbol_id, sample_count)| CpuProfileSample { symbol_id, sample_count })
+                .collect::<Vec<_>>();
+            samples.sort_unstable_by(|left, right| {
+                right
+                    .sample_count
+                    .cmp(&left.sample_count)
+                    .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+            });
+            let mut dropped_sample_count = self.dropped_sample_count;
+            if samples.len() > MAX_OUTPUT_SYMBOLS {
+                dropped_sample_count = samples[MAX_OUTPUT_SYMBOLS..]
+                    .iter()
+                    .try_fold(dropped_sample_count, |total, sample| {
+                        total.checked_add(sample.sample_count).ok_or(ProfileError::LimitExceeded)
+                    })?;
+                samples.truncate(MAX_OUTPUT_SYMBOLS);
+            }
+            if samples.is_empty() {
+                return Err(ProfileError::SourceUnavailable);
+            }
+            Ok(CpuProfileData {
+                sample_period_micros,
+                samples,
+                dropped_sample_count,
+            })
+        }
+    }
+
+    fn symbol_id(nonce: &[u8; 32], symbol: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(SYMBOL_DOMAIN);
+        digest.update(nonce);
+        digest.update(symbol.as_bytes());
+        format!("sha256:{}", hex_lower(&digest.finalize()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn summary_uses_nonce_bound_ids_and_excludes_raw_symbols() {
+            let raw_symbol = "rustfs_ecstore::disk::read_object";
+            let mut first = Accumulator::new([7; 32]);
+            first
+                .record_stack([raw_symbol].into_iter(), 9)
+                .expect("first stack should be recorded");
+            let first = first.finish(10_000).expect("first summary should be produced");
+            let mut second = Accumulator::new([8; 32]);
+            second
+                .record_stack([raw_symbol].into_iter(), 9)
+                .expect("second stack should be recorded");
+            let second = second.finish(10_000).expect("second summary should be produced");
+
+            assert_ne!(first.samples[0].symbol_id, second.samples[0].symbol_id);
+            assert_eq!(first.samples[0].sample_count, 9);
+            let encoded = serde_json::to_string(&first).expect("CPU summary should serialize");
+            assert!(!encoded.contains(raw_symbol));
+            assert!(!encoded.contains("read_object"));
+            assert!(!encoded.contains('/'));
+        }
+
+        #[test]
+        fn summary_bounds_samples_and_output_symbols() {
+            let mut accumulator = Accumulator::new([3; 32]);
+            for index in 0..=MAX_OUTPUT_SYMBOLS {
+                let symbol = format!("rustfs::bounded::{index}");
+                accumulator
+                    .record_stack([symbol.as_str()].into_iter(), 1)
+                    .expect("bounded stack should be recorded");
+            }
+            accumulator
+                .record_stack(["rustfs::large_count"].into_iter(), usize::MAX)
+                .expect("large count should be bounded");
+            let summary = accumulator.finish(10_000).expect("bounded summary should be produced");
+
+            assert_eq!(summary.samples.len(), MAX_OUTPUT_SYMBOLS);
+            assert!(summary.dropped_sample_count > 0);
+            assert!(summary.samples.iter().map(|sample| sample.sample_count).sum::<u64>() <= MAX_SAMPLES);
+        }
+
+        #[test]
+        fn window_observes_cancellation() {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            assert!(matches!(
+                wait_for_window(Instant::now() + Duration::from_secs(1), &cancel),
+                Err(ProfileError::Cancelled)
+            ));
+        }
+    }
 }
 
 pub fn encode_signed_profile_export(
