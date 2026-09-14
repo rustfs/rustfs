@@ -93,7 +93,12 @@ async fn top_rpc_captures_classified_rpc_outcomes_only() {
     assert_eq!(data.error_count, 1);
     assert_eq!(data.total_duration_micros, 18);
     let encoded = serde_json::to_value(data).expect("serialize top.rpc data");
-    let mut keys = encoded.as_object().expect("top.rpc object").keys().cloned().collect::<Vec<_>>();
+    let mut keys = encoded
+        .as_object()
+        .expect("top.rpc object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     keys.sort();
     assert_eq!(keys, ["errorCount", "requestCount", "totalDurationMicros", "windowMillis"]);
 }
