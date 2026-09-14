@@ -383,7 +383,25 @@ fn record_committed_tier_free_version_receipt(
     free_version_id: Uuid,
     batch: bool,
 ) {
-    if let Some(sink) = opts.tier_free_version_receipt_sink.as_ref()
+    record_committed_tier_free_version_receipt_to_sink(
+        opts.tier_free_version_receipt_sink.as_ref(),
+        bucket,
+        object,
+        source,
+        free_version_id,
+        batch,
+    );
+}
+
+fn record_committed_tier_free_version_receipt_to_sink(
+    sink: Option<&crate::object_api::TierFreeVersionReceiptSink>,
+    bucket: &str,
+    object: &str,
+    source: &ObjectInfo,
+    free_version_id: Uuid,
+    batch: bool,
+) {
+    if let Some(sink) = sink
         && let Err(err) = sink.record(source, free_version_id)
     {
         warn!(
@@ -3822,13 +3840,18 @@ impl SetDisks {
                 );
             }
             fi.metadata = user_defined;
-            if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
-                // Every disk must publish the same cleanup owner alongside a
-                // replaced null version. This transient key is not persisted
-                // on the new object; recovery discovers the free-version in
-                // the committed xl.meta even if this request is cancelled.
-                fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
-            }
+            let put_tier_free_version_id =
+                if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
+                    // Every disk must publish the same cleanup owner alongside a
+                    // replaced null version. This transient key is not persisted
+                    // on the new object; recovery discovers the free-version in
+                    // the committed xl.meta even if this request is cancelled.
+                    let free_version_id = Uuid::new_v4();
+                    fi.set_tier_free_version_id(&free_version_id.to_string());
+                    Some(free_version_id)
+                } else {
+                    None
+                };
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -4304,6 +4327,9 @@ impl SetDisks {
             let commit_capacity_scope_token = opts.capacity_scope_token;
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
             let commit_scanner_publication_lease_tokens = scanner_publication_lease_tokens;
+            let commit_put_tier_free_version_id = put_tier_free_version_id;
+            let commit_tier_free_version_receipt_sink = opts.tier_free_version_receipt_sink.clone();
+            let commit_skip_free_version = opts.skip_free_version;
             let request_cancellation = operation_cancellation.clone();
             tmp_cleanup_owned = true;
 
@@ -4459,6 +4485,41 @@ impl SetDisks {
                     }
                     return Err(err);
                 }
+
+                let put_tier_free_version_source =
+                    if commit_put_tier_free_version_id.is_some() && commit_tier_free_version_receipt_sink.is_some() {
+                        match commit_set
+                            .get_object_info(
+                                &commit_bucket,
+                                &commit_object,
+                                &ObjectOptions {
+                                    no_lock: true,
+                                    metadata_cache_safe: false,
+                                    versioned: commit_versioned,
+                                    version_suspended: commit_version_suspended,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(source) => Some(source),
+                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                            Err(err) => {
+                                debug!(
+                                    event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    bucket = %commit_bucket,
+                                    object = %commit_object,
+                                    error = ?err,
+                                    "Skipped opportunistic tier free-version receipt source capture"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                 Self::assign_rename_data_indexes(&mut parts_metadatas);
                 let mut rename_result = SetDisks::rename_data_owned_with_fence(
@@ -4632,6 +4693,19 @@ impl SetDisks {
                 let cleanup_disks = rename_commit.cleanup_disks;
                 let old_current_size = rename_commit.old_current_size;
                 let mut fi = rename_commit.committed_file_info;
+                if let (Some(source), Some(free_version_id)) =
+                    (put_tier_free_version_source.as_ref(), commit_put_tier_free_version_id)
+                    && transitioned_delete_publishes_free_version(source, &fi, commit_skip_free_version)
+                {
+                    record_committed_tier_free_version_receipt_to_sink(
+                        commit_tier_free_version_receipt_sink.as_ref(),
+                        &commit_bucket,
+                        &commit_object,
+                        source,
+                        free_version_id,
+                        false,
+                    );
+                }
 
                 if needs_immediate_heal {
                     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(

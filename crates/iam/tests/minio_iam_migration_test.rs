@@ -100,6 +100,34 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
         .await;
     env.make_bucket(LEGACY_META_BUCKET, false).await;
 
+    for (path, body) in [
+        ("config/iam/empty.json", Vec::new()),
+        ("config/iam/users/ignored/extra.json", b"not JSON".to_vec()),
+    ] {
+        env.put_object_bytes(LEGACY_META_BUCKET, path, body).await;
+    }
+    try_migrate_iam_config(
+        env.ecstore.clone(),
+        Some(std::sync::Arc::new(|_| panic!("unsupported IAM records must not be decrypted"))),
+    )
+    .await
+    .expect("unsupported IAM records, including empty objects, must be skipped");
+
+    let format_path = "config/iam/format.json";
+    for body in [Vec::new(), b"invalid IAM format".to_vec()] {
+        env.put_object_bytes(LEGACY_META_BUCKET, format_path, body).await;
+        let error = try_migrate_iam_config(env.ecstore.clone(), None)
+            .await
+            .expect_err("empty or incompatible supported IAM metadata must prevent startup readiness");
+        let io_error = std::io::Error::from(error);
+        let detail = io_error
+            .get_ref()
+            .and_then(|context| context.source())
+            .expect("failure must retain the supported record in its source");
+        assert!(detail.to_string().contains(format_path), "failure must identify the supported record");
+    }
+    seed_legacy_iam_object(&env, format_path, &json!({"version": 1})).await;
+
     let regular_source = json!({
         "version": 1,
         "credentials": {
@@ -155,7 +183,12 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     )
     .await;
 
-    try_migrate_iam_config(env.ecstore.clone(), None).await;
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("legacy IAM migration completes after source repair");
+    try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect("completed legacy IAM migration is idempotent");
 
     let store = ObjectStore::new(env.ecstore);
     assert_identity_survives(

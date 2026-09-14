@@ -151,8 +151,7 @@ jobs:
 
       - name: Build rustfs binary
         run: |
-          cargo build -p rustfs --bins
-          : > target/debug/rustfs.features
+          python3 scripts/e2e_binary.py build --bins
 
       - name: Verify distributed e2e membership
         env:
@@ -168,9 +167,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${FILTER}" ]; then
-            cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+            python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
           else
-            cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
+            python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
           fi
 
       - name: Upload distributed e2e diagnostics

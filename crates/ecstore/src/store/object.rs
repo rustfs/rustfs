@@ -859,7 +859,76 @@ async fn delete_recursive_prefix_with_tier_delete_journal(
             }
         }
     }
+    // A trailing slash selects a directory, not the object at its parent key.
+    // Raw filesystem recursion would also remove that object's metadata and
+    // data. Preserve it by purging the selected keys individually when they
+    // share this physical directory. The bucket write lock covers both scans.
+    if object.ends_with('/') && !is_meta_bucketname(bucket) {
+        let parent = object.strip_suffix('/').unwrap_or(object);
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(bucket, parent, None, None, 1)
+                    .await?;
+                if page.objects.iter().any(|info| info.name == parent) {
+                    return delete_directory_keys_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await;
+                }
+            }
+        }
+    }
     delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
+}
+
+async fn delete_directory_keys_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    prefix: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    for pool in &store.pools {
+        for set in &pool.disk_set {
+            let mut previous_keys = std::collections::BTreeSet::new();
+            loop {
+                // Restart after each bounded batch: its version markers have
+                // been deleted, and the bucket write lock excludes new keys.
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(
+                        bucket,
+                        prefix,
+                        None,
+                        None,
+                        RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                    )
+                    .await?;
+                let keys = page
+                    .objects
+                    .into_iter()
+                    .map(|info| info.name)
+                    .filter(|key| key.starts_with(prefix))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if keys.is_empty() {
+                    break;
+                }
+                if keys == previous_keys {
+                    return Err(Error::other("directory deletion did not advance"));
+                }
+                for key in &keys {
+                    let encoded_key = encode_dir_object(key);
+                    let mut exact_opts = opts.clone();
+                    exact_opts.delete_prefix_object = true;
+                    let _guard = store
+                        .acquire_object_write_lock_if_needed("delete_object", bucket, &encoded_key, &mut exact_opts)
+                        .await?;
+                    delete_prefix_with_tier_delete_journal(store, bucket, &encoded_key, &exact_opts, tier_journal_api).await?;
+                }
+                previous_keys = keys;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A GET whose object identity has been resolved while its namespace read lock
@@ -2054,6 +2123,9 @@ fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, Stri
                 return None;
             }
             local_tier_free_version_id = Some(version_id);
+            continue;
+        }
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID) {
             continue;
         }
 
@@ -4267,9 +4339,12 @@ impl ECStore {
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
-        self.pools[idx]
+        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+        let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-            .await
+            .await;
+        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+        result
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -4473,9 +4548,12 @@ impl ECStore {
                         crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                 }
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
-                    self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
-                        .await
+                        .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    result
                 } else {
                     Err(StorageError::InvalidArgument(
                         src_bucket.to_owned(),
@@ -4511,9 +4589,12 @@ impl ECStore {
                         put_opts.decommission_capacity_admission =
                             crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                     }
-                    return self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    return result;
                 }
                 src_info.version_only = true;
                 let capacity_object = dst_object.clone();
@@ -4562,9 +4643,12 @@ impl ECStore {
         }
 
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
-            return self.pools[pool_idx]
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+            let result = self.pools[pool_idx]
                 .put_object(dst_bucket, dst_object_name, put_object_reader, &put_opts)
                 .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            return result;
         }
 
         Err(StorageError::InvalidArgument(
@@ -4686,13 +4770,14 @@ impl ECStore {
             return Err(Error::other("lifecycle delete-all requires namespace locking"));
         }
 
-        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else if opts.delete_prefix {
-            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-        };
+        let _bucket_lifecycle_guard =
+            if is_meta_bucketname(bucket) || (opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some()) {
+                None
+            } else if opts.delete_prefix {
+                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+            } else {
+                Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+            };
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
         } else {
@@ -4816,7 +4901,9 @@ impl ECStore {
                         if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
                             self.select_decommission_capacity_target_pool(owner, 0).await?
                         } else {
-                            self.get_pool_idx_no_lock(bucket, object, 0).await?
+                            self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                                .await
+                                .ok_or(Error::DiskFull)?
                         }
                     }
                 };
@@ -7108,6 +7195,24 @@ mod tests {
 
         Arc::make_mut(&mut target.user_defined).insert(key, "arn=FAILED;".to_string());
         assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_ignores_target_bucket_incarnation_fence() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
     }
 
     #[test]

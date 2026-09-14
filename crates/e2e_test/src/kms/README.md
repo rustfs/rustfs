@@ -57,50 +57,46 @@ Broad integration tests that exercise:
    pip install awscurl
    ```
 
-2. **Build RustFS**
+2. **Build RustFS** (from the repository root)
    ```bash
-   cargo build
+   python3 scripts/e2e_binary.py build
    ```
 
 ### Run individual suites
 
+Run every command below from the repository root through `scripts/e2e_binary.py run`; plain `cargo test -p e2e_test` fails with a missing E2E run receipt.
+
 #### Local backend
 ```bash
-cd crates/e2e_test
-cargo test test_local_kms_end_to_end -- --nocapture
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_local_kms_end_to_end -- --nocapture
 ```
 
 #### Vault backend
 ```bash
-cd crates/e2e_test
-cargo test test_vault_kms_end_to_end -- --nocapture
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_vault_kms_end_to_end -- --nocapture
 ```
 
 #### High availability
 ```bash
-cd crates/e2e_test
-cargo test test_vault_kms_high_availability -- --nocapture
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_vault_kms_high_availability -- --nocapture
 ```
 
 #### Comprehensive features (disabled)
 ```bash
-cd crates/e2e_test
 # Disabled due to AWS SDK compatibility gaps
-# cargo test test_comprehensive_kms_functionality -- --nocapture
-# cargo test test_sse_modes_compatibility -- --nocapture
-# cargo test test_kms_api_comprehensive -- --nocapture
+# python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_comprehensive_kms_functionality -- --nocapture
+# python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_sse_modes_compatibility -- --nocapture
+# python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_kms_api_comprehensive -- --nocapture
 ```
 
 ### Run all KMS suites
 ```bash
-cd crates/e2e_test
-cargo test kms -- --nocapture
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test kms -- --nocapture
 ```
 
 ### Run serially (avoid port conflicts)
 ```bash
-cd crates/e2e_test
-cargo test kms -- --nocapture --test-threads=1
+python3 scripts/e2e_binary.py run -- cargo test -p e2e_test kms -- --nocapture --test-threads=1
 ```
 
 ## 🔧 Configuration
@@ -120,7 +116,7 @@ export RUST_LOG=debug
 ### Required binaries
 
 Tests look for:
-- `../../target/debug/rustfs` – RustFS server
+- RustFS server – the binary verified by `scripts/e2e_binary.py` (default `target/debug/rustfs`)
 - `vault` – Vault CLI (must be on PATH)
 - `/Users/dandan/Library/Python/3.9/bin/awscurl` – AWS SigV4 helper
 
@@ -174,14 +170,14 @@ which awscurl  # Update the path in tests accordingly
 
 **Q: Tests time out**
 ```bash
-RUST_LOG=debug cargo test test_local_kms_end_to_end -- --nocapture
+RUST_LOG=debug python3 scripts/e2e_binary.py run -- cargo test -p e2e_test test_local_kms_end_to_end -- --nocapture
 ```
 
 ### Debug tips
 
 1. **Enable verbose logs**
    ```bash
-   RUST_LOG=rustfs_kms=debug,rustfs=info cargo test -- --nocapture
+   RUST_LOG=rustfs_kms=debug,rustfs=info python3 scripts/e2e_binary.py run -- cargo test -p e2e_test kms -- --nocapture
    ```
 
 2. **Keep temporary files** – comment out cleanup logic to inspect generated configs
@@ -237,9 +233,8 @@ Designed to run inside CI/CD pipelines:
     sudo apt-get install -y vault
     pip install awscurl
 
-    cargo build
-    cd crates/e2e_test
-    cargo test kms -- --nocapture --test-threads=1
+    python3 scripts/e2e_binary.py build
+    python3 scripts/e2e_binary.py run -- cargo test -p e2e_test kms -- --nocapture --test-threads=1
 ```
 
 ## 📚 References

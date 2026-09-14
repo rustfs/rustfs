@@ -1384,9 +1384,17 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
             continue;
         };
 
+        // Only a target this pass itself derived earlier is updated in place:
+        // the same ARN, or the same peer under an older ARN shape (legacy
+        // `arn:rustfs:` / regional) recognisable by the site-replication
+        // service account and the same-name target bucket. An operator's
+        // bucket-level target that happens to point at the peer (different
+        // target bucket and credentials) is left alone and the site target
+        // is added next to it; replacing it silently orphaned the operator's
+        // replication rule (rustfs/backlog#2489, MinIO `getRemoteARN` parity).
         if let Some(index) = targets.iter().position(|existing| {
             existing.target_type == BucketTargetType::ReplicationService
-                && (bucket_target_matches_peer(existing, peer) || existing.arn == target.arn)
+                && (existing.arn == target.arn || is_site_replication_owned_target(existing, &target, peer, state))
         }) {
             let existing = targets[index].clone();
             target.path = existing.path;
@@ -1412,6 +1420,24 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
     }
 
     Ok(BucketTargets { targets })
+}
+
+/// A stored target that site replication derived for `peer` under an older
+/// ARN shape: it names the same-name target bucket and carries the site
+/// replication service account. Operator targets never match — their target
+/// bucket or credentials differ — so reconciliation cannot take them over.
+fn is_site_replication_owned_target(
+    existing: &BucketTarget,
+    derived: &BucketTarget,
+    peer: &PeerInfo,
+    state: &SiteReplicationState,
+) -> bool {
+    bucket_target_matches_peer(existing, peer)
+        && existing.target_bucket == derived.target_bucket
+        && existing
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_key == state.service_account_access_key)
 }
 
 /// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
@@ -1630,6 +1656,44 @@ pub(crate) fn build_site_replication_config(
     }
 }
 
+/// Reload `bucket`'s metadata on every other node of this site after a
+/// site-replication write. Every S3 bucket-config write does this
+/// (`app::bucket_usecase::notify_bucket_metadata_reload`); the
+/// site-replication writers did not, so on a multi-node site a node other
+/// than the one that applied the write served the previous targets and
+/// rules for up to the 15-minute refresh — a `resync start` routed to such a
+/// node reported every freshly wired bucket as `Config not found` or
+/// `recorded remote target no longer exists` (backlog#2367 A-5, backlog#2195
+/// item 2). Best effort like the S3 path: the write is durable and the
+/// refresh loop is the fallback, so an unreachable node must not fail the
+/// operation that already committed.
+pub(crate) async fn reload_bucket_metadata_on_peers(bucket: &str, operation: &'static str, scanner_maintenance_change: bool) {
+    if scanner_maintenance_change {
+        rustfs_scanner::record_scanner_maintenance_change(bucket);
+    }
+    let Some(notification_sys) = crate::admin::runtime_sources::current_notification_system() else {
+        return;
+    };
+    let result = if scanner_maintenance_change {
+        notification_sys.load_bucket_metadata_for_scanner_maintenance(bucket).await
+    } else {
+        notification_sys.load_bucket_metadata(bucket).await
+    };
+    if let Err(err) = result {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            bucket = %bucket,
+            operation,
+            result = "peer_metadata_reload_failed",
+            error = %err,
+            "admin site replication state"
+        );
+    }
+}
+
+/// Returns whether the bucket targets were rewritten.
 pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     bucket: &str,
     state: &SiteReplicationState,
@@ -1637,7 +1701,7 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     config: Option<&ReplicationConfiguration>,
     service_account_secret_key: &str,
     expected_incarnation_id: Uuid,
-) -> S3Result<()> {
+) -> S3Result<bool> {
     let existing = match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => targets,
         Err(StorageError::ConfigNotFound) => BucketTargets::default(),
@@ -1649,7 +1713,7 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     let updated =
         reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config, service_account_secret_key)?;
     if updated.targets.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let json_targets = serde_json::to_vec(&updated)
@@ -1658,12 +1722,12 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     // client — noticeable now that startup reconciles all buckets, not just the one bucket
     // an operation touched.
     if json_targets == existing_json {
-        return Ok(());
+        return Ok(false);
     }
     metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) async fn bucket_replication_config_for_target_refresh(bucket: &str) -> S3Result<Option<ReplicationConfiguration>> {
@@ -1674,13 +1738,14 @@ pub(crate) async fn bucket_replication_config_for_target_refresh(bucket: &str) -
     }
 }
 
+/// Returns whether the replication configuration was rewritten.
 pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runtime(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
     expected_incarnation_id: Uuid,
-) -> S3Result<()> {
+) -> S3Result<bool> {
     let existing = match metadata_sys::get_replication_config(bucket).await {
         Ok((existing, _)) => Some(existing),
         Err(StorageError::ConfigNotFound) => None,
@@ -1689,7 +1754,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
 
     let Some(desired) = build_site_replication_config(bucket, state, local_peer, service_account_secret_key, existing.as_ref())?
     else {
-        return Ok(());
+        return Ok(false);
     };
 
     // Derived rules are state owned by this site: rebuild them from the current peer
@@ -1721,7 +1786,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
     };
 
     if rules == existing_rules && role == existing_role {
-        return Ok(());
+        return Ok(false);
     }
 
     let data = serialize(&ReplicationConfiguration { role, rules })
@@ -1730,7 +1795,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
         .await
         .map_err(ApiError::from)?;
 
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime(
@@ -1748,9 +1813,9 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
     runtime: &SiteReplicationRuntime,
     expected_incarnation_id: Uuid,
 ) -> S3Result<()> {
-    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let targets_guard = lock_bucket_targets_metadata(bucket).await;
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    ensure_site_replication_bucket_targets_with_runtime(
+    let targets_written = ensure_site_replication_bucket_targets_with_runtime(
         bucket,
         &runtime.state,
         &runtime.local_peer,
@@ -1759,7 +1824,7 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
         expected_incarnation_id,
     )
     .await?;
-    ensure_site_replication_bucket_replication_config_with_runtime(
+    let config_written = ensure_site_replication_bucket_replication_config_with_runtime(
         bucket,
         &runtime.state,
         &runtime.local_peer,
@@ -1767,6 +1832,10 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
         expected_incarnation_id,
     )
     .await?;
+    drop(targets_guard);
+    if targets_written || config_written {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_setup", config_written).await;
+    }
     Ok(())
 }
 
@@ -1791,6 +1860,7 @@ pub(crate) async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S
     metadata_sys::update_if_incarnation(bucket, BUCKET_VERSIONING_CONFIG, bucket_versioning_xml()?, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
+    reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_versioning", false).await;
 
     Ok(())
 }

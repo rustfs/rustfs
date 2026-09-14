@@ -38,7 +38,7 @@ use super::supervise_admin_mutation;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_req};
-use crate::admin::service::caller_identity::CallerIdentity;
+use crate::admin::service::caller_identity::{CallerIdentity, oidc_profile_fields};
 use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
@@ -72,6 +72,16 @@ pub fn register_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
 
 /// `GET /rustfs/admin/v3/account/info`
 pub struct SelfAccountInfoHandler {}
+
+#[derive(Debug, serde::Serialize)]
+struct SelfAccountInfoResponse {
+    #[serde(flatten)]
+    account: SelfAccountInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+}
 
 #[async_trait::async_trait]
 impl Operation for SelfAccountInfoHandler {
@@ -124,17 +134,22 @@ impl Operation for SelfAccountInfoHandler {
             None => return Err(s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready")),
         };
 
-        let info = SelfAccountInfo {
-            access_key: caller.access_key.clone(),
-            identity_type: caller.identity_type,
-            session_access_key: caller.session_access_key.clone(),
-            is_admin: caller.is_owner,
-            status,
-            member_of,
-            policies,
-            credentials_source: caller.credentials_source,
-            mutable: caller.mutability(),
-            mfa,
+        let (username, email) = oidc_profile_fields(&caller.credentials);
+        let info = SelfAccountInfoResponse {
+            account: SelfAccountInfo {
+                access_key: caller.access_key.clone(),
+                identity_type: caller.identity_type,
+                session_access_key: caller.session_access_key.clone(),
+                is_admin: caller.is_owner,
+                status,
+                member_of,
+                policies,
+                credentials_source: caller.credentials_source,
+                mutable: caller.mutability(),
+                mfa,
+            },
+            username,
+            email,
         };
 
         admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &info)
@@ -548,6 +563,38 @@ fn validate_new_secret_key(request: &ChangePasswordRequest) -> S3Result<()> {
 mod tests {
     use super::*;
     use crate::server::ADMIN_PREFIX;
+    use rustfs_madmin::account::{AccountMutability, CredentialsSource};
+
+    #[test]
+    fn self_account_info_response_adds_oidc_display_fields_without_changing_base_type() {
+        let mut response = SelfAccountInfoResponse {
+            account: SelfAccountInfo {
+                access_key: "virtual-parent".to_string(),
+                identity_type: IdentityType::Sts,
+                session_access_key: Some("temporary-key".to_string()),
+                is_admin: false,
+                status: "enabled".to_string(),
+                member_of: Vec::new(),
+                policies: Vec::new(),
+                credentials_source: CredentialsSource::Iam,
+                mutable: AccountMutability::default(),
+                mfa: AccountMfaSummary::default(),
+            },
+            username: Some("oidc-user".to_string()),
+            email: Some("oidc-user@example.test".to_string()),
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize account response");
+        assert_eq!(value["access_key"], "virtual-parent");
+        assert_eq!(value["username"], "oidc-user");
+        assert_eq!(value["email"], "oidc-user@example.test");
+
+        response.username = None;
+        response.email = None;
+        let legacy_shape = serde_json::to_value(&response).expect("serialize account response without OIDC fields");
+        assert!(!legacy_shape.as_object().unwrap().contains_key("username"));
+        assert!(!legacy_shape.as_object().unwrap().contains_key("email"));
+    }
 
     fn change_request(current: &str, new: &str) -> ChangePasswordRequest {
         ChangePasswordRequest {

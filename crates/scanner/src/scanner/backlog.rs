@@ -428,6 +428,23 @@ impl ScannerPauseBacklogLedger {
         ScannerPauseBacklogAttemptDecision::Tracked(serial)
     }
 
+    fn blocks_usage_bootstrap_rebuild(&self) -> bool {
+        match self.phase {
+            ScannerPauseBacklogPhase::Idle => false,
+            ScannerPauseBacklogPhase::Paused => true,
+            ScannerPauseBacklogPhase::CatchingUp | ScannerPauseBacklogPhase::RetryExhausted => {
+                self.pending_full_scan || self.pending_work_items() != 0 || self.has_unfinished_attempt()
+            }
+        }
+    }
+
+    fn begin_usage_bootstrap_rebuild_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        if !self.blocks_usage_bootstrap_rebuild() {
+            return ScannerPauseBacklogAttemptDecision::Untracked;
+        }
+        self.begin_attempt(now)
+    }
+
     fn finish_attempt(
         &mut self,
         serial: u64,
@@ -1613,9 +1630,12 @@ where
         controller
     }
 
-    pub(super) fn scheduling_delay(&self, now: u64) -> Option<Duration> {
+    pub(super) fn scheduling_delay(&self, now: u64, usage_bootstrap_rebuild_pending: bool) -> Option<Duration> {
         if self.persistence_disabled {
             return Some(Duration::from_secs(self.persistence_retry_at_unix_secs.saturating_sub(now)));
+        }
+        if usage_bootstrap_rebuild_pending && !self.loaded.ledger.blocks_usage_bootstrap_rebuild() {
+            return None;
         }
         match self.loaded.ledger.phase {
             ScannerPauseBacklogPhase::Idle => None,
@@ -1638,11 +1658,24 @@ where
     }
 
     pub(super) async fn begin_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        self.begin_attempt_with(now, ScannerPauseBacklogLedger::begin_attempt).await
+    }
+
+    pub(super) async fn begin_usage_bootstrap_rebuild_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        self.begin_attempt_with(now, ScannerPauseBacklogLedger::begin_usage_bootstrap_rebuild_attempt)
+            .await
+    }
+
+    async fn begin_attempt_with(
+        &mut self,
+        now: u64,
+        begin: fn(&mut ScannerPauseBacklogLedger, u64) -> ScannerPauseBacklogAttemptDecision,
+    ) -> ScannerPauseBacklogAttemptDecision {
         if self.persistence_disabled {
             return ScannerPauseBacklogAttemptDecision::PersistenceUnavailable;
         }
         let mut candidate = self.loaded.ledger.clone();
-        let decision = candidate.begin_attempt(now);
+        let decision = begin(&mut candidate, now);
         if candidate == self.loaded.ledger {
             self.record_status(now);
             return decision;
@@ -3552,6 +3585,40 @@ mod tests {
         assert_eq!(ledger.pending_work_items(), 0);
         prepare_scanner_pause_backlog_persist(&mut ledger, 430).expect("converged ledger should persist");
         assert_eq!(decode_valid_ledger(&ledger).phase, ScannerPauseBacklogPhase::Idle);
+    }
+
+    #[test]
+    fn usage_bootstrap_rebuild_bypasses_empty_catch_up_backlog() {
+        let mut empty_catch_up = durable_ledger(100);
+        empty_catch_up.phase = ScannerPauseBacklogPhase::CatchingUp;
+        empty_catch_up.pending_full_scan = false;
+        empty_catch_up.next_attempt_at_unix_secs = 420;
+
+        assert!(!empty_catch_up.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            empty_catch_up.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::Untracked
+        );
+        assert_eq!(
+            empty_catch_up.next_attempt_at_unix_secs, 420,
+            "usage bootstrap rebuild must not rewrite an unrelated empty catch-up ledger"
+        );
+
+        let mut movement_full_scan = empty_catch_up.clone();
+        movement_full_scan.pending_full_scan = true;
+        assert!(movement_full_scan.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            movement_full_scan.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::RateLimited
+        );
+
+        let mut known_work = empty_catch_up;
+        known_work.discovered_expiry_items = 1;
+        assert!(known_work.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            known_work.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::RateLimited
+        );
     }
 
     #[test]

@@ -137,6 +137,26 @@ impl std::fmt::Display for UploadLimitExceeded {
 
 impl std::error::Error for UploadLimitExceeded {}
 
+/// Identifies inactivity of an external client body, rather than a storage timeout.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientBodyReadTimeout {
+    pub timeout: std::time::Duration,
+    pub raw_bytes_received: u64,
+}
+
+impl std::fmt::Display for ClientBodyReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request body made no progress for {} seconds after {} raw bytes",
+            self.timeout.as_secs(),
+            self.raw_bytes_received
+        )
+    }
+}
+
+impl std::error::Error for ClientBodyReadTimeout {}
+
 /// Marks a server-side object/source reader failure that must not be reported as
 /// a malformed client request body.
 #[derive(Debug)]
@@ -424,25 +444,7 @@ fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
 where
     T: std::error::Error + 'static,
 {
-    if err.downcast_ref::<T>().is_some() {
-        return true;
-    }
-
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
-        && let Some(inner) = io_err.get_ref()
-        && error_chain_has_type::<T>(inner)
-    {
-        return true;
-    }
-
-    let mut current = Some(err);
-    while let Some(err) = current {
-        if err.downcast_ref::<T>().is_some() {
-            return true;
-        }
-        current = err.source();
-    }
-    false
+    error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,31 +465,48 @@ fn classify_s3s_body_stream_error_display(err: &(dyn std::error::Error + 'static
 }
 
 fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) -> Option<S3sBodyStreamError> {
-    if let Some(classified) = classify_s3s_body_stream_error_display(err) {
-        return Some(classified);
-    }
+    error_chain_find(err, classify_s3s_body_stream_error_display)
+}
 
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
-        && let Some(inner) = io_err.get_ref()
-        && let Some(classified) = error_chain_s3s_body_stream_error(inner)
-    {
-        return Some(classified);
-    }
-
-    let mut current = err.source();
-    while let Some(err) = current {
-        if let Some(classified) = classify_s3s_body_stream_error_display(err) {
+/// `io::Error::source` skips its custom payload itself. Visit that payload
+/// explicitly at every level, then follow its source exactly once. The bound
+/// also makes cyclic or excessively deep foreign error chains safe.
+fn error_chain_find<T>(
+    err: &(dyn std::error::Error + 'static),
+    mut classify: impl FnMut(&(dyn std::error::Error + 'static)) -> Option<T>,
+) -> Option<T> {
+    let mut current = Some(err);
+    for _ in 0..64 {
+        let error = current?;
+        if let Some(classified) = classify(error) {
             return Some(classified);
         }
-        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
-            && let Some(inner) = io_err.get_ref()
-            && let Some(classified) = error_chain_s3s_body_stream_error(inner)
-        {
-            return Some(classified);
-        }
-        current = err.source();
+        current = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
     }
     None
+}
+
+fn error_chain_has_body_size_limit_exceeded(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_has_type::<s3s::BodySizeLimitExceeded>(err)
+}
+
+/// hyper reports a request body whose connection hit EOF before
+/// `Content-Length` bytes arrived as a `Kind::Body` error carrying an
+/// `UnexpectedEof` `io::Error` (its `IncompleteBody` marker is private).
+/// That is a client-side short body, not a server fault.
+fn is_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<hyper::Error>()
+        .and_then(|hyper_err| std::error::Error::source(hyper_err))
+        .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_find(err, |error| is_hyper_body_eof(error).then_some(())).is_some()
 }
 
 impl From<ApiError> for S3Error {
@@ -543,6 +562,30 @@ impl From<StorageError> for ApiError {
                 return ApiError {
                     code: S3ErrorCode::ServiceUnavailable,
                     message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
+                return ApiError {
+                    code: S3ErrorCode::RequestTimeout,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_body_size_limit_exceeded(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_hyper_body_eof(inner) {
+                return ApiError {
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
                     source: Some(Box::new(err)),
                 };
             }
@@ -690,6 +733,30 @@ impl From<std::io::Error> for ApiError {
                     source: Some(Box::new(err)),
                 };
             }
+            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
+                return ApiError {
+                    code: S3ErrorCode::RequestTimeout,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_body_size_limit_exceeded(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            if error_chain_has_hyper_body_eof(inner) {
+                return ApiError {
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
+                    source: Some(Box::new(err)),
+                };
+            }
+
             if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
                 return ApiError {
                     code: S3ErrorCode::IncompleteBody,
@@ -960,6 +1027,179 @@ mod tests {
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
+    }
+
+    #[test]
+    fn body_size_limit_exceeded_maps_to_entity_too_large_across_io_boundaries() {
+        // Shape observed in production (issue #7596):
+        // Custom { UnexpectedEof, Custom { Other, BodySizeLimitExceeded { size, limit } } }
+        let nested = || {
+            IoError::new(
+                ErrorKind::UnexpectedEof,
+                IoError::other(s3s::BodySizeLimitExceeded {
+                    size: 16384,
+                    limit: 6389,
+                }),
+            )
+        };
+
+        let direct: ApiError = nested().into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(direct.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
+
+        let storage: ApiError = StorageError::Io(nested()).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert!(storage.source.is_some());
+
+        // An unrelated message that merely mentions a limit stays internal.
+        let other: ApiError = IoError::other(MockS3sBodyStreamError("limit exceeded for something else")).into();
+        assert_eq!(other.code, S3ErrorCode::InternalError);
+        let impostor: ApiError = IoError::other(MockS3sBodyStreamError("body size 16384 exceeds limit 6389")).into();
+        assert_eq!(impostor.code, S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn client_body_timeout_survives_intermediate_io_and_storage_errors() {
+        #[derive(Debug)]
+        struct DecoderError(IoError);
+        impl std::fmt::Display for DecoderError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("decoder source failed")
+            }
+        }
+        impl std::error::Error for DecoderError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let nested = || {
+            IoError::other(DecoderError(IoError::other(IoError::new(
+                ErrorKind::TimedOut,
+                ClientBodyReadTimeout {
+                    timeout: std::time::Duration::from_secs(300),
+                    raw_bytes_received: 8192,
+                },
+            ))))
+        };
+        for error in [ApiError::from(nested()), ApiError::from(StorageError::Io(nested()))] {
+            assert_eq!(error.code, S3ErrorCode::RequestTimeout);
+            assert!(error_chain_has_type::<ClientBodyReadTimeout>(&error));
+            let s3_error = S3Error::from(error);
+            assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+        }
+        for error in [
+            ApiError::from(IoError::new(ErrorKind::TimedOut, "disk read timeout")),
+            ApiError::from(StorageError::Io(IoError::new(ErrorKind::TimedOut, "peer timeout"))),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::InternalError);
+        }
+        // A server-side source wrapper has precedence even if a remote source
+        // has carried its own client-body marker across an I/O boundary.
+        let source = ServerSideSourceReadError::new("CopyObject", nested());
+        assert_eq!(ApiError::from(IoError::other(source)).code, S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn body_error_classification_bounds_cyclic_source_chains() {
+        #[derive(Debug)]
+        struct Cycle;
+        impl std::fmt::Display for Cycle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cycle")
+            }
+        }
+        impl std::error::Error for Cycle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self)
+            }
+        }
+        assert!(!error_chain_has_type::<ClientBodyReadTimeout>(&Cycle));
+        assert_eq!(ApiError::from(IoError::other(Cycle)).code, S3ErrorCode::InternalError);
+    }
+
+    /// Exercise the public error type through the actual body budget.
+    #[tokio::test]
+    async fn real_s3s_body_size_limit_error_maps_to_entity_too_large() {
+        use futures::StreamExt;
+
+        let real_error = || async {
+            let mut body = s3s::Body::from(bytes::Bytes::from_static(b"hello"));
+            body.set_limit(Some(4));
+            body.next()
+                .await
+                .expect("one frame")
+                .expect_err("five bytes must exceed a four-byte budget")
+        };
+
+        let err = real_error().await;
+        assert!(err.is::<s3s::BodySizeLimitExceeded>(), "unexpected body error: {err}");
+
+        let err = real_error().await;
+        let storage: ApiError = StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, IoError::other(err))).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
+
+        let err = real_error().await;
+        let direct: ApiError = IoError::other(err).into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+    }
+
+    /// Drive a real hyper HTTP/1 server so the test sees hyper's own body EOF
+    /// error (`hyper::Error(Body, UnexpectedEof, IncompleteBody)`), which has no
+    /// public constructor.
+    async fn capture_hyper_body_eof_error() -> hyper::Error {
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let captured: Arc<Mutex<Option<hyper::Error>>> = Arc::new(Mutex::new(None));
+        let server_slot = Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let slot = server_slot;
+            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let slot = Arc::clone(&slot);
+                async move {
+                    let err = req.into_body().collect().await.expect_err("short body must fail");
+                    *slot.lock().expect("slot") = Some(err);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(String::new()))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nabc")
+            .await
+            .expect("write partial body");
+        client.shutdown().await.expect("shutdown write side");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+        let captured = captured.lock().expect("slot").take();
+        captured.expect("hyper body error captured")
+    }
+
+    #[tokio::test]
+    async fn hyper_body_eof_maps_to_incomplete_body_across_io_boundaries() {
+        let hyper_err = capture_hyper_body_eof_error().await;
+        assert!(is_hyper_body_eof(&hyper_err), "unexpected hyper error shape: {hyper_err:?}");
+
+        // Shape observed in production (issue #7596):
+        // Custom { UnexpectedEof, Custom { Other, hyper::Error(Body, UnexpectedEof, IncompleteBody) } }
+        let nested = IoError::new(ErrorKind::UnexpectedEof, IoError::other(hyper_err));
+        let storage: ApiError = StorageError::Io(nested).into();
+        assert_eq!(storage.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+
+        let hyper_err = capture_hyper_body_eof_error().await;
+        let direct: ApiError = IoError::other(hyper_err).into();
+        assert_eq!(direct.code, S3ErrorCode::IncompleteBody);
     }
 
     #[test]

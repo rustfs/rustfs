@@ -40,7 +40,7 @@ Options:
                      GitHub repository used to download the release asset (default: rustfs/rustfs)
   --test NAME         all, mixed-version, or rollback (default: all)
   --allow-dirty      Allow tracked source changes while collecting evidence
-  --skip-build       Reuse an existing target/debug/rustfs binary
+  --skip-build       Reuse a binary built by scripts/e2e_binary.py build from the current sources
   --skip-download    Reuse SOURCE_DIR/rustfs instead of downloading the previous release
   --plan-only        Print the resolved plan without building or running tests
   --dry-run          Validate configuration and print the commands without running them
@@ -154,13 +154,6 @@ cargo_target_dir() {
     else
         echo "$ROOT/target"
     fi
-}
-
-write_rustfs_features_stamp() {
-    local target_dir
-    target_dir="$(cargo_target_dir)"
-    mkdir -p "$target_dir/debug"
-    : > "$target_dir/debug/rustfs.features"
 }
 
 ensure_default_asset_platform() {
@@ -623,8 +616,7 @@ export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/server-logs}"
 mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
-    run_logged build-current cargo build --locked -p rustfs --bin rustfs
-    write_rustfs_features_stamp
+    run_logged build-current "$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" build
 fi
 
 SOURCE_REVISION="$(git rev-parse HEAD)"
@@ -641,6 +633,7 @@ for case_name in "${CASES[@]}"; do
         HTTP_PROXY= \
         HTTPS_PROXY= \
         RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR="$evidence_dir" \
+        "$PYTHON_BIN" "$ROOT/scripts/e2e_binary.py" run -- \
         cargo test --locked -p e2e_test "$test_filter" -- --ignored --exact --nocapture
 done
 

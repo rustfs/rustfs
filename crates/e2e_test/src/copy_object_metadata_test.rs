@@ -18,10 +18,14 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::presigning::PresigningConfig;
     use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
     use aws_sdk_s3::types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective, StorageClass, VersioningConfiguration,
     };
+    use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+    use std::io::{Read, Write};
+    use std::time::Duration;
     use tracing::info;
 
     #[tokio::test]
@@ -107,6 +111,24 @@ mod tests {
         assert_eq!(
             copied_head.metadata().and_then(|metadata| metadata.get("stale")),
             Some(&"must-be-removed".to_string())
+        );
+        let copied_get = client
+            .get_object()
+            .bucket(bucket)
+            .key(copied_key)
+            .send()
+            .await
+            .expect("GET failed after default copy");
+        assert_eq!(copied_get.content_language(), Some("en-US"));
+        assert_eq!(
+            copied_get
+                .body
+                .collect()
+                .await
+                .expect("Failed to collect copied body")
+                .into_bytes()
+                .as_ref(),
+            content,
         );
 
         client
@@ -241,6 +263,7 @@ mod tests {
             .send()
             .await
             .expect("GET failed after self-copy");
+        assert_eq!(get_resp.content_language(), Some("fr-FR"));
         let body = get_resp
             .body
             .collect()
@@ -286,6 +309,7 @@ mod tests {
             .send()
             .await
             .expect("GET failed after empty metadata replacement");
+        assert_eq!(empty_get_resp.content_language(), None);
         let empty_body = empty_get_resp
             .body
             .collect()
@@ -522,7 +546,141 @@ mod tests {
             multipart_body
         );
 
+        assert_versioned_content_language_round_trip(&client, bucket).await;
         env.stop_server();
+    }
+
+    async fn assert_versioned_content_language_round_trip(client: &aws_sdk_s3::Client, bucket: &str) {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .expect("Failed to build HTTP client without gzip decoding");
+        let original = b"Content-Language must follow the requested object version.";
+        for encoding in [None, Some("gzip")] {
+            let key = format!("language-{}.bin", encoding.unwrap_or("plain"));
+            let payload = if encoding.is_some() {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(original).expect("Failed to encode gzip fixture");
+                encoder.finish().expect("Failed to finish gzip fixture")
+            } else {
+                original.to_vec()
+            };
+            let mut versions = Vec::new();
+            for language in [Some("zh-CN"), None, Some("en-US")] {
+                let put = client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .content_type("application/octet-stream")
+                    .set_content_encoding(encoding.map(str::to_string))
+                    .set_content_language(language.map(str::to_string))
+                    .metadata("content-language", "user-language")
+                    .body(ByteStream::from(payload.clone()))
+                    .send()
+                    .await
+                    .expect("Failed to write versioned language fixture");
+                versions.push((put.version_id().expect("PUT must return a version ID").to_string(), language));
+            }
+
+            let current_version = &versions.last().expect("Fixture has three versions").0;
+            let reads = std::iter::once((None, Some("en-US")))
+                .chain(versions.iter().map(|(version, language)| (Some(version.as_str()), *language)));
+            for (version, language) in reads {
+                let expected_version = version.unwrap_or(current_version);
+                let head = client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .set_version_id(version.map(str::to_string))
+                    .send()
+                    .await
+                    .expect("HEAD failed for language fixture");
+                assert_eq!(head.content_language(), language);
+                assert_eq!(head.version_id(), Some(expected_version));
+
+                for range in [None, Some("bytes=1-7")] {
+                    let expected_body = if range.is_some() { &payload[1..8] } else { payload.as_slice() };
+                    let content_range = range.map(|_| format!("bytes 1-7/{}", payload.len()));
+                    let request = client
+                        .get_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .set_version_id(version.map(str::to_string))
+                        .set_range(range.map(str::to_string));
+                    let get = request.clone().send().await.expect("GET failed for language fixture");
+                    assert_eq!(get.content_language(), language);
+                    assert_eq!(get.content_type(), Some("application/octet-stream"));
+                    assert_eq!(get.content_encoding(), encoding);
+                    assert_eq!(
+                        get.content_length(),
+                        Some(i64::try_from(expected_body.len()).expect("Fixture length fits i64"))
+                    );
+                    assert_eq!(get.content_range(), content_range.as_deref());
+                    assert_eq!(get.version_id(), Some(expected_version));
+                    assert_eq!(get.e_tag(), head.e_tag());
+                    assert_eq!(
+                        get.metadata()
+                            .and_then(|metadata| metadata.get("content-language"))
+                            .map(String::as_str),
+                        Some("user-language")
+                    );
+                    assert_eq!(
+                        get.body
+                            .collect()
+                            .await
+                            .expect("Failed to collect GET body")
+                            .into_bytes()
+                            .as_ref(),
+                        expected_body
+                    );
+
+                    for override_language in [None, Some("fr-FR")] {
+                        let presigned = request
+                            .clone()
+                            .set_response_content_language(override_language.map(str::to_string))
+                            .presigned(PresigningConfig::expires_in(Duration::from_secs(300)).expect("Valid signature lifetime"))
+                            .await
+                            .expect("Failed to presign language GET");
+                        let mut raw_request = http.get(presigned.uri());
+                        for (name, value) in presigned.headers() {
+                            raw_request = raw_request.header(name, value);
+                        }
+                        let response = raw_request.send().await.expect("Presigned GET failed");
+                        let status = if range.is_some() {
+                            reqwest::StatusCode::PARTIAL_CONTENT
+                        } else {
+                            reqwest::StatusCode::OK
+                        };
+                        assert_eq!(response.status(), status);
+                        let header = |name: &str| {
+                            response
+                                .headers()
+                                .get(name)
+                                .map(|value| value.to_str().expect("ASCII response header"))
+                        };
+                        assert_eq!(header("content-language"), override_language.or(language));
+                        assert_eq!(header("x-amz-meta-content-language"), Some("user-language"));
+                        assert_eq!(header("content-encoding"), encoding);
+                        assert_eq!(header("content-range"), content_range.as_deref());
+                        assert_eq!(header("x-amz-version-id"), Some(expected_version));
+                        assert_eq!(
+                            response.content_length(),
+                            Some(u64::try_from(expected_body.len()).expect("Fixture length fits u64"))
+                        );
+                        let body = response.bytes().await.expect("Failed to read wire body");
+                        assert_eq!(body.as_ref(), expected_body);
+                        if encoding.is_some() && range.is_none() {
+                            let mut decoded = Vec::new();
+                            GzDecoder::new(body.as_ref())
+                                .read_to_end(&mut decoded)
+                                .expect("GET body must contain actual gzip bytes");
+                            assert_eq!(decoded, original);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

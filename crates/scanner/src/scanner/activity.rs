@@ -27,6 +27,7 @@ pub(super) enum ScannerCycleWakeReason {
     ClusterActivityUnavailable,
     RuntimeConfig,
     MaintenanceConfig,
+    Recovery,
     LeaderLockLost,
     Cancelled,
 }
@@ -453,11 +454,12 @@ impl ScannerCycleObservedGenerations {
 ///
 /// Keeping the movement inputs together makes it harder for callers to pair a
 /// generation with the wrong notification or lock predicate.
-pub(super) struct ScannerMovementWaitContext<G, F> {
+pub(super) struct ScannerMovementWaitContext<'a, G, F> {
     pub(super) movement_generation_seen: Option<u64>,
     pub(super) movement_changed: Arc<Notify>,
     pub(super) current_movement_generation: G,
     pub(super) is_lock_lost: F,
+    pub(super) recovery_wake: Option<&'a Notify>,
 }
 
 pub(super) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
@@ -682,6 +684,7 @@ where
         movement_changed: Arc::new(Notify::new()),
         current_movement_generation: || 0,
         is_lock_lost,
+        recovery_wake: None,
     };
     wait_for_next_scanner_cycle_with_movement(
         ctx,
@@ -701,7 +704,7 @@ pub(super) async fn wait_for_next_scanner_cycle_with_movement<G, F>(
     ctx: &CancellationToken,
     delay: Duration,
     generations: ScannerCycleObservedGenerations,
-    movement: &ScannerMovementWaitContext<G, F>,
+    movement: &ScannerMovementWaitContext<'_, G, F>,
 ) -> ScannerCycleWakeReason
 where
     F: Fn() -> bool,
@@ -747,9 +750,17 @@ where
         {
             return ScannerCycleWakeReason::MovementGeneration;
         }
+        let recovery_notification = async {
+            match movement.recovery_wake {
+                Some(wake) => wake.notified().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(recovery_notification);
         tokio::select! {
             _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
             _ = &mut sleep => return ScannerCycleWakeReason::Timer,
+            _ = &mut recovery_notification => return ScannerCycleWakeReason::Recovery,
             _ = &mut lock_poll => {
                 if (movement.is_lock_lost)() {
                     return ScannerCycleWakeReason::LeaderLockLost;
@@ -812,6 +823,7 @@ where
         movement_changed: Arc::new(Notify::new()),
         current_movement_generation: || 0,
         is_lock_lost,
+        recovery_wake: None,
     };
     wait_for_next_scanner_cycle_with_activity_and_movement(
         ctx,
@@ -831,7 +843,7 @@ pub(super) async fn wait_for_next_scanner_cycle_with_activity_and_movement<F, G,
     activity_poll_interval: Option<Duration>,
     activity_seen: &mut Option<ScannerActivitySnapshot>,
     generations: ScannerCycleObservedGenerations,
-    movement: ScannerMovementWaitContext<G, F>,
+    movement: ScannerMovementWaitContext<'_, G, F>,
     mut probe_activity: Probe,
 ) -> ScannerCycleWakeReason
 where
