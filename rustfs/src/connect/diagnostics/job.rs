@@ -18,7 +18,7 @@ use std::time::Duration;
 use std::{fs, io::Read as _, path::Path};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
 use base64_simd::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -30,17 +30,20 @@ use tokio_util::sync::CancellationToken;
 use uuid::{Uuid, Variant, Version};
 
 use super::{
-    CPU_PROFILE_CAPABILITY, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
+    CPU_PROFILE_CAPABILITY, DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DriveOutcome, DrivePerformanceError, DrivePerformanceRequest,
+    DriveProvenance, LocalDriveConsent, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
     MAX_TOP_EXPORT_VALIDITY, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceError,
     NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest,
     ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION, TopApiOperation,
     TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api, capture_top_locks,
-    encode_signed_profile_export, measure_network, runtime_network_peer_aliases, sign_network_export, sign_top_export,
+    encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases, sign_drive_export,
+    sign_network_export, sign_top_export,
 };
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
+const PERFORMANCE_DRIVE_JOB_TYPE: &str = "performance.drive";
 const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
 const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
@@ -52,6 +55,12 @@ const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CPU_MILLIS: u64 = 30_000;
 const MAX_NETWORK_CPU_MILLIS: u64 = 5_000;
 const MIN_NETWORK_MEMORY_BYTES: u64 = 1_048_576;
+const DRIVE_TARGET_ALIAS: &str = "drive-1";
+const DRIVE_DURATION_MILLIS: u64 = 5_000;
+const DRIVE_SCRATCH_BYTES: u64 = 524_288;
+const DRIVE_BLOCK_BYTES: u64 = 65_536;
+const DRIVE_SAMPLE_PERIOD_MICROS: u64 = 10_000;
+const DRIVE_SCRATCH_DIRECTORY: &str = ".rustfs-connect-drive-scratch";
 const MAX_TOP_API_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_API_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_LOCKS_CPU_MILLIS: u64 = 5_000;
@@ -60,6 +69,7 @@ const MIN_TOP_LOCKS_MEMORY_BYTES: u64 = 1_048_576;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
     ProfileCpu,
+    PerformanceDrive,
     PerformanceNetwork,
     TopApi,
     TopLocks,
@@ -92,6 +102,12 @@ pub struct DiagnosticJobParameters {
     pub sample_period_micros: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -408,6 +424,27 @@ impl DiagnosticJobEnvelope {
             (_, None) => {}
             (_, Some(_)) => return Err(DiagnosticJobError::Invalid),
         }
+        let has_drive_parameters = self.parameters.target_alias.is_some()
+            || self.parameters.scratch_bytes.is_some()
+            || self.parameters.block_bytes.is_some();
+        if kind == DiagnosticJobKind::PerformanceDrive {
+            if self.parameters.target_alias.as_deref() != Some(DRIVE_TARGET_ALIAS) {
+                return Err(DiagnosticJobError::Invalid);
+            }
+            if self.parameters.scratch_bytes != Some(DRIVE_SCRATCH_BYTES)
+                || self.parameters.block_bytes != Some(DRIVE_BLOCK_BYTES)
+                || self.parameters.duration_millis != DRIVE_DURATION_MILLIS
+                || self.parameters.sample_period_micros != DRIVE_SAMPLE_PERIOD_MICROS
+                || self.limits.timeout_seconds != 30
+                || self.limits.max_output_bytes != MAX_OUTPUT_BYTES
+                || self.limits.max_memory_bytes != MAX_MEMORY_BYTES
+                || self.limits.max_cpu_millis != DRIVE_DURATION_MILLIS
+            {
+                return Err(DiagnosticJobError::LimitExceeded);
+            }
+        } else if has_drive_parameters {
+            return Err(DiagnosticJobError::Invalid);
+        }
         if kind == DiagnosticJobKind::TopLocks
             && (self.limits.max_cpu_millis > MAX_TOP_LOCKS_CPU_MILLIS
                 || self.limits.max_memory_bytes < MIN_TOP_LOCKS_MEMORY_BYTES)
@@ -421,6 +458,9 @@ impl DiagnosticJobEnvelope {
         match (self.job_type.as_str(), self.required_capabilities.as_slice(), self.schema_version) {
             (PROFILE_CPU_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == CPU_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileCpu)
+            }
+            (PERFORMANCE_DRIVE_JOB_TYPE, [capability], DRIVE_SCHEMA_VERSION) if capability == DRIVE_CAPABILITY => {
+                Ok(DiagnosticJobKind::PerformanceDrive)
             }
             (PERFORMANCE_NETWORK_JOB_TYPE, [capability], NETWORK_SCHEMA_VERSION) if capability == NETWORK_CAPABILITY => {
                 Ok(DiagnosticJobKind::PerformanceNetwork)
@@ -453,12 +493,139 @@ pub async fn execute_diagnostic_job(
     let envelope = job.envelope;
     match envelope.kind()? {
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
+        DiagnosticJobKind::PerformanceDrive => {
+            let Some(scratch_root) = runtime_drive_scratch_root() else {
+                return Ok(failed_drive_execution(&envelope.job_id, "SOURCE_UNAVAILABLE"));
+            };
+            if !ensure_drive_scratch_root(&scratch_root) {
+                return Ok(failed_drive_execution(&envelope.job_id, "SOURCE_UNAVAILABLE"));
+            }
+            execute_performance_drive_job(envelope, nonce, identity, provenance, &scratch_root, cancel).await
+        }
         DiagnosticJobKind::PerformanceNetwork => {
             execute_performance_network_job(envelope, nonce, identity, provenance, cancel).await
         }
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, identity, provenance, cancel).await,
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
     }
+}
+
+fn runtime_drive_scratch_root() -> Option<std::path::PathBuf> {
+    let endpoint_pools = crate::runtime_sources::current_endpoints_handle()?;
+    drive_scratch_root_from_endpoints(&endpoint_pools)
+}
+
+fn drive_scratch_root_from_endpoints(
+    endpoint_pools: &crate::storage_api::cluster::EndpointServerPools,
+) -> Option<std::path::PathBuf> {
+    endpoint_pools
+        .as_ref()
+        .iter()
+        .flat_map(|pool| pool.endpoints.as_ref())
+        .find(|endpoint| endpoint.is_local)
+        .map(|endpoint| std::path::PathBuf::from(endpoint.get_file_path()).join(DRIVE_SCRATCH_DIRECTORY))
+}
+
+fn ensure_drive_scratch_root(path: &Path) -> bool {
+    let created = if path.exists() {
+        true
+    } else {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(path).is_ok()
+    };
+    if !created {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.permissions().mode() & 0o077 != 0 {
+        return false;
+    }
+    true
+}
+
+fn failed_drive_execution(job_id: &str, reason: &str) -> DiagnosticJobExecution {
+    DiagnosticJobExecution {
+        job_id: job_id.to_owned(),
+        outcome: "FAILED".to_owned(),
+        reason: reason.to_owned(),
+        artifact_uid: None,
+        artifact_sha256: None,
+        artifact_bytes: None,
+    }
+}
+
+async fn execute_performance_drive_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    scratch_root: &Path,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = DrivePerformanceRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        capability: DRIVE_CAPABILITY.to_owned(),
+        consent: LocalDriveConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            confirmed: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        duration: Duration::from_millis(envelope.parameters.duration_millis),
+        target_alias: DRIVE_TARGET_ALIAS.to_owned(),
+        scratch_root: scratch_root.to_path_buf(),
+        scratch_bytes: envelope.parameters.scratch_bytes.ok_or(DiagnosticJobError::LimitExceeded)?,
+        block_bytes: envelope.parameters.block_bytes.ok_or(DiagnosticJobError::LimitExceeded)?,
+        provenance: DriveProvenance::new(
+            provenance.source_commit(),
+            provenance.executable_sha256(),
+            provenance.rustfs_version(),
+            provenance.build_features().to_vec(),
+        ),
+    };
+    let measurement = measure_drive(&request, cancel).await.map_err(drive_capture_failure)?;
+    let outcome = measurement.result.outcome();
+    let reason = measurement.result.reason_code();
+    if outcome != DriveOutcome::Succeeded {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome: outcome.as_str().to_owned(),
+            reason: reason.as_str().to_owned(),
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = sign_drive_export(&request, &measurement, identity, cancel).map_err(drive_export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: outcome.as_str().to_owned(),
+        reason: reason.as_str().to_owned(),
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
 }
 
 async fn execute_performance_network_job(
@@ -765,6 +932,22 @@ fn network_export_failure(error: NetworkPerformanceError) -> DiagnosticJobError 
     }
 }
 
+fn drive_capture_failure(error: DrivePerformanceError) -> DiagnosticJobError {
+    match error {
+        DrivePerformanceError::Cancelled => DiagnosticJobError::Cancelled,
+        DrivePerformanceError::LimitExceeded | DrivePerformanceError::Busy => DiagnosticJobError::LimitExceeded,
+        _ => DiagnosticJobError::CollectionFailed,
+    }
+}
+
+fn drive_export_failure(error: DrivePerformanceError) -> DiagnosticJobError {
+    match error {
+        DrivePerformanceError::Cancelled => DiagnosticJobError::Cancelled,
+        DrivePerformanceError::LimitExceeded => DiagnosticJobError::LimitExceeded,
+        _ => DiagnosticJobError::ExportFailed,
+    }
+}
+
 fn top_export_failure(error: super::TopCaptureError) -> DiagnosticJobError {
     match error {
         super::TopCaptureError::Cancelled => DiagnosticJobError::Cancelled,
@@ -799,6 +982,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use ed25519_dalek::{Signer as _, SigningKey};
 
     fn envelope() -> DiagnosticJobEnvelope {
@@ -833,6 +1017,9 @@ mod tests {
                 duration_millis: 1_000,
                 sample_period_micros: 10_000,
                 traffic_bytes: None,
+                target_alias: None,
+                scratch_bytes: None,
+                block_bytes: None,
             },
             signature: DiagnosticJobSignature {
                 algorithm: "Ed25519".to_owned(),
@@ -944,6 +1131,125 @@ mod tests {
         let unsigned_profile = serde_json::to_value(envelope().unsigned()).expect("profile envelope");
         assert_eq!(unsigned_network["parameters"]["trafficBytes"], MAX_NETWORK_TRAFFIC_BYTES);
         assert!(unsigned_profile["parameters"].get("trafficBytes").is_none());
+    }
+
+    #[test]
+    fn accepts_only_the_fixed_drive_target_and_budget_without_a_path() {
+        let mut drive = envelope();
+        drive.job_type = PERFORMANCE_DRIVE_JOB_TYPE.to_owned();
+        drive.required_capabilities = vec![DRIVE_CAPABILITY.to_owned()];
+        drive.limits.max_cpu_millis = DRIVE_DURATION_MILLIS;
+        drive.parameters.duration_millis = DRIVE_DURATION_MILLIS;
+        drive.parameters.target_alias = Some(DRIVE_TARGET_ALIAS.to_owned());
+        drive.parameters.scratch_bytes = Some(DRIVE_SCRATCH_BYTES);
+        drive.parameters.block_bytes = Some(DRIVE_BLOCK_BYTES);
+        let (drive, signer) = signed_envelope(drive);
+        signer
+            .verify(&drive, &target(&drive), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid performance.drive job");
+
+        let mut wrong_target = drive.clone();
+        wrong_target.parameters.target_alias = Some("../../customer-data".to_owned());
+        assert_eq!(
+            signer.verify(&wrong_target, &target(&wrong_target), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Invalid)
+        );
+
+        let mut unbounded = drive.clone();
+        unbounded.parameters.scratch_bytes = Some(DRIVE_SCRATCH_BYTES + 1);
+        assert_eq!(
+            signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let unsigned = serde_json::to_value(drive.unsigned()).expect("drive envelope");
+        assert_eq!(unsigned["parameters"]["targetAlias"], DRIVE_TARGET_ALIAS);
+        assert_eq!(unsigned["parameters"]["scratchBytes"], DRIVE_SCRATCH_BYTES);
+        assert_eq!(unsigned["parameters"]["blockBytes"], DRIVE_BLOCK_BYTES);
+        assert!(unsigned["parameters"].get("scratchRoot").is_none());
+
+        let mut with_path = serde_json::to_value(&drive).expect("drive envelope");
+        with_path["parameters"]["scratchRoot"] = serde_json::Value::String("/customer/data".to_owned());
+        assert!(serde_json::from_value::<DiagnosticJobEnvelope>(with_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn drive_adapter_exports_only_successful_measurements() {
+        let now = Utc::now();
+        let mut drive = envelope();
+        drive.job_type = PERFORMANCE_DRIVE_JOB_TYPE.to_owned();
+        drive.required_capabilities = vec![DRIVE_CAPABILITY.to_owned()];
+        drive.create_time = now.to_rfc3339();
+        drive.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339();
+        drive.parameters.consent_expires_at = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        drive.limits.max_cpu_millis = DRIVE_DURATION_MILLIS;
+        drive.parameters.duration_millis = DRIVE_DURATION_MILLIS;
+        drive.parameters.target_alias = Some(DRIVE_TARGET_ALIAS.to_owned());
+        drive.parameters.scratch_bytes = Some(DRIVE_SCRATCH_BYTES);
+        drive.parameters.block_bytes = Some(DRIVE_BLOCK_BYTES);
+        let (drive, signer) = signed_envelope(drive);
+        let verified = signer.verify(&drive, &target(&drive), now).expect("valid drive job");
+        let provenance = ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", Vec::new());
+        let data_drive = tempfile::tempdir().expect("data drive");
+        let scratch = data_drive.path().join(DRIVE_SCRATCH_DIRECTORY);
+        assert!(ensure_drive_scratch_root(&scratch));
+        let result = execute_performance_drive_job(
+            verified.envelope,
+            verified.nonce,
+            &DeviceIdentity::generate(),
+            provenance.clone(),
+            &scratch,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("drive execution");
+        assert_eq!(result.outcome, "SUCCEEDED");
+        assert!(result.artifact_bytes.is_some());
+        assert_eq!(scratch.read_dir().expect("scratch contents").count(), 0);
+
+        let verified = signer.verify(&drive, &target(&drive), now).expect("valid drive job");
+        let missing_root = data_drive.path().join("not-configured");
+        let result = execute_performance_drive_job(
+            verified.envelope,
+            verified.nonce,
+            &DeviceIdentity::generate(),
+            provenance,
+            &missing_root,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("terminal drive execution");
+        assert_eq!(result.outcome, "FAILED");
+        assert_eq!(result.reason, "SOURCE_UNAVAILABLE");
+        assert!(result.artifact_uid.is_none());
+        assert!(result.artifact_sha256.is_none());
+        assert!(result.artifact_bytes.is_none());
+    }
+
+    #[test]
+    fn drive_alias_resolves_to_the_first_local_storage_endpoint() {
+        let local_drive = tempfile::tempdir().expect("local drive");
+        let mut remote = Endpoint::try_from("http://node-b.example:9000/remote-drive").expect("remote endpoint");
+        remote.set_pool_index(0);
+        remote.set_set_index(0);
+        remote.set_disk_index(0);
+        let mut local = Endpoint::try_from(local_drive.path().to_str().expect("local path")).expect("local endpoint");
+        local.set_pool_index(0);
+        local.set_set_index(0);
+        local.set_disk_index(1);
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(vec![remote, local]),
+            cmd_line: "test storage endpoints".to_owned(),
+            platform: "test".to_owned(),
+        }]);
+
+        assert_eq!(
+            drive_scratch_root_from_endpoints(&pools),
+            Some(local_drive.path().join(DRIVE_SCRATCH_DIRECTORY))
+        );
     }
 
     #[test]
