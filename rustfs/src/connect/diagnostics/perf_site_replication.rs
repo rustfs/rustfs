@@ -1336,7 +1336,7 @@ fn list_versions_url(endpoint: &Url, bucket: &str, key: &str) -> Result<Url, Sit
 fn encode_path(value: &str) -> String {
     value
         .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_owned())
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
         .collect::<Vec<_>>()
         .join("/")
 }
