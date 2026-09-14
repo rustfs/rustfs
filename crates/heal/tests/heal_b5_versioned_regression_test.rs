@@ -825,9 +825,29 @@ mod serial_tests {
     /// `test_schedule_retry_resets_both_managers_and_reheals`). Here we prove the
     /// same resume machinery drives a real ECStore heal to completion and repairs
     /// every version, with the resume state cleaned up afterward.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[serial]
-    async fn test_heal_resume_across_page_boundary_e2e() {
+    fn test_heal_resume_across_page_boundary_e2e() {
+        // Resume runs on Tokio workers as well as the test thread; both need the debug server's stack budget.
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("heal-resume-page-boundary".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("resume test runtime should build");
+                runtime.block_on(test_heal_resume_across_page_boundary_e2e_inner());
+            })
+            .expect("resume test thread should spawn")
+            .join()
+            .expect("resume test thread should finish");
+    }
+
+    async fn test_heal_resume_across_page_boundary_e2e_inner() {
         let (disk_paths, ecstore, heal_storage) = heal_env().await;
         let bucket = "b5-resume-e2e";
         create_versioned_bucket(&ecstore, bucket).await;
