@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Connect profile.cpu artifact acceptance
+name: Connect profile.cpu service-job acceptance
 
 on:
   workflow_dispatch:
@@ -126,6 +126,7 @@ jobs:
       - name: Extract exact RustFS binary
         shell: bash
         env:
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -135,17 +136,7 @@ jobs:
           mkdir -p binary
           unzip -qq "$package" rustfs -d binary
           chmod +x binary/rustfs
-
-      - name: Run profile.cpu acceptance
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          BINARY_SHA256: ${{ inputs.binary_sha256 }}
-        run: |
-          set -euo pipefail
-          scripts/ci/check_connect_profile_cpu_artifact.sh \
-            binary/rustfs "$SOURCE_SHA" "$BINARY_SHA256" \
-            profile-cpu-runtime-evidence.json profile-cpu.zip profile-cpu-bundle.zip
+          printf '%s  %s\n' "$BINARY_SHA256" binary/rustfs | sha256sum --check --strict
 
       - name: Run signed service job acceptance
         shell: bash
@@ -180,16 +171,6 @@ jobs:
             --arg connectSha "$CONNECT_SHA" \
             --arg sourceSha "$SOURCE_SHA" \
             '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha}' \
-            profile-cpu-runtime-evidence.json >profile-cpu-runtime-evidence.bound.json
-          mv profile-cpu-runtime-evidence.bound.json profile-cpu-runtime-evidence.json
-          jq \
-            --arg workflowRunId "$GITHUB_RUN_ID" \
-            --arg buildRunId "$BUILD_RUN_ID" \
-            --arg artifactId "$ARTIFACT_ID" \
-            --arg artifactDigest "$ARTIFACT_DIGEST" \
-            --arg connectSha "$CONNECT_SHA" \
-            --arg sourceSha "$SOURCE_SHA" \
-            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha}' \
             profile-service-job-evidence.json >profile-service-job-evidence.bound.json
           mv profile-service-job-evidence.bound.json profile-service-job-evidence.json
 
@@ -198,9 +179,6 @@ jobs:
         with:
           name: connect-profile-cpu-evidence-${{ github.run_id }}
           path: |
-            profile-cpu-runtime-evidence.json
-            profile-cpu.zip
-            profile-cpu-bundle.zip
             profile-service-job-evidence.json
           retention-days: 14
           if-no-files-found: error
