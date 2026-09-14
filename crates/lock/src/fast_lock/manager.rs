@@ -341,6 +341,16 @@ impl FastObjectLockManager {
         self.shards.iter().map(|shard| shard.lock_count()).sum()
     }
 
+    /// Return aggregate live holder and waiter counts without collecting lock names.
+    pub fn current_lock_counts(&self) -> (u64, u64) {
+        self.shards.iter().map(|shard| shard.current_lock_counts()).fold(
+            (0, 0),
+            |(holders, waiters), (shard_holders, shard_waiters)| {
+                (holders.saturating_add(shard_holders), waiters.saturating_add(shard_waiters))
+            },
+        )
+    }
+
     /// Get pool statistics from all shards
     pub fn get_pool_stats(&self) -> Vec<(u64, u64, u64, usize)> {
         self.shards.iter().map(|shard| shard.pool_stats()).collect()

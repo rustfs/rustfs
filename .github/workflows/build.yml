@@ -207,12 +207,12 @@ jobs:
           fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -410,15 +410,19 @@ jobs:
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             BINARY_NAMES+=(rustfs-cli)
           fi
+          FEATURE_ARGS=()
+          if [[ -n "${{ matrix.features }}" ]]; then
+            FEATURE_ARGS=(--features "${{ matrix.features }}")
+          fi
 
           # Build one binary at a time so release LTO links cannot exhaust a
           # self-hosted runner by running concurrently.
           for binary in "${BINARY_NAMES[@]}"; do
             if [[ "${{ matrix.cross }}" == "true" ]]; then
               # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
             else
-              cargo build --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
             fi
           done
 
