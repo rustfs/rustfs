@@ -1946,14 +1946,19 @@ fn get_object_resume_control(ctx: GetObjectResumeContext) -> GetObjectResumeCont
     )
 }
 
-/// Mid-stream errors that mean the pinned object data is gone (rebalance or
-/// decommission removed it after copying the version elsewhere). Only typed
+/// Mid-stream errors that mean the current read lost access to its source
+/// shards, whether through relocation or unavailable peers. Only typed
 /// `StorageError`s qualify; generic I/O errors and string-matched "not enough
 /// disks" failures keep the existing fail-loud behavior.
 fn is_object_relocation_error(err: &std::io::Error) -> bool {
     let Some(inner) = err.get_ref() else { return false };
     match inner.downcast_ref::<StorageError>() {
-        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..)) => true,
+        Some(
+            StorageError::FileNotFound
+            | StorageError::ObjectNotFound(..)
+            | StorageError::InsufficientReadQuorum(..)
+            | StorageError::ErasureReadQuorum,
+        ) => true,
         Some(StorageError::Io(source)) => source.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
@@ -7934,6 +7939,7 @@ mod tests {
             StorageError::FileNotFound,
             StorageError::ObjectNotFound("test-bucket".to_string(), "relocated-object".to_string()),
             StorageError::InsufficientReadQuorum("test-bucket".to_string(), "relocated-object".to_string()),
+            StorageError::ErasureReadQuorum,
             StorageError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "relocated shard disappeared")),
         ] {
             let reopen_count = Arc::new(AtomicUsize::new(0));
@@ -8286,30 +8292,41 @@ mod tests {
     async fn get_object_streaming_reader_non_relocation_error_passes_through() {
         use tokio::io::AsyncReadExt;
 
-        let reopen_count = Arc::new(AtomicUsize::new(0));
-        let control = counting_resume_control(Arc::clone(&reopen_count), |_| {
-            panic!("a non-relocation read error must not reopen");
-        });
-        let mut reader = GetObjectStreamingReader::new(
-            FailAtEndReader::new(b"hello ", Some(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt"))),
-            "test-bucket",
-            "corrupt-object",
-            "req-resume-passthrough",
-            None,
-            11,
-            Duration::ZERO,
-            GetObjectBodyLifecycle::disabled(),
-            Some(control),
-        );
-        let mut out = Vec::new();
-        let err = reader
-            .read_to_end(&mut out)
-            .await
-            .expect_err("a non-relocation error must fail the body unchanged");
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt"),
+            std::io::Error::other(StorageError::FileCorrupt),
+            std::io::Error::other(StorageError::FileAccessDenied),
+            std::io::Error::other(StorageError::ErasureWriteQuorum),
+            std::io::Error::other("erasure read quorum"),
+        ] {
+            let kind = error.kind();
+            let message = error.to_string();
+            let reopen_count = Arc::new(AtomicUsize::new(0));
+            let control = counting_resume_control(Arc::clone(&reopen_count), |_| {
+                panic!("a non-relocation read error must not reopen");
+            });
+            let mut reader = GetObjectStreamingReader::new(
+                FailAtEndReader::new(b"hello ", Some(error)),
+                "test-bucket",
+                "corrupt-object",
+                "req-resume-passthrough",
+                None,
+                11,
+                Duration::ZERO,
+                GetObjectBodyLifecycle::disabled(),
+                Some(control),
+            );
+            let mut out = Vec::new();
+            let err = reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("a non-relocation error must fail the body unchanged");
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(out, b"hello ");
-        assert_eq!(reopen_count.load(Ordering::Relaxed), 0);
+            assert_eq!(err.kind(), kind);
+            assert_eq!(err.to_string(), message);
+            assert_eq!(out, b"hello ");
+            assert_eq!(reopen_count.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
