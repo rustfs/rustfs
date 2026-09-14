@@ -2446,7 +2446,13 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             error = %e,
             "RPC signature verification failed"
         );
-        Status::unauthenticated("No valid auth token")
+        if failure_reason == "stale_boot_epoch" {
+            // The signature is valid, but the peer restarted before this request. Reject it
+            // before execution and let the client retry after its authenticated epoch refresh.
+            Status::unavailable("RPC boot epoch changed")
+        } else {
+            Status::unauthenticated("No valid auth token")
+        }
     })?;
 
     let parent_context =
@@ -3672,6 +3678,62 @@ mod tests {
         let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_stale_boot_epoch_is_retryable_after_signature_verification() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        let path = "/node_service.NodeService/ReadVersion";
+        rustfs_common::set_global_local_node_name(audience).await;
+        let challenge = uuid::Uuid::new_v4();
+        let proof = storage::tonic_boot_epoch_response_headers(audience, challenge).expect("signed epoch proof");
+        let epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, &proof).expect("authenticated epoch");
+        let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
+        let signed_headers = |audience: &str, epoch| {
+            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadVersion", None)
+                .expect("method-bound signature");
+            let replay = storage::gen_tonic_replay_scope_headers(
+                audience,
+                path,
+                headers["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                headers["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                epoch,
+            )
+            .expect("replay-scoped signature");
+            headers.extend(replay);
+            headers
+        };
+        let request = |headers: HeaderMap| {
+            let mut request = Request::new(());
+            request.metadata_mut().as_mut().extend(headers);
+            request.extensions_mut().insert(RpcRequestTarget {
+                uri: format!("http://{audience}{path}").parse().expect("RPC URI"),
+                method: Method::POST,
+            });
+            request
+        };
+
+        let stale = signed_headers(audience, stale_epoch);
+        let error = check_auth(request(stale.clone())).expect_err("a stale epoch must still reject the request");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "RPC boot epoch changed");
+
+        let mut forged = stale;
+        forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
+        let error = check_auth(request(forged)).expect_err("a forged stale-epoch signature must remain terminal");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch)))
+            .expect_err("a stale epoch must not hide an audience mismatch");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let current = signed_headers(audience, epoch);
+        assert!(check_auth(request(current.clone())).is_ok(), "a fresh authenticated scope must succeed");
+        let error = check_auth(request(current)).expect_err("a same-epoch nonce replay must remain terminal");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
