@@ -500,9 +500,22 @@ impl FileMeta {
             get_consistent_bytes, get_consistent_str, has_internal_suffix, strip_internal_prefix_preserving_case,
         };
 
-        if fi.version_id.is_some_and(|id| !id.is_nil()) || !contains_key_str(&fi.metadata, SUFFIX_TIER_FV_ID) {
+        if fi.version_id.is_some_and(|id| !id.is_nil()) {
             return Ok(None);
         }
+        let legacy_id = if contains_key_str(&fi.metadata, SUFFIX_TIER_FV_ID) {
+            Some(Uuid::parse_str(
+                get_consistent_str(&fi.metadata, SUFFIX_TIER_FV_ID).ok_or(Error::FileCorrupt)?,
+            )?)
+        } else {
+            None
+        };
+        let id = match (fi.overwrite_tier_free_version_id, legacy_id) {
+            (Some(current), Some(legacy)) if current != legacy => return Err(Error::FileCorrupt),
+            (Some(id), _) | (_, Some(id)) if !id.is_nil() => id,
+            (None, None) => return Ok(None),
+            _ => return Err(Error::FileCorrupt),
+        };
         let Some(existing) = self
             .versions
             .iter()
@@ -555,9 +568,7 @@ impl FileMeta {
         {
             return Ok(None);
         }
-        let id = get_consistent_str(&fi.metadata, SUFFIX_TIER_FV_ID).ok_or(Error::FileCorrupt)?;
-        let id = Uuid::parse_str(id)?;
-        if id.is_nil() || self.versions.iter().any(|version| version.header.version_id == Some(id)) {
+        if self.versions.iter().any(|version| version.header.version_id == Some(id)) {
             return Err(Error::FileCorrupt);
         }
         // The reader also accepts legacy key casing. Canonicalize only this
@@ -575,7 +586,9 @@ impl FileMeta {
                 rustfs_utils::http::insert_bytes(&mut object.meta_sys, suffix, value);
             }
         }
-        let (free_version, created) = object.init_free_version(fi)?;
+        let mut cleanup_request = fi.clone();
+        cleanup_request.set_tier_free_version_id(&id.to_string());
+        let (free_version, created) = object.init_free_version(&cleanup_request)?;
         if !created {
             return Err(Error::FileCorrupt);
         }
@@ -1656,6 +1669,68 @@ mod test {
                     .expect("replaying replacement is idempotent");
                 assert_eq!(reopened.versions.len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn tier_overwrite_rpc_intent_matches_legacy_cleanup_owner_and_replay() {
+        use crate::TransitionVersionState::{Exact, KnownDisabled, SuspendedNull, Unknown};
+
+        for state in [Exact, KnownDisabled, SuspendedNull, Unknown] {
+            for inline in [false, true] {
+                let (mut current, _) = tier_overwrite_fixture(state);
+                let mut legacy = current.clone();
+                let id = Uuid::new_v4();
+                let mut replacement = FileInfo::new("object", 2, 2);
+                replacement.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("fixture timestamp"));
+                replacement.data_dir = Some(Uuid::new_v4());
+                replacement.size = 3;
+                replacement.data = inline.then(|| Bytes::from_static(b"new"));
+                replacement.overwrite_tier_free_version_id = Some(id);
+                let mut legacy_replacement = replacement.clone();
+                legacy_replacement.overwrite_tier_free_version_id = None;
+                legacy_replacement.set_tier_free_version_id(&id.to_string());
+
+                legacy.add_version(legacy_replacement).expect("legacy cleanup intent");
+                current.add_version(replacement.clone()).expect("RPC cleanup intent");
+                let mut reopened = FileMeta::load(&current.marshal_msg().expect("persist both versions")).expect("reload");
+                assert_eq!(
+                    reopened.find_version(Some(id)).expect("RPC cleanup owner").1,
+                    legacy.find_version(Some(id)).expect("legacy cleanup owner").1
+                );
+                let info = reopened
+                    .into_fileinfo("bucket", "object", "", false, false, true)
+                    .expect("replacement remains readable");
+                assert!(info.overwrite_tier_free_version_id.is_none(), "the RPC intent must not persist");
+                assert!(!rustfs_utils::http::contains_key_str(
+                    &info.metadata,
+                    rustfs_utils::http::SUFFIX_TIER_FV_ID
+                ));
+                reopened.add_version(replacement).expect("same-intent replay");
+                assert_eq!(reopened.versions.len(), 2, "replay retains exactly one cleanup owner");
+                assert!(
+                    reopened
+                        .find_version(Some(id))
+                        .expect("owner survives replay")
+                        .1
+                        .free_version()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tier_overwrite_rejects_conflicting_or_nil_rpc_intent_without_mutation() {
+        for (intent, legacy) in [(Uuid::nil(), None), (Uuid::new_v4(), Some(Uuid::new_v4()))] {
+            let (mut meta, _) = tier_overwrite_fixture(crate::TransitionVersionState::Exact);
+            let before = meta.clone();
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.overwrite_tier_free_version_id = Some(intent);
+            if let Some(legacy) = legacy {
+                replacement.set_tier_free_version_id(&legacy.to_string());
+            }
+            assert_eq!(meta.add_version(replacement), Err(Error::FileCorrupt));
+            assert_eq!(meta, before);
         }
     }
 

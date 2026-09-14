@@ -16,6 +16,7 @@ use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
 use crate::heal::storage::HealStorageObjectResult;
 
+mod concurrent_delete;
 mod deferred_retry;
 
 mod canonical_outcome {
@@ -305,7 +306,10 @@ mod canonical_outcome {
 
     #[tokio::test(start_paused = true)]
     async fn admin_cluster_lock_timeout_exhaustion_keeps_progress_and_retry_outcome() {
-        let storage = Arc::new(MockStorage::default());
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(Uuid::new_v4())),
+            ..Default::default()
+        });
         storage.heal_object_outcomes.lock().expect("outcomes").insert(
             "object-a".to_string(),
             (0..4).map(|_| MockHealObjectOutcome::RetryableLockTimeout).collect(),
@@ -1388,6 +1392,7 @@ struct MockStorage {
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
     bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
+    bucket_incarnation_after_listing: Mutex<Option<Uuid>>,
     bucket_incarnation_unavailable: Mutex<bool>,
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
@@ -1791,7 +1796,10 @@ fn replacement_identity(
     }
 }
 
+#[derive(Clone)]
 enum MockHealObjectOutcome {
+    MissingVersion,
+    PermissionDenied,
     RetryableLock,
     RetryableLockTimeout,
     OkWithOtherError(&'static str),
@@ -1899,6 +1907,18 @@ impl HealStorageAPI for MockStorage {
         Ok(*self.bucket_incarnation_id.lock().unwrap())
     }
 
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
+    }
+
     async fn heal_object(
         &self,
         bucket: &str,
@@ -1928,6 +1948,12 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::MissingVersion => {
+                    Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
+                }
+                MockHealObjectOutcome::PermissionDenied => {
+                    Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileAccessDenied))))
+                }
                 MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
                     HealResultItem::default(),
                     Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
@@ -1974,6 +2000,12 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::MissingVersion => {
+                    Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
+                }
+                MockHealObjectOutcome::PermissionDenied => {
+                    Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileAccessDenied))))
+                }
                 MockHealObjectOutcome::RetiredMarkerDeferred => Ok((
                     HealResultItem::default(),
                     Some(Error::Storage(EcstoreError::retired_marker_deferred("no committed retirement record"))),
@@ -2140,6 +2172,14 @@ impl HealStorageAPI for MockStorage {
         continuation_token: Option<&str>,
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        if let Some(incarnation) = self
+            .bucket_incarnation_after_listing
+            .lock()
+            .expect("listing incarnation")
+            .take()
+        {
+            *self.bucket_incarnation_id.lock().expect("bucket incarnation") = Some(incarnation);
+        }
         self.listed_prefixes.lock().unwrap().push(prefix.to_string());
         self.listing_tokens
             .lock()

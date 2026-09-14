@@ -5791,6 +5791,47 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn bitrot_reader_setup_preserves_multistripe_hedge_reopeners() {
+        temp_env::async_with_vars([("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("false"))], async {
+            let files = vec![inline_reader_setup_fileinfo(Some(b"abcdefgh")); 4];
+            let disks = vec![None; files.len()];
+            let setup = create_bitrot_readers_until_quorum_with_preference(
+                &files,
+                &disks,
+                "bucket",
+                "object",
+                1,
+                0,
+                8,
+                4,
+                HashAlgorithm::None,
+                false,
+                false,
+                2,
+                2,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+            for (index, reopen) in setup.deferred_reopeners.iter().enumerate() {
+                let reopen = reopen
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("healthy shard {index} needs a reopener for a later stripe"));
+                let mut reader = reopen(1).expect("reopen the second stripe");
+                let mut bytes = [0; 4];
+                assert_eq!(reader.read(&mut bytes).await.expect("read reopened shard"), bytes.len());
+                assert_eq!(&bytes, b"efgh", "reopened shard must not return the previous stripe");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn bitrot_reader_setup_data_blocks_first_keeps_deferred_fallback_readers() {
         let mut setup = temp_env::async_with_vars(
             [("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true"))],

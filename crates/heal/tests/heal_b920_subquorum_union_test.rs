@@ -39,7 +39,7 @@ use walkdir::WalkDir;
 
 mod storage_api;
 
-use storage_api::integration::{BucketOperations, ECStore, MakeBucketOptions, ObjectIO as _};
+use storage_api::integration::{BucketOperations, ECStore, MakeBucketOptions, ObjectIO as _, WriteCompletion};
 
 /// 256 KiB + change: large enough to be stored as non-inline erasure shards, so
 /// deleting the `xl.meta` file does NOT delete the data (the `part.*` shards live
@@ -90,6 +90,8 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
     let mut reader = PutObjReader::from_vec(data.to_vec());
     let opts = ObjectOptions {
         versioned: true,
+        // These fixtures inspect or mutate physical shards after PUT returns.
+        write_completion: WriteCompletion::TailDrained,
         ..Default::default()
     };
     let info = (**ecstore)
@@ -774,7 +776,10 @@ mod absence_receipt_regressions {
             .await
             .expect("C06 bucket traversal should complete");
         let outcome = task.get_outcome().await;
-        assert_eq!(outcome.counters.processed, 3);
+        assert_eq!(
+            outcome.counters.processed, 3,
+            "bucket traversal must process each fixture version once: {outcome:?}"
+        );
         assert_eq!(outcome.counters.healed, 1, "completed cleanup must be repaired: {outcome:?}");
         // Exact historical absence has its own proof. The two live legacy
         // versions remain readable but carry no independent payload receipt.
@@ -798,9 +803,29 @@ mod absence_receipt_regressions {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[serial]
-    async fn historical_absence_receipt_grace_and_dry_run_preserve_version() {
+    fn historical_absence_receipt_grace_and_dry_run_preserve_version() {
+        // Match the debug server's stack budget for composed real-storage heal futures.
+        const STACK_SIZE: usize = 8 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("absence-receipt-grace".to_owned())
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(STACK_SIZE)
+                    .enable_all()
+                    .build()
+                    .expect("grace test runtime should build");
+                runtime.block_on(historical_absence_receipt_grace_and_dry_run_preserve_version_inner());
+            })
+            .expect("grace test thread should spawn")
+            .join()
+            .expect("grace test thread should finish");
+    }
+
+    async fn historical_absence_receipt_grace_and_dry_run_preserve_version_inner() {
         let bucket = "absence-receipt-grace";
         let (paths, _store, storage, old, _current) = stale_history(bucket).await;
         let target = xl_meta_path(&object_dir(&paths[0], bucket, OBJECT));
