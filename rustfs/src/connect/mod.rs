@@ -48,8 +48,9 @@ mod telemetry;
 
 pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{
-    ENV_CONNECT_PROXY_BYPASS, ENV_CONNECT_PROXY_PASSWORD_FILE, ENV_CONNECT_PROXY_URL, ENV_CONNECT_PROXY_USERNAME_FILE,
-    HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule, ProxyConfig, ProxyConfigError,
+    ENV_CONNECT_JOB_SIGNING_KEY_ID, ENV_CONNECT_JOB_SIGNING_PUBLIC_KEY_FILE, ENV_CONNECT_PROXY_BYPASS,
+    ENV_CONNECT_PROXY_PASSWORD_FILE, ENV_CONNECT_PROXY_URL, ENV_CONNECT_PROXY_USERNAME_FILE, HeartbeatConfig,
+    HeartbeatConfigError, HeartbeatSchedule, ProxyConfig, ProxyConfigError,
 };
 pub use credential_store::{CredentialStore, DeviceCredential};
 pub use diagnostics::{
@@ -80,6 +81,10 @@ pub use diagnostics::{
     save_signed_client_export, save_signed_drive_export, save_signed_log_export, save_signed_profile_export,
     save_signed_telemetry_export, sign_client_export, sign_drive_export, spawn_environment_schedule, validate_client_limits,
     validate_drive_limits,
+};
+pub use diagnostics::{
+    DIAGNOSTIC_JOB_SIGNATURE_DOMAIN, DiagnosticJobEnvelope, DiagnosticJobError, DiagnosticJobExecution, DiagnosticJobLimits,
+    DiagnosticJobParameters, DiagnosticJobTarget, TrustedDiagnosticJobSigner, VerifiedDiagnosticJob, execute_diagnostic_job,
 };
 pub use diagnostics::{
     LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,

@@ -144,7 +144,11 @@ pub(crate) fn upload_source(
     }
     verify_envelope_signature(&identity, &envelope_bytes, &signature.value)?;
 
-    let produced_at = now.format(&Rfc3339).map_err(|_| ReportBundleError::Invalid)?;
+    let produced_at = now
+        .replace_nanosecond(0)
+        .map_err(|_| ReportBundleError::Invalid)?
+        .format(&Rfc3339)
+        .map_err(|_| ReportBundleError::Invalid)?;
     let entries = [
         manifest_entry(ENVELOPE_PATH, &envelope_bytes, &envelope.classification),
         manifest_entry(ENVELOPE_SIGNATURE_PATH, &envelope_signature_bytes, &envelope.classification),
@@ -418,6 +422,7 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
         assert_eq!(manifest["bundleUid"], bundle_uid);
         assert_eq!(manifest["nonce"], fixture.nonce);
+        assert_eq!(manifest["producedAt"].as_str().expect("producedAt").len(), 20);
         assert_eq!(manifest["entries"].as_array().expect("entries").len(), 3);
         for (index, (path, bytes)) in [
             ("envelope.json", fixture.envelope.as_slice()),
