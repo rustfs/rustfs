@@ -21,6 +21,31 @@ use std::sync::Arc;
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]
+fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
+    let objects = vec![
+        "catalog/table-1/table-entry.json".to_string(),
+        "catalog/namespace.json".to_string(),
+        "catalog/table-2/table-entry.json".to_string(),
+    ];
+
+    assert_eq!(
+        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 3).unwrap(),
+        vec![
+            "catalog/table-1/table-entry.json".to_string(),
+            "catalog/table-2/table-entry.json".to_string(),
+        ]
+    );
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(objects, false, 2),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("2-catalog-object safety limit")
+    );
+    assert_matches!(
+        bounded_table_entry_objects_for_data_plane_scan(vec!["catalog/table-entry.json".to_string()], true, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
+    );
+}
+
+#[test]
 fn catalog_lock_authority_failures_are_typed_as_unavailable() {
     for error in [
         rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
@@ -4481,6 +4506,8 @@ async fn table_data_plane_resource_scans_when_a_ready_index_entry_is_missing() {
         .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
         .await
         .expect("warehouse index entry should be removed");
+    let migration_lock = store.paths.backing_migration_fence_lock_path(bucket);
+    let migration_permits_before = backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await;
     backend.reset_call_counts().await;
 
     let resource = table_data_plane_resource_for_object(&store, bucket, object)
@@ -4489,7 +4516,120 @@ async fn table_data_plane_resource_scans_when_a_ready_index_entry_is_missing() {
         .expect("the table scan must retain table-aware protection");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
+    assert_eq!(
+        backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await,
+        migration_permits_before + 1,
+        "repairing a missing warehouse index must hold the object-backed migration permit"
+    );
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(
+                RUSTFS_META_BUCKET,
+                &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"),
+            )
+            .await
+            .expect("repaired warehouse index lookup should succeed")
+            .is_some(),
+        "the bounded scan should repair the missing index"
+    );
+
+    backend.reset_call_counts().await;
+    let indexed = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("repaired warehouse index lookup should succeed")
+        .expect("repaired warehouse index should retain table-aware protection");
+    assert_eq!(indexed.table, "orders");
+    assert_eq!(backend.list_call_count().await, 0);
+    assert_eq!(
+        backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_lock).await,
+        migration_permits_before + 1,
+        "an indexed lookup must not acquire a write permit"
+    );
+}
+
+#[tokio::test]
+async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane_limit() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse index entry should be removed");
+    let catalog_prefix = store.paths.namespace_entries_prefix(bucket);
+    for index in 0..TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS {
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &format!("{catalog_prefix}noise-{index}.json"), b"{}".to_vec())
+            .await;
+    }
+
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, object).await,
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("4096-catalog-object safety limit")
+    );
+    store
+        .backfill_table_warehouse_index(bucket)
+        .await
+        .expect("operator backfill should reconcile a ready index without the data-plane limit");
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .expect("reconciled warehouse index lookup should succeed")
+            .is_some(),
+        "operator reconciliation must recreate the missing ready-state index"
+    );
+
+    backend.reset_call_counts().await;
+    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("reconciled index lookup should succeed")
+        .expect("reconciled index should retain table-aware protection");
+    assert_eq!(resource.table, "orders");
+    assert_eq!(backend.list_call_count().await, 0);
+}
+
+#[tokio::test]
+async fn table_data_plane_index_repair_honors_an_active_migration_fence() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+    let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .materialize_durable_strong_backing_migration(bucket)
+        .await
+        .expect("durable strong migration should install its object-backed write fence");
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &index_path)
+        .await
+        .expect("warehouse index entry should be removed after migration fencing");
+
+    assert_matches!(
+        table_data_plane_resource_for_object(&store, bucket, object).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("writes are fenced")
+    );
+    assert!(
+        store
+            .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
+            .await
+            .expect("warehouse index lookup should succeed")
+            .is_none(),
+        "a fenced object-backed catalog must not repair the missing warehouse index"
+    );
 }
 
 #[tokio::test]
@@ -5161,7 +5301,7 @@ async fn table_data_plane_resource_falls_back_to_scan_without_index_state() {
         .expect("legacy table entry should resolve");
 
     assert_eq!(resource.table, "orders");
-    assert!(backend.list_call_count().await > 0);
+    assert_eq!(backend.list_call_count().await, 1);
     assert!(store.warehouse_index_ready(bucket).await.unwrap());
 
     backend.reset_call_counts().await;
