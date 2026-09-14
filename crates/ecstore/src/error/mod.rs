@@ -636,6 +636,10 @@ impl Clone for StorageError {
                             source: Box::new(context.clone()),
                         },
                     ))
+                } else if let Some(refusal) = crate::bucket::metadata::unreadable_config_refusal(self) {
+                    // Keep the refusal typed so a cloned error still maps to
+                    // its retryable S3 response (rustfs/backlog#1734).
+                    StorageError::Io(std::io::Error::new(e.kind(), refusal.clone()))
                 } else {
                     StorageError::Io(std::io::Error::new(e.kind(), e.to_string()))
                 }

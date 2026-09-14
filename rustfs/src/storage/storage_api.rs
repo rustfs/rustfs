@@ -415,7 +415,7 @@ pub(crate) mod ecstore_bucket {
         bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
         remote_s3_client, replication, tagging, target, utils,
     };
-    pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
+    pub(crate) use rustfs_ecstore::api::bucket::{config_parse_mode, quota, versioning, versioning_sys};
 }
 
 pub(crate) mod ecstore_capacity {
