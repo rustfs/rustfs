@@ -111,7 +111,7 @@ pub use top_api::{
     TopCoverage, TopOutcome, TopProvenance, TopReasonCode, TopResult, capture_top_api, save_signed_top_export, sign_top_export,
 };
 pub use top_disk::{DiskCounterSnapshot, TopDiskData, capture_top_disk, evaluate_disk_window};
-pub use top_locks::{TopLocksData, capture_top_locks};
+pub use top_locks::{TopLocksData, capture_top_locks, evaluate_lock_snapshot};
 pub use top_net::{NetworkCounterSnapshot, TopNetData, capture_top_net, evaluate_network_window};
 pub use top_rpc::{TopRpcData, capture_top_rpc};
 pub use trace_analysis::{OperationSummary, TraceAnalysis, TraceAnalysisError, analyze_trace};

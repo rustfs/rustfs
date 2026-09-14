@@ -717,6 +717,16 @@ impl LockShard {
         objects.values().filter(|state| state.is_locked()).count()
     }
 
+    pub(crate) fn current_lock_counts(&self) -> (u64, u64) {
+        self.objects
+            .read()
+            .values()
+            .map(|state| state.atomic_state.holder_and_waiter_counts())
+            .fold((0, 0), |(holders, waiters), (state_holders, state_waiters)| {
+                (holders.saturating_add(state_holders), waiters.saturating_add(state_waiters))
+            })
+    }
+
     /// Adaptive cleanup based on current load
     pub fn adaptive_cleanup(&self) -> usize {
         let current_load = self.current_load_factor();
