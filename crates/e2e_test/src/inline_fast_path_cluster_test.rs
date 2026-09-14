@@ -929,7 +929,13 @@ async fn assert_case(
         case.label
     );
     assert_storage_layout(cluster, bucket, &key, version_id.as_deref(), case.stored_inline)?;
-    Ok((key, body, put.e_tag().map(str::to_owned), version_id))
+    // A suspended PUT omits the response version, but reads identify the
+    // stored null version explicitly.
+    let read_version_id = match state {
+        VersionState::Suspended => Some("null".to_owned()),
+        _ => version_id,
+    };
+    Ok((key, body, put.e_tag().map(str::to_owned), read_version_id))
 }
 
 async fn get_and_assert(

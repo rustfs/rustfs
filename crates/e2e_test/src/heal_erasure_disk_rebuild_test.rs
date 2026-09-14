@@ -670,8 +670,8 @@ mod tests {
             && operations["retryingTasks"].as_u64() == Some(0)
     }
 
-    // Queued low-priority repairs cannot execute while the single admin slot is
-    // occupied; ownership is determined by active and retrying tasks only.
+    // Admission slots are per node: remote read repairs can briefly overlap
+    // the coordinator's admin task. Require them to drain before interruption.
     fn only_admin_heal_is_active(status: &serde_json::Value) -> bool {
         let operations = &status["healOperations"];
         status["clusterStatusComplete"] == serde_json::Value::Bool(true)
@@ -1850,9 +1850,22 @@ mod tests {
                 "interruption tests require a server built with e2e-test-hooks"
             );
         }
-        let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
-        let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
-            .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
+        let pre_interrupt_status = loop {
+            let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+            let status: serde_json::Value = serde_json::from_str(&status_body)
+                .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {status_body}"))?;
+            if background_enabled || only_admin_heal_is_active(&status) {
+                break status;
+            }
+            if Instant::now() >= partial_deadline {
+                return Err(format!("non-admin heal did not drain before the interruption deadline: {status}").into());
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            metadata_count(&replaced_disk, bucket, &expected_manifests) < expected_manifests.len(),
+            "root heal must still be partially complete at the interruption checkpoint"
+        );
         let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
         if background_rejoin_heal_evidence {
             let target_log = std::fs::read_to_string(format!("{log_dir}/node1.log"))?;
