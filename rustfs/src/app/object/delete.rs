@@ -1663,11 +1663,7 @@ mod tests {
                         .expect_err("the marker version must actually be gone");
                     assert_eq!(
                         missing.code(),
-                        &if pool_count == 1 {
-                            S3ErrorCode::NoSuchKey
-                        } else {
-                            S3ErrorCode::NoSuchVersion
-                        },
+                        &S3ErrorCode::NoSuchVersion,
                         "pool_count={pool_count} suspended={suspended} batch={batch}: removed marker lookup returned {missing:?}"
                     );
                     let get = GetObjectInput::builder()
