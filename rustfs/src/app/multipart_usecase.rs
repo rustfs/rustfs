@@ -1129,7 +1129,7 @@ impl DefaultMultipartUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    pub async fn execute_upload_part(&self, mut req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1140,6 +1140,7 @@ impl DefaultMultipartUsecase {
             req.uri.query(),
             req.extensions.get::<VerifiedPresignedRequest>().is_some(),
         )?;
+        normalize_presigned_part_checksums(&mut req)?;
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let input = req.input;
@@ -1913,6 +1914,53 @@ fn passthrough_part_actual_size(headers: &HeaderMap) -> Option<i64> {
         .filter(|size| *size > 0)
 }
 
+// Hoisted values are signed query parameters, not HTTP headers. Normalize only
+// after access control has verified the presigned request.
+fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
+    if req.extensions.get::<VerifiedPresignedRequest>().is_none() {
+        return Ok(());
+    }
+    let Some(query) = req.uri.query() else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::new();
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let field = match name.as_ref() {
+            "x-amz-checksum-crc32" => Some(&mut req.input.checksum_crc32),
+            "x-amz-checksum-crc32c" => Some(&mut req.input.checksum_crc32c),
+            "x-amz-checksum-crc64nvme" => Some(&mut req.input.checksum_crc64nvme),
+            "x-amz-checksum-sha1" => Some(&mut req.input.checksum_sha1),
+            "x-amz-checksum-sha256" => Some(&mut req.input.checksum_sha256),
+            "x-amz-sdk-checksum-algorithm" => None,
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Duplicate checksum query parameter"));
+        }
+        if let Some(header) = req.headers.get(name.as_ref())
+            && header.as_bytes() != value.as_bytes()
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "Conflicting checksum header and query parameter",
+            ));
+        }
+        let header = http::HeaderValue::from_str(&value)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?;
+        req.headers.insert(
+            http::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?,
+            header,
+        );
+        if let Some(field) = field {
+            *field = Some(value.into_owned());
+        } else {
+            req.input.checksum_algorithm = Some(ChecksumAlgorithm::from(value.into_owned()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1927,6 +1975,102 @@ mod tests {
     use std::{collections::HashMap, io::Cursor};
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
+
+    fn presigned_checksum_request(query: &str) -> S3Request<UploadPartInput> {
+        let mut req = build_request(UploadPartInput::default(), Method::PUT);
+        req.uri = format!("/bucket/object?{query}").parse().unwrap();
+        req.extensions.insert(VerifiedPresignedRequest);
+        req
+    }
+
+    #[tokio::test]
+    async fn normalize_presigned_part_checksums_validates_body() {
+        // SHA256("abc"), including percent-encoded base64 punctuation.
+        let checksum = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=";
+        let query =
+            "x-amz-checksum-sha256=ungWv48Bz%2BpBQUDeXa4iI7ADYaOWF3qctBD%2FYfIAFa0%3D&x-amz-sdk-checksum-algorithm=SHA256";
+        for payload in [b"abc", b"abd"] {
+            let mut req = presigned_checksum_request(query);
+            normalize_presigned_part_checksums(&mut req).unwrap();
+            assert_eq!(req.input.checksum_sha256.as_deref(), Some(checksum));
+            assert_eq!(
+                req.input.checksum_algorithm.as_ref().map(|algorithm| algorithm.as_str()),
+                Some(ChecksumAlgorithm::SHA256)
+            );
+            let mut reader = HashReader::from_stream(Cursor::new(payload), 3, 3, None, None, false).unwrap();
+            reader.add_checksum_from_s3s(&req.headers, None, false).unwrap();
+            assert_eq!(reader.content_crc_type(), Some(rustfs_rio::ChecksumType::SHA256));
+            let mut bytes = Vec::new();
+            let result = reader.read_to_end(&mut bytes).await;
+            if payload == b"abc" {
+                result.unwrap();
+                assert_eq!(bytes, payload);
+                assert_eq!(reader.content_crc().get("SHA256").map(String::as_str), Some(checksum));
+            } else {
+                let err = S3Error::from(ApiError::from(result.unwrap_err()));
+                assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normalize_presigned_part_checksums_accepts_sdk_crc32_default() {
+        let mut req = presigned_checksum_request("x-amz-checksum-crc32=y%2FQ5Jg%3D%3D&x-amz-sdk-checksum-algorithm=CRC32");
+        normalize_presigned_part_checksums(&mut req).unwrap();
+        assert_eq!(req.input.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
+        let mut reader = HashReader::from_stream(Cursor::new(b"123456789"), 9, 9, None, None, false).unwrap();
+        reader.add_checksum_from_s3s(&req.headers, None, false).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"123456789");
+        assert_eq!(reader.content_crc().get("CRC32").map(String::as_str), Some("y/Q5Jg=="));
+    }
+
+    #[test]
+    fn normalize_presigned_part_checksums_rejects_ambiguous_values() {
+        for query in [
+            "x-amz-checksum-sha256=one&x-amz-checksum-sha256=two",
+            "x-amz-sdk-checksum-algorithm=SHA256&x-amz-sdk-checksum-algorithm=CRC32",
+        ] {
+            let mut req = presigned_checksum_request(query);
+            assert_eq!(
+                *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+                S3ErrorCode::InvalidRequest
+            );
+        }
+        let mut req = presigned_checksum_request("x-amz-checksum-sha256=one");
+        req.headers.insert("x-amz-checksum-sha256", HeaderValue::from_static("two"));
+        assert_eq!(
+            *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+            S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn normalize_presigned_part_checksums_preserves_headers_and_rejects_invalid_values() {
+        let mut req = presigned_checksum_request("partNumber=1&uploadId=test");
+        req.input.checksum_sha256 = Some("existing".to_owned());
+        req.headers
+            .insert("x-amz-checksum-sha256", HeaderValue::from_static("existing"));
+        normalize_presigned_part_checksums(&mut req).unwrap();
+        assert_eq!(req.input.checksum_sha256.as_deref(), Some("existing"));
+        assert_eq!(req.headers["x-amz-checksum-sha256"], "existing");
+
+        let mut req = presigned_checksum_request("x-amz-checksum-sha256=%0D%0A");
+        assert_eq!(
+            *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn normalize_presigned_part_checksums_requires_verified_presign() {
+        let mut req = presigned_checksum_request("x-amz-checksum-sha256=one");
+        req.extensions.remove::<VerifiedPresignedRequest>();
+        normalize_presigned_part_checksums(&mut req).unwrap();
+        assert!(req.input.checksum_sha256.is_none());
+        assert!(req.headers.is_empty());
+    }
 
     fn upload_metadata_with_checksum_type(recorded: &str) -> HashMap<String, String> {
         HashMap::from([(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(), recorded.to_string())])
