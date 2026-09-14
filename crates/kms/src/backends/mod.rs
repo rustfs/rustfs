@@ -32,6 +32,35 @@ pub mod vault;
 pub(crate) mod vault_credentials;
 pub mod vault_transit;
 
+/// Refuse a key identifier that cannot be used as a single path segment.
+///
+/// Every path-addressed backend derives its storage location by joining the key
+/// identifier onto a configured prefix: the Local backend joins it onto `key_dir`,
+/// the Vault KV2 backend onto `key_path_prefix`, the Vault Transit backend onto
+/// both `transit/keys/` and the metadata prefix. A separator, a dot segment or a
+/// NUL byte in the identifier moves that join somewhere else — `../evil` reads and
+/// deletes a record outside the prefix, `a/b` addresses a nested path the listing
+/// reports as a directory rather than a key. The rule is containment, not a
+/// character allowlist, so identifiers already in use keep resolving.
+///
+/// Applied by each backend at the point where the identifier becomes a path or a
+/// Vault key name, never at the manager: the AWS backend addresses keys by ARN and
+/// alias, both of which legitimately contain `/`.
+pub(crate) fn validate_key_id_segment(key_id: &str) -> Result<()> {
+    if key_id.is_empty() {
+        return Err(KmsError::invalid_key("key identifier must not be empty"));
+    }
+    if key_id.contains('/') || key_id.contains('\\') || key_id.contains('\0') {
+        return Err(KmsError::invalid_key(format!(
+            "key identifier must not contain path separators or NUL: {key_id:?}"
+        )));
+    }
+    if key_id == "." || key_id == ".." {
+        return Err(KmsError::invalid_key(format!("key identifier must not be a dot segment: {key_id:?}")));
+    }
+    Ok(())
+}
+
 /// Operations whose availability depends on the key's lifecycle state.
 ///
 /// Decryption is deliberately absent: RustFS allows decryption with
@@ -723,6 +752,27 @@ mod tests {
     use super::*;
     use crate::config::KmsConfig;
     use base64_simd::STANDARD as BASE64;
+
+    #[test]
+    fn key_id_segment_rule_refuses_every_form_that_leaves_the_prefix() {
+        for refused in [
+            "",
+            "bad/name",
+            "../escape",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "nul\0byte",
+            "a/../b",
+        ] {
+            let err = validate_key_id_segment(refused).expect_err("must be refused");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "{refused:?}: {err:?}");
+        }
+        for accepted in ["k213", "a.b_c-1", "..leading-dots", "3f2504e0-4f89-11d3-9a0c-0305e82c3301"] {
+            validate_key_id_segment(accepted).unwrap_or_else(|e| panic!("{accepted:?} must be accepted: {e:?}"));
+        }
+    }
 
     /// Backend that implements only the trait-mandated operations and relies
     /// on the default `capabilities` implementation.

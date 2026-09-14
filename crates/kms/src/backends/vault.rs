@@ -22,6 +22,7 @@ use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
     classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_key_status_permits,
     ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
+    validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{
@@ -671,9 +672,17 @@ impl VaultKmsClient {
         policy::execute(operation, class, &self.retry, &self.cancel, attempt).await
     }
 
-    /// Get the full path for a key in Vault
-    fn key_path(&self, key_id: &str) -> String {
-        format!("{}/{}", self.key_path_prefix, key_id)
+    /// Get the full path for a key in Vault.
+    ///
+    /// Every KV2 path this backend reads, writes or deletes is derived here, so
+    /// refusing an identifier that is not a single path segment at this one
+    /// point keeps `create`, `describe`, `delete` and the metadata writes inside
+    /// `key_path_prefix`: `../evil` would otherwise address a record outside it
+    /// once the HTTP client normalises the URL, and `a/b` a nested path that the
+    /// listing reports as a directory rather than a key.
+    fn key_path(&self, key_id: &str) -> Result<String> {
+        validate_key_id_segment(key_id)?;
+        Ok(format!("{}/{}", self.key_path_prefix, key_id))
     }
 
     /// Get the path of the immutable record holding one version's material
@@ -765,7 +774,7 @@ impl VaultKmsClient {
     /// Read the key record together with the KV2 secret version holding it, so a
     /// later write can be check-and-set against exactly this snapshot.
     async fn get_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         let metadata = self
@@ -806,7 +815,7 @@ impl VaultKmsClient {
     /// On success returns the secret version created by this write so a caller
     /// can chain further check-and-set writes.
     async fn try_cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<Option<u32>> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Single attempt: replaying a lost-response write would double-apply
@@ -910,7 +919,7 @@ impl VaultKmsClient {
     /// when a record already exists — i.e. a concurrent create committed
     /// first. An existing record is never overwritten.
     async fn try_create_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<bool> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Single attempt: the create-only CAS makes a duplicate replay fail
@@ -937,7 +946,7 @@ impl VaultKmsClient {
     /// records.
     #[cfg(test)]
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         self.run("vault_kv2_write_key", OpClass::MutatingNonIdempotent, move || async move {
@@ -984,7 +993,7 @@ impl VaultKmsClient {
 
     /// Retrieve key data from Vault
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         let secret: VaultKeyData = self
@@ -1122,7 +1131,7 @@ impl VaultKmsClient {
 
     /// Physically delete a key from Vault storage
     async fn delete_key(&self, key_id: &str) -> Result<()> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         // Purge immutable version records first: if any purge fails, the top-level
@@ -2436,6 +2445,42 @@ mod tests {
     /// A caller asking for no keys gets an empty page, and the page arithmetic
     /// never reaches for the element before an empty page. The scripted key
     /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    /// A key identifier becomes a KV2 path by string join, so one that is not a
+    /// single segment is refused before any request leaves the process: `../x`
+    /// would otherwise read, overwrite or delete a record outside the key
+    /// prefix once the URL is normalised, and `a/b` would create a nested path
+    /// the listing reports as a directory rather than a key.
+    #[tokio::test]
+    async fn path_addressed_operations_refuse_key_ids_that_leave_the_key_prefix() {
+        let (vault, client) = scripted_client(vec![]).await;
+
+        for key_id in ["bad/name", "../escape", "..", ".", "", "back\\slash", "nul\0byte"] {
+            let err = client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect_err("create must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "create {key_id:?}: {err:?}");
+
+            let err = client
+                .get_key_data(key_id)
+                .await
+                .expect_err("read must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "read {key_id:?}: {err:?}");
+
+            let err = client
+                .delete_key(key_id)
+                .await
+                .expect_err("delete must refuse a non-segment key id");
+            assert!(matches!(err, KmsError::InvalidKey { .. }), "delete {key_id:?}: {err:?}");
+        }
+
+        assert!(
+            vault.requests().is_empty(),
+            "a refused key id must never reach Vault: {:?}",
+            vault.requests()
+        );
+    }
+
     #[tokio::test]
     async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
         let (vault, client) =
@@ -3003,7 +3048,7 @@ mod tests {
             .await
             .expect("client");
 
-        assert_eq!(client.key_path("my-key"), "rustfs/kms/keys/my-key");
+        assert_eq!(client.key_path("my-key").expect("valid key id"), "rustfs/kms/keys/my-key");
         assert_eq!(client.key_versions_dir("my-key"), "rustfs/kms/keys/my-key/versions");
         assert_eq!(client.key_version_path("my-key", 3), "rustfs/kms/keys/my-key/versions/3");
     }
