@@ -1923,6 +1923,11 @@ impl HealStorageAPI for MockStorage {
         Ok(*self.bucket_incarnation_id.lock().unwrap())
     }
 
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_bucket(bucket, opts).await
+    }
+
     async fn heal_object_at_incarnation(
         &self,
         bucket: &str,
@@ -4146,6 +4151,7 @@ async fn erasure_set_disk_walk_keeps_cluster_usage_baseline_indeterminate() {
         let disk = make_resume_disk(&temp).await;
         let storage = Arc::new(MockStorage {
             resume_disk: Mutex::new(Some(disk)),
+            bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(42))),
             usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
                 objects_count: 10,
                 bytes: 8,

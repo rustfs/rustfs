@@ -19,6 +19,7 @@
 //! or deletion.
 
 use super::*;
+use crate::heal::resume::CheckpointManager;
 use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
 use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,8 @@ enum RecoveryHealType {
     ErasureSet {
         buckets: Vec<String>,
         set_disk_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all_buckets: Option<bool>,
     },
     Metadata {
         bucket: String,
@@ -70,6 +73,25 @@ enum RecoveryHealType {
 }
 
 impl RecoveryHealType {
+    fn normalize_legacy_scope(&mut self) {
+        if let Self::ErasureSet {
+            buckets, all_buckets, ..
+        } = self
+            && buckets.is_empty()
+            && all_buckets.is_none()
+        {
+            *all_buckets = Some(true);
+        }
+        if let Self::ErasureSet {
+            buckets, all_buckets, ..
+        } = self
+            && !buckets.is_empty()
+            && *all_buckets == Some(false)
+        {
+            *all_buckets = None;
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Cluster => {}
@@ -94,10 +116,19 @@ impl RecoveryHealType {
                 validate_recovery_component("bucket", bucket)?;
                 validate_recovery_component("prefix", prefix)?;
             }
-            Self::ErasureSet { buckets, set_disk_id } => {
-                validate_recovery_component("set disk id", set_disk_id)?;
-                if buckets.is_empty() {
-                    return Err(Error::Other("Admin heal recovery erasure set must name buckets".to_string()));
+            Self::ErasureSet {
+                buckets,
+                set_disk_id,
+                all_buckets,
+            } => {
+                crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+                // RUSTFS_COMPAT_TODO(backlog-2539): Remove after all pre-marker administrator ErasureSet intents are retired.
+                // Admission historically emitted an omitted marker with an empty list.
+                let all_buckets = all_buckets.unwrap_or(buckets.is_empty());
+                if all_buckets != buckets.is_empty() {
+                    return Err(Error::Other(
+                        "Admin heal recovery bucket scope conflicts with its bucket list".to_string(),
+                    ));
                 }
                 for bucket in buckets {
                     validate_recovery_component("bucket", bucket)?;
@@ -133,6 +164,7 @@ impl From<&HealType> for RecoveryHealType {
             HealType::ErasureSet { buckets, set_disk_id } => Self::ErasureSet {
                 buckets: buckets.clone(),
                 set_disk_id: set_disk_id.clone(),
+                all_buckets: buckets.is_empty().then_some(true),
             },
             HealType::Metadata { bucket, object } => Self::Metadata {
                 bucket: bucket.clone(),
@@ -166,7 +198,9 @@ impl From<RecoveryHealType> for HealType {
                 version_id,
             },
             RecoveryHealType::Prefix { bucket, prefix } => Self::Prefix { bucket, prefix },
-            RecoveryHealType::ErasureSet { buckets, set_disk_id } => Self::ErasureSet { buckets, set_disk_id },
+            RecoveryHealType::ErasureSet {
+                buckets, set_disk_id, ..
+            } => Self::ErasureSet { buckets, set_disk_id },
             RecoveryHealType::Metadata { bucket, object } => Self::Metadata { bucket, object },
             RecoveryHealType::EcDecode {
                 bucket,
@@ -310,7 +344,7 @@ impl RootHealIntent {
 }
 
 #[derive(Default)]
-pub(super) struct RootHealRecovery {
+pub(crate) struct RootHealRecovery {
     mutation: Mutex<()>,
     #[cfg(any(test, feature = "test-util"))]
     disabled_for_tests: bool,
@@ -379,7 +413,7 @@ fn terminal_path(task_id: &str) -> Result<String> {
 
 fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     let _ = intent_path(task_id)?;
-    let intent: RootHealIntent = serde_json::from_slice(bytes)
+    let mut intent: RootHealIntent = serde_json::from_slice(bytes)
         .map_err(|error| Error::Other(format!("Invalid root heal recovery record {task_id}: {error}")))?;
     if intent.task_id != task_id {
         return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}")));
@@ -396,6 +430,7 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
             "Unexpected bucket incarnation in root heal recovery record {task_id}"
         )));
     }
+    intent.heal_type.normalize_legacy_scope();
     intent.heal_type.validate()?;
     Ok(intent)
 }
@@ -457,6 +492,18 @@ impl RootHealRecovery {
         let mut disks = map.values().flatten().cloned().collect::<Vec<_>>();
         disks.sort_by_key(|disk| EcstoreDiskAPI::endpoint(disk.as_ref()).to_string());
         Ok(disks)
+    }
+
+    pub(crate) async fn resume_disk(&self, task_id: &str) -> Result<Option<DiskStore>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(None);
+        }
+        let _guard = self.mutation.lock().await;
+        Self::find(&self.disks().await?, task_id)
+            .await?
+            .map(|(disk, _)| Some(disk))
+            .ok_or_else(|| Error::other("Administrator heal recovery owner is missing"))
     }
 
     async fn find(disks: &[DiskStore], task_id: &str) -> Result<Option<(DiskStore, EcstoreDiskBytes)>> {
@@ -567,8 +614,10 @@ impl RootHealRecovery {
         if request.options.no_lock {
             return Err(Error::Other("Administrator root heal cannot skip namespace locking".to_string()));
         }
-        let bytes = serde_json::to_vec(&RootHealIntent::from_request(request))
-            .map_err(|error| Error::Other(format!("Serialize root heal recovery record: {error}")))?;
+        let intent = RootHealIntent::from_request(request);
+        intent.heal_type.validate()?;
+        let bytes =
+            serde_json::to_vec(&intent).map_err(|error| Error::Other(format!("Serialize root heal recovery record: {error}")))?;
         let path = intent_path(&request.id)?;
         if let Some((disk, expected)) = existing {
             return match EcstoreDiskAPI::compare_and_update_file(
@@ -775,7 +824,18 @@ impl RootHealRecovery {
             )
             .await?
             {
-                EcstoreConditionalFileUpdate::Updated => {}
+                EcstoreConditionalFileUpdate::Updated => {
+                    if matches!(heal_type, HealType::ErasureSet { .. }) && CheckpointManager::has_checkpoint(&disk, task_id).await
+                    {
+                        let checkpoint = CheckpointManager::load_from_disk(disk.clone(), task_id).await?;
+                        if checkpoint.get_checkpoint().await.admin.is_some_and(|admin| admin.completed) {
+                            checkpoint.cleanup().await?;
+                            if ResumeManager::has_resume_state(&disk, task_id).await {
+                                ResumeManager::load_from_disk(disk, task_id).await?.cleanup().await?;
+                            }
+                        }
+                    }
+                }
                 _ => {
                     return Err(Error::Other(format!(
                         "Root heal recovery record changed while publishing terminal {task_id}"

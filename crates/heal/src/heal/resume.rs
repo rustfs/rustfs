@@ -34,6 +34,7 @@ mod legacy_handoff;
 mod replacement;
 mod utils;
 
+pub(crate) use checkpoint::AdminErasureCheckpoint;
 pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ResumeCheckpoint};
 pub(crate) use gc::ResumeGc;
 pub use handoff::{ReplacementHandoff, ReplacementHandoffLink, ReplacementHandoffPhase};
