@@ -63,7 +63,7 @@ const ENVELOPE_PATH: &str = "envelope.json";
 const SIGNATURE_PATH: &str = "envelope.sig";
 const RESULT_PATH: &str = "result.json";
 const MAX_OBJECT_RESPONSE_BYTES: usize = 16_384;
-const CLEANUP_RESERVE_MAX: Duration = Duration::from_secs(1);
+const CLEANUP_RESERVE_MAX: Duration = Duration::from_millis(250);
 const OUTPUT_MODE: u32 = 0o600;
 
 static OBJECT_COLLECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -401,7 +401,7 @@ impl S3ObjectProbe {
         cancel: &CancellationToken,
     ) -> Result<ObjectProbeMeasurement, ObjectProbeError> {
         let started = Instant::now();
-        let reserve = CLEANUP_RESERVE_MAX.min(request.duration / 4);
+        let reserve = CLEANUP_RESERVE_MAX.min(request.duration / 10);
         let operation_deadline = started + request.duration.saturating_sub(reserve);
         let cleanup_deadline = started + request.duration;
         let bucket = format!("rustfs-connect-perf-{}", request.artifact_uid.replace('-', ""));

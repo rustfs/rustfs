@@ -503,8 +503,13 @@ impl ConnectClient {
                     let reason = decode_reason(response).await;
                     return Err(ClientError::Rejected { status, reason });
                 }
-                Err(error) if !error.is_timeout() && !error.is_connect() => return Err(ClientError::Transport(error)),
-                Err(error) => last_transport_failure = classify_transport_failure(&error, self.proxy.is_some()),
+                Err(error) => {
+                    if let Some(failure) = classify_transport_failure(&error, self.proxy.is_some()) {
+                        last_transport_failure = Some(failure);
+                    } else if !error.is_timeout() && !error.is_connect() {
+                        return Err(ClientError::Transport(error));
+                    }
+                }
             }
 
             if attempt + 1 < MAX_ATTEMPTS {
@@ -520,16 +525,18 @@ impl ConnectClient {
     async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<SingleRequest, ClientError> {
         let response = match request.send().await {
             Ok(response) => response,
-            Err(error) if error.is_timeout() || error.is_connect() => {
+            Err(error) => {
                 if let Some(failure) = classify_transport_failure(&error, self.proxy.is_some()) {
                     return Err(failure.into());
                 }
-                return Ok(SingleRequest::Unavailable {
-                    status: None,
-                    retry_after: None,
-                });
+                if error.is_timeout() || error.is_connect() {
+                    return Ok(SingleRequest::Unavailable {
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                return Err(ClientError::Transport(error));
             }
-            Err(error) => return Err(ClientError::Transport(error)),
         };
         let status = response.status();
         if status == success {
@@ -647,7 +654,10 @@ pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configure
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
         let message = error.to_string().to_ascii_lowercase();
-        if message.contains("407") || message.contains("proxy authentication") || message.contains("proxy authorization required")
+        if proxy_configured
+            && (message.contains("407")
+                || message.contains("proxy authentication")
+                || message.contains("proxy authorization required"))
         {
             return Some(TransportFailure::ProxyAuthentication);
         }
