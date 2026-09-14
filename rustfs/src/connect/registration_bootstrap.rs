@@ -120,6 +120,7 @@ pub async fn register_from_protected_input(
         .map_err(|error| match error {
             super::ClientError::ProxyAuthentication => RegistrationBootstrapError::ProxyAuthentication,
             super::ClientError::ProxyRejected => RegistrationBootstrapError::ProxyRejected,
+            super::ClientError::TlsPeer => RegistrationBootstrapError::TlsPeer,
             _ => RegistrationBootstrapError::Exchange,
         })?;
     if credential.name != format!("{cluster_name}/clusterDevices/{}", credential.uid) {
