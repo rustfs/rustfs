@@ -61,6 +61,7 @@ pub(crate) use health::{
 };
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
+pub use layer::s3_http_request_guard;
 pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
