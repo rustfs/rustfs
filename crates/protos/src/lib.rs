@@ -172,7 +172,11 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
+// v4 is an admission boundary, not a transport version bump. A peer that
+// cannot recognize this probe must fail the Admin Heal capability preflight;
+// accepting the older v3 probe would allow an upgraded node to silently lose
+// newly validated request semantics during a rolling upgrade.
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
@@ -318,7 +322,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v4\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -2261,10 +2265,10 @@ mod heal_control_tests {
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
         assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v4"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v4\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -2279,6 +2283,8 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+        let legacy_probe = [b"rustfs-heal-control-capability-v3\0".as_slice(), &[7; 16]].concat();
+        assert!(!is_heal_control_capability_probe(&legacy_probe));
     }
 
     #[test]

@@ -861,6 +861,15 @@ mod tests {
         let unknown = rmp_serde::to_vec_named(&unknown).unwrap();
         assert!(decode_envelope(&unknown).unwrap_err().contains("unknown field"));
 
+        let mut read_repair = serde_json::to_value(&envelope).expect("start envelope should serialize");
+        read_repair["command"]["request"]
+            .as_object_mut()
+            .expect("start request must be an object")
+            .insert("readRepair".to_string(), serde_json::Value::Bool(true));
+        let encoded = rmp_serde::to_vec_named(&read_repair).expect("invalid start fixture should encode");
+        let error = decode_envelope(&encoded).expect_err("RPC must reject an Admin readRepair field");
+        assert!(error.contains("unknown field") && error.contains("readRepair"), "{error}");
+
         let executable =
             Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 10_000, 20_000, 7)).unwrap();
         assert!(executable.validate_execution(15_000, 7).is_ok());

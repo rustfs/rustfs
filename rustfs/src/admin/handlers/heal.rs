@@ -1039,6 +1039,7 @@ where
     E: FnOnce() -> EF,
     EF: Future<Output = S3Result<T>>,
 {
+    validate_heal_start_options(options)?;
     validate_heal_selector(endpoints, options.pool, options.set)
         .map_err(|err| admin_error(S3ErrorCode::InvalidArgument, err.to_string()))?;
     probe().await?;
@@ -1346,6 +1347,17 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     Ok(())
 }
 
+fn validate_heal_start_options(options: &HealOpts) -> S3Result<()> {
+    if options.read_repair {
+        return Err(admin_error(
+            S3ErrorCode::InvalidArgument,
+            "readRepair=true is not supported for Admin Heal",
+        ));
+    }
+
+    Ok(())
+}
+
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1451,6 +1463,9 @@ impl Operation for HealHandler {
         };
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
         validate_heal_request_mode(&hip)?;
+        if hip.client_token.is_empty() && !hip.force_stop {
+            validate_heal_start_options(&hip.hs)?;
+        }
         let response_operation = if hip.force_stop {
             "cancel_heal"
         } else if !hip.client_token.is_empty() && !hip.force_start {
@@ -1904,6 +1919,36 @@ mod tests {
         .await
         .unwrap();
         assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn read_repair_admin_start_is_rejected_before_probe_or_execution() {
+        let probed = AtomicBool::new(false);
+        let executed = AtomicBool::new(false);
+        let options = HealOpts {
+            read_repair: true,
+            ..Default::default()
+        };
+
+        let error = execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &options,
+            || async {
+                probed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("Admin Heal must reject the internal read-repair mode");
+
+        assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(error.code().status_code(), Some(StatusCode::BAD_REQUEST));
+        assert!(!probed.load(Ordering::SeqCst), "rejected options must precede capability probing");
+        assert!(!executed.load(Ordering::SeqCst), "rejected options must not execute a heal");
     }
 
     #[tokio::test]

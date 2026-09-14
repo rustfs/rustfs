@@ -76,6 +76,12 @@ setup = 'ecstore-base-stack'
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
 
+# The pool metadata placement regression composes the full erasure-heal
+# startup future and overflows the default Linux test-thread stack.
+[[profile.default.scripts]]
+filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+setup = 'ecstore-large-stack'
+
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
@@ -238,6 +244,12 @@ setup = 'ecstore-base-stack'
 [[profile.ci.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
+
+# The pool metadata placement regression composes the full erasure-heal
+# startup future and overflows the default Linux test-thread stack.
+[[profile.ci.scripts]]
+filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+setup = 'ecstore-large-stack'
 
 # ===========================================================================
 # QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.
