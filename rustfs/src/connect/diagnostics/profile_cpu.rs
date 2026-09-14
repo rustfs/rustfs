@@ -722,7 +722,7 @@ mod local_cpu {
 
         #[test]
         fn summary_uses_nonce_bound_ids_and_excludes_raw_symbols() {
-            let raw_symbol = "rustfs_ecstore::disk::read_object";
+            let raw_symbol = "rustfs::storage::disk::read_object";
             let mut first = Accumulator::new([7; 32]);
             first
                 .record_stack([raw_symbol].into_iter(), 9)
