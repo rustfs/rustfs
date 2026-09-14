@@ -1250,7 +1250,9 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                         Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
                         None => return Err(Error::other("--thread-scope is required for the threads profile")),
                     };
-                    export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+                    export_thread_profile(&request, scope, &key, &cancel)
+                        .await
+                        .map_err(Error::other)
                 }
             }
         };

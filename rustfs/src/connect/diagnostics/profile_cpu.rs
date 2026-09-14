@@ -300,6 +300,44 @@ impl MemoryProfileData {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadProfileData {
+    scope: ThreadProfileScope,
+    states: Vec<ThreadStateCount>,
+}
+
+impl ThreadProfileData {
+    pub(super) fn native(states: Vec<ThreadStateCount>) -> Self {
+        Self {
+            scope: ThreadProfileScope::NativeThreads,
+            states,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ThreadState {
+    Runnable,
+    Waiting,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStateCount {
+    state: ThreadState,
+    thread_count: u64,
+}
+
+impl ThreadStateCount {
+    pub(super) const fn new(state: ThreadState, thread_count: u64) -> Self {
+        Self { state, thread_count }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ThreadProfileScope {
@@ -312,6 +350,7 @@ pub enum ThreadProfileScope {
 pub enum ProfileData {
     Cpu(CpuProfileData),
     Memory(MemoryProfileData),
+    Threads(ThreadProfileData),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -416,6 +455,8 @@ pub enum ProfileError {
     SourceUnavailable,
     #[error("profile_counter_reset")]
     CounterReset,
+    #[error("profile_collection_failed")]
+    CollectionFailed,
     #[error("profile_export_signing_failed")]
     Signing,
     #[error("profile_export_exists")]
