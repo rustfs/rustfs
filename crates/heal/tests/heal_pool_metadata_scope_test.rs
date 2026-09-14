@@ -13,6 +13,8 @@
 // limitations under the License.
 
 //! Regression for replacement healing requiring pool.bin on a non-owning set.
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_heal::heal::{
     storage::{ECStoreHealStorage, HealObjectOptions, HealPutObjReader, HealStorageAPI},
