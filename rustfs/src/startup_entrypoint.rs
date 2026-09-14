@@ -918,7 +918,8 @@ async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpt
 
 async fn execute_connect_site_replication_performance(options: ConnectSiteReplicationPerformanceOpts) -> Result<()> {
     use crate::connect::{
-        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationEndpoint, SiteReplicationOutcome,
+        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationCredentials,
+        SiteReplicationEndpoint, SiteReplicationOutcome,
         SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
         read_protected_site_replication_credential, save_signed_site_replication_export, sign_site_replication_export,
         validate_site_replication_limits,
@@ -960,9 +961,11 @@ async fn execute_connect_site_replication_performance(options: ConnectSiteReplic
         options.source_deployment_id.clone(),
         &options.source_endpoint,
         source_ca.as_deref(),
-        source_access_key,
-        source_secret_key,
-        source_session_token,
+        SiteReplicationCredentials {
+            access_key: source_access_key,
+            secret_key: source_secret_key,
+            session_token: source_session_token,
+        },
         duration,
     )
     .map_err(Error::other)?;
@@ -971,9 +974,11 @@ async fn execute_connect_site_replication_performance(options: ConnectSiteReplic
         options.destination_deployment_id.clone(),
         &options.destination_endpoint,
         destination_ca.as_deref(),
-        destination_access_key,
-        destination_secret_key,
-        destination_session_token,
+        SiteReplicationCredentials {
+            access_key: destination_access_key,
+            secret_key: destination_secret_key,
+            session_token: destination_session_token,
+        },
         duration,
     )
     .map_err(Error::other)?;

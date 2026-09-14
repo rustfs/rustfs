@@ -334,6 +334,13 @@ pub trait SiteReplicationProbe: Send + Sync {
     ) -> SiteReplicationProbeFuture<'a>;
 }
 
+/// Static credential set for one site-replication endpoint connection.
+pub struct SiteReplicationCredentials {
+    pub access_key: Zeroizing<String>,
+    pub secret_key: Zeroizing<String>,
+    pub session_token: Zeroizing<String>,
+}
+
 pub struct SiteReplicationEndpoint {
     pub alias: String,
     pub deployment_id: String,
@@ -350,13 +357,11 @@ impl SiteReplicationEndpoint {
         deployment_id: impl Into<String>,
         endpoint: &str,
         root_ca_pem: Option<&[u8]>,
-        access_key: Zeroizing<String>,
-        secret_key: Zeroizing<String>,
-        session_token: Zeroizing<String>,
+        credentials: SiteReplicationCredentials,
         timeout: Duration,
     ) -> Result<Self, SiteReplicationPerformanceError> {
         let endpoint = deployment_endpoint(endpoint)?;
-        if access_key.is_empty() || secret_key.is_empty() {
+        if credentials.access_key.is_empty() || credentials.secret_key.is_empty() {
             return Err(SiteReplicationPerformanceError::InvalidCredential);
         }
         let mut builder = Client::builder()
@@ -376,9 +381,9 @@ impl SiteReplicationEndpoint {
             deployment_id: deployment_id.into(),
             endpoint,
             client,
-            access_key,
-            secret_key,
-            session_token,
+            access_key: credentials.access_key,
+            secret_key: credentials.secret_key,
+            session_token: credentials.session_token,
         })
     }
 }
@@ -1421,7 +1426,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn build_feature(value: &String) -> bool {
+fn build_feature(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value

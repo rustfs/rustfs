@@ -85,7 +85,7 @@ pub use perf_object::{
 pub use perf_site_replication::{
     LocalSiteReplicationConsent, MAX_SITE_REPLICATION_DURATION, MAX_SITE_REPLICATION_TRAFFIC_BYTES, S3SiteReplicationProbe,
     SITE_REPLICATION_CAPABILITY, SITE_REPLICATION_SCHEMA_VERSION, SITE_REPLICATION_TOOL_ID, SavedSiteReplicationExport,
-    SignedSiteReplicationExport, SiteReplicationDiagnosticResult, SiteReplicationEndpoint, SiteReplicationMeasurement,
+    SignedSiteReplicationExport, SiteReplicationCredentials, SiteReplicationDiagnosticResult, SiteReplicationEndpoint, SiteReplicationMeasurement,
     SiteReplicationOutcome, SiteReplicationPerformanceData, SiteReplicationPerformanceError, SiteReplicationPerformanceRequest,
     SiteReplicationProbe, SiteReplicationProbeError, SiteReplicationProbeFuture, SiteReplicationProbeMeasurement,
     SiteReplicationProvenance, SiteReplicationReasonCode, SiteReplicationTargetReasonCode, SiteReplicationTargetResult,
