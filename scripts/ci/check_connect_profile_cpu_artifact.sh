@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 <rustfs-binary> <source-sha> <binary-sha256> <evidence-json> <archive-output>" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: $0 <rustfs-binary> <source-sha> <binary-sha256> <evidence-json> <archive-output> <bundle-output>" >&2
   exit 2
 fi
 
@@ -25,6 +25,7 @@ expected_source_sha=$2
 expected_binary_sha256=$3
 evidence_json=$4
 archive_output=$5
+bundle_output=$6
 work_dir=$(mktemp -d)
 load_pids=()
 cleanup() {
@@ -141,6 +142,66 @@ device_public_key=$(tail -c 65 "$work_dir/device.pub.der" | base64 -w0 | tr '+/'
 [[ $(jq -r '.deviceKeyId' "$envelope") == "$device_key_id" ]]
 openssl dgst -sha256 -verify "$work_dir/device.pub" -signature "$work_dir/signature.der" "$work_dir/signed-input"
 
+bundle_uid=019e3ae0-1111-7000-8000-000000000015
+bundle_dir=$work_dir/bundle
+mkdir -p "$bundle_dir"
+cp "$envelope" "$work_dir/archive/envelope.sig" "$result" "$bundle_dir"
+for member in envelope.json envelope.sig result.json; do
+  size=$(stat -c %s "$bundle_dir/$member")
+  digest=$(sha256sum "$bundle_dir/$member" | awk '{print $1}')
+  jq -n \
+    --arg path "$member" \
+    --argjson sizeBytes "$size" \
+    --arg sha256 "$digest" \
+    '{path: $path, type: "offline-diagnostic", sizeBytes: $sizeBytes, sha256: $sha256, classification: "L3"}' \
+    >"$work_dir/$member.entry.json"
+done
+jq -n \
+  --arg bundleUid "$bundle_uid" \
+  --arg organizationName "$organization" \
+  --arg clusterName "$cluster" \
+  --arg deviceName "$device" \
+  --arg deviceKeyId "$device_key_id" \
+  --arg nonce "$(jq -r '.nonce' "$envelope")" \
+  --arg producedAt "$(jq -r '.producedAt' "$envelope")" \
+  --slurpfile envelopeEntry "$work_dir/envelope.json.entry.json" \
+  --slurpfile signatureEntry "$work_dir/envelope.sig.entry.json" \
+  --slurpfile resultEntry "$work_dir/result.json.entry.json" \
+  '{formatVersion: "rustfs.connect.support.bundleManifest/1", protocolVersion: "v1", bundleUid: $bundleUid, organizationName: $organizationName, clusterName: $clusterName, deviceName: $deviceName, deviceKeyId: $deviceKeyId, nonce: $nonce, producedAt: $producedAt, redactionVersion: "rustfs.connect.redaction.v1", rulesetHash: "b37436d8e72515394a122d633865b1dc028d4ece349352a0a3a23f52ca4285f3", classificationRegistryVersion: 1, entries: [$envelopeEntry[0], $signatureEntry[0], $resultEntry[0]]}' \
+  >"$bundle_dir/manifest.json"
+printf 'rustfs-support-bundle-v1\0' >"$work_dir/manifest-signed-input"
+cat "$bundle_dir/manifest.json" >>"$work_dir/manifest-signed-input"
+openssl dgst -sha256 -sign "$work_dir/device.pem" -out "$work_dir/manifest-signature.der" "$work_dir/manifest-signed-input"
+manifest_signature=$(python3 - "$work_dir/manifest-signature.der" <<'PY'
+import base64
+import sys
+
+der = open(sys.argv[1], "rb").read()
+if len(der) < 8 or der[0] != 0x30 or der[2] != 0x02:
+    raise SystemExit("manifest signature is not a DER ECDSA sequence")
+offset = 3
+r_length = der[offset]
+offset += 1
+r = int.from_bytes(der[offset:offset + r_length], "big")
+offset += r_length
+if der[offset] != 0x02:
+    raise SystemExit("manifest signature has no S integer")
+offset += 1
+s_length = der[offset]
+offset += 1
+s = int.from_bytes(der[offset:offset + s_length], "big")
+order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+if s > order // 2:
+    s = order - s
+raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+print(base64.urlsafe_b64encode(raw).decode().rstrip("="))
+PY
+)
+jq -n --arg keyId "$device_key_id" --arg value "$manifest_signature" \
+  '{algorithm: "ES256", keyId: $keyId, value: $value}' >"$bundle_dir/manifest.sig"
+(cd "$bundle_dir" && zip -q -0 "$work_dir/profile-cpu-bundle.zip" manifest.json manifest.sig envelope.json envelope.sig result.json)
+bundle_archive_sha256=$(sha256sum "$work_dir/profile-cpu-bundle.zip" | awk '{print $1}')
+
 if grep -R -E '(/home/|device\.key|thread(Name|Id)?|0x[0-9a-fA-F]+|rustfs::)' "$work_dir/archive"; then
   echo "profile.cpu export leaked raw process material" >&2
   exit 1
@@ -210,15 +271,21 @@ if [[ -e "$archive_output" ]]; then
   echo "refusing to replace existing archive output: $archive_output" >&2
   exit 1
 fi
+if [[ -e "$bundle_output" ]]; then
+  echo "refusing to replace existing bundle output: $bundle_output" >&2
+  exit 1
+fi
 cp -- "$output" "$archive_output"
+cp -- "$work_dir/profile-cpu-bundle.zip" "$bundle_output"
 result_json=$(jq -c . "$result")
 jq -n \
   --arg sourceSha "$expected_source_sha" \
   --arg binarySha256 "$actual_binary_sha256" \
   --arg runnerArchitecture "$runner_architecture" \
   --arg archiveSha256 "$actual_archive_sha256" \
+  --arg bundleArchiveSha256 "$bundle_archive_sha256" \
   --arg deviceKeyId "$device_key_id" \
   --arg devicePublicKey "$device_public_key" \
   --argjson result "$result_json" \
-  '{sourceSha: $sourceSha, binarySha256: $binarySha256, runnerArchitecture: $runnerArchitecture, archiveSha256: $archiveSha256, deviceKeyId: $deviceKeyId, devicePublicKey: $devicePublicKey, invocation: "scripts/ci/check_connect_profile_cpu_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", singleCollector: "SECOND_CAPTURE_REJECTED", redaction: "VERIFIED"}}' >"$evidence_json"
-jq '{sourceSha, binarySha256, runnerArchitecture, archiveSha256, result: {outcome: .result.outcome, reasonCode: .result.reasonCode, durationMillis: .result.durationMillis, sampleCount: (.result.data.samples | length), totalSamples: ([.result.data.samples[].sampleCount] | add), droppedSampleCount: .result.data.droppedSampleCount}, controls}' "$evidence_json"
+  '{sourceSha: $sourceSha, binarySha256: $binarySha256, runnerArchitecture: $runnerArchitecture, archiveSha256: $archiveSha256, bundleArchiveSha256: $bundleArchiveSha256, deviceKeyId: $deviceKeyId, devicePublicKey: $devicePublicKey, invocation: "scripts/ci/check_connect_profile_cpu_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", singleCollector: "SECOND_CAPTURE_REJECTED", redaction: "VERIFIED"}}' >"$evidence_json"
+jq '{sourceSha, binarySha256, runnerArchitecture, archiveSha256, bundleArchiveSha256, result: {outcome: .result.outcome, reasonCode: .result.reasonCode, durationMillis: .result.durationMillis, sampleCount: (.result.data.samples | length), totalSamples: ([.result.data.samples[].sampleCount] | add), droppedSampleCount: .result.data.droppedSampleCount}, controls}' "$evidence_json"
