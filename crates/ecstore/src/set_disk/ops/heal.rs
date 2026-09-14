@@ -55,6 +55,20 @@ pub(crate) struct HealedObjectAbsence {
     pub removed: bool,
 }
 
+fn is_unavailable_heal_rpc(error: &DiskError) -> bool {
+    let DiskError::Io(error) = error else {
+        return false;
+    };
+    let Some(status) = crate::cluster::rpc::client::embedded_tonic_status(error) else {
+        return false;
+    };
+    // Tonic can report a locally observed HTTP/2 GOAWAY as Internal. Only a
+    // typed transport source identifies that case; peer-supplied text cannot.
+    status.code() == tonic::Code::Unavailable
+        || (matches!(status.code(), tonic::Code::Internal | tonic::Code::Unknown)
+            && std::error::Error::source(status).is_some_and(|source| source.is::<tonic::transport::Error>()))
+}
+
 fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
     match error {
         DiskError::DiskNotFound | DiskError::RemoteClientUnavailable(_) => DriveState::Offline,
@@ -65,6 +79,7 @@ fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
         | DiskError::PartMissingOrCorrupt
         | DiskError::OutdatedXLMeta => DriveState::Missing,
         DiskError::FileCorrupt => DriveState::Corrupt,
+        _ if is_unavailable_heal_rpc(error) => DriveState::Offline,
         _ => DriveState::Unknown(error.to_string()),
     }
 }
@@ -3166,6 +3181,32 @@ mod heal_result_report_tests {
             super::heal_drive_state_for_error(&DiskError::RemoteClientUnavailable("peer restarting".to_string())).to_string(),
             DriveState::Offline.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn heal_preserves_rpc_transport_failure_through_metadata_classification() {
+        let transport = tonic::transport::Endpoint::from_static("http://127.0.0.1:0")
+            .connect()
+            .await
+            .expect_err("port zero cannot serve an internode connection");
+        let mut interrupted = tonic::Status::internal("h2 protocol error: http2 error");
+        interrupted.set_source(Arc::new(transport));
+        for (status, offline) in [
+            (interrupted, true),
+            (tonic::Status::unavailable("peer restarting"), true),
+            (tonic::Status::internal("h2 protocol error: http2 error"), false),
+            (tonic::Status::permission_denied("connection reset"), false),
+            (tonic::Status::data_loss("broken pipe"), false),
+        ] {
+            let error = DiskError::from(status);
+            let (_, _, reason) = super::should_heal_object_on_disk(&Some(error), &[], &FileInfo::default(), &FileInfo::default());
+            let reason = reason.expect("metadata probe failure must survive classification");
+            assert_eq!(
+                matches!(super::heal_drive_state_for_error(&reason), DriveState::Offline),
+                offline,
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]

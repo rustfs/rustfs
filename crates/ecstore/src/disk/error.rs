@@ -700,15 +700,20 @@ impl Clone for DiskError {
             DiskError::Io(io_error) if self.is_conditional_file_not_committed() => DiskError::Io(
                 DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
             ),
-            DiskError::Io(io_error) => DiskError::Io(
-                Self::clone_dangling_delete_grace(io_error)
-                    .or_else(|| Self::clone_retired_marker_deferred(io_error))
-                    .or_else(|| rustfs_rio::clone_internode_http_io_error(io_error))
-                    .and_then(std::io::Error::into_inner)
-                    // The helper derives a kind from the source; Clone must retain the original outer kind.
-                    .map(|source| std::io::Error::new(io_error.kind(), source))
-                    .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
-            ),
+            DiskError::Io(io_error) => {
+                if let Some(status) = io_error.get_ref().and_then(|source| source.downcast_ref::<RpcStatusError>()) {
+                    return DiskError::Io(io::Error::new(io_error.kind(), RpcStatusError(status.0.clone())));
+                }
+                DiskError::Io(
+                    Self::clone_dangling_delete_grace(io_error)
+                        .or_else(|| Self::clone_retired_marker_deferred(io_error))
+                        .or_else(|| rustfs_rio::clone_internode_http_io_error(io_error))
+                        .and_then(std::io::Error::into_inner)
+                        // The helper derives a kind from the source; Clone must retain the original outer kind.
+                        .map(|source| std::io::Error::new(io_error.kind(), source))
+                        .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
+                )
+            }
             DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             DiskError::Unexpected => DiskError::Unexpected,
             DiskError::CorruptedFormat => DiskError::CorruptedFormat,
