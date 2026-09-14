@@ -1998,7 +1998,7 @@ mod tests {
                 Some(ChecksumAlgorithm::SHA256)
             );
             let mut reader = HashReader::from_stream(Cursor::new(payload), 3, 3, None, None, false).unwrap();
-            reader.add_checksum_from_s3s(&req.headers, None, false).unwrap();
+            reader.add_checksum(&req.headers, None, false).unwrap();
             assert_eq!(reader.content_crc_type(), Some(rustfs_rio::ChecksumType::SHA256));
             let mut bytes = Vec::new();
             let result = reader.read_to_end(&mut bytes).await;
@@ -2019,7 +2019,7 @@ mod tests {
         normalize_presigned_part_checksums(&mut req).unwrap();
         assert_eq!(req.input.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
         let mut reader = HashReader::from_stream(Cursor::new(b"123456789"), 9, 9, None, None, false).unwrap();
-        reader.add_checksum_from_s3s(&req.headers, None, false).unwrap();
+        reader.add_checksum(&req.headers, None, false).unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"123456789");
