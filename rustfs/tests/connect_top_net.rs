@@ -106,6 +106,15 @@ fn top_network_uses_exact_counter_deltas_and_fails_closed_on_reset() {
     assert_eq!(reset.outcome, TopOutcome::Failed);
     assert_eq!(reset.reason_code, TopReasonCode::CollectionFailed);
     assert!(reset.data.is_none());
+
+    let idle = NetworkCounterSnapshot {
+        received_bytes: 100,
+        sent_bytes: 50,
+    };
+    let unavailable = evaluate_network_window(&request(), idle, idle, 1_000).expect("empty window result");
+    assert_eq!(unavailable.outcome, TopOutcome::Failed);
+    assert_eq!(unavailable.reason_code, TopReasonCode::SourceUnavailable);
+    assert!(unavailable.data.is_none());
 }
 
 #[tokio::test]
@@ -336,18 +345,31 @@ fn local_top_export_is_private_no_clobber_cancel_safe_and_rejects_forged_artifac
 }
 
 #[test]
-fn production_cli_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
+fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
     let directory = tempfile::tempdir().expect("CLI directory");
     let state = directory.path().join("state");
-    rustfs::connect::IdentityStore::new(state.join("identity"))
+    let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
         .load_or_create()
         .expect("enrolled identity");
 
     let net_output = directory.path().join("net.zip");
-    let net = top_command("net", &state, &net_output, "019e3ae0-0000-7000-8000-000000000021", 1, true)
-        .output()
-        .expect("run top.net");
-    assert!(!net.status.success());
+    // Keep traffic flowing through CLI startup and the capture window. An idle
+    // host and a busy CI runner must exercise the same successful export path.
+    let (stop_traffic, stopped) = std::sync::mpsc::channel::<()>();
+    let traffic = std::thread::spawn(move || -> std::io::Result<()> {
+        loop {
+            generate_loopback_traffic()?;
+            match stopped.recv_timeout(Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    });
+    let net = top_command("net", &state, &net_output, "019e3ae0-0000-7000-8000-000000000021", 500, true).output();
+    drop(stop_traffic);
+    traffic.join().expect("traffic thread").expect("generate loopback traffic");
+    let net = net.expect("run top.net");
+    assert!(net.status.success(), "stderr: {}", String::from_utf8_lossy(&net.stderr));
     let stdout = String::from_utf8(net.stdout).expect("UTF-8 stdout");
     let result: serde_json::Value = stdout
         .lines()
@@ -355,16 +377,40 @@ fn production_cli_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
         .map(|line| serde_json::from_str(line).expect("result JSON"))
         .expect("result line");
     assert_eq!(result["toolId"], "top.net");
-    assert_eq!(result["outcome"], "FAILED");
-    assert_eq!(result["reasonCode"], "SOURCE_UNAVAILABLE");
+    assert_eq!(result["outcome"], "SUCCEEDED");
+    assert_eq!(result["reasonCode"], "COMPLETE");
     assert_eq!(result["coverage"]["requestedUnits"], 1);
-    assert_eq!(result["coverage"]["completedUnits"], 0);
+    assert_eq!(result["coverage"]["completedUnits"], 1);
+    assert!(result["data"]["receivedBytes"].as_u64().expect("received bytes") > 0);
+    assert!(result["data"]["sentBytes"].as_u64().expect("sent bytes") > 0);
     assert_eq!(result["provenance"]["sourceCommit"], rustfs::version::build::COMMIT_HASH);
     assert_eq!(
         result["provenance"]["executableSha256"],
         sha256_file(Path::new(env!("CARGO_BIN_EXE_rustfs")))
     );
-    assert!(!net_output.exists());
+
+    let bytes = fs::read(&net_output).expect("top.net archive");
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&net_output).expect("output metadata").permissions().mode() & 0o777, 0o600);
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("top.net archive");
+    let names = (0..archive.len())
+        .map(|index| archive.by_index(index).expect("archive member").name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["envelope.json", "envelope.sig", "result.json"]);
+
+    let envelope = archive_entry(&mut archive, "envelope.json");
+    let signature_document = archive_entry(&mut archive, "envelope.sig");
+    let signature_document: serde_json::Value = serde_json::from_slice(&signature_document).expect("signature JSON");
+    let raw = URL_SAFE_NO_PAD
+        .decode_to_vec(signature_document["value"].as_str().expect("signature value"))
+        .expect("base64url signature");
+    let signature = Signature::from_slice(&raw).expect("P-256 signature");
+    let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+    signed.extend_from_slice(&envelope);
+    VerifyingKey::from_public_key_der(&identity.public_key_der())
+        .expect("public key")
+        .verify(&signed, &signature)
+        .expect("valid ES256 signature");
 
     let locks_output = directory.path().join("locks.zip");
     let locks = top_command("locks", &state, &locks_output, "019e3ae0-0000-7000-8000-000000000031", 1, true)
