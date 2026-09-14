@@ -111,7 +111,8 @@ jobs:
         run: |
           set -euo pipefail
           scripts/ci/check_connect_top_disk_artifact.sh \
-            binary/rustfs "$SOURCE_SHA" "$BINARY_SHA256" top-disk-runtime-evidence.json
+            binary/rustfs "$SOURCE_SHA" "$BINARY_SHA256" \
+            top-disk-runtime-evidence.json top-disk.zip
 
       - name: Bind workflow and artifact provenance
         shell: bash
@@ -134,6 +135,8 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: connect-top-disk-evidence-${{ github.run_id }}
-          path: top-disk-runtime-evidence.json
+          path: |
+            top-disk-runtime-evidence.json
+            top-disk.zip
           retention-days: 14
           if-no-files-found: error

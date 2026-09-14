@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>" >&2
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 <rustfs-binary> <source-sha> <binary-sha256> <evidence-json> <archive-output>" >&2
   exit 2
 fi
 
@@ -24,6 +24,7 @@ binary=$(realpath "$1")
 expected_source_sha=$2
 expected_binary_sha256=$3
 evidence_json=$4
+archive_output=$5
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
@@ -162,6 +163,12 @@ if find "$work_dir" -name '*.partial' -print -quit | grep -q .; then
   echo "interrupted capture left a partial file" >&2
   exit 1
 fi
+
+if [[ -e "$archive_output" ]]; then
+  echo "refusing to replace existing archive output: $archive_output" >&2
+  exit 1
+fi
+cp -- "$output" "$archive_output"
 
 jq -n \
   --arg sourceSha "$expected_source_sha" \
