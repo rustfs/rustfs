@@ -23,7 +23,12 @@ use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
 use rand::{TryRng as _, rngs::SysRng};
-use rustfs_common::trace_bus::{TelemetryTraceOperation, TelemetryTraceStatus, subscribe_telemetry_trace_events};
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, subscribe_telemetry_trace_events, telemetry_trace_emit,
+    telemetry_trace_subscriber_count,
+};
+use rustfs_io_metrics::install_s3_http_completion_observer;
+use rustfs_s3_ops::S3Operation;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -223,11 +228,11 @@ pub enum TopApiOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopApiData {
+    pub error_count: u64,
     pub operation: TopApiOperation,
     pub request_count: u64,
-    pub error_count: u64,
-    pub window_millis: u64,
     pub total_duration_micros: u64,
+    pub window_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,6 +342,7 @@ pub async fn capture_top_api(
     let Some(_permit) = request.acquire(cancel).await? else {
         return request.cancelled(TOOL_ID);
     };
+    install_top_api_s3_completion_observer();
     let mut subscription = subscribe_telemetry_trace_events();
     let source_operation = telemetry_operation(operation);
     let started = tokio::time::Instant::now();
@@ -382,6 +388,9 @@ pub async fn capture_top_api(
     if request_count > MAX_SAFE_INTEGER || error_count > MAX_SAFE_INTEGER || total_duration_micros > MAX_SAFE_INTEGER {
         return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
     }
+    if request_count == 0 {
+        return request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool);
+    }
     let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
     request.succeeded(
         TOOL_ID,
@@ -394,6 +403,36 @@ pub async fn capture_top_api(
             total_duration_micros,
         },
     )
+}
+
+fn install_top_api_s3_completion_observer() {
+    install_s3_http_completion_observer(top_api_trace_enabled, emit_s3_request_telemetry);
+}
+
+fn top_api_trace_enabled() -> bool {
+    telemetry_trace_subscriber_count() != 0
+}
+
+fn emit_s3_request_telemetry(operation: S3Operation, duration: Duration, succeeded: bool) {
+    let Some(operation) = s3_telemetry_operation(operation) else {
+        return;
+    };
+    let status = if succeeded {
+        TelemetryTraceStatus::Ok
+    } else {
+        TelemetryTraceStatus::Error
+    };
+    telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, duration, status));
+}
+
+const fn s3_telemetry_operation(operation: S3Operation) -> Option<TelemetryTraceOperation> {
+    match operation {
+        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
+        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
+        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
+        _ => None,
+    }
 }
 
 const fn telemetry_operation(operation: TopApiOperation) -> TelemetryTraceOperation {
