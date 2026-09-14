@@ -172,6 +172,7 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
             let baseline = temporary_entries(&disks).await;
             let _ = path_count();
             let (request, sender, waiting, _) = observed_request(&bucket, &upload.upload_id, part_size);
+            let control = request.extensions.get::<BodyReadControl>().expect("raw body control").clone();
             sender
                 .send(Ok(Frame::data(Bytes::from(vec![7; partial_size]))))
                 .expect("partial body");
@@ -184,16 +185,20 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
             })
                 .await
                 .expect("storage must request raw input");
-            // Advance only after actual storage demand; filesystem setup and
-            // cleanup run on a real clock and cannot race auto-advance.
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(300)).await;
-            tokio::time::resume();
+            // The producer can request more input while encoded blocks are
+            // still being written. Elapse only the raw body's inactivity so
+            // those concurrent disk writes retain their real deadlines.
+            control.advance_wait_for_test(Duration::from_secs(300));
+            sender.send(Ok(Frame::data(Bytes::new()))).expect("wake waiting raw body");
             let error = tokio::time::timeout(Duration::from_secs(10), upload_future)
                 .await
                 .expect("inline cleanup must complete")
                 .expect_err("stalled part");
-            assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+            assert_eq!(
+                error.code(),
+                &S3ErrorCode::RequestTimeout,
+                "part_size={part_size}, capped={capped}, replacement={replacement}, retry_after_failure={retry_after_failure}: {error:?}"
+            );
             assert_eq!(path_count(), 1, "failure must exercise {path}");
             assert!(sender.is_closed(), "producer must release the failed raw body");
             assert_eq!(

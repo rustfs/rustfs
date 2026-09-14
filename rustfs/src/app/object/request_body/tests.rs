@@ -27,6 +27,19 @@ mod protocol;
 
 type FrameSender = mpsc::UnboundedSender<Result<Frame<Bytes>, io::Error>>;
 
+impl BodyReadControl {
+    /// Elapse this body's active wait without advancing storage timers.
+    /// The fixture must wake the raw body afterward so it polls the deadline.
+    pub(crate) fn advance_wait_for_test(&self, elapsed: Duration) {
+        let mut state = self.0.budget.lock();
+        assert!(
+            state.demand && state.waiting_since.is_some(),
+            "body must already be waiting for raw input"
+        );
+        state.waited = state.waited.saturating_add(elapsed);
+    }
+}
+
 fn raw_reader(timeout: Duration) -> (FrameSender, DynReader, BodyReadControl) {
     let (sender, receiver) = mpsc::unbounded_channel();
     let control = BodyReadControl::default();
