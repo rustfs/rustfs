@@ -17,6 +17,7 @@
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
     classify_listed_key_failure, ensure_key_status_permits, ensure_tag_keys_are_mutable, paginate_keys, started_at_the_first_key,
+    validate_key_id_segment,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -62,14 +63,9 @@ use zeroize::Zeroizing;
 /// pub(crate) because the backup restore path applies the same containment
 /// rule to key identifiers recovered from bundle artifacts.
 pub(crate) fn validate_key_id(key_id: &str) -> Result<()> {
-    if key_id.is_empty() {
-        return Err(KmsError::invalid_key("key identifier must not be empty"));
-    }
-    if key_id.contains('/') || key_id.contains('\\') || key_id.contains('\0') {
-        return Err(KmsError::invalid_key(format!(
-            "key identifier must not contain path separators or NUL: {key_id:?}"
-        )));
-    }
+    // The separator, NUL and dot-segment refusals are shared with the Vault
+    // backends; the component check below is the filesystem-specific half.
+    validate_key_id_segment(key_id)?;
 
     // Catches `.`, `..`, absolute paths, and platform-specific forms such as Windows
     // drive prefixes, all of which would move the join outside key_dir.
@@ -3405,8 +3401,8 @@ mod tests {
 
         // The invariant is containment, so assert that directly: whatever the input, the
         // result is either refused or a path whose parent is exactly the key directory.
-        // Note `.` and `..` are contained rather than refused — the `.key` suffix turns
-        // them into the ordinary filenames `..key` and `...key`.
+        // `.` and `..` would be contained by the `.key` suffix alone, but the shared
+        // segment rule refuses them so every backend answers alike.
         for candidate in [
             "../escape",
             "../../etc/rustfs",
@@ -3431,7 +3427,7 @@ mod tests {
         }
 
         // The traversal forms specifically must be refused, not merely contained.
-        for escaping in ["../escape", "sub/dir", "/absolute", "back\\slash", "nul\0byte", ""] {
+        for escaping in ["../escape", "sub/dir", "/absolute", "back\\slash", "nul\0byte", "", ".", ".."] {
             let err = client.master_key_path(escaping).expect_err("traversal must be refused");
             assert!(
                 matches!(err, KmsError::InvalidKey { .. }),
