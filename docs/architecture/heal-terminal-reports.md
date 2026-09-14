@@ -1,0 +1,29 @@
+# Retained Admin Heal Reports
+
+Admin heal tokens retain their terminal status for ten minutes from the original completion time. The persistence owner is `RootHealRecovery` in `crates/heal/src/heal/manager/root_recovery.rs`; the bounded report codec is in `crates/heal/src/heal/manager/root_recovery/report.rs`.
+
+## Publication and Recovery
+
+The original schema-1 `terminal-root-heal-<token>.json` remains the commit marker. Its separate `heal-terminal-report-<token>.json` report has its own schema version and embeds the exact terminal identity. Both files belong to the same coordinator disk as the pending intent.
+
+Publication writes the report through the storage owner's conditional file update, writes the terminal marker, and then conditionally removes the pending intent. Recovery never treats a report without its marker as committed. A committed terminal continues to suppress stale pending work even when its report is unreadable. An initial publication failure leaves the existing responsibility available for recovery.
+
+The report preserves the canonical execution, traversal coverage, cumulative counters, diagnostic object window, progress, legacy result window, truncation flags, and incremental cursors. Restoring it neither recounts objects nor derives counters from progress. Its embedded terminal must match the retained marker before the report can be returned.
+
+## Cancellation
+
+An active cancellation first publishes an `aborted/cancelled` partial snapshot before retiring active ownership. The worker can subsequently finish recording its last object. Its final report replaces the earlier report, while the terminal marker and original completion timestamp remain unchanged. Cancelling a retry preserves any retained preceding attempt's outcome; unavailable historical counters remain unavailable.
+
+If the final report update fails, the scheduler rereads the disk because an error can occur after publication. It returns that persisted report when readable. If the result cannot be resolved, the cached response exposes no canonical outcome or result window and marks the detail as truncated. It does not assume that the previous report won an uncertain write.
+
+## Bounds and Retention
+
+Report encoding and reading each enforce an 8 MiB JSON limit. The canonical diagnostic window retains at most 128 objects and 64 KiB of object storage accounting, with at most 1 KiB per detail. The legacy result window retains the existing 1 MiB memory budget. Decoding validates the report version, terminal identity, terminal execution, counters, object bounds, and cursor ordering, and reconstructs memory accounting.
+
+GC uses the original completion timestamp, including after repeated restarts or cancellation refinement. For an expired terminal, it removes stale pending work before the report and marker. Report deletions share the existing 64-deletion budget. Expired orphan reports left before marker publication or by rollback GC are removed without deleting pending responsibility. Corrupt records are retained and reported as errors.
+
+## Upgrade and Rollback
+
+Schema-1 terminals without reports remain queryable. A terminal response without a canonical outcome adds `outcomeStatus: "unavailable"`; it does not fabricate counters or complete coverage. Missing historical result windows are marked truncated. Responses with an outcome and running responses do not add this field.
+
+Older binaries retain their original terminal decoder and ignore the distinct report namespace. They continue to query status and prevent replay, but do not expose the new report's outcome. A later upgrade can read a retained report again; reports whose markers were collected by the old binary are handled as uncommitted orphans. Rollback therefore preserves the old status/replay contract, not the new outcome capability.

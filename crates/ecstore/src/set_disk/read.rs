@@ -540,7 +540,7 @@ impl SetDisks {
 
         let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object, &vid]))
         {
             Ok(v) => v,
             Err(e) => {
@@ -564,7 +564,7 @@ impl SetDisks {
                 GET_STAGE_METADATA_RESOLVE,
                 metadata_resolve_stage_start,
             );
-            return Err(to_object_err(err.into(), vec![bucket, object]));
+            return Err(to_object_err(err.into(), vec![bucket, object, &vid]));
         }
 
         let (op_online_disks, mut fi, fileinfo_selection_quorum) =

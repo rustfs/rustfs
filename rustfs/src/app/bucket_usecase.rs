@@ -1914,9 +1914,11 @@ impl DefaultBucketUsecase {
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((cfg, _)) => cfg.rules,
-            Err(_) => {
+            Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
+            // An unreadable stored configuration is not an absent one.
+            Err(err) => return Err(ApiError::from(err).into()),
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
@@ -1940,17 +1942,24 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
-            warn!(
-                component = LOG_COMPONENT_APP,
-                subsystem = LOG_SUBSYSTEM_BUCKET,
-                event = "bucket_notification_config_load_failed",
-                bucket = %bucket,
-                error = ?err,
-                "Failed to load bucket notification configuration"
-            );
-            None
-        });
+        let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
+            Ok(config) => config,
+            // An unreadable config is not "no notifications configured".
+            Err(err) if crate::storage_api::error::is_unreadable_config_error(&err) => {
+                return Err(ApiError::from(err).into());
+            }
+            Err(err) => {
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_notification_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket notification configuration"
+                );
+                None
+            }
+        };
 
         if let Some(NotificationConfiguration {
             event_bridge_configuration,

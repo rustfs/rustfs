@@ -145,6 +145,17 @@ fn get_skip_verify_bitrot() -> bool {
     }
 }
 
+/// Like [`bucket_versioning_config`], for laying out an object write or
+/// delete: an unreadable stored configuration is refused in strict mode
+/// instead of being read as unversioned (rustfs/backlog#1734).
+async fn bucket_versioning_config_for_write(bucket: &str) -> Result<VersioningConfiguration> {
+    #[cfg(test)]
+    VERSIONING_CONFIG_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    wait_for_versioning_config_test_hook(bucket).await;
+    BucketVersioningSys::get_for_write(bucket).await
+}
+
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
     bucket: &str,
@@ -153,7 +164,7 @@ pub async fn del_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     del_opts_with_versioning(bucket, object, vid, headers, metadata, &versioning_cfg, false)
 }
 
@@ -350,7 +361,7 @@ pub async fn put_opts_with_replication_authorization(
     metadata: HashMap<String, String>,
     replication_request_authorized: bool,
 ) -> Result<ObjectOptions> {
-    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
 

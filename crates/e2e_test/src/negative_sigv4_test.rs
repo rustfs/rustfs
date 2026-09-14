@@ -261,6 +261,118 @@ async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+const XM99_SOURCE_BUCKET: &str = "xm99-private-source";
+const XM99_SOURCE_BODY: &[u8] = b"private source object";
+const XM99_TARGET_BODY: &[u8] = b"original target object";
+
+/// Seed a private source object and upload the target with a plain
+/// header-signed PutObject, returning the target path and the copy source.
+async fn xm99_seed_target(
+    env: &RustFSTestEnvironment,
+    signer: &SigV4,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    env.create_test_bucket(XM99_SOURCE_BUCKET).await?;
+    env.create_s3_client()
+        .put_object()
+        .bucket(XM99_SOURCE_BUCKET)
+        .key("secret")
+        .body(ByteStream::from_static(XM99_SOURCE_BODY))
+        .send()
+        .await?;
+
+    let path = format!("/{BUCKET}/xm99-target");
+    let signed = signer.sign("PUT", &path, "", UNSIGNED_PAYLOAD);
+    let resp = send_signed(env, reqwest::Method::PUT, &path, &signed, Some(XM99_TARGET_BODY.to_vec())).await?;
+    assert_eq!(resp.status().as_u16(), 200, "plain header-signed upload must succeed");
+    Ok((path, format!("/{XM99_SOURCE_BUCKET}/secret")))
+}
+
+async fn xm99_target_body(env: &RustFSTestEnvironment) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let object = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key("xm99-target")
+        .send()
+        .await?;
+    Ok(object.body.collect().await?.into_bytes().to_vec())
+}
+
+/// GHSA-xm99-m3gq-83g8: replaying a header-signed PutObject with an unsigned
+/// `x-amz-copy-source` must not become a CopyObject that reads another bucket
+/// with the signer's permissions, and swapping the algorithm token must not
+/// route the request around the check.
+#[tokio::test]
+async fn ghsa_xm99_header_sigv4_rejects_unsigned_copy_source() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let signer = SigV4::new(&env);
+    let (path, copy_source) = xm99_seed_target(&env, &signer).await?;
+
+    // The PutObject signature covers host, payload hash and date only.
+    let signed = signer.sign("PUT", &path, "", UNSIGNED_PAYLOAD);
+    let variants = [
+        (
+            signed.authorization.clone(),
+            "There were headers present in the request which were not signed",
+        ),
+        (
+            signed.authorization.replacen(SIGN_V4_ALGORITHM, "OTHER", 1),
+            "Unsupported SigV4 authorization algorithm",
+        ),
+    ];
+    for (authorization, message) in variants {
+        let resp = local_http_client()
+            .put(format!("{}{path}", env.url))
+            .header("authorization", &authorization)
+            .header("x-amz-date", &signed.amz_date)
+            .header("x-amz-content-sha256", &signed.content_sha256)
+            .header("x-amz-copy-source", &copy_source)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await?;
+        assert_eq!(status, 403, "unsigned x-amz-copy-source must be denied, got body:\n{body}");
+        assert_error_code(&body, "AccessDenied");
+        assert!(body.contains(message), "expected {message:?} in response body, got:\n{body}");
+    }
+
+    assert_eq!(
+        xm99_target_body(&env).await?,
+        XM99_TARGET_BODY,
+        "a rejected copy must leave the destination object unchanged"
+    );
+    Ok(())
+}
+
+/// Positive control for GHSA-xm99-m3gq-83g8: the same CopyObject succeeds when
+/// the credential holder signs `x-amz-copy-source`.
+#[tokio::test]
+async fn ghsa_xm99_header_sigv4_accepts_signed_copy_source() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let signer = SigV4::new(&env);
+    let (path, copy_source) = xm99_seed_target(&env, &signer).await?;
+
+    let signed = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD, &[("x-amz-copy-source", &copy_source)]);
+    let resp = local_http_client()
+        .put(format!("{}{path}", env.url))
+        .header("authorization", &signed.authorization)
+        .header("x-amz-date", &signed.amz_date)
+        .header("x-amz-content-sha256", &signed.content_sha256)
+        .header("x-amz-copy-source", &copy_source)
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+    assert_eq!(status, 200, "signed copy must succeed, got body:\n{body}");
+    assert!(body.contains("CopyObjectResult"), "expected CopyObjectResult, got:\n{body}");
+    assert_eq!(xm99_target_body(&env).await?, XM99_SOURCE_BODY, "signed copy must replace the target");
+    Ok(())
+}
+
 /// (a) Tampering the `Signature=` component must be rejected with
 /// SignatureDoesNotMatch / 403.
 #[tokio::test]

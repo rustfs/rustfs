@@ -410,7 +410,13 @@ impl SetDisks {
         default_parity_count: usize,
     ) -> disk::error::Result<(i32, i32)> {
         if Self::all_not_found_metadata(errs) {
-            return Err(DiskError::FileNotFound);
+            // Preserve explicit-version absence from the disk replies before
+            // the object/API error boundary assigns the S3 error code.
+            return Err(if errs.iter().any(|err| matches!(err, Some(DiskError::FileVersionNotFound))) {
+                DiskError::FileVersionNotFound
+            } else {
+                DiskError::FileNotFound
+            });
         }
 
         let expected_rquorum = if default_parity_count == 0 {

@@ -2294,7 +2294,8 @@ impl HealManager {
         source: HealRequestSource,
         options: &HealOptions,
     ) -> Result<bool> {
-        let completed = CompletedHealStatus {
+        let previous = self.completed_heals.lock().await.get(task_id).cloned();
+        let mut completed = CompletedHealStatus {
             outcome: None,
             progress: None,
             retained_bytes: std::sync::OnceLock::new(),
@@ -2307,6 +2308,17 @@ impl HealManager {
             next_seq: 0,
             min_seq: 0,
         };
+        if let Some(previous) = previous.filter(|previous| previous.heal_type == *heal_type) {
+            completed.progress = previous.progress.clone();
+            completed.outcome = previous.outcome.as_deref().cloned().map(|mut outcome| {
+                outcome.finish(Some(crate::heal::outcome::HealAbortReason::Cancelled));
+                Arc::new(outcome)
+            });
+            completed.seqed_items = previous.seqed_items.clone();
+            completed.next_seq = previous.next_seq;
+            completed.min_seq = previous.min_seq;
+            completed.result_items_truncated = previous.result_items_truncated;
+        }
         self.publish_admin_terminal(task_id, heal_type, source, &completed).await
     }
 

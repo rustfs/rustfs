@@ -492,8 +492,19 @@ impl HealTask {
                 .collect(),
         };
 
+        // Cluster and prefix requests have no bucket identity at admission.
+        // Pin it before enumeration and retain it across sets and object retries:
+        // a deleted candidate must never be repaired or certified in a successor bucket.
+        let traversal_incarnation_id = match self.bucket_incarnation_id {
+            Some(expected) => Some(expected),
+            None if self.source == HealRequestSource::Admin && !heal_opts.dry_run => {
+                Some(self.await_with_control(self.storage.admit_bucket_incarnation(bucket)).await?)
+            }
+            None => None,
+        };
+
         for (set_disk_id, heal_opts) in listing_scopes {
-            let bucket_incarnation_id = match self.bucket_incarnation_id {
+            let bucket_incarnation_id = match traversal_incarnation_id {
                 Some(expected) => {
                     self.await_with_control(self.storage.validate_bucket_incarnation(bucket, Some(expected)))
                         .await?;
@@ -621,7 +632,7 @@ impl HealTask {
                     } else {
                         match self
                             .await_with_control(async {
-                                match self.bucket_incarnation_id {
+                                match traversal_incarnation_id {
                                     Some(expected) => {
                                         self.storage
                                             .heal_object_at_incarnation(
