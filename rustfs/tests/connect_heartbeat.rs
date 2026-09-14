@@ -296,6 +296,7 @@ fn config_with_stores(
             max_backoff: Duration::from_millis(80),
         },
         proxy: None,
+        diagnostic_job_signer: None,
     }
 }
 
