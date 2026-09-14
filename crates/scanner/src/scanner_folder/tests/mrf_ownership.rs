@@ -252,14 +252,16 @@ impl HealStorageAPI for NoticeStorage {
         _: Option<&str>,
         _: &HealOpts,
     ) -> rustfs_heal::Result<(HealItem, Option<rustfs_heal::Error>)> {
-        let retry = {
+        let call = {
             let mut calls = self.calls.lock().expect("fixture calls");
             let count = calls.entry(object.to_string()).or_default();
             *count += 1;
-            *count > 1
+            *count
         };
-        if retry {
-            self.retry_started.notify_one();
+        if call > 1 {
+            if call == 2 {
+                self.retry_started.notify_one();
+            }
             std::future::pending::<()>().await;
         }
         match object {
@@ -336,18 +338,24 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
         bucket_incarnation_id: Uuid::new_v4(),
         ..Default::default()
     });
+    const OBJECTS: [&str; 4] = ["grace", "unknown", "failed", "cancelled"];
     let manager = Arc::new(HealManager::new(
         storage.clone(),
         Some(HealConfig {
             enable_auto_heal: false,
             mainline_throttle_enable: false,
             heal_interval: Duration::from_millis(10),
+            // Unproved partial writes remain durable after cancellation and
+            // may replay while later cases run. Give every retained case a
+            // slot so an earlier blocked retry cannot starve the next case.
+            max_concurrent_heals: OBJECTS.len(),
+            max_concurrent_per_set: OBJECTS.len(),
             ..Default::default()
         }),
     ));
     manager.start().await.expect("production manager starts");
     spawn_mrf_consumer(manager.clone());
-    for (index, object) in ["grace", "unknown", "failed", "cancelled"].iter().enumerate() {
+    for (index, object) in OBJECTS.iter().enumerate() {
         let version = Uuid::new_v4();
         scanner.new_cache.info.pending_heals.push(pending_heal(
             PendingScannerHealKind::Object,
