@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfs_ecstore::api::bucket::metadata::BUCKET_TAGGING_CONFIG;
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
+use rustfs_ecstore::api::bucket::metadata::{BUCKET_TAGGING_CONFIG, is_unreadable_config_error};
 use rustfs_ecstore::api::bucket::metadata_sys::{get as get_swift_bucket_metadata_from_backend, update_config_with};
 use rustfs_ecstore::api::bucket::utils::serialize as serialize_bucket_config;
 use rustfs_ecstore::api::error::Error as SwiftStorageError;
@@ -62,11 +62,6 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_STORAGE: &str = "swift_storage";
 const EVENT_SWIFT_BUCKET_TAGGING_UPDATE: &str = "swift_bucket_tagging_update";
 
-/// Marks the refusal to rewrite an unreadable persisted tagging config, so the
-/// caller can turn it into an actionable client error rather than a generic
-/// storage failure. Carried through the ecstore error, which is a string type.
-const UNREADABLE_TAGGING_SENTINEL: &str = "swift: persisted tagging config could not be parsed";
-
 pub type SwiftGetObjectReader = <SwiftStore as storage_contracts::ObjectIO>::GetObjectReader;
 pub type SwiftObjectInfo = <SwiftStore as storage_contracts::ObjectOperations>::ObjectInfo;
 pub type SwiftObjectOptions = <SwiftStore as storage_contracts::ObjectOperations>::ObjectOptions;
@@ -105,15 +100,11 @@ where
     // write has to fail with to abort the transaction.
     let mut rejected = None;
 
+    // `update_config_with` refuses to run this closure over an unparseable
+    // tag set: merging onto it would silently drop every tag the bucket has —
+    // including the container ACL and versioning tags — because the rewrite
+    // closures treat "no parsed tags" as "no tags".
     let result = update_config_with(&bucket, BUCKET_TAGGING_CONFIG, |bm| {
-        // Merging onto an unparseable tag set would silently drop every tag
-        // the bucket has — including the container ACL and versioning tags —
-        // because the rewrite closures treat "no parsed tags" as "no tags".
-        // Refuse instead: the persisted config is intact, just unreadable.
-        if !bm.tagging_config_xml.is_empty() && bm.tagging_config.is_none() {
-            return Err(SwiftStorageError::other(UNREADABLE_TAGGING_SENTINEL));
-        }
-
         let tagging = match rewrite(bm.tagging_config.as_ref()) {
             Ok(tagging) => tagging,
             Err(err) => {
@@ -140,7 +131,7 @@ where
     }
 
     if let Err(err) = result {
-        let unreadable = err.to_string().contains(UNREADABLE_TAGGING_SENTINEL);
+        let unreadable = is_unreadable_config_error(&err);
         tracing::error!(
             event = EVENT_SWIFT_BUCKET_TAGGING_UPDATE,
             component = LOG_COMPONENT_PROTOCOLS,

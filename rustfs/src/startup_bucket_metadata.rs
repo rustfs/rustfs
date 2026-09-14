@@ -21,6 +21,7 @@ use crate::storage_api::startup::bucket_metadata::{
     reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
+    future::Future,
     io::{Error as IoError, Result as IoResult},
     sync::Arc,
     time::{Duration, Instant},
@@ -35,6 +36,8 @@ const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_STARTED: &str = "replication_r
 const LOG_COMPONENT_STARTUP_BUCKET_METADATA: &str = "startup_bucket_metadata";
 const LOG_SUBSYSTEM_ON_DEMAND_MIGRATION: &str = "on_demand_migration";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
+const IAM_MIGRATION_MAX_RETRIES: usize = 15;
+const IAM_MIGRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const METRIC_REPLICATION_RESYNC_STARTUP_BACKGROUND_DURATION_SECONDS: &str =
     "rustfs_replication_resync_startup_background_duration_seconds";
 const METRIC_REPLICATION_RESYNC_STARTUP_BACKGROUND_EVENTS_TOTAL: &str =
@@ -84,12 +87,57 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     try_migrate_bucket_metadata(store.clone()).await?;
 
-    try_migrate_iam_config(store.clone()).await?;
+    retry_iam_config_migration(|| try_migrate_iam_config(store.clone())).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);
 
     Ok(buckets)
+}
+
+async fn retry_iam_config_migration<Operation, OperationFuture>(mut operation: Operation) -> IoResult<()>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = IoResult<()>>,
+{
+    retry_iam_config_migration_with(&mut operation, IAM_MIGRATION_MAX_RETRIES, IAM_MIGRATION_RETRY_INTERVAL).await
+}
+
+async fn retry_iam_config_migration_with<Operation, OperationFuture>(
+    operation: &mut Operation,
+    max_retries: usize,
+    retry_interval: Duration,
+) -> IoResult<()>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = IoResult<()>>,
+{
+    let mut retries = 0;
+    loop {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) if iam_migration_error_is_retryable(&error) && retries < max_retries => {
+                retries += 1;
+                tracing::warn!(
+                    component = LOG_COMPONENT_STARTUP_BUCKET_METADATA,
+                    subsystem = "iam_migration",
+                    retry_count = retries,
+                    max_retries,
+                    error = %error,
+                    "IAM config migration hit a transient quorum error; retrying"
+                );
+                tokio::time::sleep(retry_interval).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn iam_migration_error_is_retryable(error: &IoError) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<StorageError>())
+        .is_some_and(StorageError::is_quorum_error)
 }
 
 /// Publishes the on-demand migration module switch, installs the app-layer
@@ -280,5 +328,42 @@ mod tests {
         assert_eq!(STARTUP_BACKGROUND_STATUS_SUCCEEDED, 1.0);
         assert_eq!(STARTUP_BACKGROUND_STATUS_RUNNING, 2.0);
         assert_eq!(STARTUP_BACKGROUND_STATUS_CANCELED, 3.0);
+    }
+
+    #[tokio::test]
+    async fn iam_migration_retries_only_quorum_errors() {
+        let mut attempts = 0;
+        retry_iam_config_migration_with(
+            &mut || {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(IoError::other(StorageError::InsufficientReadQuorum(
+                        ".minio.sys".into(),
+                        "config/iam/".into(),
+                    )))
+                } else {
+                    Ok(())
+                })
+            },
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .expect("quorum recovery must allow startup to continue");
+        assert_eq!(attempts, 2);
+
+        let mut deterministic_attempts = 0;
+        let error = retry_iam_config_migration_with(
+            &mut || {
+                deterministic_attempts += 1;
+                std::future::ready(Err(IoError::other("incompatible IAM metadata")))
+            },
+            1,
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("deterministic migration errors must fail immediately");
+        assert_eq!(error.to_string(), "incompatible IAM metadata");
+        assert_eq!(deterministic_attempts, 1);
     }
 }

@@ -27,7 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
-use rustfs_common::trace_bus::subscribe_trace_events;
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, subscribe_telemetry_trace_events,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -131,14 +133,14 @@ pub struct RecordedTrace {
     pub dropped_span_count: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TraceRecordCompletion {
     Complete,
     LimitExceeded,
     SourceUnavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceRecordCapture {
     pub data: RecordedTrace,
     pub completion: TraceRecordCompletion,
@@ -162,6 +164,14 @@ impl LocalTelemetryConsent {
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(TelemetryProducerError::ConsentExpired)
+    }
+
+    fn capture_deadline(self, duration: Duration) -> Result<Instant, TelemetryProducerError> {
+        let deadline = Instant::now() + duration;
+        if deadline > self.expires_at {
+            return Err(TelemetryProducerError::ConsentExpired);
+        }
+        Ok(deadline)
     }
 }
 
@@ -563,12 +573,8 @@ pub async fn record_trace(
     if cancel.is_cancelled() {
         return Err(TelemetryProducerError::Cancelled);
     }
-    let remaining = consent.remaining()?;
-    if remaining < limits.duration {
-        return Err(TelemetryProducerError::ConsentExpired);
-    }
+    let deadline = consent.capture_deadline(limits.duration)?;
     let _lease = acquire_telemetry_lease()?;
-    let deadline = Instant::now() + limits.duration;
     let mut spans = Vec::with_capacity(limits.max_spans.min(64));
     let mut dropped_span_count = 0u64;
     let mut completion = TraceRecordCompletion::Complete;
@@ -610,13 +616,7 @@ pub async fn record_trace(
     })
 }
 
-/// Capture the process-local RustFS trace bus.
-///
-/// The current bus exposes only heal and scanner operations, none of which has
-/// the frozen GET/PUT/HEAD/LIST/INTERNAL_RPC semantics. The adapter consumes
-/// that real source but refuses to infer an operation or status from raw
-/// fields, so it remains unavailable until RustFS publishes an approved typed
-/// event.
+/// Capture the process-local, pre-classified S3 and internode RPC trace source.
 pub async fn record_trace_bus(
     consent: LocalTelemetryConsent,
     limits: TraceRecordLimits,
@@ -626,22 +626,78 @@ pub async fn record_trace_bus(
     if cancel.is_cancelled() {
         return Err(TelemetryProducerError::Cancelled);
     }
-    let remaining = consent.remaining()?;
-    if remaining < limits.duration {
-        return Err(TelemetryProducerError::ConsentExpired);
-    }
+    let deadline = consent.capture_deadline(limits.duration)?;
     let _lease = acquire_telemetry_lease()?;
-    let deadline = Instant::now() + limits.duration;
-    let mut subscription = subscribe_trace_events();
+    let mut subscription = subscribe_telemetry_trace_events();
+    let mut spans = Vec::with_capacity(limits.max_spans.min(64));
+    let mut dropped_span_count = 0u64;
+    let mut completion = TraceRecordCompletion::Complete;
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(TelemetryProducerError::Cancelled),
-            _ = tokio::time::sleep_until(deadline.into()) => return Err(TelemetryProducerError::SourceUnavailable),
+            _ = tokio::time::sleep_until(deadline.into()) => break,
             received = subscription.recv() => match received {
-                Ok(_event) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_dropped)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(TelemetryProducerError::SourceUnavailable),
+                Ok(event) => {
+                    if spans.len() == limits.max_spans {
+                        completion = TraceRecordCompletion::LimitExceeded;
+                        dropped_span_count = dropped_span_count.saturating_add(1).min(MAX_SAFE_INTEGER);
+                        drain_telemetry_drops(&mut subscription, &mut dropped_span_count);
+                        break;
+                    }
+                    spans.push(to_contract_span(observe_trace_bus_event(&event))?);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    completion = TraceRecordCompletion::LimitExceeded;
+                    dropped_span_count = dropped_span_count.saturating_add(dropped).min(MAX_SAFE_INTEGER);
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    if spans.is_empty() {
+                        return Err(TelemetryProducerError::SourceUnavailable);
+                    }
+                    completion = TraceRecordCompletion::SourceUnavailable;
+                    break;
+                }
+            }
+        }
+    }
+
+    let result = RecordedTrace {
+        spans,
+        dropped_span_count,
+    };
+    ensure_result_size(&result)?;
+    Ok(TraceRecordCapture {
+        data: result,
+        completion,
+    })
+}
+
+fn observe_trace_bus_event(event: &TelemetryTraceEvent) -> ObservedTelemetrySpan {
+    let operation = match event.operation {
+        TelemetryTraceOperation::GetObject => TelemetryOperation::GetObject,
+        TelemetryTraceOperation::PutObject => TelemetryOperation::PutObject,
+        TelemetryTraceOperation::HeadObject => TelemetryOperation::HeadObject,
+        TelemetryTraceOperation::ListObjects => TelemetryOperation::ListObjects,
+        TelemetryTraceOperation::InternalRpc => TelemetryOperation::InternalRpc,
+    };
+    let status = match event.status {
+        TelemetryTraceStatus::Ok => TelemetrySpanStatus::Ok,
+        TelemetryTraceStatus::Error => TelemetrySpanStatus::Error,
+    };
+    ObservedTelemetrySpan::new(operation, event.duration, status)
+}
+
+fn drain_telemetry_drops(subscription: &mut rustfs_common::trace_bus::TelemetryTraceSubscription, dropped_span_count: &mut u64) {
+    loop {
+        match subscription.try_recv() {
+            Ok(_) => *dropped_span_count = dropped_span_count.saturating_add(1).min(MAX_SAFE_INTEGER),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) => {
+                *dropped_span_count = dropped_span_count.saturating_add(dropped).min(MAX_SAFE_INTEGER);
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty | tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                break;
             }
         }
     }

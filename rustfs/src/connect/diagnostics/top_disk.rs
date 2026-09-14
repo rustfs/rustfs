@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.disk";
+pub const TOP_DISK_CAPABILITY: &str = "top.disk@1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskCounterSnapshot {

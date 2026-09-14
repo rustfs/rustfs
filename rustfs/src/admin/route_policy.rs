@@ -819,6 +819,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/gateway-key-inventory",
+        INSPECT_DATA,
+        RouteRiskLevel::High,
+    ),
     // MinIO-compatible profiling / trace endpoints.
     admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
     admin(
@@ -2322,6 +2328,12 @@ mod tests {
     #[test]
     fn route_policy_requires_dedicated_inspect_action_for_encrypted_archive() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA);
+    }
+
+    #[test]
+    fn route_policy_requires_inspect_action_for_gateway_key_inventory() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/gateway-key-inventory", INSPECT_DATA);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/gateway-key-inventory", SERVER_INFO);
     }
 
     #[test]

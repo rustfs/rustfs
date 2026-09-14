@@ -128,6 +128,39 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_connect_inspect_object_parses() {
+        let result = Opt::parse_command([
+            "rustfs", "connect", "inspect", "object", "--state-dir", "/state", "--output", "/tmp/inspect.zip",
+            "--organization", "organizations/019e3ae0-0000-7000-8000-000000000021", "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022/clusterDevices/019e3ae0-0000-7000-8000-000000000023",
+            "--run-uid", "019e3ae0-0000-7000-8000-000000000024", "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000025", "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000026", "--policy-revision", "3", "--consent-expires-at",
+            "2000000000", "--expires-at", "2000000000", "--path", "/data/drive-1", "--path", "/data/drive-2",
+            "--bucket", "customer-bucket", "--object", "private/report.bin", "--acknowledge-l3",
+        ])
+        .expect("connect inspect object should parse");
+
+        match result {
+            CommandResult::ConnectInspect(opts) => {
+                assert_eq!(
+                    opts.paths,
+                    [
+                        std::path::PathBuf::from("/data/drive-1"),
+                        std::path::PathBuf::from("/data/drive-2"),
+                    ]
+                );
+                assert_eq!(opts.bucket, "customer-bucket");
+                assert_eq!(opts.object, "private/report.bin");
+            }
+            _ => panic!("expected Connect inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_parse_from_non_server_commands_falls_back_without_panicking() {
         let info_opt = Opt::parse_from(["rustfs", "info"]);
         let tls_opt = Opt::parse_from(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]);

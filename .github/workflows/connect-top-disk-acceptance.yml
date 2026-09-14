@@ -1,0 +1,142 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Connect top.disk artifact acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful main-branch Build and Release workflow run ID
+        required: true
+        type: string
+      artifact_id:
+        description: Linux x86_64 GNU artifact ID from that run
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character source commit
+        required: true
+        type: string
+      artifact_digest:
+        description: GitHub artifact digest including sha256 prefix
+        required: true
+        type: string
+      binary_sha256:
+        description: Expected rustfs binary SHA-256
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  top-disk:
+    name: Verify native Linux x86_64 top.disk artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout acceptance harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify source run and artifact identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")
+          [[ $(jq -r '.conclusion' <<<"$run") == success ]]
+          [[ $(jq -r '.head_sha' <<<"$run") == "$SOURCE_SHA" ]]
+          [[ $(jq -r '.head_branch' <<<"$run") == main ]]
+          [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
+          [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
+
+          artifact=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")
+          [[ $(jq -r '.workflow_run.id' <<<"$artifact") == "$BUILD_RUN_ID" ]]
+          [[ $(jq -r '.workflow_run.head_sha' <<<"$artifact") == "$SOURCE_SHA" ]]
+          [[ $(jq -r '.name' <<<"$artifact") == rustfs-linux-x86_64-gnu-* ]]
+          [[ $(jq -r '.digest' <<<"$artifact") == "$ARTIFACT_DIGEST" ]]
+          [[ $(jq -r '.expired' <<<"$artifact") == false ]]
+
+      - name: Download exact build artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          path: artifact
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Extract exact RustFS binary
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          short_sha=${SOURCE_SHA:0:7}
+          package=$(find artifact -type f -name "rustfs-linux-x86_64-gnu-dev-${short_sha}.zip" -print -quit)
+          [[ -n "$package" ]]
+          mkdir -p binary
+          unzip -qq "$package" rustfs -d binary
+          chmod +x binary/rustfs
+
+      - name: Run top.disk acceptance
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          scripts/ci/check_connect_top_disk_artifact.sh \
+            binary/rustfs "$SOURCE_SHA" "$BINARY_SHA256" \
+            top-disk-runtime-evidence.json top-disk.zip
+
+      - name: Bind workflow and artifact provenance
+        shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          jq \
+            --arg workflowRunId "$GITHUB_RUN_ID" \
+            --arg buildRunId "$BUILD_RUN_ID" \
+            --arg artifactId "$ARTIFACT_ID" \
+            --arg artifactDigest "$ARTIFACT_DIGEST" \
+            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest}' \
+            top-disk-runtime-evidence.json >top-disk-runtime-evidence.bound.json
+          mv top-disk-runtime-evidence.bound.json top-disk-runtime-evidence.json
+
+      - name: Upload acceptance evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: connect-top-disk-evidence-${{ github.run_id }}
+          path: |
+            top-disk-runtime-evidence.json
+            top-disk.zip
+          retention-days: 14
+          if-no-files-found: error

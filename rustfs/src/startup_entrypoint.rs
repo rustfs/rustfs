@@ -15,9 +15,11 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
-        ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
-        ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectEnvironmentInventoryOpts, ConnectInspectObjectOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts,
+        ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts,
+        ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts,
+        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
+        ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -136,15 +138,21 @@ async fn async_main() -> Result<()> {
             println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
             return Ok(());
         }
-        CommandResult::ConnectLicense(command) => return execute_connect_license(command),
+        CommandResult::ConnectLicense(command) => return execute_connect_license(command).await,
+        CommandResult::ConnectRelay(options) => return execute_connect_relay(*options).await,
+        CommandResult::ConnectReportUpload(options) => return execute_connect_report_upload(options).await,
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
-        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(options).await,
+        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(*options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
         CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
+        CommandResult::ConnectSiteReplicationPerformance(options) => {
+            return execute_connect_site_replication_performance(*options).await;
+        }
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
+        CommandResult::ConnectInspect(options) => return execute_connect_inspect(options).await,
         CommandResult::Server(config) => config,
     };
 
@@ -170,6 +178,101 @@ async fn async_main() -> Result<()> {
                 "Server runtime failed"
             );
             Err(e)
+        }
+    }
+}
+
+async fn execute_connect_inspect(options: ConnectInspectObjectOpts) -> Result<()> {
+    use crate::connect::IdentityStore;
+    use crate::connect::diagnostics::{
+        InspectArtifactConsent, InspectProvenance, InspectRequest, InspectRule, InspectRun, export_inspect_summary,
+        save_signed_inspect_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let identity = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect inspect requires an enrolled device identity"))?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = InspectRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: InspectArtifactConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        drive_roots: options.paths,
+        bucket: options.bucket,
+        object: options.object,
+        version_id: options.version_id,
+        rules: vec![
+            InspectRule::ShardBitrot,
+            InspectRule::ShardAvailability,
+            InspectRule::MetadataIdentity,
+        ],
+        max_duration: Duration::from_millis(options.duration_millis),
+        max_read_bytes: options.max_read_bytes,
+        max_memory_bytes: options.max_memory_bytes,
+        provenance: InspectProvenance::new(
+            crate::version::build::COMMIT_HASH.to_string(),
+            hash_current_executable()?,
+            env!("CARGO_PKG_VERSION").to_string(),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker_request = request.clone();
+    let mut worker = tokio::task::spawn_blocking(move || export_inspect_summary(&worker_request, &identity, &worker_cancel));
+    let run = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            worker.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut worker => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    match run {
+        InspectRun::Terminal(result) => {
+            println!("result={}", serde_json::to_string(&result).map_err(Error::other)?);
+            Err(Error::other("inspect collection did not produce an artifact"))
+        }
+        InspectRun::Signed(export) => {
+            let output = options.output;
+            let writer_cancel = cancel.clone();
+            let mut writer = tokio::task::spawn_blocking(move || save_signed_inspect_export(&output, &export, &writer_cancel));
+            let receipt = tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    writer.await.map_err(Error::other)?.map_err(Error::other)?
+                }
+                result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+            };
+            println!(
+                "artifact={} bytes={} sha256={}",
+                receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+            );
+            println!("upload=not-performed");
+            Ok(())
         }
     }
 }
@@ -296,13 +399,13 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
     use crate::connect::{
         LocalOtlpHeaders, LocallyReviewedTraceArtifact, MAX_OTLP_BODY_BYTES, MAX_TELEMETRY_RESULT_BYTES, OtlpBatch,
         RecordedTrace, TelemetryDiagnosticResult, TelemetryProducerError, TelemetryTool, TraceRecordLimits, analyze_trace,
-        export_trace_otlp_result, record_diagnostic_result, record_trace_bus, replay_trace_result,
+        export_trace_otlp_result, record_diagnostic_result, replay_trace_result, request_local_trace_capture,
     };
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     match command {
         ConnectTelemetryCommands::Record(options) => {
-            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            let (key, request, _consent) = telemetry_context(&options.artifact)?;
             request.validate().map_err(Error::other)?;
             if options.duration_millis == 0
                 || options.duration_millis > 30_000
@@ -313,8 +416,9 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
             }
             let cancel = CancellationToken::new();
             let started = Instant::now();
-            let capture = record_trace_bus(
-                consent,
+            let capture = request_local_trace_capture(
+                &options.artifact.state_dir,
+                options.artifact.consent_expires_at_unix,
                 TraceRecordLimits {
                     duration: Duration::from_millis(options.duration_millis),
                     max_spans: options.max_spans,
@@ -336,7 +440,7 @@ async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<
                     let result = record_diagnostic_result(&request, capture, started.elapsed());
                     save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
                 }
-                Err(TelemetryProducerError::SourceUnavailable) => {
+                Err(crate::connect::LocalTraceCaptureError::Producer(TelemetryProducerError::SourceUnavailable)) => {
                     let result = TelemetryDiagnosticResult::<RecordedTrace>::unsupported(
                         &request,
                         TelemetryTool::Record,
@@ -909,6 +1013,184 @@ async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpt
     Ok(())
 }
 
+async fn execute_connect_site_replication_performance(options: ConnectSiteReplicationPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationCredentials, SiteReplicationEndpoint,
+        SiteReplicationOutcome, SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
+        read_protected_site_replication_credential, save_signed_site_replication_export, sign_site_replication_export,
+        validate_site_replication_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    let late_arrival_cleanup = Duration::from_millis(options.late_arrival_cleanup_millis);
+    validate_site_replication_limits(duration, options.traffic_bytes, late_arrival_cleanup).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect site-replication performance requires an enrolled device identity"))?;
+    let source_access_key = read_protected_site_replication_credential(&options.source_access_key_file).map_err(Error::other)?;
+    let source_secret_key = read_protected_site_replication_credential(&options.source_secret_key_file).map_err(Error::other)?;
+    let source_session_token = options
+        .source_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let destination_access_key =
+        read_protected_site_replication_credential(&options.destination_access_key_file).map_err(Error::other)?;
+    let destination_secret_key =
+        read_protected_site_replication_credential(&options.destination_secret_key_file).map_err(Error::other)?;
+    let destination_session_token = options
+        .destination_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let source_ca = read_optional_root_ca(options.source_ca_file.as_deref(), "source")?;
+    let destination_ca = read_optional_root_ca(options.destination_ca_file.as_deref(), "destination")?;
+    let source = SiteReplicationEndpoint::new(
+        options.source_alias.clone(),
+        options.source_deployment_id.clone(),
+        &options.source_endpoint,
+        source_ca.as_deref(),
+        SiteReplicationCredentials {
+            access_key: source_access_key,
+            secret_key: source_secret_key,
+            session_token: source_session_token,
+        },
+        duration,
+    )
+    .map_err(Error::other)?;
+    let destination = SiteReplicationEndpoint::new(
+        options.destination_alias.clone(),
+        options.destination_deployment_id.clone(),
+        &options.destination_endpoint,
+        destination_ca.as_deref(),
+        SiteReplicationCredentials {
+            access_key: destination_access_key,
+            secret_key: destination_secret_key,
+            session_token: destination_session_token,
+        },
+        duration,
+    )
+    .map_err(Error::other)?;
+    let probe = S3SiteReplicationProbe::new(source, destination);
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = SiteReplicationPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        destination_cluster_name: options.destination_cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalSiteReplicationConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            nonce,
+            confirmed: options.acknowledge_l2,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        duration,
+        traffic_bytes: options.traffic_bytes,
+        source_alias: options.source_alias,
+        source_deployment_id: options.source_deployment_id,
+        destination_alias: options.destination_alias,
+        destination_deployment_id: options.destination_deployment_id,
+        scratch_bucket: options.scratch_bucket,
+        late_arrival_cleanup,
+        provenance: SiteReplicationProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_site_replication(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.siteReplication outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+
+    // Measurement cancellation has already completed bounded late-arrival
+    // cleanup. Preserve that terminal result in the signed offline artifact.
+    let writer_cancel = CancellationToken::new();
+    let export = sign_site_replication_export(&request, &measurement, &key, &writer_cancel).map_err(Error::other)?;
+    let output = options.output;
+    let save_cancel = writer_cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || save_signed_site_replication_export(&output, &export, &save_cancel))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    if measurement.result.outcome() != SiteReplicationOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "site-replication performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn read_optional_root_ca(path: Option<&std::path::Path>, label: &str) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::other(format!(
+            "connect site-replication {label} root CA exceeds the 1048576-byte limit"
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_relay_root_ca(path: &std::path::Path) -> Result<Vec<u8>> {
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ROOT_CA_BYTES {
+        return Err(Error::other("connect relay root CA is empty or exceeds the 1048576-byte limit"));
+    }
+    Ok(bytes)
+}
+
 async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
     use crate::connect::{
         DriveOutcome, DrivePerformanceRequest, DriveProvenance, IdentityStore, LocalDriveConsent, measure_drive,
@@ -1055,7 +1337,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                     if options.thread_scope.is_some() {
                         return Err(Error::other("--thread-scope is valid only for the threads profile"));
                     }
-                    export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
+                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
                 }
                 ConnectProfileTool::Memory => {
                     if options.thread_scope.is_some() {
@@ -1069,7 +1351,9 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                         Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
                         None => return Err(Error::other("--thread-scope is required for the threads profile")),
                     };
-                    export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+                    export_thread_profile(&request, scope, &key, &cancel)
+                        .await
+                        .map_err(Error::other)
                 }
             }
         };
@@ -1171,19 +1455,91 @@ fn enabled_build_features() -> Vec<String> {
     features
 }
 
-fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
-    use crate::connect::{apply_license_artifact, inspect_installed_license, verify_license_artifact};
+async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
+    use crate::connect::{
+        CredentialStore, HeartbeatConfig, IdentityStore, LicenseRenewalClient, LicenseRenewalOutcome, ProxyConfig,
+        apply_license_artifact, inspect_installed_license, verify_license_artifact,
+    };
 
     let scope = match &command {
         ConnectLicenseCommands::Import(options) | ConnectLicenseCommands::Verify(options) => &options.scope,
         ConnectLicenseCommands::Show(options) => options,
+        ConnectLicenseCommands::Renew(options) => &options.scope,
+        ConnectLicenseCommands::RelayExport(options) => &options.scope,
+        ConnectLicenseCommands::RelayImport(options) => &options.scope,
     };
+    if let ConnectLicenseCommands::Renew(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+        let mut config = HeartbeatConfig::new(
+            &options.endpoint,
+            root_ca_pem,
+            IdentityStore::new(scope.state_dir.join("identity")),
+            CredentialStore::new(scope.state_dir.join("credential")),
+            scope.state_dir.join("heartbeat/state.json"),
+        );
+        config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+        let outcome = LicenseRenewalClient::new(config)
+            .map_err(Error::other)?
+            .renew_installed(&scope.state_dir, &context)
+            .await
+            .map_err(Error::other)?;
+        match outcome {
+            LicenseRenewalOutcome::Requested => println!("{{\"status\":\"REQUESTED\"}}"),
+            LicenseRenewalOutcome::Pending { replacement_license_uid } => println!(
+                "{}",
+                serde_json::json!({
+                    "status": "PENDING",
+                    "replacementLicenseUid": replacement_license_uid,
+                })
+            ),
+            LicenseRenewalOutcome::Installed(report) => print_license_report(&report)?,
+        }
+        return Ok(());
+    }
+    if let ConnectLicenseCommands::RelayExport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let exported = crate::connect::export_service_license_relay(
+            &options.artifact,
+            &options.envelope,
+            &options.transfer_uid,
+            &scope.state_dir,
+            &context,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        println!("{}", serde_json::to_string(&exported).map_err(Error::other)?);
+        return Ok(());
+    }
+    if let ConnectLicenseCommands::RelayImport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let signer = crate::connect::DestinationReceiptSigner::from_private_key_file(
+            &options.receipt_signing_key_file,
+            options.receipt_key_id.clone(),
+        )
+        .map_err(Error::other)?;
+        let received = crate::connect::receive_service_license_relay(
+            &options.envelope,
+            &scope.state_dir,
+            &context,
+            &signer,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        std::io::stdout().write_all(&received.receipt_bytes)?;
+        std::io::stdout().write_all(b"\n")?;
+        return Ok(());
+    }
     let context = license_context(scope);
     let report = match context {
         Ok(context) => match &command {
             ConnectLicenseCommands::Import(options) => apply_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Verify(options) => verify_license_artifact(&options.artifact, &scope.state_dir, &context),
             ConnectLicenseCommands::Show(_) => inspect_installed_license(&scope.state_dir, &context),
+            ConnectLicenseCommands::Renew(_) => unreachable!("renewal is handled before local license commands"),
+            ConnectLicenseCommands::RelayExport(_) | ConnectLicenseCommands::RelayImport(_) => {
+                unreachable!("relay commands are handled before local license commands")
+            }
         }
         .unwrap_or_else(|error| {
             let installed = matches!(&command, ConnectLicenseCommands::Show(_))
@@ -1198,6 +1554,97 @@ fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
     } else {
         Err(Error::other(format!("Connect service license status is {}", report.status)))
     }
+}
+
+async fn execute_connect_report_upload(options: ConnectReportUploadOpts) -> Result<()> {
+    use crate::connect::{CredentialStore, HeartbeatConfig, IdentityStore, ProxyConfig, ReportUploadClient};
+
+    let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+    let mut config = HeartbeatConfig::new(
+        &options.endpoint,
+        root_ca_pem,
+        IdentityStore::new(options.state_dir.join("identity")),
+        CredentialStore::new(options.state_dir.join("credential")),
+        options.state_dir.join("heartbeat/state.json"),
+    );
+    config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = ReportUploadClient::new(config, Duration::from_secs(options.upload_timeout_seconds)).map_err(Error::other)?;
+    let cancellation = CancellationToken::new();
+    let upload = client.upload(&options.archive, &cancellation);
+    tokio::pin!(upload);
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancellation.cancel();
+            return Err(Error::other("connect report upload cancelled"));
+        }
+        result = upload.as_mut() => result.map_err(Error::other)?,
+    };
+    println!("{}", serde_json::to_string(&receipt).map_err(Error::other)?);
+    Ok(())
+}
+
+async fn execute_connect_relay(options: ConnectRelayOpts) -> Result<()> {
+    use crate::connect::{
+        ProxyConfig, RelayHttpClient, RelayMaterialKind, RelayParty, TrustedReceiptSigner, prepare_approved_artifact,
+        read_protected_relay_artifact, read_protected_relay_authentication,
+    };
+
+    if options.timeout_seconds == 0 || options.timeout_seconds > 300 {
+        return Err(Error::other("relay timeout must be between 1 and 300 seconds"));
+    }
+    let artifact = read_protected_relay_artifact(&options.artifact).map_err(Error::other)?;
+    let root_ca_pem = read_relay_root_ca(&options.ca_file)?;
+    let cookie = read_protected_relay_authentication(&options.session_cookie_file).map_err(Error::other)?;
+    let csrf_token = read_protected_relay_authentication(&options.csrf_token_file).map_err(Error::other)?;
+    let receipt_trust = TrustedReceiptSigner::from_public_key_file(&options.receipt_public_key_file, options.receipt_key_id)
+        .map_err(Error::other)?;
+    let material_kind = match options.material_kind {
+        ConnectRelayMaterialKind::OfflineEnrollmentResponse => RelayMaterialKind::OfflineEnrollmentResponse,
+        ConnectRelayMaterialKind::DiagnosticBundleManifest => RelayMaterialKind::DiagnosticBundleManifest,
+    };
+    let organization_name = format!("organizations/{}", options.organization_uid);
+    let prepared = prepare_approved_artifact(
+        &options.transfer_uid,
+        material_kind,
+        &artifact,
+        RelayParty {
+            party_type: "DEVICE".to_owned(),
+            name: options.producer_name,
+            key_id: Some(options.producer_key_id),
+        },
+        RelayParty {
+            party_type: "CONNECT".to_owned(),
+            name: organization_name,
+            key_id: None,
+        },
+        |_| options.acknowledge_reviewed,
+    )
+    .map_err(Error::other)?;
+    let proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = RelayHttpClient::new(
+        &options.endpoint,
+        &root_ca_pem,
+        &options.organization_uid,
+        options.approval_reference,
+        &cookie,
+        &csrf_token,
+        Duration::from_secs(options.timeout_seconds),
+        proxy.as_ref(),
+    )
+    .map_err(Error::other)?;
+    let delivery = client.deliver(prepared, &receipt_trust).await.map_err(Error::other)?;
+    let receipt: serde_json::Value = serde_json::from_slice(&delivery.receipt_bytes).map_err(Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "attempts": delivery.attempts,
+            "receipt": receipt,
+            "review": delivery.review,
+        })
+    );
+    Ok(())
 }
 
 fn license_context(

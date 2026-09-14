@@ -21,7 +21,7 @@ use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::client::{ClientError, ConnectClient};
+use super::client::{ClientError, ConnectClient, TransportFailure, build_client, classify_transport_failure};
 use super::config::HeartbeatConfig;
 use super::credential_store::{CredentialStoreError, DeviceCredential};
 use super::identity::IdentityError;
@@ -95,6 +95,15 @@ impl TelemetryTransport {
     }
 
     pub(crate) async fn post<T: Serialize>(&self, collection: &str, value: &T) -> Result<TelemetryDelivery, TelemetryError> {
+        self.post_expect(collection, value, StatusCode::OK).await
+    }
+
+    pub(crate) async fn post_expect<T: Serialize>(
+        &self,
+        collection: &str,
+        value: &T,
+        expected_status: StatusCode,
+    ) -> Result<TelemetryDelivery, TelemetryError> {
         let mut authenticated = self.authenticated_client().await?;
         let mut refreshed = false;
         loop {
@@ -104,6 +113,13 @@ impl TelemetryTransport {
             let response = match authenticated.client.post(url).json(value).send().await {
                 Ok(response) => response,
                 Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+                    if let Some(failure) = classify_transport_failure(&error, self.config.proxy.is_some()) {
+                        return Err(match failure {
+                            TransportFailure::ProxyAuthentication => TelemetryError::ProxyAuthentication,
+                            TransportFailure::ProxyRejected => TelemetryError::ProxyRejected,
+                            TransportFailure::TlsPeer => TelemetryError::TlsPeer,
+                        });
+                    }
                     return Ok(TelemetryDelivery::Retry { retry_after: None });
                 }
                 Err(error) => return Err(error.into()),
@@ -131,7 +147,7 @@ impl TelemetryTransport {
                     reason: response_reason(response).await,
                 });
             }
-            if status != StatusCode::OK {
+            if status != expected_status {
                 return Ok(TelemetryDelivery::Rejected {
                     status: status.as_u16(),
                     reason: response_reason(response).await,
@@ -142,6 +158,10 @@ impl TelemetryTransport {
                 body: bounded_body(response).await?,
             });
         }
+    }
+
+    pub(crate) fn presigned_client(&self, timeout: Duration) -> Result<Client, TelemetryError> {
+        build_client(&self.roots, timeout, None, self.config.proxy.as_ref()).map_err(credential_recovery_error)
     }
 
     async fn authenticated_client(&self) -> Result<AuthenticatedClient, TelemetryError> {
@@ -177,19 +197,8 @@ impl TelemetryTransport {
         pem.push(b'\n');
         pem.extend_from_slice(key.as_bytes());
         let identity = reqwest::Identity::from_pem(&pem).map_err(|_| TelemetryError::IdentityCertificate)?;
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| reqwest::Certificate::from_der(root.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.config.schedule.timeout)
-            .tls_certs_only(roots)
-            .identity(identity)
-            .build()
-            .map_err(Into::into)
+        build_client(&self.roots, self.config.schedule.timeout, Some(identity), self.config.proxy.as_ref())
+            .map_err(credential_recovery_error)
     }
 }
 
@@ -197,6 +206,10 @@ fn credential_recovery_error(error: ClientError) -> TelemetryError {
     match error {
         ClientError::Endpoint => TelemetryError::Endpoint,
         ClientError::RootCertificate => TelemetryError::RootCertificate,
+        ClientError::ProxyConfiguration(_) => TelemetryError::ProxyConfiguration,
+        ClientError::ProxyAuthentication => TelemetryError::ProxyAuthentication,
+        ClientError::ProxyRejected => TelemetryError::ProxyRejected,
+        ClientError::TlsPeer => TelemetryError::TlsPeer,
         ClientError::PendingRegistration | ClientError::PendingRotation => TelemetryError::StateConflict,
         ClientError::NotRegistered => TelemetryError::NotRegistered,
         ClientError::IdentityMissing => TelemetryError::IdentityMissing,
@@ -291,6 +304,16 @@ pub(crate) enum TelemetryError {
     Endpoint,
     #[error("Connect telemetry root CA configuration is invalid")]
     RootCertificate,
+    #[error("Connect telemetry proxy configuration is invalid")]
+    ProxyConfiguration,
+    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error("Connect telemetry retry schedule is invalid")]
     Schedule,
     #[error("RustFS is not registered with Connect")]

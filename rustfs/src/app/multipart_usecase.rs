@@ -67,6 +67,7 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
+use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
     put_object_body_read_timeout, reject_oversize_single_upload,
@@ -629,8 +630,9 @@ impl DefaultMultipartUsecase {
         let mut opts = get_complete_multipart_upload_opts_with_replication_authorization(&req.headers, replication_authorized)
             .map_err(ApiError::from)?;
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
+        let (versioned, version_suspended) = BucketVersioningSys::write_state(&bucket, &key)
+            .await
+            .map_err(ApiError::from)?;
         opts.versioned = versioned;
         opts.version_suspended = version_suspended;
         let capacity_scope_token = Uuid::new_v4();
@@ -1264,7 +1266,7 @@ impl DefaultMultipartUsecase {
             let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
                 .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1275,7 +1277,7 @@ impl DefaultMultipartUsecase {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
 
-        if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
+        if let Err(err) = reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), size < 0) {
             return Err(ApiError::from(err).into());
         }
         opts.want_checksum = reader.checksum();

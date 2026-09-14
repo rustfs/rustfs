@@ -14,7 +14,13 @@ use rustfs::connect::{
     TelemetrySpanStatus, TelemetryTool, TraceRecordCompletion, TraceRecordLimits, encode_signed_telemetry_export,
     record_diagnostic_result, record_trace, record_trace_bus, save_signed_telemetry_export,
 };
-use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
+use rustfs::server::s3_http_request_guard;
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, TraceEvent, TraceFunc, TraceKind, subscribe_trace_events,
+    telemetry_trace_emit, telemetry_trace_subscriber_count, trace_emit,
+};
+use rustfs_io_metrics::record_s3_op;
+use rustfs_s3_ops::S3Operation;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +28,16 @@ use zip::ZipArchive;
 
 fn consent() -> LocalTelemetryConsent {
     LocalTelemetryConsent::new(Instant::now() + Duration::from_secs(5)).expect("future consent")
+}
+
+async fn wait_for_telemetry_subscriber() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while telemetry_trace_subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("telemetry subscriber should become ready");
 }
 
 fn artifact_request() -> TelemetryArtifactRequest {
@@ -242,19 +258,21 @@ fn connect_trace_record_enforces_exact_duration_and_sample_boundaries() {
 
 #[tokio::test]
 #[serial]
-async fn connect_trace_record_refuses_to_relabel_the_real_heal_bus_as_frozen_telemetry() {
+async fn connect_trace_record_uses_classified_s3_and_rpc_events_only() {
+    let _unrelated_subscription = subscribe_trace_events();
     let task = tokio::spawn(async {
         record_trace_bus(
             consent(),
             TraceRecordLimits {
-                duration: Duration::from_millis(80),
+                duration: Duration::from_millis(40),
                 max_spans: 8,
             },
             &CancellationToken::new(),
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_telemetry_subscriber().await;
+
     assert!(trace_emit(|| {
         TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
             .with_bucket("SYNTHETIC_SECRET_BUCKET")
@@ -262,11 +280,121 @@ async fn connect_trace_record_refuses_to_relabel_the_real_heal_bus_as_frozen_tel
             .with_duration(Duration::from_micros(41))
             .with_attr("error", "SYNTHETIC_SECRET_ERROR")
     }));
+
+    let mut s3_request = s3_http_request_guard("GET");
+    s3_request.in_scope(|| record_s3_op(S3Operation::GetObject));
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    s3_request.response(200);
+    assert!(telemetry_trace_emit(|| {
+        TelemetryTraceEvent::new(
+            TelemetryTraceOperation::InternalRpc,
+            Duration::from_micros(41),
+            TelemetryTraceStatus::Error,
+        )
+    }));
+
+    let record = task.await.expect("capture task").expect("typed capture should succeed");
+    assert_eq!(record.completion, TraceRecordCompletion::Complete);
+    assert_eq!(record.data.spans.len(), 2);
+    assert_eq!(record.data.spans[0].operation, TelemetryOperation::GetObject);
+    assert_eq!(record.data.spans[0].status, TelemetrySpanStatus::Ok);
+    assert_eq!(record.data.spans[1].operation, TelemetryOperation::InternalRpc);
+    assert_eq!(record.data.spans[1].duration_micros, 41);
+    assert_eq!(record.data.spans[1].status, TelemetrySpanStatus::Error);
+
+    let json = serde_json::to_string(&record.data).expect("serialize typed telemetry");
+    for forbidden in ["SYNTHETIC_SECRET_BUCKET", "private/object", "SYNTHETIC_SECRET_ERROR"] {
+        assert!(!json.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_trace_record_typed_bus_stops_at_the_span_limit() {
+    let task = tokio::spawn(async {
+        record_trace_bus(
+            consent(),
+            TraceRecordLimits {
+                duration: Duration::from_secs(1),
+                max_spans: 1,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+    });
+    wait_for_telemetry_subscriber().await;
+
+    for _ in 0..3 {
+        assert!(telemetry_trace_emit(|| {
+            TelemetryTraceEvent::new(TelemetryTraceOperation::InternalRpc, Duration::from_micros(1), TelemetryTraceStatus::Ok)
+        }));
+    }
+
+    let record = task
+        .await
+        .expect("capture task")
+        .expect("bounded typed capture should finish");
+    assert_eq!(record.completion, TraceRecordCompletion::LimitExceeded);
+    assert_eq!(record.data.spans.len(), 1);
+    assert_eq!(record.data.dropped_span_count, 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_trace_record_typed_bus_honors_expiry_and_stop() {
+    let short_consent = LocalTelemetryConsent::new(Instant::now() + Duration::from_millis(10)).expect("short consent");
+    let error = record_trace_bus(
+        short_consent,
+        TraceRecordLimits {
+            duration: Duration::from_secs(1),
+            max_spans: 1,
+        },
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("capture must fit inside the consent window");
+    assert_eq!(error, TelemetryProducerError::ConsentExpired);
+
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        record_trace_bus(
+            consent(),
+            TraceRecordLimits {
+                duration: Duration::from_secs(1),
+                max_spans: 1,
+            },
+            &task_cancel,
+        )
+        .await
+    });
+    wait_for_telemetry_subscriber().await;
+    cancel.cancel();
+
     let error = task
         .await
         .expect("capture task")
-        .expect_err("heal/scanner events have no frozen telemetry semantics");
-    assert_eq!(error, TelemetryProducerError::SourceUnavailable);
+        .expect_err("cancelled typed capture must fail");
+    assert_eq!(error, TelemetryProducerError::Cancelled);
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_trace_record_completes_an_idle_typed_window_without_inventing_spans() {
+    let record = record_trace_bus(
+        consent(),
+        TraceRecordLimits {
+            duration: Duration::from_millis(5),
+            max_spans: 8,
+        },
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("idle typed source remains available");
+
+    assert_eq!(record.completion, TraceRecordCompletion::Complete);
+    assert!(record.data.spans.is_empty());
+    assert_eq!(record.data.dropped_span_count, 0);
 }
 
 #[test]

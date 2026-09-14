@@ -15,6 +15,7 @@
 use crate::runtime_sources::current_region;
 use crate::server::ShutdownHandle;
 use crate::server::runtime_sources::current_notify_interface;
+use crate::storage_api::error::{StorageError, is_unreadable_config_error};
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
@@ -169,13 +170,48 @@ fn notification_config_to_event_rules(
     Ok(event_rules)
 }
 
-async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
-    let has_notification_config = get_bucket_notification_config(bucket)
-        .await
-        .map_err(|err| NotificationError::StorageNotAvailable(format!("load bucket notification config for {bucket}: {err}")))?;
+/// One bucket's persisted notification configuration as startup sees it.
+#[derive(Debug)]
+enum BucketNotificationLookup {
+    Configured(s3s::dto::NotificationConfiguration),
+    Missing,
+    /// Stored bytes cannot be parsed. Deterministic, so a retry cannot help,
+    /// and reading it as missing would clear the bucket's rules.
+    Unreadable,
+}
 
-    match has_notification_config {
-        Some(cfg) => {
+fn classify_bucket_notification_lookup(
+    bucket: &str,
+    lookup: Result<Option<s3s::dto::NotificationConfiguration>, StorageError>,
+) -> Result<BucketNotificationLookup, NotificationError> {
+    match lookup {
+        Ok(Some(cfg)) => Ok(BucketNotificationLookup::Configured(cfg)),
+        Ok(None) => Ok(BucketNotificationLookup::Missing),
+        Err(err) if is_unreadable_config_error(&err) => {
+            error!(
+                target: "rustfs::init",
+                event = "notification_config_unreadable",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                error = %err,
+                "Bucket notification configuration is unreadable; leaving its rules unchanged"
+            );
+            Ok(BucketNotificationLookup::Unreadable)
+        }
+        Err(err) => Err(NotificationError::StorageNotAvailable(format!(
+            "load bucket notification config for {bucket}: {err}"
+        ))),
+    }
+}
+
+/// Apply one bucket's persisted notification rules. An unreadable config is
+/// isolated to its bucket: it neither aborts setup for the other buckets nor
+/// clears the bucket's rules as if it had none.
+async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
+    match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
+        BucketNotificationLookup::Unreadable => Ok(false),
+        BucketNotificationLookup::Configured(cfg) => {
             info!(
                 target: "rustfs::init",
                 event = "notification_config_loaded",
@@ -195,7 +231,7 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
                 .await?;
             Ok(true)
         }
-        None => {
+        BucketNotificationLookup::Missing => {
             info!(
                 target: "rustfs::init",
                 event = "notification_config_missing",
@@ -1375,15 +1411,41 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::{
-        build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config, notification_config_to_event_rules,
-        resolve_buffer_profile_config,
+        BucketNotificationLookup, build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config,
+        classify_bucket_notification_lookup, notification_config_to_event_rules, resolve_buffer_profile_config,
     };
     use crate::config::{BufferConfig, WorkloadProfile};
+    use crate::storage_api::error::{StorageError, UnreadableBucketConfig};
     use rustfs_config::KI_B;
     use rustfs_s3_types::EventName;
     use s3s::dto::{
         FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter,
     };
+
+    /// rustfs/backlog#1734: an unreadable notification config is isolated to
+    /// its bucket. It must not abort setup for every other bucket (a storage
+    /// fault still does, so reconciliation retries) and must not read as
+    /// missing, which would clear the bucket's rules.
+    #[test]
+    fn unreadable_notification_config_is_isolated_to_its_bucket() {
+        let unreadable = StorageError::other(UnreadableBucketConfig {
+            bucket: "b".to_string(),
+            config_file: "notification.xml".to_string(),
+            raw_len: 5,
+        });
+        assert!(matches!(
+            classify_bucket_notification_lookup("b", Err(unreadable)),
+            Ok(BucketNotificationLookup::Unreadable)
+        ));
+        assert!(matches!(
+            classify_bucket_notification_lookup("b", Ok(None)),
+            Ok(BucketNotificationLookup::Missing)
+        ));
+        assert!(matches!(
+            classify_bucket_notification_lookup("b", Err(StorageError::ErasureReadQuorum)),
+            Err(rustfs_notify::NotificationError::StorageNotAvailable(_))
+        ));
+    }
 
     #[test]
     fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
