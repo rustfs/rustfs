@@ -318,7 +318,7 @@ impl HealTask {
                         if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
                             retry_attempt = retry_attempt.saturating_add(1);
                             self.await_with_control(async {
-                                tokio::time::sleep(self.bucket_object_retry_delay(retry_attempt)).await;
+                                tokio::time::sleep(Self::bucket_object_retry_delay(&self.id, retry_attempt)).await;
                                 Ok(())
                             })
                             .await?;
@@ -578,8 +578,8 @@ impl HealTask {
                                     self.outcome.write().await.attempt_failed();
                                     if error.is_recoverable_heal() && listing_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
                                         listing_attempt += 1;
-                                        listing_due =
-                                            tokio::time::Instant::now() + self.bucket_object_retry_delay(listing_attempt);
+                                        listing_due = tokio::time::Instant::now()
+                                            + Self::bucket_object_retry_delay(&self.id, listing_attempt);
                                         continue;
                                     }
                                     self.outcome.write().await.mark_untraversable();
@@ -777,7 +777,7 @@ impl HealTask {
                                 result = "object_retry_scheduled",
                                 "Heal bucket object retry scheduled"
                             );
-                            item.defer(self.bucket_object_retry_delay(retry_attempt + 1));
+                            item.defer(Self::bucket_object_retry_delay(&self.id, retry_attempt + 1));
                             if let Err(item) = deferred.push(item) {
                                 inline_retry = Some(item);
                             }

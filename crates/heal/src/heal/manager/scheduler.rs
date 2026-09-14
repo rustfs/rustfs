@@ -197,7 +197,8 @@ impl HealManager {
                 };
                 let task = Arc::new(
                     HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
-                        .with_mainline_pacer(mainline_pacer),
+                        .with_mainline_pacer(mainline_pacer)
+                        .with_admin_recovery(root_recovery.clone()),
                 );
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());

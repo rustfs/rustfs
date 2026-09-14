@@ -16,8 +16,8 @@ use crate::heal::{
     DiskError, EcstoreError, ErasureSetHealer, HealDiskExt as _,
     erasure_healer::target_outcomes_complete,
     outcome::{
-        HealAbortReason, HealDeferredReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind,
-        HealObjectOutcome, HealObjectReceipt, HealTaskOutcome,
+        HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
+        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealTaskOutcome,
     },
     progress::HealProgress,
     resume::{
@@ -75,7 +75,7 @@ const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
 const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
 const MAX_RETAINED_HEAL_RESULT_ITEMS: usize = 1024;
 const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
-const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
+pub(super) const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
 const MAX_BUCKET_FAILURE_LOG_SAMPLES: u64 = 5;
 
 /// Emits at `$level`, demoted to `debug!` when `$demote` is true. Keeps
@@ -428,6 +428,7 @@ pub struct HealTask {
     /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
     outcome: Arc<RwLock<HealTaskOutcome>>,
+    admin_recovery: Option<Arc<super::manager::root_recovery::RootHealRecovery>>,
     /// Result items collected from storage heal calls, each stamped with a
     /// monotonically increasing sequence number for incremental consumption
     /// (the client passes the last seen seq back and receives only newer
@@ -501,6 +502,7 @@ impl HealTask {
             batch_failure: Arc::new(RwLock::new(None)),
             batch_failure_recorded: Arc::new(AtomicBool::new(false)),
             outcome: Arc::new(RwLock::new(HealTaskOutcome::default())),
+            admin_recovery: None,
             created_at: request.created_at,
             enqueued_at: request.enqueued_at,
             started_at: Arc::new(RwLock::new(None)),
@@ -556,6 +558,11 @@ impl HealTask {
         self
     }
 
+    pub(crate) fn with_admin_recovery(mut self, recovery: Arc<super::manager::root_recovery::RootHealRecovery>) -> Self {
+        self.admin_recovery = Some(recovery);
+        self
+    }
+
     async fn pace_mainline(&self) -> Result<()> {
         if let Some(pacer) = &self.mainline_pacer {
             self.await_with_control(pacer.wait(&self.cancel_token)).await?;
@@ -565,6 +572,14 @@ impl HealTask {
 
     pub fn metric_type_label(&self) -> &'static str {
         self.heal_type.kind_label()
+    }
+
+    pub(super) async fn restore_outcome(&self, mut outcome: HealTaskOutcome) {
+        let mut current = self.outcome.write().await;
+        if self.cancel_token.is_cancelled() || current.execution == HealExecutionOutcome::Aborted(HealAbortReason::Cancelled) {
+            outcome.finish(Some(HealAbortReason::Cancelled));
+        }
+        *current = outcome;
     }
 
     pub async fn get_outcome(&self) -> HealTaskOutcome {
@@ -888,10 +903,9 @@ impl HealTask {
         }
     }
 
-    fn bucket_object_retry_delay(&self, retry_attempt: u32) -> Duration {
+    pub(super) fn bucket_object_retry_delay(task_id: &str, retry_attempt: u32) -> Duration {
         let base = Duration::from_secs(2_u64.saturating_pow(retry_attempt.clamp(1, MAX_BUCKET_OBJECT_HEAL_RETRIES)));
-        let jitter_seed = self
-            .id
+        let jitter_seed = task_id
             .bytes()
             .fold(0_u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(u64::from(byte)));
         Duration::from_millis(jitter_seed % 500).saturating_add(base)
@@ -1321,7 +1335,7 @@ impl HealTask {
         self.result_items_truncated.load(Ordering::Relaxed)
     }
 
-    async fn record_result_item(&self, result: HealResultItem) {
+    pub(super) async fn record_result_item(&self, result: HealResultItem) {
         let seq = self.next_item_seq.fetch_add(1, Ordering::Relaxed);
         let mut result_items = self.result_items.write().await;
         if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {

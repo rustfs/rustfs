@@ -37,6 +37,7 @@ const CHECKPOINT_PER_VERSION_SCHEMA: u32 = 7;
 /// persist incomplete counters; schema 6 could acknowledge null as latest.
 /// Discard those positions and dedup identities and replay the scan.
 pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 7;
+const ADMIN_CHECKPOINT_SCHEMA: u32 = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CheckpointObjectOutcome {
@@ -58,12 +59,50 @@ pub struct CheckpointObjectOutcomeRecord {
     pub counter_unknown: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminErasureCheckpoint {
+    pub set_disk_id: String,
+    pub options: rustfs_heal_contracts::heal_channel::HealOpts,
+    pub buckets: std::collections::BTreeMap<String, Option<uuid::Uuid>>,
+    pub outcome: crate::heal::outcome::HealTaskOutcome,
+    pub completed: bool,
+}
+
+impl AdminErasureCheckpoint {
+    pub(crate) fn validate_scope(
+        &self,
+        set_disk_id: &str,
+        options: &rustfs_heal_contracts::heal_channel::HealOpts,
+    ) -> Result<()> {
+        let current = serde_json::to_value(options).map_err(|e| Error::InvalidCheckpoint(e.to_string()))?;
+        let saved = serde_json::to_value(self.options).map_err(|e| Error::InvalidCheckpoint(e.to_string()))?;
+        if self.set_disk_id != set_disk_id || current != saved {
+            return Err(Error::InvalidCheckpoint("Administrator checkpoint scope changed".to_string()));
+        }
+        if self.buckets.values().any(|id| {
+            if options.dry_run {
+                id.is_some()
+            } else {
+                id.is_none_or(|id| id.is_nil())
+            }
+        }) {
+            return Err(Error::InvalidCheckpoint(
+                "Administrator checkpoint lacks a bucket incarnation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
     /// on-disk schema version; absent in legacy snapshots (defaults to 0)
     #[serde(default)]
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin: Option<AdminErasureCheckpoint>,
     /// task id
     pub task_id: String,
     /// checkpoint time
@@ -116,6 +155,7 @@ impl ResumeCheckpoint {
     pub fn new(task_id: String) -> Self {
         Self {
             schema_version: CURRENT_CHECKPOINT_SCHEMA,
+            admin: None,
             task_id,
             checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             current_bucket_index: 0,
@@ -371,11 +411,19 @@ impl CheckpointManager {
         // Older checkpoints can contain identities that are not comparable to
         // the current keys or lack their corresponding aggregate counters.
         // Discard the stale sets and position so the scan restarts cleanly.
-        if checkpoint.schema_version > CURRENT_CHECKPOINT_SCHEMA {
+        let supported_schema = if checkpoint.admin.is_some() {
+            ADMIN_CHECKPOINT_SCHEMA
+        } else {
+            CURRENT_CHECKPOINT_SCHEMA
+        };
+        if checkpoint.admin.is_some() && checkpoint.schema_version < ADMIN_CHECKPOINT_SCHEMA {
+            return Err(Error::InvalidCheckpoint("Administrator outcome requires checkpoint schema 8".to_string()));
+        }
+        if checkpoint.schema_version > supported_schema {
             Self::block_invalid_snapshot(&disk, task_id).await;
             return Err(Error::TaskExecutionFailed {
                 message: format!(
-                    "Checkpoint schema {} is newer than supported schema {CURRENT_CHECKPOINT_SCHEMA}",
+                    "Checkpoint schema {} is newer than supported schema {supported_schema}",
                     checkpoint.schema_version
                 ),
             });
@@ -390,7 +438,7 @@ impl CheckpointManager {
                 )));
             }
             true
-        } else if checkpoint.schema_version >= CURRENT_CHECKPOINT_SCHEMA {
+        } else if checkpoint.schema_version >= CHECKPOINT_PER_VERSION_SCHEMA {
             Self::block_invalid_snapshot(&disk, task_id).await;
             return Err(Error::InvalidCheckpoint(format!(
                 "Resume checkpoint digest is missing for task {task_id}"
@@ -447,7 +495,7 @@ impl CheckpointManager {
             checkpoint.current_bucket_index = 0;
             checkpoint.current_object_index = 0;
         }
-        checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
+        checkpoint.schema_version = supported_schema;
 
         Ok(Self {
             disk,
@@ -559,6 +607,24 @@ impl CheckpointManager {
 
     /// Atomically persist an object's dedup identity with its aggregate result.
     pub async fn record_object_outcome(&self, record: CheckpointObjectOutcomeRecord) -> Result<()> {
+        self.record_outcome(record, None, 0).await.map(|_| ())
+    }
+
+    pub(crate) async fn set_admin(&self, admin: AdminErasureCheckpoint) -> Result<()> {
+        {
+            let mut checkpoint = self.checkpoint.write().await;
+            checkpoint.schema_version = ADMIN_CHECKPOINT_SCHEMA;
+            checkpoint.admin = Some(admin);
+        }
+        self.save_checkpoint().await
+    }
+
+    pub(crate) async fn record_outcome(
+        &self,
+        record: CheckpointObjectOutcomeRecord,
+        canonical: Option<crate::heal::outcome::HealObjectOutcome>,
+        attempt_failures: u32,
+    ) -> Result<Option<crate::heal::outcome::HealTaskOutcome>> {
         let CheckpointObjectOutcomeRecord {
             object,
             outcome,
@@ -571,6 +637,23 @@ impl CheckpointManager {
             counter_unknown,
         } = record;
         let mut checkpoint = self.checkpoint.write().await;
+        let durable_admin = canonical.is_some();
+        if let Some(canonical) = canonical {
+            let already_recorded = checkpoint.processed_objects.contains(&object)
+                || checkpoint.failed_objects.contains(&object)
+                || checkpoint.skipped_objects.contains(&object);
+            if already_recorded {
+                return Err(Error::InvalidCheckpoint("Administrator object was accounted twice".to_string()));
+            }
+            let admin = checkpoint
+                .admin
+                .as_mut()
+                .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome".to_string()))?;
+            for _ in 0..attempt_failures {
+                admin.outcome.attempt_failed();
+            }
+            admin.outcome.record(canonical);
+        }
         match outcome {
             CheckpointObjectOutcome::Processed => checkpoint.add_processed_object(object),
             CheckpointObjectOutcome::Failed => checkpoint.add_failed_object(object),
@@ -581,8 +664,18 @@ impl CheckpointManager {
         if counter_unknown {
             checkpoint.mark_counter_unknown();
         }
+        let canonical_snapshot = checkpoint
+            .admin
+            .as_ref()
+            .filter(|_| durable_admin)
+            .map(|admin| admin.outcome.clone());
         drop(checkpoint);
-        self.save_checkpoint_if_due().await
+        if durable_admin {
+            self.save_checkpoint().await?;
+        } else {
+            self.save_checkpoint_if_due().await?;
+        }
+        Ok(canonical_snapshot)
     }
 
     pub async fn update_progress(&self, successful: u64, failed: u64, skipped: u64, bytes: u64) -> Result<()> {
@@ -734,11 +827,16 @@ impl CheckpointManager {
                             message: "Existing checkpoint task id does not match filename".to_string(),
                         });
                     }
-                    if current.schema_version > CURRENT_CHECKPOINT_SCHEMA {
+                    let supported_schema = if current.admin.is_some() {
+                        ADMIN_CHECKPOINT_SCHEMA
+                    } else {
+                        CURRENT_CHECKPOINT_SCHEMA
+                    };
+                    if current.schema_version > supported_schema {
                         Self::block_invalid_snapshot(&self.disk, &checkpoint.task_id).await;
                         return Err(Error::TaskExecutionFailed {
                             message: format!(
-                                "Existing checkpoint schema {} is newer than supported schema {CURRENT_CHECKPOINT_SCHEMA}",
+                                "Existing checkpoint schema {} is newer than supported schema {supported_schema}",
                                 current.schema_version
                             ),
                         });

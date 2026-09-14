@@ -2816,7 +2816,7 @@ impl std::fmt::Debug for HealManager {
 
 mod auto_scan;
 mod queue;
-mod root_recovery;
+pub(crate) mod root_recovery;
 mod scheduler;
 mod unclean_shutdown;
 

@@ -2437,3 +2437,115 @@ async fn bucket_incarnation_metadata_failure_defers_replay_without_retiring_owne
     );
     assert!(manager.heal_queue.lock().await.requests().next().is_none());
 }
+
+#[tokio::test]
+async fn root_recovery_all_buckets_erasure_terminal_round_trip() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::ErasureSet {
+        buckets: Vec::new(),
+        set_disk_id: "pool_0_set_0".to_string(),
+    });
+    manager
+        .submit_heal_request_with_receipt(request.clone())
+        .await
+        .expect("admit all-buckets erasure heal");
+    let pending = manager.root_recovery.pending().await.expect("decode admitted scope");
+    assert_eq!(pending[0].heal_type, request.heal_type);
+    let completed = completed_admin_status(&request.heal_type, SystemTime::now());
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("publish all-buckets terminal");
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("restart after all-buckets completion");
+    assert_eq!(restarted.get_queue_length().await, 0);
+    let report = restarted.get_task_report(&request.id).await.expect("retained same token");
+    assert_eq!(report.status, HealTaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn root_recovery_legacy_empty_erasure_scope_does_not_block_other_owners() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let ordinary = root_request();
+    manager
+        .root_recovery
+        .persist(&ordinary)
+        .await
+        .expect("ordinary pending owner");
+    let request = admin_request(HealType::ErasureSet {
+        buckets: Vec::new(),
+        set_disk_id: "pool_0_set_0".to_string(),
+    });
+    // Pinned pre-marker shape: production admitted this record before #2539.
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 2, "task_id": request.id,
+        "heal_type": { "type": "erasure_set", "buckets": [], "set_disk_id": "pool_0_set_0" },
+        "options": request.options, "priority": request.priority, "retry_attempts": 0, "created_at": request.created_at
+    }))
+    .expect("legacy scoped fixture");
+    disk.write_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", request.id), bytes.into())
+        .await
+        .expect("legacy owner");
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("restore both accepted responsibilities");
+    let ids = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .map(|request| request.id.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(ids, HashSet::from([ordinary.id, request.id.clone()]));
+    restarted
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("retry updates legacy scope");
+    let completed = completed_admin_status(&request.heal_type, SystemTime::now());
+    restarted
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("retire legacy scope");
+}
+
+#[tokio::test]
+async fn root_recovery_erasure_bucket_scope_marker_rejects_conflicts() {
+    for (buckets, marker, valid) in [
+        (serde_json::json!([]), serde_json::json!(true), true),
+        (serde_json::json!([]), serde_json::json!(false), false),
+        (serde_json::json!(["bucket"]), serde_json::json!(false), true),
+        (serde_json::json!(["bucket"]), serde_json::json!(true), false),
+        (serde_json::json!([]), serde_json::json!("all"), false),
+    ] {
+        let (_temp, disk) = recovery_disk().await;
+        let request = root_request();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": 3, "task_id": request.id,
+            "heal_type": { "type": "erasure_set", "buckets": buckets, "set_disk_id": "pool_0_set_0", "all_buckets": marker },
+            "options": request.options, "priority": request.priority, "retry_attempts": 0, "created_at": request.created_at
+        }))
+        .expect("scope marker fixture");
+        let path = format!("root-heal-{}.json", request.id);
+        disk.write_all(RUSTFS_META_BUCKET, &path, bytes.clone().into())
+            .await
+            .expect("scope marker record");
+        let manager = recovery_manager(vec![disk.clone()]);
+        let result = manager.root_recovery.pending().await;
+        assert_eq!(result.is_ok(), valid, "{marker:?}, {buckets:?}");
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("retained record")
+                .as_ref(),
+            bytes.as_slice()
+        );
+    }
+}
