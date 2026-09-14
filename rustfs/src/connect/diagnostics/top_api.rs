@@ -23,6 +23,12 @@ use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
 use rand::{TryRng as _, rngs::SysRng};
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, subscribe_telemetry_trace_events, telemetry_trace_emit,
+    telemetry_trace_subscriber_count,
+};
+use rustfs_io_metrics::install_s3_http_completion_observer;
+use rustfs_s3_ops::S3Operation;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -34,6 +40,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use crate::connect::identity::DeviceIdentity;
 
 pub const TOP_SCHEMA_VERSION: u8 = 1;
+pub const TOP_API_CAPABILITY: &str = "top.api@1";
 pub const TOP_CLASSIFICATION: &str = "L3";
 pub const MAX_TOP_DURATION: Duration = Duration::from_secs(30);
 pub const MAX_TOP_RESULT_BYTES: usize = 262_144;
@@ -221,11 +228,11 @@ pub enum TopApiOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopApiData {
+    pub error_count: u64,
     pub operation: TopApiOperation,
     pub request_count: u64,
-    pub error_count: u64,
-    pub window_millis: u64,
     pub total_duration_micros: u64,
+    pub window_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,19 +330,123 @@ struct DiagnosticSignature {
 
 pub async fn capture_top_api(
     request: &TopCaptureRequest,
-    _operation: TopApiOperation,
+    operation: TopApiOperation,
     cancel: &CancellationToken,
 ) -> Result<TopResult<TopApiData>, TopCaptureError> {
-    request.validate_capture("top.api")?;
+    const TOOL_ID: &str = "top.api";
+
+    request.validate_capture(TOOL_ID)?;
     if cancel.is_cancelled() {
-        return request.cancelled("top.api");
+        return request.cancelled(TOOL_ID);
+    }
+    let Some(_permit) = request.acquire(cancel).await? else {
+        return request.cancelled(TOOL_ID);
+    };
+    install_top_api_s3_completion_observer();
+    let mut subscription = subscribe_telemetry_trace_events();
+    let source_operation = telemetry_operation(operation);
+    let started = tokio::time::Instant::now();
+    let deadline = started + request.window;
+    let mut request_count = 0_u64;
+    let mut error_count = 0_u64;
+    let mut total_duration_micros = 0_u64;
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return request.cancelled(TOOL_ID),
+            () = tokio::time::sleep_until(deadline) => break,
+            received = subscription.recv() => match received {
+                Ok(event) if event.operation == source_operation => {
+                    if request_count >= u64::from(request.limits.max_operations)
+                        || request_count >= u64::from(request.limits.max_records)
+                    {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::LimitExceeded);
+                    }
+                    let Ok(duration_micros) = u64::try_from(event.duration.as_micros()) else {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+                    };
+                    let Some(next_duration) = total_duration_micros.checked_add(duration_micros) else {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+                    };
+                    request_count += 1;
+                    error_count += u64::from(event.status == TelemetryTraceStatus::Error);
+                    total_duration_micros = next_duration;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::LimitExceeded);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::SourceUnavailable);
+                }
+            }
+        }
     }
 
-    // RustFS has exact bounded S3 operation/outcome counters, but no snapshot of
-    // total request duration for the same operation/window. The v1 shape makes
-    // that field mandatory, so publishing the available counters would invent a
-    // duration or mix unrelated histograms.
-    request.unsupported("top.api", TopReasonCode::UnsupportedTool)
+    request.validate_scope(TOOL_ID)?;
+    if request_count > MAX_SAFE_INTEGER || error_count > MAX_SAFE_INTEGER || total_duration_micros > MAX_SAFE_INTEGER {
+        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+    }
+    if request_count == 0 {
+        return request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool);
+    }
+    let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
+    request.succeeded(
+        TOOL_ID,
+        window_millis,
+        TopApiData {
+            operation,
+            request_count,
+            error_count,
+            window_millis,
+            total_duration_micros,
+        },
+    )
+}
+
+fn install_top_api_s3_completion_observer() {
+    install_s3_http_completion_observer(top_api_trace_enabled, emit_s3_request_telemetry);
+}
+
+fn top_api_trace_enabled() -> bool {
+    telemetry_trace_subscriber_count() != 0
+}
+
+fn emit_s3_request_telemetry(operation: S3Operation, duration: Duration, succeeded: bool) {
+    let Some(operation) = s3_telemetry_operation(operation) else {
+        return;
+    };
+    let status = if succeeded {
+        TelemetryTraceStatus::Ok
+    } else {
+        TelemetryTraceStatus::Error
+    };
+    telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, duration, status));
+}
+
+const fn s3_telemetry_operation(operation: S3Operation) -> Option<TelemetryTraceOperation> {
+    match operation {
+        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
+        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
+        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
+        _ => None,
+    }
+}
+
+const fn telemetry_operation(operation: TopApiOperation) -> TelemetryTraceOperation {
+    match operation {
+        TopApiOperation::GetObject => TelemetryTraceOperation::GetObject,
+        TopApiOperation::PutObject => TelemetryTraceOperation::PutObject,
+        TopApiOperation::HeadObject => TelemetryTraceOperation::HeadObject,
+        TopApiOperation::ListObjects => TelemetryTraceOperation::ListObjects,
+        TopApiOperation::InternalRpc => TelemetryTraceOperation::InternalRpc,
+    }
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1)
 }
 
 pub fn sign_top_export<T: Serialize>(
@@ -400,7 +511,11 @@ pub fn sign_top_export<T: Serialize>(
         classification: TOP_CLASSIFICATION,
         consent_uid: &request.scope.consent.uid,
         policy_revision: request.scope.policy_revision,
-        produced_at: now.format(&Rfc3339).map_err(|_| TopCaptureError::Serialization)?,
+        produced_at: now
+            .replace_nanosecond(0)
+            .map_err(|_| TopCaptureError::Serialization)?
+            .format(&Rfc3339)
+            .map_err(|_| TopCaptureError::Serialization)?,
         expires_at: OffsetDateTime::from_unix_timestamp(expires_at_unix)
             .map_err(|_| TopCaptureError::Expired)?
             .format(&Rfc3339)
@@ -853,4 +968,135 @@ fn lower_hex(value: &str, len: usize) -> bool {
 
 fn hex_lower(bytes: &[u8]) -> String {
     hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_common::trace_bus::telemetry_trace_subscriber_count;
+    use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
+    use rustfs_s3_ops::S3Operation;
+    use serial_test::serial;
+
+    fn capture_request(window: Duration) -> TopCaptureRequest {
+        let organization_uid = Uuid::now_v7();
+        let cluster_uid = Uuid::now_v7();
+        let device_uid = Uuid::now_v7();
+        let organization_name = format!("organizations/{organization_uid}");
+        let cluster_name = format!("{organization_name}/clusters/{cluster_uid}");
+        let device_name = format!("{cluster_name}/clusterDevices/{device_uid}");
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 60;
+        TopCaptureRequest {
+            scope: TopCaptureScope {
+                organization_name,
+                cluster_name,
+                device_name,
+                run_uid: Uuid::now_v7().to_string(),
+                artifact_uid: Uuid::now_v7().to_string(),
+                policy_revision: 1,
+                run_expires_at_unix: expires_at,
+                executable_sha256: "0".repeat(64),
+                build_features: Vec::new(),
+                consent: LocalTopConsent {
+                    uid: Uuid::now_v7().to_string(),
+                    tool_id: "top.api".to_owned(),
+                    classification: TOP_CLASSIFICATION.to_owned(),
+                    active: true,
+                    expires_at_unix: expires_at,
+                },
+            },
+            limits: TopCaptureLimits::default(),
+            window,
+            export_validity: Duration::from_secs(60),
+        }
+    }
+
+    async fn wait_for_subscription(previous: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while telemetry_trace_subscriber_count() <= previous {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("top.api should subscribe to the runtime source");
+    }
+
+    async fn record_http_result(operation: S3Operation, status: u16) {
+        let mut guard = S3HttpRequestGuard::new("GET");
+        guard.in_scope(|| record_s3_op(operation));
+        tokio::task::yield_now().await;
+        guard.response(status);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn top_api_captures_real_s3_outcomes_and_excludes_other_operations() {
+        let request = capture_request(Duration::from_millis(25));
+        let previous_subscribers = telemetry_trace_subscriber_count();
+        let task_request = request.clone();
+        let capture =
+            tokio::spawn(
+                async move { capture_top_api(&task_request, TopApiOperation::GetObject, &CancellationToken::new()).await },
+            );
+        wait_for_subscription(previous_subscribers).await;
+
+        record_http_result(S3Operation::GetObject, 200).await;
+        record_http_result(S3Operation::GetObject, 503).await;
+        record_http_result(S3Operation::PutObject, 500).await;
+
+        let result = capture.await.expect("capture task").expect("top.api result");
+        assert_eq!(result.outcome, TopOutcome::Succeeded);
+        let data = result.data.expect("successful capture data");
+        assert_eq!(data.operation, TopApiOperation::GetObject);
+        assert_eq!(data.request_count, 2);
+        assert_eq!(data.error_count, 1);
+        assert!(data.total_duration_micros > 0);
+        let encoded = serde_json::to_value(data).expect("serialize top.api data");
+        assert_eq!(
+            encoded.as_object().expect("top.api object").keys().collect::<Vec<_>>(),
+            [
+                "errorCount",
+                "operation",
+                "requestCount",
+                "totalDurationMicros",
+                "windowMillis"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn top_api_cancellation_stops_without_exportable_data() {
+        let request = capture_request(Duration::from_secs(1));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let previous_subscribers = telemetry_trace_subscriber_count();
+        let capture = tokio::spawn(async move { capture_top_api(&request, TopApiOperation::GetObject, &task_cancel).await });
+        wait_for_subscription(previous_subscribers).await;
+        cancel.cancel();
+
+        let result = capture.await.expect("capture task").expect("cancelled result");
+        assert_eq!(result.outcome, TopOutcome::Cancelled);
+        assert_eq!(result.reason_code, TopReasonCode::Cancelled);
+        assert!(result.data.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn top_api_refuses_to_publish_a_truncated_window() {
+        let mut request = capture_request(Duration::from_secs(1));
+        request.limits.max_operations = 1;
+        request.limits.max_records = 1;
+        let previous_subscribers = telemetry_trace_subscriber_count();
+        let capture =
+            tokio::spawn(async move { capture_top_api(&request, TopApiOperation::GetObject, &CancellationToken::new()).await });
+        wait_for_subscription(previous_subscribers).await;
+        record_http_result(S3Operation::GetObject, 200).await;
+        record_http_result(S3Operation::GetObject, 200).await;
+
+        let result = capture.await.expect("capture task").expect("limited result");
+        assert_eq!(result.outcome, TopOutcome::Failed);
+        assert_eq!(result.reason_code, TopReasonCode::LimitExceeded);
+        assert!(result.data.is_none());
+    }
 }

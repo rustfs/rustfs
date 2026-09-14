@@ -38,6 +38,9 @@ use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
 use rustfs_common::GlobalReadiness;
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
+};
 use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
@@ -273,7 +276,7 @@ where
 
         // This outer boundary includes readiness, rate-limit and auth
         // rejections. Metric attribution never depends on an enabled span.
-        let mut metrics = is_s3.then(|| S3HttpRequestGuard::new(req.method().as_str()));
+        let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
@@ -284,6 +287,40 @@ where
             is_s3,
             metrics,
         }
+    }
+}
+
+/// Start accounting for an external S3 request. While a typed telemetry trace
+/// is being recorded, the finished request is also published to the trace bus
+/// as a pre-classified event; otherwise no clock is read.
+pub fn s3_http_request_guard(method: &str) -> S3HttpRequestGuard {
+    let guard = S3HttpRequestGuard::new(method);
+    if telemetry_trace_subscriber_count() == 0 {
+        return guard;
+    }
+    guard.with_completion_observer(emit_s3_request_telemetry)
+}
+
+fn emit_s3_request_telemetry(operation: rustfs_s3_ops::S3Operation, duration: Duration, succeeded: bool) {
+    let Some(operation) = telemetry_operation(operation) else {
+        return;
+    };
+    let status = if succeeded {
+        TelemetryTraceStatus::Ok
+    } else {
+        TelemetryTraceStatus::Error
+    };
+    telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, duration, status));
+}
+
+fn telemetry_operation(operation: rustfs_s3_ops::S3Operation) -> Option<TelemetryTraceOperation> {
+    use rustfs_s3_ops::S3Operation;
+    match operation {
+        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
+        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
+        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
+        _ => None,
     }
 }
 
@@ -2326,6 +2363,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {
+        use rustfs_s3_ops::S3Operation;
+        assert_eq!(telemetry_operation(S3Operation::GetObject), Some(TelemetryTraceOperation::GetObject));
+        assert_eq!(telemetry_operation(S3Operation::PutObject), Some(TelemetryTraceOperation::PutObject));
+        assert_eq!(telemetry_operation(S3Operation::HeadObject), Some(TelemetryTraceOperation::HeadObject));
+        assert_eq!(telemetry_operation(S3Operation::ListObjects), Some(TelemetryTraceOperation::ListObjects));
+        assert_eq!(
+            telemetry_operation(S3Operation::ListObjectsV2),
+            Some(TelemetryTraceOperation::ListObjects)
+        );
+        assert_eq!(telemetry_operation(S3Operation::DeleteObject), None);
+    }
 
     fn public_health_layer() -> PublicHealthEndpointLayer {
         let readiness = Arc::new(GlobalReadiness::new());

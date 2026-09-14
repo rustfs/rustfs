@@ -50,15 +50,22 @@ mod snapshot;
 mod config_test;
 
 // Re-export public types
+pub use cli::ConnectSiteReplicationPerformanceOpts;
 pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{
     ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,
 };
 pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
-pub use cli::{ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts};
+pub use cli::{ConnectInspectCommands, ConnectInspectObjectOpts, ConnectInspectOpts};
+pub use cli::{
+    ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseRelayExportOpts, ConnectLicenseRelayImportOpts,
+    ConnectLicenseRenewOpts, ConnectLicenseScopeOpts,
+};
 pub use cli::{ConnectLogsMode, ConnectLogsOpts};
 pub use cli::{ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts};
 pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
+pub use cli::{ConnectRelayMaterialKind, ConnectRelayOpts};
+pub use cli::{ConnectReportCommands, ConnectReportOpts, ConnectReportUploadOpts};
 pub use cli::{
     ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
     ConnectTelemetryReplayOpts,

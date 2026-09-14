@@ -133,6 +133,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         optional_runtimes,
         heartbeat,
         inventory,
+        local_trace_capture,
         iam_bootstrap,
         enable_scanner,
     } = service_runtime;
@@ -166,6 +167,9 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     )
     .await;
     shutdown_connect_runtimes(heartbeat, inventory).await;
+    if let Some(runtime) = local_trace_capture {
+        runtime.shutdown().await;
+    }
     if let Some(cleanup) = scanner_cleanup {
         let _ = wait_for_scanner_cleanup(cleanup).await;
     }

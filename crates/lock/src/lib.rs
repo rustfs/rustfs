@@ -273,6 +273,11 @@ pub fn get_global_lock_manager() -> Arc<GlobalLockManager> {
     GLOBAL_LOCK_MANAGER.get_or_init(|| Arc::new(GlobalLockManager::new())).clone()
 }
 
+/// Return the global lock manager only when it is already initialized.
+pub fn get_initialized_global_lock_manager() -> Option<Arc<GlobalLockManager>> {
+    GLOBAL_LOCK_MANAGER.get().cloned()
+}
+
 /// Get the global shared FastLock manager instance (legacy)
 ///
 /// This function is deprecated. Use get_global_lock_manager() instead.

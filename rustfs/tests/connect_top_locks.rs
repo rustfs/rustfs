@@ -16,14 +16,14 @@ use std::time::Duration;
 
 use rustfs::connect::diagnostics::{
     LocalTopConsent, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, TopReasonCode, capture_top_locks,
+    evaluate_lock_snapshot,
 };
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-#[tokio::test]
-async fn top_locks_reports_unsupported_instead_of_inventing_waiters_or_exposing_names() {
+fn request() -> TopCaptureRequest {
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let request = TopCaptureRequest {
+    TopCaptureRequest {
         scope: TopCaptureScope {
             organization_name: "organizations/019e3ae0-0000-7000-8000-000000000010".to_owned(),
             cluster_name: "organizations/019e3ae0-0000-7000-8000-000000000010/clusters/019e3ae0-0000-7000-8000-000000000011".to_owned(),
@@ -45,15 +45,34 @@ async fn top_locks_reports_unsupported_instead_of_inventing_waiters_or_exposing_
         limits: TopCaptureLimits::default(),
         window: Duration::from_millis(1),
         export_validity: Duration::from_secs(300),
-    };
+    }
+}
 
+#[tokio::test]
+async fn top_locks_fails_when_the_server_lock_runtime_is_not_in_process() {
+    let request = request();
     let result = capture_top_locks(&request, &CancellationToken::new())
         .await
         .expect("structured unsupported result");
-    assert_eq!(result.outcome, TopOutcome::Unsupported);
-    assert_eq!(result.reason_code, TopReasonCode::UnsupportedTool);
+    assert_eq!(result.outcome, TopOutcome::Failed);
+    assert_eq!(result.reason_code, TopReasonCode::SourceUnavailable);
+    assert!(result.data.is_none());
     let json = serde_json::to_string(&result).expect("locks json");
-    assert!(json.contains(r#""data":null"#));
+    assert!(!json.contains("resource"));
+    assert!(!json.contains("owner"));
+}
+
+#[test]
+fn top_locks_maps_real_runtime_counts_without_exposing_names() {
+    let request = request();
+    let result = evaluate_lock_snapshot(&request, 2, 1, 1_000).expect("lock count result");
+    assert_eq!(result.outcome, TopOutcome::Succeeded);
+    assert_eq!(result.reason_code, TopReasonCode::Complete);
+    let data = result.data.expect("lock counts");
+    assert_eq!(data.held_count, 2);
+    assert_eq!(data.waiting_count, 1);
+    assert!(!data.truncated);
+    let json = serde_json::to_string(&data).expect("locks JSON");
     assert!(!json.contains("resource"));
     assert!(!json.contains("owner"));
 }

@@ -6,13 +6,13 @@
   "requestAdditions": {
     "telemetryProfile": "extended",
     "authorization": "Bearer non-functional-example",
-    "capabilities": ["heartbeat", "future.capability"],
+    "capabilities": ["heartbeat", "inventory.environment@1", "inventory.environment@2", "future.capability"],
     "coarseNodeSummary": {"rackNames": ["customer-rack"]}
   },
   "expected": {
     "decision": "ACCEPT",
-    "storedCapabilities": ["heartbeat"],
-    "discarded": ["authorization", "future.capability", "telemetryProfile", "coarseNodeSummary.rackNames"],
+    "storedCapabilities": ["heartbeat", "inventory.environment@1"],
+    "discarded": ["authorization", "future.capability", "inventory.environment@2", "telemetryProfile", "coarseNodeSummary.rackNames"],
     "echoed": []
   }
 }

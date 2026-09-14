@@ -110,7 +110,7 @@ pub enum Commands {
     /// Offline, read-only inspection of on-disk data (no server required)
     Inspect(InspectOpts),
     /// Configure outbound RustFS Connect integration
-    Connect(ConnectOpts),
+    Connect(Box<ConnectOpts>),
 }
 
 /// RustFS Connect subcommand options
@@ -127,6 +127,10 @@ pub enum ConnectCommands {
     Register(ConnectRegisterOpts),
     /// Import, verify, or inspect a signed Connect service license
     License(ConnectLicenseOpts),
+    /// Deliver a reviewed signed artifact through the customer relay (Unix only)
+    Relay(Box<ConnectRelayOpts>),
+    /// Upload an explicitly selected support report with the registered device identity
+    Report(ConnectReportOpts),
     /// Read the persisted deployment inventory and collect an approved environment summary
     Inventory(ConnectInventoryOpts),
     /// Run an explicitly approved, bounded local performance measurement
@@ -139,6 +143,180 @@ pub enum ConnectCommands {
     Telemetry(ConnectTelemetryOpts),
     /// Capture a consent-bound local top snapshot
     Top(ConnectTopOpts),
+    /// Inspect one local object and write a signed integrity summary
+    Inspect(ConnectInspectOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInspectOpts {
+    #[command(subcommand)]
+    pub command: ConnectInspectCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ConnectInspectCommands {
+    /// Inspect one object's local erasure metadata and shards
+    Object(ConnectInspectObjectOpts),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectInspectObjectOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this inspection
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    /// Drive root containing the object's local erasure state; repeat for every local drive
+    #[arg(long = "path", required = true)]
+    pub paths: Vec<PathBuf>,
+    /// Bucket containing the object
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub bucket: String,
+    /// Object key to inspect
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub object: String,
+    /// Optional exact object version UUID
+    #[arg(long = "version-id", value_parser = NonEmptyStringValueParser::new())]
+    pub version_id: Option<String>,
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated producer capability
+    #[arg(long, default_value = "inspect.object@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 30_000)]
+    pub duration_millis: u64,
+    /// Maximum bytes read from local metadata and shards
+    #[arg(long = "max-read-bytes", default_value_t = 268_435_456)]
+    pub max_read_bytes: u64,
+    /// Maximum working memory in bytes
+    #[arg(long = "max-memory-bytes", default_value_t = 67_108_864)]
+    pub max_memory_bytes: u64,
+    /// Confirm this explicit local L3 diagnostic operation
+    #[arg(long = "acknowledge-l3", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l3: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConnectRelayMaterialKind {
+    OfflineEnrollmentResponse,
+    DiagnosticBundleManifest,
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectRelayOpts {
+    /// HTTPS Connect control API base ending in /api/
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+    /// Owner-only file containing the browser Cookie header value
+    #[arg(long = "session-cookie-file")]
+    pub session_cookie_file: PathBuf,
+    /// Owner-only file containing the browser X-XSRF-TOKEN header value
+    #[arg(long = "csrf-token-file")]
+    pub csrf_token_file: PathBuf,
+    /// Organization UUIDv7 used by the approved Connect tenant
+    #[arg(long = "organization-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub organization_uid: String,
+    /// Approval resource UID returned after customer review in Connect
+    #[arg(long = "approval-reference", value_parser = NonEmptyStringValueParser::new())]
+    pub approval_reference: String,
+    /// UUIDv7 identifying this exact relay attempt
+    #[arg(long = "transfer-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub transfer_uid: String,
+    /// Allow-listed signed artifact type accepted by the Connect receiver
+    #[arg(long = "material-kind", value_enum)]
+    pub material_kind: ConnectRelayMaterialKind,
+    /// Owner-only signed artifact wrapper to transfer unchanged
+    #[arg(long)]
+    pub artifact: PathBuf,
+    /// Device or candidate-device resource name shown during review
+    #[arg(long = "producer-name", value_parser = NonEmptyStringValueParser::new())]
+    pub producer_name: String,
+    /// SHA-256 key ID of the device that signed the artifact
+    #[arg(long = "producer-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub producer_key_id: String,
+    /// Owner-only file containing the pinned receipt public key
+    #[arg(long = "receipt-public-key-file")]
+    pub receipt_public_key_file: PathBuf,
+    /// SHA-256 key ID of the pinned Connect receipt key
+    #[arg(long = "receipt-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub receipt_key_id: String,
+    /// Bounded HTTPS request timeout
+    #[arg(long = "timeout-seconds", default_value_t = 30)]
+    pub timeout_seconds: u64,
+    /// Confirm the artifact, producer, destination, digest and classification were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
+}
+
+/// Support report operations.
+#[derive(Args, Clone)]
+pub struct ConnectReportOpts {
+    #[command(subcommand)]
+    pub command: ConnectReportCommands,
+}
+
+/// Device-authenticated support report operations.
+#[derive(Subcommand, Clone)]
+pub enum ConnectReportCommands {
+    /// Upload one bounded archive through a short-lived object-store authorization
+    Upload(ConnectReportUploadOpts),
+}
+
+/// `connect report upload` options.
+#[derive(Args, Clone)]
+pub struct ConnectReportUploadOpts {
+    /// Connect agent API HTTPS base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used for Connect and its authorized object store
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    /// Directory containing the registered Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Explicitly selected support report archive
+    #[arg(long)]
+    pub archive: PathBuf,
+
+    /// Bounded timeout for each object upload request
+    #[arg(long = "upload-timeout-seconds", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=900))]
+    pub upload_timeout_seconds: u64,
 }
 
 #[derive(Args, Clone)]
@@ -250,8 +428,113 @@ pub enum ConnectPerformanceCommands {
     Client(Box<ConnectClientPerformanceOpts>),
     /// Measure bounded S3 object throughput in a dedicated temporary namespace
     Object(Box<ConnectObjectPerformanceOpts>),
+    /// Measure bounded destination-confirmed site-replication performance
+    SiteReplication(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Measure generated-file write and warm page-cache read performance
     Drive(Box<ConnectDrivePerformanceOpts>),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectSiteReplicationPerformanceOpts {
+    /// Directory containing an enrolled Connect device identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// Source RustFS deployment endpoint
+    #[arg(long = "source-endpoint", value_parser = NonEmptyStringValueParser::new())]
+    pub source_endpoint: String,
+    /// Destination RustFS deployment endpoint
+    #[arg(long = "destination-endpoint", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_endpoint: String,
+    /// Optional PEM root certificate for the source endpoint
+    #[arg(long = "source-ca-file")]
+    pub source_ca_file: Option<PathBuf>,
+    /// Optional PEM root certificate for the destination endpoint
+    #[arg(long = "destination-ca-file")]
+    pub destination_ca_file: Option<PathBuf>,
+    /// Owner-readable file containing the source S3 access key
+    #[arg(long = "source-access-key-file")]
+    pub source_access_key_file: PathBuf,
+    /// Owner-readable file containing the source S3 secret key
+    #[arg(long = "source-secret-key-file")]
+    pub source_secret_key_file: PathBuf,
+    /// Optional owner-readable file containing a source S3 session token
+    #[arg(long = "source-session-token-file")]
+    pub source_session_token_file: Option<PathBuf>,
+    /// Owner-readable file containing the destination S3 access key
+    #[arg(long = "destination-access-key-file")]
+    pub destination_access_key_file: PathBuf,
+    /// Owner-readable file containing the destination S3 secret key
+    #[arg(long = "destination-secret-key-file")]
+    pub destination_secret_key_file: PathBuf,
+    /// Optional owner-readable file containing a destination S3 session token
+    #[arg(long = "destination-session-token-file")]
+    pub destination_session_token_file: Option<PathBuf>,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Negotiated producer schema version
+    #[arg(long = "schema-version", default_value_t = 1)]
+    pub schema_version: u16,
+    /// Negotiated producer capability
+    #[arg(long, default_value = "performance.siteReplication@1", value_parser = NonEmptyStringValueParser::new())]
+    pub capability: String,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Destination cluster resource name bound to the signed target pair
+    #[arg(long = "destination-cluster", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this measurement
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    /// Generated transfer size in bytes
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+    /// Maximum wall-clock duration in milliseconds
+    #[arg(long = "duration-millis", default_value_t = 5_000)]
+    pub duration_millis: u64,
+    /// Stable opaque alias for the source deployment
+    #[arg(long = "source-alias", value_parser = NonEmptyStringValueParser::new())]
+    pub source_alias: String,
+    /// Source deployment identifier from site-replication configuration
+    #[arg(long = "source-deployment-id", value_parser = NonEmptyStringValueParser::new())]
+    pub source_deployment_id: String,
+    /// Stable opaque alias for the destination deployment
+    #[arg(long = "destination-alias", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_alias: String,
+    /// Destination deployment identifier from site-replication configuration
+    #[arg(long = "destination-deployment-id", value_parser = NonEmptyStringValueParser::new())]
+    pub destination_deployment_id: String,
+    /// Existing versioned bucket dedicated to disposable performance objects
+    #[arg(long = "scratch-bucket", value_parser = NonEmptyStringValueParser::new())]
+    pub scratch_bucket: String,
+    /// Bounded cleanup window for versions that arrive after cancellation
+    #[arg(long = "late-arrival-cleanup-millis", default_value_t = 1_000)]
+    pub late_arrival_cleanup_millis: u64,
+    /// Confirm this explicit local L2 diagnostic operation
+    #[arg(long = "acknowledge-l2", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l2: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -847,6 +1130,27 @@ pub enum ConnectLicenseCommands {
     Verify(ConnectLicenseArtifactOpts),
     /// Verify and display the installed license for one deployment and service
     Show(ConnectLicenseScopeOpts),
+    /// Check Connect and install an operator-approved replacement license
+    Renew(ConnectLicenseRenewOpts),
+    /// Verify a license and write its reviewed relay envelope (Unix only)
+    RelayExport(ConnectLicenseRelayExportOpts),
+    /// Re-verify and install a reviewed relay envelope, then sign a destination receipt (Unix only)
+    RelayImport(ConnectLicenseRelayImportOpts),
+}
+
+/// Online renewal transport plus local trust and scope pins.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRenewOpts {
+    /// HTTPS Connect agent API base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
 }
 
 /// Trust and scope pins shared by service-license commands.
@@ -894,6 +1198,52 @@ pub struct ConnectLicenseArtifactOpts {
 
     #[command(flatten)]
     pub scope: ConnectLicenseScopeOpts,
+}
+
+/// A verified license artifact exported as an opaque relay envelope.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRelayExportOpts {
+    /// Downloaded signed license artifact to transfer unchanged
+    #[arg(long)]
+    pub artifact: PathBuf,
+
+    /// New owner-only relay envelope file
+    #[arg(long)]
+    pub envelope: PathBuf,
+
+    /// UUIDv7 identifying this exact relay attempt
+    #[arg(long = "transfer-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub transfer_uid: String,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
+
+    /// Confirm the verified issuer, destination, digest, expiry, and license scope were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
+}
+
+/// A cluster-side relay import with a pre-bound destination receipt key.
+#[derive(Args, Clone)]
+pub struct ConnectLicenseRelayImportOpts {
+    /// Owner-only service-license relay envelope
+    #[arg(long)]
+    pub envelope: PathBuf,
+
+    /// Owner-only Ed25519 seed for the pre-bound cluster receipt key
+    #[arg(long = "receipt-signing-key-file")]
+    pub receipt_signing_key_file: PathBuf,
+
+    /// SHA-256 key ID of the pre-bound cluster receipt key
+    #[arg(long = "receipt-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub receipt_key_id: String,
+
+    #[command(flatten)]
+    pub scope: ConnectLicenseScopeOpts,
+
+    /// Confirm the verified issuer, destination, digest, expiry, and license scope were reviewed
+    #[arg(long = "acknowledge-reviewed", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_reviewed: bool,
 }
 
 /// Offline inspection subcommand options
@@ -1197,14 +1547,20 @@ pub enum CommandResult {
     ConnectRegister(ConnectRegisterOpts),
     /// Local Connect service-license command
     ConnectLicense(ConnectLicenseCommands),
+    /// Customer-operated relay of one reviewed signed artifact
+    ConnectRelay(Box<ConnectRelayOpts>),
+    /// Device-authenticated upload of one support report archive
+    ConnectReportUpload(ConnectReportUploadOpts),
     /// Explicit local Connect environment inventory command
     ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
-    ConnectClientPerformance(ConnectClientPerformanceOpts),
+    ConnectClientPerformance(Box<ConnectClientPerformanceOpts>),
     /// Consent-bound S3 object performance export
     ConnectObjectPerformance(ConnectObjectPerformanceOpts),
+    /// Consent-bound site-replication performance export
+    ConnectSiteReplicationPerformance(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export
@@ -1213,6 +1569,8 @@ pub enum CommandResult {
     ConnectTelemetry(ConnectTelemetryCommands),
     /// Consent-bound local Connect top operation
     ConnectTop(ConnectTopCommands),
+    /// Consent-bound local object integrity export
+    ConnectInspect(ConnectInspectObjectOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -1252,10 +1610,52 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ConnectCommands, ConnectInventoryCommands, InspectCommands, preprocess_args_for_legacy};
+    use super::{
+        Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, ConnectRelayMaterialKind,
+        ConnectReportCommands, InspectCommands, preprocess_args_for_legacy,
+    };
+    use crate::connect::CONNECT_DIAGNOSTIC_CAPABILITIES;
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn advertised_diagnostic_capabilities_have_cli_dispatch() {
+        let expected = [
+            ("performance.client@1", &["performance", "client"][..]),
+            ("performance.drive@1", &["performance", "drive"][..]),
+            ("performance.object@1", &["performance", "object"][..]),
+            ("performance.siteReplication@1", &["performance", "site-replication"][..]),
+            ("logs.capture@1", &["logs"][..]),
+            ("profile.cpu@1", &["profile"][..]),
+            ("profile.memory@1", &["profile"][..]),
+            ("profile.threads@1", &["profile"][..]),
+            ("telemetry.record@1", &["telemetry", "record"][..]),
+            ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
+            ("telemetry.replay@1", &["telemetry", "replay"][..]),
+            ("top.api@1", &["top", "api"][..]),
+            ("top.disk@1", &["top", "disk"][..]),
+            ("top.locks@1", &["top", "locks"][..]),
+            ("top.net@1", &["top", "net"][..]),
+            ("top.rpc@1", &["top", "rpc"][..]),
+            ("inspect.object@1", &["inspect", "object"][..]),
+        ];
+        assert_eq!(
+            CONNECT_DIAGNOSTIC_CAPABILITIES,
+            expected.iter().map(|(capability, _)| *capability).collect::<Vec<_>>()
+        );
+
+        let command = Cli::command();
+        let connect = command.find_subcommand("connect").expect("connect command");
+        for (capability, path) in expected {
+            let mut command = connect;
+            for segment in path {
+                command = command
+                    .find_subcommand(segment)
+                    .unwrap_or_else(|| panic!("{capability} is missing CLI dispatch at {segment}"));
+            }
+        }
+    }
 
     #[test]
     fn preprocess_help_command_displays_top_level_help() {
@@ -1356,6 +1756,123 @@ mod tests {
         assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
         assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));
         assert!(register.token_file.is_none());
+    }
+
+    #[test]
+    fn connect_license_renew_requires_transport_and_scope_pins() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "license",
+            "renew",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--public-key-file",
+            "/etc/rustfs/connect-license.pub",
+            "--key-id",
+            "aabbcc",
+            "--issuer",
+            "connect",
+            "--audience",
+            "rustfs",
+            "--organization",
+            "organizations/018cc251-f400-7000-8000-000000000003",
+            "--deployment",
+            "organizations/018cc251-f400-7000-8000-000000000003/clusters/018cc251-f400-7000-8000-000000000004",
+            "--service-code",
+            "SUPPORT",
+        ])
+        .expect("connect license renew arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::License(license) = connect.command else {
+            panic!("connect license command expected");
+        };
+        let ConnectLicenseCommands::Renew(renew) = license.command else {
+            panic!("connect license renew command expected");
+        };
+        assert_eq!(renew.endpoint, "https://connect.example/agent/");
+        assert_eq!(renew.scope.service_code, "SUPPORT");
+    }
+
+    #[test]
+    fn connect_relay_requires_protected_authentication_files_and_review() {
+        let cli = Cli::try_parse_from([
+            "rustfs", "connect", "relay", "--endpoint", "https://connect.example/api/", "--ca-file",
+            "/etc/rustfs/connect-ca.pem", "--session-cookie-file", "/run/secrets/connect-cookie", "--csrf-token-file",
+            "/run/secrets/connect-csrf", "--organization-uid", "0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50",
+            "--approval-reference", "0198f3a1-b100-7a10-8a11-001122334455", "--transfer-uid",
+            "0198f3a1-a200-7b20-8b22-112233445566", "--material-kind", "diagnostic-bundle-manifest", "--artifact",
+            "/var/lib/rustfs/relay/manifest.json", "--producer-name",
+            "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50/clusters/0198f3a1-5d00-7b20-9c31-1d2e3f4a5b61/clusterDevices/0198f3a1-6e00-7c30-ad41-2e3f4a5b6c72",
+            "--producer-key-id", "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+            "--receipt-public-key-file", "/etc/rustfs/connect-relay.pub", "--receipt-key-id",
+            "aef7765496addd64bb9fcdd7b61682148622aed4856a7315326faea0aa86d53b", "--acknowledge-reviewed",
+        ])
+        .expect("reviewed relay arguments should parse");
+        let Some(Commands::Connect(connect)) = cli.command else { panic!("connect command expected") };
+        let ConnectCommands::Relay(options) = connect.command else { panic!("relay command expected") };
+        assert_eq!(options.material_kind, ConnectRelayMaterialKind::DiagnosticBundleManifest);
+        assert!(options.acknowledge_reviewed);
+    }
+
+    #[test]
+    fn connect_report_upload_accepts_only_explicit_archive_and_transport_paths() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "report",
+            "upload",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--archive",
+            "/var/lib/rustfs/reports/support.tar.zst",
+        ])
+        .expect("report upload arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Report(report) = connect.command else {
+            panic!("connect report command expected");
+        };
+        let ConnectReportCommands::Upload(upload) = report.command;
+        assert_eq!(upload.endpoint, "https://connect.example/agent/");
+        assert_eq!(upload.archive, std::path::Path::new("/var/lib/rustfs/reports/support.tar.zst"));
+        assert_eq!(upload.upload_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn connect_report_upload_rejects_unbounded_timeout() {
+        let error = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "report",
+            "upload",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+            "--archive",
+            "/var/lib/rustfs/reports/support.tar.zst",
+            "--upload-timeout-seconds",
+            "901",
+        ])
+        .err()
+        .expect("unbounded upload timeout must fail");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

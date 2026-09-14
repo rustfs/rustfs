@@ -59,9 +59,12 @@ fn request() -> ProfileCaptureRequest {
     }
 }
 
-#[test]
-fn cpu_without_reviewed_symbol_catalog_is_explicitly_unsupported() {
-    let result = capture_cpu_profile(&request(), &CancellationToken::new()).expect("unsupported is a typed result");
+#[cfg(not(feature = "pyroscope"))]
+#[tokio::test]
+async fn cpu_without_local_sampler_is_explicitly_unsupported() {
+    let result = capture_cpu_profile(&request(), &CancellationToken::new())
+        .await
+        .expect("unsupported is a typed result");
     assert_eq!(result.outcome(), ProfileOutcome::Unsupported);
     assert_eq!(result.reason_code(), ProfileReasonCode::UnsupportedTool);
     assert!(result.data().is_none(), "unsupported CPU must not fabricate zero samples");
@@ -74,48 +77,63 @@ fn cpu_without_reviewed_symbol_catalog_is_explicitly_unsupported() {
     assert!(json["data"].is_null());
 }
 
-#[test]
-fn cpu_refuses_missing_or_expired_local_consent_before_capability_disclosure() {
+#[cfg(feature = "pyroscope")]
+#[tokio::test]
+async fn cpu_with_local_sampler_returns_bounded_redacted_samples() {
+    let result = capture_cpu_profile(&request(), &CancellationToken::new())
+        .await
+        .expect("local CPU capture should complete");
+    assert!(matches!(result.outcome(), ProfileOutcome::Succeeded | ProfileOutcome::Partial));
+    let json = serde_json::to_string(&result).expect("result JSON");
+    assert!(json.contains("sha256:"));
+    assert!(!json.contains("rustfs::"));
+    assert!(!json.contains("/Users/"));
+    assert!(!json.contains("threadName"));
+}
+
+#[tokio::test]
+async fn cpu_refuses_missing_or_expired_local_consent_before_capability_disclosure() {
     let mut missing = request();
     missing.consent.confirmed = false;
     assert!(matches!(
-        capture_cpu_profile(&missing, &CancellationToken::new()),
+        capture_cpu_profile(&missing, &CancellationToken::new()).await,
         Err(ProfileError::ConsentRequired)
     ));
 
     let mut expired = request();
     expired.consent.expires_at_unix = now() - 1;
     assert!(matches!(
-        capture_cpu_profile(&expired, &CancellationToken::new()),
+        capture_cpu_profile(&expired, &CancellationToken::new()).await,
         Err(ProfileError::ConsentExpired)
     ));
 }
 
-#[test]
-fn cpu_negotiation_and_resource_limits_are_closed_at_the_boundary() {
+#[tokio::test]
+async fn cpu_negotiation_and_resource_limits_are_closed_at_the_boundary() {
     let mut invalid = request();
     invalid.schema_version = 2;
     assert!(matches!(
-        capture_cpu_profile(&invalid, &CancellationToken::new()),
+        capture_cpu_profile(&invalid, &CancellationToken::new()).await,
         Err(ProfileError::UnsupportedVersion)
     ));
 
     let mut invalid = request();
     invalid.capability = "profile.cpu@2".to_string();
     assert!(matches!(
-        capture_cpu_profile(&invalid, &CancellationToken::new()),
+        capture_cpu_profile(&invalid, &CancellationToken::new()).await,
         Err(ProfileError::UnsupportedCapability)
     ));
 
     let mut boundary = request();
     boundary.duration = MAX_PROFILE_DURATION;
     boundary.sample_period = MAX_PROFILE_DURATION;
-    assert!(capture_cpu_profile(&boundary, &CancellationToken::new()).is_ok());
+    #[cfg(not(feature = "pyroscope"))]
+    assert!(capture_cpu_profile(&boundary, &CancellationToken::new()).await.is_ok());
 
     let mut over = request();
     over.duration = MAX_PROFILE_DURATION + Duration::from_nanos(1);
     assert!(matches!(
-        capture_cpu_profile(&over, &CancellationToken::new()),
+        capture_cpu_profile(&over, &CancellationToken::new()).await,
         Err(ProfileError::LimitExceeded)
     ));
 
@@ -127,7 +145,7 @@ fn cpu_negotiation_and_resource_limits_are_closed_at_the_boundary() {
         (0..65).map(|index| format!("feature_{index}")).collect(),
     );
     assert!(matches!(
-        capture_cpu_profile(&features, &CancellationToken::new()),
+        capture_cpu_profile(&features, &CancellationToken::new()).await,
         Err(ProfileError::InvalidRequest)
     ));
 
@@ -135,7 +153,7 @@ fn cpu_negotiation_and_resource_limits_are_closed_at_the_boundary() {
     empty_version_suffix.provenance =
         ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0-", vec!["default".to_string()]);
     assert!(matches!(
-        capture_cpu_profile(&empty_version_suffix, &CancellationToken::new()),
+        capture_cpu_profile(&empty_version_suffix, &CancellationToken::new()).await,
         Err(ProfileError::InvalidRequest)
     ));
 
@@ -144,14 +162,14 @@ fn cpu_negotiation_and_resource_limits_are_closed_at_the_boundary() {
     overflowing_window.expires_at_unix = i64::MAX;
     overflowing_window.consent.expires_at_unix = i64::MAX;
     assert!(matches!(
-        capture_cpu_profile(&overflowing_window, &CancellationToken::new()),
+        capture_cpu_profile(&overflowing_window, &CancellationToken::new()).await,
         Err(ProfileError::Expired)
     ));
 }
 
-#[test]
-fn cpu_honors_pre_cancelled_capture() {
+#[tokio::test]
+async fn cpu_honors_pre_cancelled_capture() {
     let cancel = CancellationToken::new();
     cancel.cancel();
-    assert!(matches!(capture_cpu_profile(&request(), &cancel), Err(ProfileError::Cancelled)));
+    assert!(matches!(capture_cpu_profile(&request(), &cancel).await, Err(ProfileError::Cancelled)));
 }

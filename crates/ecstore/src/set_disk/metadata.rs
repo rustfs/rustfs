@@ -23,6 +23,7 @@ use crate::disk::DiskOption;
 use crate::disk::endpoint::Endpoint;
 #[cfg(test)]
 use crate::disk::new_disk;
+use rustfs_filemeta::metadata_keys;
 use rustfs_utils::http;
 use sha2::Digest;
 
@@ -586,7 +587,7 @@ impl SetDisks {
     }
 
     fn is_replication_quorum_metadata_key(name: &str) -> bool {
-        if name.eq_ignore_ascii_case(http::AMZ_BUCKET_REPLICATION_STATUS) {
+        if name.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS) {
             return true;
         }
 
