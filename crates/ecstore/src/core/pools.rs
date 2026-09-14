@@ -14021,14 +14021,20 @@ impl ECStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(
-        self,
-        set,
-        lifecycle_config,
-        object_lock_config,
-        replication_config,
-        source_changed_exhaustions
-    ))]
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "processing",
+            pool_index = idx,
+            bucket = %bucket,
+            object = %entry.name,
+            generation = %generation,
+        )
+    )]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
