@@ -5546,6 +5546,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bitrot_reader_setup_reopeners_preserve_range_and_bitrot() {
+        const SHARD_SIZE: usize = 16;
+        for corrupt in [false, true] {
+            let algo = HashAlgorithm::HighwayHash256S;
+            let blocks = [[b'a'; SHARD_SIZE], [b'b'; SHARD_SIZE], [b'c'; SHARD_SIZE]];
+            let mut encoded = encoded_inline_blocks(&[&blocks[0], &blocks[1], &blocks[2]], SHARD_SIZE, algo.clone())
+                .await
+                .to_vec();
+            if corrupt {
+                encoded[2 * (SHARD_SIZE + algo.size()) + algo.size()] ^= 0xff;
+            }
+            let files = vec![encoded_reader_setup_fileinfo(Some(encoded))];
+            let setup = create_bitrot_readers_until_quorum_with_preference(
+                &files,
+                &[None],
+                "bucket",
+                "object",
+                7,
+                SHARD_SIZE,
+                SHARD_SIZE * 2,
+                SHARD_SIZE,
+                algo,
+                false,
+                false,
+                1,
+                0,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+                None,
+                None,
+            )
+            .await;
+            let reopen = setup.deferred_reopeners[0]
+                .as_ref()
+                .expect("eager source must retain a reopener");
+            let mut reader = reopen(1).expect("advance one stripe relative to the requested range");
+            let mut output = [0; SHARD_SIZE];
+            let result = reader.read(&mut output).await;
+            if corrupt {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
+            } else {
+                assert_eq!(result.unwrap(), SHARD_SIZE);
+                assert_eq!(output, blocks[2]);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn inline_part_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
         const SHARD_SIZE: usize = 16;
         let hash_algo = HashAlgorithm::HighwayHash256S;
@@ -5682,6 +5730,7 @@ mod tests {
 
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+        assert!(setup.deferred_reopeners.iter().all(Option::is_some));
 
         let fallback_index = setup
             .attempted
@@ -5707,8 +5756,8 @@ mod tests {
     /// parity reader must be an unopened deferred reader carrying a stripe
     /// handle and disposable reopener, so the decode path can realign it to a
     /// mid-object stripe without consuming the later-stripe reserve. With the
-    /// gate off (default), eagerly opened parity readers are kept exactly as
-    /// before and carry neither.
+    /// gate off (default), eagerly opened parity readers keep their streams,
+    /// but also retain an opener for recovery after a later hedge.
     #[tokio::test]
     #[serial_test::serial]
     async fn bitrot_reader_setup_gates_parity_stripe_handle_conversion() {
@@ -5737,11 +5786,13 @@ mod tests {
                     enabled.is_some(),
                     "parity slot {idx} stripe handle must match the gate (enabled={enabled:?})"
                 );
-                assert_eq!(
-                    setup.deferred_reopeners[idx].is_some(),
-                    enabled.is_some(),
-                    "parity slot {idx} reopener must match the gate (enabled={enabled:?})"
-                );
+                let reopen = setup.deferred_reopeners[idx]
+                    .as_ref()
+                    .expect("ready parity must retain a reopener");
+                let mut reopened = reopen(0).expect("reopen the original stripe");
+                let mut bytes = [0; 4];
+                assert_eq!(reopened.read(&mut bytes).await.unwrap(), 4);
+                assert_eq!(&bytes, [b"cccc", b"dddd"][idx - 2]);
             }
 
             if enabled.is_some() {

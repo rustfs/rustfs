@@ -590,6 +590,9 @@ pub(crate) struct ParallelReader<R> {
     // Demand-bound hedges use a fresh deferred reader so cancelling a hedge
     // never consumes the unopened reader reserved for a later stripe.
     deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+    // Cancelled streams cannot be reused, but their pinned sources remain
+    // available if a later stripe needs the redundancy.
+    hedged_readers: ShardIndexes,
     stripe_index: usize,
 }
 }
@@ -799,6 +802,7 @@ where
             engaged,
             deferred_handles: Vec::new(),
             deferred_reopeners: Vec::new(),
+            hedged_readers: ShardIndexes::new(),
             stripe_index: 0,
         }
     }
@@ -1461,13 +1465,20 @@ where
         // Retire any shard the hedge left in flight: dropping `sets` above
         // cancelled its read, so the reader is now at an indeterminate stream
         // position and can never be block-aligned again — the same reason a
-        // mid-block read error retires a reader. Its slot stays missing and is
-        // covered by the stripe-aligned parity substitution below.
+        // mid-block read error retires a reader. Preserve only a fresh opener
+        // for hedged slots, so later peer loss cannot exhaust redundancy merely
+        // because a healthy source was slow on an earlier stripe.
         if hedged {
             for i in 0..num_readers {
                 if self.engaged[i] && self.readers[i].is_some() && shards[i].is_none() && errs[i].is_none() {
                     errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read hedged after a slow shard")));
                     retire_readers.push(i);
+                    if self.deferred_reopeners.get(i).is_some_and(Option::is_some) {
+                        self.hedged_readers.push(i);
+                        if let Some(handle) = self.deferred_handles.get_mut(i) {
+                            *handle = None;
+                        }
+                    }
                 }
             }
         }
@@ -1522,13 +1533,54 @@ where
             }
         }
 
+        for i in retire_readers {
+            self.readers[i] = None;
+        }
+
+        // Reopen cancelled sources only when the surviving streams cannot
+        // supply the usual decode-plus-verification quorum. Each opener pins
+        // the original part and aligns a fresh bitrot reader to this stripe;
+        // never reuse the indeterminate position of a cancelled stream.
+        if !self.hedged_readers.is_empty() && shards.iter().take(data_shards).any(Option::is_none) && success <= data_shards {
+            let mut pending = FuturesUnordered::new();
+            for i in self.hedged_readers.drain(..) {
+                let Some(reader) = self.deferred_reopeners[i].as_ref().and_then(|reopen| reopen(stripe_index)) else {
+                    continue;
+                };
+                let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+                scheduled += 1;
+                pending.push(read_shard_owned(
+                    i,
+                    read_cost,
+                    Some(reader),
+                    Some(self.buffers.take(i, shard_size)),
+                    shard_size,
+                    data_shards,
+                    read_timeout,
+                    metrics_path,
+                ));
+            }
+            while let Some((i, _read_cost, result, reader, should_retire)) = pending.next().await {
+                completed += 1;
+                match result {
+                    Ok(bytes) => {
+                        shards[i] = Some(bytes);
+                        success += 1;
+                        if !should_retire {
+                            self.readers[i] = reader;
+                        }
+                    }
+                    Err(error) => {
+                        errs[i] = Some(error);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
         if let Some(path) = metrics_path {
             record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_QUORUM, stripe_read_start);
             rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
-        }
-
-        for i in retire_readers {
-            self.readers[i] = None;
         }
     }
 
@@ -5000,6 +5052,156 @@ mod tests {
         assert!(bufs[2].is_some());
         assert!(bufs[3].is_some());
         assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_hedged_shards_survive_later_peer_loss() {
+        const DATA: usize = 12;
+        const PARITY: usize = 4;
+        const BLOCK: usize = 192;
+        let erasure = Erasure::new(DATA, PARITY, BLOCK);
+        let shard_size = erasure.shard_size();
+        let payload: Vec<u8> = (0..BLOCK * 4).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
+        let mut stored = vec![Vec::new(); DATA + PARITY];
+        for block in payload.chunks(BLOCK) {
+            for (slot, shard) in stored.iter_mut().zip(erasure.encode_data(block).unwrap()) {
+                slot.extend_from_slice(&shard);
+            }
+        }
+        let readers = stored
+            .iter()
+            .enumerate()
+            .map(|(idx, bytes)| {
+                let source = if idx > DATA {
+                    TestShardReader::PartialThenPending {
+                        data: bytes[..3].to_vec(),
+                        emitted: false,
+                    }
+                } else {
+                    TestShardReader::Ready(Cursor::new(bytes.clone()))
+                };
+                Some(BitrotReader::new(source, shard_size, HashAlgorithm::None, false))
+            })
+            .collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reopeners: Vec<Option<DeferredReaderReopener<TestShardReader>>> = vec![None; DATA + PARITY];
+        for idx in DATA + 1..DATA + PARITY {
+            let bytes = stored[idx].clone();
+            let calls = calls.clone();
+            reopeners[idx] = Some(Arc::new(move |stripe| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(bytes[stripe * shard_size..].to_vec())),
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                ))
+            }));
+        }
+        let mut reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            payload.len(),
+            None,
+            vec![ShardReadCost::Unknown; DATA + PARITY],
+            Duration::from_secs(60),
+            true,
+        )
+        .with_deferred_parity_reopeners(reopeners);
+        // Pin the production default without mutating process-wide rollout gates.
+        reader.demand_bound_lockstep = false;
+        reader.engaged.fill(true);
+        let (mut first, _) = tokio::time::timeout(Duration::from_secs(2), reader.read()).await.unwrap();
+        assert_eq!(first.iter().flatten().count(), DATA + 1);
+        erasure.decode_data_with_reconstruction_verification(&mut first).unwrap();
+        let mut output = Vec::new();
+        write_data_blocks(&mut output, &first, DATA, 0, BLOCK).await.unwrap();
+        assert_eq!(output, payload[..BLOCK]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "healthy stripes must not reopen readers");
+
+        // A peer now disappears (four of sixteen disks), after three healthy
+        // shards were partially read and cancelled by the preceding hedge.
+        for slot in reader.readers.iter_mut().take(PARITY) {
+            *slot = Some(BitrotReader::new(TestShardReader::TimedOut, shard_size, HashAlgorithm::None, false));
+        }
+        for stripe in 1..3 {
+            let (mut shards, _) = tokio::time::timeout(Duration::from_secs(2), reader.read()).await.unwrap();
+            assert_eq!(
+                shards.iter().flatten().count(),
+                DATA,
+                "one peer loss must retain decode quorum at stripe {stripe}"
+            );
+            erasure.decode_data_with_reconstruction_verification(&mut shards).unwrap();
+            write_data_blocks(&mut output, &shards, DATA, 0, BLOCK).await.unwrap();
+        }
+        assert_eq!(output, payload[..BLOCK * 3], "reopened readers must resume at the correct stripe");
+        assert_eq!(calls.load(Ordering::SeqCst), PARITY - 1, "reopened streams must survive later stripes");
+
+        // Five actual disk failures exceed the four parity shards. Recovery
+        // must not fabricate quorum or emit a partial/corrupt fourth stripe.
+        reader.readers[PARITY] = Some(BitrotReader::new(TestShardReader::TimedOut, shard_size, HashAlgorithm::None, false));
+        let (mut shards, errors) = reader.read().await;
+        assert_eq!(shards.iter().flatten().count(), DATA - 1);
+        let mut written = output.len();
+        let mut error = None;
+        let flow = erasure
+            .emit_decoded_stripe(&mut output, &mut shards, &errors, 0, BLOCK, &mut written, &mut error, false, false)
+            .await;
+        assert!(matches!(flow, StripeFlow::Stop));
+        assert!(error.unwrap().to_string().contains("quorum"));
+        assert_eq!(written, BLOCK * 3);
+        assert_eq!(output, payload[..BLOCK * 3]);
+        assert_eq!(calls.load(Ordering::SeqCst), PARITY - 1);
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_keeps_hedged_reserves_unopened_without_later_failure() {
+        let erasure = Erasure::new(2, 2, 64);
+        let shard_size = erasure.shard_size();
+        let readers = (0..4)
+            .map(|idx| {
+                Some(BitrotReader::new(
+                    if idx == 3 {
+                        TestShardReader::Parked
+                    } else {
+                        TestShardReader::Ready(Cursor::new(vec![idx as u8; shard_size * 3]))
+                    },
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                ))
+            })
+            .collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_counter = calls.clone();
+        let mut reopeners: Vec<Option<DeferredReaderReopener<TestShardReader>>> = vec![None; 4];
+        reopeners[3] = Some(Arc::new(move |_| {
+            call_counter.fetch_add(1, Ordering::SeqCst);
+            Some(BitrotReader::new(TestShardReader::Parked, shard_size, HashAlgorithm::None, false))
+        }));
+        let mut reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            64 * 3,
+            None,
+            vec![ShardReadCost::Unknown; 4],
+            Duration::from_secs(60),
+            true,
+        )
+        .with_deferred_parity_reopeners(reopeners);
+        reader.demand_bound_lockstep = false;
+        reader.engaged.fill(true);
+        for _ in 0..3 {
+            let (shards, _) = tokio::time::timeout(Duration::from_secs(2), reader.read()).await.unwrap();
+            assert_eq!(shards.iter().flatten().count(), 3);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a slow source must not be reopened on every healthy stripe"
+        );
     }
 
     /// Demand-bound lockstep regression: a slow data shard must be hedged as
