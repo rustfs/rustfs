@@ -58,6 +58,7 @@ pub struct ReportUploadReceipt {
 pub struct ReportUploadClient {
     transport: TelemetryTransport,
     upload_client: Client,
+    identity_store: super::IdentityStore,
     initial_backoff: Duration,
     max_backoff: Duration,
     proxy_configured: bool,
@@ -73,28 +74,36 @@ impl ReportUploadClient {
         let initial_backoff = config.schedule.initial_backoff;
         let max_backoff = config.schedule.max_backoff;
         let proxy_configured = config.proxy.is_some();
+        let identity_store = config.identity_store.clone();
         let transport = TelemetryTransport::new(config).map_err(transport_error)?;
         let upload_client = transport.presigned_client(upload_timeout).map_err(transport_error)?;
         Ok(Self {
             transport,
             upload_client,
+            identity_store,
             initial_backoff,
             max_backoff,
             proxy_configured,
         })
     }
 
-    /// Hashes the exact opened file, reserves one object, retries interrupted
-    /// single-object PUTs with fresh short-lived authorization, and completes
-    /// the reservation only after the object store accepts the archive.
+    /// Wraps a typed diagnostic in its signed upload manifest when needed,
+    /// hashes the exact upload bytes, reserves one object, and completes the
+    /// reservation only after the object store accepts the archive.
     pub async fn upload(
         &self,
         archive: &Path,
         cancellation: &CancellationToken,
     ) -> Result<ReportUploadReceipt, ReportUploadError> {
-        let prepared = prepare_archive(archive, cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Err(ReportUploadError::Cancelled);
+        }
+        let generated_bundle_uid = Uuid::now_v7().to_string();
+        let source = super::report_bundle::upload_source(archive, &generated_bundle_uid, &self.identity_store)
+            .map_err(report_bundle_error)?;
+        let prepared = prepare_file(File::from_std(source.file), cancellation).await?;
         let request_id = Uuid::new_v4().to_string();
-        let bundle_uid = Uuid::now_v7().to_string();
+        let bundle_uid = source.bundle_uid;
         let reserve = ReserveRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: &request_id,
@@ -233,7 +242,11 @@ struct PreparedArchive {
 }
 
 async fn prepare_archive(path: &Path, cancellation: &CancellationToken) -> Result<PreparedArchive, ReportUploadError> {
-    let mut file = File::open(path).await.map_err(ReportUploadError::ArchiveOpen)?;
+    let file = File::open(path).await.map_err(ReportUploadError::ArchiveOpen)?;
+    prepare_file(file, cancellation).await
+}
+
+async fn prepare_file(mut file: File, cancellation: &CancellationToken) -> Result<PreparedArchive, ReportUploadError> {
     let metadata = file.metadata().await.map_err(ReportUploadError::ArchiveRead)?;
     if !metadata.is_file() {
         return Err(ReportUploadError::ArchiveType);
@@ -501,6 +514,17 @@ fn transport_error(error: TelemetryError) -> ReportUploadError {
     }
 }
 
+fn report_bundle_error(error: super::report_bundle::ReportBundleError) -> ReportUploadError {
+    use super::report_bundle::ReportBundleError;
+
+    match error {
+        ReportBundleError::Expired => ReportUploadError::DiagnosticExpired,
+        ReportBundleError::IdentityMissing => ReportUploadError::IdentityMissing,
+        ReportBundleError::Io(error) => ReportUploadError::ArchiveRead(error),
+        ReportBundleError::Invalid | ReportBundleError::Zip(_) => ReportUploadError::DiagnosticArchive,
+    }
+}
+
 /// Safe, credential-redacted report upload failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ReportUploadError {
@@ -544,6 +568,10 @@ pub enum ReportUploadError {
     ArchiveSize,
     #[error("the report archive changed while its digest was calculated")]
     ArchiveChanged,
+    #[error("the signed diagnostic archive is invalid")]
+    DiagnosticArchive,
+    #[error("the signed diagnostic archive has expired")]
+    DiagnosticExpired,
     #[error("Connect returned an invalid report upload response")]
     Response,
     #[error("Connect returned an invalid or expired report upload authorization")]

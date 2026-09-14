@@ -41,6 +41,7 @@ pub mod offline;
 pub mod registration;
 pub mod registration_bootstrap;
 pub mod relay;
+mod report_bundle;
 pub mod report_upload;
 pub mod runtime;
 mod telemetry;
