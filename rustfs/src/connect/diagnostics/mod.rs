@@ -38,7 +38,7 @@ mod trace_replay;
 #[cfg(unix)]
 mod trace_runtime;
 
-/// Exact signed diagnostic producers dispatched by the `rustfs connect` CLI.
+/// Signed diagnostic producers available through the CLI or authenticated service jobs.
 pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
     perf_client::CLIENT_CAPABILITY,
     perf_drive::DRIVE_CAPABILITY,

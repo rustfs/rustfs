@@ -1206,6 +1206,58 @@ mod tests {
     }
 
     #[test]
+    fn advertised_diagnostic_capabilities_have_execution_paths() {
+        use crate::config::Cli;
+        use clap::CommandFactory;
+
+        let expected = [
+            ("performance.client@1", &["performance", "client"][..]),
+            ("performance.drive@1", &["performance", "drive"][..]),
+            ("performance.network@1", &[][..]),
+            ("performance.object@1", &["performance", "object"][..]),
+            ("performance.siteReplication@1", &["performance", "site-replication"][..]),
+            ("logs.capture@1", &["logs"][..]),
+            ("profile.cpu@1", &["profile"][..]),
+            ("profile.memory@1", &["profile"][..]),
+            ("profile.threads@1", &["profile"][..]),
+            ("telemetry.record@1", &["telemetry", "record"][..]),
+            ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
+            ("telemetry.replay@1", &["telemetry", "replay"][..]),
+            ("top.api@1", &["top", "api"][..]),
+            ("top.disk@1", &["top", "disk"][..]),
+            ("top.locks@1", &["top", "locks"][..]),
+            ("top.net@1", &["top", "net"][..]),
+            ("top.rpc@1", &["top", "rpc"][..]),
+            ("inspect.object@1", &["inspect", "object"][..]),
+        ];
+        assert_eq!(
+            super::super::CONNECT_DIAGNOSTIC_CAPABILITIES,
+            expected.iter().map(|(capability, _)| *capability).collect::<Vec<_>>()
+        );
+
+        let command = Cli::command();
+        let connect = command.find_subcommand("connect").expect("connect command");
+        for (capability, path) in expected {
+            if path.is_empty() {
+                // Network probes use the authenticated service dispatcher and
+                // locally resolved peers, not a standalone CLI command.
+                let mut job = envelope();
+                job.job_type = PERFORMANCE_NETWORK_JOB_TYPE.to_owned();
+                job.required_capabilities = vec![capability.to_owned()];
+                job.schema_version = NETWORK_SCHEMA_VERSION;
+                assert_eq!(job.kind(), Ok(DiagnosticJobKind::PerformanceNetwork));
+                continue;
+            }
+            let mut command = connect;
+            for segment in path {
+                command = command
+                    .find_subcommand(segment)
+                    .unwrap_or_else(|| panic!("{capability} is missing CLI dispatch at {segment}"));
+            }
+        }
+    }
+
+    #[test]
     fn accepts_a_bounded_signed_profile_job_for_the_exact_device() {
         let (envelope, signer) = signed();
         signer

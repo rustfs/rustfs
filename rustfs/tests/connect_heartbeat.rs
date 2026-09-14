@@ -538,6 +538,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "inventory.environment@1",
             "performance.client@1",
             "performance.drive@1",
+            "performance.network@1",
             "performance.object@1",
             "performance.siteReplication@1",
             "logs.capture@1",

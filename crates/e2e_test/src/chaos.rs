@@ -374,6 +374,30 @@ pub(crate) fn census_object_version_on_disk(
     })
 }
 
+pub(crate) fn is_cluster_heal_coordination_unavailable(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let message = error.to_string();
+    message.contains("500 Internal Server Error") && message.contains("cluster heal coordination unavailable")
+}
+
+/// Wait for the restarted cluster to admit the first root heal request.
+pub(crate) async fn start_root_heal_when_control_ready(
+    heal_url: &str,
+    heal_body: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> ChaosResult<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        match signed_admin_post(heal_url, Some(heal_body), access_key, secret_key).await {
+            Ok(_) => return Ok(()),
+            Err(error) if is_cluster_heal_coordination_unavailable(error.as_ref()) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// `POST` a signed (SigV4, service `s3`) admin request without relying on the
 /// external `awscurl` binary. Mirrors the admin heal calls used by the heal
 /// regression suite.

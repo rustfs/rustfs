@@ -16,7 +16,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
+    use crate::chaos::{
+        VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post, start_root_heal_when_control_ready,
+    };
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
         init_logging, rustfs_binary_path,
@@ -960,19 +962,26 @@ mod tests {
 
         let online_key = "cluster/online-before-replacement.bin";
         let online_body = b"object written while all cluster nodes are online".to_vec();
-        clients[0]
-            .put_object()
-            .bucket(bucket)
-            .key(online_key)
-            .body(ByteStream::from(online_body.clone()))
-            .send()
-            .await?;
-
         let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
-        assert!(
-            object_metadata_exists_on_disk(&replaced_disk, bucket, online_key),
-            "node 1 should contain metadata before disk replacement"
-        );
+        // A quorum write need not include the disk this fixture will replace.
+        // Establish that disk's baseline before testing its reconstruction.
+        timeout(Duration::from_secs(30), async {
+            loop {
+                clients[0]
+                    .put_object()
+                    .bucket(bucket)
+                    .key(online_key)
+                    .body(ByteStream::from(online_body.clone()))
+                    .send()
+                    .await?;
+                if object_metadata_exists_on_disk(&replaced_disk, bucket, online_key) {
+                    return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "node 1 did not store the baseline object before disk replacement")??;
 
         cluster.stop_node(1)?;
         std::fs::remove_dir_all(&replaced_disk)?;
@@ -1017,7 +1026,7 @@ mod tests {
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
-        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+        start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key).await?;
 
         let expected_objects = [(online_key, online_body.as_slice()), (outage_key, outage_body.as_slice())];
         let mut remaining_rebuild_keys: HashSet<&str> = expected_objects.iter().map(|(key, _)| *key).collect();
