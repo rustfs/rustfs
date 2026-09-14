@@ -209,7 +209,7 @@ fn transfer_uid_reuse_with_different_material_conflicts() {
     let destination = party("CONNECT", "organizations/o", false);
     let signing_key = SigningKey::from_bytes(&[12; 32]);
     let mut relay_destination = Destination::new(signing_key, false);
-    let first = envelope(b"first", producer.clone(), destination.clone());
+    let first = envelope(b"first", producer, destination);
     assert!(relay_destination.deliver(&serde_json::to_vec(&first).unwrap()).is_ok());
     assert!(relay_destination.deliver(&serde_json::to_vec(&first).unwrap()).is_ok());
     let mut conflicting = first;
