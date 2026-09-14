@@ -22,7 +22,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
-use base64_simd::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -34,6 +33,7 @@ use super::{
     execute_diagnostic_job,
 };
 use crate::connect::config::HeartbeatConfig;
+use crate::connect::report_upload::ReportUploadClient;
 use crate::connect::telemetry::{TelemetryDelivery, TelemetryTransport};
 
 const PROTOCOL_VERSION: &str = "v1";
@@ -56,12 +56,23 @@ pub(crate) struct DiagnosticJobRuntime {
 enum JobState {
     Active,
     Completed(DiagnosticJobExecution),
+    Uploaded(UploadedDiagnosticJobResult),
     Delivered,
 }
 
 #[derive(Clone)]
 struct JobStateStore {
     directory: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct UploadedDiagnosticJobResult {
+    job_id: String,
+    outcome: String,
+    reason: String,
+    artifact_name: Option<String>,
+    artifact_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -72,10 +83,8 @@ struct DiagnosticJobResultRequest<'a> {
     job_id: &'a str,
     outcome: &'a str,
     reason: &'a str,
-    artifact_uid: Option<&'a str>,
+    artifact_name: Option<&'a str>,
     artifact_sha256: Option<&'a str>,
-    artifact_encoding: Option<&'static str>,
-    artifact: Option<String>,
 }
 
 impl DiagnosticJobRuntime {
@@ -106,6 +115,16 @@ impl DiagnosticJobRuntime {
             match states.get(&job_id) {
                 Some(JobState::Active) => return,
                 Some(JobState::Completed(result)) => Some(result.clone()),
+                Some(JobState::Uploaded(result)) => {
+                    let result = result.clone();
+                    drop(states);
+                    let runtime = self.clone();
+                    let cancel = shutdown.child_token();
+                    tokio::spawn(async move {
+                        runtime.deliver_uploaded(result, &cancel).await;
+                    });
+                    return;
+                }
                 Some(JobState::Delivered) => return,
                 None => match self.store.load(&job_id) {
                     Ok(Some(JobState::Completed(result))) => {
@@ -117,6 +136,19 @@ impl DiagnosticJobRuntime {
                     }
                     Ok(Some(JobState::Delivered)) => {
                         states.insert(job_id, JobState::Delivered);
+                        return;
+                    }
+                    Ok(Some(JobState::Uploaded(result))) => {
+                        if !valid_uploaded_result(&result, &job_id) {
+                            return;
+                        }
+                        states.insert(job_id.clone(), JobState::Uploaded(result.clone()));
+                        drop(states);
+                        let runtime = self.clone();
+                        let cancel = shutdown.child_token();
+                        tokio::spawn(async move {
+                            runtime.deliver_uploaded(result, &cancel).await;
+                        });
                         return;
                     }
                     Ok(Some(JobState::Active)) => {
@@ -159,13 +191,20 @@ impl DiagnosticJobRuntime {
                     result
                 }
             };
-            if deliver_result(&runtime.config, &result, &cancel).await
-                && runtime.store.save(&job_id, &JobState::Delivered).is_ok()
-                && let Ok(mut states) = runtime.states.lock()
-            {
-                states.insert(job_id, JobState::Delivered);
+            if let Some(uploaded) = prepare_result(&runtime, result, &cancel).await {
+                runtime.deliver_uploaded(uploaded, &cancel).await;
             }
         });
+    }
+
+    async fn deliver_uploaded(&self, result: UploadedDiagnosticJobResult, cancel: &CancellationToken) {
+        let job_id = result.job_id.clone();
+        if deliver_result(&self.config, &result, cancel).await
+            && self.store.save(&job_id, &JobState::Delivered).is_ok()
+            && let Ok(mut states) = self.states.lock()
+        {
+            states.insert(job_id, JobState::Delivered);
+        }
     }
 }
 
@@ -372,6 +411,13 @@ fn enabled_build_features() -> Vec<String> {
 }
 
 fn failed_execution(job_id: &str, reason: &'static str) -> DiagnosticJobExecution {
+    let reason = if reason == "CANCELLED" {
+        "CANCELLED"
+    } else if reason == "LIMIT_EXCEEDED" {
+        "LIMIT_EXCEEDED"
+    } else {
+        "COLLECTION_FAILED"
+    };
     DiagnosticJobExecution {
         job_id: job_id.to_owned(),
         outcome: if reason == "CANCELLED" { "CANCELLED" } else { "FAILED" }.to_owned(),
@@ -382,7 +428,64 @@ fn failed_execution(job_id: &str, reason: &'static str) -> DiagnosticJobExecutio
     }
 }
 
-async fn deliver_result(config: &HeartbeatConfig, result: &DiagnosticJobExecution, cancel: &CancellationToken) -> bool {
+async fn prepare_result(
+    runtime: &DiagnosticJobRuntime,
+    result: DiagnosticJobExecution,
+    cancel: &CancellationToken,
+) -> Option<UploadedDiagnosticJobResult> {
+    let uploaded = if let (Some(bytes), true) =
+        (result.artifact_bytes.as_ref(), matches!(result.outcome.as_str(), "SUCCEEDED" | "PARTIAL"))
+    {
+        if runtime.store.ensure_directory().is_err() {
+            return None;
+        }
+        let path = runtime
+            .store
+            .directory
+            .join(format!(".{}.{}.artifact", result.job_id, Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path).ok()?;
+        if file.write_all(bytes).and_then(|()| file.sync_all()).is_err() {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+        drop(file);
+        let receipt = match ReportUploadClient::new(runtime.config.clone(), Duration::from_secs(15 * 60)) {
+            Ok(client) => client.upload(&path, cancel).await.ok(),
+            Err(_) => None,
+        };
+        let _ = fs::remove_file(path);
+        let receipt = receipt?;
+        UploadedDiagnosticJobResult {
+            job_id: result.job_id,
+            outcome: result.outcome,
+            reason: result.reason,
+            artifact_name: Some(receipt.name),
+            artifact_sha256: Some(receipt.declared_sha256),
+        }
+    } else {
+        UploadedDiagnosticJobResult {
+            job_id: result.job_id,
+            outcome: result.outcome,
+            reason: result.reason,
+            artifact_name: None,
+            artifact_sha256: None,
+        }
+    };
+    let state = JobState::Uploaded(uploaded.clone());
+    if runtime.store.save(&uploaded.job_id, &state).is_err() {
+        return None;
+    }
+    if let Ok(mut states) = runtime.states.lock() {
+        states.insert(uploaded.job_id.clone(), state);
+    }
+    Some(uploaded)
+}
+
+async fn deliver_result(config: &HeartbeatConfig, result: &UploadedDiagnosticJobResult, cancel: &CancellationToken) -> bool {
     let Ok(transport) = TelemetryTransport::new(config.clone()) else {
         return false;
     };
@@ -393,13 +496,8 @@ async fn deliver_result(config: &HeartbeatConfig, result: &DiagnosticJobExecutio
         job_id: &result.job_id,
         outcome: &result.outcome,
         reason: &result.reason,
-        artifact_uid: result.artifact_uid.as_deref(),
+        artifact_name: result.artifact_name.as_deref(),
         artifact_sha256: result.artifact_sha256.as_deref(),
-        artifact_encoding: result.artifact_bytes.as_ref().map(|_| "base64url"),
-        artifact: result
-            .artifact_bytes
-            .as_ref()
-            .map(|bytes| URL_SAFE_NO_PAD.encode_to_string(bytes)),
     };
     for attempt in 0..DELIVERY_ATTEMPTS {
         if cancel.is_cancelled() {
@@ -421,14 +519,38 @@ async fn deliver_result(config: &HeartbeatConfig, result: &DiagnosticJobExecutio
     false
 }
 
-fn valid_execution(result: &DiagnosticJobExecution, job_id: &str) -> bool {
-    let valid_outcome = matches!(result.outcome.as_str(), "SUCCEEDED" | "PARTIAL" | "FAILED" | "UNSUPPORTED" | "CANCELLED");
-    let valid_reason = !result.reason.is_empty()
-        && result.reason.len() <= 64
-        && result
-            .reason
+fn valid_uploaded_result(result: &UploadedDiagnosticJobResult, job_id: &str) -> bool {
+    result.job_id == job_id
+        && valid_terminal_fields(&result.outcome, &result.reason)
+        && match (&result.artifact_name, &result.artifact_sha256) {
+            (Some(name), Some(digest)) => {
+                matches!(result.outcome.as_str(), "SUCCEEDED" | "PARTIAL")
+                    && name.len() <= 512
+                    && name.starts_with("organizations/")
+                    && lower_hex(digest, 64)
+            }
+            (None, None) => matches!(result.outcome.as_str(), "FAILED" | "UNSUPPORTED" | "CANCELLED"),
+            _ => false,
+        }
+}
+
+fn valid_terminal_fields(outcome: &str, reason: &str) -> bool {
+    matches!(outcome, "SUCCEEDED" | "PARTIAL" | "FAILED" | "UNSUPPORTED" | "CANCELLED")
+        && !reason.is_empty()
+        && reason.len() <= 64
+        && reason
             .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_execution(result: &DiagnosticJobExecution, job_id: &str) -> bool {
     let valid_artifact = match (&result.artifact_uid, &result.artifact_sha256, &result.artifact_bytes) {
         (Some(uid), Some(digest), Some(bytes)) => {
             Uuid::parse_str(uid).is_ok_and(|value| value.get_version_num() == 7 && value.to_string() == *uid)
@@ -439,7 +561,7 @@ fn valid_execution(result: &DiagnosticJobExecution, job_id: &str) -> bool {
         (None, None, None) => matches!(result.outcome.as_str(), "FAILED" | "CANCELLED") && result.reason != "COMPLETE",
         _ => false,
     };
-    result.job_id == job_id && valid_outcome && valid_reason && valid_artifact
+    result.job_id == job_id && valid_terminal_fields(&result.outcome, &result.reason) && valid_artifact
 }
 
 #[cfg(test)]
@@ -465,14 +587,21 @@ mod tests {
             job_id: "018cc251-f400-7abc-8def-0123456789ab",
             outcome: "FAILED",
             reason: "CANCELLED",
-            artifact_uid: None,
+            artifact_name: None,
             artifact_sha256: None,
-            artifact_encoding: None,
-            artifact: None,
         };
         let value = serde_json::to_value(request).expect("result request");
         assert_eq!(value["jobId"], "018cc251-f400-7abc-8def-0123456789ab");
-        for forbidden in ["command", "script", "path", "sql", "arguments"] {
+        for forbidden in [
+            "command",
+            "script",
+            "path",
+            "sql",
+            "arguments",
+            "artifact",
+            "artifactUid",
+            "artifactEncoding",
+        ] {
             assert!(value.get(forbidden).is_none());
         }
     }
@@ -497,6 +626,27 @@ mod tests {
         };
         assert_eq!(loaded, expected);
         assert!(valid_execution(&loaded, &job_id));
+
+        let uploaded = UploadedDiagnosticJobResult {
+            job_id: job_id.clone(),
+            outcome: "SUCCEEDED".to_owned(),
+            reason: "COMPLETE".to_owned(),
+            artifact_name: Some(format!(
+                "organizations/{}/clusters/{}/supportBundles/{}",
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                Uuid::now_v7()
+            )),
+            artifact_sha256: Some("a".repeat(64)),
+        };
+        store
+            .save(&job_id, &JobState::Uploaded(uploaded.clone()))
+            .expect("uploaded state");
+        let loaded = match store.load(&job_id).expect("load state") {
+            Some(JobState::Uploaded(result)) => result,
+            _ => panic!("uploaded state expected"),
+        };
+        assert!(valid_uploaded_result(&loaded, &job_id));
 
         store.save(&job_id, &JobState::Delivered).expect("delivered state");
         assert!(matches!(store.load(&job_id), Ok(Some(JobState::Delivered))));
