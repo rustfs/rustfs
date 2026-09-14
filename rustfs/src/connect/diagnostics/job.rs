@@ -261,6 +261,10 @@ pub enum DiagnosticJobError {
     Cancelled,
     #[error("connect_diagnostic_job_collection_failed")]
     CollectionFailed,
+    #[error("connect_diagnostic_job_profile_source_unavailable")]
+    ProfileSourceUnavailable,
+    #[error("connect_diagnostic_job_export_failed")]
+    ExportFailed,
 }
 
 impl DiagnosticJobError {
@@ -277,6 +281,8 @@ impl DiagnosticJobError {
             Self::Encoding => "ENCODING_FAILED",
             Self::Cancelled => "CANCELLED",
             Self::CollectionFailed => "COLLECTION_FAILED",
+            Self::ProfileSourceUnavailable => "PROFILE_SOURCE_UNAVAILABLE",
+            Self::ExportFailed => "EXPORT_FAILED",
         }
     }
 }
@@ -403,14 +409,8 @@ pub async fn execute_diagnostic_job(
         sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
         provenance,
     };
-    let result = capture_cpu_profile(&request, cancel).await.map_err(|error| match error {
-        super::ProfileError::Cancelled => DiagnosticJobError::Cancelled,
-        _ => DiagnosticJobError::CollectionFailed,
-    })?;
-    let export = encode_signed_profile_export(&request, &result, identity, cancel).map_err(|error| match error {
-        super::ProfileError::Cancelled => DiagnosticJobError::Cancelled,
-        _ => DiagnosticJobError::CollectionFailed,
-    })?;
+    let result = capture_cpu_profile(&request, cancel).await.map_err(capture_failure)?;
+    let export = encode_signed_profile_export(&request, &result, identity, cancel).map_err(export_failure)?;
     if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
         return Err(DiagnosticJobError::LimitExceeded);
     }
@@ -424,6 +424,23 @@ pub async fn execute_diagnostic_job(
         artifact_sha256: Some(export.archive_sha256),
         artifact_bytes: Some(export.archive_bytes),
     })
+}
+
+fn capture_failure(error: super::ProfileError) -> DiagnosticJobError {
+    match error {
+        super::ProfileError::Cancelled => DiagnosticJobError::Cancelled,
+        super::ProfileError::LimitExceeded | super::ProfileError::TimedOut => DiagnosticJobError::LimitExceeded,
+        super::ProfileError::SourceUnavailable => DiagnosticJobError::ProfileSourceUnavailable,
+        _ => DiagnosticJobError::CollectionFailed,
+    }
+}
+
+fn export_failure(error: super::ProfileError) -> DiagnosticJobError {
+    match error {
+        super::ProfileError::Cancelled => DiagnosticJobError::Cancelled,
+        super::ProfileError::LimitExceeded => DiagnosticJobError::LimitExceeded,
+        _ => DiagnosticJobError::ExportFailed,
+    }
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>, DiagnosticJobError> {
@@ -563,5 +580,18 @@ mod tests {
             signer.verify(&envelope, &target(&envelope), "2030-01-01T00:00:10Z".parse().expect("time")),
             Err(DiagnosticJobError::Unsupported)
         );
+    }
+
+    #[test]
+    fn exposes_only_allow_listed_profile_failure_reasons() {
+        assert_eq!(
+            capture_failure(super::super::ProfileError::SourceUnavailable),
+            DiagnosticJobError::ProfileSourceUnavailable
+        );
+        assert_eq!(capture_failure(super::super::ProfileError::TimedOut), DiagnosticJobError::LimitExceeded);
+        assert_eq!(capture_failure(super::super::ProfileError::Cancelled), DiagnosticJobError::Cancelled);
+        assert_eq!(export_failure(super::super::ProfileError::Encoding), DiagnosticJobError::ExportFailed);
+        assert_eq!(DiagnosticJobError::ProfileSourceUnavailable.reason(), "PROFILE_SOURCE_UNAVAILABLE");
+        assert_eq!(DiagnosticJobError::ExportFailed.reason(), "EXPORT_FAILED");
     }
 }
