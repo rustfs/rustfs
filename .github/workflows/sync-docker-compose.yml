@@ -1,0 +1,73 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Notify rustfs/rustfs.com when the published docker-compose.yml changes so
+# https://rustfs.com/docker-compose.yml can be event-synced (no redirect).
+#
+# Maintainer setup:
+#   Secret: WEBSITE_DISPATCH_TOKEN — PAT (or GitHub App token) that can create
+#   repository_dispatch on rustfs/rustfs.com (typically contents:write there).
+#   Event type: sync-docker-compose
+#
+# rustfs/rustfs.com.cn is not dispatched: no established .cn automation exists.
+
+name: Sync docker-compose to website
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "docker-compose.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch rustfs.com sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Notify rustfs/rustfs.com
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::WEBSITE_DISPATCH_TOKEN is not configured; cannot dispatch rustfs/rustfs.com" >&2
+            echo "Add a repository secret named WEBSITE_DISPATCH_TOKEN with permission to send repository_dispatch to rustfs/rustfs.com." >&2
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg event_type "sync-docker-compose" \
+            --arg repository "${SOURCE_REPOSITORY}" \
+            --arg ref "${SOURCE_REF}" \
+            --arg sha "${SOURCE_SHA}" \
+            --arg path "docker-compose.yml" \
+            '{event_type: $event_type, client_payload: {repository: $repository, ref: $ref, sha: $sha, path: $path}}')"
+
+          if ! printf '%s\n' "${payload}" | gh api --method POST repos/rustfs/rustfs.com/dispatches --input -; then
+            echo "::error::Failed to dispatch sync-docker-compose to rustfs/rustfs.com" >&2
+            exit 1
+          fi
+          echo "dispatched sync-docker-compose to rustfs/rustfs.com"
