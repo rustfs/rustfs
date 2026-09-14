@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start an ephemeral Vault, issue a least-privilege AppRole, and run the two
+# Start an ephemeral Vault, issue a least-privilege AppRole, and run the
 # ignored RustFS KMS checks without ever exposing the generated credentials.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +77,8 @@ if [[ "$ready" != 1 ]]; then
 fi
 
 vault_cli secrets enable -path=transit transit >/dev/null
+vault_cli secrets enable -path=kms-test/transit transit >/dev/null
+vault_cli secrets enable -path=kms-test/metadata kv-v2 >/dev/null
 vault_cli auth enable approle >/dev/null
 
 POLICY_NAME="rustfs-kms-live-$$"
@@ -105,6 +107,11 @@ path "secret/metadata/rustfs/kms/transit-metadata" {
   capabilities = ["list"]
 }
 
+# Non-default Transit metadata mount and prefix, both containing slashes.
+path "kms-test/metadata/data/custom/transit-metadata/*" {
+  capabilities = ["create", "read", "update"]
+}
+
 # Transit key lifecycle and data-path operations.
 path "transit/keys" {
   capabilities = ["list"]
@@ -116,6 +123,20 @@ path "transit/encrypt/*" {
   capabilities = ["update"]
 }
 path "transit/decrypt/*" {
+  capabilities = ["update"]
+}
+
+# The same operations under a non-default, nested Transit mount.
+path "kms-test/transit/keys" {
+  capabilities = ["list"]
+}
+path "kms-test/transit/keys/*" {
+  capabilities = ["create", "read", "update"]
+}
+path "kms-test/transit/encrypt/*" {
+  capabilities = ["update"]
+}
+path "kms-test/transit/decrypt/*" {
   capabilities = ["update"]
 }
 EOF
@@ -135,6 +156,9 @@ SECRET_ID="$(vault_cli write -f -field=secret_id "auth/approle/role/${ROLE_NAME}
 run_live_test() {
   local backend="$1"
   local test_name="$2"
+  local transit_mount="${3:-transit}"
+  local metadata_mount="${4:-secret}"
+  local metadata_prefix="${5:-rustfs/kms/transit-metadata}"
 
   local -a backend_env=(
     -u RUSTFS_KMS_BACKEND
@@ -178,9 +202,9 @@ run_live_test() {
     )
   else
     backend_env+=(
-      RUSTFS_KMS_VAULT_MOUNT_PATH=transit
-      RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT=secret
-      RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX=rustfs/kms/transit-metadata
+      RUSTFS_KMS_VAULT_MOUNT_PATH="$transit_mount"
+      RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT="$metadata_mount"
+      RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX="$metadata_prefix"
     )
   fi
 
@@ -193,4 +217,9 @@ run_live_test() {
 cd "$PROJECT_ROOT"
 run_live_test vault vault_kv2_approle_auth_live
 run_live_test vault-transit vault_transit_approle_auth_live
+# Remove the default mounts so a fallback to transit or secret cannot pass.
+vault_cli secrets disable transit >/dev/null
+vault_cli secrets disable secret >/dev/null
+run_live_test vault-transit vault_transit_approle_custom_paths_live \
+  kms-test/transit kms-test/metadata custom/transit-metadata
 echo "Vault AppRole KV2 and Transit live checks passed"
