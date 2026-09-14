@@ -348,6 +348,25 @@ pub struct ConnectEnvironmentInventoryOpts {
     /// Confirm this explicit local L1 inventory operation
     #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
     pub acknowledge_l1: bool,
+    /// New local signed archive path; omit to print the four-field JSON inventory
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub organization: Option<String>,
+    #[arg(long)]
+    pub cluster: Option<String>,
+    #[arg(long)]
+    pub device: Option<String>,
+    #[arg(long = "run-uid")]
+    pub run_uid: Option<String>,
+    #[arg(long = "artifact-uid")]
+    pub artifact_uid: Option<String>,
+    #[arg(long = "consent-uid")]
+    pub consent_uid: Option<String>,
+    #[arg(long = "policy-revision")]
+    pub policy_revision: Option<u64>,
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: Option<i64>,
 }
 
 #[derive(Args, Clone)]
