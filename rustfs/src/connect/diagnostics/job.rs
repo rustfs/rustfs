@@ -35,10 +35,10 @@ use super::{
     MAX_TOP_EXPORT_VALIDITY, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceError,
     NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest,
     ProfileOutcome, ProfileProvenance, THREAD_PROFILE_CAPABILITY, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY,
-    TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome,
-    capture_cpu_profile, capture_thread_profile, capture_top_api, capture_top_locks, encode_signed_profile_export, measure_drive,
-    measure_network, runtime_network_peer_aliases, sign_drive_export, sign_network_export, sign_top_export,
-    sign_top_export_with_nonce,
+    TOP_RPC_CAPABILITY, TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits, TopCaptureRequest,
+    TopCaptureScope, TopOutcome, capture_cpu_profile, capture_thread_profile, capture_top_api, capture_top_locks,
+    capture_top_rpc, encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases,
+    sign_drive_export, sign_network_export, sign_top_export, sign_top_export_with_nonce,
 };
 use crate::connect::DeviceIdentity;
 
@@ -49,6 +49,7 @@ const PERFORMANCE_DRIVE_JOB_TYPE: &str = "performance.drive";
 const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
 const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
+const TOP_RPC_JOB_TYPE: &str = "top.rpc";
 pub const DIAGNOSTIC_JOB_SIGNATURE_DOMAIN: &[u8] = b"rustfs-connect-agent-job-v1\0";
 const MAX_JOB_LIFETIME_SECONDS: i64 = 1_800;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
@@ -67,6 +68,8 @@ const MAX_TOP_API_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_API_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_LOCKS_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_LOCKS_MEMORY_BYTES: u64 = 1_048_576;
+const MAX_TOP_RPC_CPU_MILLIS: u64 = 5_000;
+const MIN_TOP_RPC_MEMORY_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
@@ -76,6 +79,7 @@ enum DiagnosticJobKind {
     PerformanceNetwork,
     TopApi,
     TopLocks,
+    TopRpc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -454,6 +458,11 @@ impl DiagnosticJobEnvelope {
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
+        if kind == DiagnosticJobKind::TopRpc
+            && (self.limits.max_cpu_millis > MAX_TOP_RPC_CPU_MILLIS || self.limits.max_memory_bytes < MIN_TOP_RPC_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
         Ok(())
     }
 
@@ -480,6 +489,11 @@ impl DiagnosticJobEnvelope {
                 if capability == TOP_LOCKS_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
             {
                 Ok(DiagnosticJobKind::TopLocks)
+            }
+            (TOP_RPC_JOB_TYPE, [capability], version)
+                if capability == TOP_RPC_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
+            {
+                Ok(DiagnosticJobKind::TopRpc)
             }
             _ => Err(DiagnosticJobError::Unsupported),
         }
@@ -514,6 +528,7 @@ pub async fn execute_diagnostic_job(
         }
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
+        DiagnosticJobKind::TopRpc => execute_top_rpc_job(envelope, nonce, identity, provenance, cancel).await,
     }
 }
 
@@ -948,6 +963,70 @@ async fn execute_top_locks_job(
         });
     }
     let export = sign_top_export(&request, &result, identity, cancel).map_err(top_export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome,
+        reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+async fn execute_top_rpc_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = TopCaptureRequest {
+        scope: TopCaptureScope {
+            organization_name: envelope.organization_name,
+            cluster_name: envelope.cluster_name,
+            device_name: envelope.device_name,
+            run_uid: envelope.job_id.clone(),
+            artifact_uid: envelope.parameters.artifact_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            run_expires_at_unix: expire.timestamp(),
+            executable_sha256: provenance.executable_sha256().to_owned(),
+            build_features: provenance.build_features().to_vec(),
+            consent: LocalTopConsent {
+                uid: envelope.parameters.consent_uid,
+                tool_id: TOP_RPC_JOB_TYPE.to_owned(),
+                classification: TOP_CLASSIFICATION.to_owned(),
+                active: true,
+                expires_at_unix: consent_expire.timestamp(),
+            },
+        },
+        limits: TopCaptureLimits {
+            max_duration_millis: envelope.parameters.duration_millis,
+            max_working_memory_bytes: envelope.limits.max_memory_bytes,
+            max_cpu_millis: envelope.limits.max_cpu_millis,
+            ..TopCaptureLimits::default()
+        },
+        window: Duration::from_millis(envelope.parameters.duration_millis),
+        export_validity: MAX_TOP_EXPORT_VALIDITY,
+    };
+    let result = capture_top_rpc(&request, cancel).await.map_err(top_capture_failure)?;
+    let outcome = result.outcome.as_str().to_owned();
+    let reason = result.reason_code.as_str().to_owned();
+    if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome,
+            reason,
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = sign_top_export_with_nonce(&request, &result, identity, cancel, nonce).map_err(top_export_failure)?;
     if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
         return Err(DiagnosticJobError::LimitExceeded);
     }
@@ -1400,6 +1479,74 @@ mod tests {
             signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
             Err(DiagnosticJobError::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn accepts_only_the_bounded_top_rpc_capability_pair() {
+        let mut top = envelope();
+        top.job_type = TOP_RPC_JOB_TYPE.to_owned();
+        top.required_capabilities = vec![TOP_RPC_CAPABILITY.to_owned()];
+        top.limits.max_cpu_millis = MAX_TOP_RPC_CPU_MILLIS;
+        let (top, signer) = signed_envelope(top);
+        signer
+            .verify(&top, &target(&top), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid top.rpc job");
+
+        let mut mismatched = top.clone();
+        mismatched.required_capabilities = vec![TOP_LOCKS_CAPABILITY.to_owned()];
+        assert_eq!(
+            signer.verify(&mismatched, &target(&mismatched), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Unsupported)
+        );
+
+        let mut unbounded = top;
+        unbounded.limits.max_cpu_millis += 1;
+        assert_eq!(
+            signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn top_rpc_job_captures_service_process_events_and_exports_a_signed_artifact() {
+        use rustfs_common::trace_bus::{
+            TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit,
+        };
+
+        let mut top = envelope();
+        top.job_type = TOP_RPC_JOB_TYPE.to_owned();
+        top.required_capabilities = vec![TOP_RPC_CAPABILITY.to_owned()];
+        top.limits.max_cpu_millis = MAX_TOP_RPC_CPU_MILLIS;
+        top.parameters.duration_millis = 50;
+
+        let emit = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(telemetry_trace_emit(|| {
+                TelemetryTraceEvent::new(
+                    TelemetryTraceOperation::InternalRpc,
+                    Duration::from_micros(37),
+                    TelemetryTraceStatus::Ok,
+                )
+            }));
+        };
+        let identity = DeviceIdentity::generate();
+        let cancellation = CancellationToken::new();
+        let execute = execute_diagnostic_job(
+            VerifiedDiagnosticJob {
+                envelope: top,
+                nonce: [7_u8; 32],
+            },
+            &identity,
+            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+            &cancellation,
+        );
+        let (execution, ()) = tokio::join!(execute, emit);
+        let execution = execution.expect("top.rpc job should execute");
+
+        assert_eq!(execution.outcome, "SUCCEEDED");
+        assert_eq!(execution.reason, "COMPLETE");
+        assert!(execution.artifact_bytes.is_some_and(|bytes| !bytes.is_empty()));
     }
 
     #[test]
