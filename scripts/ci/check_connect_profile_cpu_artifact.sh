@@ -135,6 +135,10 @@ PY
 printf 'rustfs-diagnostic-envelope-v1\0' >"$work_dir/signed-input"
 cat "$envelope" >>"$work_dir/signed-input"
 openssl pkey -in "$work_dir/device.pem" -pubout -out "$work_dir/device.pub" >/dev/null 2>&1
+openssl pkey -in "$work_dir/device.pem" -pubout -outform DER -out "$work_dir/device.pub.der" >/dev/null 2>&1
+device_key_id=$(sha256sum "$work_dir/device.pub.der" | awk '{print $1}')
+device_public_key=$(tail -c 65 "$work_dir/device.pub.der" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+[[ $(jq -r '.deviceKeyId' "$envelope") == "$device_key_id" ]]
 openssl dgst -sha256 -verify "$work_dir/device.pub" -signature "$work_dir/signature.der" "$work_dir/signed-input"
 
 if grep -R -E '(/home/|device\.key|thread(Name|Id)?|0x[0-9a-fA-F]+|rustfs::)' "$work_dir/archive"; then
@@ -213,6 +217,8 @@ jq -n \
   --arg binarySha256 "$actual_binary_sha256" \
   --arg runnerArchitecture "$runner_architecture" \
   --arg archiveSha256 "$actual_archive_sha256" \
+  --arg deviceKeyId "$device_key_id" \
+  --arg devicePublicKey "$device_public_key" \
   --argjson result "$result_json" \
-  '{sourceSha: $sourceSha, binarySha256: $binarySha256, runnerArchitecture: $runnerArchitecture, archiveSha256: $archiveSha256, invocation: "scripts/ci/check_connect_profile_cpu_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", singleCollector: "SECOND_CAPTURE_REJECTED", redaction: "VERIFIED"}}' >"$evidence_json"
+  '{sourceSha: $sourceSha, binarySha256: $binarySha256, runnerArchitecture: $runnerArchitecture, archiveSha256: $archiveSha256, deviceKeyId: $deviceKeyId, devicePublicKey: $devicePublicKey, invocation: "scripts/ci/check_connect_profile_cpu_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", singleCollector: "SECOND_CAPTURE_REJECTED", redaction: "VERIFIED"}}' >"$evidence_json"
 jq '{sourceSha, binarySha256, runnerArchitecture, archiveSha256, result: {outcome: .result.outcome, reasonCode: .result.reasonCode, durationMillis: .result.durationMillis, sampleCount: (.result.data.samples | length), totalSamples: ([.result.data.samples[].sampleCount] | add), droppedSampleCount: .result.data.droppedSampleCount}, controls}' "$evidence_json"
