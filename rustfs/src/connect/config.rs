@@ -27,7 +27,7 @@ use std::time::Duration;
 use reqwest::{ClientBuilder, NoProxy, Proxy, Url};
 use zeroize::Zeroizing;
 
-use super::{CredentialStore, IdentityStore};
+use super::{CredentialStore, IdentityStore, TrustedDiagnosticJobSigner};
 
 pub const ENV_CONNECT_ENDPOINT: &str = "RUSTFS_CONNECT_ENDPOINT";
 pub const ENV_CONNECT_ROOT_CA_FILE: &str = "RUSTFS_CONNECT_ROOT_CA_FILE";
@@ -36,6 +36,8 @@ pub const ENV_CONNECT_PROXY_URL: &str = "RUSTFS_CONNECT_PROXY_URL";
 pub const ENV_CONNECT_PROXY_BYPASS: &str = "RUSTFS_CONNECT_PROXY_BYPASS";
 pub const ENV_CONNECT_PROXY_USERNAME_FILE: &str = "RUSTFS_CONNECT_PROXY_USERNAME_FILE";
 pub const ENV_CONNECT_PROXY_PASSWORD_FILE: &str = "RUSTFS_CONNECT_PROXY_PASSWORD_FILE";
+pub const ENV_CONNECT_JOB_SIGNING_KEY_ID: &str = "RUSTFS_CONNECT_JOB_SIGNING_KEY_ID";
+pub const ENV_CONNECT_JOB_SIGNING_PUBLIC_KEY_FILE: &str = "RUSTFS_CONNECT_JOB_SIGNING_PUBLIC_KEY_FILE";
 
 const MAX_PROXY_BYPASS_BYTES: usize = 2048;
 const MAX_PROXY_USERNAME_BYTES: usize = 256;
@@ -312,6 +314,7 @@ pub struct HeartbeatConfig {
     pub state_path: PathBuf,
     pub schedule: HeartbeatSchedule,
     pub proxy: Option<ProxyConfig>,
+    pub diagnostic_job_signer: Option<TrustedDiagnosticJobSigner>,
 }
 
 impl HeartbeatConfig {
@@ -331,6 +334,7 @@ impl HeartbeatConfig {
             state_path,
             schedule: HeartbeatSchedule::default(),
             proxy: None,
+            diagnostic_job_signer: None,
         }
     }
 
@@ -344,6 +348,7 @@ impl HeartbeatConfig {
             state_path: state_root.join("heartbeat/state.json"),
             schedule: HeartbeatSchedule::default(),
             proxy: None,
+            diagnostic_job_signer: None,
         }
     }
 
@@ -356,7 +361,7 @@ impl HeartbeatConfig {
     }
 
     pub fn from_env() -> Result<Option<Self>, HeartbeatConfigError> {
-        Self::from_env_values(
+        let mut config = Self::from_env_values(
             env::var_os(ENV_CONNECT_ENDPOINT),
             env::var_os(ENV_CONNECT_ROOT_CA_FILE),
             env::var_os(ENV_CONNECT_STATE_DIR),
@@ -364,7 +369,20 @@ impl HeartbeatConfig {
             env::var_os(ENV_CONNECT_PROXY_BYPASS),
             env::var_os(ENV_CONNECT_PROXY_USERNAME_FILE),
             env::var_os(ENV_CONNECT_PROXY_PASSWORD_FILE),
-        )
+        )?;
+        let key_id = env::var_os(ENV_CONNECT_JOB_SIGNING_KEY_ID);
+        let public_key_file = env::var_os(ENV_CONNECT_JOB_SIGNING_PUBLIC_KEY_FILE);
+        if key_id.is_some() != public_key_file.is_some() {
+            return Err(HeartbeatConfigError::DiagnosticJobTrust);
+        }
+        if let (Some(config), Some(key_id), Some(public_key_file)) = (&mut config, key_id, public_key_file) {
+            let key_id = key_id.into_string().map_err(|_| HeartbeatConfigError::DiagnosticJobTrust)?;
+            config.diagnostic_job_signer = Some(
+                TrustedDiagnosticJobSigner::from_public_key_file(&PathBuf::from(public_key_file), key_id)
+                    .map_err(|_| HeartbeatConfigError::DiagnosticJobTrust)?,
+            );
+        }
+        Ok(config)
     }
 
     fn from_env_values(
@@ -452,6 +470,8 @@ pub enum HeartbeatConfigError {
     PlatformSecurity,
     #[error(transparent)]
     Proxy(#[from] ProxyConfigError),
+    #[error("Connect diagnostic job signing trust configuration is invalid")]
+    DiagnosticJobTrust,
 }
 
 #[cfg(test)]

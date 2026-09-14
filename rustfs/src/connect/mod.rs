@@ -48,8 +48,9 @@ mod telemetry;
 
 pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{
-    ENV_CONNECT_PROXY_BYPASS, ENV_CONNECT_PROXY_PASSWORD_FILE, ENV_CONNECT_PROXY_URL, ENV_CONNECT_PROXY_USERNAME_FILE,
-    HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule, ProxyConfig, ProxyConfigError,
+    ENV_CONNECT_JOB_SIGNING_KEY_ID, ENV_CONNECT_JOB_SIGNING_PUBLIC_KEY_FILE, ENV_CONNECT_PROXY_BYPASS,
+    ENV_CONNECT_PROXY_PASSWORD_FILE, ENV_CONNECT_PROXY_URL, ENV_CONNECT_PROXY_USERNAME_FILE, HeartbeatConfig,
+    HeartbeatConfigError, HeartbeatSchedule, ProxyConfig, ProxyConfigError,
 };
 pub use credential_store::{CredentialStore, DeviceCredential};
 pub use diagnostics::{

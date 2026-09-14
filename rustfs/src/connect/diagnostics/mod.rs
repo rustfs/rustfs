@@ -14,6 +14,7 @@
 
 mod inspect;
 mod job;
+pub(crate) mod job_delivery;
 mod logs;
 mod perf_client;
 mod perf_drive;
