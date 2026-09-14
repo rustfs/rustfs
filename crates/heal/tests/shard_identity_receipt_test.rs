@@ -379,3 +379,162 @@ fn admin_pool_set_repairs_five_shards_and_retains_exact_terminal_after_restart()
         .join()
         .expect("heal fixture result");
 }
+
+#[test]
+#[serial]
+fn admin_normal_protected_repairs_report_repaired_for_data_and_parity() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("heal fixture runtime")
+                .block_on(async {
+                    use rustfs_heal::heal::{
+                        manager::{HealConfig, HealManager},
+                        task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
+                    };
+                    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+                    use std::sync::Arc;
+                    use std::time::Duration;
+                    use storage_api::integration::WriteCompletion;
+
+                    let root = tempfile::tempdir().expect("normal repair fixture");
+                    let env = TestECStoreEnv::builder()
+                        .base_dir(root.path())
+                        .prefix("admin_normal_repair_receipts")
+                        .build()
+                        .await;
+                    let bucket = "admin-normal-repair";
+                    env.make_bucket(bucket, false).await;
+                    let set = env.ecstore.pools[0].get_disks(0);
+                    let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+                    let mut faults = Vec::new();
+                    for (object, want_data, byte) in [("missing-data", true, 0x31_u8), ("missing-parity", false, 0x72_u8)] {
+                        let body = vec![byte; 1024 * 1024 + 37];
+                        env.ecstore
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(body.clone()),
+                                &ObjectOptions {
+                                    write_completion: WriteCompletion::TailDrained,
+                                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("commit protected fixture");
+                        let mut metadata = Vec::new();
+                        for disk in &disks {
+                            metadata.push(
+                                disk.read_version("", bucket, object, "", &ReadOptions::default())
+                                    .await
+                                    .expect("fixture metadata"),
+                            );
+                        }
+                        let target_slot = metadata
+                            .iter()
+                            .position(|part| (part.erasure.index <= part.erasure.data_blocks) == want_data)
+                            .expect("fixture must expose both data and parity shards");
+                        let target = &metadata[target_slot];
+                        let path = env.disk_paths[target_slot]
+                            .join(bucket)
+                            .join(object)
+                            .join(target.data_dir.expect("external shard").to_string())
+                            .join("part.1");
+                        let original = tokio::fs::read(&path).await.expect("original shard bytes");
+                        tokio::fs::remove_file(&path).await.expect("inject missing shard");
+                        faults.push((object.to_owned(), path, original, body));
+                    }
+
+                    let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+                    let manager = HealManager::new(
+                        storage.clone(),
+                        Some(HealConfig {
+                            enable_auto_heal: false,
+                            ..Default::default()
+                        }),
+                    );
+                    manager.start().await.expect("start heal manager");
+                    let mut request = HealRequest::new(
+                        HealType::ErasureSet {
+                            buckets: Vec::new(),
+                            set_disk_id: "pool_0_set_0".to_owned(),
+                        },
+                        HealOptions {
+                            recursive: true,
+                            scan_mode: HealScanMode::Normal,
+                            pool_index: Some(0),
+                            set_index: Some(0),
+                            timeout: Some(Duration::from_secs(60)),
+                            ..Default::default()
+                        },
+                        HealPriority::High,
+                    );
+                    request.source = HealRequestSource::Admin;
+                    let token = request.id.clone();
+                    manager
+                        .submit_heal_request(request)
+                        .await
+                        .expect("admit normal all-buckets heal");
+                    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+                        loop {
+                            let report = manager.get_task_report(&token).await.expect("same-token report");
+                            if matches!(
+                                report.status,
+                                HealTaskStatus::Completed | HealTaskStatus::Failed { .. } | HealTaskStatus::Timeout
+                            ) {
+                                break report;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect("terminal deadline");
+                    assert_eq!(terminal.status, HealTaskStatus::Completed);
+                    let outcome = terminal.outcome.as_deref().expect("canonical terminal");
+                    assert_eq!(
+                        (
+                            outcome.counters.processed,
+                            outcome.counters.healed,
+                            outcome.counters.unchanged,
+                            outcome.counters.skipped,
+                            outcome.counters.failed,
+                            outcome.counters.unknown,
+                        ),
+                        (2, 2, 0, 0, 0, 0),
+                        "normal protected repairs must be canonical: {outcome:?}"
+                    );
+                    assert_eq!(outcome.objects.len(), 2);
+                    for (object, path, original, body) in &faults {
+                        assert_eq!(&tokio::fs::read(path).await.expect("rebuilt physical shard"), original);
+                        let receipt = outcome
+                            .objects
+                            .iter()
+                            .find(|receipt| receipt.identity.bucket == bucket && receipt.identity.object == *object)
+                            .expect("one receipt per repaired object");
+                        assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+                        assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
+                        assert!(receipt.identity.version_id.is_some());
+                        assert_eq!(
+                            receipt.identity.bucket_incarnation_id,
+                            Some(storage.admit_bucket_incarnation(bucket).await.expect("original bucket"))
+                        );
+                        let mut reader = env
+                            .ecstore
+                            .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+                            .await
+                            .expect("read repaired object");
+                        let mut actual = Vec::new();
+                        reader.stream.read_to_end(&mut actual).await.expect("read repaired body");
+                        assert_eq!(&actual, body);
+                    }
+                    manager.stop().await.expect("stop heal manager");
+                });
+        })
+        .expect("heal fixture thread")
+        .join()
+        .expect("heal fixture result");
+}

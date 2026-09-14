@@ -105,7 +105,7 @@ fn verified_object_receipt(
     item: &HealResultItem,
     bucket_incarnation_id: Uuid,
 ) -> Option<HealObjectReceipt> {
-    if opts.dry_run || !item.integrity_verified {
+    if opts.dry_run || (!item.integrity_verified && !item.repair_verified) {
         return None;
     }
     let resolved_version = Uuid::from_bytes(item.resolved_version_id?);
@@ -116,6 +116,9 @@ fn verified_object_receipt(
     }
     item.drives_reported()?;
     let drives_healed = item.drives_healed()?;
+    if item.repair_verified && drives_healed == 0 {
+        return None;
+    }
     let ok_drive_state = DriveState::Ok.to_string();
     if !item.after.drives.iter().all(|drive| drive.state == ok_drive_state) {
         return None;
@@ -132,8 +135,10 @@ fn verified_object_receipt(
         },
         disposition: if drives_healed > 0 {
             HealObjectDisposition::Repaired
-        } else {
+        } else if item.integrity_verified {
             HealObjectDisposition::VerifiedHealthy
+        } else {
+            return None;
         },
     })
 }
@@ -682,7 +687,7 @@ impl ECStoreHealStorage {
             } else {
                 None
             }
-        } else if error.is_none() && !opts.dry_run && item.integrity_verified {
+        } else if error.is_none() && !opts.dry_run && (item.integrity_verified || item.repair_verified) {
             let bucket_incarnation_id = match expected {
                 Some(expected) => Some(expected),
                 None => self.ecstore.bucket_incarnation_id(bucket).await.ok(),
@@ -1848,6 +1853,20 @@ mod tests {
             "the exact version cannot certify unverified shard integrity"
         );
         assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+        item.repair_verified = true;
+        item.resolved_version_id = Some([0; 16]);
+        assert_eq!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
+                .expect("a protected repaired shard should carry a repair receipt")
+                .disposition,
+            HealObjectDisposition::Repaired
+        );
+        item.before.drives[0].state = "ok".to_string();
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
+            "repair proof without a repaired drive must remain unresolved"
+        );
+        item.repair_verified = false;
         item.integrity_verified = true;
         item.resolved_version_id = None;
         assert!(
