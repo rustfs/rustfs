@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ use crate::connect::telemetry::{TelemetryDelivery, TelemetryTransport};
 
 const PROTOCOL_VERSION: &str = "v1";
 const MAX_EXECUTABLE_BYTES: u64 = 2_147_483_648;
-const DELIVERY_ATTEMPTS: u8 = 3;
+const DELIVERY_ATTEMPTS: u8 = 8;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 524_288;
 const MAX_STATE_FILES: usize = 65_536;
@@ -48,7 +48,16 @@ pub(crate) struct DiagnosticJobRuntime {
     config: HeartbeatConfig,
     signer: TrustedDiagnosticJobSigner,
     states: Arc<Mutex<BTreeMap<String, JobState>>>,
+    deliveries: DeliveryRegistry,
     store: JobStateStore,
+}
+
+#[derive(Clone, Default)]
+struct DeliveryRegistry(Arc<Mutex<HashSet<String>>>);
+
+struct DeliveryLease {
+    job_id: String,
+    registry: DeliveryRegistry,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -94,6 +103,7 @@ impl DiagnosticJobRuntime {
             config: config.clone(),
             signer: config.diagnostic_job_signer.clone()?,
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            deliveries: DeliveryRegistry::default(),
             store: JobStateStore {
                 directory: state_root.join("diagnostic-jobs"),
             },
@@ -199,11 +209,35 @@ impl DiagnosticJobRuntime {
 
     async fn deliver_uploaded(&self, result: UploadedDiagnosticJobResult, cancel: &CancellationToken) {
         let job_id = result.job_id.clone();
+        let Some(_lease) = self.deliveries.acquire(&job_id) else {
+            return;
+        };
         if deliver_result(&self.config, &result, cancel).await
             && self.store.save(&job_id, &JobState::Delivered).is_ok()
             && let Ok(mut states) = self.states.lock()
         {
             states.insert(job_id, JobState::Delivered);
+        }
+    }
+}
+
+impl DeliveryRegistry {
+    fn acquire(&self, job_id: &str) -> Option<DeliveryLease> {
+        let mut active = self.0.lock().ok()?;
+        if !active.insert(job_id.to_owned()) {
+            return None;
+        }
+        Some(DeliveryLease {
+            job_id: job_id.to_owned(),
+            registry: self.clone(),
+        })
+    }
+}
+
+impl Drop for DeliveryLease {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.0.lock() {
+            active.remove(&self.job_id);
         }
     }
 }
@@ -604,6 +638,16 @@ mod tests {
         ] {
             assert!(value.get(forbidden).is_none());
         }
+    }
+
+    #[test]
+    fn result_redelivery_has_only_one_in_flight_attempt_loop() {
+        let registry = DeliveryRegistry::default();
+        let job_id = Uuid::now_v7().to_string();
+        let first = registry.acquire(&job_id).expect("first delivery");
+        assert!(registry.acquire(&job_id).is_none());
+        drop(first);
+        assert!(registry.acquire(&job_id).is_some());
     }
 
     #[test]
