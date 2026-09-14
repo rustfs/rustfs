@@ -72,6 +72,12 @@ struct HealWalkObject {
 /// order, so each successful ingest corresponds to exactly one new object.
 struct HealWalkCollector {
     bucket: String,
+    /// Full S3 prefix used after moving the walk to a non-root base directory.
+    /// The local walker emits the base directory marker before applying its
+    /// relative filter, so the boundary must also be checked on the decoded key.
+    prefix: String,
+    /// Inclusive full object-key cursor for the current page.
+    forward_to: Option<String>,
     batch_objects: usize,
     version_budget: usize,
     include_lifecycle_object_info: bool,
@@ -83,6 +89,10 @@ struct HealWalkCollector {
 }
 
 impl HealWalkCollector {
+    fn accepts_name(&self, name: &str) -> bool {
+        name.starts_with(&self.prefix) && self.forward_to.as_deref().is_none_or(|forward_to| name >= forward_to)
+    }
+
     fn lock_objects(&self) -> disk::error::Result<std::sync::MutexGuard<'_, Vec<HealWalkObject>>> {
         self.objects.lock().map_err(|_| {
             self.cancel.cancel();
@@ -99,6 +109,29 @@ impl HealWalkCollector {
         self.cancel.cancel();
     }
 
+    fn record_object(&self, name: String, versions: Vec<HealWalkVersion>) -> Option<(usize, usize)> {
+        let mut objects = self.lock_objects().ok()?;
+        let mut added = 0;
+        if let Some(existing) = objects.iter_mut().find(|object| object.name == name) {
+            let mut seen: HashSet<String> = existing
+                .versions
+                .iter()
+                .filter_map(|version| version.version_id.clone())
+                .collect();
+            for version in versions {
+                if seen.insert(version.version_id.clone().unwrap_or_default()) {
+                    existing.versions.push(version);
+                    added += 1;
+                }
+            }
+        } else {
+            added = versions.len();
+            objects.push(HealWalkObject { name, versions });
+        }
+        let ver_total = self.version_total.fetch_add(added, Ordering::SeqCst) + added;
+        Some((objects.len(), ver_total))
+    }
+
     fn take_decode_error(&self) -> disk::error::Result<Option<DiskError>> {
         self.decode_error.lock().map(|mut error| error.take()).map_err(|_| {
             self.cancel.cancel();
@@ -111,6 +144,10 @@ impl HealWalkCollector {
     /// is met — always at a sorted object-key boundary so a heavily-versioned
     /// object is never split across pages.
     fn ingest(&self, entry: MetaCacheEntry) {
+        if !self.accepts_name(&entry.name) {
+            return;
+        }
+
         // Skip pure directory entries; they carry no versions to heal here.
         if entry.is_dir() {
             return;
@@ -147,18 +184,8 @@ impl HealWalkCollector {
             return;
         }
 
-        let added = versions.len();
-        let (objs_len, ver_total) = {
-            let Ok(mut objects) = self.lock_objects() else {
-                return;
-            };
-            objects.push(HealWalkObject {
-                name: entry.name,
-                versions,
-            });
-            let objs_len = objects.len();
-            let ver_total = self.version_total.fetch_add(added, Ordering::SeqCst) + added;
-            (objs_len, ver_total)
+        let Some((objs_len, ver_total)) = self.record_object(entry.name, versions) else {
+            return;
         };
 
         // Bound at an object boundary (this object is fully included).
@@ -178,7 +205,7 @@ impl HealWalkCollector {
         let mut versions = Vec::new();
 
         for entry in entries.0.iter().flatten() {
-            if entry.is_dir() || entry.name.is_empty() {
+            if !self.accepts_name(&entry.name) || entry.is_dir() || entry.name.is_empty() {
                 continue;
             }
             if name.is_empty() {
@@ -215,15 +242,8 @@ impl HealWalkCollector {
             return;
         }
 
-        let added = versions.len();
-        let (objs_len, ver_total) = {
-            let Ok(mut objects) = self.lock_objects() else {
-                return;
-            };
-            objects.push(HealWalkObject { name, versions });
-            let objs_len = objects.len();
-            let ver_total = self.version_total.fetch_add(added, Ordering::SeqCst) + added;
-            (objs_len, ver_total)
+        let Some((objs_len, ver_total)) = self.record_object(name, versions) else {
+            return;
         };
 
         if objs_len >= self.batch_objects || ver_total >= self.version_budget {
@@ -290,6 +310,8 @@ impl SetDisks {
 
         let collector = Arc::new(HealWalkCollector {
             bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            forward_to: forward_to.map(str::to_owned),
             batch_objects,
             version_budget: version_budget.max(1),
             include_lifecycle_object_info,
@@ -303,12 +325,26 @@ impl SetDisks {
         let agreed_collector = collector.clone();
         let partial_collector = collector.clone();
 
-        let filter_prefix = if prefix.is_empty() { None } else { Some(prefix.to_string()) };
+        // `scan_dir` applies `filter_prefix` to names relative to `path`. Keep
+        // the full prefix in the collector as a second boundary check because
+        // the walker emits the base directory marker before that filter.
+        let path = rustfs_utils::path::base_dir_from_prefix(prefix);
+        let filter_prefix = if prefix.is_empty() {
+            None
+        } else {
+            Some(
+                prefix
+                    .trim_start_matches(&path)
+                    .trim_start_matches('/')
+                    .trim_end_matches('/')
+                    .to_owned(),
+            )
+        };
 
         let opts = ListPathRawOptions {
             disks,
             bucket: bucket.to_string(),
-            path: String::new(),
+            path,
             recursive: true,
             incl_deleted: true,
             filter_prefix,
@@ -372,8 +408,14 @@ mod tests {
     use uuid::Uuid;
 
     fn test_collector() -> Arc<HealWalkCollector> {
+        test_collector_for("", None)
+    }
+
+    fn test_collector_for(prefix: &str, forward_to: Option<&str>) -> Arc<HealWalkCollector> {
         Arc::new(HealWalkCollector {
             bucket: "bucket".to_string(),
+            prefix: prefix.to_string(),
+            forward_to: forward_to.map(str::to_owned),
             batch_objects: 2,
             version_budget: 2,
             include_lifecycle_object_info: false,
@@ -383,6 +425,101 @@ mod tests {
             truncated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn collector_rechecks_full_prefix_and_forward_cursor() {
+        let collector = test_collector_for("a/b/", Some("a/b/child"));
+
+        assert!(!collector.accepts_name("a/"), "base marker outside the requested prefix must be ignored");
+        assert!(!collector.accepts_name("a/b-other/object"), "sibling prefixes must not be included");
+        assert!(
+            !collector.accepts_name("a/b/before"),
+            "objects before the inclusive cursor must be ignored"
+        );
+        assert!(collector.accepts_name("a/b/child"), "the cursor boundary is inclusive");
+        assert!(collector.accepts_name("a/b/child/deep"), "descendants after the cursor must be included");
+    }
+
+    #[tokio::test]
+    async fn heal_walk_scopes_non_root_prefix_to_nested_objects() {
+        use rustfs_filemeta::FileInfo;
+
+        let (temp_dirs, disks, set_disks) = hermetic_set_disks_isolated(4).await;
+        let bucket = "nested-prefix-bucket";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+        let objects = [
+            "a/",
+            "a/b",
+            "a/b/direct",
+            "a/b/child/deep",
+            "a/b/child/later",
+            "a/b-other/sibling",
+            "a/c/outside",
+            "single",
+            "中文/%2F+ key/item",
+        ];
+
+        // A single replica is below read quorum. The raw UNION must still
+        // discover every version, including explicit directory markers.
+        for (index, object) in objects.iter().enumerate() {
+            let mut info = FileInfo::new(object, 4, 2);
+            info.volume = bucket.to_string();
+            info.name = object.to_string();
+            info.version_id = Some(Uuid::from_u128(u128::try_from(index + 1).expect("index fits UUID")));
+            info.versioned = true;
+            info.size = if object.ends_with('/') { 0 } else { 100 };
+            info.mod_time = Some(
+                OffsetDateTime::from_unix_timestamp(i64::try_from(index + 1).expect("index fits timestamp"))
+                    .expect("fixture timestamp"),
+            );
+            let mut metadata = FileMeta::new();
+            metadata
+                .add_version(info)
+                .expect("fixture metadata should accept the version");
+            let object_dir = temp_dirs[0]
+                .path()
+                .join(bucket)
+                .join(rustfs_utils::path::encode_dir_object(object));
+            tokio::fs::create_dir_all(&object_dir)
+                .await
+                .expect("object directory should be created");
+            tokio::fs::write(
+                object_dir.join(crate::disk::STORAGE_FORMAT_FILE),
+                metadata.marshal_msg().expect("fixture metadata should serialize"),
+            )
+            .await
+            .expect("fixture metadata should be written");
+        }
+
+        for prefix in ["", "a/", "a/b", "a/b/", "single", "中文/", "中文/%2F+", "absent/"] {
+            let mut expected: Vec<_> = objects.iter().copied().filter(|object| object.starts_with(prefix)).collect();
+            expected.sort_unstable();
+            let mut actual = Vec::new();
+            let mut forward: Option<String> = None;
+            let mut pages = 0;
+            loop {
+                let (versions, next, truncated) = set_disks
+                    .heal_walk_versions_page(bucket, prefix, forward.as_deref(), 2, 100, false)
+                    .await
+                    .expect("prefix disk walk should succeed");
+                pages += 1;
+                actual.extend(versions.into_iter().map(|version| version.name));
+                if !truncated {
+                    assert!(next.is_none(), "complete prefix page must clear its cursor");
+                    break;
+                }
+                let next = next.expect("truncated prefix page must return a cursor");
+                assert!(next.starts_with(prefix), "cursor must retain the full logical key");
+                assert!(forward.as_ref().is_none_or(|previous| &next > previous), "cursor must advance");
+                forward = Some(next);
+                assert!(pages < 20, "prefix pagination must terminate");
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "prefix {prefix:?} must enumerate every matching key exactly once");
+        }
     }
 
     #[test]
@@ -573,6 +710,8 @@ mod tests {
 
         let collector = Arc::new(HealWalkCollector {
             bucket: "bucket".to_string(),
+            prefix: "".to_string(),
+            forward_to: None,
             batch_objects: 1000,
             version_budget: 10_000,
             include_lifecycle_object_info: false,
