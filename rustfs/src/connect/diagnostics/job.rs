@@ -81,6 +81,14 @@ pub struct DiagnosticJobSignature {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DiagnosticJobAuthorization {
+    actor_type: String,
+    actor_name: String,
+    request_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiagnosticJobEnvelope {
     pub job_id: String,
     pub protocol_version: String,
@@ -93,6 +101,7 @@ pub struct DiagnosticJobEnvelope {
     pub expire_time: String,
     pub nonce: String,
     pub required_capabilities: Vec<String>,
+    pub authorization: DiagnosticJobAuthorization,
     pub limits: DiagnosticJobLimits,
     pub parameters: DiagnosticJobParameters,
     pub signature: DiagnosticJobSignature,
@@ -112,6 +121,7 @@ struct UnsignedDiagnosticJob<'a> {
     expire_time: &'a str,
     nonce: &'a str,
     required_capabilities: &'a [String],
+    authorization: &'a DiagnosticJobAuthorization,
     limits: &'a DiagnosticJobLimits,
     parameters: &'a DiagnosticJobParameters,
 }
@@ -285,6 +295,7 @@ impl DiagnosticJobEnvelope {
             expire_time: &self.expire_time,
             nonce: &self.nonce,
             required_capabilities: &self.required_capabilities,
+            authorization: &self.authorization,
             limits: &self.limits,
             parameters: &self.parameters,
         }
@@ -315,6 +326,10 @@ impl DiagnosticJobEnvelope {
         if !uuid7(&self.job_id)
             || !uuid7(&self.parameters.artifact_uid)
             || !uuid7(&self.parameters.consent_uid)
+            || self.authorization.actor_type != "BROWSER_USER"
+            || !self.authorization.actor_name.strip_prefix("users/").is_some_and(uuid7)
+            || !Uuid::parse_str(&self.authorization.request_id)
+                .is_ok_and(|value| value.get_version_num() == 4 && value.to_string() == self.authorization.request_id)
             || self.parameters.consent_policy_revision == 0
         {
             return Err(DiagnosticJobError::Invalid);
@@ -452,6 +467,11 @@ mod tests {
             expire_time: "2030-01-01T00:00:30Z".to_owned(),
             nonce: URL_SAFE_NO_PAD.encode_to_string([7_u8; 32]),
             required_capabilities: vec![CPU_PROFILE_CAPABILITY.to_owned()],
+            authorization: DiagnosticJobAuthorization {
+                actor_type: "BROWSER_USER".to_owned(),
+                actor_name: "users/018cc251-f400-7abc-8def-0123456789ab".to_owned(),
+                request_id: "123e4567-e89b-42d3-a456-426614174001".to_owned(),
+            },
             limits: DiagnosticJobLimits {
                 timeout_seconds: 30,
                 max_output_bytes: 524_288,
@@ -520,6 +540,12 @@ mod tests {
         assert_eq!(
             signer.verify(&envelope, &target(&envelope), "2030-01-01T00:00:30Z".parse().expect("time")),
             Err(DiagnosticJobError::Expired)
+        );
+        let (mut actor_tampered, signer) = signed();
+        actor_tampered.authorization.actor_name.push('0');
+        assert_eq!(
+            signer.verify(&actor_tampered, &target(&actor_tampered), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Invalid)
         );
     }
 
