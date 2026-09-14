@@ -30,15 +30,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::{Uuid, Variant, Version};
 
 use super::{
-    CPU_PROFILE_CAPABILITY, LocalProfileConsent, LocalTopConsent, MAX_TOP_EXPORT_VALIDITY, PROFILE_SCHEMA_VERSION,
-    ProfileCaptureRequest, ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION,
-    TopApiOperation, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api,
-    capture_top_locks, encode_signed_profile_export, sign_top_export,
+    CPU_PROFILE_CAPABILITY, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
+    MAX_TOP_EXPORT_VALIDITY, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceError,
+    NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest,
+    ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION, TopApiOperation,
+    TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api, capture_top_locks,
+    encode_signed_profile_export, measure_network, runtime_network_peer_aliases, sign_network_export, sign_top_export,
 };
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
+const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
 const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
 pub const DIAGNOSTIC_JOB_SIGNATURE_DOMAIN: &[u8] = b"rustfs-connect-agent-job-v1\0";
@@ -47,6 +50,8 @@ const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
 const MAX_OUTPUT_BYTES: u64 = 524_288;
 const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CPU_MILLIS: u64 = 30_000;
+const MAX_NETWORK_CPU_MILLIS: u64 = 5_000;
+const MIN_NETWORK_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_API_CPU_MILLIS: u64 = 5_000;
 const MIN_TOP_API_MEMORY_BYTES: u64 = 1_048_576;
 const MAX_TOP_LOCKS_CPU_MILLIS: u64 = 5_000;
@@ -55,6 +60,7 @@ const MIN_TOP_LOCKS_MEMORY_BYTES: u64 = 1_048_576;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
     ProfileCpu,
+    PerformanceNetwork,
     TopApi,
     TopLocks,
 }
@@ -84,6 +90,8 @@ pub struct DiagnosticJobParameters {
     pub consent_expires_at: String,
     pub duration_millis: u64,
     pub sample_period_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -389,6 +397,17 @@ impl DiagnosticJobEnvelope {
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
+        match (kind, self.parameters.traffic_bytes) {
+            (DiagnosticJobKind::PerformanceNetwork, Some(1..=MAX_NETWORK_TRAFFIC_BYTES)) => {
+                if self.limits.max_cpu_millis > MAX_NETWORK_CPU_MILLIS || self.limits.max_memory_bytes < MIN_NETWORK_MEMORY_BYTES
+                {
+                    return Err(DiagnosticJobError::LimitExceeded);
+                }
+            }
+            (DiagnosticJobKind::PerformanceNetwork, _) => return Err(DiagnosticJobError::LimitExceeded),
+            (_, None) => {}
+            (_, Some(_)) => return Err(DiagnosticJobError::Invalid),
+        }
         if kind == DiagnosticJobKind::TopLocks
             && (self.limits.max_cpu_millis > MAX_TOP_LOCKS_CPU_MILLIS
                 || self.limits.max_memory_bytes < MIN_TOP_LOCKS_MEMORY_BYTES)
@@ -402,6 +421,9 @@ impl DiagnosticJobEnvelope {
         match (self.job_type.as_str(), self.required_capabilities.as_slice(), self.schema_version) {
             (PROFILE_CPU_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == CPU_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileCpu)
+            }
+            (PERFORMANCE_NETWORK_JOB_TYPE, [capability], NETWORK_SCHEMA_VERSION) if capability == NETWORK_CAPABILITY => {
+                Ok(DiagnosticJobKind::PerformanceNetwork)
             }
             (TOP_API_JOB_TYPE, [capability], version)
                 if capability == TOP_API_CAPABILITY && version == u16::from(TOP_SCHEMA_VERSION) =>
@@ -431,9 +453,100 @@ pub async fn execute_diagnostic_job(
     let envelope = job.envelope;
     match envelope.kind()? {
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
+        DiagnosticJobKind::PerformanceNetwork => {
+            execute_performance_network_job(envelope, nonce, identity, provenance, cancel).await
+        }
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, identity, provenance, cancel).await,
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
     }
+}
+
+async fn execute_performance_network_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let Some(peer_aliases) = runtime_network_peer_aliases() else {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome: "FAILED".to_owned(),
+            reason: "SOURCE_UNAVAILABLE".to_owned(),
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    };
+    let traffic_bytes = envelope.parameters.traffic_bytes.ok_or(DiagnosticJobError::LimitExceeded)?;
+    let peer_count = u64::try_from(peer_aliases.len()).map_err(|_| DiagnosticJobError::LimitExceeded)?;
+    let traffic_bytes_per_peer = traffic_bytes
+        .checked_div(peer_count)
+        .filter(|value| *value > 0)
+        .ok_or(DiagnosticJobError::LimitExceeded)?;
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = NetworkPerformanceRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        capability: NETWORK_CAPABILITY.to_owned(),
+        consent: LocalNetworkConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            confirmed: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        duration: Duration::from_millis(envelope.parameters.duration_millis),
+        peer_aliases,
+        traffic_bytes_per_peer,
+        provenance: NetworkProvenance::new(
+            provenance.source_commit(),
+            provenance.executable_sha256(),
+            provenance.rustfs_version(),
+            provenance.build_features().to_vec(),
+        ),
+    };
+    let measurement = measure_network(&request, cancel).await.map_err(network_capture_failure)?;
+    let measured_outcome = measurement.result.outcome();
+    let measured_reason = measurement.result.reason_code();
+    let outcome = measured_outcome.as_str().to_owned();
+    let reason = measured_reason.as_str().to_owned();
+    if !matches!(measured_outcome, NetworkOutcome::Succeeded | NetworkOutcome::Partial) {
+        let (outcome, reason) = match (measured_outcome, measured_reason) {
+            (NetworkOutcome::Unsupported, NetworkReasonCode::SourceUnavailable) => {
+                ("FAILED".to_owned(), "SOURCE_UNAVAILABLE".to_owned())
+            }
+            (NetworkOutcome::Unsupported, _) => ("FAILED".to_owned(), "COLLECTION_FAILED".to_owned()),
+            _ => (outcome, reason),
+        };
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome,
+            reason,
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = sign_network_export(&request, &measurement, identity, cancel).map_err(network_export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome,
+        reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
 }
 
 async fn execute_profile_cpu_job(
@@ -636,6 +749,22 @@ fn top_capture_failure(error: super::TopCaptureError) -> DiagnosticJobError {
     }
 }
 
+fn network_capture_failure(error: NetworkPerformanceError) -> DiagnosticJobError {
+    match error {
+        NetworkPerformanceError::Cancelled => DiagnosticJobError::Cancelled,
+        NetworkPerformanceError::LimitExceeded | NetworkPerformanceError::Busy => DiagnosticJobError::LimitExceeded,
+        _ => DiagnosticJobError::CollectionFailed,
+    }
+}
+
+fn network_export_failure(error: NetworkPerformanceError) -> DiagnosticJobError {
+    match error {
+        NetworkPerformanceError::Cancelled => DiagnosticJobError::Cancelled,
+        NetworkPerformanceError::LimitExceeded => DiagnosticJobError::LimitExceeded,
+        _ => DiagnosticJobError::ExportFailed,
+    }
+}
+
 fn top_export_failure(error: super::TopCaptureError) -> DiagnosticJobError {
     match error {
         super::TopCaptureError::Cancelled => DiagnosticJobError::Cancelled,
@@ -703,6 +832,7 @@ mod tests {
                 consent_expires_at: "2030-01-01T00:01:00Z".to_owned(),
                 duration_millis: 1_000,
                 sample_period_micros: 10_000,
+                traffic_bytes: None,
             },
             signature: DiagnosticJobSignature {
                 algorithm: "Ed25519".to_owned(),
@@ -767,6 +897,53 @@ mod tests {
             signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
             Err(DiagnosticJobError::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn accepts_only_a_bounded_network_traffic_budget() {
+        let mut network = envelope();
+        network.job_type = PERFORMANCE_NETWORK_JOB_TYPE.to_owned();
+        network.required_capabilities = vec![NETWORK_CAPABILITY.to_owned()];
+        network.limits.max_cpu_millis = MAX_NETWORK_CPU_MILLIS;
+        network.parameters.duration_millis = MAX_NETWORK_CPU_MILLIS;
+        network.parameters.traffic_bytes = Some(MAX_NETWORK_TRAFFIC_BYTES);
+        let (network, signer) = signed_envelope(network);
+        signer
+            .verify(&network, &target(&network), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid performance.network job");
+
+        let mut missing = network.clone();
+        missing.parameters.traffic_bytes = None;
+        assert_eq!(
+            signer.verify(&missing, &target(&missing), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut zero = network.clone();
+        zero.parameters.traffic_bytes = Some(0);
+        assert_eq!(
+            signer.verify(&zero, &target(&zero), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut unbounded = network.clone();
+        unbounded.parameters.traffic_bytes = Some(MAX_NETWORK_TRAFFIC_BYTES + 1);
+        assert_eq!(
+            signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut profile = signed().0;
+        profile.parameters.traffic_bytes = Some(1);
+        assert_eq!(
+            signer.verify(&profile, &target(&profile), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Invalid)
+        );
+
+        let unsigned_network = serde_json::to_value(network.unsigned()).expect("network envelope");
+        let unsigned_profile = serde_json::to_value(envelope().unsigned()).expect("profile envelope");
+        assert_eq!(unsigned_network["parameters"]["trafficBytes"], MAX_NETWORK_TRAFFIC_BYTES);
+        assert!(unsigned_profile["parameters"].get("trafficBytes").is_none());
     }
 
     #[test]

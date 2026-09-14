@@ -71,6 +71,18 @@ pub enum NetworkOutcome {
     Cancelled,
 }
 
+impl NetworkOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "SUCCEEDED",
+            Self::Partial => "PARTIAL",
+            Self::Failed => "FAILED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NetworkReasonCode {
@@ -84,6 +96,23 @@ pub enum NetworkReasonCode {
     Cancelled,
     InvalidInput,
     CollectionFailed,
+}
+
+impl NetworkReasonCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "COMPLETE",
+            Self::LimitExceeded => "LIMIT_EXCEEDED",
+            Self::SourceUnavailable => "SOURCE_UNAVAILABLE",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::UnsupportedTool => "UNSUPPORTED_TOOL",
+            Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
+            Self::UnsupportedPlatform => "UNSUPPORTED_PLATFORM",
+            Self::Cancelled => "CANCELLED",
+            Self::InvalidInput => "INVALID_INPUT",
+            Self::CollectionFailed => "COLLECTION_FAILED",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -388,6 +417,16 @@ pub async fn measure_network(
         return Err(NetworkPerformanceError::InvalidRequest);
     }
     measure_network_with_harness(request, &harness, cancel).await
+}
+
+pub(crate) fn runtime_network_peer_aliases() -> Option<Vec<String>> {
+    let endpoint_pools = crate::runtime_sources::current_endpoints_handle()?;
+    let aliases = NetworkPeerProbeClient::from_endpoint_pools(&endpoint_pools)
+        .targets()
+        .into_iter()
+        .map(|target| target.alias)
+        .collect::<Vec<_>>();
+    (!aliases.is_empty()).then_some(aliases)
 }
 
 pub async fn measure_network_with_harness(

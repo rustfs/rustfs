@@ -174,6 +174,14 @@ impl ProfileProvenance {
         &self.executable_sha256
     }
 
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.source_commit
+    }
+
+    pub(crate) fn rustfs_version(&self) -> &str {
+        &self.rustfs_version
+    }
+
     pub(crate) fn build_features(&self) -> &[String] {
         &self.build_features
     }

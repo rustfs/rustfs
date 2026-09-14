@@ -11,6 +11,7 @@
   "producerCapabilities": [
     "performance.client@1",
     "performance.drive@1",
+    "performance.network@1",
     "performance.object@1",
     "performance.siteReplication@1",
     "logs.capture@1",
@@ -33,6 +34,7 @@
     "inventory.environment@1",
     "performance.client@1",
     "performance.drive@1",
+    "performance.network@1",
     "performance.object@1",
     "performance.siteReplication@1",
     "logs.capture@1",
