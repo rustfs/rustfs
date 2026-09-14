@@ -384,6 +384,7 @@ fn config(temp: &tempfile::TempDir, pki: &TestPki, endpoint: &str) -> HeartbeatC
             max_backoff: Duration::from_millis(20),
         },
         proxy: None,
+        diagnostic_job_signer: None,
     }
 }
 
