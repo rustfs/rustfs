@@ -406,17 +406,21 @@ jobs:
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          BINARY_ARGS=(--bin rustfs)
+          BINARY_NAMES=(rustfs)
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_ARGS+=(--bin rustfs-cli)
+            BINARY_NAMES+=(rustfs-cli)
           fi
 
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            # All cross targets in the matrix are Linux; zigbuild handles them.
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs "${BINARY_ARGS[@]}"
-          else
-            cargo build --release --target ${{ matrix.target }} -p rustfs "${BINARY_ARGS[@]}"
-          fi
+          # Build one binary at a time so release LTO links cannot exhaust a
+          # self-hosted runner by running concurrently.
+          for binary in "${BINARY_NAMES[@]}"; do
+            if [[ "${{ matrix.cross }}" == "true" ]]; then
+              # All cross targets in the matrix are Linux; zigbuild handles them.
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+            else
+              cargo build --release --target ${{ matrix.target }} -p rustfs --bin "$binary"
+            fi
+          done
 
       - name: Create release package
         id: package
