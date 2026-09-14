@@ -108,6 +108,7 @@ impl PendingHeartbeat {
                         DiagnosticCollectionPolicy::policy_sync_capability(),
                         ENVIRONMENT_CAPABILITY,
                         "jobs",
+                        super::diagnostics::CPU_PROFILE_CAPABILITY,
                     ])
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
@@ -262,6 +263,7 @@ impl HeartbeatStateStore {
         ];
         if self.job_capable {
             capabilities.push("jobs".to_owned());
+            capabilities.push(super::diagnostics::CPU_PROFILE_CAPABILITY.to_owned());
         }
         let pending = PendingHeartbeat {
             protocol_version: PROTOCOL_VERSION.to_owned(),
