@@ -174,8 +174,27 @@ async fn snapshot_contains(object: &str) -> bool {
         })
 }
 
-#[tokio::test]
-async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
+#[test]
+fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker() {
+    // Keep the current-thread scheduler while matching the debug server's stack budget for real-storage futures.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mrf-partial-write-ec12-4".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("partial-write test runtime should build");
+            runtime.block_on(partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inner());
+        })
+        .expect("partial-write test thread should spawn")
+        .join()
+        .expect("partial-write test thread should finish");
+}
+
+async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inner() {
     temp_env::async_with_vars(
         [
             ("RUSTFS_HEAL_MRF_ENABLE", Some("true")),
