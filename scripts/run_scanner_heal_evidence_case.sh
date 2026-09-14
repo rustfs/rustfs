@@ -349,7 +349,11 @@ trap cleanup_tmp EXIT
 
 BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$ROOT/$TARGET_DIR"
+fi
 DEBUG_DIR="$TARGET_DIR/debug"
+SERVER_BINARY="$DEBUG_DIR/rustfs"
 if [[ "${RUSTFS_SCANNER_HEAL_SKIP_CLEAN:-0}" != "1" ]]; then
     cargo clean -p rustfs
 fi
@@ -365,7 +369,7 @@ cargo nextest list --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --message-
 TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 
 export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-default}"
-"$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$DEBUG_DIR/rustfs" "$TEST_BINARY"
+"$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$SERVER_BINARY" "$TEST_BINARY"
 cp "$LISTING_TMP" "$RUN_DIR/listing.json"
 export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/e2e-logs}"
 export RUSTFS_HEAL_CHAOS_LOG_DIR="${RUSTFS_HEAL_CHAOS_LOG_DIR:-$RUSTFS_E2E_LOG_DIR}"
