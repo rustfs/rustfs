@@ -483,7 +483,7 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
     let error = register_from_protected_input(&server.endpoint, &wrong_root, &wrong_ca_state, Some(&token))
         .await
         .expect_err("wrong CA must fail TLS");
-    assert!(matches!(error, RegistrationBootstrapError::Exchange));
+    assert!(matches!(error, RegistrationBootstrapError::TlsPeer));
     assert!(!wrong_ca_state.join("credential/device.crt.json").exists());
 }
 
