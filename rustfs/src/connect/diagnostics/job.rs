@@ -270,6 +270,10 @@ impl VerifiedDiagnosticJob {
     pub fn job_id(&self) -> &str {
         &self.envelope.job_id
     }
+
+    pub(crate) fn expire_time(&self) -> &str {
+        &self.envelope.expire_time
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
