@@ -1168,7 +1168,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             "issues: write",
             "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
             "uses: ./.github/actions/schedule-failure-issue",
-            "github-token: ${{ secrets.GITHUB_TOKEN }}",
+            "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
         )
         missing = [token for token in required if token not in job]
         if missing:
@@ -1176,7 +1176,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         else:
             errors.extend(
                 f"{relative}: {error}"
-                for error in alert_step_errors(job_lines, None, ("issues: write",), ("github-token: ${{ secrets.GITHUB_TOKEN }}",))
+                for error in alert_step_errors(job_lines, None, ("issues: write",), ("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",))
             )
 
     for (hour, minute), workflows in schedule_slots.items():
@@ -1221,7 +1221,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         "issues: write",
         "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
         "uses: ./.github/actions/schedule-failure-issue",
-        "github-token: ${{ secrets.GITHUB_TOKEN }}",
+        "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
         "workflow-name: ${{ github.event.workflow_run.name }}",
         "source-run-id: ${{ github.event.workflow_run.id }}",
         "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}",
@@ -1242,7 +1242,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
                 None,
                 ("actions: read", "issues: write"),
                 (
-                    "github-token: ${{ secrets.GITHUB_TOKEN }}",
+                    "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
                     "workflow-name: ${{ github.event.workflow_run.name }}",
                     "source-run-id: ${{ github.event.workflow_run.id }}",
                     "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}",
@@ -1271,7 +1271,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         "if: failure()",
         "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
         "uses: ./.github/actions/schedule-failure-issue",
-        "github-token: ${{ secrets.GITHUB_TOKEN }}",
+        "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
         "details-file: ${{ runner.temp }}/scheduled-validation-freshness.md",
     )
     missing = [token for token in required if token not in freshness_job]
@@ -1287,7 +1287,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
                 "if: failure()",
                 ("actions: read", "issues: write"),
                 (
-                    "github-token: ${{ secrets.GITHUB_TOKEN }}",
+                    "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
                     "details-file: ${{ runner.temp }}/scheduled-validation-freshness.md",
                 ),
             )
@@ -5862,7 +5862,7 @@ class SelfTests(unittest.TestCase):
                 "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                 "      - uses: ./.github/actions/schedule-failure-issue\n"
                 "        with:\n"
-                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
             )
             names: list[str] = []
             for index, relative in enumerate(SCHEDULED_ALERT_WORKFLOWS, start=1):
@@ -5890,7 +5890,7 @@ class SelfTests(unittest.TestCase):
                 + "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                 + "      - uses: ./.github/actions/schedule-failure-issue\n"
                 + "        with:\n"
-                + "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                + "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
                 + "          workflow-name: ${{ github.event.workflow_run.name }}\n"
                 + "          source-run-id: ${{ github.event.workflow_run.id }}\n"
                 + "          source-run-attempt: ${{ github.event.workflow_run.run_attempt }}\n"
@@ -5911,7 +5911,7 @@ class SelfTests(unittest.TestCase):
                 "      - uses: ./.github/actions/schedule-failure-issue\n"
                 "        if: failure()\n"
                 "        with:\n"
-                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
                 "          details-file: ${{ runner.temp }}/scheduled-validation-freshness.md\n"
             )
             checker = root / "scripts/check_scheduled_validation_freshness.py"
@@ -5938,7 +5938,7 @@ class SelfTests(unittest.TestCase):
                     "        if: github.event_name == 'workflow_dispatch'\n",
                 ),
                 ("uses: ./.github/actions/schedule-failure-issue", "uses: actions/checkout@v7"),
-                ("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing"),
+                ("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}", "github-token: missing"),
             )
             for required, replacement in mutations:
                 original = first.read_text()
@@ -5951,7 +5951,7 @@ class SelfTests(unittest.TestCase):
                 "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                 "      - uses: ./.github/actions/schedule-failure-issue\n"
                 "        with:\n"
-                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
             )
             first.write_text(
                 first_original.replace(
@@ -5963,7 +5963,7 @@ class SelfTests(unittest.TestCase):
                     "      - run: |\n"
                     "          : <<'MARKER'\n"
                     "          uses: ./.github/actions/schedule-failure-issue\n"
-                    "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
                     "          MARKER\n",
                 )
             )
@@ -5973,7 +5973,7 @@ class SelfTests(unittest.TestCase):
                     real_steps,
                     "      - uses: ./.github/actions/schedule-failure-issue\n"
                     "        with:\n"
-                    "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
                     "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n",
                 )
             )
@@ -5998,7 +5998,7 @@ class SelfTests(unittest.TestCase):
                     "        if: github.event_name == 'workflow_dispatch'\n",
                 ),
                 ("uses: ./.github/actions/schedule-failure-issue", "uses: actions/checkout@v7"),
-                ("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing"),
+                ("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}", "github-token: missing"),
                 ("source-event: ${{ github.event.workflow_run.event }}", "source-event: watchdog"),
                 (
                     "source-ref-name: ${{ github.event.workflow_run.head_branch }}",
@@ -6087,7 +6087,7 @@ class SelfTests(unittest.TestCase):
             freshness.write_text(freshness_original.replace("details-file:", "report-file:"))
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             freshness.write_text(
-                freshness_original.replace("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing")
+                freshness_original.replace("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}", "github-token: missing")
             )
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             freshness.write_text(
