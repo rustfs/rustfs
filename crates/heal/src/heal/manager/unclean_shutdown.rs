@@ -14,12 +14,34 @@
 /// Unclean-shutdown recovery: durable replacement-intent discovery and healing-marker rewrite.
 use super::*;
 
+pub(super) fn durable_replacement_reserves_targets(state: &ResumeState) -> bool {
+    state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && !state.replacement_targets.is_empty()
+        && (matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent
+                | ReplacementPhase::OwnershipPending
+                | ReplacementPhase::HandoffPending
+                | ReplacementPhase::Rebuilding
+                | ReplacementPhase::Verified
+                | ReplacementPhase::CleanupPending
+        ) || (state.replacement_phase == ReplacementPhase::Abandoned
+            && state.replacement_handoff.is_none()
+            && state.replacement_legacy_successor.is_none()))
+}
+
 pub(super) fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bool {
     state.replacement_generation.as_deref() == Some(task_id)
         && !state.replacement_targets.is_empty()
         && ((!state.completed
-            && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
-            && state.retry_count >= state.max_retries)
+            && matches!(
+                state.replacement_phase,
+                ReplacementPhase::Intent
+                    | ReplacementPhase::OwnershipPending
+                    | ReplacementPhase::HandoffPending
+                    | ReplacementPhase::Rebuilding
+            )
+            && state.retry_count < state.max_retries)
             || (state.completed
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
@@ -52,8 +74,8 @@ impl HealManager {
     pub(super) async fn process_unclean_shutdown(&self) {
         let mut unclean = false;
         let mut set_disk_ids = HashSet::new();
+        let mut reserved_replacement_sets = HashSet::new();
         let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>, String)>::new();
-        let mut replacement_restarts = HashMap::<String, (String, Vec<String>)>::new();
         let mut conflicted_replacement_sets = HashSet::new();
 
         {
@@ -112,7 +134,11 @@ impl HealManager {
 
                 // Legacy flat records are inspected only while starting. The
                 // periodic scanner lists the dedicated replacement directory.
-                if let Err(error) = ResumeUtils::migrate_legacy_replacement_records(disk).await {
+                let migration = match ResumeUtils::migrate_approved_legacy_replacements(disk, self.storage.as_ref()).await {
+                    Ok(()) => ResumeUtils::migrate_legacy_replacement_records(disk).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = migration {
                     if let Some(set_disk_id) = &disk_set_disk_id {
                         self.block_replacement_recovery_set(set_disk_id);
                     }
@@ -165,79 +191,71 @@ impl HealManager {
                         }
                     };
                     let state = manager.get_state().await;
+                    if durable_replacement_reserves_targets(&state) {
+                        reserved_replacement_sets.insert(state.set_disk_id.clone());
+                    }
                     let active_replacement = !state.completed
-                        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding);
+                        && matches!(
+                            state.replacement_phase,
+                            ReplacementPhase::Intent
+                                | ReplacementPhase::OwnershipPending
+                                | ReplacementPhase::HandoffPending
+                                | ReplacementPhase::Rebuilding
+                        )
+                        && state.retry_count < state.max_retries;
                     let verified_replacement = state.completed
                         && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
+                    if !active_replacement && !verified_replacement && durable_replacement_reserves_targets(&state) {
+                        self.block_replacement_recovery_set(&state.set_disk_id);
+                    }
                     if (active_replacement || verified_replacement)
                         && state.replacement_generation.as_deref() == Some(task_id.as_str())
                         && !state.replacement_targets.is_empty()
                     {
-                        if matches!(state.replacement_phase, ReplacementPhase::CleanupPending) {
-                            replacement_intents.entry(task_id).or_insert((
-                                state.set_disk_id,
-                                state.replacement_targets,
-                                state.replacement_buckets,
-                                endpoint.to_string(),
-                            ));
-                            continue;
-                        }
-                        match self.storage.replacement_target_identities(&state.replacement_targets).await {
-                            Ok(identities) if identities == state.replacement_target_identities => {
-                                let resume_endpoint = endpoint.to_string();
-                                match replacement_intents.entry(task_id) {
-                                    std::collections::hash_map::Entry::Vacant(entry) => {
-                                        entry.insert((
-                                            state.set_disk_id,
-                                            state.replacement_targets,
-                                            state.replacement_buckets,
-                                            resume_endpoint,
-                                        ));
-                                    }
-                                    std::collections::hash_map::Entry::Occupied(entry) => {
-                                        let (existing_set_disk_id, existing_targets, existing_buckets, existing_anchor) =
-                                            entry.get();
-                                        if existing_set_disk_id != &state.set_disk_id
-                                            || existing_targets != &state.replacement_targets
-                                            || existing_buckets != &state.replacement_buckets
-                                            || existing_anchor != &resume_endpoint
-                                        {
-                                            conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                                            self.block_replacement_recovery_set(&state.set_disk_id);
-                                        }
-                                    }
+                        let state = match manager.resolve_replacement_recovery(self.storage.as_ref()).await {
+                            Ok(state) => state,
+                            Err(_) => {
+                                conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                                continue;
+                            }
+                        };
+                        let resume_endpoint = endpoint.to_string();
+                        match replacement_intents.entry(state.task_id.clone()) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert((
+                                    state.set_disk_id,
+                                    state.replacement_targets,
+                                    state.replacement_buckets,
+                                    resume_endpoint,
+                                ));
+                            }
+                            std::collections::hash_map::Entry::Occupied(entry) => {
+                                let (existing_set, existing_targets, existing_buckets, existing_anchor) = entry.get();
+                                if existing_set != &state.set_disk_id
+                                    || existing_targets != &state.replacement_targets
+                                    || existing_buckets != &state.replacement_buckets
+                                    || existing_anchor != &resume_endpoint
+                                {
+                                    conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                                    self.block_replacement_recovery_set(&state.set_disk_id);
                                 }
                             }
-                            Ok(_) => {
-                                if manager.abandon_replacement_intent().await.is_ok() {
-                                    replacement_restarts
-                                        .entry(task_id)
-                                        .or_insert((state.set_disk_id, state.replacement_targets));
-                                }
-                            }
-                            Err(_) => {}
                         }
                     }
                 }
             }
         }
 
-        if !unclean && replacement_intents.is_empty() && replacement_restarts.is_empty() {
+        if !unclean && replacement_intents.is_empty() {
             return;
         }
 
-        let mut recovery_by_set = HashMap::<String, Vec<(Option<String>, Vec<String>, Vec<String>, Option<String>)>>::new();
+        let mut recovery_by_set = HashMap::<String, Vec<(String, Vec<String>, Vec<String>, String)>>::new();
         for (task_id, (set_disk_id, heal_endpoints, buckets, resume_endpoint)) in replacement_intents {
             recovery_by_set
                 .entry(set_disk_id)
                 .or_default()
-                .push((Some(task_id), heal_endpoints, buckets, Some(resume_endpoint)));
-        }
-        for (_abandoned_task_id, (set_disk_id, heal_endpoints)) in replacement_restarts {
-            recovery_by_set
-                .entry(set_disk_id)
-                .or_default()
-                .push((None, heal_endpoints, Vec::new(), None));
+                .push((task_id, heal_endpoints, buckets, resume_endpoint));
         }
 
         for (set_disk_id, mut recoveries) in recovery_by_set {
@@ -269,17 +287,8 @@ impl HealManager {
                 );
                 continue;
             }
-            let reuse_single_generation = recoveries.len() == 1 && recoveries[0].0.is_some();
-            let mut heal_endpoints = recoveries
-                .iter_mut()
-                .flat_map(|(_, targets, _, _)| std::mem::take(targets))
-                .collect::<Vec<_>>();
-            heal_endpoints.sort_unstable();
-            heal_endpoints.dedup();
-            let buckets = if reuse_single_generation {
-                std::mem::take(&mut recoveries[0].2)
-            } else {
-                Vec::new()
+            let Some((task_id, heal_endpoints, buckets, recovery_anchor)) = recoveries.pop() else {
+                continue;
             };
             let mut req = HealRequest::new(
                 HealType::ErasureSet {
@@ -294,19 +303,14 @@ impl HealManager {
                 },
                 HealPriority::Low,
             );
-            if reuse_single_generation && let Some(task_id) = recoveries[0].0.take() {
-                req.id = task_id;
-            }
-            let recovery_anchor = reuse_single_generation.then(|| recoveries[0].3.take()).flatten();
+            req.id = task_id;
             req.source = HealRequestSource::AutoHeal;
             req.heal_endpoints = heal_endpoints;
             let request_id = req.id.clone();
-            if let Some(anchor) = &recovery_anchor {
-                self.replacement_recovery_anchors
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(request_id.clone(), anchor.clone());
-            }
+            self.replacement_recovery_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(request_id.clone(), recovery_anchor);
             match self.submit_heal_request(req).await {
                 Ok(HealAdmissionResult::Accepted) => {}
                 Ok(_) => {
@@ -362,6 +366,9 @@ impl HealManager {
         };
 
         for set_disk_id in set_disk_ids {
+            if reserved_replacement_sets.contains(&set_disk_id) || self.replacement_recovery_set_is_blocked(&set_disk_id) {
+                continue;
+            }
             let mut req = HealRequest::new(
                 HealType::ErasureSet {
                     buckets: buckets.clone(),

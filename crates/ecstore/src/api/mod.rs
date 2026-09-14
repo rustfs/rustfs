@@ -404,7 +404,7 @@ pub mod data_usage {
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::local::ScanGuard;
+    pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{

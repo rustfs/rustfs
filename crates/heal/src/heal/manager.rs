@@ -2310,6 +2310,11 @@ impl HealManager {
         self.publish_admin_terminal(task_id, heal_type, source, &completed).await
     }
 
+    pub(crate) async fn replacement_generation_is_running(&self, task_id: &str) -> bool {
+        let task = self.active_heals.lock().await.get(task_id).cloned();
+        task.is_some_and(|task| task.replacement_is_running())
+    }
+
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         match self.lookup_task_state(&canonical_task_id, None).await? {

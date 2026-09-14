@@ -1050,6 +1050,13 @@ impl Disk {
             Disk::Remote(_) => None,
         }
     }
+
+    pub async fn acquire_replacement_execution_lease(&self) -> Result<std::sync::Arc<local::ReplacementExecutionLease>> {
+        match self {
+            Self::Local(disk) => disk.get_disk().acquire_replacement_execution_lease().await,
+            Self::Remote(_) => Err(DiskError::other("replacement execution requires a local target")),
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {

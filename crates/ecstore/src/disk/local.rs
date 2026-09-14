@@ -17,6 +17,8 @@ pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
+mod replacement_lease;
+pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
@@ -5005,6 +5007,13 @@ impl LocalDisk {
     /// from the mutable endpoint pathname.
     pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
         self.has_replacement_mount_lease().then(|| self.io_root.clone())
+    }
+
+    pub async fn acquire_replacement_execution_lease(&self) -> Result<Arc<ReplacementExecutionLease>> {
+        let root = self
+            .replacement_mount_lease_root()
+            .ok_or_else(|| DiskError::other("replacement mount lease is no longer valid"))?;
+        replacement_lease::acquire(root).await
     }
 
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {

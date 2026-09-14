@@ -28,7 +28,7 @@ use super::{
 };
 
 /// Durable-proof schema version.
-const CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA: u32 = 1;
+const CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +36,8 @@ pub enum ReplacementPhase {
     #[default]
     None,
     Intent,
+    OwnershipPending,
+    HandoffPending,
     Rebuilding,
     Verified,
     CleanupPending,
@@ -89,18 +91,35 @@ impl ReplacementRecoveryRecord {
         let (state_kind, reason) = if !state.completed && state.retry_count >= state.max_retries {
             (
                 ReplacementRecoveryState::Unrecoverable,
-                Some("replacement retry budget exhausted".to_string()),
+                Some(
+                    state
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "replacement retry budget exhausted".to_string()),
+                ),
             )
         } else if let Some(reason) = state.error_message.clone() {
             (ReplacementRecoveryState::Incomplete, Some(reason))
         } else {
             match state.replacement_phase {
-                ReplacementPhase::Intent => (ReplacementRecoveryState::WaitingForReplacement, None),
+                ReplacementPhase::Intent | ReplacementPhase::OwnershipPending | ReplacementPhase::HandoffPending => {
+                    (ReplacementRecoveryState::WaitingForReplacement, None)
+                }
                 ReplacementPhase::Rebuilding => (ReplacementRecoveryState::Running, None),
                 ReplacementPhase::Verified | ReplacementPhase::CleanupPending => (ReplacementRecoveryState::CleanupPending, None),
                 ReplacementPhase::Abandoned => (
                     ReplacementRecoveryState::Unrecoverable,
-                    Some("replacement generation was abandoned".to_string()),
+                    Some(state.replacement_handoff.as_ref().map_or_else(
+                        || {
+                            state.replacement_legacy_successor.as_ref().map_or_else(
+                                || "replacement generation was abandoned".to_string(),
+                                |successor| {
+                                    format!("replacement responsibility transferred by approved legacy migration to {successor}")
+                                },
+                            )
+                        },
+                        |handoff| format!("replacement responsibility transferred to {}", handoff.link.successor),
+                    )),
                 ),
                 ReplacementPhase::None => (ReplacementRecoveryState::Unknown, Some("replacement phase is missing".to_string())),
             }
@@ -171,6 +190,10 @@ pub(crate) struct ReplacementCompletionProof {
     pub set_disk_id: String,
     pub replacement_targets: Vec<String>,
     pub replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    #[serde(default)]
+    pub replacement_lineage: Vec<super::ReplacementHandoffLink>,
+    #[serde(default)]
+    pub replacement_legacy_import: Option<super::LegacyReplacementApproval>,
     pub verified_at: u64,
 }
 
@@ -203,26 +226,55 @@ impl ReplacementCompletionProof {
             set_disk_id: state.set_disk_id.clone(),
             replacement_targets: state.replacement_targets.clone(),
             replacement_target_identities: state.replacement_target_identities.clone(),
+            replacement_lineage: state.replacement_lineage.clone(),
+            replacement_legacy_import: state.replacement_legacy_import.clone(),
             verified_at,
         })
     }
 
     fn matches_state(&self, state: &ResumeState) -> bool {
-        self.schema_version == CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA
+        (self.schema_version == CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA
+            || (self.schema_version == 1 && state.replacement_lineage.is_empty()))
             && self.task_id == state.task_id
             && state.replacement_generation.as_deref() == Some(self.replacement_generation.as_str())
             && self.set_disk_id == state.set_disk_id
             && self.replacement_targets == state.replacement_targets
             && self.replacement_target_identities == state.replacement_target_identities
+            && self.replacement_lineage == state.replacement_lineage
+            && self.replacement_legacy_import == state.replacement_legacy_import
     }
 
     fn validate(&self, expected_task_id: &str) -> Result<()> {
-        if self.schema_version != CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA {
+        if self.schema_version != CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA
+            && !(self.schema_version == 1 && self.replacement_lineage.is_empty())
+        {
             return Err(Error::TaskExecutionFailed {
                 message: format!("Replacement completion proof schema {} is unsupported", self.schema_version),
             });
         }
         validate_resume_task_id(expected_task_id)?;
+        super::handoff::validate_lineage(expected_task_id, &self.set_disk_id, &self.replacement_lineage)?;
+        if self
+            .replacement_lineage
+            .last()
+            .is_some_and(|link| link.targets != self.replacement_target_identities)
+        {
+            return Err(replacement_recovery_conflict("completion proof lineage has a different target binding"));
+        }
+        if let Some(approval) = &self.replacement_legacy_import {
+            approval.validate()?;
+            let root = self
+                .replacement_lineage
+                .first()
+                .map_or(self.task_id.as_str(), |link| link.predecessor.as_str());
+            if self.schema_version < 2
+                || root != approval.successor
+                || self.set_disk_id != approval.set_disk_id
+                || self.replacement_targets != approval.targets
+            {
+                return Err(replacement_recovery_conflict("completion proof has an invalid legacy migration receipt"));
+            }
+        }
         if self.task_id != expected_task_id
             || self.replacement_generation != self.task_id
             || self.set_disk_id.is_empty()
@@ -290,7 +342,10 @@ impl ResumeManager {
         replacement_target_identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
         replacement_target_identities.dedup_by(|left, right| left.endpoint == right.endpoint);
         let mut state = self.state.write().await;
-        if !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
+        if !matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent | ReplacementPhase::OwnershipPending | ReplacementPhase::Rebuilding
+        ) {
             return Err(Error::TaskExecutionFailed {
                 message: format!("Replacement intent is not active for task {}", state.task_id),
             });
@@ -311,6 +366,22 @@ impl ResumeManager {
             });
         }
         state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.error_message = None;
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    pub(crate) async fn record_replacement_failure(&self, error: &Error, retry_attempts: u32) -> Result<()> {
+        let mut state = self.state.write().await;
+        if state.replacement_generation.as_deref() != Some(state.task_id.as_str()) {
+            return Err(replacement_recovery_conflict("replacement failure has no matching generation"));
+        }
+        state.error_message = Some(error.to_string());
+        state.retry_count = state.retry_count.max(retry_attempts);
+        if matches!(error, Error::ReplacementRetryBudgetExhausted | Error::ReplacementOwnershipConflict(_)) {
+            state.retry_count = state.max_retries;
+        }
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         drop(state);
         self.save_state_strict().await
@@ -378,7 +449,7 @@ impl ResumeManager {
             })
     }
 
-    async fn replacement_completion_proof_if_present(
+    pub(super) async fn replacement_completion_proof_if_present(
         disk: DiskStore,
         task_id: &str,
     ) -> Result<Option<ReplacementCompletionProof>> {
@@ -420,6 +491,12 @@ impl ResumeManager {
     /// proof is durable evidence that rebuilding finished, so it must win over
     /// an older active state before a retry may format the target again.
     pub(super) async fn reconcile_replacement_completion_proof(&self) -> Result<()> {
+        let state = self.get_state().await;
+        if state.replacement_handoff.is_some() || state.replacement_legacy_successor.is_some() {
+            // Old proofs describe the retired target incarnation. Keep them as
+            // evidence without reviving the predecessor or authorizing cleanup.
+            return Ok(());
+        }
         let task_id = self.state.read().await.task_id.clone();
         let Some(proof) = Self::replacement_completion_proof_if_present(self.disk.clone(), &task_id).await? else {
             return Ok(());
@@ -663,26 +740,33 @@ impl ResumeManager {
         state_data: EcstoreDiskBytes,
     ) -> std::result::Result<(), DiskError> {
         ensure_replacement_recovery_dir(&self.disk).await?;
-        for _ in 0..2 {
-            let expected = match self.disk.read_all(RUSTFS_META_BUCKET, path).await {
-                Ok(existing) => Some(existing),
-                Err(DiskError::FileNotFound) => None,
-                Err(error) => return Err(error),
-            };
-            match super::super::storage_api::owner::EcstoreDiskAPI::compare_and_update_file(
-                self.disk.as_ref(),
-                RUSTFS_META_BUCKET,
-                path,
-                expected,
-                Some(state_data.clone()),
-            )
-            .await
-            {
-                Ok(EcstoreConditionalFileUpdate::Updated) => return Ok(()),
-                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
-                Err(error) => return Err(error),
+        let mut candidate: ResumeState = serde_json::from_slice(&state_data).map_err(DiskError::other)?;
+        let expected_revision = candidate.replacement_revision;
+        candidate.replacement_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| DiskError::other("replacement intent revision exhausted"))?;
+        let existing = self.disk.read_all(RUSTFS_META_BUCKET, path).await?;
+        let observed: ResumeState = serde_json::from_slice(&existing).map_err(DiskError::other)?;
+        if observed.replacement_revision != expected_revision || observed.task_id != candidate.task_id {
+            return Err(DiskError::other("replacement intent changed while publishing"));
+        }
+        let bytes = serde_json::to_vec(&candidate).map_err(DiskError::other)?;
+        match super::super::storage_api::owner::EcstoreDiskAPI::compare_and_update_file(
+            self.disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            path,
+            Some(existing),
+            Some(bytes.into()),
+        )
+        .await?
+        {
+            EcstoreConditionalFileUpdate::Updated => {
+                self.state.write().await.replacement_revision = candidate.replacement_revision;
+                Ok(())
+            }
+            EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => {
+                Err(DiskError::other("replacement intent changed while publishing"))
             }
         }
-        Err(DiskError::other("replacement intent changed while publishing"))
     }
 }
