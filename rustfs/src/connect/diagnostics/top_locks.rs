@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.locks";
+pub const TOP_LOCKS_CAPABILITY: &str = "top.locks@1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

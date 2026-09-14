@@ -35,6 +35,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use crate::connect::identity::DeviceIdentity;
 
 pub const TOP_SCHEMA_VERSION: u8 = 1;
+pub const TOP_API_CAPABILITY: &str = "top.api@1";
 pub const TOP_CLASSIFICATION: &str = "L3";
 pub const MAX_TOP_DURATION: Duration = Duration::from_secs(30);
 pub const MAX_TOP_RESULT_BYTES: usize = 262_144;
