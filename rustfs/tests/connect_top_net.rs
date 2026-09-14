@@ -291,7 +291,7 @@ fn local_top_export_is_private_no_clobber_cancel_safe_and_rejects_forged_artifac
 }
 
 #[test]
-fn production_cli_exports_top_net_and_fails_closed_for_unsupported_and_invalid_runs() {
+fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
     let directory = tempfile::tempdir().expect("CLI directory");
     let state = directory.path().join("state");
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
@@ -343,7 +343,17 @@ fn production_cli_exports_top_net_and_fails_closed_for_unsupported_and_invalid_r
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
 
-    for (index, tool) in ["api", "locks", "rpc"].into_iter().enumerate() {
+    let locks_output = directory.path().join("locks.zip");
+    let locks = top_command("locks", &state, &locks_output, "019e3ae0-0000-7000-8000-000000000031", 1, true)
+        .output()
+        .expect("run top.locks outside the server process");
+    assert!(!locks.status.success());
+    let stdout = String::from_utf8(locks.stdout).expect("UTF-8 stdout");
+    assert!(stdout.contains(r#""outcome":"FAILED""#));
+    assert!(stdout.contains(r#""reasonCode":"SOURCE_UNAVAILABLE""#));
+    assert!(!locks_output.exists());
+
+    for (index, tool) in ["api", "rpc"].into_iter().enumerate() {
         let output = directory.path().join(format!("{tool}.zip"));
         let artifact_uid = format!("019e3ae0-0000-7000-8000-00000000003{}", index + 1);
         let run = top_command(tool, &state, &output, &artifact_uid, 1, true)
