@@ -31,13 +31,13 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -196,17 +196,17 @@ fn parse_inventory_query(query: Option<&str>) -> S3Result<InventoryQuery> {
         match key.as_ref() {
             "bucket" => {
                 crate::storage::ecstore_bucket::utils::check_valid_bucket_name_strict(&value)
-                    .map_err(|_| s3_error!(InvalidArgument, "invalid bucket name"))?;
+                    .map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "invalid bucket name"))?;
                 bucket = Some(value.into_owned());
             }
             "max-findings" => {
                 max_findings = Some(
                     value
                         .parse::<usize>()
-                        .map_err(|_| s3_error!(InvalidArgument, "max-findings must be a positive integer"))?,
+                        .map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "max-findings must be a positive integer"))?,
                 );
             }
-            other => return Err(s3_error!(InvalidArgument, "unknown query parameter: {other}")),
+            other => return Err(s3::error(S3ErrorCode::InvalidArgument, format!("unknown query parameter: {other}"))),
         }
     }
     Ok(InventoryQuery {
@@ -231,7 +231,8 @@ impl Operation for GatewayKeyInventoryHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
         let query = parse_inventory_query(req.uri.query())?;
-        let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+        let store =
+            current_object_store_handle().ok_or_else(|| s3::error(S3ErrorCode::InternalError, "object store not initialized"))?;
 
         let buckets = match query.bucket {
             Some(bucket) => vec![bucket],
@@ -273,7 +274,6 @@ impl Operation for GatewayKeyInventoryHandler {
 mod tests {
     use super::*;
     use http::HeaderMap;
-    use s3s::S3ErrorCode;
 
     #[test]
     fn keys_the_gateway_reaches_are_not_reported() {
@@ -376,6 +376,26 @@ mod tests {
         assert!(parse_inventory_query(Some("max-findings=-1")).is_err());
         assert!(parse_inventory_query(Some("bucket=Bad_Name")).is_err());
         assert!(parse_inventory_query(Some("prefix=x")).is_err());
+    }
+
+    #[test]
+    fn query_errors_keep_their_s3_code_status_and_message() {
+        let cases = [
+            ("bucket=Bad_Name", "invalid bucket name"),
+            ("max-findings=-1", "max-findings must be a positive integer"),
+            ("prefix=x", "unknown query parameter: prefix"),
+        ];
+        for (query, message) in cases {
+            let err = parse_inventory_query(Some(query)).expect_err(query);
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "{query}");
+            assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST), "{query}");
+            assert_eq!(err.message(), Some(message), "{query}");
+        }
+
+        let err = s3::error(S3ErrorCode::InternalError, "object store not initialized");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(err.message(), Some("object store not initialized"));
     }
 
     #[tokio::test]
