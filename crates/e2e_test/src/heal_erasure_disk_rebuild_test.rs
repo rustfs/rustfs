@@ -1563,6 +1563,21 @@ mod tests {
             "replacement target must retain only its preformatted topology identity"
         );
 
+        // A multi-set pool can route a successful outage PUT away from the
+        // replacement drive. Identify its set through a witnessed baseline.
+        let target_set_peer_drives = cluster
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(node_index, _)| *node_index != 1)
+            .flat_map(|(_, node)| node.data_dirs.iter().map(PathBuf::from))
+            .filter(|drive| object_metadata_exists_on_disk(drive, bucket, &expected_manifests[0].key))
+            .collect::<Vec<_>>();
+        assert!(
+            !outage_target_manifest_required || !target_set_peer_drives.is_empty(),
+            "the replacement erasure set must retain an online baseline shard"
+        );
+
         let outage_payload_seed = 0xf1;
         let max_outage_write_attempts = topology.total_drives().max(1);
         let mut outage_key = None;
@@ -1593,7 +1608,10 @@ mod tests {
                             &candidate_peer_manifest,
                             erasure_set_drive_count,
                             replacement_set_slot,
-                        ) {
+                        ) || !target_set_peer_drives
+                            .iter()
+                            .any(|drive| object_metadata_exists_on_disk(drive, bucket, &candidate_key))
+                        {
                             rejected_outage_keys.push(candidate_key);
                             continue;
                         }
@@ -1637,6 +1655,14 @@ mod tests {
                 .into());
             }
         };
+
+        assert!(
+            !outage_target_manifest_required
+                || target_set_peer_drives
+                    .iter()
+                    .any(|drive| object_metadata_exists_on_disk(drive, bucket, &outage_key)),
+            "outage object {outage_key} belongs to a different erasure set than the replacement drive"
+        );
 
         if !outage_write_deferred_until_rejoin && outage_peer_manifest.erasure_indices.is_empty() {
             outage_peer_manifest = collect_outage_peer_manifest(&cluster, 1, bucket, &outage_key, erasure_set_drive_count)?;
