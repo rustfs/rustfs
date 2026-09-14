@@ -786,7 +786,7 @@ async fn automatic_replacement_uses_target_scoped_format() {
     let disk = make_resume_disk(&temp).await;
     let storage = Arc::new(MockStorage {
         replacement_target_identities_ready: Mutex::new(true),
-        resume_disk: Mutex::new(Some(disk)),
+        resume_disk: Mutex::new(Some(disk.clone())),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -819,6 +819,16 @@ async fn automatic_replacement_uses_target_scoped_format() {
         &[(0, 0, vec!["replacement-a".to_string()])],
         "automatic replacement must pass the exact pool, set, and target"
     );
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failed replacement must retain its durable responsibility")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("marker")),
+        "marker admission failure must persist the error rather than leave a running replacement"
+    );
+    assert_ne!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Rebuilding);
 }
 
 fn directory_backed_replacement_request() -> HealRequest {
@@ -1088,7 +1098,11 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
         .expect("the existing non-target anchor should retain the generation")
         .get_state()
         .await;
-    assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("marker")),
+        "a reused anchor must persist marker admission failure before rebuilding starts"
+    );
 }
 
 #[tokio::test]
@@ -1402,6 +1416,8 @@ struct MockStorage {
     replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
     replacement_target_identities_ready: Mutex<bool>,
     replacement_target_identity_sequences: Mutex<VecDeque<Vec<crate::heal::resume::ReplacementTargetIdentity>>>,
+    replacement_execution_fixture: Mutex<Option<Arc<crate::heal::storage::ReplacementExecution>>>,
+    replacement_format_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     listed_prefixes: Mutex<Vec<String>>,
     truncate_without_token: Mutex<bool>,
     include_object_dir_candidate: Mutex<bool>,
@@ -2147,6 +2163,13 @@ impl HealStorageAPI for MockStorage {
             .lock()
             .unwrap()
             .push((pool_index, set_index, targets.to_vec()));
+        if let Some((entered, release)) = &self.replacement_format_barrier {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if let Some(error) = self.format_error.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok((
             HealResultItem {
                 after: Infos {
@@ -2311,6 +2334,177 @@ impl HealStorageAPI for MockStorage {
                 filesystem_identity: format!("identity-{endpoint}"),
             })
             .collect())
+    }
+
+    async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<crate::heal::storage::ReplacementExecution>> {
+        if let Some(execution) = self.replacement_execution_fixture.lock().unwrap().take() {
+            return Ok(execution);
+        }
+        if !*self.replacement_target_identities_ready.lock().unwrap() {
+            return Err(Error::other("replacement target is not ready"));
+        }
+        let identities = self.replacement_target_identity_sequences.lock().unwrap().front().cloned();
+        let identities = match identities {
+            Some(identities) => identities,
+            None => self.replacement_target_identities(targets).await?,
+        };
+        Ok(crate::heal::storage::ReplacementExecution::for_test(Vec::new(), identities))
+    }
+}
+
+#[tokio::test]
+async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_persistence_finish() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let identity = replacement_identity("replacement-a", "device-a", "mount-a");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), vec![identity.clone()]);
+    let ownership = Arc::downgrade(&execution);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let storage = Arc::new(MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
+        replacement_execution_fixture: Mutex::new(Some(execution)),
+        replacement_format_barrier: Some((entered.clone(), release.clone())),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        ..Default::default()
+    });
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let waiter = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute().await }
+    });
+    entered.notified().await;
+    waiter.abort();
+    assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+    task.cancel_token.cancel();
+    assert!(ownership.upgrade().is_some(), "issued format I/O still owns execution");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ownership.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("executor drains after storage completes");
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failure state")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("cancel")),
+        "{:?}",
+        state.error_message
+    );
+    assert!(!task.replacement_is_running());
+    assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_startup_and_scanner_decision_reuses_the_same_successor() {
+    let anchor_dir = TempDir::new().expect("anchor");
+    let anchor = make_resume_disk(&anchor_dir).await;
+    let target_dir = TempDir::new().expect("target");
+    let target = make_resume_disk(&target_dir).await;
+    let id = Uuid::new_v4().to_string();
+    let old = replacement_identity("replacement-a", "same-device", "old-mount");
+    let current = replacement_identity("replacement-a", "same-device", "new-mount");
+    let parent = ResumeManager::new_replacement_intent(
+        anchor.clone(),
+        id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![old],
+    )
+    .await
+    .expect("pre-reboot generation");
+    target
+        .write_all(
+            crate::heal::RUSTFS_META_BUCKET,
+            crate::heal::HEALING_MARKER_PATH,
+            format!("pool_0_set_0:{id}").into(),
+        )
+        .await
+        .expect("old marker");
+    let make_storage = || MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![current.clone()]])),
+        replacement_execution_fixture: Mutex::new(Some(crate::heal::storage::ReplacementExecution::for_test(
+            vec![target.clone()],
+            vec![current.clone()],
+        ))),
+        ..Default::default()
+    };
+    let first = parent
+        .resolve_replacement_recovery(&make_storage())
+        .await
+        .expect("startup decision");
+    let reloaded = ResumeManager::load_replacement_intent(anchor.clone(), &id)
+        .await
+        .expect("scanner reads durable authority");
+    let second = reloaded
+        .resolve_replacement_recovery(&make_storage())
+        .await
+        .expect("scanner decision");
+    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.task_id, id);
+    assert_eq!(first.replacement_phase, ReplacementPhase::OwnershipPending);
+    assert!(first.resume_cursor.is_none());
+    assert_eq!(first.replacement_target_identities, vec![current]);
+}
+
+#[tokio::test]
+async fn replacement_failure_persistence_retains_both_errors() {
+    let directory = TempDir::new().expect("unavailable intent anchor");
+    let disk = make_resume_disk(&directory).await;
+    let task = HealTask::from_request(directory_backed_replacement_request(), Arc::new(MockStorage::default()));
+    *task.replacement_resume_disk.write().await = Some(disk);
+    let error = task
+        .persist_replacement_result(Err(Error::other("original marker conflict")))
+        .await
+        .expect_err("persistence failed");
+    let Error::ReplacementFailurePersistence { failure, persistence } = error else {
+        panic!("failure persistence must expose both errors");
+    };
+    assert!(failure.to_string().contains("original marker conflict"));
+    assert!(!persistence.to_string().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_format_failures_consume_the_durable_budget_across_new_executors() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    for attempt in 1..=3 {
+        let storage = Arc::new(MockStorage {
+            replacement_target_identities_ready: Mutex::new(true),
+            resume_disk: Mutex::new(Some(disk.clone())),
+            format_error: Mutex::new(Some(Error::other("injected format failure"))),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(request.clone(), storage.clone());
+        assert!(
+            task.execute()
+                .await
+                .expect_err("format fails")
+                .to_string()
+                .contains("format failure")
+        );
+        let state = ResumeManager::load_replacement_intent(disk.clone(), &task.id)
+            .await
+            .expect("durable failure")
+            .get_state()
+            .await;
+        assert_eq!(state.retry_count, attempt, "a new executor must not reset or double-charge the attempt");
+        assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+        assert_eq!(storage.replacement_format_calls.lock().unwrap().len(), 1);
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
     }
 }
 

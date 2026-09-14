@@ -37,7 +37,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -399,6 +399,7 @@ pub struct HealResultWindow {
     pub lagged: bool,
 }
 
+#[derive(Clone)]
 pub struct HealTask {
     /// Task ID
     pub id: String,
@@ -418,6 +419,10 @@ pub struct HealTask {
     /// Durable resume anchor injected by the manager for an existing automatic
     /// replacement generation.
     replacement_resume_endpoint: Option<String>,
+    replacement_resume_disk: Arc<RwLock<Option<crate::heal::DiskStore>>>,
+    replacement_execution: Arc<RwLock<Option<Arc<super::storage::ReplacementExecution>>>>,
+    replacement_running: Arc<AtomicBool>,
+    replacement_start_retry_count: Arc<AtomicU32>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -483,6 +488,10 @@ impl HealTask {
             retry_attempts: request.retry_attempts,
             heal_endpoints: request.heal_endpoints,
             replacement_resume_endpoint: None,
+            replacement_resume_disk: Arc::new(RwLock::new(None)),
+            replacement_execution: Arc::new(RwLock::new(None)),
+            replacement_running: Arc::new(AtomicBool::new(false)),
+            replacement_start_retry_count: Arc::new(AtomicU32::new(0)),
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_HEAL_RESULT_ITEMS))),
@@ -768,6 +777,14 @@ impl HealTask {
         F: Future<Output = Result<T>> + Send,
         T: Send,
     {
+        let execution = self.replacement_execution.read().await.clone();
+        if let Some(_execution) = execution {
+            // Replacement mutations finish at their storage boundary before
+            // cancellation is observed. Dropping them can leave detached I/O
+            // writing after the execution lease has been released.
+            self.check_control_flags().await?;
+            return fut.await;
+        }
         let cancel_token = self.cancel_token.clone();
         if let Some(remaining) = self.remaining_timeout().await? {
             if remaining.is_zero() {
@@ -983,6 +1000,22 @@ impl HealTask {
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
     #[hotpath::measure]
     pub async fn execute(&self) -> Result<()> {
+        if self.source == HealRequestSource::AutoHeal
+            && !self.heal_endpoints.is_empty()
+            && matches!(self.heal_type, HealType::ErasureSet { .. })
+        {
+            // The waiter may be cancelled or dropped while storage owns a
+            // blocking write. Keep the entire executor, including its leases,
+            // alive until that write and failure persistence have finished.
+            let task = self.clone();
+            return tokio::spawn(async move { task.execute_inner().await })
+                .await
+                .map_err(|error| Error::other(format!("replacement executor failed: {error}")))?;
+        }
+        self.execute_inner().await
+    }
+
+    async fn execute_inner(&self) -> Result<()> {
         self.outcome.write().await.start();
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
@@ -1050,6 +1083,10 @@ impl HealTask {
             }
         }
         .await;
+
+        self.replacement_running.store(false, Ordering::Release);
+        let result = self.persist_replacement_result(result).await;
+        self.replacement_execution.write().await.take();
 
         #[cfg(test)]
         pause_outcome_finish(&self.id).await;
@@ -1170,6 +1207,38 @@ impl HealTask {
         self.emit_trace_task_state(terminal_state, start_instant.elapsed(), result.as_ref().err());
 
         result
+    }
+
+    pub(crate) fn replacement_is_running(&self) -> bool {
+        self.replacement_running.load(Ordering::Acquire)
+    }
+
+    async fn persist_replacement_result(&self, result: Result<()>) -> Result<()> {
+        let Err(failure) = result else {
+            return result;
+        };
+        let Some(disk) = self.replacement_resume_disk.read().await.clone() else {
+            return Err(failure);
+        };
+        // The erasure healer has its own manager. Reload its latest durable
+        // progress instead of overwriting it with the pre-format snapshot.
+        let persisted = async {
+            let manager = ResumeManager::load_replacement_intent(disk, &self.id).await?;
+            let attempt = self
+                .replacement_start_retry_count
+                .load(Ordering::Acquire)
+                .max(self.retry_attempts)
+                .saturating_add(1);
+            manager.record_replacement_failure(&failure, attempt).await
+        }
+        .await;
+        match persisted {
+            Ok(()) => Err(failure),
+            Err(persistence) => Err(Error::ReplacementFailurePersistence {
+                failure: Box::new(failure),
+                persistence: Box::new(persistence),
+            }),
+        }
     }
 
     pub async fn cancel(&self) -> Result<()> {

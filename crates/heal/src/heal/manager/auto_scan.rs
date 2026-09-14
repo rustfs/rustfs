@@ -214,8 +214,8 @@ impl HealManager {
 
                         // Once formatting succeeds a replacement is no longer
                         // discoverable as UnformattedDisk. Re-admit exactly one
-                        // incomplete durable generation per set after bounded
-                        // scheduler retries are exhausted, or re-admit its
+                        // incomplete durable generation per set within its
+                        // persisted retry budget, or re-admit its
                         // verified terminal cleanup. Multiple generations are a
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
@@ -281,16 +281,19 @@ impl HealManager {
                                 };
                                 let state = resume_manager.get_state().await;
                                 if !durable_replacement_recovery_is_due(&state, &task_id) {
+                                    if durable_replacement_reserves_targets(&state) {
+                                        conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                    }
                                     continue;
                                 }
-                                if !matches!(state.replacement_phase, ReplacementPhase::CleanupPending) {
-                                    let Ok(identities) = storage.replacement_target_identities(&state.replacement_targets).await else {
-                                        continue;
-                                    };
-                                    if identities != state.replacement_target_identities {
+                                let state = match resume_manager.resolve_replacement_recovery(storage.as_ref()).await {
+                                    Ok(state) => state,
+                                    Err(_) => {
+                                        conflicted_recovery_sets.insert(state.set_disk_id.clone());
                                         continue;
                                     }
-                                }
+                                };
+                                let task_id = state.task_id.clone();
                                 let targets = state
                                     .replacement_targets
                                     .iter()
@@ -302,6 +305,7 @@ impl HealManager {
                                     })
                                     .collect::<Vec<_>>();
                                 if targets.len() != state.replacement_targets.len() {
+                                    conflicted_recovery_sets.insert(state.set_disk_id.clone());
                                     continue;
                                 }
                                 let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(

@@ -16,7 +16,7 @@ use super::checkpoint::CURRENT_CHECKPOINT_SCHEMA;
 use super::replacement::ReplacementCompletionProof;
 use super::*;
 
-async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
+pub(super) async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
     use super::super::{DiskOption, Endpoint, new_disk};
 
     let temp_dir = tempfile::TempDir::new().expect("create schema test directory");
@@ -394,6 +394,7 @@ async fn torn_intent_recovery_cas_preserves_a_concurrent_valid_binding() {
             }],
         ))),
         throttle: Mutex::new(PersistThrottle::new()),
+        persistence_lock: tokio::sync::Mutex::new(()),
         state_file: ResumeStateFile::ReplacementIntent,
     };
     let error = match loser.publish_new_replacement_intent(Some(expected)).await {

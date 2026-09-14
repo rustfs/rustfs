@@ -29,11 +29,15 @@ use super::{
 
 mod checkpoint;
 mod gc;
+mod handoff;
+mod legacy_handoff;
 mod replacement;
 mod utils;
 
 pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ResumeCheckpoint};
 pub(crate) use gc::ResumeGc;
+pub use handoff::{ReplacementHandoff, ReplacementHandoffLink, ReplacementHandoffPhase};
+pub use legacy_handoff::{LegacyReplacementApproval, LegacyReplacementSource};
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
@@ -64,7 +68,7 @@ const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corru
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
 /// older schema could mark historical null versions covered after reading
 /// latest. Discard their cursor and progress and scan from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 6;
+const CURRENT_RESUME_SCHEMA: u32 = 7;
 
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
@@ -326,6 +330,20 @@ pub struct ResumeState {
     pub replacement_generation: Option<String>,
     #[serde(default)]
     pub replacement_phase: ReplacementPhase,
+    #[serde(default)]
+    pub replacement_execution_protocol: u8,
+    #[serde(default)]
+    pub replacement_revision: u64,
+    #[serde(default)]
+    pub replacement_predecessor: Option<String>,
+    #[serde(default)]
+    pub replacement_handoff: Option<ReplacementHandoff>,
+    #[serde(default)]
+    pub replacement_lineage: Vec<ReplacementHandoffLink>,
+    #[serde(default)]
+    pub replacement_legacy_import: Option<LegacyReplacementApproval>,
+    #[serde(default)]
+    pub replacement_legacy_successor: Option<String>,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -395,6 +413,13 @@ impl ResumeState {
             replacement_buckets: Vec::new(),
             replacement_generation: None,
             replacement_phase: ReplacementPhase::None,
+            replacement_execution_protocol: 0,
+            replacement_revision: 0,
+            replacement_predecessor: None,
+            replacement_handoff: None,
+            replacement_lineage: Vec::new(),
+            replacement_legacy_import: None,
+            replacement_legacy_successor: None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -434,6 +459,7 @@ impl ResumeState {
         state.replacement_buckets = state.pending_buckets.clone();
         state.replacement_generation = Some(task_id);
         state.replacement_phase = ReplacementPhase::Intent;
+        state.replacement_execution_protocol = 1;
         state
     }
 
@@ -581,6 +607,7 @@ pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
     throttle: Mutex<PersistThrottle>,
+    persistence_lock: tokio::sync::Mutex<()>,
     state_file: ResumeStateFile,
 }
 
@@ -608,6 +635,8 @@ fn is_replacement_intent(state: &ResumeState) -> bool {
         && matches!(
             state.replacement_phase,
             ReplacementPhase::Intent
+                | ReplacementPhase::OwnershipPending
+                | ReplacementPhase::HandoffPending
                 | ReplacementPhase::Rebuilding
                 | ReplacementPhase::Verified
                 | ReplacementPhase::CleanupPending
@@ -630,6 +659,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::Ordinary,
         };
 
@@ -669,6 +699,9 @@ impl ResumeManager {
             match Self::load_replacement_intent(disk.clone(), &task_id).await {
                 Ok(manager) => {
                     let state = manager.get_state().await;
+                    if !state.completed && state.retry_count >= state.max_retries {
+                        return Err(Error::ReplacementRetryBudgetExhausted);
+                    }
                     if state.set_disk_id != set_disk_id
                         || state.replacement_targets != replacement_targets
                         || state.replacement_target_identities != replacement_target_identities
@@ -676,6 +709,7 @@ impl ResumeManager {
                         || !matches!(
                             state.replacement_phase,
                             ReplacementPhase::Intent
+                                | ReplacementPhase::OwnershipPending
                                 | ReplacementPhase::Rebuilding
                                 | ReplacementPhase::Verified
                                 | ReplacementPhase::CleanupPending
@@ -721,6 +755,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::ReplacementIntent,
         };
         manager.publish_new_replacement_intent(recovery_expected).await?;
@@ -789,9 +824,10 @@ impl ResumeManager {
             disk,
             state: legacy.state.clone(),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::ReplacementIntent,
         };
-        migrated.save_state_strict().await?;
+        migrated.publish_new_replacement_intent(None).await?;
         migrated.ensure_replacement_intent_seal().await?;
         legacy.cleanup().await?;
         delete_resume_file(&migrated.disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
@@ -819,6 +855,11 @@ impl ResumeManager {
                     state.schema_version
                 ),
             });
+        }
+        if state.schema_version == 6 && state.replacement_generation.is_none() && state.replacement_targets.is_empty() {
+            // Schema 7 adds replacement ownership only. Ordinary schema-6
+            // cursors already contain the exact historical-null identity.
+            state.schema_version = CURRENT_RESUME_SCHEMA;
         }
         if state.schema_version < CURRENT_RESUME_SCHEMA {
             // Replacement intents may already have a separate completion proof.
@@ -862,10 +903,39 @@ impl ResumeManager {
             state.schema_version = CURRENT_RESUME_SCHEMA;
         }
 
+        if state.replacement_generation.is_some() {
+            handoff::validate_lineage(&state.task_id, &state.set_disk_id, &state.replacement_lineage)?;
+            if let Some(handoff) = &state.replacement_handoff {
+                Self::validate_handoff(handoff, &state)?;
+            }
+            if state
+                .replacement_lineage
+                .last()
+                .is_some_and(|link| link.targets != state.replacement_target_identities)
+            {
+                return Err(replacement_recovery_conflict("replacement lineage has a different target binding"));
+            }
+            if let Some(approval) = &state.replacement_legacy_import {
+                approval.validate_state(&state)?;
+            }
+            if let Some(successor) = &state.replacement_legacy_successor {
+                validate_resume_task_id(successor)?;
+                if successor == &state.task_id || state.replacement_phase != ReplacementPhase::Abandoned {
+                    return Err(replacement_recovery_conflict("invalid retired legacy generation"));
+                }
+            }
+            if state.replacement_execution_protocol != 1
+                || state.replacement_predecessor.as_deref()
+                    != state.replacement_lineage.last().map(|link| link.predecessor.as_str())
+            {
+                return Err(replacement_recovery_conflict("replacement execution protocol or predecessor is invalid"));
+            }
+        }
         Ok(Self {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file,
         })
     }
@@ -1101,6 +1171,7 @@ impl ResumeManager {
     }
 
     async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
+        let _persistence = self.persistence_lock.lock().await;
         let state = self.state.read().await.clone();
         validate_resume_task_id(&state.task_id)?;
         let state_data = EcstoreDiskBytes::from(serde_json::to_vec(&state).map_err(|e| Error::TaskExecutionFailed {

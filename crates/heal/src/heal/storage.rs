@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
+pub use super::replacement_execution::ReplacementExecution;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
@@ -610,6 +611,10 @@ pub trait HealStorageAPI: Send + Sync {
     /// Capture the mounted replacement instance before it is formatted.
     async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
         Err(Error::other("replacement target identity collection is unsupported"))
+    }
+
+    async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
+        Err(Error::other("replacement execution lease acquisition is unsupported"))
     }
 }
 
@@ -1756,6 +1761,10 @@ impl HealStorageAPI for ECStoreHealStorage {
         super::replacement_readiness::auto_replacement_target_identities(targets)
             .await
             .ok_or_else(|| Error::other("replacement target is not a stable mounted disk"))
+    }
+
+    async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
+        ReplacementExecution::acquire(targets).await
     }
 }
 

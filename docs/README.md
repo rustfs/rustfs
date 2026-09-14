@@ -21,6 +21,9 @@ operators should start with:
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
+For disk replacement across VM restarts and schema 5/6 maintenance migration,
+see [Replacement generation recovery](operations/replacement-generation-recovery.md).
+
 For historical GET timeouts during PUT or Heal, see
 [Object lock contention diagnostics](operations/object-lock-contention.md).
 
