@@ -1100,6 +1100,8 @@ mod tests {
             &ObjectOptions {
                 versioned: true,
                 version_id: Some(version.clone()),
+                // Drain every rename before the fixture removes a physical shard.
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
