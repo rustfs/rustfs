@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: Successful main-branch Build and Release workflow run ID
+        description: Main-branch Build and Release workflow run ID
         required: true
         type: string
       artifact_id:
@@ -102,11 +102,17 @@ jobs:
           [[ $(git -C connect-harness remote get-url origin) == https://github.com/rustfs/connect ]]
 
           run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")
-          [[ $(jq -r '.conclusion' <<<"$run") == success ]]
           [[ $(jq -r '.head_sha' <<<"$run") == "$SOURCE_SHA" ]]
           [[ $(jq -r '.head_branch' <<<"$run") == main ]]
           [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
           [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
+
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
+          jq -e --arg name "$expected_job" '
+            [.[].jobs[] | select(.name == $name)] as $matches
+            | (($matches | length) == 1 and $matches[0].conclusion == "success")
+          ' <<<"$jobs" >/dev/null
 
           artifact=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")
           [[ $(jq -r '.workflow_run.id' <<<"$artifact") == "$BUILD_RUN_ID" ]]
