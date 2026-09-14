@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.rpc";
+pub const TOP_RPC_CAPABILITY: &str = "top.rpc@1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +90,9 @@ pub async fn capture_top_rpc(
     request.validate_scope(TOOL_ID)?;
     if request_count > MAX_SAFE_INTEGER || error_count > MAX_SAFE_INTEGER || total_duration_micros > MAX_SAFE_INTEGER {
         return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+    }
+    if request_count == 0 {
+        return request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool);
     }
     let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
     request.succeeded(

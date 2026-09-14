@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.net";
+pub const TOP_NET_CAPABILITY: &str = "top.net@1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkCounterSnapshot {
@@ -93,6 +94,9 @@ pub fn evaluate_network_window(
     };
     if received_bytes > MAX_SAFE_INTEGER || sent_bytes > MAX_SAFE_INTEGER {
         return request.failed(TOOL_ID, window_millis, TopReasonCode::CollectionFailed);
+    }
+    if received_bytes == 0 && sent_bytes == 0 {
+        return request.failed(TOOL_ID, window_millis, TopReasonCode::SourceUnavailable);
     }
 
     request.succeeded(

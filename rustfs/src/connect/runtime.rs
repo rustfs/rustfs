@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{ClientError, ConnectClient, ConnectConfig, RotationAttempt};
 use super::config::HeartbeatConfig;
+use super::diagnostics::job_delivery::DiagnosticJobRuntime;
 use super::diagnostics::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticReceiptDelivery, DiagnosticReceiptSender, DiagnosticScheduleRuntime,
     DiagnosticScheduleStatus, spawn_environment_schedule,
@@ -138,7 +139,8 @@ where
     .map_err(rotation_failure)?;
     let identity_store = config.identity_store.clone();
     let credential_store = config.credential_store.clone();
-    let store = HeartbeatStateStore::new(config.state_path.clone());
+    let diagnostic_job_runtime = DiagnosticJobRuntime::from_config(&config);
+    let store = HeartbeatStateStore::new(config.state_path.clone(), diagnostic_job_runtime.is_some());
     let lock = store.try_runtime_lock()?;
     let schedule = config.schedule;
     let state_root = config.state_root().ok_or(HeartbeatError::StateConflict)?.to_path_buf();
@@ -218,12 +220,16 @@ where
                 Delivery::Accepted {
                     server_time,
                     diagnostic_collection_policy,
+                    diagnostic_job,
                 } => {
                     if let Err(error) = store.mark_accepted(&pending).await {
                         return failed(&status_tx, error);
                     }
                     backoff = schedule.initial_backoff;
                     let _ = policy_tx.send(diagnostic_collection_policy);
+                    if let (Some(runtime), Some(job)) = (&diagnostic_job_runtime, diagnostic_job) {
+                        runtime.offer(*job, &task_shutdown);
+                    }
                     let _ = status_tx.send(HeartbeatStatus::Online { server_time });
                     schedule.cadence.saturating_add(jitter(schedule.jitter))
                 }

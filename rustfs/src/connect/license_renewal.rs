@@ -46,7 +46,7 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub enum LicenseRenewalOutcome {
     Requested,
     Pending { replacement_license_uid: String },
-    Installed(LicenseReport),
+    Installed(Box<LicenseReport>),
 }
 
 /// An mTLS client for the read-only Connect license-renewal delivery surface.
@@ -314,7 +314,7 @@ fn install_downloaded_artifact(
             return Err(LicenseRenewalError::Response);
         }
         apply_license_artifact(&path, state_directory, context)
-            .map(LicenseRenewalOutcome::Installed)
+            .map(|report| LicenseRenewalOutcome::Installed(Box::new(report)))
             .map_err(LicenseRenewalError::License)
     })();
     let _ = fs::remove_file(path);

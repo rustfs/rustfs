@@ -241,6 +241,7 @@ struct PreparedArchive {
     checksum_base64: String,
 }
 
+#[cfg(test)]
 async fn prepare_archive(path: &Path, cancellation: &CancellationToken) -> Result<PreparedArchive, ReportUploadError> {
     let file = File::open(path).await.map_err(ReportUploadError::ArchiveOpen)?;
     prepare_file(file, cancellation).await
@@ -285,7 +286,7 @@ async fn prepare_file(mut file: File, cancellation: &CancellationToken) -> Resul
         file,
         size,
         sha256: faster_hex::hex_string(&digest),
-        checksum_base64: base64_simd::STANDARD.encode_to_string(&digest),
+        checksum_base64: base64_simd::STANDARD.encode_to_string(digest),
     })
 }
 
@@ -430,14 +431,22 @@ fn validate_headers(raw: HashMap<String, String>, archive: &PreparedArchive) -> 
         headers.insert(name, value);
     }
     let expected_length = archive.size.to_string();
+    let encryption_authorized = match headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("AES256") => true,
+        Some("aws:kms") => headers
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty()),
+        _ => false,
+    };
     if headers.get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()) != Some(CONTENT_TYPE)
         || headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()) != Some(expected_length.as_str())
         || headers.get(header::IF_NONE_MATCH).and_then(|value| value.to_str().ok()) != Some("*")
         || headers.get("x-amz-checksum-sha256").and_then(|value| value.to_str().ok()) != Some(archive.checksum_base64.as_str())
-        || headers
-            .get("x-amz-server-side-encryption")
-            .and_then(|value| value.to_str().ok())
-            != Some("AES256")
+        || !encryption_authorized
     {
         return Err(ReportUploadError::UploadAuthorization);
     }
@@ -612,7 +621,7 @@ mod tests {
         assert_eq!(archive.size, 23);
         let digest = Sha256::digest(b"redacted support bundle");
         assert_eq!(archive.sha256, faster_hex::hex_string(&digest));
-        assert_eq!(archive.checksum_base64, base64_simd::STANDARD.encode_to_string(&digest));
+        assert_eq!(archive.checksum_base64, base64_simd::STANDARD.encode_to_string(digest));
     }
 
     #[tokio::test]
@@ -665,6 +674,22 @@ mod tests {
 
         decode_reservation(&serde_json::to_vec(&response).expect("response JSON"), &name, &bundle_uid, &archive)
             .expect("valid reservation");
+
+        let mut kms_response = response.clone();
+        kms_response["uploadAuthorization"]["headers"]["x-amz-server-side-encryption"] = json!("aws:kms");
+        kms_response["uploadAuthorization"]["headers"]["x-amz-server-side-encryption-aws-kms-key-id"] =
+            json!("connect-support-bundles");
+        decode_reservation(&serde_json::to_vec(&kms_response).expect("response JSON"), &name, &bundle_uid, &archive)
+            .expect("valid KMS reservation");
+
+        kms_response["uploadAuthorization"]["headers"]
+            .as_object_mut()
+            .expect("headers object")
+            .remove("x-amz-server-side-encryption-aws-kms-key-id");
+        assert!(matches!(
+            decode_reservation(&serde_json::to_vec(&kms_response).expect("response JSON"), &name, &bundle_uid, &archive,),
+            Err(ReportUploadError::UploadAuthorization)
+        ));
 
         let mut wrong_target = response.clone();
         wrong_target["supportBundle"]["name"] = json!(format!("organizations/o/clusters/other/supportBundles/{bundle_uid}"));

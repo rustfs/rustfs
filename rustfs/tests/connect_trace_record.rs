@@ -14,11 +14,12 @@ use rustfs::connect::{
     TelemetrySpanStatus, TelemetryTool, TraceRecordCompletion, TraceRecordLimits, encode_signed_telemetry_export,
     record_diagnostic_result, record_trace, record_trace_bus, save_signed_telemetry_export,
 };
+use rustfs::server::s3_http_request_guard;
 use rustfs_common::trace_bus::{
     TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, TraceEvent, TraceFunc, TraceKind, subscribe_trace_events,
     telemetry_trace_emit, telemetry_trace_subscriber_count, trace_emit,
 };
-use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
+use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -280,7 +281,7 @@ async fn connect_trace_record_uses_classified_s3_and_rpc_events_only() {
             .with_attr("error", "SYNTHETIC_SECRET_ERROR")
     }));
 
-    let mut s3_request = S3HttpRequestGuard::new("GET");
+    let mut s3_request = s3_http_request_guard("GET");
     s3_request.in_scope(|| record_s3_op(S3Operation::GetObject));
     tokio::time::sleep(Duration::from_millis(1)).await;
     s3_request.response(200);
