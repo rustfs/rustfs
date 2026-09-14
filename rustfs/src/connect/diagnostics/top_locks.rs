@@ -17,7 +17,7 @@
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use super::top_api::{TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
+use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.locks";
 
@@ -37,10 +37,45 @@ pub async fn capture_top_locks(
     if cancel.is_cancelled() {
         return request.cancelled(TOOL_ID);
     }
+    let Some(global_manager) = rustfs_lock::get_initialized_global_lock_manager() else {
+        return request.failed(TOOL_ID, 0, TopReasonCode::SourceUnavailable);
+    };
+    let Some(manager) = global_manager.as_fast_lock_manager() else {
+        return request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool);
+    };
+    let Some(_permit) = request.acquire(cancel).await? else {
+        return request.cancelled(TOOL_ID);
+    };
+    let started = tokio::time::Instant::now();
+    if !request.wait_window(TOOL_ID, cancel).await? {
+        return request.cancelled(TOOL_ID);
+    }
+    let (held_count, waiting_count) = manager.current_lock_counts();
+    let duration_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).max(1);
+    evaluate_lock_snapshot(request, held_count, waiting_count, duration_millis)
+}
 
-    // `GlobalLockManager` exposes exact held-lock entries, but the current
-    // public adapter does not expose the live waiter total required by v1.
-    // Reading holder resource names only to discard them would widen L3
-    // collection without making the result valid.
-    request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool)
+pub fn evaluate_lock_snapshot(
+    request: &TopCaptureRequest,
+    held_count: u64,
+    waiting_count: u64,
+    duration_millis: u64,
+) -> Result<TopResult<TopLocksData>, TopCaptureError> {
+    request.validate_scope(TOOL_ID)?;
+    if duration_millis == 0 || duration_millis > request.limits.max_duration_millis {
+        return Err(TopCaptureError::Limits);
+    }
+    if held_count > MAX_SAFE_INTEGER || waiting_count > MAX_SAFE_INTEGER {
+        return request.failed(TOOL_ID, duration_millis, TopReasonCode::CollectionFailed);
+    }
+
+    request.succeeded(
+        TOOL_ID,
+        duration_millis,
+        TopLocksData {
+            held_count,
+            waiting_count,
+            truncated: false,
+        },
+    )
 }

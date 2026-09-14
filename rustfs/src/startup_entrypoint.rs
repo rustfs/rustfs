@@ -1236,7 +1236,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                     if options.thread_scope.is_some() {
                         return Err(Error::other("--thread-scope is valid only for the threads profile"));
                     }
-                    export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
+                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
                 }
                 ConnectProfileTool::Memory => {
                     if options.thread_scope.is_some() {
@@ -1250,7 +1250,9 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                         Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
                         None => return Err(Error::other("--thread-scope is required for the threads profile")),
                     };
-                    export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+                    export_thread_profile(&request, scope, &key, &cancel)
+                        .await
+                        .map_err(Error::other)
                 }
             }
         };
