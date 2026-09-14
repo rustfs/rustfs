@@ -10394,13 +10394,14 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     let target_bucket = "proxy-tag-dst";
     let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
 
-    target_client
+    let tagged = target_client
         .put_object()
         .bucket(target_bucket)
         .key("proxy-tagged")
         .body(ByteStream::from_static(b"tagged payload"))
         .send()
         .await?;
+    let tagged_version = tagged.version_id().ok_or("versioned target PUT omitted its identity")?;
     target_client
         .put_object_tagging()
         .bucket(target_bucket)
@@ -10424,6 +10425,11 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
     assert_eq!(tags.tag_set[0].key.as_str(), "team");
     assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+    assert_eq!(
+        tags.version_id(),
+        Some(tagged_version),
+        "proxy must preserve the resolved remote identity"
+    );
 
     let record = target
         .requests()
@@ -10436,6 +10442,33 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
         "proxied tagging read must carry the anti-loop marker"
     );
     assert!(record.proxy_headers.replication_check.is_none());
+
+    let empty = target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"new version without tags"))
+        .send()
+        .await?;
+    let empty_version = empty.version_id().ok_or("empty-tag version omitted its identity")?;
+    for selector in [None, Some(empty_version), Some(tagged_version)] {
+        let tags = source_client
+            .get_object_tagging()
+            .bucket(source_bucket)
+            .key("proxy-tagged")
+            .set_version_id(selector.map(str::to_owned))
+            .send()
+            .await?;
+        let expected_version = selector.unwrap_or(empty_version);
+        assert_eq!(tags.version_id(), Some(expected_version));
+        if expected_version == tagged_version {
+            assert_eq!(tags.tag_set().len(), 1);
+            assert_eq!(tags.tag_set()[0].key(), "team");
+            assert_eq!(tags.tag_set()[0].value(), "storage");
+        } else {
+            assert!(tags.tag_set().is_empty());
+        }
+    }
 
     drop(source_env);
     target.shutdown().await;

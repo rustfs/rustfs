@@ -198,7 +198,7 @@ impl FS {
         object: &str,
         version_id: Option<String>,
         headers: &http::HeaderMap,
-    ) -> Option<TagSet> {
+    ) -> Option<GetObjectTaggingOutput> {
         let opts = Self::tagging_proxy_opts(bucket, object, version_id, headers).await?;
         let targets = get_read_proxy_targets(bucket, object, &opts).await;
         if targets.is_empty() {
@@ -213,8 +213,8 @@ impl FS {
                     // MinIO-aligned accounting: one total per proxy attempt,
                     // one failed when no target served it.
                     record_replication_proxy(bucket, "GetObjectTagging", false).await;
-                    return Some(
-                        remote
+                    return Some(GetObjectTaggingOutput {
+                        tag_set: remote
                             .tag_set
                             .into_iter()
                             .map(|tag| Tag {
@@ -222,7 +222,8 @@ impl FS {
                                 value: Some(tag.value),
                             })
                             .collect(),
-                    );
+                        version_id: remote.version_id,
+                    });
                 }
                 Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
                     debug!(bucket, object, arn = %target.arn, "tagging proxy: target does not have the object");
@@ -1134,6 +1135,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
+
         record_s3_op(S3Operation::GetObjectTagging);
         let start_time = std::time::Instant::now();
         let bucket = req.input.bucket.as_str();
@@ -1152,30 +1155,38 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_id = req.input.version_id.clone();
+        let version_id = parse_object_version_id(req.input.version_id.clone())?.map(Into::into);
+        let versioning = BucketVersioningSys::get(bucket).await.map_err(ApiError::from)?;
         let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
+            version_id,
+            versioned: versioning.prefix_enabled(object),
+            version_suspended: versioning.prefix_suspended(object),
             ..Default::default()
         };
 
-        let tags = match store.get_object_tags(bucket, object, &opts).await {
-            Ok(tags) => tags,
+        // Tags and response identity must come from the same locked metadata snapshot.
+        let info = match store.get_object_info(bucket, object, &opts).await {
+            Ok(info) if info.delete_marker => {
+                return Err(S3Error::new(if opts.version_id.is_some() {
+                    S3ErrorCode::MethodNotAllowed
+                } else {
+                    S3ErrorCode::NoSuchKey
+                }));
+            }
+            Ok(info) => info,
             Err(e) => {
                 // Replication lag window: the object may exist on a
                 // replication target even though it is missing locally —
                 // proxy the tagging read there (backlog#1675 P1-5).
                 if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
-                    && let Some(tag_set) =
+                    && let Some(output) =
                         Self::proxy_get_object_tagging(bucket, object, req.input.version_id.clone(), &req.headers).await
                 {
                     counter!("rustfs_get_object_tagging_success").increment(1);
                     let duration = start_time.elapsed();
                     histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get")
                         .record(duration.as_secs_f64());
-                    return Ok(S3Response::new(GetObjectTaggingOutput {
-                        tag_set,
-                        version_id: req.input.version_id.clone(),
-                    }));
+                    return Ok(S3Response::new(output));
                 }
                 if is_err_object_not_found(&e) {
                     debug!(
@@ -1206,7 +1217,7 @@ impl S3 for FS {
             }
         };
 
-        let tag_set = decode_tags(tags.as_str());
+        let tag_set = decode_tags(info.user_tags.as_str());
         debug!(
             component = LOG_COMPONENT_STORAGE,
             subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -1222,7 +1233,7 @@ impl S3 for FS {
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
-            version_id: req.input.version_id.clone(),
+            version_id: s3_api::read_response_version_id(info.version_id),
         }))
     }
 
