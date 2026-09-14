@@ -935,9 +935,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use rustfs_common::trace_bus::telemetry_trace_subscriber_count;
-    use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
+    use rustfs_io_metrics::record_s3_op;
     use rustfs_s3_ops::S3Operation;
     use serial_test::serial;
+    use tower::{Layer as _, Service as _};
 
     fn capture_request(window: Duration) -> TopCaptureRequest {
         let organization_uid = Uuid::now_v7();
@@ -983,10 +984,16 @@ mod tests {
     }
 
     async fn record_http_result(operation: S3Operation, status: u16) {
-        let mut guard = S3HttpRequestGuard::new("GET");
-        guard.in_scope(|| record_s3_op(operation));
-        tokio::task::yield_now().await;
-        guard.response(status);
+        let inner = tower::service_fn(move |_request: http::Request<()>| async move {
+            record_s3_op(operation);
+            tokio::task::yield_now().await;
+            Ok::<_, std::convert::Infallible>(http::Response::builder().status(status).body(()).expect("HTTP response"))
+        });
+        let mut service = crate::server::ExternalRequestContextLayer::default().layer(inner);
+        service
+            .call(http::Request::builder().uri("/bucket/object").body(()).expect("S3 request"))
+            .await
+            .expect("HTTP accounting should complete");
     }
 
     #[tokio::test]
@@ -1012,17 +1019,13 @@ mod tests {
         assert_eq!(data.request_count, 2);
         assert_eq!(data.error_count, 1);
         assert!(data.total_duration_micros > 0);
-        let encoded = serde_json::to_value(data).expect("serialize top.api data");
-        assert_eq!(
-            encoded.as_object().expect("top.api object").keys().collect::<Vec<_>>(),
-            [
-                "errorCount",
-                "operation",
-                "requestCount",
-                "totalDurationMicros",
-                "windowMillis"
-            ]
+        let encoded = serde_json::to_vec(&data).expect("serialize top.api data");
+        // Pin the serialized field order used by the signed export, without a Value map conversion.
+        let expected = format!(
+            r#"{{"operation":"GET_OBJECT","requestCount":2,"errorCount":1,"windowMillis":{},"totalDurationMicros":{}}}"#,
+            data.window_millis, data.total_duration_micros
         );
+        assert_eq!(encoded, expected.as_bytes());
     }
 
     #[tokio::test]

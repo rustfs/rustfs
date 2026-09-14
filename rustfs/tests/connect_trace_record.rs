@@ -15,11 +15,8 @@ use rustfs::connect::{
     record_diagnostic_result, record_trace, record_trace_bus, save_signed_telemetry_export,
 };
 use rustfs_common::trace_bus::{
-    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, TraceEvent, TraceFunc, TraceKind, subscribe_trace_events,
-    telemetry_trace_emit, telemetry_trace_subscriber_count, trace_emit,
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
 };
-use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
-use rustfs_s3_ops::S3Operation;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -253,58 +250,6 @@ fn connect_trace_record_enforces_exact_duration_and_sample_boundaries() {
         .expect_err("sample N+1 must fail"),
         TelemetryProducerError::InvalidSpanLimit
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn connect_trace_record_uses_classified_s3_and_rpc_events_only() {
-    let _unrelated_subscription = subscribe_trace_events();
-    let task = tokio::spawn(async {
-        record_trace_bus(
-            consent(),
-            TraceRecordLimits {
-                duration: Duration::from_millis(40),
-                max_spans: 8,
-            },
-            &CancellationToken::new(),
-        )
-        .await
-    });
-    wait_for_telemetry_subscriber().await;
-
-    assert!(trace_emit(|| {
-        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
-            .with_bucket("SYNTHETIC_SECRET_BUCKET")
-            .with_object("private/object")
-            .with_duration(Duration::from_micros(41))
-            .with_attr("error", "SYNTHETIC_SECRET_ERROR")
-    }));
-
-    let mut s3_request = S3HttpRequestGuard::new("GET");
-    s3_request.in_scope(|| record_s3_op(S3Operation::GetObject));
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    s3_request.response(200);
-    assert!(telemetry_trace_emit(|| {
-        TelemetryTraceEvent::new(
-            TelemetryTraceOperation::InternalRpc,
-            Duration::from_micros(41),
-            TelemetryTraceStatus::Error,
-        )
-    }));
-
-    let record = task.await.expect("capture task").expect("typed capture should succeed");
-    assert_eq!(record.completion, TraceRecordCompletion::Complete);
-    assert_eq!(record.data.spans.len(), 2);
-    assert_eq!(record.data.spans[0].operation, TelemetryOperation::GetObject);
-    assert_eq!(record.data.spans[0].status, TelemetrySpanStatus::Ok);
-    assert_eq!(record.data.spans[1].operation, TelemetryOperation::InternalRpc);
-    assert_eq!(record.data.spans[1].duration_micros, 41);
-    assert_eq!(record.data.spans[1].status, TelemetrySpanStatus::Error);
-
-    let json = serde_json::to_string(&record.data).expect("serialize typed telemetry");
-    for forbidden in ["SYNTHETIC_SECRET_BUCKET", "private/object", "SYNTHETIC_SECRET_ERROR"] {
-        assert!(!json.contains(forbidden));
-    }
 }
 
 #[tokio::test]

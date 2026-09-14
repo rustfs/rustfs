@@ -38,10 +38,14 @@ use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
 use rustfs_common::GlobalReadiness;
+use rustfs_common::trace_bus::{
+    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
+};
 use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
+use rustfs_s3_ops::S3Operation;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
@@ -273,7 +277,7 @@ where
 
         // This outer boundary includes readiness, rate-limit and auth
         // rejections. Metric attribution never depends on an enabled span.
-        let mut metrics = is_s3.then(|| S3HttpRequestGuard::new(req.method().as_str()));
+        let mut metrics = is_s3.then(|| S3HttpAccounting::new(req.method().as_str()));
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
@@ -287,13 +291,74 @@ where
     }
 }
 
+// The HTTP owner combines leaf-crate metrics with the process trace bus.
+// Keep the same lifetime so response, service error and cancellation each
+// finish accounting once, including requests rejected before S3 dispatch.
+struct S3HttpAccounting {
+    metrics: S3HttpRequestGuard,
+    telemetry_started_at: Option<Instant>,
+}
+
+impl S3HttpAccounting {
+    fn new(method: &str) -> Self {
+        Self {
+            metrics: S3HttpRequestGuard::new(method),
+            telemetry_started_at: (telemetry_trace_subscriber_count() != 0).then(Instant::now),
+        }
+    }
+
+    fn in_scope<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        self.metrics.in_scope(f)
+    }
+
+    fn response(&mut self, status: u16) {
+        self.metrics.response(status);
+        self.finish_telemetry(if (200..300).contains(&status) {
+            TelemetryTraceStatus::Ok
+        } else {
+            TelemetryTraceStatus::Error
+        });
+    }
+
+    fn service_error(&mut self) {
+        self.metrics.service_error();
+        self.finish_telemetry(TelemetryTraceStatus::Error);
+    }
+
+    fn finish_telemetry(&mut self, status: TelemetryTraceStatus) {
+        let Some(started_at) = self.telemetry_started_at.take() else {
+            return;
+        };
+        if let Some(operation) = telemetry_operation(self.metrics.operation()) {
+            telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, started_at.elapsed(), status));
+        }
+    }
+}
+
+impl Drop for S3HttpAccounting {
+    fn drop(&mut self) {
+        self.metrics.cancel();
+        self.finish_telemetry(TelemetryTraceStatus::Error);
+    }
+}
+
+fn telemetry_operation(operation: Option<S3Operation>) -> Option<TelemetryTraceOperation> {
+    match operation? {
+        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
+        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
+        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
+        _ => None,
+    }
+}
+
 pin_project! {
     pub struct ExternalRequestContextFuture<F> {
         #[pin]
         inner: F,
         request_id: Option<HeaderValue>,
         is_s3: bool,
-        metrics: Option<S3HttpRequestGuard>,
+        metrics: Option<S3HttpAccounting>,
     }
 }
 
@@ -2331,6 +2396,182 @@ mod tests {
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
         PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
+    }
+
+    #[test]
+    fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {
+        for (operation, expected) in [
+            (S3Operation::GetObject, TelemetryTraceOperation::GetObject),
+            (S3Operation::PutObject, TelemetryTraceOperation::PutObject),
+            (S3Operation::HeadObject, TelemetryTraceOperation::HeadObject),
+            (S3Operation::ListObjects, TelemetryTraceOperation::ListObjects),
+            (S3Operation::ListObjectsV2, TelemetryTraceOperation::ListObjects),
+        ] {
+            assert_eq!(telemetry_operation(Some(operation)), Some(expected));
+        }
+        assert_eq!(telemetry_operation(Some(S3Operation::DeleteObject)), None);
+        assert_eq!(telemetry_operation(None), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn external_s3_telemetry_capture_uses_classified_s3_and_rpc_events_only() {
+        use crate::connect::{
+            LocalTelemetryConsent, TelemetryOperation, TelemetrySpanStatus, TraceRecordCompletion, TraceRecordLimits,
+            record_trace_bus,
+        };
+        use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, subscribe_trace_events, trace_emit};
+        use rustfs_io_metrics::record_s3_op;
+        let _unrelated_subscription = subscribe_trace_events();
+        let task = tokio::spawn(async {
+            record_trace_bus(
+                LocalTelemetryConsent::new(Instant::now() + Duration::from_secs(5)).expect("future consent"),
+                TraceRecordLimits {
+                    duration: Duration::from_millis(40),
+                    max_spans: 8,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while telemetry_trace_subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capture should subscribe");
+
+        assert!(trace_emit(|| {
+            TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
+                .with_bucket("SYNTHETIC_SECRET_BUCKET")
+                .with_object("private/object")
+                .with_duration(Duration::from_micros(41))
+                .with_attr("error", "SYNTHETIC_SECRET_ERROR")
+        }));
+
+        let inner = tower::service_fn(|_request: Request<()>| async {
+            record_s3_op(S3Operation::GetObject);
+            tokio::task::yield_now().await;
+            Ok::<_, Infallible>(Response::new(()))
+        });
+        ExternalRequestContextLayer::default()
+            .layer(inner)
+            .call(
+                Request::builder()
+                    .uri("/SYNTHETIC_SECRET_BUCKET/private/object")
+                    .body(())
+                    .expect("S3 request"),
+            )
+            .await
+            .expect("S3 response");
+        assert!(telemetry_trace_emit(|| {
+            TelemetryTraceEvent::new(
+                TelemetryTraceOperation::InternalRpc,
+                Duration::from_micros(41),
+                TelemetryTraceStatus::Error,
+            )
+        }));
+
+        let record = task.await.expect("capture task").expect("typed capture should succeed");
+        assert_eq!(record.completion, TraceRecordCompletion::Complete);
+        assert_eq!(record.data.spans.len(), 2);
+        assert_eq!(record.data.spans[0].operation, TelemetryOperation::GetObject);
+        assert_eq!(record.data.spans[0].status, TelemetrySpanStatus::Ok);
+        assert_eq!(record.data.spans[1].operation, TelemetryOperation::InternalRpc);
+        assert_eq!(record.data.spans[1].duration_micros, 41);
+        assert_eq!(record.data.spans[1].status, TelemetrySpanStatus::Error);
+
+        let json = serde_json::to_string(&record.data).expect("serialize typed telemetry");
+        for forbidden in ["SYNTHETIC_SECRET_BUCKET", "private/object", "SYNTHETIC_SECRET_ERROR"] {
+            assert!(!json.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn external_s3_telemetry_covers_response_error_cancel_and_exclusions() {
+        use rustfs_common::trace_bus::subscribe_telemetry_trace_events;
+        use rustfs_io_metrics::record_s3_op;
+        let mut subscription = subscribe_telemetry_trace_events();
+        let inner = tower::service_fn(|req: Request<()>| async move {
+            if req.uri().path() != "/bucket/undispatched" {
+                record_s3_op(if req.uri().path() == "/bucket/delete" {
+                    S3Operation::DeleteObject
+                } else {
+                    S3Operation::GetObject
+                });
+            }
+            match req.uri().path() {
+                "/bucket/cancel" => std::future::pending::<Result<Response<()>, io::Error>>().await,
+                "/bucket/service-error" => Err(io::Error::other("test service failure")),
+                path => Ok(Response::builder()
+                    .status(match path {
+                        "/bucket/partial" => StatusCode::PARTIAL_CONTENT,
+                        "/bucket/denied" => StatusCode::FORBIDDEN,
+                        "/bucket/unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::OK,
+                    })
+                    .body(())
+                    .expect("response")),
+            }
+        });
+        let mut service = ExternalRequestContextLayer::default().layer(inner);
+        for path in ["/bucket/ok", "/bucket/partial", "/bucket/denied", "/bucket/unavailable"] {
+            service
+                .call(Request::builder().uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+        }
+        assert!(
+            service
+                .call(Request::builder().uri("/bucket/service-error").body(()).expect("request"))
+                .await
+                .is_err()
+        );
+        let mut cancelled = Box::pin(service.call(Request::builder().uri("/bucket/cancel").body(()).expect("request")));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        for path in [
+            "/bucket/delete",
+            "/bucket/undispatched",
+            "/health/ready",
+            "/rustfs/admin/v3/metrics",
+            "/rustfs/rpc/test",
+        ] {
+            service
+                .call(Request::builder().uri(path).body(()).expect("excluded request"))
+                .await
+                .expect("response");
+        }
+        for status in [
+            TelemetryTraceStatus::Ok,
+            TelemetryTraceStatus::Ok,
+            TelemetryTraceStatus::Error,
+            TelemetryTraceStatus::Error,
+            TelemetryTraceStatus::Error,
+            TelemetryTraceStatus::Error,
+        ] {
+            let event = subscription.try_recv().expect("one event per accounted request");
+            assert_eq!(event.operation, TelemetryTraceOperation::GetObject);
+            assert_eq!(event.status, status);
+        }
+        assert!(matches!(subscription.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    #[serial]
+    fn s3_telemetry_does_not_retroactively_time_requests_without_subscribers() {
+        use rustfs_common::trace_bus::{subscribe_telemetry_trace_events, telemetry_trace_subscriber_count};
+        use rustfs_io_metrics::record_s3_op;
+        assert_eq!(telemetry_trace_subscriber_count(), 0);
+        let mut request = S3HttpAccounting::new("GET");
+        assert!(request.telemetry_started_at.is_none());
+        let mut subscription = subscribe_telemetry_trace_events();
+        request.in_scope(|| record_s3_op(S3Operation::GetObject));
+        request.response(200);
+        drop(request);
+        assert!(matches!(subscription.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
     }
 
     #[tokio::test]

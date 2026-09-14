@@ -16,14 +16,10 @@
 //! Admin snapshots and metric exporters share these counters. The older
 //! operation counter counts handler entries and is not an HTTP denominator.
 
-use rustfs_common::trace_bus::{
-    TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
-};
 use rustfs_s3_ops::S3Operation;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
-use std::time::Instant;
 
 const METRIC: &str = "rustfs_s3_http_requests_total";
 const METHODS: [&str; 10] = [
@@ -114,7 +110,6 @@ pub(crate) fn observe_s3_http_operation(op: S3Operation) {
 pub struct S3HttpRequestGuard {
     method: usize,
     operation: usize,
-    telemetry_started_at: Option<Instant>,
     finished: bool,
 }
 
@@ -127,7 +122,6 @@ impl S3HttpRequestGuard {
         Self {
             method: METHODS.iter().position(|known| *known == method).unwrap_or(METHODS.len() - 1),
             operation: UNKNOWN_OPERATION,
-            telemetry_started_at: (telemetry_trace_subscriber_count() != 0).then(Instant::now),
             finished: false,
         }
     }
@@ -142,6 +136,11 @@ impl S3HttpRequestGuard {
         })
     }
 
+    /// The first S3 operation dispatched in this request's scope, if any.
+    pub fn operation(&self) -> Option<S3Operation> {
+        S3Operation::ALL.get(self.operation).copied()
+    }
+
     pub fn response(&mut self, status: u16) {
         let outcome = match status {
             100..=599 => usize::from(status / 100 - 1),
@@ -154,35 +153,23 @@ impl S3HttpRequestGuard {
         self.finish(6);
     }
 
+    /// Record cancellation before dependent request accounting is published.
+    /// Like response/error accounting, repeated completion is a no-op.
+    pub fn cancel(&mut self) {
+        self.finish(7);
+    }
+
     fn finish(&mut self, outcome: usize) {
         if !self.finished {
             COUNTERS.record(self.method, self.operation, outcome);
-            if let Some((started_at, operation)) = self.telemetry_started_at.take().zip(telemetry_operation(self.operation)) {
-                let status = if outcome == 1 {
-                    TelemetryTraceStatus::Ok
-                } else {
-                    TelemetryTraceStatus::Error
-                };
-                telemetry_trace_emit(|| TelemetryTraceEvent::new(operation, started_at.elapsed(), status));
-            }
             self.finished = true;
         }
     }
 }
 
-fn telemetry_operation(index: usize) -> Option<TelemetryTraceOperation> {
-    match S3Operation::ALL.get(index)? {
-        S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
-        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
-        S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
-        S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
-        _ => None,
-    }
-}
-
 impl Drop for S3HttpRequestGuard {
     fn drop(&mut self) {
-        self.finish(7);
+        self.cancel();
     }
 }
 
@@ -195,32 +182,6 @@ mod tests {
     use super::*;
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
-
-    #[test]
-    fn telemetry_adapter_accepts_only_the_frozen_s3_operations() {
-        assert_eq!(
-            telemetry_operation(S3Operation::GetObject.metric_index()),
-            Some(TelemetryTraceOperation::GetObject)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::PutObject.metric_index()),
-            Some(TelemetryTraceOperation::PutObject)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::HeadObject.metric_index()),
-            Some(TelemetryTraceOperation::HeadObject)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::ListObjects.metric_index()),
-            Some(TelemetryTraceOperation::ListObjects)
-        );
-        assert_eq!(
-            telemetry_operation(S3Operation::ListObjectsV2.metric_index()),
-            Some(TelemetryTraceOperation::ListObjects)
-        );
-        assert_eq!(telemetry_operation(S3Operation::DeleteObject.metric_index()), None);
-        assert_eq!(telemetry_operation(UNKNOWN_OPERATION), None);
-    }
 
     #[test]
     fn outcome_counters_distinguish_partial_and_complete_write_failure() {
@@ -289,16 +250,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cancellation_is_recorded_before_drop_and_only_once() {
+        let total = |outcome: &str| {
+            s3_http_metrics_snapshot()
+                .into_iter()
+                .filter(|s| s.method == "OPTIONS" && s.operation == S3Operation::HeadObject.as_str() && s.outcome == outcome)
+                .map(|s| s.total)
+                .sum::<u64>()
+        };
+        let cancelled_before = total("cancelled");
+        let successful_before = total("2xx");
+        let mut request = S3HttpRequestGuard::new("OPTIONS");
+        request.in_scope(|| observe_s3_http_operation(S3Operation::HeadObject));
+        request.cancel();
+        assert_eq!(total("cancelled"), cancelled_before + 1);
+        request.response(200);
+        request.cancel();
+        drop(request);
+        assert_eq!(total("cancelled"), cancelled_before + 1);
+        assert_eq!(total("2xx"), successful_before);
+    }
+
+    #[test]
     fn request_operation_is_scoped_and_first_dispatch_wins() {
         let mut request = S3HttpRequestGuard::new("PUT");
         request.in_scope(|| {
             observe_s3_http_operation(S3Operation::PutObject);
             observe_s3_http_operation(S3Operation::GetObject);
         });
-        assert_eq!(request.operation, S3Operation::PutObject.metric_index());
+        assert_eq!(request.operation(), Some(S3Operation::PutObject));
         observe_s3_http_operation(S3Operation::GetObject);
         let other = S3HttpRequestGuard::new("attacker-controlled-method");
         assert_eq!(other.method, METHODS.len() - 1);
-        assert_eq!(other.operation, UNKNOWN_OPERATION);
+        assert_eq!(other.operation(), None);
     }
 }
