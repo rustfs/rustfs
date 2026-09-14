@@ -134,6 +134,600 @@ fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> Com
     }
 }
 
+#[tokio::test]
+async fn root_recovery_terminal_outcome_survives_repeated_restart() {
+    use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
+
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admit root heal");
+    let mut completed = completed_admin_status(&request.heal_type, SystemTime::now());
+    let mut outcome = HealTaskOutcome::default();
+    outcome.execution = HealExecutionOutcome::Completed;
+    outcome.coverage = HealTraversalCoverage::Complete;
+    outcome.counters.processed = 257;
+    outcome.counters.healed = 255;
+    outcome.counters.unchanged = 2;
+    completed.outcome = Some(Arc::new(outcome));
+    let expected = serde_json::to_value(completed.outcome.as_deref()).expect("expected outcome");
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("publish root outcome");
+    drop(manager);
+
+    for _ in 0..2 {
+        let restarted = recovery_manager(vec![disk.clone()]);
+        restarted.replay_root_heals().await.expect("replay terminal receipt");
+        assert_eq!(restarted.get_queue_length().await, 0);
+        let report = restarted.get_task_report(&request.id).await.expect("retained report");
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        assert_eq!(serde_json::to_value(report.outcome.as_deref()).expect("restored outcome"), expected);
+        let retained = restarted
+            .root_recovery
+            .completed(&request.id)
+            .await
+            .expect("receipt")
+            .expect("retained");
+        assert_eq!(retained.completed_at, completed.completed_at, "restart cannot renew retention");
+    }
+}
+
+fn terminal_with_outcome(heal_type: &HealType, status: HealTaskStatus) -> CompletedHealStatus {
+    use crate::heal::outcome::{
+        HealAbortReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectOutcome,
+    };
+    let mut completed = completed_admin_status(heal_type, SystemTime::now());
+    let mut outcome = HealTaskOutcome::default();
+    outcome.start();
+    for index in 0..257 {
+        let disposition = if index < 255 {
+            HealObjectDisposition::Repaired
+        } else {
+            HealObjectDisposition::VerifiedHealthy
+        };
+        outcome.record(HealObjectOutcome {
+            identity: HealObjectIdentity {
+                kind: HealObjectKind::Object,
+                bucket: "bucket".to_string(),
+                object: format!("object-{index}"),
+                version_id: None,
+                bucket_incarnation_id: None,
+                pool_index: None,
+                set_index: None,
+            },
+            disposition,
+            detail: Some("verified repair".to_string()),
+        });
+    }
+    if matches!(status, HealTaskStatus::Failed { .. }) {
+        let mut failure = outcome.objects.back().expect("last object").clone();
+        failure.disposition = HealObjectDisposition::Failed(HealFailureClass::Permanent);
+        outcome.record(failure);
+        outcome.attempt_failed();
+    }
+    outcome.finish((status == HealTaskStatus::Cancelled).then_some(HealAbortReason::Cancelled));
+    completed.outcome = Some(Arc::new(outcome));
+    completed.status = status;
+    completed.seqed_items = vec![(
+        9,
+        HealResultItem {
+            object: "retained-object".to_string(),
+            ..Default::default()
+        },
+    )];
+    completed.next_seq = 10;
+    completed.min_seq = 9;
+    completed.result_items_truncated = true;
+    completed
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_report_preserves_states_windows_and_legacy_marker() {
+    for status in [
+        HealTaskStatus::Completed,
+        HealTaskStatus::Cancelled,
+        HealTaskStatus::Failed {
+            error: "permanent failure".to_string(),
+        },
+    ] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let request = root_request();
+        let completed = terminal_with_outcome(&request.heal_type, status.clone());
+        manager.root_recovery.persist(&request).await.expect("admission");
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .expect("terminal report");
+        let marker = disk
+            .read_all(RUSTFS_META_BUCKET, &format!("terminal-root-heal-{}.json", request.id))
+            .await
+            .expect("legacy marker");
+        let marker_json: serde_json::Value = serde_json::from_slice(&marker).expect("legacy JSON");
+        let keys = marker_json
+            .as_object()
+            .expect("terminal object")
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "schema",
+                "task_id",
+                "heal_type",
+                "status",
+                "options",
+                "progress",
+                "completed_at"
+            ])
+        );
+        assert_eq!(marker_json["schema"], 1, "rollback readers retain their original format");
+        let expected = serde_json::to_value(completed.outcome.as_deref()).expect("outcome JSON");
+        assert_eq!(expected["objectsTruncated"], true);
+        assert_eq!(expected["objects"].as_array().expect("window").len(), 128);
+        drop(manager);
+        for _ in 0..2 {
+            let restarted = recovery_manager(vec![disk.clone()]);
+            restarted.replay_root_heals().await.expect("restart");
+            let report = restarted
+                .get_task_report_since(&request.id, Some(8))
+                .await
+                .expect("incremental report");
+            assert_eq!(report.status, status);
+            assert_eq!(serde_json::to_value(report.outcome.as_deref()).expect("restored outcome"), expected);
+            assert_eq!(report.result_items.len(), 1);
+            assert_eq!(report.result_items[0].object, "retained-object");
+            assert_eq!((report.next_seq, report.min_seq, report.result_items_truncated), (10, 9, true));
+            assert_eq!(
+                serde_json::to_value(report.progress).expect("progress"),
+                serde_json::to_value(&completed.progress).expect("expected progress")
+            );
+        }
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("terminal-root-heal-{}.json", request.id))
+                .await
+                .expect("unchanged marker"),
+            marker
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_legacy_terminal_does_not_invent_outcome() {
+    let (_temp, disk) = recovery_disk().await;
+    let task_id = "00000000-0000-0000-0000-000000002519";
+    let mut marker: serde_json::Value = serde_json::from_str(r#"{"schema":1,"task_id":"00000000-0000-0000-0000-000000002519","heal_type":{"type":"cluster"},"status":"Cancelled","progress":null,"completed_at":{"secs_since_epoch":1,"nanos_since_epoch":0}}"#).expect("pinned legacy terminal");
+    marker["completed_at"] = serde_json::to_value(SystemTime::now()).expect("current retention epoch");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &format!("terminal-root-heal-{task_id}.json"),
+        serde_json::to_vec(&marker).expect("legacy marker").into(),
+    )
+    .await
+    .expect("write legacy marker");
+    let manager = recovery_manager(vec![disk]);
+    let report = manager.get_task_report(task_id).await.expect("legacy report");
+    assert_eq!(report.status, HealTaskStatus::Cancelled);
+    assert!(report.outcome.is_none(), "historical counters are unavailable");
+    assert!(report.result_items_truncated, "missing historical detail must be explicit");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_recovery_cancelled_worker_publishes_durable_refinement_or_keeps_previous_report() {
+    use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
+    for failure_mode in 0..4 {
+        let (temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let bucket = format!("terminal-report-cancel-{}", Uuid::new_v4());
+        let request = admin_request(HealType::Object {
+            bucket: bucket.clone(),
+            object: "object".to_string(),
+            version_id: None,
+        });
+        let task_id = request.id.clone();
+        let hook = Arc::new(CompletedRetentionHook {
+            pause_before_publish: true,
+            ..Default::default()
+        });
+        {
+            let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+            hooks.insert(bucket.clone(), hook.clone());
+            hooks.insert(task_id.clone(), hook.clone());
+        }
+        manager.submit_heal_request(request).await.expect("admit cancellable object");
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(10), hook.started.notified())
+            .await
+            .expect("worker entered storage");
+        manager.cancel_task(&task_id).await.expect("durable cancellation");
+        let initial = manager.get_task_report(&task_id).await.expect("initial cancelled report");
+        assert_eq!(
+            initial.outcome.as_ref().expect("initial outcome").execution,
+            HealExecutionOutcome::Aborted(HealAbortReason::Cancelled)
+        );
+        let completed_at = manager
+            .root_recovery
+            .completed(&task_id)
+            .await
+            .expect("receipt")
+            .expect("retained")
+            .completed_at;
+        hook.execute.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), hook.before_publish.notified())
+            .await
+            .expect("worker finalized outcome");
+        let read_only =
+            matches!(failure_mode, 1 | 3).then(|| RestoreDirectoryMode::read_only(temp.path().join(RUSTFS_META_BUCKET)));
+        if failure_mode == 3 {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(temp.path().join(RUSTFS_META_BUCKET), std::fs::Permissions::from_mode(0))
+                .expect("make the report owner unreadable as well as unwritable");
+        }
+        manager
+            .root_recovery
+            .fail_after_terminal_write
+            .store(failure_mode == 2, std::sync::atomic::Ordering::SeqCst);
+        hook.publish.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), hook.handoff.notified())
+            .await
+            .expect("worker published completion");
+        let final_report = manager.get_task_report(&task_id).await.expect("final cancelled report");
+        let expected = if failure_mode == 3 {
+            assert!(
+                final_report.outcome.is_none(),
+                "an uncertain unreadable report must be marked unavailable"
+            );
+            assert!(final_report.result_items_truncated);
+            assert!(final_report.result_items.is_empty());
+            serde_json::to_value(initial.outcome.as_deref()).expect("last durable report after I/O recovers")
+        } else {
+            serde_json::to_value(final_report.outcome.as_deref()).expect("final outcome")
+        };
+        if failure_mode == 1 {
+            assert_eq!(
+                expected,
+                serde_json::to_value(initial.outcome.as_deref()).expect("previous durable outcome")
+            );
+        } else if failure_mode != 3 {
+            assert!(
+                final_report.outcome.as_ref().expect("final counters").counters.processed
+                    > initial.outcome.as_ref().expect("initial counters").counters.processed
+            );
+        }
+        drop(read_only);
+        for _ in 0..2 {
+            let restarted = recovery_manager(vec![disk.clone()]);
+            restarted.replay_root_heals().await.expect("cancelled restart");
+            assert_eq!(restarted.get_queue_length().await, 0);
+            let restored = restarted.get_task_report(&task_id).await.expect("restored cancellation");
+            assert_eq!(serde_json::to_value(restored.outcome.as_deref()).expect("restored outcome"), expected);
+            assert_eq!(
+                restarted
+                    .root_recovery
+                    .completed(&task_id)
+                    .await
+                    .expect("receipt")
+                    .expect("retained")
+                    .completed_at,
+                completed_at
+            );
+        }
+        hook.finish.notify_one();
+        COMPLETED_RETENTION_HOOKS
+            .lock()
+            .await
+            .retain(|key, _| key != &bucket && key != &task_id);
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_retry_cancellation_preserves_previous_attempt_outcome() {
+    use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("durable retry intent");
+    let previous = terminal_with_outcome(
+        &request.heal_type,
+        HealTaskStatus::Failed {
+            error: "retryable".to_string(),
+        },
+    );
+    let counters = previous.outcome.as_ref().expect("attempt outcome").counters.clone();
+    manager
+        .completed_heals
+        .lock()
+        .await
+        .insert(request.id.clone(), Arc::new(previous));
+    manager.retrying_heals.lock().await.insert(
+        request.id.clone(),
+        RetryingHeal {
+            request: request.clone(),
+            error: "retryable".to_string(),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+    manager.cancel_task(&request.id).await.expect("cancel retry");
+    drop(manager);
+    let restarted = recovery_manager(vec![disk]);
+    let report = restarted
+        .get_task_report(&request.id)
+        .await
+        .expect("retained retry cancellation");
+    let outcome = report.outcome.expect("previous attempt retained");
+    assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Cancelled));
+    assert_eq!(outcome.counters, counters);
+    assert_eq!(report.result_items.len(), 1);
+}
+
+#[tokio::test]
+async fn root_recovery_corrupt_or_oversize_reports_do_not_resurrect_terminal_work() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let completed = terminal_with_outcome(&request.heal_type, HealTaskStatus::Completed);
+    manager.root_recovery.persist(&request).await.expect("admission");
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("terminal");
+    let path = format!("heal-terminal-report-{}.json", request.id);
+    let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("valid report");
+    let original_json: serde_json::Value = serde_json::from_slice(&original).expect("report JSON");
+    for (pointer, value) in [
+        ("/schema", serde_json::json!(2)),
+        ("/terminal/task_id", serde_json::json!(Uuid::new_v4().to_string())),
+        ("/terminal/completed_at/secs_since_epoch", serde_json::json!(1)),
+        ("/outcome/execution", serde_json::json!({"state":"running"})),
+        ("/outcome/counters/processed", serde_json::json!(0)),
+        ("/outcome/objects/0/detail", serde_json::json!("x".repeat(1025))),
+        ("/min_seq", serde_json::json!(11)),
+    ] {
+        let mut corrupted = original_json.clone();
+        *corrupted.pointer_mut(pointer).expect("existing field") = value;
+        disk.write_all(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&corrupted).expect("corrupt JSON").into())
+            .await
+            .expect("inject corruption");
+        assert!(manager.get_task_report(&request.id).await.is_err(), "must reject {pointer}");
+        assert!(
+            manager
+                .root_recovery
+                .pending()
+                .await
+                .expect("terminal still fences replay")
+                .is_empty()
+        );
+    }
+    disk.write_all(RUSTFS_META_BUCKET, &path, b"{".to_vec().into())
+        .await
+        .expect("inject malformed JSON");
+    assert!(manager.get_task_report(&request.id).await.is_err());
+    let mut boundary = original.to_vec();
+    boundary.resize(8 * 1024 * 1024, b' ');
+    disk.write_all(RUSTFS_META_BUCKET, &path, boundary.clone().into())
+        .await
+        .expect("exact-size valid JSON");
+    assert!(
+        manager
+            .get_task_report(&request.id)
+            .await
+            .expect("exact byte limit is accepted")
+            .outcome
+            .is_some()
+    );
+    boundary.push(b' ');
+    disk.write_all(RUSTFS_META_BUCKET, &path, boundary.into())
+        .await
+        .expect("limit plus one");
+    assert!(
+        manager
+            .get_task_report(&request.id)
+            .await
+            .expect_err("oversized otherwise-valid JSON")
+            .to_string()
+            .contains("size limit")
+    );
+    disk.write_all(RUSTFS_META_BUCKET, &path, original)
+        .await
+        .expect("restore valid report");
+    assert!(
+        manager
+            .get_task_report(&request.id)
+            .await
+            .expect("valid report restored")
+            .outcome
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_recovery_report_write_failure_preserves_pending_owner() {
+    let (temp, disk) = recovery_disk().await;
+    let (_other_temp, other) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone(), other.clone()]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admission");
+    let intent_path = format!("root-heal-{}.json", request.id);
+    let original = disk
+        .read_all(RUSTFS_META_BUCKET, &intent_path)
+        .await
+        .expect("original responsibility");
+    let completed = terminal_with_outcome(&request.heal_type, HealTaskStatus::Completed);
+    let read_only = RestoreDirectoryMode::read_only(temp.path().join(RUSTFS_META_BUCKET));
+    assert!(
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &intent_path)
+            .await
+            .expect("responsibility retained"),
+        original
+    );
+    for disk in [&disk, &other] {
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("terminal-root-heal-{}.json", request.id))
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("heal-terminal-report-{}.json", request.id))
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+    drop(read_only);
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("retry on original owner");
+}
+
+#[tokio::test]
+async fn root_recovery_old_cancelled_token_cannot_stop_successor() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let old = root_request();
+    let cancelled = terminal_with_outcome(&old.heal_type, HealTaskStatus::Cancelled);
+    manager
+        .publish_admin_terminal(&old.id, &old.heal_type, old.source, &cancelled)
+        .await
+        .expect("old cancellation");
+    let mut successor = root_request();
+    successor.force_start = true;
+    manager.submit_heal_request(successor.clone()).await.expect("admit successor");
+    let path = format!("root-heal-{}.json", successor.id);
+    let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("successor owner");
+    manager.cancel_task(&old.id).await.expect("repeat old STOP");
+    assert_eq!(
+        manager.get_task_status(&successor.id).await.expect("successor still pending"),
+        HealTaskStatus::Pending
+    );
+    assert_eq!(disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("same successor intent"), original);
+    drop(manager);
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("successor restart");
+    assert_eq!(
+        restarted
+            .get_task_status(&successor.id)
+            .await
+            .expect("successor survives restart"),
+        HealTaskStatus::Pending
+    );
+    assert_eq!(
+        serde_json::to_value(
+            restarted
+                .get_task_report(&old.id)
+                .await
+                .expect("old report")
+                .outcome
+                .as_deref()
+        )
+        .expect("restored"),
+        serde_json::to_value(cancelled.outcome.as_deref()).expect("original")
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_uncertain_terminal_publication_preserves_commit_and_pending_fence() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("original responsibility");
+    let completed = terminal_with_outcome(&request.heal_type, HealTaskStatus::Cancelled);
+    manager
+        .root_recovery
+        .fail_after_terminal_write
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .is_err()
+    );
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", request.id))
+            .await
+            .is_ok(),
+        "uncertain publication must not retire pending ownership"
+    );
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("commit marker fences stale pending");
+    assert_eq!(restarted.get_queue_length().await, 0);
+    let report = restarted
+        .get_task_report(&request.id)
+        .await
+        .expect("committed report survives uncertain response");
+    assert_eq!(
+        serde_json::to_value(report.outcome.as_deref()).expect("restored"),
+        serde_json::to_value(completed.outcome.as_deref()).expect("committed")
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_orphan_report_never_commits_or_retires_pending_work() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let mut completed = terminal_with_outcome(&request.heal_type, HealTaskStatus::Completed);
+    completed.completed_at = SystemTime::now() - KEEP_HEAL_TASK_STATUS_DURATION - Duration::from_secs(1);
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("report fixture");
+    let path = format!("terminal-root-heal-{}.json", request.id);
+    let marker = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("marker");
+    assert_eq!(
+        crate::heal::storage_api::owner::EcstoreDiskAPI::compare_and_update_file(
+            disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            &path,
+            Some(marker),
+            None
+        )
+        .await
+        .expect("simulate missing commit marker"),
+        crate::heal::storage_api::owner::EcstoreConditionalFileUpdate::Updated
+    );
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("original pending responsibility");
+    assert_eq!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("uncommitted report cannot mask pending")
+            .len(),
+        1
+    );
+    assert!(matches!(manager.get_task_report(&request.id).await, Err(Error::TaskNotFound { .. })));
+    let gc = manager
+        .root_recovery
+        .gc_terminal_receipts_once(SystemTime::now())
+        .await
+        .expect("orphan GC");
+    assert_eq!(gc.reports_removed, 1);
+    assert_eq!((gc.pending_removed, gc.terminals_removed), (0, 0));
+    assert_eq!(manager.root_recovery.pending().await.expect("pending survives GC").len(), 1);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn root_recovery_new_intent_skips_prepublication_read_only_owner() {
@@ -792,7 +1386,8 @@ async fn root_recovery_terminal_gc_is_delete_budget_bounded() {
         .gc_terminal_receipts_once(now)
         .await
         .expect("budgeted terminal GC");
-    assert_eq!(report.terminals_removed, 64);
+    assert_eq!(report.terminals_removed, 32);
+    assert_eq!(report.reports_removed, 32, "report deletion shares the 64-operation budget");
     assert!(report.budget_exhausted);
     let terminal_entries = disk
         .list_dir("", RUSTFS_META_BUCKET, "", -1)
@@ -801,7 +1396,7 @@ async fn root_recovery_terminal_gc_is_delete_budget_bounded() {
         .into_iter()
         .filter(|entry| entry.starts_with("terminal-root-heal-"))
         .count();
-    assert_eq!(terminal_entries, 1);
+    assert_eq!(terminal_entries, 33);
 }
 
 #[tokio::test]
