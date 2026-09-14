@@ -169,6 +169,14 @@ impl ProfileProvenance {
             build_features,
         }
     }
+
+    pub(crate) fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
+    }
+
+    pub(crate) fn build_features(&self) -> &[String] {
+        &self.build_features
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
