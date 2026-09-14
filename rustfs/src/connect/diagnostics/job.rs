@@ -34,15 +34,17 @@ use super::{
     DriveProvenance, LocalDriveConsent, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
     MAX_TOP_EXPORT_VALIDITY, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceError,
     NetworkPerformanceRequest, NetworkProvenance, NetworkReasonCode, PROFILE_SCHEMA_VERSION, ProfileCaptureRequest,
-    ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION, TopApiOperation,
-    TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api, capture_top_locks,
-    encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases, sign_drive_export,
-    sign_network_export, sign_top_export, sign_top_export_with_nonce,
+    ProfileOutcome, ProfileProvenance, THREAD_PROFILE_CAPABILITY, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY,
+    TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome,
+    capture_cpu_profile, capture_thread_profile, capture_top_api, capture_top_locks, encode_signed_profile_export, measure_drive,
+    measure_network, runtime_network_peer_aliases, sign_drive_export, sign_network_export, sign_top_export,
+    sign_top_export_with_nonce,
 };
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
+const PROFILE_THREADS_JOB_TYPE: &str = "profile.threads";
 const PERFORMANCE_DRIVE_JOB_TYPE: &str = "performance.drive";
 const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
@@ -69,6 +71,7 @@ const MIN_TOP_LOCKS_MEMORY_BYTES: u64 = 1_048_576;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
     ProfileCpu,
+    ProfileThreads,
     PerformanceDrive,
     PerformanceNetwork,
     TopApi,
@@ -459,6 +462,9 @@ impl DiagnosticJobEnvelope {
             (PROFILE_CPU_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == CPU_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileCpu)
             }
+            (PROFILE_THREADS_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == THREAD_PROFILE_CAPABILITY => {
+                Ok(DiagnosticJobKind::ProfileThreads)
+            }
             (PERFORMANCE_DRIVE_JOB_TYPE, [capability], DRIVE_SCHEMA_VERSION) if capability == DRIVE_CAPABILITY => {
                 Ok(DiagnosticJobKind::PerformanceDrive)
             }
@@ -493,6 +499,7 @@ pub async fn execute_diagnostic_job(
     let envelope = job.envelope;
     match envelope.kind()? {
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
+        DiagnosticJobKind::ProfileThreads => execute_profile_threads_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::PerformanceDrive => {
             let Some(scratch_root) = runtime_drive_scratch_root() else {
                 return Ok(failed_drive_execution(&envelope.job_id, "SOURCE_UNAVAILABLE"));
@@ -710,6 +717,68 @@ async fn execute_performance_network_job(
         job_id: envelope.job_id,
         outcome,
         reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+async fn execute_profile_threads_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = ProfileCaptureRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid.clone(),
+        schema_version: envelope.schema_version,
+        capability: THREAD_PROFILE_CAPABILITY.to_owned(),
+        consent: LocalProfileConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            confirmed: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        duration: Duration::from_millis(envelope.parameters.duration_millis),
+        sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
+        provenance,
+    };
+    let owned_request = request.clone();
+    let owned_cancel = cancel.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        capture_thread_profile(&owned_request, ThreadProfileScope::NativeThreads, &owned_cancel)
+    })
+    .await
+    .map_err(|_| DiagnosticJobError::CollectionFailed)?
+    .map_err(capture_failure)?;
+    if result.outcome() == ProfileOutcome::Unsupported {
+        return Ok(DiagnosticJobExecution {
+            job_id: envelope.job_id,
+            outcome: result.outcome().as_str().to_owned(),
+            reason: result.reason_code().as_str().to_owned(),
+            artifact_uid: None,
+            artifact_sha256: None,
+            artifact_bytes: None,
+        });
+    }
+    let export = encode_signed_profile_export(&request, &result, identity, cancel).map_err(export_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: result.outcome().as_str().to_owned(),
+        reason: result.reason_code().as_str().to_owned(),
         artifact_uid: Some(export.artifact_uid),
         artifact_sha256: Some(export.archive_sha256),
         artifact_bytes: Some(export.archive_bytes),
@@ -1059,6 +1128,60 @@ mod tests {
         signer
             .verify(&envelope, &target(&envelope), "2030-01-01T00:00:10Z".parse().expect("time"))
             .expect("valid job");
+    }
+
+    #[test]
+    fn accepts_only_the_thread_profile_capability_pair() {
+        let mut threads = envelope();
+        threads.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        threads.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+        let (threads, signer) = signed_envelope(threads);
+        signer
+            .verify(&threads, &target(&threads), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid profile.threads job");
+
+        let mut mismatched = threads;
+        mismatched.required_capabilities = vec![CPU_PROFILE_CAPABILITY.to_owned()];
+        assert_eq!(
+            signer.verify(&mismatched, &target(&mismatched), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Unsupported)
+        );
+    }
+
+    #[tokio::test]
+    async fn executes_thread_profile_jobs_against_the_service_process() {
+        let now = Utc::now();
+        let mut envelope = envelope();
+        envelope.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        envelope.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+        envelope.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        envelope.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        envelope.parameters.consent_expires_at =
+            (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let execution = execute_diagnostic_job(
+            VerifiedDiagnosticJob {
+                envelope,
+                nonce: [7_u8; 32],
+            },
+            &DeviceIdentity::generate(),
+            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("native thread profile job should execute");
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(execution.outcome, "SUCCEEDED");
+            assert_eq!(execution.reason, "COMPLETE");
+            assert!(execution.artifact_bytes.is_some_and(|bytes| !bytes.is_empty()));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(execution.outcome, "UNSUPPORTED");
+            assert_eq!(execution.reason, "UNSUPPORTED_PLATFORM");
+            assert!(execution.artifact_bytes.is_none());
+        }
     }
 
     #[test]
