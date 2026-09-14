@@ -1777,17 +1777,26 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn internode_rpc_telemetry_publishes_only_the_classified_outcome() {
+    async fn internode_rpc_telemetry_publishes_only_classified_completions() {
         let mut subscription = rustfs_common::trace_bus::subscribe_telemetry_trace_events();
 
-        super::emit_internode_rpc_telemetry(std::time::Instant::now(), StatusCode::FORBIDDEN);
+        super::emit_internode_rpc_telemetry(std::time::Instant::now() - Duration::from_micros(7), StatusCode::FORBIDDEN);
+        super::emit_internode_rpc_telemetry(std::time::Instant::now() - Duration::from_micros(11), StatusCode::OK);
 
-        let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        let error = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
             .await
             .expect("telemetry event should arrive")
             .expect("telemetry source should remain open");
-        assert_eq!(event.operation, rustfs_common::trace_bus::TelemetryTraceOperation::InternalRpc);
-        assert_eq!(event.status, rustfs_common::trace_bus::TelemetryTraceStatus::Error);
+        let success = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("telemetry event should arrive")
+            .expect("telemetry source should remain open");
+        assert_eq!(error.operation, rustfs_common::trace_bus::TelemetryTraceOperation::InternalRpc);
+        assert_eq!(error.status, rustfs_common::trace_bus::TelemetryTraceStatus::Error);
+        assert!(error.duration > Duration::ZERO);
+        assert_eq!(success.operation, rustfs_common::trace_bus::TelemetryTraceOperation::InternalRpc);
+        assert_eq!(success.status, rustfs_common::trace_bus::TelemetryTraceStatus::Ok);
+        assert!(success.duration > Duration::ZERO);
     }
 
     #[tokio::test]

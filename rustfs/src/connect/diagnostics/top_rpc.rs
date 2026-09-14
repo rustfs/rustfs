@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Honest `top.rpc` capability result.
+//! Bounded `top.rpc` aggregation over pre-classified internode HTTP RPC completions.
 
+use std::time::Duration;
+
+use rustfs_common::trace_bus::{TelemetryTraceOperation, TelemetryTraceStatus, subscribe_telemetry_trace_events};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use super::top_api::{TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
+use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
 
 const TOOL_ID: &str = "top.rpc";
+pub const TOP_RPC_CAPABILITY: &str = "top.rpc@1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,9 +42,68 @@ pub async fn capture_top_rpc(
     if cancel.is_cancelled() {
         return request.cancelled(TOOL_ID);
     }
+    let Some(_permit) = request.acquire(cancel).await? else {
+        return request.cancelled(TOOL_ID);
+    };
+    // The typed source is emitted only after an internode HTTP response has a
+    // final status. Tonic streams need a separate body-completion boundary.
+    let mut subscription = subscribe_telemetry_trace_events();
+    let started = tokio::time::Instant::now();
+    let deadline = started + request.window;
+    let mut request_count = 0_u64;
+    let mut error_count = 0_u64;
+    let mut total_duration_micros = 0_u64;
 
-    // Internode metrics expose traffic, dial failures, and average dial time.
-    // They do not expose one matching RPC request/error/duration cohort, so v1
-    // cannot be produced without mixing unrelated counters.
-    request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool)
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return request.cancelled(TOOL_ID),
+            () = tokio::time::sleep_until(deadline) => break,
+            received = subscription.recv() => match received {
+                Ok(event) if event.operation == TelemetryTraceOperation::InternalRpc => {
+                    if request_count >= u64::from(request.limits.max_operations)
+                        || request_count >= u64::from(request.limits.max_records)
+                    {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::LimitExceeded);
+                    }
+                    let Ok(duration_micros) = u64::try_from(event.duration.as_micros()) else {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+                    };
+                    let Some(next_duration) = total_duration_micros.checked_add(duration_micros) else {
+                        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+                    };
+                    request_count += 1;
+                    error_count += u64::from(event.status == TelemetryTraceStatus::Error);
+                    total_duration_micros = next_duration;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::LimitExceeded);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::SourceUnavailable);
+                }
+            }
+        }
+    }
+
+    request.validate_scope(TOOL_ID)?;
+    if request_count > MAX_SAFE_INTEGER || error_count > MAX_SAFE_INTEGER || total_duration_micros > MAX_SAFE_INTEGER {
+        return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
+    }
+    let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
+    request.succeeded(
+        TOOL_ID,
+        window_millis,
+        TopRpcData {
+            request_count,
+            error_count,
+            window_millis,
+            total_duration_micros,
+        },
+    )
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1)
 }

@@ -15,10 +15,11 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
-        ConnectEnvironmentInventoryOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts,
-        ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
-        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts,
-        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectEnvironmentInventoryOpts, ConnectInspectObjectOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts,
+        ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts,
+        ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts,
+        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
+        ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -151,6 +152,7 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
+        CommandResult::ConnectInspect(options) => return execute_connect_inspect(options).await,
         CommandResult::Server(config) => config,
     };
 
@@ -176,6 +178,101 @@ async fn async_main() -> Result<()> {
                 "Server runtime failed"
             );
             Err(e)
+        }
+    }
+}
+
+async fn execute_connect_inspect(options: ConnectInspectObjectOpts) -> Result<()> {
+    use crate::connect::IdentityStore;
+    use crate::connect::diagnostics::{
+        InspectArtifactConsent, InspectProvenance, InspectRequest, InspectRule, InspectRun, export_inspect_summary,
+        save_signed_inspect_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let identity = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect inspect requires an enrolled device identity"))?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = InspectRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: InspectArtifactConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        drive_roots: options.paths,
+        bucket: options.bucket,
+        object: options.object,
+        version_id: options.version_id,
+        rules: vec![
+            InspectRule::ShardBitrot,
+            InspectRule::ShardAvailability,
+            InspectRule::MetadataIdentity,
+        ],
+        max_duration: Duration::from_millis(options.duration_millis),
+        max_read_bytes: options.max_read_bytes,
+        max_memory_bytes: options.max_memory_bytes,
+        provenance: InspectProvenance::new(
+            crate::version::build::COMMIT_HASH.to_string(),
+            hash_current_executable()?,
+            env!("CARGO_PKG_VERSION").to_string(),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker_request = request.clone();
+    let mut worker = tokio::task::spawn_blocking(move || export_inspect_summary(&worker_request, &identity, &worker_cancel));
+    let run = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            worker.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut worker => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    match run {
+        InspectRun::Terminal(result) => {
+            println!("result={}", serde_json::to_string(&result).map_err(Error::other)?);
+            Err(Error::other("inspect collection did not produce an artifact"))
+        }
+        InspectRun::Signed(export) => {
+            let output = options.output;
+            let writer_cancel = cancel.clone();
+            let mut writer = tokio::task::spawn_blocking(move || save_signed_inspect_export(&output, &export, &writer_cancel));
+            let receipt = tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    writer.await.map_err(Error::other)?.map_err(Error::other)?
+                }
+                result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+            };
+            println!(
+                "artifact={} bytes={} sha256={}",
+                receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+            );
+            println!("upload=not-performed");
+            Ok(())
         }
     }
 }
@@ -1236,7 +1333,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                     if options.thread_scope.is_some() {
                         return Err(Error::other("--thread-scope is valid only for the threads profile"));
                     }
-                    export_cpu_profile(&request, &key, &cancel).map_err(Error::other)
+                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
                 }
                 ConnectProfileTool::Memory => {
                     if options.thread_scope.is_some() {
@@ -1250,7 +1347,9 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                         Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
                         None => return Err(Error::other("--thread-scope is required for the threads profile")),
                     };
-                    export_thread_profile(&request, scope, &key, &cancel).map_err(Error::other)
+                    export_thread_profile(&request, scope, &key, &cancel)
+                        .await
+                        .map_err(Error::other)
                 }
             }
         };

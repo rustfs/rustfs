@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::fs;
+use std::io::Write as _;
 use std::io::{Cursor, Read as _};
+use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -26,7 +28,7 @@ use p256::pkcs8::DecodePublicKey as _;
 use rustfs::connect::DeviceIdentity;
 use rustfs::connect::diagnostics::{
     LocalTopConsent, NetworkCounterSnapshot, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, TopReasonCode,
-    evaluate_network_window, save_signed_top_export, sign_top_export,
+    capture_top_net, evaluate_network_window, save_signed_top_export, sign_top_export,
 };
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
@@ -106,6 +108,48 @@ fn top_network_uses_exact_counter_deltas_and_fails_closed_on_reset() {
     assert!(reset.data.is_none());
 }
 
+#[tokio::test]
+async fn top_network_capture_observes_real_loopback_traffic() {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return;
+    }
+
+    let mut request = request();
+    request.window = Duration::from_millis(500);
+    let traffic = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        generate_loopback_traffic().expect("generate loopback traffic");
+    });
+
+    let result = capture_top_net(&request, &CancellationToken::new())
+        .await
+        .expect("capture host network traffic");
+    traffic.join().expect("traffic thread");
+
+    assert_eq!(result.outcome, TopOutcome::Succeeded);
+    let data = result.data.expect("network data");
+    assert!(data.received_bytes > 0, "real loopback traffic must increase received bytes");
+    assert!(data.sent_bytes > 0, "real loopback traffic must increase sent bytes");
+}
+
+fn generate_loopback_traffic() -> std::io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received)?;
+        if received.len() != 256 * 1024 {
+            return Err(std::io::Error::other("loopback payload was truncated"));
+        }
+        Ok(())
+    });
+    let mut client = TcpStream::connect(address)?;
+    client.write_all(&vec![0x5a; 256 * 1024])?;
+    client.shutdown(Shutdown::Write)?;
+    server.join().map_err(|_| std::io::Error::other("loopback server panicked"))?
+}
+
 #[test]
 fn top_network_export_is_bounded_redacted_and_signed_over_exact_envelope_bytes() {
     let request = request();
@@ -144,6 +188,7 @@ fn top_network_export_is_bounded_redacted_and_signed_over_exact_envelope_bytes()
     let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("envelope");
     assert_eq!(envelope["toolId"], "top.net");
     assert_eq!(envelope["classification"], "L3");
+    assert_eq!(envelope["producedAt"].as_str().expect("producedAt").len(), 20);
     assert_eq!(envelope["payload"]["path"], "result.json");
     assert_eq!(envelope["payload"]["sha256"], export.result_sha256);
     let result_text = String::from_utf8_lossy(&export.result_json);
@@ -291,7 +336,7 @@ fn local_top_export_is_private_no_clobber_cancel_safe_and_rejects_forged_artifac
 }
 
 #[test]
-fn production_cli_exports_top_net_and_fails_closed_for_unsupported_and_invalid_runs() {
+fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
     let directory = tempfile::tempdir().expect("CLI directory");
     let state = directory.path().join("state");
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
@@ -343,7 +388,17 @@ fn production_cli_exports_top_net_and_fails_closed_for_unsupported_and_invalid_r
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
 
-    for (index, tool) in ["api", "locks", "rpc"].into_iter().enumerate() {
+    let locks_output = directory.path().join("locks.zip");
+    let locks = top_command("locks", &state, &locks_output, "019e3ae0-0000-7000-8000-000000000031", 1, true)
+        .output()
+        .expect("run top.locks outside the server process");
+    assert!(!locks.status.success());
+    let stdout = String::from_utf8(locks.stdout).expect("UTF-8 stdout");
+    assert!(stdout.contains(r#""outcome":"FAILED""#));
+    assert!(stdout.contains(r#""reasonCode":"SOURCE_UNAVAILABLE""#));
+    assert!(!locks_output.exists());
+
+    for (index, tool) in ["api", "rpc"].into_iter().enumerate() {
         let output = directory.path().join(format!("{tool}.zip"));
         let artifact_uid = format!("019e3ae0-0000-7000-8000-00000000003{}", index + 1);
         let run = top_command(tool, &state, &output, &artifact_uid, 1, true)

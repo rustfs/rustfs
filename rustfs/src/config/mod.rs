@@ -56,6 +56,7 @@ pub use cli::{
     ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,
 };
 pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
+pub use cli::{ConnectInspectCommands, ConnectInspectObjectOpts, ConnectInspectOpts};
 pub use cli::{
     ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseRelayExportOpts, ConnectLicenseRelayImportOpts,
     ConnectLicenseRenewOpts, ConnectLicenseScopeOpts,
