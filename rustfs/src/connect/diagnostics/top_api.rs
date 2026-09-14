@@ -455,6 +455,26 @@ pub fn sign_top_export<T: Serialize>(
     identity: &DeviceIdentity,
     cancel: &CancellationToken,
 ) -> Result<SignedTopExport, TopCaptureError> {
+    sign_top_export_inner(request, result, identity, cancel, None)
+}
+
+pub(crate) fn sign_top_export_with_nonce<T: Serialize>(
+    request: &TopCaptureRequest,
+    result: &TopResult<T>,
+    identity: &DeviceIdentity,
+    cancel: &CancellationToken,
+    nonce: [u8; 32],
+) -> Result<SignedTopExport, TopCaptureError> {
+    sign_top_export_inner(request, result, identity, cancel, Some(nonce))
+}
+
+fn sign_top_export_inner<T: Serialize>(
+    request: &TopCaptureRequest,
+    result: &TopResult<T>,
+    identity: &DeviceIdentity,
+    cancel: &CancellationToken,
+    supplied_nonce: Option<[u8; 32]>,
+) -> Result<SignedTopExport, TopCaptureError> {
     if !matches!(result.tool_id, "top.api" | "top.disk" | "top.locks" | "top.net" | "top.rpc") {
         return Err(TopCaptureError::Result);
     }
@@ -495,8 +515,13 @@ pub fn sign_top_export<T: Serialize>(
         return Err(TopCaptureError::Expired);
     }
 
-    let mut nonce = [0u8; 32];
-    SysRng.try_fill_bytes(&mut nonce).map_err(|_| TopCaptureError::Random)?;
+    let nonce = if let Some(nonce) = supplied_nonce {
+        nonce
+    } else {
+        let mut nonce = [0u8; 32];
+        SysRng.try_fill_bytes(&mut nonce).map_err(|_| TopCaptureError::Random)?;
+        nonce
+    };
     let device_key_id = hex_lower(&Sha256::digest(identity.public_key_der()));
     let envelope = DiagnosticEnvelope {
         format_version: ENVELOPE_FORMAT,
@@ -1046,7 +1071,7 @@ mod tests {
 
         let result = capture.await.expect("capture task").expect("top.api result");
         assert_eq!(result.outcome, TopOutcome::Succeeded);
-        let data = result.data.expect("successful capture data");
+        let data = result.data.as_ref().expect("successful capture data");
         assert_eq!(data.operation, TopApiOperation::GetObject);
         assert_eq!(data.request_count, 2);
         assert_eq!(data.error_count, 1);
@@ -1062,6 +1087,11 @@ mod tests {
                 "windowMillis"
             ]
         );
+        let nonce = [7_u8; 32];
+        let export = sign_top_export_with_nonce(&request, &result, &DeviceIdentity::generate(), &CancellationToken::new(), nonce)
+            .expect("signed top.api export");
+        let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("diagnostic envelope");
+        assert_eq!(envelope["nonce"], URL_SAFE_NO_PAD.encode_to_string(nonce));
     }
 
     #[tokio::test]
