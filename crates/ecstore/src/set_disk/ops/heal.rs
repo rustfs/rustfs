@@ -5591,7 +5591,8 @@ mod heal_result_report_tests {
             )
             .await;
         assert!(
-            matches!(&resurrected, Err(Error::FileVersionNotFound) | Err(Error::ObjectNotFound(..))),
+            matches!(&resurrected, Err(Error::VersionNotFound(b, o, v))
+                if b == bucket && o == object && v == &first_version),
             "a racing heal must not resurrect the deleted version: {resurrected:?}"
         );
 

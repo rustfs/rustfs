@@ -11528,6 +11528,76 @@ mod tests {
     }
 
     #[test]
+    fn test_object_quorum_from_meta_preserves_version_not_found() {
+        for errs in [
+            vec![Some(DiskError::FileVersionNotFound); 4],
+            vec![
+                Some(DiskError::FileVersionNotFound),
+                Some(DiskError::FileNotFound),
+                Some(DiskError::FileVersionNotFound),
+                Some(DiskError::FileNotFound),
+            ],
+            vec![
+                Some(DiskError::FileVersionNotFound),
+                Some(DiskError::VolumeNotFound),
+                Some(DiskError::DiskNotFound),
+                Some(DiskError::FileVersionNotFound),
+            ],
+        ] {
+            let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+                .expect_err("absent version metadata must remain a version miss");
+            assert_eq!(err, DiskError::FileVersionNotFound, "disk replies: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_version_misses_preserve_other_failures() {
+        for (errs, expected) in [
+            (vec![Some(DiskError::DiskNotFound); 4], DiskError::ErasureReadQuorum),
+            (
+                vec![
+                    Some(DiskError::FileVersionNotFound),
+                    Some(DiskError::FileCorrupt),
+                    Some(DiskError::DiskNotFound),
+                    None,
+                ],
+                DiskError::ErasureReadQuorum,
+            ),
+            (
+                vec![
+                    Some(DiskError::FileVersionNotFound),
+                    Some(DiskError::FileAccessDenied),
+                    Some(DiskError::FileAccessDenied),
+                    Some(DiskError::DiskNotFound),
+                ],
+                DiskError::FileAccessDenied,
+            ),
+            (
+                vec![
+                    Some(DiskError::FileVersionNotFound),
+                    Some(DiskError::VolumeNotFound),
+                    Some(DiskError::VolumeNotFound),
+                    None,
+                ],
+                DiskError::VolumeNotFound,
+            ),
+            (
+                vec![
+                    Some(DiskError::FileVersionNotFound),
+                    Some(DiskError::FileVersionNotFound),
+                    Some(DiskError::FileCorrupt),
+                    None,
+                ],
+                DiskError::FileVersionNotFound,
+            ),
+        ] {
+            let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+                .expect_err("metadata failures must retain quorum reduction semantics");
+            assert_eq!(err, expected, "disk replies: {errs:?}");
+        }
+    }
+
+    #[test]
     fn test_object_quorum_from_meta_preserves_read_quorum_for_mixed_failures() {
         let errs = vec![
             Some(DiskError::FileNotFound),
