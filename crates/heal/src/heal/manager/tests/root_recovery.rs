@@ -364,7 +364,7 @@ async fn root_recovery_cancelled_worker_publishes_durable_refinement_or_keeps_pr
             matches!(failure_mode, 1 | 3).then(|| RestoreDirectoryMode::read_only(temp.path().join(RUSTFS_META_BUCKET)));
         if failure_mode == 3 {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(temp.path().join(RUSTFS_META_BUCKET), std::fs::Permissions::from_mode(0))
+            std::fs::set_permissions(temp.path().join(RUSTFS_META_BUCKET), std::fs::Permissions::from_mode(0o0))
                 .expect("make the report owner unreadable as well as unwritable");
         }
         manager
