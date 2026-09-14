@@ -201,7 +201,7 @@ fn original_source(path: &Path, bundle_uid: &str) -> Result<UploadSource, Report
 }
 
 fn read_member(archive: &mut ZipArchive<File>, name: &str, maximum: u64) -> Result<Vec<u8>, ReportBundleError> {
-    let mut entry = archive.by_name(name)?;
+    let entry = archive.by_name(name)?;
     let size = entry.size();
     if size == 0 || size > maximum || !entry.is_file() {
         return Err(ReportBundleError::Invalid);
@@ -487,7 +487,7 @@ mod tests {
             let run_uid = Uuid::now_v7().to_string();
             let result = serde_json::to_vec(&json!({
                 "schemaVersion": 1,
-                "runUid": run_uid.clone(),
+                "runUid": run_uid,
                 "toolId": "top.net",
                 "capability": "top.net@1",
                 "outcome": "SUCCEEDED",
@@ -524,8 +524,8 @@ mod tests {
                 "policyRevision": 1,
                 "producedAt": now.format(&Rfc3339).expect("producedAt"),
                 "expiresAt": (now + validity).format(&Rfc3339).expect("expiresAt"),
-                "nonce": nonce.clone(),
-                "deviceKeyId": key_id.clone(),
+                "nonce": nonce,
+                "deviceKeyId": key_id,
                 "payload": {
                     "path": "result.json",
                     "mediaType": "application/json",

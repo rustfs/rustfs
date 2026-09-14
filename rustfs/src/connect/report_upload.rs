@@ -241,6 +241,7 @@ struct PreparedArchive {
     checksum_base64: String,
 }
 
+#[cfg(test)]
 async fn prepare_archive(path: &Path, cancellation: &CancellationToken) -> Result<PreparedArchive, ReportUploadError> {
     let file = File::open(path).await.map_err(ReportUploadError::ArchiveOpen)?;
     prepare_file(file, cancellation).await

@@ -395,6 +395,17 @@ impl ProfileResult {
         }
     }
 
+    #[cfg(all(
+        feature = "pyroscope",
+        any(
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     fn partial(request: &ProfileCaptureRequest, tool: ProfileTool, duration: Duration, data: ProfileData) -> Self {
         Self {
             schema_version: PROFILE_SCHEMA_VERSION,
@@ -514,7 +525,7 @@ pub async fn capture_cpu_profile(
         } else {
             ProfileResult::partial(request, ProfileTool::Cpu, elapsed, ProfileData::Cpu(data))
         };
-        return Ok(outcome);
+        Ok(outcome)
     }
 
     #[cfg(not(all(

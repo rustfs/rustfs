@@ -110,7 +110,7 @@ pub enum Commands {
     /// Offline, read-only inspection of on-disk data (no server required)
     Inspect(InspectOpts),
     /// Configure outbound RustFS Connect integration
-    Connect(ConnectOpts),
+    Connect(Box<ConnectOpts>),
 }
 
 /// RustFS Connect subcommand options
