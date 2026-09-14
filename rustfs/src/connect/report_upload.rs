@@ -241,6 +241,7 @@ struct PreparedArchive {
     checksum_base64: String,
 }
 
+#[cfg(test)]
 async fn prepare_archive(path: &Path, cancellation: &CancellationToken) -> Result<PreparedArchive, ReportUploadError> {
     let file = File::open(path).await.map_err(ReportUploadError::ArchiveOpen)?;
     prepare_file(file, cancellation).await
@@ -285,7 +286,7 @@ async fn prepare_file(mut file: File, cancellation: &CancellationToken) -> Resul
         file,
         size,
         sha256: faster_hex::hex_string(&digest),
-        checksum_base64: base64_simd::STANDARD.encode_to_string(&digest),
+        checksum_base64: base64_simd::STANDARD.encode_to_string(digest),
     })
 }
 
@@ -620,7 +621,7 @@ mod tests {
         assert_eq!(archive.size, 23);
         let digest = Sha256::digest(b"redacted support bundle");
         assert_eq!(archive.sha256, faster_hex::hex_string(&digest));
-        assert_eq!(archive.checksum_base64, base64_simd::STANDARD.encode_to_string(&digest));
+        assert_eq!(archive.checksum_base64, base64_simd::STANDARD.encode_to_string(digest));
     }
 
     #[tokio::test]

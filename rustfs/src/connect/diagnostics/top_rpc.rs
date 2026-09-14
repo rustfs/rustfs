@@ -91,6 +91,9 @@ pub async fn capture_top_rpc(
     if request_count > MAX_SAFE_INTEGER || error_count > MAX_SAFE_INTEGER || total_duration_micros > MAX_SAFE_INTEGER {
         return request.failed(TOOL_ID, elapsed_millis(started.elapsed()), TopReasonCode::CollectionFailed);
     }
+    if request_count == 0 {
+        return request.unsupported(TOOL_ID, TopReasonCode::UnsupportedTool);
+    }
     let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
     request.succeeded(
         TOOL_ID,
