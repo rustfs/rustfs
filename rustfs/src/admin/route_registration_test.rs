@@ -439,6 +439,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -636,6 +641,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),

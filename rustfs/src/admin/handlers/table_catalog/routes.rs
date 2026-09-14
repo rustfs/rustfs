@@ -50,6 +50,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&CANCEL_TABLE_CATALOG_MIGRATION_HANDLER),
     )?;
     r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/warehouse-index/backfill").as_str(),
+        AdminOperation(&BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER),
+    )?;
+    r.insert(
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces").as_str(),
         AdminOperation(&LIST_NAMESPACES_HANDLER),
