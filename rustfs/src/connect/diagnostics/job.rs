@@ -210,12 +210,18 @@ pub struct VerifiedDiagnosticJob {
     nonce: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+impl VerifiedDiagnosticJob {
+    pub fn job_id(&self) -> &str {
+        &self.envelope.job_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiagnosticJobExecution {
     pub job_id: String,
-    pub outcome: &'static str,
-    pub reason: &'static str,
+    pub outcome: String,
+    pub reason: String,
     pub artifact_uid: Option<String>,
     pub artifact_sha256: Option<String>,
     pub artifact_bytes: Option<Vec<u8>>,
@@ -245,6 +251,24 @@ pub enum DiagnosticJobError {
     Cancelled,
     #[error("connect_diagnostic_job_collection_failed")]
     CollectionFailed,
+}
+
+impl DiagnosticJobError {
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Invalid => "INVALID",
+            Self::TargetMismatch => "TARGET_MISMATCH",
+            Self::Expired => "EXPIRED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::LimitExceeded => "LIMIT_EXCEEDED",
+            Self::TrustInvalid => "TRUST_INVALID",
+            Self::SignerUntrusted => "SIGNER_UNTRUSTED",
+            Self::SignatureInvalid => "SIGNATURE_INVALID",
+            Self::Encoding => "ENCODING_FAILED",
+            Self::Cancelled => "CANCELLED",
+            Self::CollectionFailed => "COLLECTION_FAILED",
+        }
+    }
 }
 
 impl DiagnosticJobEnvelope {
@@ -379,8 +403,8 @@ pub async fn execute_diagnostic_job(
     let reason = result.reason_code().as_str();
     Ok(DiagnosticJobExecution {
         job_id: envelope.job_id,
-        outcome,
-        reason,
+        outcome: outcome.to_owned(),
+        reason: reason.to_owned(),
         artifact_uid: Some(export.artifact_uid),
         artifact_sha256: Some(export.archive_sha256),
         artifact_bytes: Some(export.archive_bytes),
