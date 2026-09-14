@@ -37,7 +37,7 @@ use super::{
     ProfileProvenance, TOP_API_CAPABILITY, TOP_CLASSIFICATION, TOP_LOCKS_CAPABILITY, TOP_SCHEMA_VERSION, TopApiOperation,
     TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, capture_cpu_profile, capture_top_api, capture_top_locks,
     encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases, sign_drive_export,
-    sign_network_export, sign_top_export,
+    sign_network_export, sign_top_export, sign_top_export_with_nonce,
 };
 use crate::connect::DeviceIdentity;
 
@@ -505,7 +505,7 @@ pub async fn execute_diagnostic_job(
         DiagnosticJobKind::PerformanceNetwork => {
             execute_performance_network_job(envelope, nonce, identity, provenance, cancel).await
         }
-        DiagnosticJobKind::TopApi => execute_top_api_job(envelope, identity, provenance, cancel).await,
+        DiagnosticJobKind::TopApi => execute_top_api_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
     }
 }
@@ -765,6 +765,7 @@ async fn execute_profile_cpu_job(
 
 async fn execute_top_api_job(
     envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
     identity: &DeviceIdentity,
     provenance: ProfileProvenance,
     cancel: &CancellationToken,
@@ -814,7 +815,7 @@ async fn execute_top_api_job(
             artifact_bytes: None,
         });
     }
-    let export = sign_top_export(&request, &result, identity, cancel).map_err(top_export_failure)?;
+    let export = sign_top_export_with_nonce(&request, &result, identity, cancel, nonce).map_err(top_export_failure)?;
     if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
         return Err(DiagnosticJobError::LimitExceeded);
     }

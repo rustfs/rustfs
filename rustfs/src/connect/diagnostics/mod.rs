@@ -135,6 +135,7 @@ pub use schedule::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
 };
+pub(crate) use top_api::sign_top_export_with_nonce;
 pub use top_api::{
     LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, SavedTopExport, SignedTopExport, TOP_API_CAPABILITY,
     TOP_CLASSIFICATION, TOP_SCHEMA_VERSION, TopApiData, TopApiOperation, TopCaptureError, TopCaptureLimits, TopCaptureRequest,
