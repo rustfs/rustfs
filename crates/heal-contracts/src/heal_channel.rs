@@ -383,6 +383,16 @@ pub struct HealChannelRequest {
     pub source: HealRequestSource,
 }
 
+impl HealChannelRequest {
+    /// Create a request with a stable identity before publishing it.
+    pub fn new() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Heal response from ahm to admin
 #[derive(Debug, Clone)]
 pub struct HealChannelResponse {

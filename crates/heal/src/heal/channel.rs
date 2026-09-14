@@ -344,11 +344,14 @@ impl HealChannelProcessor {
     /// Process start request
     async fn process_start_request(
         &self,
-        request: HealChannelRequest,
+        mut request: HealChannelRequest,
         preserve_alias: bool,
         publish_canonical_id: bool,
         response_tx: oneshot::Sender<std::result::Result<HealAdmissionReceipt, String>>,
     ) -> Result<()> {
+        if request.id.is_empty() {
+            request.id = uuid::Uuid::new_v4().to_string();
+        }
         debug!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_REQUEST,
@@ -1788,6 +1791,145 @@ mod tests {
             .expect("receipt processor should stop when channels close")
             .expect("receipt processor task should join")
             .expect("receipt processor should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn heal_empty_request_ids_keep_scanner_objects_independent() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager.clone());
+        let request = HealChannelRequest {
+            bucket: "scanner-bucket".to_string(),
+            object_prefix: Some("first".to_string()),
+            source: HealRequestSource::Scanner,
+            priority: HealChannelPriority::Normal,
+            ..Default::default()
+        };
+        let mut other = request.clone();
+        other.object_prefix = Some("second".to_string());
+        let (first, second) =
+            tokio::join!(processor.execute_start_request(request.clone()), processor.execute_start_request(other),);
+        let first = first.expect("first scanner object should be admitted");
+        let second = second.expect("second scanner object should be admitted");
+        assert_eq!(first.result, HealAdmissionResult::Accepted);
+        assert_eq!(second.result, HealAdmissionResult::Accepted);
+        assert!(!first.task_id.is_empty());
+        assert!(!second.task_id.is_empty());
+        assert_ne!(first.task_id, second.task_id);
+        let mut published_ids = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let response = processor
+                .response_receiver
+                .try_recv()
+                .expect("admission should publish its response");
+            assert!(response.success);
+            published_ids.insert(response.request_id);
+        }
+        assert_eq!(
+            published_ids,
+            std::collections::HashSet::from([first.task_id.clone(), second.task_id.clone()])
+        );
+
+        let merged = processor
+            .execute_start_request(request.clone())
+            .await
+            .expect("a repeated object should retain its canonical owner");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, first.task_id);
+        let mut conflict = request;
+        conflict.id = first.task_id.clone();
+        conflict.object_prefix = Some("conflicting-object".to_string());
+        let conflict = processor
+            .execute_start_request(conflict)
+            .await
+            .expect("conflicting ID should get a receipt");
+        assert_eq!(conflict.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+        assert_eq!(conflict.task_id, first.task_id);
+        for id in [&first.task_id, &second.task_id] {
+            let status = processor
+                .execute_query_request(String::new(), id.clone())
+                .await
+                .expect("generated token should be queryable");
+            assert!(status.success);
+            assert_eq!(status.request_id, *id);
+        }
+        let cancelled = processor
+            .execute_cancel_request(String::new(), first.task_id.clone())
+            .await
+            .expect("generated token should cancel its own request");
+        assert!(cancelled.success);
+        assert!(matches!(manager.get_task_status(&first.task_id).await, Err(Error::TaskNotFound { .. })));
+        assert_eq!(
+            manager
+                .get_task_status(&second.task_id)
+                .await
+                .expect("other object must retain its queued owner"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_empty_request_ids_legacy_response_matches_admitted_task() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager.clone());
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_command(HealChannelCommand::Start {
+                request: HealChannelRequest {
+                    bucket: "bucket".to_string(),
+                    object_prefix: Some("object".to_string()),
+                    source: HealRequestSource::Scanner,
+                    ..Default::default()
+                },
+                response_tx: tx,
+            })
+            .await
+            .expect("legacy start should be processed");
+        assert_eq!(
+            rx.await.expect("start response should arrive").expect("start should succeed"),
+            HealAdmissionResult::Accepted
+        );
+        let response = processor
+            .response_receiver
+            .try_recv()
+            .expect("legacy response should be published");
+        assert!(response.success);
+        assert!(!response.request_id.is_empty());
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket/object", &response.request_id)
+                .await
+                .expect("published ID must resolve to the admitted object"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_empty_request_ids_are_normalized_at_manager_admission() {
+        let manager = create_test_heal_manager();
+        let mut first = HealRequest::object("bucket".to_string(), "first".to_string(), None);
+        first.id.clear();
+        let mut second = HealRequest::object("bucket".to_string(), "second".to_string(), None);
+        second.id.clear();
+        let (first, second) = tokio::join!(
+            manager.submit_heal_request_with_receipt(first),
+            manager.submit_heal_request_with_receipt(second),
+        );
+        let first = first.expect("first direct request should be admitted");
+        let second = second.expect("second direct request should be admitted");
+        assert_eq!(first.result, HealAdmissionResult::Accepted);
+        assert_eq!(second.result, HealAdmissionResult::Accepted);
+        assert!(!first.task_id.is_empty());
+        assert!(!second.task_id.is_empty());
+        assert_ne!(first.task_id, second.task_id);
+        for id in [&first.task_id, &second.task_id] {
+            assert_eq!(
+                manager
+                    .get_task_status(id)
+                    .await
+                    .expect("canonical owner should be queryable"),
+                HealTaskStatus::Pending
+            );
+        }
     }
 
     #[tokio::test]

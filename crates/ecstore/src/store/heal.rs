@@ -319,6 +319,24 @@ impl ECStore {
         }
     }
 
+    /// Whether a replacement set owns this pool's `pool.bin` replica.
+    /// Placement is determined by the same hash as metadata writes, never by
+    /// whether a shard is currently readable on the replacement disk.
+    pub fn replacement_pool_metadata_required(&self, pool_index: usize, set_index: usize) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let target_set = pool.get_disks_for_heal_object(
+            POOL_META_NAME,
+            &HealOpts {
+                set: Some(set_index),
+                ..Default::default()
+            },
+        )?;
+        Ok(Arc::ptr_eq(&target_set, &pool.get_disks_by_key(POOL_META_NAME)))
+    }
+
     /// Return every live erasure set selected by an object-heal scope.
     pub async fn heal_erasure_set_scopes(&self, opts: &HealOpts) -> Result<Vec<(usize, usize)>> {
         let pools = self.get_pools_for_heal_object(opts)?;

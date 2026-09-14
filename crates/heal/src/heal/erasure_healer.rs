@@ -1032,6 +1032,12 @@ impl ErasureSetHealer {
             });
         }
 
+        // pool.bin is stored in one hashed set per pool. Requiring it on any
+        // other replacement set would retry a healthy absence forever.
+        if !self.storage.replacement_pool_metadata_required(&self.heal_opts)? {
+            return Ok(());
+        }
+
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
         let checkpoint = checkpoint_manager.get_checkpoint().await;
@@ -2203,6 +2209,7 @@ mod resume_loop_tests {
         Ok,
         /// The version vanished before heal ran (deleted mid-heal).
         VersionNotFound,
+        FileNotFound,
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
@@ -2237,6 +2244,7 @@ mod resume_loop_tests {
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
+        pool_metadata_placement: Mutex<Option<ReplacementCommitEvidence>>,
         fail_listing: AtomicBool,
         fail_listing_buckets: Mutex<HashSet<String>>,
     }
@@ -2408,6 +2416,7 @@ mod resume_loop_tests {
             let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
             match outcome {
                 HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
+                HealOutcome::FileNotFound => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileNotFound)))),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2423,6 +2432,13 @@ mod resume_loop_tests {
                 return Err(Error::other("injected format failure"));
             }
             Ok((HealResultItem::default(), None))
+        }
+        fn replacement_pool_metadata_required(&self, _opts: &HealOpts) -> Result<bool> {
+            match self.pool_metadata_placement.lock().unwrap().as_ref() {
+                Some(ReplacementCommitEvidence::Confirmed(required)) => Ok(*required),
+                Some(ReplacementCommitEvidence::Error(message)) => Err(Error::other(message.clone())),
+                None => Ok(true),
+            }
         }
         async fn replacement_targets_have_version(
             &self,
@@ -3035,6 +3051,93 @@ mod resume_loop_tests {
         assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
         assert_eq!(state.retry_count, 1);
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_placement_controls_completion() {
+        // Exercise both replacement intents and the admin/directory-backed path.
+        for automatic in [false, true] {
+            for placement in [Ok(false), Ok(true), Err("placement unavailable")] {
+                let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+                *env.storage.pool_metadata_placement.lock().unwrap() = Some(match placement {
+                    Ok(required) => ReplacementCommitEvidence::Confirmed(required),
+                    Err(message) => ReplacementCommitEvidence::Error(message.to_string()),
+                });
+                // An absent pool.bin is healthy only when another set owns it.
+                env.storage.set_outcome(POOL_META_NAME, None, HealOutcome::FileNotFound);
+                let task_id = ResumeUtils::generate_task_id();
+                if automatic {
+                    ResumeManager::new_replacement_intent(
+                        env.healer.disk.clone(),
+                        task_id.clone(),
+                        "pool_0_set_0".to_string(),
+                        vec![],
+                        vec!["replacement-a".to_string()],
+                        vec![crate::heal::resume::ReplacementTargetIdentity {
+                            endpoint: "replacement-a".to_string(),
+                            canonical_path: "/mnt/replacement-a".to_string(),
+                            physical_device_ids: vec!["device-a".to_string()],
+                            filesystem_identity: "1:2:3".to_string(),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                }
+                let healer = ErasureSetHealer::new(
+                    env.storage.clone(),
+                    Arc::new(RwLock::new(HealProgress::new())),
+                    CancellationToken::new(),
+                    env.healer.disk.clone(),
+                    HealOpts {
+                        recreate: true,
+                        pool: Some(0),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                    if automatic {
+                        HealRequestSource::AutoHeal
+                    } else {
+                        HealRequestSource::Admin
+                    },
+                )
+                .with_replacement_targets(vec!["replacement-a".to_string()], automatic.then(|| task_id.clone()));
+                let result = if automatic {
+                    healer.heal_erasure_set(&[], "pool_0_set_0").await
+                } else {
+                    healer
+                        .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+                        .await
+                };
+                let state = if automatic {
+                    ResumeManager::load_replacement_intent(env.healer.disk.clone(), &task_id)
+                        .await
+                        .unwrap()
+                        .get_state()
+                        .await
+                } else {
+                    env.resume.get_state().await
+                };
+                assert_eq!(result.is_ok(), placement == Ok(false));
+                assert_eq!(state.completed, placement == Ok(false));
+                if automatic {
+                    assert_eq!(
+                        state.replacement_phase == crate::heal::resume::ReplacementPhase::Verified,
+                        placement == Ok(false)
+                    );
+                }
+                match placement {
+                    Ok(true) => {
+                        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+                        assert_eq!(state.retry_count, 1);
+                    }
+                    Ok(false) => assert!(env.storage.calls().is_empty()),
+                    Err(message) => {
+                        assert!(result.unwrap_err().to_string().contains(message));
+                        assert!(env.storage.calls().is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

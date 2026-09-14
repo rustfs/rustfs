@@ -1793,6 +1793,9 @@ impl HealManager {
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
     ) -> Result<HealAdmissionReceipt> {
         let admission_start = Instant::now();
+        if request.id.is_empty() {
+            request.id = uuid::Uuid::new_v4().to_string();
+        }
         let source = request.source;
         let force_start = request.force_start;
         // Keep ordinary STARTs outside forceStart's cancel-then-admit window.
