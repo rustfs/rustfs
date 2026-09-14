@@ -40,7 +40,6 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
-use url::form_urlencoded;
 use uuid::{Uuid, Variant, Version};
 use zeroize::Zeroizing;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -1337,7 +1336,7 @@ fn list_versions_url(endpoint: &Url, bucket: &str, key: &str) -> Result<Url, Sit
 fn encode_path(value: &str) -> String {
     value
         .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).into_owned())
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_owned())
         .collect::<Vec<_>>()
         .join("/")
 }
