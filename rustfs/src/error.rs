@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
-use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError};
+use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unreadable_config_refusal};
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
@@ -532,6 +532,16 @@ impl From<StorageError> for ApiError {
                 source: Some(Box::new(err)),
             };
         }
+        // A stored bucket config that cannot be parsed stays refused until an
+        // operator repairs it, so it is a recoverable 503 that names what to
+        // repair rather than a generic 500 (rustfs/backlog#1734).
+        if let Some(message) = unreadable_config_refusal(&err).map(ToString::to_string) {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message,
+                source: Some(Box::new(err)),
+            };
+        }
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
@@ -816,6 +826,25 @@ mod tests {
     use super::*;
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    /// rustfs/backlog#1734: a refusal to act on a stored bucket config that
+    /// cannot be parsed is recoverable once an operator repairs the bytes, so
+    /// it answers 503 naming the bucket, config and stored length, not a
+    /// generic 500. It must survive the error being cloned on the way.
+    #[test]
+    fn unreadable_bucket_config_maps_to_service_unavailable_naming_the_config() {
+        let err = StorageError::other(crate::storage_api::error::UnreadableBucketConfig {
+            bucket: "photos".to_string(),
+            config_file: "versioning.xml".to_string(),
+            raw_len: 42,
+        });
+        for api_error in [ApiError::from(err.clone()), ApiError::from(err)] {
+            assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+            for needle in ["photos", "versioning.xml", "42"] {
+                assert!(api_error.message.contains(needle), "{needle} missing from {:?}", api_error.message);
+            }
+        }
+    }
 
     #[test]
     fn api_error_diagnostic_preserves_typed_cause_without_sensitive_payload() {

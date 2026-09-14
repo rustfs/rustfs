@@ -20,7 +20,7 @@ use crate::auth::{
     VerifiedSigV4Request, check_key_valid_with_context, get_condition_values_with_client_info,
     get_condition_values_with_query_and_client_info, get_request_auth_type_with_query, get_session_token,
     parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
-    reject_unsigned_amz_headers_on_presigned_request,
+    reject_unsigned_amz_headers_on_sigv4_request,
 };
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -1710,10 +1710,10 @@ fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()
 #[async_trait::async_trait]
 impl S3Access for FS {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        // GHSA-g8w9-qw9q-fghr: a presigned URL only authorises the headers it
+        // SigV4 only authorises the request properties covered by headers it
         // signed. Reject unsigned `x-amz-*` headers first, before the session
         // token lookup below or any handler reads a request header.
-        reject_unsigned_amz_headers_on_presigned_request(cx.headers(), cx.uri().query())?;
+        reject_unsigned_amz_headers_on_sigv4_request(cx.headers(), cx.uri().query())?;
 
         // Upper layer has verified ak/sk
         // info!(

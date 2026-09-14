@@ -54,6 +54,19 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]
+    ReplacementFailurePersistence {
+        #[source]
+        failure: Box<Error>,
+        persistence: Box<Error>,
+    },
+
+    #[error("Replacement ownership conflict: {0}")]
+    ReplacementOwnershipConflict(String),
+
+    #[error("replacement recovery retry budget exhausted")]
+    ReplacementRetryBudgetExhausted,
+
     #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
     StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
 

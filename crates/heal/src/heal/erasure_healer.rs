@@ -116,6 +116,7 @@ pub struct ErasureSetHealer {
     pool_metadata_target_endpoints: Arc<[String]>,
     replacement_task_id: Option<String>,
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
+    replacement_execution: Option<Arc<super::storage::ReplacementExecution>>,
     mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
 }
 
@@ -366,12 +367,18 @@ impl ErasureSetHealer {
             pool_metadata_target_endpoints: Vec::new().into(),
             replacement_task_id: None,
             replacement_target_identities: None,
+            replacement_execution: None,
             mainline_pacer: None,
         }
     }
 
     pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
         self.mainline_pacer = pacer;
+        self
+    }
+
+    pub(crate) fn with_replacement_execution(mut self, execution: Option<Arc<super::storage::ReplacementExecution>>) -> Self {
+        self.replacement_execution = execution;
         self
     }
 
@@ -1415,7 +1422,11 @@ impl ErasureSetHealer {
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
                 let mainline_pacer = self.mainline_pacer.clone();
 
-                page_tasks.push(async move {
+                let execution = self.replacement_execution.clone();
+                let failure_identity = execution
+                    .as_ref()
+                    .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
+                let work = async move {
                     let permit = acquire_page_permit(semaphore, mainline_pacer.as_deref(), &cancel_token).await;
 
                     let _permit = match permit {
@@ -1437,9 +1448,7 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
-                            Ok((result, None))
-                                if target_outcomes_complete(&result, &target_endpoints) =>
-                            {
+                            Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
                                 let object_size = result_object_size_u64(&result);
                                 if !replacement_commit_evidence_required {
                                     (object_size, Ok(true))
@@ -1455,15 +1464,21 @@ impl ErasureSetHealer {
                                         .await
                                     {
                                         Ok(true) => (object_size, Ok(true)),
-                                        Ok(false) => (object_size, Err(Error::transient_skip(format!(
-                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
-                                        )))),
-                                        Err(err) => (object_size, Err(Error::transient_skip(format!(
-                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
-                                        )))),
+                                        Ok(false) => (
+                                            object_size,
+                                            Err(Error::transient_skip(format!(
+                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
+                                            ))),
+                                        ),
+                                        Err(err) => (
+                                            object_size,
+                                            Err(Error::transient_skip(format!(
+                                                "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
+                                            ))),
+                                        ),
                                     }
                                 }
-                            },
+                            }
                             Ok((result, None)) if !target_endpoints.is_empty() => (
                                 result_object_size_u64(&result),
                                 Err(Error::transient_skip(format!(
@@ -1478,23 +1493,39 @@ impl ErasureSetHealer {
                                 let object_size = result_object_size_u64(&result);
                                 match Self::classify_heal_object_error(&err) {
                                     HealObjectOutcome::Absent => (object_size, Ok(false)),
-                                    HealObjectOutcome::Transient => (object_size, Err(Error::transient_skip(format!(
-                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
-                                    )))),
+                                    HealObjectOutcome::Transient => (
+                                        object_size,
+                                        Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                        ))),
+                                    ),
                                     HealObjectOutcome::Failed => (object_size, Err(err)),
                                 }
                             }
                             Err(err) => match Self::classify_heal_object_error(&err) {
                                 HealObjectOutcome::Absent => (0, Ok(false)),
-                                HealObjectOutcome::Transient => (0, Err(Error::transient_skip(format!(
-                                    "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
-                                )))),
+                                HealObjectOutcome::Transient => (
+                                    0,
+                                    Err(Error::transient_skip(format!(
+                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                    ))),
+                                ),
                                 HealObjectOutcome::Failed => (0, Err(err)),
                             },
                         }
                     };
 
                     (dedup_key, object_name, version_id, result)
+                };
+                page_tasks.push(async move {
+                    if let (Some(execution), Some((key, object, version))) = (execution, failure_identity) {
+                        match execution.run(work).await {
+                            Ok(result) => result,
+                            Err(error) => (key, object, version, (0, Err(error))),
+                        }
+                    } else {
+                        work.await
+                    }
                 });
             }
 

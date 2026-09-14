@@ -24,6 +24,9 @@ use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod report;
+use report::{ROOT_REPORT_PREFIX, RootHealReport, read_report, remove_report, write_report};
+
 // The metadata bucket already exists and its parent is durable. Creating a
 // nested journal directory here would also require syncing every ancestor.
 const ROOT_RECOVERY_PREFIX: &str = "root-heal-";
@@ -205,7 +208,7 @@ struct RootHealIntent {
     created_at: SystemTime,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootHealTerminal {
     schema: u32,
@@ -219,6 +222,21 @@ struct RootHealTerminal {
 }
 
 impl RootHealTerminal {
+    fn validate(&self, task_id: &str) -> Result<()> {
+        let _ = terminal_path(task_id)?;
+        if self.schema != ROOT_TERMINAL_SCHEMA || self.task_id != task_id {
+            return Err(Error::Other(format!("Unsupported or mismatched root heal terminal record {task_id}")));
+        }
+        self.heal_type.validate()?;
+        if !matches!(
+            self.status,
+            HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
+        ) {
+            return Err(Error::Other(format!("Non-terminal root heal receipt {task_id}")));
+        }
+        Ok(())
+    }
+
     fn from_completed(task_id: &str, completed: &CompletedHealStatus) -> Self {
         Self {
             schema: ROOT_TERMINAL_SCHEMA,
@@ -298,6 +316,8 @@ pub(super) struct RootHealRecovery {
     disabled_for_tests: bool,
     #[cfg(test)]
     disks: Option<Vec<DiskStore>>,
+    #[cfg(test)]
+    pub(super) fail_after_terminal_write: std::sync::atomic::AtomicBool,
 }
 
 pub(super) fn is_admin_heal_recovery(heal_type: &HealType, source: HealRequestSource) -> bool {
@@ -384,16 +404,7 @@ fn decode_terminal(task_id: &str, bytes: &[u8]) -> Result<RootHealTerminal> {
     let _ = terminal_path(task_id)?;
     let terminal: RootHealTerminal = serde_json::from_slice(bytes)
         .map_err(|error| Error::Other(format!("Invalid root heal terminal record {task_id}: {error}")))?;
-    if terminal.schema != ROOT_TERMINAL_SCHEMA || terminal.task_id != task_id {
-        return Err(Error::Other(format!("Unsupported or mismatched root heal terminal record {task_id}")));
-    }
-    terminal.heal_type.validate()?;
-    if !matches!(
-        terminal.status,
-        HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
-    ) {
-        return Err(Error::Other(format!("Non-terminal root heal receipt {task_id}")));
-    }
+    terminal.validate(task_id)?;
     Ok(terminal)
 }
 
@@ -403,6 +414,7 @@ pub(super) struct RootTerminalGcReport {
     pub(super) retained: usize,
     pub(super) pending_removed: usize,
     pub(super) terminals_removed: usize,
+    pub(super) reports_removed: usize,
     pub(super) budget_exhausted: bool,
 }
 
@@ -413,6 +425,7 @@ impl RootHealRecovery {
             mutation: Mutex::new(()),
             disabled_for_tests: false,
             disks: Some(disks),
+            fail_after_terminal_write: Default::default(),
         }
     }
 
@@ -423,6 +436,8 @@ impl RootHealRecovery {
             disabled_for_tests: true,
             #[cfg(test)]
             disks: None,
+            #[cfg(test)]
+            fail_after_terminal_write: Default::default(),
         }
     }
 
@@ -504,14 +519,22 @@ impl RootHealRecovery {
         disks: &[DiskStore],
         task_id: &str,
         terminal: RootHealTerminal,
+        completed: &CompletedHealStatus,
     ) -> Result<Option<(DiskStore, EcstoreDiskBytes)>> {
         let path = terminal_path(task_id)?;
-        if let Some((_, bytes)) = Self::find_terminal(disks, task_id).await? {
+        if let Some((disk, bytes)) = Self::find_terminal(disks, task_id).await? {
             let current = decode_terminal(task_id, &bytes)?;
-            if current == terminal {
-                return Self::find(disks, task_id).await;
+            // Only cancellation has a second publication: the worker may finish
+            // recording its last object after cancellation retired active ownership.
+            let cancelled_refinement = current.status == HealTaskStatus::Cancelled
+                && terminal.status == HealTaskStatus::Cancelled
+                && current.heal_type == terminal.heal_type
+                && current.options == terminal.options;
+            if current != terminal && !cancelled_refinement {
+                return Err(Error::Other(format!("Root heal terminal record changed for {task_id}")));
             }
-            return Err(Error::Other(format!("Root heal terminal record changed for {task_id}")));
+            write_report(&disk, task_id, &RootHealReport::from_completed(current, completed)).await?;
+            return Self::find(disks, task_id).await;
         }
         let pending = Self::find(disks, task_id).await?;
         let disk = pending
@@ -521,6 +544,9 @@ impl RootHealRecovery {
             .ok_or_else(|| Error::Other("No local disk available for root heal terminal receipt".to_string()))?;
         let bytes = serde_json::to_vec(&terminal)
             .map_err(|error| Error::Other(format!("Serialize root heal terminal receipt: {error}")))?;
+        // RUSTFS_COMPAT_TODO(backlog-2519): preserve rollback fences. Remove after supported readers accept standalone reports.
+        // A crash before the marker leaves the pending responsibility intact.
+        write_report(&disk, task_id, &RootHealReport::from_completed(terminal, completed)).await?;
         match EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, &path, None, Some(bytes.into())).await? {
             EcstoreConditionalFileUpdate::Updated => Ok(pending),
             _ => Err(Error::Other(format!("Root heal terminal record changed for {task_id}"))),
@@ -697,7 +723,8 @@ impl RootHealRecovery {
         let pending = decode_intent(task_id, &bytes)?;
         let heal_type = HealType::from(pending.heal_type);
         let terminal = RootHealTerminal::cancelled(task_id, &heal_type, pending.options);
-        let _ = Self::persist_terminal_locked(&disks, task_id, terminal).await?;
+        let completed = terminal.clone().into_completed();
+        let _ = Self::persist_terminal_locked(&disks, task_id, terminal, &completed).await?;
         match EcstoreDiskAPI::compare_and_update_file(
             disk.as_ref(),
             RUSTFS_META_BUCKET,
@@ -729,7 +756,15 @@ impl RootHealRecovery {
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let pending =
-            Self::persist_terminal_locked(&disks, task_id, RootHealTerminal::from_completed(task_id, completed)).await?;
+            Self::persist_terminal_locked(&disks, task_id, RootHealTerminal::from_completed(task_id, completed), completed)
+                .await?;
+        #[cfg(test)]
+        if self
+            .fail_after_terminal_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Io(std::io::Error::other("injected failure after terminal report publication")));
+        }
         if let Some((disk, bytes)) = pending {
             match EcstoreDiskAPI::compare_and_update_file(
                 disk.as_ref(),
@@ -761,10 +796,20 @@ impl RootHealRecovery {
         }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
-        let Some((_, bytes)) = Self::find_retained_terminal(&disks, task_id, SystemTime::now()).await? else {
+        let Some((disk, bytes)) = Self::find_retained_terminal(&disks, task_id, SystemTime::now()).await? else {
             return Ok(None);
         };
-        Ok(Some(decode_terminal(task_id, &bytes)?.into_completed()))
+        let terminal = decode_terminal(task_id, &bytes)?;
+        if let Some((report, _)) = read_report(&disk, task_id).await? {
+            if *report.terminal() != terminal {
+                return Err(Error::Other(format!("Root heal report does not match its terminal receipt {task_id}")));
+            }
+            return Ok(Some(report.into_completed()));
+        }
+        // Legacy receipts cannot reconstruct counters or the retained result window.
+        let mut completed = terminal.into_completed();
+        completed.result_items_truncated = true;
+        Ok(Some(completed))
     }
 
     pub(super) async fn completed_matches_path(&self, heal_path: &str) -> Result<bool> {
@@ -831,6 +876,7 @@ impl RootHealRecovery {
                 report.scanned += 1;
                 let Some(task_id) = entry
                     .strip_prefix(ROOT_TERMINAL_PREFIX)
+                    .or_else(|| entry.strip_prefix(ROOT_REPORT_PREFIX))
                     .and_then(|entry| entry.strip_suffix(".json"))
                 else {
                     continue;
@@ -849,6 +895,23 @@ impl RootHealRecovery {
                 break;
             }
             let Some((terminal_disk, terminal_bytes)) = Self::find_terminal(&disks, &task_id).await? else {
+                // A crash before terminal publication, or an old-version GC,
+                // can leave an uncommitted report. It never authorizes replay.
+                for disk in &disks {
+                    if deletes >= ROOT_TERMINAL_GC_DELETE_BUDGET {
+                        report.budget_exhausted = true;
+                        break;
+                    }
+                    if let Some((snapshot, bytes)) = read_report(disk, &task_id).await? {
+                        if snapshot.terminal().retained_at(now) {
+                            report.retained += 1;
+                        } else {
+                            remove_report(disk, &task_id, bytes).await?;
+                            deletes += 1;
+                            report.reports_removed += 1;
+                        }
+                    }
+                }
                 continue;
             };
             let terminal = decode_terminal(&task_id, &terminal_bytes)?;
@@ -877,6 +940,19 @@ impl RootHealRecovery {
                             "Root heal recovery record changed while pruning terminal receipt {task_id}"
                         )));
                     }
+                }
+            }
+            if let Some((snapshot, bytes)) = read_report(&terminal_disk, &task_id).await? {
+                if *snapshot.terminal() != terminal {
+                    return Err(Error::Other(format!("Root heal report does not match expired receipt {task_id}")));
+                }
+                remove_report(&terminal_disk, &task_id, bytes).await?;
+                deletes += 1;
+                report.reports_removed += 1;
+                if deletes >= ROOT_TERMINAL_GC_DELETE_BUDGET {
+                    report.retained += 1;
+                    report.budget_exhausted = true;
+                    break;
                 }
             }
             match EcstoreDiskAPI::compare_and_update_file(

@@ -577,6 +577,18 @@ impl HealStorageAPI for MockStorage {
         self.heal_bucket(bucket, opts).await
     }
 
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<crate::heal::storage::HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
+    }
+
     async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
         Ok(None)
     }
@@ -2390,10 +2402,21 @@ fn durable_replacement_recovery_re_admits_only_the_matching_generation() {
     state.replacement_generation = Some(task_id.to_string());
     state.replacement_phase = ReplacementPhase::Intent;
     state.replacement_targets = vec!["replacement-a".to_string()];
-    assert!(!durable_replacement_recovery_is_due(&state, task_id));
-
-    state.retry_count = state.max_retries;
     assert!(durable_replacement_recovery_is_due(&state, task_id));
+
+    for phase in [ReplacementPhase::OwnershipPending, ReplacementPhase::HandoffPending] {
+        state.replacement_phase = phase;
+        assert!(durable_replacement_recovery_is_due(&state, task_id));
+    }
+    state.retry_count = state.max_retries;
+    assert!(
+        durable_replacement_reserves_targets(&state),
+        "an exhausted generation must prevent fresh admission"
+    );
+    assert!(
+        !durable_replacement_recovery_is_due(&state, task_id),
+        "periodic recovery must preserve the exhausted budget"
+    );
 
     state.completed = true;
     state.retry_count = 0;
@@ -2428,6 +2451,28 @@ fn durable_replacement_recovery_re_admits_only_the_matching_generation() {
     assert!(
         !durable_replacement_recovery_is_due(&state, task_id),
         "a task must not adopt another generation's terminal cleanup"
+    );
+}
+
+#[test]
+fn replacement_target_reservation_ends_only_after_an_explicit_transfer() {
+    let mut state = ResumeState::new(
+        Uuid::new_v4().to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        Vec::new(),
+    );
+    state.replacement_generation = Some(state.task_id.clone());
+    state.replacement_targets = vec!["replacement-a".to_string()];
+    state.replacement_phase = ReplacementPhase::Abandoned;
+    assert!(
+        durable_replacement_reserves_targets(&state),
+        "an unlinked orphan still owns a responsibility"
+    );
+    state.replacement_legacy_successor = Some(Uuid::new_v4().to_string());
+    assert!(
+        !durable_replacement_reserves_targets(&state),
+        "an approved migration has transferred responsibility"
     );
 }
 

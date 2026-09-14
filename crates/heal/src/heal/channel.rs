@@ -79,6 +79,8 @@ struct HealTaskStatusPayload<'a> {
     progress: Option<&'a HealProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<&'a super::outcome::HealTaskOutcome>,
+    #[serde(rename = "outcomeStatus", skip_serializing_if = "Option::is_none")]
+    outcome_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     settings: Option<&'a HealOpts>,
 }
@@ -105,6 +107,7 @@ fn encode_heal_task_status_payload(
             min_seq: sequence.1,
             progress,
             outcome,
+            outcome_status: (outcome.is_none() && matches!(summary, "finished" | "stopped")).then_some("unavailable"),
             settings,
         })
         .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
@@ -908,6 +911,35 @@ mod tests {
                 error: None,
             })
             .expect("a freshly constructed processor must accept responses on its channel");
+    }
+
+    #[test]
+    fn terminal_without_outcome_is_explicitly_unavailable() {
+        for summary in ["finished", "stopped", "running"] {
+            let (bytes, _) = encode_heal_status_response(summary, Vec::new(), HealStatusResponseContext::default())
+                .expect("status without canonical outcome");
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("status JSON");
+            assert!(payload.get("outcome").is_none(), "missing counters cannot become zero counters");
+            if summary == "running" {
+                assert!(payload.get("outcomeStatus").is_none());
+            } else {
+                assert_eq!(payload["outcomeStatus"], "unavailable");
+            }
+        }
+        let mut outcome = super::super::outcome::HealTaskOutcome::default();
+        outcome.finish(None);
+        let (bytes, _) = encode_heal_status_response(
+            "finished",
+            Vec::new(),
+            HealStatusResponseContext {
+                outcome: Some(&outcome),
+                ..Default::default()
+            },
+        )
+        .expect("known terminal outcome");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("known status JSON");
+        assert!(payload.get("outcomeStatus").is_none());
+        assert_eq!(payload["outcome"]["execution"]["state"], "completed");
     }
 
     #[test]

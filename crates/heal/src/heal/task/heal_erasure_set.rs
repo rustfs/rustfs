@@ -129,6 +129,13 @@ impl HealTask {
             None
         };
 
+        let replacement_execution = if is_auto_replacement {
+            let execution = self.storage.replacement_execution(&self.heal_endpoints).await?;
+            *self.replacement_execution.write().await = Some(execution.clone());
+            Some(execution)
+        } else {
+            None
+        };
         let replacement_resume_disk = if is_auto_replacement {
             Some(match replacement_resume_disk {
                 Some(disk) => disk,
@@ -178,7 +185,10 @@ impl HealTask {
                 identities.clone(),
             )
             .await?;
-            buckets = manager.get_state().await.replacement_buckets;
+            *self.replacement_resume_disk.write().await = Some(disk.clone());
+            let state = manager.get_state().await;
+            self.replacement_start_retry_count.store(state.retry_count, Ordering::Release);
+            buckets = state.replacement_buckets;
             Some((disk, manager, identities))
         } else {
             None
@@ -299,7 +309,7 @@ impl HealTask {
                         message: format!("Failed to verify formatted replacement targets for {set_disk_id}"),
                     });
                 }
-                if let Some((_, replacement_resume, expected_identities)) = &replacement_resume {
+                if let Some((_, _, expected_identities)) = &replacement_resume {
                     let identities = self
                         .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
                         .await?;
@@ -308,7 +318,6 @@ impl HealTask {
                             message: format!("Replacement target changed after format for automatic heal {set_disk_id}"),
                         });
                     }
-                    replacement_resume.mark_replacement_rebuilding(identities).await?;
                 }
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
@@ -345,7 +354,19 @@ impl HealTask {
 
         // The rebuilt disks are formatted now: mark them as healing so
         // DiskInfo.healing reflects the rebuild until it completes.
-        super::super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
+        if let (Some(execution), Some((_, manager, _))) = (&replacement_execution, &replacement_resume) {
+            manager.acquire_replacement_markers(execution).await?;
+        } else {
+            super::super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
+        }
+        if let Some((_, replacement_resume, expected_identities)) = &replacement_resume {
+            self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "marker acquisition")
+                .await?;
+            replacement_resume
+                .mark_replacement_rebuilding(expected_identities.clone())
+                .await?;
+            self.replacement_running.store(true, Ordering::Release);
+        }
 
         // Step 2: Get disk for resume functionality
         debug!(
@@ -457,6 +478,7 @@ impl HealTask {
             Vec::new()
         })
         .with_replacement_identity_fence(replacement_target_identities.clone())
+        .with_replacement_execution(replacement_execution)
         .with_mainline_pacer(self.mainline_pacer.clone());
 
         {

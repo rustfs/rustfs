@@ -336,6 +336,19 @@ pub async fn current_replacement_recovery_snapshot() -> ReplacementRecoverySnaps
         }
     }
 
+    for record in records.values_mut() {
+        if matches!(record.state, ReplacementRecoveryState::Running)
+            && !match get_heal_manager() {
+                Some(manager) => manager.replacement_generation_is_running(&record.task_id).await,
+                None => false,
+            }
+        {
+            record.state = ReplacementRecoveryState::Unknown;
+            record.reason = Some("durable rebuilding generation has no active replacement owner".to_string());
+            reason.get_or_insert_with(|| "replacement execution ownership is not established".to_string());
+        }
+    }
+
     ReplacementRecoverySnapshot {
         records: records.into_values().collect(),
         definitive: reason.is_none(),

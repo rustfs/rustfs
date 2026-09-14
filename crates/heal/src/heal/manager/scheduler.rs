@@ -302,8 +302,8 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
-                    let cancelled_completion = if owns_completion {
-                        false
+                    let cancelled_snapshot = if owns_completion {
+                        None
                     } else {
                         // Cancellation can win while a finished worker waits
                         // for active ownership. It must not resurrect a retry
@@ -313,18 +313,21 @@ impl HealManager {
                             .lock()
                             .await
                             .get(&task_id)
-                            .is_some_and(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .filter(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .cloned()
                     };
-                    if cancelled_completion {
+                    let cancelled_completion = cancelled_snapshot.is_some();
+                    if let Some(cancelled) = &cancelled_snapshot {
                         completed_status = HealTaskStatus::Cancelled;
                         completed_status_entry.status = HealTaskStatus::Cancelled;
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
+                        completed_status_entry.completed_at = cancelled.completed_at;
                     }
                     let terminal_completion = matches!(
                         completed_status,
                         HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
                     );
-                    if owns_completion
+                    if (owns_completion || cancelled_completion)
                         && terminal_completion
                         && root_recovery::is_admin_heal_recovery(&task.heal_type, task.source)
                         && let Err(error) = root_recovery_clone
@@ -344,6 +347,24 @@ impl HealManager {
                             error = %error,
                             "Failed to publish heal terminal receipt"
                         );
+                        // A failed write can already have replaced the report.
+                        // Resolve it from disk instead of assuming the old snapshot won.
+                        if let Some(cancelled) = &cancelled_snapshot {
+                            completed_status_entry = match root_recovery_clone.completed(&task_id).await {
+                                Ok(Some(persisted)) => persisted,
+                                Ok(None) | Err(_) => {
+                                    let mut unavailable = (**cancelled).clone();
+                                    unavailable.outcome = None;
+                                    unavailable.progress = None;
+                                    unavailable.seqed_items = Vec::new();
+                                    unavailable.next_seq = 0;
+                                    unavailable.min_seq = 0;
+                                    unavailable.result_items_truncated = true;
+                                    unavailable.retained_bytes.take();
+                                    unavailable
+                                }
+                            };
+                        }
                     }
                     if owns_completion
                         && !terminal_completion

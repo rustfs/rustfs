@@ -168,10 +168,17 @@ pub mod bucket {
             BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
             BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
             BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG,
-            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, OBJECT_LOCK_CONFIG,
-            load_bucket_metadata, table_catalog_path_hash,
+            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, ConfigState,
+            OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
+            table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+    }
+
+    pub mod config_parse_mode {
+        pub use crate::bucket::config_parse_mode::{
+            BucketConfigParseMode, bucket_config_parse_mode, validate_bucket_config_parse_mode_env,
+        };
     }
 
     pub mod durability {
@@ -404,7 +411,7 @@ pub mod data_usage {
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::local::ScanGuard;
+    pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
