@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::fs;
+use std::io::Write as _;
 use std::io::{Cursor, Read as _};
+use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -26,7 +28,7 @@ use p256::pkcs8::DecodePublicKey as _;
 use rustfs::connect::DeviceIdentity;
 use rustfs::connect::diagnostics::{
     LocalTopConsent, NetworkCounterSnapshot, TopCaptureLimits, TopCaptureRequest, TopCaptureScope, TopOutcome, TopReasonCode,
-    evaluate_network_window, save_signed_top_export, sign_top_export,
+    capture_top_net, evaluate_network_window, save_signed_top_export, sign_top_export,
 };
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
@@ -104,6 +106,48 @@ fn top_network_uses_exact_counter_deltas_and_fails_closed_on_reset() {
     assert_eq!(reset.outcome, TopOutcome::Failed);
     assert_eq!(reset.reason_code, TopReasonCode::CollectionFailed);
     assert!(reset.data.is_none());
+}
+
+#[tokio::test]
+async fn top_network_capture_observes_real_loopback_traffic() {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return;
+    }
+
+    let mut request = request();
+    request.window = Duration::from_millis(500);
+    let traffic = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        generate_loopback_traffic().expect("generate loopback traffic");
+    });
+
+    let result = capture_top_net(&request, &CancellationToken::new())
+        .await
+        .expect("capture host network traffic");
+    traffic.join().expect("traffic thread");
+
+    assert_eq!(result.outcome, TopOutcome::Succeeded);
+    let data = result.data.expect("network data");
+    assert!(data.received_bytes > 0, "real loopback traffic must increase received bytes");
+    assert!(data.sent_bytes > 0, "real loopback traffic must increase sent bytes");
+}
+
+fn generate_loopback_traffic() -> std::io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received)?;
+        if received.len() != 256 * 1024 {
+            return Err(std::io::Error::other("loopback payload was truncated"));
+        }
+        Ok(())
+    });
+    let mut client = TcpStream::connect(address)?;
+    client.write_all(&vec![0x5a; 256 * 1024])?;
+    client.shutdown(Shutdown::Write)?;
+    server.join().map_err(|_| std::io::Error::other("loopback server panicked"))?
 }
 
 #[test]
