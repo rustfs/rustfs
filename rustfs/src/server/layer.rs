@@ -48,6 +48,7 @@ use rustfs_protocols::swift::SwiftRouter;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
+use s3s::S3Error;
 use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -1606,6 +1607,94 @@ where
         .expect("failed to build virtual-host hint response")
 }
 
+/// GHSA-xm99-m3gq-83g8 / GHSA-g8w9-qw9q-fghr: enforce the SigV4 unsigned
+/// `x-amz-*` header rules ahead of s3s dispatch.
+///
+/// s3s verifies the claimed algorithm as the first step of its own signature
+/// flow and answers a swapped algorithm token with `501 NotImplemented` before
+/// RustFS's access layer (`S3Access::check`) ever runs, so the `AccessDenied`
+/// rulings of [`crate::auth::reject_unsigned_amz_headers_on_sigv4_request`]
+/// must be applied here, in front of s3s. Rejections carry the same S3 error
+/// document the access layer would have produced.
+#[derive(Clone, Default)]
+pub struct SigV4HeaderGuardLayer;
+
+impl<S> Layer<S> for SigV4HeaderGuardLayer {
+    type Service = SigV4HeaderGuardService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SigV4HeaderGuardService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct SigV4HeaderGuardService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for SigV4HeaderGuardService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        match crate::auth::reject_unsigned_amz_headers_on_sigv4_request(req.headers(), req.uri().query()) {
+            Ok(()) => {}
+            Err(error) => {
+                let version = req.version();
+                return Box::pin(async move { Ok(sigv4_header_guard_rejection(version, error)) });
+            }
+        }
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
+/// Serialize a header-guard rejection as the S3 error document the access
+/// layer would have produced for the same rule violation.
+fn sigv4_header_guard_rejection<RestBody, GrpcBody>(
+    version: http::Version,
+    error: S3Error,
+) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    let status = error.status_code().unwrap_or(StatusCode::FORBIDDEN);
+    let message = error.message().unwrap_or_default().to_owned();
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>{code}</Code><Message>{message}</Message></Error>",
+        code = xml_escape(error.code().as_str()),
+        message = xml_escape(&message),
+    );
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/xml");
+    // This short-circuit path does not drain the request body. For HTTP/1.x, signal
+    // connection close so an undrained body cannot disrupt keep-alive reuse. `Connection`
+    // is a forbidden header in HTTP/2+, so it is only set for HTTP/1.x.
+    if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+        builder = builder.header(http::header::CONNECTION, "close");
+    }
+    builder
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(Bytes::from(body)),
+        })
+        .expect("failed to build SigV4 header guard rejection response")
+}
+
 /// Returns an actionable error for virtual-hosted-style S3 requests that cannot be
 /// routed because `RUSTFS_SERVER_DOMAINS` is not configured. See
 /// [`unroutable_virtual_host_target`]. The layer is only installed when no server
@@ -3140,6 +3229,122 @@ mod tests {
         let h2_response: Response<HybridBody<Full<Bytes>, Full<Bytes>>> =
             build_virtual_host_hint_response(http::Version::HTTP_2, "my-bucket.s3.example.com", "/");
         assert!(h2_response.headers().get(http::header::CONNECTION).is_none());
+    }
+
+    #[tokio::test]
+    async fn sigv4_header_guard_layer_rejects_swapped_algorithm_token_with_access_denied() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = SigV4HeaderGuardLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/xm99-private-source/target")
+                    .header(
+                        "authorization",
+                        "OTHER Credential=rustfsadmin/20260914/us-east-1/s3/aws4_request, \
+                         SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                         Signature=00e997a1db4d3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d",
+                    )
+                    .header("x-amz-date", "20260914T000000Z")
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .header("x-amz-copy-source", "/negative-sigv4-bucket/source")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("guard response");
+
+        // The swapped token must be answered with the access-layer ruling
+        // instead of s3s's algorithm 501.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("<Code>AccessDenied</Code>"), "body: {body}");
+        assert!(body.contains("Unsupported SigV4 authorization algorithm"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn sigv4_header_guard_layer_rejects_unsigned_copy_source_header() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = SigV4HeaderGuardLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/xm99-private-source/target")
+                    .header(
+                        "authorization",
+                        "AWS4-HMAC-SHA256 Credential=rustfsadmin/20260914/us-east-1/s3/aws4_request, \
+                         SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                         Signature=00e997a1db4d3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d",
+                    )
+                    .header("x-amz-date", "20260914T000000Z")
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .header("x-amz-copy-source", "/negative-sigv4-bucket/source")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("guard response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("<Code>AccessDenied</Code>"), "body: {body}");
+        assert!(
+            body.contains("There were headers present in the request which were not signed"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sigv4_header_guard_layer_passes_unsigned_and_signed_envelope_requests_through() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = SigV4HeaderGuardLayer.layer(inner);
+
+        // Anonymous request: no Authorization header, no presigned query.
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/bucket/key")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Header-signed request whose only x-amz-* headers are the signed envelope.
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/bucket/key")
+                    .header(
+                        "authorization",
+                        "AWS4-HMAC-SHA256 Credential=rustfsadmin/20260914/us-east-1/s3/aws4_request, \
+                         SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                         Signature=00e997a1db4d3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d3f3fb3b6ee6c26d3f7d",
+                    )
+                    .header("x-amz-date", "20260914T000000Z")
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

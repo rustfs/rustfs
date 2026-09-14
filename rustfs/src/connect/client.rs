@@ -644,11 +644,13 @@ pub(crate) enum TransportFailure {
 }
 
 pub(crate) fn classify_transport_failure(error: &reqwest::Error, proxy_configured: bool) -> Option<TransportFailure> {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    if proxy_configured && error.status() == Some(StatusCode::PROXY_AUTHENTICATION_REQUIRED) {
+        return Some(TransportFailure::ProxyAuthentication);
+    }
+    let mut source = std::error::Error::source(error);
     while let Some(error) = source {
         let message = error.to_string().to_ascii_lowercase();
-        if message.contains("407") || message.contains("proxy authentication") || message.contains("proxy authorization required")
-        {
+        if proxy_configured && (message.contains("proxy authentication") || message.contains("proxy authorization required")) {
             return Some(TransportFailure::ProxyAuthentication);
         }
         if message.contains("certificate")
@@ -769,4 +771,35 @@ pub enum ClientError {
     CredentialStore(#[from] CredentialStoreError),
     #[error(transparent)]
     Credential(#[from] CredentialValidationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_error(status: StatusCode, url: &str) -> reqwest::Error {
+        reqwest::Response::from(http::Response::builder().status(status).body("").expect("HTTP response"))
+            .error_for_status()
+            .expect_err("error status")
+            .with_url(Url::parse(url).expect("request URL"))
+    }
+
+    #[test]
+    fn request_url_digits_do_not_imply_proxy_authentication() {
+        let error = status_error(StatusCode::SERVICE_UNAVAILABLE, "https://127.0.0.1:40701/upload/407");
+        assert!(error.to_string().contains("407"));
+        for proxy_configured in [false, true] {
+            assert!(classify_transport_failure(&error, proxy_configured).is_none());
+        }
+    }
+
+    #[test]
+    fn proxy_authentication_status_requires_a_configured_proxy() {
+        let error = status_error(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "https://localhost/upload");
+        assert!(matches!(
+            classify_transport_failure(&error, true),
+            Some(TransportFailure::ProxyAuthentication)
+        ));
+        assert!(classify_transport_failure(&error, false).is_none());
+    }
 }

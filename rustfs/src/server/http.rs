@@ -26,7 +26,7 @@ use crate::server::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
         ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
         PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
-        StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     ssec_transport::SsecTransportLayer,
@@ -1942,6 +1942,7 @@ fn process_connection(
         // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -2061,6 +2062,7 @@ fn process_connection(
                 ))
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .layer(DoubleSlashListBucketsCompatLayer)
+                .layer(SigV4HeaderGuardLayer)
                 .service(service)
         };
         let build_internode_stack = |service| {

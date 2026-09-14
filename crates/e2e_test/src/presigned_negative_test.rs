@@ -527,7 +527,16 @@ async fn ghsa_g8w9_presigned_put_rejects_unsigned_copy_source() -> Result<(), Bo
         .presigned(valid_config())
         .await?;
 
-    let copy_source = format!("/{BUCKET}/{CANONICAL_KEY}");
+    let source_bucket = "presigned-copy-source";
+    env.create_test_bucket(source_bucket).await?;
+    env.create_s3_client()
+        .put_object()
+        .bucket(source_bucket)
+        .key(CANONICAL_KEY)
+        .body(ByteStream::from_static(CANONICAL_BODY))
+        .send()
+        .await?;
+    let copy_source = format!("/{source_bucket}/{CANONICAL_KEY}");
     let unsigned: Vec<(&str, &str)> = vec![("x-amz-copy-source", copy_source.as_str())];
     let headers = pr.headers().chain(unsigned.iter().copied());
     let resp = send_raw(pr.method(), pr.uri(), headers, None).await?;

@@ -810,17 +810,9 @@ impl Erasure {
             record_internal_stage_if_enabled("erasure_encode_write", write_stage_start);
         }
 
-        if let Some(err) = write_err {
+        if let Some(mut err) = write_err {
             match ready_producer_state(&mut task).await {
-                Some(ReadyProducerState::ReadError(read_err)) => {
-                    drop(rx);
-                    let shutdown_stage_start = stage_timer_if_enabled();
-                    if let Err(shutdown_err) = writers.shutdown().await {
-                        error!("failed to shutdown erasure writers after producer read error: {:?}", shutdown_err);
-                    }
-                    record_internal_stage_if_enabled("erasure_encode_shutdown", shutdown_stage_start);
-                    return Err(read_err);
-                }
+                Some(ReadyProducerState::ReadError(read_err)) => err = read_err,
                 Some(ReadyProducerState::Finished) => {}
                 None => task.abort_and_wait().await,
             }
@@ -949,17 +941,9 @@ impl Erasure {
             }
         }
 
-        if let Some(err) = write_err {
+        if let Some(mut err) = write_err {
             match ready_producer_state(&mut task).await {
-                Some(ReadyProducerState::ReadError(read_err)) => {
-                    drop(rx);
-                    let shutdown_stage_start = stage_timer_if_enabled();
-                    if let Err(shutdown_err) = writers.shutdown().await {
-                        error!("failed to shutdown erasure writers after producer read error: {:?}", shutdown_err);
-                    }
-                    record_internal_stage_if_enabled("erasure_encode_batched_shutdown", shutdown_stage_start);
-                    return Err(read_err);
-                }
+                Some(ReadyProducerState::ReadError(read_err)) => err = read_err,
                 Some(ReadyProducerState::Finished) => {}
                 None => task.abort_and_wait().await,
             }

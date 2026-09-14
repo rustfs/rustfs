@@ -308,3 +308,72 @@ async fn assert_foreground_queue() {
         .expect("upload task")
         .expect("queue time is not client inactivity");
 }
+
+#[test]
+#[serial_test::serial]
+fn presigned_part_checksum_survives_completion_and_rejects_bad_retry() {
+    crate::app::gating_test_env::run_large_stack_test("presigned-part-checksum", || async {
+        let (_, store) = crate::app::gating_test_env::shared_gating_ecstore_and_disk_paths().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let usecase =
+            DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::new(ConcurrencyManager::default()));
+        let bucket = format!("presigned-checksum-{}", Uuid::new_v4().simple());
+        store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+        let checksum = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=";
+        for compressed in [false, true] {
+            let mut options = ObjectOptions {
+                want_checksum: Some(rustfs_rio::Checksum {
+                    checksum_type: rustfs_rio::ChecksumType::SHA256,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if compressed {
+                insert_str(
+                    &mut options.user_defined,
+                    rustfs_utils::http::SUFFIX_COMPRESSION,
+                    compression_metadata_value(CompressionAlgorithm::default()),
+                );
+            }
+            let upload = store.new_multipart_upload(&bucket, "object", &options).await.unwrap();
+            let mut etag = None;
+            for payload in [b"abc", b"abd"] {
+                let mut req = part_request(&bucket, &upload.upload_id, StreamingBlob::from(Bytes::copy_from_slice(payload)), 3);
+                req.uri = "/bucket/object?x-amz-checksum-sha256=ungWv48Bz%2BpBQUDeXa4iI7ADYaOWF3qctBD%2FYfIAFa0%3D&x-amz-sdk-checksum-algorithm=SHA256".parse().unwrap();
+                req.extensions.insert(VerifiedPresignedRequest);
+                let result = usecase.execute_upload_part(req).await;
+                if payload == b"abc" {
+                    let response = result.expect("hoisted SHA256 part must be accepted");
+                    assert_eq!(response.output.checksum_sha256.as_deref(), Some(checksum));
+                    etag = response.output.e_tag.map(|etag| etag.value().to_owned());
+                } else {
+                    assert_eq!(*result.unwrap_err().code(), S3ErrorCode::BadDigest);
+                }
+            }
+            store
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    "object",
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: 1,
+                        etag,
+                        checksum_sha256: Some(checksum.to_owned()),
+                        ..Default::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("stored checksum must survive failed replacement and complete");
+            let mut object = store
+                .get_object_reader(&bucket, "object", None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            object.stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"abc");
+        }
+    });
+}
