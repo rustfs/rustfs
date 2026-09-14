@@ -42,6 +42,7 @@ mod trace_runtime;
 pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
     perf_client::CLIENT_CAPABILITY,
     perf_drive::DRIVE_CAPABILITY,
+    perf_network::NETWORK_CAPABILITY,
     perf_object::OBJECT_CAPABILITY,
     perf_site_replication::SITE_REPLICATION_CAPABILITY,
     logs::LOGS_CAPABILITY,
@@ -88,6 +89,7 @@ pub use perf_drive::{
     DriveTargetReasonCode, DriveTargetResult, DriveTargetUnits, LocalDriveConsent, SavedDriveExport, SignedDriveExport,
     measure_drive, save_signed_drive_export, sign_drive_export, validate_drive_limits,
 };
+pub(crate) use perf_network::runtime_network_peer_aliases;
 pub use perf_network::{
     LocalNetworkConsent, MAX_ARCHIVE_BYTES as MAX_NETWORK_ARCHIVE_BYTES,
     MAX_BANDWIDTH_BYTES_PER_SECOND as MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND,
