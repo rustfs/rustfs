@@ -29,6 +29,8 @@ trap 'rm -rf "$work_dir"' EXIT
 
 actual_binary_sha256=$(sha256sum "$binary" | awk '{print $1}')
 [[ "$actual_binary_sha256" == "$expected_binary_sha256" ]]
+runner_architecture=$(uname -m)
+[[ "$runner_architecture" == x86_64 ]]
 
 version=$($binary --version)
 grep -Fq "git commit   : $expected_source_sha" <<<"$version"
@@ -164,8 +166,9 @@ fi
 jq -n \
   --arg sourceSha "$expected_source_sha" \
   --arg binarySha256 "$actual_binary_sha256" \
+  --arg runnerArchitecture "$runner_architecture" \
   --arg archiveSha256 "$actual_archive_sha256" \
   --argjson result "$result_json" \
-  '{sourceSha: $sourceSha, binarySha256: $binarySha256, archiveSha256: $archiveSha256, invocation: "scripts/ci/check_connect_top_disk_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", redaction: "VERIFIED"}}' >"$evidence_json"
+  '{sourceSha: $sourceSha, binarySha256: $binarySha256, runnerArchitecture: $runnerArchitecture, archiveSha256: $archiveSha256, invocation: "scripts/ci/check_connect_top_disk_artifact.sh <rustfs-binary> <source-sha> <binary-sha256> <evidence-json>", result: $result, controls: {signature: "VERIFIED", consent: "REJECTED_WITHOUT_ACKNOWLEDGEMENT", expiry: "REJECTED", limits: "REJECTED", sigint: "CANCELLED_WITHOUT_OUTPUT", noClobber: "PRESERVED", redaction: "VERIFIED"}}' >"$evidence_json"
 
-jq '{sourceSha, binarySha256, archiveSha256, result: {outcome: .result.outcome, reasonCode: .result.reasonCode, durationMillis: .result.durationMillis, data: .result.data}, controls}' "$evidence_json"
+jq '{sourceSha, binarySha256, runnerArchitecture, archiveSha256, result: {outcome: .result.outcome, reasonCode: .result.reasonCode, durationMillis: .result.durationMillis, data: .result.data}, controls}' "$evidence_json"
