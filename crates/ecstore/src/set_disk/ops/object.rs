@@ -3842,12 +3842,12 @@ impl SetDisks {
             fi.metadata = user_defined;
             let put_tier_free_version_id =
                 if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
-                    // Every disk must publish the same cleanup owner alongside a
-                    // replaced null version. This transient key is not persisted
-                    // on the new object; recovery discovers the free-version in
-                    // the committed xl.meta even if this request is cancelled.
+                    // Current disks publish the same cleanup owner alongside a
+                    // replaced null version. Keep the intent outside metadata:
+                    // older disks persist unknown metadata keys, which splits
+                    // the replacement's read-quorum identity during an upgrade.
                     let free_version_id = Uuid::new_v4();
-                    fi.set_tier_free_version_id(&free_version_id.to_string());
+                    fi.overwrite_tier_free_version_id = Some(free_version_id);
                     Some(free_version_id)
                 } else {
                     None

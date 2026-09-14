@@ -307,6 +307,9 @@ pub struct FileInfo {
     pub versioned: bool,
     /// True when version meta was parsed via rmp_serde fallback (legacy format).
     pub uses_legacy_checksum: bool,
+    /// Transient PUT intent for the cleanup owner of a replaced tiered null version.
+    /// Named-map RPC readers may ignore this field; xl.meta never persists it.
+    pub overwrite_tier_free_version_id: Option<Uuid>,
 }
 
 /// Metadata keys whose values carry sealed encryption material (KEK-wrapped DEK,
@@ -389,6 +392,7 @@ impl std::fmt::Debug for FileInfo {
             checksum,
             versioned,
             uses_legacy_checksum,
+            overwrite_tier_free_version_id,
         } = self;
         f.debug_struct("FileInfo")
             .field("volume", volume)
@@ -421,6 +425,7 @@ impl std::fmt::Debug for FileInfo {
             .field("checksum", &ElidedBytes(checksum))
             .field("versioned", versioned)
             .field("uses_legacy_checksum", uses_legacy_checksum)
+            .field("overwrite_tier_free_version_id", overwrite_tier_free_version_id)
             .finish()
     }
 }
@@ -460,6 +465,8 @@ struct FileInfoMapDef {
     checksum: Option<Bytes>,
     versioned: bool,
     uses_legacy_checksum: bool,
+    #[serde(default)]
+    overwrite_tier_free_version_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -500,6 +507,7 @@ const FILE_INFO_FIELDS: &[&str] = &[
     "checksum",
     "versioned",
     "uses_legacy_checksum",
+    "overwrite_tier_free_version_id",
 ];
 
 impl Serialize for FileInfo {
@@ -507,7 +515,8 @@ impl Serialize for FileInfo {
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(FILE_INFO_FIELDS.len()))?;
+        let mut map = serializer
+            .serialize_map(Some(FILE_INFO_FIELDS.len() - usize::from(self.overwrite_tier_free_version_id.is_none())))?;
         map.serialize_entry("volume", &self.volume)?;
         map.serialize_entry("name", &self.name)?;
         map.serialize_entry("version_id", &self.version_id)?;
@@ -538,6 +547,9 @@ impl Serialize for FileInfo {
         map.serialize_entry("checksum", &self.checksum)?;
         map.serialize_entry("versioned", &self.versioned)?;
         map.serialize_entry("uses_legacy_checksum", &self.uses_legacy_checksum)?;
+        if let Some(id) = self.overwrite_tier_free_version_id {
+            map.serialize_entry("overwrite_tier_free_version_id", &id)?;
+        }
         map.end()
     }
 }
@@ -657,6 +669,7 @@ impl<'de> Deserialize<'de> for FileInfo {
                     checksum,
                     versioned,
                     uses_legacy_checksum,
+                    overwrite_tier_free_version_id: None,
                 })
             }
         }
@@ -2311,6 +2324,7 @@ mod tests {
                     checksum,
                     versioned,
                     uses_legacy_checksum,
+                    overwrite_tier_free_version_id: None,
                 }
             })
     }
@@ -2457,6 +2471,7 @@ mod tests {
             checksum: Some(Bytes::from_static(b"combined-checksum")),
             versioned: false,
             uses_legacy_checksum: true,
+            overwrite_tier_free_version_id: None,
         }
     }
 
@@ -2595,12 +2610,15 @@ mod tests {
 
     #[test]
     fn fileinfo_serializes_as_map_readable_by_beta11_and_beta12_shapes() {
-        let expected = positional_compat_file_info();
+        let mut expected = positional_compat_file_info();
+        expected.overwrite_tier_free_version_id = Some(Uuid::new_v4());
         let encoded = expected.marshal_msg().expect("current FileInfo map should encode");
         let mut cursor = encoded.as_slice();
         let field_count = usize::try_from(rmp::decode::read_map_len(&mut cursor).expect("FileInfo should start with a map"))
             .expect("FileInfo map field count should fit usize");
         assert_eq!(field_count, FILE_INFO_FIELDS.len());
+        let current = FileInfo::unmarshal(&encoded).expect("current reader preserves the transient PUT intent");
+        assert_eq!(current.overwrite_tier_free_version_id, expected.overwrite_tier_free_version_id);
 
         let beta11: Beta11MapProbe = rmp_serde::from_slice(&encoded).expect("beta.11 field shape should read current map");
         assert_eq!(beta11.volume, expected.volume);
@@ -2618,6 +2636,31 @@ mod tests {
             rmp_serde::from_slice(&nested_encoded).expect("beta.11 field shape should read nested current map");
         assert_eq!(nested_beta11.file_info.volume, expected.volume);
         assert_eq!(nested_beta11.file_info.expire_restored, expected.expire_restored);
+    }
+
+    #[test]
+    fn fileinfo_defaults_missing_put_intent_without_extending_legacy_arrays() {
+        let expected = positional_compat_file_info();
+        let encoded = expected.marshal_msg().expect("ordinary FileInfo map should encode");
+        let mut cursor = encoded.as_slice();
+        assert_eq!(
+            rmp::decode::read_map_len(&mut cursor).expect("FileInfo map header") as usize,
+            FILE_INFO_FIELDS.len() - 1
+        );
+        assert!(
+            FileInfo::unmarshal(&encoded)
+                .expect("map without PUT intent")
+                .overwrite_tier_free_version_id
+                .is_none()
+        );
+        for fixture in [BETA11_FILEINFO_FIXTURE, BETA12_FILEINFO_FIXTURE] {
+            assert!(
+                FileInfo::unmarshal(fixture)
+                    .expect("historical positional array")
+                    .overwrite_tier_free_version_id
+                    .is_none()
+            );
+        }
     }
 
     #[test]
