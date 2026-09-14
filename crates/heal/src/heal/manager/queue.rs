@@ -81,6 +81,8 @@ pub(super) enum QueuePushOutcome {
 #[derive(Debug, Clone)]
 pub(super) struct CompletedHealStatus {
     pub(super) heal_type: HealType,
+    /// Options used to execute the task, retained for token-scoped status.
+    pub(super) options: HealOptions,
     pub(super) status: HealTaskStatus,
     pub(super) progress: Option<HealProgress>,
     pub(super) outcome: Option<Arc<HealTaskOutcome>>,
@@ -209,6 +211,7 @@ impl CompletedHealStatus {
         let (next_seq, min_seq) = task.result_seq_cursors();
         let mut snapshot = Self {
             heal_type: task.heal_type.clone(),
+            options: task.options.clone(),
             status,
             progress: Some(task.get_progress().await),
             outcome: Some(Arc::new(task.get_outcome().await)),
@@ -432,10 +435,21 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     pub(super) fn make_dedup_key(request: &HealRequest) -> String {
-        let base = Self::make_dedup_key_for_type(&request.heal_type);
-        match (&request.heal_type, request.options.set_key()) {
-            (HealType::Object { .. } | HealType::ECDecode { .. }, Some(scope)) => format!("{base}:scope:{scope}"),
-            _ => base,
+        Self::make_dedup_key_for_scope(&request.heal_type, &request.options)
+    }
+
+    pub(super) fn make_dedup_key_for_scope(heal_type: &HealType, options: &HealOptions) -> String {
+        let base = Self::make_dedup_key_for_type(heal_type);
+        // Erasure-set keys already encode pool/set and are also queried by
+        // automatic replacement admission through contains_erasure_set.
+        if matches!(heal_type, HealType::ErasureSet { .. }) {
+            return base;
+        }
+        match heal_scope_indices(heal_type, options) {
+            (None, None) => base,
+            // A distinct leading tag cannot alias an unscoped S3 key that
+            // happens to contain the scope suffix as literal object bytes.
+            (pool, set) => format!("scope:{pool:?}:{set:?}:{base}"),
         }
     }
 
@@ -491,14 +505,15 @@ impl PriorityHealQueue {
         self.heap.iter().map(|item| &item.request)
     }
 
+    #[cfg(test)]
     pub(super) fn contains_request_id(&self, request_id: &str) -> bool {
         self.heap.iter().any(|item| item.request.id == request_id)
     }
 
-    pub(super) fn contains_request_id_matching_path(&self, request_id: &str, heal_path: &str) -> bool {
-        self.heap
-            .iter()
-            .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
+    pub(super) fn request_matching_id_and_path(&self, request_id: &str, heal_path: Option<&str>) -> Option<&HealRequest> {
+        self.heap.iter().map(|item| &item.request).find(|request| {
+            request.id == request_id && heal_path.is_none_or(|path| heal_type_matches_path(&request.heal_type, path))
+        })
     }
 
     pub(super) fn queued_request_id_for_dedup_key(&self, key: &str) -> Option<&str> {

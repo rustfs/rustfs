@@ -229,6 +229,12 @@ fn tier_backend_error_response(err: &AdminError) -> Option<S3Error> {
     Some(response)
 }
 
+fn tier_admin_custom_error_response(err: &AdminError) -> S3Error {
+    let mut response = S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message.clone());
+    response.set_status_code(err.status_code);
+    response
+}
+
 fn clear_tier_error_response(err: &AdminError) -> S3Error {
     S3Error::with_message(S3ErrorCode::Custom("TierClearFailed".into()), format!("tier clear failed. {err}"))
 }
@@ -406,7 +412,7 @@ impl Operation for AddTier {
             } else if err.code == ERR_TIER_INVALID_CONFIG.code {
                 Err(S3Error::with_message(S3ErrorCode::InvalidArgument, err.message))
             } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
-                Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message))
+                Err(tier_admin_custom_error_response(&err))
             } else {
                 warn!(
                     event = EVENT_ADMIN_TIER_STATE,
@@ -1397,6 +1403,15 @@ mod tests {
             status_code: StatusCode::CONFLICT,
         };
         assert!(tier_backend_error_response(&unknown).is_none());
+    }
+
+    #[test]
+    fn tier_admin_custom_error_response_preserves_admin_status() {
+        let response = tier_admin_custom_error_response(&ERR_TIER_INVALID_CREDENTIALS);
+
+        assert_eq!(response.code(), &S3ErrorCode::Custom("XRustFSAdminTierInvalidCredentials".into()));
+        assert_eq!(response.message(), Some("Invalid remote tier credentials"));
+        assert_eq!(response.status_code(), Some(StatusCode::BAD_REQUEST));
     }
 
     #[test]

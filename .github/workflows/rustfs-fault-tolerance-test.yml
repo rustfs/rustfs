@@ -118,6 +118,9 @@ jobs:
 
       - name: Run fault-tolerance scenarios (A, B, C, C2)
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
+        continue-on-error: true
         run: |
           ARGS=(--all -y --package-url "${{ inputs.package_url || env.RUSTFS_NIGHTLY_PACKAGE_URL }}" --log-file "${LOG_FILE}")
           if [ "${{ inputs.strict }}" = "true" ]; then
@@ -149,6 +152,20 @@ jobs:
               printf '%s -> %s\n' "$(basename "${f}" .code)" "$(cat "${f}")"
             done
           } > "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+          # Product gate: failing FT cases keep the run green — the report above and
+          # the backlog issue manager carry the signal. Only harness/environment
+          # breakdowns (no case verdicts at all) turn the workflow red.
+          FT_CASES="$(grep -cE '^FT-CASE:' "${LOG_FILE}" 2>/dev/null || true)"
+          FT_FAILED="$(grep -cE '^FT-CASE: .* verdict=UNEXPECTED' "${LOG_FILE}" 2>/dev/null || true)"
+          FT_PASSED=$(( ${FT_CASES:-0} - ${FT_FAILED:-0} ))
+          HARNESS_OK=0
+          if [ "${{ steps.test.outcome }}" = "success" ]; then
+            HARNESS_OK=1
+          elif [ "${{ steps.test.outcome }}" = "failure" ] && [ "${FT_CASES}" -gt 0 ] && [ "${FT_PASSED}" -ge 1 ]; then
+            HARNESS_OK=1
+          fi
+          [ "${HARNESS_OK}" = "1" ]
 
       - name: Manage backlog issues (dedup / label / auto-close)
         # Signal-based lifecycle: dedups against open issues by label

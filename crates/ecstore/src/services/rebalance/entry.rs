@@ -21,9 +21,9 @@ use super::worker::{
     RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
     record_rebalance_error, resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result,
     resolve_rebalance_file_info_versions_result, resolve_rebalance_migrate_result_error, resolve_rebalance_stats_update_result,
-    resolve_rebalance_worker_result, run_rebalance_listing_with_retry, should_cleanup_rebalance_source_entry,
-    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker,
-    wait_rebalance_entry_tasks, with_rebalance_entry_context,
+    resolve_rebalance_worker_result, retry_rebalance_metadata_access, run_rebalance_listing_with_retry,
+    should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
+    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, with_rebalance_entry_context,
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_ENTRY, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
@@ -264,7 +264,10 @@ impl ECStore {
         // Target capacity admission can then acquire pool.bin under the run fence.
         // Stop waits for in-flight entries through cleanup, but not for entries admitted later.
         ensure_rebalance_entry_active(&cancel)?;
-        let run_guard = self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry").await?;
+        let run_guard = retry_rebalance_metadata_access(Some(&cancel), rebalance_max_attempts(), || {
+            self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry")
+        })
+        .await?;
         #[cfg(test)]
         if let Ok((arrived, release)) = REBALANCE_ENTRY_RUN_FENCE_BARRIER.try_with(Clone::clone) {
             arrived.notify_one();
@@ -981,6 +984,7 @@ mod tests {
     };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
+    use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
@@ -1246,6 +1250,155 @@ mod tests {
         let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
         assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
         assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_entry_recovers_after_run_fence_lock_timeout() {
+        assert_real_rebalance_entry_metadata_retry(EntryRetryAction::Complete).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_entry_cancels_after_run_fence_lock_timeout() {
+        assert_real_rebalance_entry_metadata_retry(EntryRetryAction::Cancel).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_entry_rechecks_persisted_run_after_lock_timeout() {
+        assert_real_rebalance_entry_metadata_retry(EntryRetryAction::ReplaceRun).await;
+    }
+
+    enum EntryRetryAction {
+        Complete,
+        Cancel,
+        ReplaceRun,
+    }
+
+    async fn assert_real_rebalance_entry_metadata_retry(action: EntryRetryAction) {
+        const REBALANCE_ID: &str = "rebalance-entry-lock-retry";
+        let (_temp_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(Some(
+            active_rebalance_meta(REBALANCE_ID),
+        ))
+        .await;
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-entry-lock-retry-object";
+        let payload = b"metadata contention must not fail a rebalance entry".repeat(1024);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let source_before = source_set
+            .put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &opts)
+            .await
+            .expect("source version should be written");
+        let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+        let ns_lock = store.pools[0]
+            .new_ns_lock(bucket, super::super::REBAL_META_NAME)
+            .await
+            .expect("metadata lock should be available");
+        let writer = ns_lock
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("hold the metadata write lock");
+        let retried = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let transfer = super::super::worker::REBALANCE_METADATA_RETRY_PROBE.scope(
+            Arc::clone(&retried),
+            Arc::clone(&store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                source_set,
+                Arc::new(RebalanceBucketConfigs::default()),
+                Arc::from(REBALANCE_ID),
+                cancel.clone(),
+            ),
+        );
+        tokio::pin!(transfer);
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            tokio::select! {
+                _ = retried.notified() => {},
+                result = &mut transfer => panic!("entry admission must retry its contended run fence: {result:?}"),
+            }
+        })
+        .await
+        .expect("entry should encounter a real metadata lock timeout");
+        match action {
+            EntryRetryAction::Complete => {}
+            EntryRetryAction::Cancel => cancel.cancel(),
+            EntryRetryAction::ReplaceRun => {
+                let mut save_opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+                save_opts.add_namespace_lock_guard(&writer);
+                active_rebalance_meta("replacement-rebalance-run")
+                    .save_with_opts(Arc::clone(&store.pools[0]), save_opts)
+                    .await
+                    .expect("a peer may replace the persisted run while holding the metadata writer");
+            }
+        }
+        drop(writer);
+        let result = tokio::time::timeout(StdDuration::from_secs(30), transfer)
+            .await
+            .expect("entry should finish after the metadata writer releases");
+        if !matches!(action, EntryRetryAction::Complete) {
+            let err = result.expect_err("a cancelled or replaced run must not resume migration");
+            match action {
+                EntryRetryAction::Cancel => assert!(matches!(err, Error::OperationCanceled)),
+                EntryRetryAction::ReplaceRun => assert!(err.to_string().contains("stale rebalance run rejected")),
+                EntryRetryAction::Complete => unreachable!(),
+            }
+            let mut reader = store.pools[0]
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("rejected entry must retain its source");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("retained source must remain readable");
+            assert_eq!(actual, payload);
+            let target_err = target_set
+                .get_object_info(bucket, object, &opts)
+                .await
+                .expect_err("rejected entry must not publish a target version");
+            assert!(crate::error::is_err_object_not_found(&target_err) || crate::error::is_err_version_not_found(&target_err));
+            return;
+        }
+        assert!(matches!(
+            result.expect("transient metadata contention must not fail the entry"),
+            RebalanceEntryOutcome::Completed
+        ));
+        let mut reader = target_set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("target version must be readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("target body should drain completely");
+        assert_eq!(actual, payload);
+        assert_eq!(reader.object_info.version_id, source_before.version_id);
+        assert_eq!(reader.object_info.etag, source_before.etag);
+        let source_error = store.pools[0]
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect_err("completed migration should remove the source version");
+        assert!(crate::error::is_err_object_not_found(&source_error) || crate::error::is_err_version_not_found(&source_error));
+        let meta = store.rebalance_meta.read().await;
+        let stats = &meta.as_ref().expect("run must remain installed").pool_stats[0];
+        assert_eq!((stats.num_objects, stats.num_versions, stats.cleanup_warnings.count), (1, 1, 0));
     }
 
     #[tokio::test]

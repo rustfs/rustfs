@@ -383,7 +383,25 @@ fn record_committed_tier_free_version_receipt(
     free_version_id: Uuid,
     batch: bool,
 ) {
-    if let Some(sink) = opts.tier_free_version_receipt_sink.as_ref()
+    record_committed_tier_free_version_receipt_to_sink(
+        opts.tier_free_version_receipt_sink.as_ref(),
+        bucket,
+        object,
+        source,
+        free_version_id,
+        batch,
+    );
+}
+
+fn record_committed_tier_free_version_receipt_to_sink(
+    sink: Option<&crate::object_api::TierFreeVersionReceiptSink>,
+    bucket: &str,
+    object: &str,
+    source: &ObjectInfo,
+    free_version_id: Uuid,
+    batch: bool,
+) {
+    if let Some(sink) = sink
         && let Err(err) = sink.record(source, free_version_id)
     {
         warn!(
@@ -3417,6 +3435,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let protect_write = opts.shard_integrity_write_enabled();
         if publication_fence.is_none()
             && opts.data_movement
             && rustfs_utils::http::metadata_compat::contains_key_str(
@@ -3461,6 +3480,7 @@ impl SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if let Some(eval_metadata) = &opts.eval_metadata {
             merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
         }
@@ -3556,7 +3576,9 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned)
+                && put_object_size >= 0
+                && usize::try_from(put_object_size).is_ok_and(|size| size <= erasure.block_size);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -3677,48 +3699,16 @@ impl SetDisks {
             };
 
             let encode_stage_start = collect_stage_timing.then(Instant::now);
-            let mut inline_shards = None;
-            let (reader, w_size) = match write_path {
-                SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_shards_with_size_hint(stream, small_size_hint)
-                    .await
-                {
-                    Ok((r, w, shards)) => {
-                        inline_shards = Some(shards);
-                        (r, w)
-                    }
-                    Err(e) => {
-                        error!("encode_inline_small err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
-                    .await
-                {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode_single_block_non_inline err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
-                SmallWritePath::PipelineBatchedLarge => {
-                    match Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await {
-                        Ok((r, w)) => (r, w),
-                        Err(e) => {
-                            error!("encode_batched err {:?}", e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-                SmallWritePath::Pipeline => match Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await {
-                    Ok((r, w)) => (r, w),
-                    Err(e) => {
-                        error!("encode err {:?}", e);
-                        return Err(e.into());
-                    }
-                },
+            use crate::erasure::coding::encode::IntegrityEncodeMode;
+            let mode = match write_path {
+                SmallWritePath::Inline => IntegrityEncodeMode::Inline(small_size_hint),
+                SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let (reader, w_size, inline_shards, integrity) = Arc::clone(&erasure)
+                .encode_with_shard_integrity(stream, &mut writers, write_quorum, 1, mode, protect_write)
+                .await?;
             let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
             let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
             if let Some(encode_elapsed) = encode_elapsed {
@@ -3820,18 +3810,54 @@ impl SetDisks {
                 )));
             }
 
-            fi.metadata = user_defined;
-            if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
-                // Every disk must publish the same cleanup owner alongside a
-                // replaced null version. This transient key is not persisted
-                // on the new object; recovery discovers the free-version in
-                // the committed xl.meta even if this request is cancelled.
-                fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            let part_integrity = if let Some(integrity) = integrity {
+                Some(if is_inline_buffer {
+                    integrity.set_inline_metadata(&mut fi)?;
+                    integrity.part
+                } else {
+                    integrity
+                        .write(
+                            &mut shuffle_disks,
+                            bucket,
+                            RUSTFS_META_TMP_BUCKET,
+                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
+                        )
+                        .await?
+                })
+            } else {
+                None
+            };
+            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                return Err(Error::ErasureWriteQuorum);
             }
+            if let Some(inline_proof) =
+                rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY)
+            {
+                insert_str(
+                    &mut user_defined,
+                    rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+                    inline_proof.to_owned(),
+                );
+            }
+            fi.metadata = user_defined;
+            let put_tier_free_version_id =
+                if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
+                    // Every disk must publish the same cleanup owner alongside a
+                    // replaced null version. This transient key is not persisted
+                    // on the new object; recovery discovers the free-version in
+                    // the committed xl.meta even if this request is cancelled.
+                    let free_version_id = Uuid::new_v4();
+                    fi.set_tier_free_version_id(&free_version_id.to_string());
+                    Some(free_version_id)
+                } else {
+                    None
+                };
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
             fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
+            fi.parts[0].integrity = part_integrity;
+            fi.persist_shard_integrity()?;
             if opts.data_movement {
                 fi.set_data_moved();
             }
@@ -4301,6 +4327,9 @@ impl SetDisks {
             let commit_capacity_scope_token = opts.capacity_scope_token;
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
             let commit_scanner_publication_lease_tokens = scanner_publication_lease_tokens;
+            let commit_put_tier_free_version_id = put_tier_free_version_id;
+            let commit_tier_free_version_receipt_sink = opts.tier_free_version_receipt_sink.clone();
+            let commit_skip_free_version = opts.skip_free_version;
             let request_cancellation = operation_cancellation.clone();
             tmp_cleanup_owned = true;
 
@@ -4456,6 +4485,41 @@ impl SetDisks {
                     }
                     return Err(err);
                 }
+
+                let put_tier_free_version_source =
+                    if commit_put_tier_free_version_id.is_some() && commit_tier_free_version_receipt_sink.is_some() {
+                        match commit_set
+                            .get_object_info(
+                                &commit_bucket,
+                                &commit_object,
+                                &ObjectOptions {
+                                    no_lock: true,
+                                    metadata_cache_safe: false,
+                                    versioned: commit_versioned,
+                                    version_suspended: commit_version_suspended,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(source) => Some(source),
+                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                            Err(err) => {
+                                debug!(
+                                    event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    bucket = %commit_bucket,
+                                    object = %commit_object,
+                                    error = ?err,
+                                    "Skipped opportunistic tier free-version receipt source capture"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                 Self::assign_rename_data_indexes(&mut parts_metadatas);
                 let mut rename_result = SetDisks::rename_data_owned_with_fence(
@@ -4629,6 +4693,19 @@ impl SetDisks {
                 let cleanup_disks = rename_commit.cleanup_disks;
                 let old_current_size = rename_commit.old_current_size;
                 let mut fi = rename_commit.committed_file_info;
+                if let (Some(source), Some(free_version_id)) =
+                    (put_tier_free_version_source.as_ref(), commit_put_tier_free_version_id)
+                    && transitioned_delete_publishes_free_version(source, &fi, commit_skip_free_version)
+                {
+                    record_committed_tier_free_version_receipt_to_sink(
+                        commit_tier_free_version_receipt_sink.as_ref(),
+                        &commit_bucket,
+                        &commit_object,
+                        source,
+                        free_version_id,
+                        false,
+                    );
+                }
 
                 if needs_immediate_heal {
                     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
@@ -4642,8 +4719,7 @@ impl SetDisks {
                     request.object_version_id = committed_version_id
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
-                    let heal_set = commit_set.clone();
-                    tokio::spawn(async move { heal_set.submit_rename_tail_heal(request).await });
+                    commit_set.submit_rename_tail_heal(request).await;
                 }
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
@@ -7447,7 +7523,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Self-copy with a data reader: write tier data back locally (de-tiering).
             // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
             if let Some(mut put_reader) = src_info.put_object_reader.take() {
-                return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+                let mut put_opts = dst_opts.clone();
+                put_opts.inherit_shard_integrity(src_info);
+                return self.put_object(dst_bucket, dst_object, &mut put_reader, &put_opts).await;
             }
             // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
             // path so the caller gets a disk/quorum error rather than NotImplemented.
@@ -7614,6 +7692,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None
         };
         let mut replacement_metadata = (*src_info.user_defined).clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut replacement_metadata);
+        for suffix in [
+            rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+            rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+        ] {
+            if rustfs_utils::http::contains_key_str(&fi.metadata, suffix) {
+                let value = rustfs_utils::http::get_consistent_str(&fi.metadata, suffix).ok_or(Error::FileCorrupt)?;
+                rustfs_utils::http::insert_str(&mut replacement_metadata, suffix, value.to_owned());
+            }
+        }
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }
@@ -7825,6 +7913,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         join_all(rollback_futures).await;
         drop(namespace_owner);
+        // An explicit purge can carry deleted=true for the existing marker.
+        // It must not create a repair intent that could reintroduce that marker.
+        if quorum_result.is_ok()
+            && fi.deleted
+            && (fi.mark_deleted || force_del_marker)
+            && !fi.tier_free_version()
+            && version_purge_status_from_filemeta(fi.version_purge_status()) != VersionPurgeStatusType::Complete
+            && errs.iter().any(Option::is_some)
+        {
+            let version_id = fi.version_id.map(|version| version.to_string());
+            let _ = self
+                .add_partial(bucket, object, version_id.as_deref().unwrap_or_default())
+                .await;
+        }
         quorum_result
     }
 
@@ -8124,6 +8226,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if removed_delete_marker && version_id.is_some() {
                 vr.deleted = true;
                 vr.mod_time = goi.mod_time;
+            }
+
+            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+                vr.set_delete_marker_incarnation(incarnation);
             }
 
             let v = {
@@ -8807,6 +8913,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             fi.set_tier_free_version_id(&find_vid.to_string());
 
+            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+                fi.set_delete_marker_incarnation(incarnation);
+            }
+
             fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
                 let vid = Uuid::parse_str(vid.as_str())?;
                 (!opts.version_suspended || !vid.is_nil()).then_some(vid)
@@ -8865,6 +8975,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         dfi.set_tier_free_version_id(&find_vid.to_string());
+
+        if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+            dfi.set_delete_marker_incarnation(incarnation);
+        }
 
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
@@ -8936,24 +9050,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        // MRF journal intent: partial-write recovery must survive a restart
-        // (HS-01); the heal request below remains the in-memory fast path.
-        let version_uuid = if version_id.is_empty() {
-            Some(None)
-        } else {
-            uuid::Uuid::try_parse(version_id).ok().map(Some)
-        };
-        if let Some(version_uuid) = version_uuid
-            && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(self.pool_index), u32::try_from(self.set_index))
-        {
-            let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
-            let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
-                rustfs_common::mrf_channel::MrfKind::PartialWrite,
-                bucket,
-                object,
-                version_uuid,
-                Some(scope),
-            );
+        if self.persist_partial_write(bucket, object, Some(version_id)).await {
+            return Ok(());
         }
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),

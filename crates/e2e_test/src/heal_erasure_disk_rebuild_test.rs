@@ -601,7 +601,9 @@ mod tests {
                         .set_continuation_token(continuation_token.clone())
                         .send(),
                 )
-                .await??;
+                .await
+                .map_err(|error| format!("node {node_index} recovery listing timed out for bucket {bucket}: {error}"))?
+                .map_err(|error| format!("node {node_index} recovery listing failed for bucket {bucket}: {error}"))?;
                 listed_keys.extend(
                     response
                         .contents()
@@ -679,8 +681,11 @@ mod tests {
             && operations["activeBySource"]["admin"].as_u64() == Some(1)
     }
 
-    fn is_service_unavailable_put(error: &SdkError<PutObjectError>) -> bool {
-        error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ServiceUnavailable")
+    fn is_retryable_outage_put(error: &SdkError<PutObjectError>) -> bool {
+        matches!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("SlowDownRead" | "ServiceUnavailable")
+        )
     }
 
     fn is_service_unavailable_delete(error: &SdkError<DeleteObjectError>) -> bool {
@@ -707,8 +712,14 @@ mod tests {
                 Ok(Err(error)) if is_retryable_recovery_get(&error) && Instant::now() < deadline => {
                     sleep(Duration::from_millis(250)).await;
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(error) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    return Err(
+                        format!("recovery GET failed for {bucket}/{key} after waiting up to {timeout_secs}s: {error}").into(),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!("recovery GET timed out for {bucket}/{key} after 30s attempt: {error}").into());
+                }
             }
         }
     }
@@ -1587,12 +1598,19 @@ mod tests {
                     outage_key = Some(candidate_key);
                     break;
                 }
-                Ok(Err(error)) if is_service_unavailable_put(&error) => {
+                Ok(Err(error)) if is_retryable_outage_put(&error) => {
                     service_unavailable_outage_writes += 1;
                     last_service_unavailable = Some(format!("{error:?}"));
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(error) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    return Err(format!("outage PUT candidate {candidate_key} failed before target rejoin: {error}").into());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "outage PUT candidate {candidate_key} timed out before target rejoin after 30s: {error}"
+                    )
+                    .into());
+                }
             }
         }
         let outage_key = match outage_key {
@@ -1665,6 +1683,16 @@ mod tests {
             }
         }
 
+        // Keep the partial-repair checkpoint stable across readiness and admin
+        // requests. Endpoint-blackhole tests must prove their own network stall.
+        let commit_barrier = if scenario != InterruptionScenario::TargetEndpointBlackhole {
+            let barrier = replaced_disk.join(".rustfs.sys/e2e-heal-commit-barrier");
+            std::fs::create_dir_all(barrier.parent().ok_or("commit barrier has no parent")?)?;
+            std::fs::write(&barrier, format!("{bucket}/cluster/online/"))?;
+            Some(barrier)
+        } else {
+            None
+        };
         cluster.start_node_from_binary(1, &server_binary).await?;
         for rejected_key in rejected_outage_keys {
             let delete_deadline = Instant::now() + Duration::from_secs(60);
@@ -1816,6 +1844,12 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         };
 
+        if let Some(barrier) = &commit_barrier {
+            assert!(
+                barrier.with_extension("admitted").is_file(),
+                "interruption tests require a server built with e2e-test-hooks"
+            );
+        }
         let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
@@ -2021,6 +2055,9 @@ mod tests {
                     }
                 }
             }
+            if let Some(barrier) = &commit_barrier {
+                std::fs::remove_file(barrier)?;
+            }
             cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {
                 let target = cluster.nodes[1]
@@ -2173,11 +2210,21 @@ mod tests {
                 .await;
                 match put_result {
                     Ok(Ok(_)) => break,
-                    Ok(Err(error)) if is_service_unavailable_put(&error) && Instant::now() < deferred_deadline => {
+                    Ok(Err(error)) if is_retryable_outage_put(&error) && Instant::now() < deferred_deadline => {
                         sleep(Duration::from_secs(1)).await;
                     }
-                    Ok(Err(error)) => return Err(error.into()),
-                    Err(error) => return Err(error.into()),
+                    Ok(Err(error)) => {
+                        return Err(format!(
+                            "deferred outage PUT failed for {bucket}/{outage_key} after target rejoin and up to 60s wait: {error}"
+                        )
+                        .into());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "deferred outage PUT timed out for {bucket}/{outage_key} after 30s attempt: {error}"
+                        )
+                        .into());
+                    }
                 }
             }
             info!(

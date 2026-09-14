@@ -5828,6 +5828,25 @@ impl LocalDisk {
             opts,
             namespace_owner,
         } = mutation;
+        if let Some(expected) = opts.expected_delete_marker.as_ref() {
+            let expected_info = expected.into_fileinfo(volume, path, false)?;
+            if force_del_marker
+                || opts.recursive
+                || opts.immediate
+                || opts.undo_write
+                || opts.undo_delete
+                || opts.old_data_dir.is_some()
+                || path.starts_with(SLASH_SEPARATOR)
+                || fi.deleted
+                || fi.mark_deleted
+                || fi.version_id.is_none_or(|id| id.is_nil())
+                || fi.version_id != expected.version_id
+                || expected_info.delete_marker_incarnation().is_none()
+                || !expected_info.is_canonical_delete_marker()
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+        }
         if path.starts_with(SLASH_SEPARATOR) {
             return self
                 .delete_with_namespace_owner(
@@ -5879,6 +5898,23 @@ impl LocalDisk {
         };
 
         let mut meta = FileMeta::load(&buf)?;
+        if let Some(expected) = opts.expected_delete_marker.as_ref() {
+            let Some(version) = meta
+                .versions
+                .iter()
+                .find(|version| version.header.version_id == fi.version_id)
+            else {
+                return Err(DiskError::FileVersionNotFound);
+            };
+            let actual = version.parse_version_meta()?;
+            if actual.version_type != rustfs_filemeta::VersionType::Delete
+                || actual.object.is_some()
+                || actual.legacy_object.is_some()
+                || actual.delete_marker.as_ref() != Some(expected)
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+        }
         let old_dir = meta.delete_version(&fi)?;
         let mut reserved_version_delete = false;
         if let Some(rollback_dir) = rollback_dir {
@@ -6409,6 +6445,10 @@ impl LocalDisk {
                 // A missing or still-populated directory is benign here; see
                 // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
                 // convention, rustfs/rustfs#4978).
+                if is_dir_not_empty_error(&err) {
+                    // A populated directory keeps its ancestors populated; no further pruning is needed.
+                    return Ok(());
+                }
                 if !is_benign_object_rmdir_error(&err) {
                     warn!(
                         event = EVENT_DISK_LOCAL_DELETE_FAILED,
@@ -9354,6 +9394,41 @@ impl DiskAPI for LocalDisk {
         }
 
         let durability = effective_durability(dst_volume);
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        if let Some(integrity) = part.integrity {
+            integrity.validate()?;
+            if usize::try_from(integrity.number).map_err(|_| DiskError::FileCorrupt)? != part.number
+                || usize::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)? != part.size
+                || dst_file_path.file_name().and_then(|name| name.to_str()) != Some(format!("part.{}", part.number).as_str())
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+            let proof_name = integrity.file_name();
+            let source = src_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
+            let destination = dst_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
+            check_path_length(source.to_string_lossy().as_ref())?;
+            check_path_length(destination.to_string_lossy().as_ref())?;
+            let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
+            if !stat.is_file() || stat.len() != u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)? {
+                return Err(DiskError::FileCorrupt);
+            }
+            if durability.syncs_data_shards() {
+                let source = source.clone();
+                tokio::task::spawn_blocking(move || os::sync_file(&source))
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?;
+            }
+            // Publish the immutable generation before preparing the part switch.
+            // Rollback retains the old generation; an unreferenced new index is
+            // reclaimed with the upload directory if preparation is interrupted.
+            rename_all(&source, &destination, &dst_volume_dir, &self.publication_root).await?;
+            if durability.syncs_commit_metadata() {
+                os::fsync_dir(destination.parent().ok_or(DiskError::FileCorrupt)?)
+                    .await
+                    .map_err(to_file_error)?;
+            }
+        }
         tokio::task::spawn_blocking(move || {
             let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
             if !source.is_file() {
@@ -9462,6 +9537,41 @@ impl DiskAPI for LocalDisk {
             let Some(parent) = transaction_path.parent() else {
                 return Err(DiskError::InvalidPath);
             };
+            // Delete only the generation made obsolete by this settled switch.
+            // Check the published metadata before removing either proof, so a
+            // repeated or interrupted settlement cannot remove a live index.
+            let (retained_name, obsolete_name) = match action {
+                PartTransactionAction::Commit => (PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META),
+                PartTransactionAction::Rollback => (PART_TRANSACTION_OLD_META, PART_TRANSACTION_NEW_META),
+            };
+            if let (Ok(current), Ok(retained), Ok(obsolete)) = (
+                std::fs::read(&current_meta_path),
+                std::fs::read(transaction_path.join(retained_name)),
+                std::fs::read(transaction_path.join(obsolete_name)),
+            ) && current == retained
+                && let Ok(obsolete) = ObjectPartInfo::unmarshal(&obsolete)
+                && let Some(integrity) = obsolete.integrity
+                && integrity.validate().is_ok()
+                && usize::try_from(integrity.number).ok() == Some(obsolete.number)
+                && current_data_path.file_name().and_then(|name| name.to_str())
+                    == Some(format!("part.{}", obsolete.number).as_str())
+                && ObjectPartInfo::unmarshal(&retained)
+                    .ok()
+                    .and_then(|part| part.integrity)
+                    .as_ref()
+                    != Some(&integrity)
+            {
+                let obsolete_path = parent.join(integrity.file_name());
+                match std::fs::remove_file(&obsolete_path) {
+                    Ok(()) => {
+                        if durability.syncs_commit_metadata() {
+                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(to_file_error(error).into()),
+                }
+            }
             let cleanup_path = parent.join(format!(".part-txn-settled-{}", Uuid::new_v4()));
             std::fs::rename(&transaction_path, &cleanup_path).map_err(to_file_error)?;
             if durability.syncs_commit_metadata() {
@@ -9733,6 +9843,31 @@ impl DiskAPI for LocalDisk {
         self.io_backend
             .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
             .await
+    }
+
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        let source = self.io_get_object_path(src_volume, src_path)?;
+        let destination = self.io_get_object_path(dst_volume, dst_path)?;
+        check_path_length(source.to_string_lossy().as_ref())?;
+        check_path_length(destination.to_string_lossy().as_ref())?;
+        let durability = effective_durability(dst_volume);
+        let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
+        if !stat.is_file() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        if durability.syncs_data_shards() {
+            tokio::task::spawn_blocking(move || os::sync_file(&source))
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
+        }
+        self.rename_file(src_volume, src_path, dst_volume, dst_path).await?;
+        if durability.syncs_commit_metadata() {
+            os::fsync_dir(destination.parent().ok_or(DiskError::InvalidPath)?)
+                .await
+                .map_err(to_file_error)?;
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -11228,6 +11363,176 @@ mod test {
             (disk, dir)
         }
 
+        #[tokio::test]
+        async fn delete_pruning_stops_at_live_metadata_below_a_guarded_ancestor() {
+            // Tuple fields drop in order, releasing the disk's root handle before the temporary directory.
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            let base = disk.get_bucket_path(RUSTFS_META_BUCKET).expect("resolve metadata volume");
+            let shared = base.join("buckets");
+            let guard = Arc::new(
+                os::mkdir_all_below_existing_base_std(&shared, &base, &disk.publication_root)
+                    .expect("retain the shared publication directory"),
+            );
+
+            for owned in [false, true] {
+                for missing_backup in [false, true] {
+                    let transaction = Uuid::new_v4();
+                    let object = shared.join(".bloomcycle.bin");
+                    let rollback = object.join(transaction.to_string());
+                    let metadata = object.join(STORAGE_FORMAT_FILE);
+                    let backup = rollback.join(STORAGE_FORMAT_FILE_BACKUP);
+                    fs::create_dir_all(&rollback).await.expect("create rollback directory");
+                    fs::write(&metadata, b"committed metadata")
+                        .await
+                        .expect("write live metadata");
+                    if !missing_backup {
+                        fs::write(&backup, b"old metadata").await.expect("write rollback backup");
+                    }
+                    let owner: Option<Arc<dyn Send + Sync>> = if owned { Some(guard.clone()) } else { None };
+                    let result = disk
+                        .delete_with_namespace_owner(
+                            RUSTFS_META_BUCKET,
+                            &format!("buckets/.bloomcycle.bin/{transaction}/{STORAGE_FORMAT_FILE_BACKUP}"),
+                            DeleteOptions::default(),
+                            owner,
+                        )
+                        .await;
+
+                    assert!(!backup.exists(), "backup must be absent, owned={owned}, missing={missing_backup}");
+                    assert!(!rollback.exists(), "empty rollback directory must be pruned");
+                    assert_eq!(fs::read(&metadata).await.expect("read committed metadata"), b"committed metadata");
+                    result.expect("a nonempty object must stop pruning before the guarded ancestor");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_removes_empty_and_missing_ancestors_but_keeps_the_volume() {
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+
+            for missing in [false, true] {
+                let parent = base.join("parent");
+                let rollback = parent.join("object/transaction");
+                fs::create_dir_all(&rollback).await.expect("create empty ancestor chain");
+                let path = if missing {
+                    "parent/object/transaction/missing/xl.meta.bkp"
+                } else {
+                    fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), b"backup")
+                        .await
+                        .expect("create backup");
+                    "parent/object/transaction/xl.meta.bkp"
+                };
+
+                disk.delete("pruning", path, DeleteOptions::default())
+                    .await
+                    .expect("empty and missing ancestors should be pruned");
+                assert!(!parent.exists(), "the whole empty chain should be removed");
+                assert!(base.is_dir(), "pruning must stop at the volume boundary");
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_pruning_does_not_remove_the_base_or_an_outside_path() {
+            let fixture = new_disk().await;
+            let (disk, dir) = &fixture;
+            let base = dir.path().join("base");
+            let outside = dir.path().join("outside");
+            fs::create_dir(&base).await.expect("create base");
+            fs::write(&outside, b"outside data").await.expect("create outside file");
+
+            disk.delete_file(&base, &base, false, false)
+                .await
+                .expect("base path is protected");
+            disk.delete_file(&base, &outside, false, false)
+                .await
+                .expect("outside path is protected");
+            assert!(base.is_dir(), "the base must not be removed even when empty");
+            assert_eq!(fs::read(&outside).await.expect("read outside file"), b"outside data");
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_backup_error() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
+
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let backup = base.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&backup)
+                .expect("hold the backup without delete sharing");
+
+            let err = disk
+                .delete("pruning", STORAGE_FORMAT_FILE_BACKUP, DeleteOptions::default())
+                .await
+                .expect_err("a genuine target-file deletion failure must propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve the failing path and original OS error");
+            assert_eq!(context.path, backup);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert_eq!(fs::read(&backup).await.expect("backup remains readable"), b"backup");
+            drop(guard);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn delete_pruning_propagates_a_locked_empty_parent_error() {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "pruning").await;
+            let base = disk.get_bucket_path("pruning").expect("resolve test volume");
+            let parent = base.join("parent");
+            let guard = os::mkdir_all_below_existing_base_std(&parent, &base, &disk.publication_root)
+                .expect("retain an empty parent without delete sharing");
+            let backup = parent.join(STORAGE_FORMAT_FILE_BACKUP);
+            fs::write(&backup, b"backup").await.expect("write backup");
+
+            let err = disk
+                .delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect_err("a real parent failure without a nonempty boundary must still propagate");
+            let DiskError::Io(err) = err else {
+                panic!("expected contextual I/O error, got {err:?}");
+            };
+            let context = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<FileAccessDeniedWithContext>())
+                .expect("preserve parent failure context");
+            assert_eq!(context.path, parent);
+            assert_eq!(
+                context.source.raw_os_error(),
+                Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("OS code fits"))
+            );
+            assert!(!backup.exists(), "the target was removed before the parent error");
+            assert!(parent.is_dir(), "the guarded parent remains");
+            drop(guard);
+            disk.delete("pruning", "parent/xl.meta.bkp", DeleteOptions::default())
+                .await
+                .expect("pruning should succeed once the actual guard is released");
+            assert!(!parent.exists());
+            assert!(base.is_dir());
+        }
+
         // #948: a genuinely missing source is benign and must still return Ok.
         #[tokio::test]
         async fn windows_and_unix_move_to_trash_missing_source_is_ok() {
@@ -11711,12 +12016,57 @@ mod test {
     /// stale deterministically, instead of sleeping and hoping the filesystem
     /// timestamp granularity (or a backward wall-clock step) cooperates.
     fn backdate_mtime(path: &Path, age: Duration) {
-        use std::fs::{File, FileTimes};
+        use std::fs::{FileTimes, OpenOptions};
         let mtime = std::time::SystemTime::now() - age;
-        File::open(path)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+            // Directories need backup semantics, and changing mtime needs attribute-write access.
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options
+            .open(path)
             .expect("path should open to backdate its mtime")
             .set_times(FileTimes::new().set_modified(mtime))
             .expect("mtime should rewind into the past");
+    }
+
+    #[test]
+    fn cleanup_tmp_on_startup_backdate_mtime_preserves_files_and_directory_contents() {
+        use std::time::SystemTime;
+
+        let root = tempfile::tempdir().expect("create timestamp fixture root");
+        let directory = root.path().join("directory");
+        let file = directory.join("payload");
+        std::fs::create_dir(&directory).expect("create timestamp fixture directory");
+        std::fs::write(&file, b"unchanged payload").expect("write timestamp fixture payload");
+        let age = Duration::from_secs(60);
+        // Filesystems may round stored timestamps; do not require subsecond precision or sleep.
+        let rounding = Duration::from_secs(2);
+
+        for path in [&file, &directory] {
+            let earliest = SystemTime::now() - age - rounding;
+            backdate_mtime(path, age);
+            let latest = SystemTime::now() - age + rounding;
+            let modified = std::fs::metadata(path)
+                .expect("read backdated path metadata")
+                .modified()
+                .expect("read backdated modification time");
+            assert!(modified >= earliest && modified <= latest, "mtime must be backdated for {path:?}");
+        }
+
+        let moved = root.path().join("moved");
+        std::fs::rename(&directory, &moved).expect("mtime helper must release its handles before cleanup");
+        assert_eq!(
+            std::fs::read(moved.join("payload")).expect("read preserved payload"),
+            b"unchanged payload"
+        );
     }
 
     #[tokio::test]
@@ -12088,7 +12438,15 @@ mod test {
         ensure_test_volume(&disk, bucket).await;
 
         let payload = Bytes::from_static(b"part payload");
-        let meta = Bytes::from_static(b"part metadata");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("legacy part metadata"),
+        );
         disk.write_all(tmp_volume, "upload/part.1", payload.clone())
             .await
             .expect("source part should be written");
@@ -12178,7 +12536,15 @@ mod test {
             "regression path must cross the traditional Windows MAX_PATH boundary: {deepest_marker:?}"
         );
         let payload = Bytes::from_static(b"part payload");
-        let meta = Bytes::from_static(b"part metadata");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("legacy part metadata"),
+        );
         disk.write_all(RUSTFS_META_TMP_BUCKET, src_path, payload.clone())
             .await
             .expect("source part should be written");
@@ -12207,7 +12573,15 @@ mod test {
         );
 
         let replacement_payload = Bytes::from_static(b"replacement part payload");
-        let replacement_meta = Bytes::from_static(b"replacement part metadata");
+        let replacement_meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: replacement_payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("legacy replacement metadata"),
+        );
         disk.write_all(RUSTFS_META_TMP_BUCKET, src_path, replacement_payload.clone())
             .await
             .expect("replacement source part should be written");
@@ -12272,9 +12646,23 @@ mod test {
             .await
             .expect("old part metadata should be staged");
 
-        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", Bytes::from_static(b"new metadata"))
-            .await
-            .expect("part transaction should be prepared");
+        disk.prepare_part_transaction(
+            "tmp",
+            "upload/part.1",
+            "bucket",
+            "object/part.1",
+            Bytes::from(
+                ObjectPartInfo {
+                    number: 1,
+                    size: 8,
+                    ..Default::default()
+                }
+                .marshal_msg()
+                .expect("legacy part metadata"),
+            ),
+        )
+        .await
+        .expect("part transaction should be prepared");
         disk.rename_file("tmp", "upload/part.1", "bucket", "object/part.1")
             .await
             .expect("data publication should succeed");
@@ -12293,6 +12681,139 @@ mod test {
                 .await
                 .expect("old part metadata should be restored"),
             Bytes::from_static(b"old metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_part_transaction_keeps_only_the_settled_generation() {
+        use crate::io_support::shard_integrity::IntegrityBuilder;
+        use rustfs_filemeta::shard_integrity::IntegrityLayout;
+        for action in [PartTransactionAction::Commit, PartTransactionAction::Rollback] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("path")).expect("endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+            ensure_test_volume(&disk, "tmp").await;
+            ensure_test_volume(&disk, "bucket").await;
+            let mut parts = Vec::new();
+            for (volume, directory, byte) in [("bucket", "object", b'a'), ("tmp", "upload", b'b')] {
+                let mut builder =
+                    IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+                let shard = [byte; 4];
+                builder.push([shard.as_slice(); 4].into_iter()).await.expect("stripe");
+                let prepared = builder.finish(8).await.expect("proof");
+                disk.write_all(
+                    volume,
+                    &format!("{directory}/{}", prepared.part.file_name()),
+                    prepared.inline_bytes().expect("index"),
+                )
+                .await
+                .expect("index file");
+                disk.write_all(volume, &format!("{directory}/part.1"), Bytes::copy_from_slice(&shard))
+                    .await
+                    .expect("data");
+                let part = ObjectPartInfo {
+                    number: 1,
+                    size: 8,
+                    integrity: Some(prepared.part),
+                    ..Default::default()
+                };
+                let meta = Bytes::from(part.marshal_msg().expect("metadata"));
+                disk.write_all(volume, &format!("{directory}/part.1.meta"), meta.clone())
+                    .await
+                    .expect("part meta");
+                parts.push((part, meta));
+            }
+            disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", parts[1].1.clone())
+                .await
+                .expect("prepare");
+            for (part, _) in &parts {
+                assert!(
+                    disk.read_all("bucket", &format!("object/{}", part.integrity.as_ref().expect("proof").file_name()))
+                        .await
+                        .is_ok(),
+                    "both generations survive preparation"
+                );
+            }
+            disk.rename_part("tmp", "upload/part.1", "bucket", "object/part.1", parts[1].1.clone())
+                .await
+                .expect("publish");
+            disk.settle_part_transaction("bucket", "object/part.1", action)
+                .await
+                .expect("settle");
+            let retained = usize::from(action == PartTransactionAction::Commit);
+            assert_eq!(
+                disk.read_all("bucket", "object/part.1.meta").await.expect("settled metadata"),
+                parts[retained].1
+            );
+            for (index, (part, _)) in parts.iter().enumerate() {
+                let exists = disk
+                    .read_all("bucket", &format!("object/{}", part.integrity.as_ref().expect("proof").file_name()))
+                    .await
+                    .is_ok();
+                assert_eq!(exists, index == retained, "obsolete proof is reclaimed after settlement");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_settlement_never_deletes_another_parts_index() {
+        use crate::io_support::shard_integrity::IntegrityBuilder;
+        use rustfs_filemeta::shard_integrity::IntegrityLayout;
+        let dir = tempfile::tempdir().expect("fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+        let mut builder = IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 2).expect("builder");
+        builder.push([b"data".as_slice(); 4].into_iter()).await.expect("stripe");
+        let prepared = builder.finish(8).await.expect("index");
+        let other_index = format!("object/{}", prepared.part.file_name());
+        let index_bytes = prepared.inline_bytes().expect("index bytes");
+        disk.write_all("bucket", &other_index, index_bytes.clone())
+            .await
+            .expect("part 2 index");
+        let corrupt = ObjectPartInfo {
+            number: 1,
+            size: 8,
+            integrity: Some(prepared.part),
+            ..Default::default()
+        };
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old data"))
+            .await
+            .expect("old data");
+        disk.write_all(
+            "bucket",
+            "object/part.1.meta",
+            Bytes::from(corrupt.marshal_msg().expect("misdirected metadata")),
+        )
+        .await
+        .expect("corrupt old metadata");
+        disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"new data"))
+            .await
+            .expect("new data");
+        let replacement = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: 8,
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("replacement"),
+        );
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", replacement.clone())
+            .await
+            .expect("prepare");
+        disk.rename_part("tmp", "upload/part.1", "bucket", "object/part.1", replacement)
+            .await
+            .expect("publish");
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Commit)
+            .await
+            .expect("settle");
+        assert_eq!(
+            disk.read_all("bucket", &other_index)
+                .await
+                .expect("unrelated part index retained"),
+            index_bytes
         );
     }
 
@@ -16119,6 +16640,114 @@ mod test {
     }
 
     #[tokio::test]
+    async fn retired_marker_condition_preserves_replacements_and_other_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.unwrap());
+        let bucket = "retired-marker-condition";
+        let object = "reused.bin";
+        ensure_test_volume(&disk, bucket).await;
+        let version = Uuid::new_v4();
+        let old_incarnation = Uuid::new_v4();
+        let mut old = FileInfo {
+            name: object.into(),
+            version_id: Some(version),
+            deleted: true,
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        old.set_delete_marker_incarnation(old_incarnation);
+        let condition = rustfs_filemeta::MetaDeleteMarker::from(old.clone());
+        let request = FileInfo {
+            name: object.into(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let options = DeleteOptions {
+            expected_delete_marker: Some(condition),
+            ..Default::default()
+        };
+        let mut unrelated =
+            test_file_info(object, Uuid::new_v4(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"current bytes")));
+        unrelated.set_inline_data();
+        disk.write_metadata("", bucket, object, unrelated.clone()).await.unwrap();
+        disk.write_metadata("", bucket, object, old.clone()).await.unwrap();
+        for replacement in [
+            {
+                let mut current = old.clone();
+                current.set_delete_marker_incarnation(Uuid::new_v4());
+                current
+            },
+            {
+                let mut changed = old.clone();
+                changed.mod_time = Some(changed.mod_time.unwrap() + time::Duration::seconds(1));
+                changed
+            },
+            test_file_info(object, version, Some(Uuid::new_v4()), Some(Bytes::from_static(b"replacement data"))),
+        ] {
+            // The request was formed from the old observation. Publication must
+            // still compare against the metadata present when it obtains the lease.
+            disk.write_metadata("", bucket, object, replacement).await.unwrap();
+            let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let before = fs::read(&path).await.unwrap();
+            assert!(
+                disk.delete_version(bucket, object, request.clone(), false, options.clone())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&path).await.unwrap(),
+                before,
+                "a stale condition must not publish any metadata change"
+            );
+        }
+        disk.write_metadata("", bucket, object, old.clone()).await.unwrap();
+        let lease = os::acquire_metadata_mutation_lease(&disk.get_object_path(bucket, object).unwrap(), None).await;
+        let pending = tokio::spawn({
+            let disk = disk.clone();
+            let request = request.clone();
+            let options = options.clone();
+            async move { disk.delete_version(bucket, object, request, false, options).await }
+        });
+        // Publish a competing generation while owning the actual metadata
+        // lease. The delayed delete must read this replacement after release.
+        let mut replacement = old.clone();
+        replacement.set_delete_marker_incarnation(Uuid::new_v4());
+        disk.write_metadata_with_namespace_owner(bucket, object, replacement, Some(lease.clone()))
+            .await
+            .unwrap();
+        let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let after_replacement = fs::read(&path).await.unwrap();
+        assert!(!pending.is_finished(), "conditional deletion must wait for the metadata lease");
+        drop(lease);
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(fs::read(&path).await.unwrap(), after_replacement);
+        disk.write_metadata("", bucket, object, old).await.unwrap();
+        disk.delete_version(bucket, object, request, false, options)
+            .await
+            .expect("matching retired marker condition");
+        assert!(matches!(
+            disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                .await,
+            Err(DiskError::FileVersionNotFound)
+        ));
+        let retained = disk
+            .read_version(
+                "",
+                bucket,
+                object,
+                &unrelated.version_id.unwrap().to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unrelated new version remains");
+        assert_eq!(retained.data, unrelated.data);
+    }
+
+    #[tokio::test]
     async fn test_delete_version_undo_restores_backup_to_object_root() {
         use tempfile::tempdir;
 
@@ -19393,6 +20022,7 @@ mod test {
             undo_write: false,
             undo_delete: false,
             old_data_dir: None,
+            expected_delete_marker: None,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await

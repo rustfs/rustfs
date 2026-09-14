@@ -22,13 +22,15 @@ use super::*;
 use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
 use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // The metadata bucket already exists and its parent is durable. Creating a
 // nested journal directory here would also require syncing every ancestor.
 const ROOT_RECOVERY_PREFIX: &str = "root-heal-";
 const ROOT_TERMINAL_PREFIX: &str = "terminal-root-heal-";
 const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
-const ROOT_RECOVERY_SCHEMA: u32 = 2;
+const SCOPED_ROOT_RECOVERY_SCHEMA: u32 = 2;
+const ROOT_RECOVERY_SCHEMA: u32 = 3;
 const ROOT_TERMINAL_SCHEMA: u32 = 1;
 const ROOT_TERMINAL_GC_SCAN_BUDGET: usize = 1024;
 const ROOT_TERMINAL_GC_DELETE_BUDGET: usize = 64;
@@ -194,6 +196,8 @@ struct RootHealIntent {
     task_id: String,
     #[serde(default = "default_recovery_heal_type")]
     heal_type: RecoveryHealType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bucket_incarnation_id: Option<Uuid>,
     #[serde(deserialize_with = "decode_options")]
     options: HealOptions,
     priority: HealPriority,
@@ -208,6 +212,8 @@ struct RootHealTerminal {
     task_id: String,
     heal_type: RecoveryHealType,
     status: HealTaskStatus,
+    #[serde(default, deserialize_with = "decode_options")]
+    options: HealOptions,
     progress: Option<HealProgress>,
     completed_at: SystemTime,
 }
@@ -219,17 +225,19 @@ impl RootHealTerminal {
             task_id: task_id.to_owned(),
             heal_type: RecoveryHealType::from(&completed.heal_type),
             status: completed.status.clone(),
+            options: completed.options.clone(),
             progress: completed.progress.clone(),
             completed_at: completed.completed_at,
         }
     }
 
-    fn cancelled(task_id: &str, heal_type: &HealType) -> Self {
+    fn cancelled(task_id: &str, heal_type: &HealType, options: HealOptions) -> Self {
         Self {
             schema: ROOT_TERMINAL_SCHEMA,
             task_id: task_id.to_owned(),
             heal_type: RecoveryHealType::from(heal_type),
             status: HealTaskStatus::Cancelled,
+            options,
             progress: None,
             completed_at: SystemTime::now(),
         }
@@ -241,6 +249,7 @@ impl RootHealTerminal {
             progress: self.progress,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: self.heal_type.into(),
+            options: self.options,
             status: self.status,
             result_items_truncated: false,
             completed_at: self.completed_at,
@@ -263,6 +272,7 @@ impl RootHealIntent {
             schema: ROOT_RECOVERY_SCHEMA,
             task_id: request.id.clone(),
             heal_type: RecoveryHealType::from(&request.heal_type),
+            bucket_incarnation_id: request.bucket_incarnation_id,
             options: request.options.clone(),
             priority: request.priority,
             retry_attempts: request.retry_attempts,
@@ -273,6 +283,7 @@ impl RootHealIntent {
     fn into_request(self) -> HealRequest {
         let mut request = HealRequest::new(self.heal_type.into(), self.options, self.priority);
         request.id = self.task_id;
+        request.bucket_incarnation_id = self.bucket_incarnation_id;
         request.source = HealRequestSource::Admin;
         request.retry_attempts = self.retry_attempts;
         request.created_at = self.created_at;
@@ -354,9 +365,16 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
         return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}")));
     }
     match intent.schema {
-        LEGACY_ROOT_RECOVERY_SCHEMA if intent.heal_type == RecoveryHealType::Cluster => {}
+        LEGACY_ROOT_RECOVERY_SCHEMA
+            if intent.heal_type == RecoveryHealType::Cluster && intent.bucket_incarnation_id.is_none() => {}
+        SCOPED_ROOT_RECOVERY_SCHEMA if intent.bucket_incarnation_id.is_none() => {}
         ROOT_RECOVERY_SCHEMA => {}
         _ => return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}"))),
+    }
+    if !matches!(intent.heal_type, RecoveryHealType::Bucket { .. }) && intent.bucket_incarnation_id.is_some() {
+        return Err(Error::Other(format!(
+            "Unexpected bucket incarnation in root heal recovery record {task_id}"
+        )));
     }
     intent.heal_type.validate()?;
     Ok(intent)
@@ -612,7 +630,9 @@ impl RootHealRecovery {
             return Ok(());
         };
         let mut intent = decode_intent(&task.id, &expected)?;
-        if HealType::from(intent.heal_type.clone()) != task.heal_type {
+        if HealType::from(intent.heal_type.clone()) != task.heal_type
+            || intent.bucket_incarnation_id != task.bucket_incarnation_id
+        {
             return Err(Error::Other(format!("Root heal recovery owner changed for {}", task.id)));
         }
         let mut expected_options = intent.options.clone();
@@ -676,7 +696,7 @@ impl RootHealRecovery {
         };
         let pending = decode_intent(task_id, &bytes)?;
         let heal_type = HealType::from(pending.heal_type);
-        let terminal = RootHealTerminal::cancelled(task_id, &heal_type);
+        let terminal = RootHealTerminal::cancelled(task_id, &heal_type, pending.options);
         let _ = Self::persist_terminal_locked(&disks, task_id, terminal).await?;
         match EcstoreDiskAPI::compare_and_update_file(
             disk.as_ref(),
@@ -923,7 +943,31 @@ impl HealManager {
         // Decode every record before admitting anything. These are already
         // accepted responsibilities, so restore distinct IDs even when their
         // paths overlap or the configured admission capacity has changed.
-        let requests = self.root_recovery.pending().await?;
+        let pending = self.root_recovery.pending().await?;
+        let mut requests = Vec::with_capacity(pending.len());
+        for request in pending {
+            if let HealType::Bucket { bucket } = &request.heal_type {
+                match self
+                    .storage
+                    .validate_bucket_incarnation(bucket, request.bucket_incarnation_id)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error @ Error::StaleBucketIncarnation { .. }) => {
+                        let mut terminal = RootHealTerminal::cancelled(&request.id, &request.heal_type, request.options.clone());
+                        terminal.status = HealTaskStatus::Failed {
+                            error: error.to_string(),
+                        };
+                        self.root_recovery
+                            .persist_terminal(&request.id, &request.heal_type, request.source, &terminal.into_completed())
+                            .await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            requests.push(request);
+        }
         let active = self.active_heals.lock().await;
         let mut queue = self.heal_queue.lock().await;
         let retrying = self.retrying_heals.lock().await;

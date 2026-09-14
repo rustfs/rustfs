@@ -17,6 +17,20 @@ use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
 use std::collections::HashSet;
 
+fn bucket_incarnations() -> &'static std::sync::Mutex<HashMap<String, Option<Uuid>>> {
+    static IDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Uuid>>>> = std::sync::OnceLock::new();
+    IDS.get_or_init(Default::default)
+}
+
+pub(super) fn test_bucket_incarnation(bucket: &str) -> Option<Uuid> {
+    bucket_incarnations()
+        .lock()
+        .expect("bucket incarnation fixture")
+        .get(bucket)
+        .copied()
+        .unwrap_or(Some(Uuid::from_u128(42)))
+}
+
 #[cfg(unix)]
 struct RestoreDirectoryMode {
     path: std::path::PathBuf,
@@ -93,6 +107,9 @@ fn root_request() -> HealRequest {
 fn admin_request(heal_type: HealType) -> HealRequest {
     let mut request = HealRequest::new(heal_type, HealOptions::default(), HealPriority::High);
     request.source = HealRequestSource::Admin;
+    if let HealType::Bucket { bucket } = &request.heal_type {
+        request.bucket_incarnation_id = test_bucket_incarnation(bucket);
+    }
     request
 }
 
@@ -100,6 +117,7 @@ fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> Com
     CompletedHealStatus {
         outcome: None,
         heal_type: heal_type.clone(),
+        options: HealOptions::default(),
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
             objects_scanned: 1,
@@ -381,9 +399,12 @@ async fn root_recovery_non_admin_request_is_not_persisted() {
 async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
-    let request = admin_request(HealType::Bucket {
+    let mut request = admin_request(HealType::Bucket {
         bucket: "bucket".to_string(),
     });
+    request.options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Deep;
+    request.options.dry_run = true;
+    request.options.recreate_missing = false;
     manager
         .root_recovery
         .persist(&request)
@@ -417,6 +438,14 @@ async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
             .await
             .expect("durable cancellation remains queryable by id"),
         HealTaskStatus::Cancelled
+    );
+    assert_eq!(
+        restarted
+            .get_task_report(&request.id)
+            .await
+            .expect("durable cancellation report")
+            .options,
+        Some(request.options)
     );
 }
 
@@ -480,7 +509,7 @@ async fn root_recovery_terminal_receipt_wins_over_stale_pending_scoped_intent_af
         .await
         .expect("durable bucket responsibility");
     manager
-        .publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source)
+        .publish_admin_cancelled_terminal(&request.id, &request.heal_type, request.source, &request.options)
         .await
         .expect("publish terminal receipt");
     manager
@@ -517,9 +546,12 @@ async fn root_recovery_terminal_receipt_wins_over_stale_pending_scoped_intent_af
 async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
-    let request = admin_request(HealType::Bucket {
+    let mut request = admin_request(HealType::Bucket {
         bucket: "bucket".to_string(),
     });
+    request.options.scan_mode = rustfs_heal_contracts::heal_channel::HealScanMode::Deep;
+    request.options.dry_run = true;
+    request.options.recreate_missing = false;
     manager
         .root_recovery
         .persist(&request)
@@ -528,6 +560,7 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
     let completed = CompletedHealStatus {
         outcome: None,
         heal_type: request.heal_type.clone(),
+        options: request.options.clone(),
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
             objects_scanned: 2,
@@ -574,6 +607,49 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
         .expect("completed terminal exposes progress");
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
+    assert_eq!(
+        restarted
+            .get_task_report(&request.id)
+            .await
+            .expect("completed terminal report")
+            .options,
+        Some(request.options)
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_legacy_terminal_without_options_uses_defaults() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "legacy-bucket".to_string(),
+    });
+    let completed = completed_admin_status(&request.heal_type, SystemTime::now());
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("publish terminal receipt");
+
+    let path = format!("terminal-root-heal-{}.json", request.id);
+    let bytes = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read terminal receipt");
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("decode terminal receipt");
+    value.as_object_mut().expect("terminal object").remove("options");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &path,
+        serde_json::to_vec(&value).expect("encode legacy receipt").into(),
+    )
+    .await
+    .expect("write legacy terminal receipt");
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    let report = restarted
+        .get_task_report(&request.id)
+        .await
+        .expect("legacy terminal remains queryable");
+    assert_eq!(report.status, HealTaskStatus::Completed);
+    assert_eq!(report.options, Some(HealOptions::default()));
 }
 
 #[tokio::test]
@@ -857,6 +933,161 @@ async fn root_recovery_force_start_cancels_only_overlapping_durable_admin_record
 }
 
 #[tokio::test]
+async fn root_recovery_admin_overlap_rejects_durable_only_owners_without_writing_new_intents() {
+    for (existing, incoming, reason) in [
+        ("scope/", "scope/", HealAdmissionDropReason::AlreadyRunning),
+        ("scope/", "scope/child/", HealAdmissionDropReason::OverlappingPaths),
+        ("scope/child/", "scope/", HealAdmissionDropReason::OverlappingPaths),
+    ] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk]);
+        let mut owner = admin_prefix_request("bucket", existing);
+        owner.options.timeout = Some(Duration::ZERO);
+        manager.root_recovery.persist(&owner).await.expect("persist unreplayed owner");
+        let receipt = manager
+            .submit_heal_request_with_receipt(admin_prefix_request("bucket", incoming))
+            .await
+            .expect("durable overlap decision");
+        assert_eq!(receipt.result, HealAdmissionResult::Dropped(reason));
+        assert_eq!(receipt.task_id, owner.id);
+        assert!(manager.heal_queue.lock().await.is_empty());
+        let pending = manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("original durable responsibility remains");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, owner.id);
+        assert_eq!(
+            pending[0].options.timeout,
+            Some(Duration::ZERO),
+            "admission must not reset an exhausted budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_same_id_does_not_overwrite_a_durable_only_budget() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let mut owner = admin_prefix_request("bucket", "scope/");
+    owner.options.timeout = Some(Duration::ZERO);
+    manager.root_recovery.persist(&owner).await.expect("exhausted owner");
+    let mut replay = owner.clone();
+    replay.options.timeout = Some(Duration::from_secs(60));
+    replay.force_start = true;
+    let receipt = manager
+        .submit_heal_request_with_receipt(replay)
+        .await
+        .expect("same ID conflicts with durable owner");
+    assert_eq!(receipt.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    let pending = manager.root_recovery.pending().await.expect("retained owner");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].options.timeout, Some(Duration::ZERO));
+    assert!(manager.heal_queue.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_owner() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let owner = admin_prefix_request("bucket", "scope/child/");
+    manager
+        .submit_heal_request(owner.clone())
+        .await
+        .expect("admit original owner");
+    let corrupt = root_request();
+    let path = format!("root-heal-{}.json", corrupt.id);
+    disk.write_all(RUSTFS_META_BUCKET, &path, b"{".to_vec().into())
+        .await
+        .expect("inject corrupt ownership record");
+    let mut replacement = admin_prefix_request("bucket", "scope/");
+    replacement.force_start = true;
+    assert!(
+        manager.submit_heal_request(replacement).await.is_err(),
+        "unknown ownership must fail before cancellation"
+    );
+    assert_eq!(
+        manager
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>(),
+        vec![owner.id.clone()]
+    );
+    assert_eq!(
+        manager
+            .get_task_status(&owner.id)
+            .await
+            .expect("original owner remains queryable"),
+        HealTaskStatus::Pending
+    );
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("retain corrupt record")
+            .as_ref(),
+        b"{"
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_admin_overlap_preserves_legacy_owners_and_replays_replacement_cancellations() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let parent = admin_prefix_request("bucket", "scope/");
+    let child = admin_prefix_request("bucket", "scope/child/");
+    manager
+        .root_recovery
+        .persist(&parent)
+        .await
+        .expect("legacy parent responsibility");
+    manager
+        .root_recovery
+        .persist(&child)
+        .await
+        .expect("legacy child responsibility");
+    manager
+        .replay_root_heals()
+        .await
+        .expect("accepted legacy owners must not be discarded");
+    assert_eq!(manager.heal_queue.lock().await.len(), 2);
+    let rejected = manager
+        .submit_heal_request_with_receipt(admin_prefix_request("bucket", "scope/child/deep/"))
+        .await
+        .expect("new overlap must reject after replay");
+    assert_eq!(rejected.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths));
+    let mut replacement = admin_prefix_request("bucket", "scope/");
+    replacement.force_start = true;
+    let receipt = manager
+        .submit_heal_request_with_receipt(replacement)
+        .await
+        .expect("replace both recovered owners");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    drop(manager);
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restart replacement");
+    assert_eq!(
+        restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>(),
+        vec![receipt.task_id]
+    );
+    for owner in [&parent.id, &child.id] {
+        assert_eq!(
+            restarted.get_task_status(owner).await.expect("cancellation survives restart"),
+            HealTaskStatus::Cancelled
+        );
+    }
+}
+
+#[tokio::test]
 async fn root_recovery_queued_non_root_admin_owner_is_not_priority_displaced() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
@@ -981,7 +1212,9 @@ async fn root_recovery_queued_owner_is_not_priority_displaced() {
         HealOptions::default(),
         HealPriority::Urgent,
     );
-    bucket.source = HealRequestSource::Admin;
+    // Internal urgent work has the same displacement eligibility without
+    // taking the administrator overlap rejection before the capacity check.
+    bucket.source = HealRequestSource::Internal;
     assert_eq!(
         manager
             .submit_heal_request(bucket)
@@ -1200,7 +1433,7 @@ async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
         let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read root record");
         let mut value: serde_json::Value = serde_json::from_slice(&original).expect("record JSON");
         match kind {
-            "schema" => value["schema"] = 3.into(),
+            "schema" => value["schema"] = 4.into(),
             "identity" => value["task_id"] = valid.id.clone().into(),
             "option" => value["options"]["future_delete_mode"] = true.into(),
             "no_lock" => value["options"]["no_lock"] = true.into(),
@@ -1437,4 +1670,175 @@ async fn root_recovery_terminal_timeout_updates_only_existing_journal_before_sec
             "durable={durable}"
         );
     }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_recovery_retires_old_owner_and_admits_successor() {
+    let (_temp, disk) = recovery_disk().await;
+    let bucket = format!("incarnation-replay-{}", Uuid::new_v4());
+    let old = Uuid::new_v4();
+    let new = Uuid::new_v4();
+    bucket_incarnations()
+        .lock()
+        .expect("fixture")
+        .insert(bucket.clone(), Some(old));
+    let manager = recovery_manager(vec![disk.clone()]);
+    let mut request = HealRequest::bucket(bucket.clone());
+    request.source = HealRequestSource::Admin;
+    request.options.recursive = true;
+    let token = request.id.clone();
+    manager
+        .submit_heal_request_with_receipt(request)
+        .await
+        .expect("admit original bucket");
+    let pending = manager.root_recovery.pending().await.expect("read admission");
+    assert_eq!(pending[0].bucket_incarnation_id, Some(old));
+    let original = disk
+        .read_all(RUSTFS_META_BUCKET, &format!("root-heal-{token}.json"))
+        .await
+        .expect("raw admission");
+    drop(manager);
+
+    let same = recovery_manager(vec![disk.clone()]);
+    same.replay_root_heals().await.expect("same generation restart");
+    let restored = same
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .next()
+        .expect("restored owner")
+        .clone();
+    assert_eq!(restored.id, token);
+    assert_eq!(restored.bucket_incarnation_id, Some(old));
+    assert!(restored.options.recursive);
+    let retry = HealTask::from_request(restored, Arc::new(MockStorage)).retry_request();
+    assert_eq!(retry.bucket_incarnation_id, Some(old));
+    drop(same);
+
+    bucket_incarnations()
+        .lock()
+        .expect("fixture")
+        .insert(bucket.clone(), Some(new));
+    let restarted = recovery_manager(vec![disk.clone()]);
+    restarted.replay_root_heals().await.expect("retire obsolete admission");
+    assert_eq!(restarted.heal_queue.lock().await.len(), 0);
+    assert!(matches!(restarted.get_task_status(&token).await.expect("old token remains queryable"),
+        HealTaskStatus::Failed { error } if error.starts_with("stale_bucket_incarnation:")));
+    let mut fresh = HealRequest::bucket(bucket.clone());
+    fresh.source = HealRequestSource::Admin;
+    let receipt = restarted
+        .submit_heal_request_with_receipt(fresh)
+        .await
+        .expect("new generation admission");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    assert_ne!(receipt.task_id, token);
+    assert_eq!(
+        restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .next()
+            .expect("new owner")
+            .bucket_incarnation_id,
+        Some(new)
+    );
+
+    // A terminal receipt must dominate a duplicate old journal after another crash.
+    disk.write_all(RUSTFS_META_BUCKET, &format!("root-heal-{token}.json"), original)
+        .await
+        .expect("restore old bytes");
+    let again = recovery_manager(vec![disk]);
+    again.replay_root_heals().await.expect("restart with duplicate old bytes");
+    assert!(again.heal_queue.lock().await.requests().all(|request| request.id != token));
+    assert!(matches!(
+        again.get_task_status(&token).await.expect("terminal persists"),
+        HealTaskStatus::Failed { .. }
+    ));
+    bucket_incarnations().lock().expect("fixture").remove(&bucket);
+}
+
+#[tokio::test]
+async fn bucket_incarnation_legacy_admissions_are_queryable_without_rebinding() {
+    for identity in [None, Some(Uuid::nil())] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let request = admin_request(HealType::Bucket {
+            bucket: format!("legacy-{}", Uuid::new_v4()),
+        });
+        manager
+            .root_recovery
+            .persist(&request)
+            .await
+            .expect("capture server admission");
+        let path = format!("root-heal-{}.json", request.id);
+        let bytes = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read JSON");
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).expect("decode JSON");
+        if let Some(id) = identity {
+            legacy["bucket_incarnation_id"] = serde_json::json!(id);
+        } else {
+            legacy["schema"] = 2.into();
+            legacy.as_object_mut().expect("root record").remove("bucket_incarnation_id");
+        }
+        disk.write_all(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&legacy).expect("legacy bytes").into())
+            .await
+            .expect("legacy journal");
+        let restarted = recovery_manager(vec![disk]);
+        restarted.replay_root_heals().await.expect("retire unsafe legacy task");
+        assert_eq!(restarted.heal_queue.lock().await.len(), 0);
+        assert!(matches!(restarted.get_task_status(&request.id).await.expect("legacy token"),
+            HealTaskStatus::Failed { error } if error.starts_with("stale_bucket_incarnation:")));
+    }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_queued_and_retrying_work_does_not_rebind() {
+    for successor in [None, Some(Uuid::new_v4())] {
+        let bucket = format!("queued-incarnation-{}", Uuid::new_v4());
+        let old = Uuid::new_v4();
+        bucket_incarnations()
+            .lock()
+            .expect("fixture")
+            .insert(bucket.clone(), Some(old));
+        let request = admin_request(HealType::Bucket { bucket: bucket.clone() });
+        let retry = HealTask::from_request(request.clone(), Arc::new(MockStorage)).retry_request();
+        bucket_incarnations()
+            .lock()
+            .expect("fixture")
+            .insert(bucket.clone(), successor);
+        for pending in [request, retry] {
+            let task = HealTask::from_request(pending, Arc::new(MockStorage));
+            let error = task.execute().await.expect_err("obsolete generation cannot execute");
+            assert!(matches!(error, Error::StaleBucketIncarnation { expected: Some(id), .. } if id == old));
+            assert!(!error.is_recoverable_heal(), "never retry against a successor");
+            assert_eq!(task.get_outcome().await.counters.processed, 0);
+        }
+        bucket_incarnations().lock().expect("fixture").remove(&bucket);
+    }
+}
+
+#[tokio::test]
+async fn bucket_incarnation_metadata_failure_defers_replay_without_retiring_owner() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let request = admin_request(HealType::Bucket {
+        bucket: format!("incarnation-metadata-unavailable-{}", Uuid::new_v4()),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("accepted responsibility");
+    assert!(matches!(manager.replay_root_heals().await, Err(Error::Storage(EcstoreError::SlowDown))));
+    assert_eq!(manager.root_recovery.pending().await.expect("pending owner").len(), 1);
+    assert!(
+        manager
+            .root_recovery
+            .completed(&request.id)
+            .await
+            .expect("terminal lookup")
+            .is_none()
+    );
+    assert!(manager.heal_queue.lock().await.requests().next().is_none());
 }

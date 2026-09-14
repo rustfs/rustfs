@@ -32,6 +32,18 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
+/// Encode the resolved local read identity. Storage distinguishes a null
+/// version from an unversioned object by returning a nil UUID instead of None.
+pub(crate) fn read_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+    version_id.map(|id| {
+        if id.is_nil() {
+            NULL_VERSION_ID.to_owned()
+        } else {
+            id.to_string()
+        }
+    })
+}
+
 fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
     let code = if version_id.is_some() {
         S3ErrorCode::MethodNotAllowed
@@ -1412,9 +1424,10 @@ mod tests {
 
     #[test]
     fn resolve_bucket_default_sse_falls_back_to_aes256_for_an_unknown_algorithm() {
-        // Reachable only through corrupt or hand-edited bucket metadata;
-        // PutBucketEncryption rejects unknown algorithms. All three call sites
-        // now share this single decision (backlog#1826).
+        // PutBucketEncryption refuses unknown algorithms, so this is reachable
+        // only through a configuration stored before that check or through
+        // hand-edited bucket metadata. All three call sites share this single
+        // decision (backlog#1826).
         let config = bucket_sse_config_with("garbage", None);
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);

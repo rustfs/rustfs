@@ -202,7 +202,9 @@ pub mod bucket {
     }
 
     pub mod migration {
-        pub use crate::bucket::migration::{LegacyBlobDecryptFn, try_migrate_bucket_metadata, try_migrate_iam_config};
+        pub use crate::bucket::migration::{
+            LegacyBlobDecryptFn, migration_startup_error, try_migrate_bucket_metadata, try_migrate_iam_config,
+        };
     }
 
     pub mod object_lock {
@@ -501,9 +503,9 @@ pub mod object {
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
         RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
-        ScannerPublicationCommitState, StreamConsumer, WriteCompletion, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCompletion,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
@@ -589,6 +591,7 @@ pub mod storage {
         all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
         prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
     };
+    pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};
 }
 
 pub mod tier {

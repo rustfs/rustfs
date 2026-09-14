@@ -310,6 +310,8 @@ pub struct HealRequest {
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    /// Admission identity for an explicit administrator bucket heal. Never rebound on replay.
+    pub bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority
@@ -337,6 +339,7 @@ impl HealRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             heal_type,
+            bucket_incarnation_id: None,
             options,
             priority,
             source: HealRequestSource::Internal,
@@ -401,6 +404,7 @@ pub struct HealTask {
     pub id: String,
     /// Heal type
     pub heal_type: HealType,
+    pub bucket_incarnation_id: Option<Uuid>,
     /// Heal options
     pub options: HealOptions,
     /// Priority inherited from the request
@@ -472,6 +476,7 @@ impl HealTask {
         Self {
             id: request.id,
             heal_type: request.heal_type,
+            bucket_incarnation_id: request.bucket_incarnation_id,
             options: request.options,
             priority: request.priority,
             source: request.source,
@@ -502,6 +507,7 @@ impl HealTask {
         HealRequest {
             id: self.id.clone(),
             heal_type: self.heal_type.clone(),
+            bucket_incarnation_id: self.bucket_incarnation_id,
             options: self.options.clone(),
             priority: self.priority,
             source: self.source,
@@ -632,7 +638,7 @@ impl HealTask {
         true
     }
 
-    async fn record_deferred_object(&self, reason: HealDeferredReason) {
+    async fn record_deferred_object(&self, reason: HealDeferredReason, retry_not_before: Option<SystemTime>) {
         if let Some(identity) = self.single_object_identity() {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
@@ -640,7 +646,7 @@ impl HealTask {
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason,
-                    retry_not_before: None,
+                    retry_not_before,
                 },
                 detail: None,
             });
@@ -782,7 +788,8 @@ impl HealTask {
     }
 
     async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
-        self.record_deferred_object(HealDeferredReason::TransientExistenceCheck).await;
+        self.record_deferred_object(HealDeferredReason::TransientExistenceCheck, None)
+            .await;
         warn!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_OBJECT_RESULT,
@@ -882,7 +889,8 @@ impl HealTask {
             return false;
         }
 
-        self.record_deferred_object(HealDeferredReason::TransientUsageCache).await;
+        self.record_deferred_object(HealDeferredReason::TransientUsageCache, None)
+            .await;
 
         warn!(
             target: "rustfs::heal::task",
@@ -901,12 +909,33 @@ impl HealTask {
         true
     }
 
+    async fn skip_retired_marker_error(&self, err: &Error) -> bool {
+        if !matches!(err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+            return false;
+        }
+        if let Some(identity) = self.single_object_identity() {
+            let mut outcome = self.outcome.write().await;
+            outcome.attempt_failed();
+            outcome.record(HealObjectOutcome {
+                identity,
+                disposition: HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::RetiredMarkerProof,
+                    retry_not_before: None,
+                },
+                detail: Some(err.to_string()),
+            });
+        }
+        self.progress.write().await.update_stage(3, 3);
+        true
+    }
+
     async fn skip_dangling_delete_grace_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::is_dangling_delete_grace_error(err) {
             return false;
         }
 
-        self.record_deferred_object(HealDeferredReason::DanglingDeleteGrace).await;
+        self.record_deferred_object(HealDeferredReason::DanglingDeleteGrace, err.dangling_delete_retry_not_before())
+            .await;
 
         warn!(
             target: "rustfs::heal::task",

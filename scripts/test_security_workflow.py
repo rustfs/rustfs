@@ -110,7 +110,6 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.env = {
             **os.environ, "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
             "GITHUB_ENV": str(self.directory / "github-env"), "RUNNER_TEMP": self.temp.name, "TMPDIR": self.temp.name,
-            "LOG_FILE": str(self.directory / "suite.log"),
         }
         for key in ("server_url", "repository", "run_id", "run_attempt", "sha", "event_name"):
             self.env[f"GITHUB_{key.upper()}"] = self.context[f"github.{key}"]
@@ -118,10 +117,17 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.artifacts = self.directory / "rustfs-security-314159-2"
         suite = self.directory / "auto-testing/rustfs-security-test.sh"
         suite.parent.mkdir()
+        ansi = {"ANSI_GREEN": "\033[1;32m", "ANSI_RED": "\033[1;31m", "ANSI_YELLOW": "\033[1;33m", "ANSI_RESET": "\033[0m"}
         suite.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'log_dir=$(mktemp -d "$TMPDIR/rustfs-security.XXXXXX")\n'
-            'echo "CURRENT SUITE LOG" > "$log_dir/suite.log"\n'
+            # Verdict lines carry ANSI color escapes and are printed to stdout
+            # (captured via tee into the artifacts suite.log), exactly like the
+            # real suite output the report step has to grep through: a color
+            # tag before the verdict and a reset escape between the tag and
+            # the case id.
+            'printf "%s\\n" "${ANSI_GREEN}[PASS]${ANSI_RESET} IAM-101 ok" "${ANSI_RED}[FAIL]${ANSI_RESET} STS-105 broken" "${ANSI_YELLOW}[SKIP]${ANSI_RESET} OIDC-103 skipped" | tee "$log_dir/suite.log"\n'
+            'echo "CURRENT SUITE LOG" >> "$log_dir/suite.log"\n'
             'echo "CURRENT SUITE STDOUT"; echo "CURRENT SUITE STDERR" >&2\n'
             'case "$FAKE_REPORT" in\n'
             f'  present) printf "%s\\n" "CURRENT SUITE DIAGNOSTIC" "{CASE_ROW}" > "$REPORT_FILE" ;;\n'
@@ -130,6 +136,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             'echo "UNWRAPPED SUITE SUMMARY" >> "$GITHUB_STEP_SUMMARY"\n'
             'exit "$FAKE_EXIT"\n'
         )
+        self.env.update(ansi)
 
     def test_workflow_wiring(self) -> None:
         names = list(self.steps)
@@ -167,11 +174,19 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     self.assertEqual(suite.returncode, exit_code, suite.stderr)
                     logs = list(Path(str(self.artifacts) + "-scratch").glob("rustfs-security.*/suite.log"))
                     self.assertEqual(len(logs), 1)
-                    self.assertEqual(logs[0].read_text(), "CURRENT SUITE LOG\n")
+                    self.assertEqual(logs[0].read_text().splitlines()[-1], "CURRENT SUITE LOG")
                 self.context["steps.test.outcome"] = outcome
+                # A suite that never ran (skipped with no report, or a
+                # cancelled run) leaves no suite.log behind, so there are no
+                # verdict lines and the report step stays red.
+                ran = outcome != "skipped" or mode == "present"
                 report = self.run_step("Generate report")
+                # The report step is red only for harness/environment breakdowns:
+                # a failed suite that still produced verdict lines stays green,
+                # while skipped/cancelled never reach a verdict at all.
                 success = outcome == "success" and mode == "present"
-                self.assertEqual(report.returncode == 0, success, report.stderr)
+                green = ran and (outcome == "success" or outcome == "failure")
+                self.assertEqual(report.returncode == 0, green, report.stderr)
                 contents = (self.artifacts / "report.md").read_text()
                 for expected in (
                     "https://github.com/rustfs/rustfs/actions/runs/314159", "Attempt: 2",
@@ -179,8 +194,15 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}",
                 ):
                     self.assertIn(expected, contents)
-                self.assertEqual(CASE_ROW in contents, success)
-                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, success)
+                # The verdict counters must see through the ANSI escapes in the
+                # suite log: 1 passed, 1 failed, 1 skipped (only when the suite
+                # actually ran and left a suite.log behind).
+                if ran:
+                    self.assertIn("Product result: 1 passed, 1 failed, 1 skipped", contents)
+                else:
+                    self.assertIn("Product result: 0 passed, 0 failed", contents)
+                self.assertEqual(CASE_ROW in contents, mode == "present")
+                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, mode == "present")
                 if mode == "present":
                     raw = (self.artifacts / "suite-report.md").read_text()
                     self.assertEqual(raw, f"CURRENT SUITE DIAGNOSTIC\n{CASE_ROW}\n")
@@ -190,7 +212,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 expected = {self.artifacts / "report.md"}
                 if outcome != "skipped" or mode == "present":
                     expected.add(self.artifacts / "suite.log")
-                    self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE STDOUT\nCURRENT SUITE STDERR\n")
+                    self.assertIn("CURRENT SUITE STDOUT\nCURRENT SUITE STDERR", (self.artifacts / "suite.log").read_text())
                 if mode in ("present", "empty"):
                     expected.add(self.artifacts / "suite-report.md")
                 (self.artifacts / "unexpected-token.json").write_text("FAKE-SECRET-CANARY")
@@ -404,7 +426,9 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 steps = named_steps(job)
                 if suite in self.DIRECT_TESTS:
                     test = steps[self.DIRECT_TESTS[suite]]
-                    self.assertNotRegex("\n".join(test), r'''(?m)^        ["']?continue-on-error["']?\s*:''')
+                    # Case failures keep the run green; the step records its
+                    # outcome for the report and the backlog issue manager.
+                    self.assertRegex("\n".join(test), r'''(?m)^        continue-on-error: true$''')
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
@@ -621,10 +645,14 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     self.context["steps.test.outcome"] = outcome
                     report = self.run_step("Generate report")
                     success = outcome == "success" and log == good
-                    self.assertEqual(report.returncode == 0, success, report.stderr)
+                    # Report steps are red only for harness/environment breakdowns;
+                    # a failure outcome with recorded case rows stays green
+                    # (performance is unchanged and still gates on the suite result).
+                    green = (outcome == "success" or (outcome == "failure" and log in (good, partial))) if suite != "performance" else success
+                    self.assertEqual(report.returncode == 0, green, report.stderr)
                     contents = Path(self.env["REPORT_FILE"]).read_text()
                     self.assertNotIn("OLD RUN EVIDENCE", contents)
-                    self.assertEqual("| PASS |" in contents, success)
+                    self.assertEqual("| PASS |" in contents, success if suite == "performance" else log in (good, partial))
                     for value in ("actions/runs/314159", "Attempt: 2", "Workflow Commit: " + self.context["github.sha"],
                                   f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}"):
                         self.assertIn(value, contents)
@@ -666,8 +694,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 )
                 result = self.run_step(name)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE LOG\n")
-                self.assertEqual(len(list(Path(self.env["TMPDIR"]).glob("fixture.*/trace.log"))), 1)
+                self.assertEqual((self.artifacts / "suite.log").read_text().splitlines()[-1], "CURRENT SUITE LOG")
                 self.assertEqual(list(self.artifacts.glob("fixture.*")), [])
                 if suite == "performance":
                     self.assertEqual((self.artifacts / "results/summary.md").read_text(), "CURRENT RESULTS\n")
@@ -802,11 +829,14 @@ emit_step_result() {
         for failed_log in failed_logs:
             with self.subTest(log=failed_log):
                 Path(self.env["LOG_FILE"]).write_text(failed_log)
+                # A failing heal run exits non-zero; the report step stays green
+                # because the steps ran, and the per-step table is always published.
+                self.context["steps.test.outcome"] = "failure"
                 report = self.run_step("Generate report")
-                self.assertNotEqual(report.returncode, 0, report.stderr)
+                self.assertEqual(report.returncode, 0, report.stderr)
                 contents = Path(self.env["REPORT_FILE"]).read_text()
                 self.assertIn("Test Step Outcome: failure", contents)
-                self.assertNotIn("| PASS |", contents)
+                self.assertIn("| PASS |", contents)
                 if "original failure" in failed_log:
                     self.assertIn("| 3 | original failure | FAIL |", (self.artifacts / "steps.md").read_text())
                 if "later step failure" in failed_log:

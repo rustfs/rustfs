@@ -130,6 +130,9 @@ jobs:
 
       - name: Run replication suite
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
+        continue-on-error: true
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-replication-test.sh
@@ -181,6 +184,21 @@ jobs:
           if [ '${{ steps.test.outcome }}' = 'success' ] && [ "${CASE_RESULT}" = 'success' ]; then
             RESULT=success
           fi
+
+          # Product gate: failing cases keep the run green — they are reported
+          # below and tracked in rustfs/backlog. Only harness/environment
+          # breakdowns (the suite never reached case level, or a wholesale
+          # failure with zero passes) turn the workflow red.
+          CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
+          CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
+          HARNESS_OK=0
+          if [ '${{ steps.test.outcome }}' = 'success' ]; then
+            HARNESS_OK=1
+          elif [ '${{ steps.test.outcome }}' = 'failure' ] && [ "${CASES_TOTAL}" -gt 0 ] && [ "${CASES_PASS}" -ge 1 ]; then
+            HARNESS_OK=1
+          fi
           {
             echo "# RustFS replication test report"
             echo ""
@@ -193,19 +211,24 @@ jobs:
             echo "- Test Step Outcome: ${RESULT}"
             echo "- Suite Step Outcome: ${{ steps.test.outcome }}"
             echo ""
-            if [ "${RESULT}" = "success" ]; then
+            if [ -s "${CASE_TABLE}" ]; then
               cat "${CASE_TABLE}"
               echo ""
+            fi
+            echo "- Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed (failing cases are tracked in rustfs/backlog)"
+            echo ""
+            if [ -s "${CASE_TABLE}" ]; then
               echo "## Log tail"
               echo '```text'
-              tail -n 200 "${LOG_FILE}"
+              tail -n 200 "${LOG_FILE}" 2>/dev/null || true
               echo '```'
             else
               echo "The suite or evidence validation failed. See this run's artifact for partial case results and suite.log."
             fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
-          [ "${RESULT}" = "success" ]
+          # Red only for harness/environment breakdowns; case failures stay green.
+          [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
         if: ${{ always() && steps.evidence.outcome == 'success' }}

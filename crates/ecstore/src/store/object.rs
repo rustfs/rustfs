@@ -859,7 +859,76 @@ async fn delete_recursive_prefix_with_tier_delete_journal(
             }
         }
     }
+    // A trailing slash selects a directory, not the object at its parent key.
+    // Raw filesystem recursion would also remove that object's metadata and
+    // data. Preserve it by purging the selected keys individually when they
+    // share this physical directory. The bucket write lock covers both scans.
+    if object.ends_with('/') && !is_meta_bucketname(bucket) {
+        let parent = object.strip_suffix('/').unwrap_or(object);
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(bucket, parent, None, None, 1)
+                    .await?;
+                if page.objects.iter().any(|info| info.name == parent) {
+                    return delete_directory_keys_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await;
+                }
+            }
+        }
+    }
     delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
+}
+
+async fn delete_directory_keys_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    prefix: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    for pool in &store.pools {
+        for set in &pool.disk_set {
+            let mut previous_keys = std::collections::BTreeSet::new();
+            loop {
+                // Restart after each bounded batch: its version markers have
+                // been deleted, and the bucket write lock excludes new keys.
+                let page = set
+                    .clone()
+                    .inner_list_object_versions_for_recursive_delete(
+                        bucket,
+                        prefix,
+                        None,
+                        None,
+                        RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                    )
+                    .await?;
+                let keys = page
+                    .objects
+                    .into_iter()
+                    .map(|info| info.name)
+                    .filter(|key| key.starts_with(prefix))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if keys.is_empty() {
+                    break;
+                }
+                if keys == previous_keys {
+                    return Err(Error::other("directory deletion did not advance"));
+                }
+                for key in &keys {
+                    let encoded_key = encode_dir_object(key);
+                    let mut exact_opts = opts.clone();
+                    exact_opts.delete_prefix_object = true;
+                    let _guard = store
+                        .acquire_object_write_lock_if_needed("delete_object", bucket, &encoded_key, &mut exact_opts)
+                        .await?;
+                    delete_prefix_with_tier_delete_journal(store, bucket, &encoded_key, &exact_opts, tier_journal_api).await?;
+                }
+                previous_keys = keys;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A GET whose object identity has been resolved while its namespace read lock
@@ -2054,6 +2123,9 @@ fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, Stri
                 return None;
             }
             local_tier_free_version_id = Some(version_id);
+            continue;
+        }
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID) {
             continue;
         }
 
@@ -4267,9 +4339,12 @@ impl ECStore {
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
-        self.pools[idx]
+        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+        let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-            .await
+            .await;
+        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+        result
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -4336,6 +4411,7 @@ impl ECStore {
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
         let mut dst_opts = dst_opts.clone();
+        dst_opts.inherit_shard_integrity(src_info);
         if !is_meta_bucketname(dst_bucket) && dst_opts.expected_bucket_incarnation_id.is_none() {
             dst_opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(dst_bucket).await?);
         }
@@ -4455,6 +4531,7 @@ impl ECStore {
                 let mut put_opts = ObjectOptions {
                     user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
                     versioned: dst_opts.versioned,
+                    shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                     version_id: dst_opts.version_id.clone(),
                     no_lock: dst_opts.no_lock,
                     mod_time: dst_opts.mod_time,
@@ -4471,9 +4548,12 @@ impl ECStore {
                         crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                 }
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
-                    self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
-                        .await
+                        .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    result
                 } else {
                     Err(StorageError::InvalidArgument(
                         src_bucket.to_owned(),
@@ -4493,6 +4573,7 @@ impl ECStore {
                     let mut put_opts = ObjectOptions {
                         user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
                         versioned: dst_opts.versioned,
+                        shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
                         version_id: dst_opts.version_id.clone(),
                         no_lock: dst_opts.no_lock,
                         mod_time: dst_opts.mod_time,
@@ -4508,9 +4589,12 @@ impl ECStore {
                         put_opts.decommission_capacity_admission =
                             crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
                     }
-                    return self.pools[pool_idx]
+                    let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+                    let result = self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
+                    enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+                    return result;
                 }
                 src_info.version_only = true;
                 let capacity_object = dst_object.clone();
@@ -4541,6 +4625,7 @@ impl ECStore {
         let mut put_opts = ObjectOptions {
             user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
             versioned: dst_opts.versioned,
+            shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
             version_id: dst_opts.version_id.clone(),
             no_lock: dst_opts.no_lock,
             mod_time: dst_opts.mod_time,
@@ -4558,9 +4643,12 @@ impl ECStore {
         }
 
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
-            return self.pools[pool_idx]
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
+            let result = self.pools[pool_idx]
                 .put_object(dst_bucket, dst_object_name, put_object_reader, &put_opts)
                 .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            return result;
         }
 
         Err(StorageError::InvalidArgument(
@@ -4682,13 +4770,14 @@ impl ECStore {
             return Err(Error::other("lifecycle delete-all requires namespace locking"));
         }
 
-        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
-            None
-        } else if opts.delete_prefix {
-            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-        };
+        let _bucket_lifecycle_guard =
+            if is_meta_bucketname(bucket) || (opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some()) {
+                None
+            } else if opts.delete_prefix {
+                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+            } else {
+                Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+            };
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
         } else {
@@ -4737,7 +4826,7 @@ impl ECStore {
         {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if opts.delete_prefix && opts.expected_bucket_incarnation_id.is_none() {
+        if opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
         #[cfg(any(test, feature = "test-util"))]
@@ -4812,7 +4901,9 @@ impl ECStore {
                         if let Some(owner) = DecommissionCapacityOwner::from_options(&opts) {
                             self.select_decommission_capacity_target_pool(owner, 0).await?
                         } else {
-                            self.get_pool_idx_no_lock(bucket, object, 0).await?
+                            self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                                .await
+                                .ok_or(Error::DiskFull)?
                         }
                     }
                 };
@@ -5174,6 +5265,9 @@ impl ECStore {
                 objects.as_slice(),
                 StorageError::BucketNotFound(bucket.to_string()),
             );
+        }
+        if opts.expected_bucket_incarnation_id.is_none() {
+            opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
         #[cfg(any(test, feature = "test-util"))]
         if current_bucket_incarnation_id.is_some() {
@@ -7104,6 +7198,24 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_data_movement_delete_marker_ignores_target_bucket_incarnation_fence() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
     fn data_movement_delete_marker_source_requires_persisted_mod_time() {
         let source = ObjectInfo {
             delete_marker: true,
@@ -8337,6 +8449,292 @@ mod tests {
             .await
             .expect("create the versioned bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_marker_converges_after_bucket_recreation_on_sixteen_disks() {
+        let bucket = "retired-marker-c11";
+        let object = "marker.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (dirs, original) = make_local_set_disks_with_ctx(16, 4, ctx.clone()).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let create = MakeBucketOptions {
+            versioning_enabled: true,
+            ..Default::default()
+        };
+        store.handle_make_bucket(bucket, &create).await.expect("create old bucket");
+        let old_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("old identity");
+        let mut historical = Vec::new();
+        for value in 1..=3 {
+            historical.push(
+                store
+                    .put_object(
+                        bucket,
+                        "history.bin",
+                        &mut PutObjReader::from_vec(vec![value; 4097]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write old version")
+                    .version_id
+                    .unwrap(),
+            );
+        }
+        let marker = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create old marker")
+            .version_id
+            .expect("explicit marker version");
+        assert!(
+            store
+                .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            !crate::bucket::retirement::is_retired(store.clone(), bucket, old_incarnation)
+                .await
+                .unwrap(),
+            "failed bucket deletion cannot publish retirement"
+        );
+        let set = &store.pools[0].disk_set[0];
+        let before = set.disks.read().await.clone();
+        for disk in before.iter().flatten() {
+            let info = disk
+                .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("read original marker");
+            assert_eq!(info.delete_marker_incarnation(), Some(old_incarnation));
+        }
+        // Taking four actual members offline preserves their existing xl.meta.
+        // All deletion/recreation work below goes through the normal store API.
+        for slot in 12..16 {
+            set.disks.write().await[slot] = None;
+        }
+        for version in historical {
+            store
+                .delete_object(
+                    bucket,
+                    "history.bin",
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("delete exact old data version with four drives offline");
+        }
+        store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(marker.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete exact old marker with four drives offline");
+        store
+            .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete empty old bucket");
+        assert!(
+            crate::bucket::retirement::is_retired(store.clone(), bucket, old_incarnation)
+                .await
+                .expect("durable retirement")
+        );
+        store
+            .handle_make_bucket(bucket, &create)
+            .await
+            .expect("recreate same bucket name");
+        let current = store.bucket_incarnation_id_from_disk(bucket).await.expect("new identity");
+        assert_ne!(old_incarnation, current);
+        let mut new_versions = Vec::new();
+        for (key, payload) in [
+            (object, b"new generation reused key".as_slice()),
+            ("new.bin", b"new generation control".as_slice()),
+        ] {
+            let info = store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut PutObjReader::from_vec(payload.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write new generation");
+            new_versions.push((key, info.version_id.unwrap(), payload));
+        }
+        *set.disks.write().await = before.clone();
+        let heal = rustfs_heal_contracts::heal_channel::HealOpts {
+            remove: true,
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+            ..Default::default()
+        };
+        let observed = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list after rejoin");
+        assert_eq!(observed.objects.len(), 2, "stale marker must not contaminate listing");
+        assert!(observed.objects.iter().all(|info| !info.delete_marker));
+        for (key, version, _) in &new_versions {
+            let repaired = store
+                .heal_object_with_proof(bucket, key, &version.to_string(), &heal)
+                .await
+                .expect("heal new generation");
+            assert!(repaired.error.is_none(), "new version heal: {:?}", repaired.error);
+        }
+        let no_remove = store
+            .heal_object_with_proof(
+                bucket,
+                object,
+                &marker.to_string(),
+                &rustfs_heal_contracts::heal_channel::HealOpts { remove: false, ..heal },
+            )
+            .await
+            .expect("inspect marker without removal");
+        assert!(no_remove.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(no_remove.absence.is_none());
+        let dry = store
+            .heal_object_with_proof(
+                bucket,
+                object,
+                &marker.to_string(),
+                &rustfs_heal_contracts::heal_channel::HealOpts { dry_run: true, ..heal },
+            )
+            .await
+            .expect("dry run");
+        assert!(dry.absence.is_none());
+        for disk in before.iter().skip(12).flatten() {
+            assert!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
+        let original_marker = before[12]
+            .as_ref()
+            .unwrap()
+            .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+            .await
+            .unwrap();
+        for stamp in [None, Some(current), Some(Uuid::new_v4())] {
+            for disk in before.iter().skip(12).flatten() {
+                let mut changed = original_marker.clone();
+                changed.metadata.clear();
+                if let Some(stamp) = stamp {
+                    changed.set_delete_marker_incarnation(stamp);
+                }
+                disk.write_metadata("", bucket, object, changed).await.unwrap();
+            }
+            let unresolved = store
+                .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+                .await
+                .unwrap();
+            assert!(
+                unresolved.error.as_ref().is_some_and(Error::is_retired_marker_deferred),
+                "legacy/current/unproven markers must be deferred: {:?}",
+                unresolved.error
+            );
+            assert!(unresolved.absence.is_none());
+            for disk in before.iter().skip(12).flatten() {
+                assert!(
+                    disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                        .await
+                        .is_ok()
+                );
+                disk.write_metadata("", bucket, object, original_marker.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        set.disks.write().await[15] = None;
+        let incomplete = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .unwrap();
+        assert!(incomplete.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(incomplete.absence.is_none(), "offline targets cannot be omitted from a cleanup receipt");
+        set.disks.write().await[15] = before[15].clone();
+        let failure =
+            crate::set_disk::DanglingDeleteFailure::install(bucket, object, 15, crate::disk::error::DiskError::FaultyDisk);
+        let partial = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .unwrap();
+        assert!(partial.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
+        assert!(
+            partial.absence.is_none(),
+            "fifteen successful/absent disks cannot hide one remaining marker"
+        );
+        assert!(
+            before[15]
+                .as_ref()
+                .unwrap()
+                .read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .is_ok()
+        );
+        drop(failure);
+        let cleaned = store
+            .heal_object_at_incarnation(bucket, object, &marker.to_string(), current, &heal)
+            .await
+            .expect("cleanup retired marker");
+        assert!(cleaned.error.is_none(), "cleanup error: {:?}", cleaned.error);
+        let proof = cleaned.absence.expect("complete cleanup receipt");
+        assert!(proof.removed);
+        assert_eq!(proof.bucket_incarnation_id, current);
+        for disk in before.iter().flatten() {
+            assert!(matches!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await,
+                Err(crate::disk::error::DiskError::FileVersionNotFound | crate::disk::error::DiskError::FileNotFound)
+            ));
+        }
+        let replay = store
+            .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
+            .await
+            .expect("idempotent replay");
+        assert!(replay.error.is_none());
+        assert!(!replay.absence.expect("authoritative absence receipt").removed);
+        for (key, version, payload) in new_versions {
+            let mut reader = store
+                .handle_get_object_reader(
+                    bucket,
+                    key,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("new generation still readable");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read new bytes");
+            assert_eq!(actual, payload);
+        }
+        assert_eq!(dirs.len(), 16);
     }
 
     #[tokio::test]

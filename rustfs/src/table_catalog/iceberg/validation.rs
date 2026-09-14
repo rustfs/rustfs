@@ -69,6 +69,11 @@ fn warehouse_object_prefix_from_location(
             "table warehouse location must be inside the table bucket".to_string(),
         ));
     }
+    if is_reserved_table_object_key(object_prefix.strip_suffix('/').unwrap_or(object_prefix)) {
+        return Err(TableCatalogStoreError::Invalid(
+            "table warehouse location overlaps the reserved table catalog prefix".to_string(),
+        ));
+    }
     normalize_warehouse_object_prefix(object_prefix, max_prefix_depth)
 }
 
@@ -270,6 +275,29 @@ pub(crate) fn table_data_plane_resource_from_entry(table: TableEntry, warehouse_
     }
 }
 
+pub(crate) fn table_data_plane_resource_from_warehouse_index(
+    index: &TableWarehouseIndexEntry,
+) -> TableCatalogStoreResult<TableDataPlaneResource> {
+    if index.table_bucket.is_empty() || index.table_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid(
+            "warehouse index has an empty table bucket or table id".to_string(),
+        ));
+    }
+    parse_namespace_for_store(&index.namespace)?;
+    parse_table_for_store(&index.table)?;
+    let normalized = normalize_warehouse_object_prefix(&index.warehouse_object_prefix, Some(WAREHOUSE_INDEX_MAX_PREFIX_DEPTH))?;
+    if normalized != index.warehouse_object_prefix {
+        return Err(TableCatalogStoreError::Invalid("warehouse index prefix is not canonical".to_string()));
+    }
+    Ok(TableDataPlaneResource {
+        table_bucket: index.table_bucket.clone(),
+        namespace: index.namespace.clone(),
+        table: index.table.clone(),
+        table_id: index.table_id.clone(),
+        warehouse_object_prefix: index.warehouse_object_prefix.clone(),
+    })
+}
+
 pub(crate) async fn table_data_plane_resource_for_object<S>(
     store: &S,
     bucket: &str,
@@ -279,6 +307,54 @@ where
     S: TableCatalogStore + ?Sized,
 {
     store.resolve_table_data_plane_resource(bucket, object).await
+}
+
+fn table_entry_owns_current_metadata_object(entry: &TableEntry, object: &str) -> bool {
+    entry.state == TableCatalogEntryState::Active
+        && table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location).as_deref() == Some(object)
+}
+
+pub(crate) fn table_metadata_data_plane_resource_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a TableEntry>,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+    if bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+        return Ok(None);
+    }
+
+    let mut matched = None;
+    for entry in entries {
+        if entry.table_bucket != bucket {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "metadata ownership scan for {bucket} returned a table from {}",
+                entry.table_bucket
+            )));
+        }
+        if !table_entry_owns_current_metadata_object(entry, object) {
+            continue;
+        }
+        let warehouse_object_prefix = table_warehouse_object_prefix(entry)?;
+        let resource = table_data_plane_resource_from_entry(entry.clone(), warehouse_object_prefix);
+        if matched.is_some() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "reserved metadata object {object} is owned by multiple active tables"
+            )));
+        }
+        matched = Some(resource);
+    }
+    Ok(matched)
+}
+
+pub(crate) async fn table_metadata_data_plane_resource_for_object<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> TableCatalogStoreResult<Option<TableDataPlaneResource>>
+where
+    S: TableCatalogStore + ?Sized,
+{
+    store.resolve_table_metadata_data_plane_resource(bucket, object).await
 }
 
 pub(crate) async fn scan_table_data_plane_resource_for_object<S>(

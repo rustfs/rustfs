@@ -28,6 +28,7 @@ mod harness;
 mod heal_test;
 mod object_lock_test;
 mod observability_test;
+mod replication_delete_marker_test;
 mod replication_quota_test;
 mod s3_basic_test;
 mod s3_during_data_movement_test;

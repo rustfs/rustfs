@@ -17,12 +17,15 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
+use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::runtime::EndpointServerPools;
+use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_error};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
     HealControlCoordinator, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
-    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint,
+    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint, validate_heal_selector,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -242,6 +245,40 @@ struct HealStartSuccess {
     start_time: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct HealStatusSettings {
+    recursive: bool,
+    dry_run: bool,
+    remove: bool,
+    recreate: bool,
+    scan_mode: HealScanMode,
+    update_parity: bool,
+    #[serde(rename = "nolock")]
+    no_lock: bool,
+    #[serde(rename = "readRepair")]
+    read_repair: bool,
+    pool: Option<usize>,
+    set: Option<usize>,
+}
+
+impl From<HealOpts> for HealStatusSettings {
+    fn from(settings: HealOpts) -> Self {
+        Self {
+            recursive: settings.recursive,
+            dry_run: settings.dry_run,
+            remove: settings.remove,
+            recreate: settings.recreate,
+            scan_mode: settings.scan_mode,
+            update_parity: settings.update_parity,
+            no_lock: settings.no_lock,
+            read_repair: settings.read_repair,
+            pool: settings.pool,
+            set: settings.set,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealTaskStatus {
@@ -251,7 +288,7 @@ struct HealTaskStatus {
     failure_detail: String,
     start_time: String,
     #[serde(rename = "settings")]
-    heal_settings: HealOpts,
+    heal_settings: HealStatusSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -815,6 +852,7 @@ fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
 }
 
 struct PreparedHealControlRoute {
+    endpoints: EndpointServerPools,
     remote_grid_hosts: Vec<String>,
     fingerprint: String,
     coordinator_epoch: u64,
@@ -839,6 +877,7 @@ fn prepare_heal_control_route(context: &crate::admin::runtime_sources::AppContex
         .map(|node| node.grid_host)
         .collect();
     Ok(PreparedHealControlRoute {
+        endpoints,
         remote_grid_hosts,
         fingerprint,
         coordinator_epoch,
@@ -908,9 +947,12 @@ async fn route_cluster_heal_control(
     coordinator_capability_verified: bool,
 ) -> S3Result<rustfs_protos::heal_control::Outcome> {
     let response = if route.coordinator.is_local {
-        crate::storage::rpc::node_service::execute_heal_control_envelope(envelope, route.coordinator_epoch)
+        crate::storage::rpc::node_service::execute_heal_control_envelope(envelope, route.coordinator_epoch, &route.endpoints)
             .await
             .map_err(|err| {
+                if err.code() == tonic::Code::InvalidArgument {
+                    return admin_error(S3ErrorCode::InvalidArgument, err.message().to_owned());
+                }
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -952,6 +994,9 @@ async fn route_cluster_heal_control(
             .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, route.fingerprint.clone(), command)
             .await
             .map_err(|err| {
+                if let StorageError::InvalidArgument(_, _, message) = &err {
+                    return admin_error(S3ErrorCode::InvalidArgument, message.clone());
+                }
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -982,13 +1027,20 @@ async fn route_cluster_heal_control(
         })
 }
 
-async fn execute_after_heal_control_capability<P, PF, E, EF, T>(probe: P, execute: E) -> S3Result<T>
+async fn execute_after_heal_start_preflight<P, PF, E, EF, T>(
+    endpoints: &EndpointServerPools,
+    options: &HealOpts,
+    probe: P,
+    execute: E,
+) -> S3Result<T>
 where
     P: FnOnce() -> PF,
     PF: Future<Output = S3Result<()>>,
     E: FnOnce() -> EF,
     EF: Future<Output = S3Result<T>>,
 {
+    validate_heal_selector(endpoints, options.pool, options.set)
+        .map_err(|err| admin_error(S3ErrorCode::InvalidArgument, err.to_string()))?;
     probe().await?;
     execute().await
 }
@@ -998,7 +1050,9 @@ async fn submit_cluster_heal_start(
     hip: &HealInitParams,
 ) -> S3Result<HealAdmissionReceipt> {
     let route = prepare_heal_control_route(&context)?;
-    let result = execute_after_heal_control_capability(
+    let result = execute_after_heal_start_preflight(
+        &route.endpoints,
+        &hip.hs,
         || require_cluster_heal_control_capability(&context, &route),
         || async {
             let heal_request = build_heal_channel_request(hip);
@@ -1076,6 +1130,8 @@ async fn submit_cluster_heal_channel_command(
 struct HealTaskStatusPayload {
     #[serde(skip)]
     adapted_detail: Option<String>,
+    #[serde(default, rename = "settings", skip_serializing)]
+    heal_settings: Option<HealStatusSettings>,
     summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
@@ -1130,9 +1186,10 @@ fn encode_heal_start_success(client_token: String, client_address: String) -> S3
 fn encode_heal_task_status(
     mut payload: HealTaskStatusPayload,
     failure_detail: String,
-    heal_settings: HealOpts,
+    fallback_heal_settings: HealOpts,
 ) -> S3Result<Vec<u8>> {
     let failure_detail = payload.adapted_detail.take().unwrap_or(failure_detail);
+    let heal_settings = payload.heal_settings.take().unwrap_or_else(|| fallback_heal_settings.into());
     encode_json(&HealTaskStatus {
         payload,
         failure_detail,
@@ -1597,7 +1654,7 @@ mod tests {
         BackgroundHealCoverage, BackgroundHealCoverageReason, BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState,
         aggregate_cluster_heal_status, aggregate_replacement_recovery_cluster_status, background_heal_runtime_state,
         build_heal_channel_request, build_replacement_recovery_status_response, encode_background_heal_status,
-        encode_heal_control_path, encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability,
+        encode_heal_control_path, encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight,
         heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id,
         json_response, map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
         query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission, validate_heal_request_mode,
@@ -1774,9 +1831,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_selector_preflight_rejects_before_probe_and_token_creation() {
+        use crate::admin::storage_api::runtime::PoolEndpoints;
+
+        let endpoints = super::EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Default::default(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        for (pool, set) in [(99, 99), (1, 0), (0, 1)] {
+            let hip = HealInitParams {
+                hs: HealOpts {
+                    pool: Some(pool),
+                    set: Some(set),
+                    recursive: true,
+                    ..Default::default()
+                },
+                force_start: true,
+                ..Default::default()
+            };
+            let probed = AtomicBool::new(false);
+            let mut token = None;
+            let error = execute_after_heal_start_preflight(
+                &endpoints,
+                &hip.hs,
+                || async {
+                    probed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                || async {
+                    token = Some(build_heal_channel_request(&hip).id);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("invalid selector must be rejected synchronously");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code().status_code(), Some(StatusCode::BAD_REQUEST));
+            assert!(!probed.load(Ordering::SeqCst));
+            assert!(token.is_none(), "rejected START must not allocate a client token");
+        }
+    }
+
+    #[tokio::test]
     async fn cluster_capability_gate_runs_before_execution() {
         let executed = AtomicBool::new(false);
-        let rejected = execute_after_heal_control_capability(
+        let rejected = execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &HealOpts::default(),
             || async { Err(super::cluster_heal_control_unavailable("test_capability_failure")) },
             || async {
                 executed.store(true, Ordering::SeqCst);
@@ -1787,7 +1892,9 @@ mod tests {
         assert!(rejected.is_err());
         assert!(!executed.load(Ordering::SeqCst));
 
-        execute_after_heal_control_capability(
+        execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &HealOpts::default(),
             || async { Ok(()) },
             || async {
                 executed.store(true, Ordering::SeqCst);
@@ -1809,7 +1916,9 @@ mod tests {
         for attempt in 0..3 {
             let executed_ids = &mut request_ids;
             let request_params = &hip;
-            let result = execute_after_heal_control_capability(
+            let result = execute_after_heal_start_preflight(
+                &super::EndpointServerPools::default(),
+                &HealOpts::default(),
                 || async {
                     if attempt < 2 {
                         Err(super::cluster_heal_control_unavailable("test_capability_failure"))
@@ -1952,6 +2061,7 @@ mod tests {
         ] {
             let error = reject_heal_admission(HealAdmissionResult::Dropped(reason));
             assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+            assert_eq!(error.code().status_code(), Some(StatusCode::CONFLICT));
             assert!(
                 error.to_string().contains(label),
                 "the caller must distinguish conflicts from transient coordination failure"
@@ -2957,6 +3067,50 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_uses_settings_from_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(
+                br#"{"summary":"running","settings":{"recursive":true,"dryRun":true,"remove":true,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false,"readRepair":false,"pool":1,"set":2}}"#
+                    .to_vec(),
+            ),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 2);
+        assert_eq!(json["settings"]["dryRun"], true);
+        assert_eq!(json["settings"]["remove"], true);
+        assert_eq!(json["settings"]["recreate"], false);
+        assert_eq!(json["settings"]["updateParity"], false);
+        assert_eq!(json["settings"]["recursive"], true);
+        assert_eq!(json["settings"]["pool"], 1);
+        assert_eq!(json["settings"]["set"], 2);
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_defaults_settings_for_legacy_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(br#"{"summary":"running"}"#.to_vec()),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("legacy channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("legacy public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 1);
+        assert_eq!(json["settings"]["dryRun"], false);
+        assert_eq!(json["settings"]["remove"], false);
     }
 
     #[test]

@@ -2921,6 +2921,12 @@ mod tests {
                         )
                         .await
                         .expect("seed transitioned source with locally restored bytes");
+                    // The overwrite queues its committed cleanup owner right
+                    // away, and from the second iteration on the restarted
+                    // store already runs expiry workers. Fail that first remote
+                    // DELETE so the owner stays durable and the restart below
+                    // still has to rediscover it from xl.meta.
+                    backend.set_remove_failure(true);
                     let expected = if self_copy {
                         payload.clone()
                     } else {
@@ -3002,33 +3008,36 @@ mod tests {
                             .expect("rebind the same remote destination after restart");
                     }
                     let set = store.pools[0].get_disks_by_key(object);
+                    // A deferred first cleanup must retain its durable owner
+                    // until a later recovery scan can retry the operation.
+                    backend.set_remove_failure(true);
                     ExpiryState::resize_workers(1, Arc::clone(&store)).await;
                     let recovered = recover_tier_free_versions(Arc::clone(&store), 100, None, None)
                         .await
                         .expect("recover persisted cleanup owner");
                     assert!(recovered.enqueued >= 1);
-                    tokio::time::timeout(Duration::from_secs(30), async {
-                        loop {
-                            let versions = set
-                                .load_file_info_versions_exact(&bucket, object)
-                                .await
-                                .expect("read cleanup progress")
-                                .expect("new object must survive cleanup");
-                            if versions
-                                .versions
-                                .iter()
-                                .chain(versions.free_versions.iter())
-                                .all(|fi| !fi.tier_free_version())
-                            {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await
-                    .expect("cleanup must converge");
+                    wait_for_expiry_workers_idle(&store).await;
+                    assert!(backend.contains(&remote).await, "failed cleanup must retain remote bytes");
+                    assert_eq!(backend.remove_count().await, removed_before);
+                    backend.set_remove_failure(false);
+                    // This fixture starts expiry workers without the runtime's
+                    // recovery loop, so drive its durable rescan explicitly.
+                    wait_for_tier_free_version_recovery(Arc::clone(&store), &backend, removed_before + 1).await;
+                    let versions = set
+                        .load_file_info_versions_exact(&bucket, object)
+                        .await
+                        .expect("read cleanup progress")
+                        .expect("new object must survive cleanup");
+                    assert!(
+                        versions
+                            .versions
+                            .iter()
+                            .chain(versions.free_versions.iter())
+                            .all(|fi| !fi.tier_free_version()),
+                        "cleanup must remove its owner: {state:?}, suspended={suspended}, copy={self_copy}"
+                    );
                     assert!(!backend.contains(&remote).await);
-                    assert_eq!(backend.remove_count().await, removed_before + 1, "one remote DELETE per owner");
+                    assert_eq!(backend.remove_count().await, removed_before + 1, "one successful remote DELETE per owner");
                     assert_eq!(backend.remove_versions().await.last(), Some(&(remote.clone(), version.to_string())));
                     let mut reader = store
                         .get_object_reader(&bucket, object, None, HeaderMap::new(), &options)
@@ -3129,6 +3138,51 @@ mod tests {
             .await
             .expect("target body should stream");
         assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn unfinished_multipart_upload_is_not_copy_source_readable() {
+        let temp_dir = tempfile::tempdir().expect("create unfinished multipart copy store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "unfinished-multipart-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("unfinished-multipart-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let payload = vec![0xCD; 273];
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for unfinished multipart copy source");
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload);
+        store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage unfinished multipart source part");
+
+        let source_err = match store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(_) => panic!("an uncompleted multipart upload must not be readable as a CopyObject source"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                source_err,
+                StorageError::ObjectNotFound(_, _) | StorageError::FileNotFound | StorageError::VersionNotFound(_, _, _)
+            ),
+            "unexpected unfinished multipart source error: {source_err:?}"
+        );
+
         shutdown.cancel();
     }
 
@@ -16378,11 +16432,13 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = set
-                    .load_file_info_versions_exact(bucket, object)
-                    .await
-                    .expect("retry cleanup metadata should remain readable")
-                    .is_none();
+                // Cleanup rewrites xl.meta disk by disk, so a read racing it
+                // can briefly miss quorum; any other error is a real failure.
+                let metadata_absent = match set.load_file_info_versions_exact(bucket, object).await {
+                    Ok(versions) => versions.is_none(),
+                    Err(StorageError::InsufficientReadQuorum(..)) => false,
+                    Err(err) => panic!("retry cleanup metadata should remain readable: {err:?}"),
+                };
                 if metadata_absent && backend.remove_count().await == 1 {
                     return;
                 }

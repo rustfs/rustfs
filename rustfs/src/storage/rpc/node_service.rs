@@ -127,6 +127,19 @@ fn verify_node_mutation_body<T: CanonicalMutationBody>(request: &Request<T>, ope
         .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
 }
 
+fn require_incarnation_body_digest<T>(request: &Request<T>) -> Result<(), Status> {
+    if request
+        .metadata()
+        .get("x-rustfs-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.is_empty() && value != "UNSIGNED-PAYLOAD")
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("incarnation-bound mutation requires a body-bound digest"))
+    }
+}
+
 fn verify_node_signal_body<T: CanonicalMutationBody>(request: &Request<T>, operation: &'static str) -> Result<(), Status> {
     let canonical_body = request
         .get_ref()
@@ -252,7 +265,10 @@ fn heal_control_remaining(expires_at_unix_ms: i64, now_unix_ms: i64) -> Result<D
     Ok(Duration::from_millis(remaining_ms))
 }
 
-fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_channel::HealChannelRequest) -> Result<(), Status> {
+fn validate_admin_heal_control_start(
+    request: &rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    endpoints: &EndpointServerPools,
+) -> Result<(), Status> {
     if request.source != rustfs_heal_contracts::heal_channel::HealRequestSource::Admin {
         return Err(Status::permission_denied("heal control start source must be admin"));
     }
@@ -261,9 +277,8 @@ fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_chann
             "admin heal control start cannot contain automatic replacement endpoints",
         ));
     }
-    if request.pool_index.is_some() != request.set_index.is_some() {
-        return Err(Status::invalid_argument("heal control start requires both pool and set"));
-    }
+    heal::validate_heal_selector(endpoints, request.pool_index, request.set_index)
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
     if request.bucket.is_empty() {
         if request.object_prefix.as_deref().is_some_and(|prefix| !prefix.is_empty()) {
             return Err(Status::invalid_argument("root heal control start cannot contain an object prefix"));
@@ -274,6 +289,14 @@ fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_chann
         let erasure_set_target = request.pool_index.is_some();
         if request.disk.is_some() != erasure_set_target {
             return Err(Status::invalid_argument("root erasure-set heal control target is inconsistent"));
+        }
+        if let Some(disk) = &request.disk {
+            let selector = rustfs_heal::heal::utils::normalize_set_disk_id(disk)
+                .and_then(|normalized| rustfs_heal::heal::utils::parse_set_disk_id(&normalized).ok())
+                .ok_or_else(|| Status::invalid_argument("invalid root erasure-set heal control target"))?;
+            if (Some(selector.0), Some(selector.1)) != (request.pool_index, request.set_index) {
+                return Err(Status::invalid_argument("root erasure-set heal control target is inconsistent"));
+            }
         }
     } else if request.disk.is_some() {
         return Err(Status::invalid_argument(
@@ -763,14 +786,16 @@ async fn initialize_heal_topology_fingerprint_with_probe(
 pub(crate) async fn execute_heal_control_envelope(
     envelope: rustfs_protos::heal_control::Envelope,
     expected_coordinator_epoch: u64,
+    endpoints: &EndpointServerPools,
 ) -> Result<Vec<u8>, Status> {
-    execute_heal_control_envelope_with_manager(envelope, expected_coordinator_epoch, None).await
+    execute_heal_control_envelope_with_manager(envelope, expected_coordinator_epoch, None, endpoints).await
 }
 
 async fn execute_heal_control_envelope_with_manager(
     envelope: rustfs_protos::heal_control::Envelope,
     expected_coordinator_epoch: u64,
     manager: Option<Arc<rustfs_heal::HealManager>>,
+    endpoints: &EndpointServerPools,
 ) -> Result<Vec<u8>, Status> {
     let now = heal_control_now_unix_ms()?;
     envelope
@@ -780,6 +805,12 @@ async fn execute_heal_control_envelope_with_manager(
     let canonical_envelope = rustfs_protos::heal_control::encode_envelope(&envelope).map_err(Status::invalid_argument)?;
     let command_digest = Sha256::digest(&canonical_envelope).into();
     let (request_id, coordinator_epoch, command) = envelope.into_execution().map_err(Status::invalid_argument)?;
+
+    // Reject invalid targets before replay admission or forceStart can mutate
+    // task ownership. Both local and forwarded starts use this boundary.
+    if let rustfs_protos::heal_control::ExecutableCommand::Start { request } = &command {
+        validate_admin_heal_control_start(request, endpoints)?;
+    }
 
     let replay_cache = HEAL_CONTROL_REPLAY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
     let replay_entry = {
@@ -799,9 +830,6 @@ async fn execute_heal_control_envelope_with_manager(
         return Ok(cached.clone());
     }
 
-    if let rustfs_protos::heal_control::ExecutableCommand::Start { request } = &command {
-        validate_admin_heal_control_start(request)?;
-    }
     let retain_completed_result = !matches!(&command, rustfs_protos::heal_control::ExecutableCommand::Query { .. });
 
     let manager = manager
@@ -1197,7 +1225,7 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             rustfs_protos::heal_control::decode_envelope(&request.get_ref().command).map_err(Status::invalid_argument)?;
         let coordinator_epoch =
             rustfs_protos::heal_control_coordinator_epoch(fingerprint).map_err(Status::failed_precondition)?;
-        let result = execute_heal_control_envelope(envelope, coordinator_epoch).await?;
+        let result = execute_heal_control_envelope(envelope, coordinator_epoch, &endpoints).await?;
         let canonical_response = rustfs_protos::canonical_heal_control_response_body(
             request.get_ref().version,
             &request.get_ref().topology_fingerprint,
@@ -1366,6 +1394,25 @@ impl Node for NodeService {
 
     async fn heal_bucket(&self, request: Request<HealBucketRequest>) -> Result<Response<HealBucketResponse>, Status> {
         verify_node_mutation_body(&request, "heal bucket")?;
+        if !request.get_ref().bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("incarnation-bound heal requires HealBucketAtIncarnation"));
+        }
+        self.handle_heal_bucket(request).await
+    }
+
+    async fn heal_bucket_at_incarnation(
+        &self,
+        request: Request<HealBucketRequest>,
+    ) -> Result<Response<HealBucketResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        verify_node_signal_body(&request, "heal bucket at incarnation")?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
         self.handle_heal_bucket(request).await
     }
 
@@ -1396,6 +1443,21 @@ impl Node for NodeService {
     }
 
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        if !request.get_ref().bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("incarnation-bound mutation requires its dedicated RPC"));
+        }
+        self.handle_delete(request).await
+    }
+
+    async fn delete_at_incarnation(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
         self.handle_delete(request).await
     }
 
@@ -1585,6 +1647,24 @@ impl Node for NodeService {
     }
 
     async fn rename_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
+        if !request.get_ref().bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("incarnation-bound rename requires RenameDataAtIncarnation"));
+        }
+        self.handle_rename_data(request).await
+    }
+
+    async fn rename_data_at_incarnation(
+        &self,
+        request: Request<RenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
         self.handle_rename_data(request).await
     }
 
@@ -1634,6 +1714,24 @@ impl Node for NodeService {
     }
 
     async fn write_metadata(&self, request: Request<WriteMetadataRequest>) -> Result<Response<WriteMetadataResponse>, Status> {
+        if !request.get_ref().bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("incarnation-bound mutation requires its dedicated RPC"));
+        }
+        self.handle_write_metadata(request).await
+    }
+
+    async fn write_metadata_at_incarnation(
+        &self,
+        request: Request<WriteMetadataRequest>,
+    ) -> Result<Response<WriteMetadataResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
         self.handle_write_metadata(request).await
     }
 
@@ -1653,7 +1751,32 @@ impl Node for NodeService {
     }
 
     async fn delete_version(&self, request: Request<DeleteVersionRequest>) -> Result<Response<DeleteVersionResponse>, Status> {
-        self.handle_delete_version(request).await
+        if !request.get_ref().bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("incarnation-bound delete requires DeleteVersionAtIncarnation"));
+        }
+        self.handle_delete_version(request, false).await
+    }
+
+    async fn delete_version_at_incarnation(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
+        self.handle_delete_version(request, false).await
+    }
+
+    async fn delete_retired_marker(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        self.handle_delete_version(request, true).await
     }
 
     async fn delete_versions(&self, request: Request<DeleteVersionsRequest>) -> Result<Response<DeleteVersionsResponse>, Status> {
@@ -2900,9 +3023,14 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 18] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 23] = [
         "renamedata",
+        "renamedataatincarnation",
+        "writemetadataatincarnation",
+        "deleteatincarnation",
+        "deleteversionatincarnation",
         "deleteversion",
+        "deleteretiredmarker",
         "deleteversions",
         "writemetadata",
         "updatemetadata",
@@ -3090,7 +3218,7 @@ mod tests {
         request.recursive = Some(true);
         request.heal_endpoints = vec!["/mnt/replacement".to_string()];
 
-        let err = validate_admin_heal_control_start(&request)
+        let err = validate_admin_heal_control_start(&request, &heal_control_test_endpoints_with_coordinator("node-d", true))
             .expect_err("admin heal-control must not accept automatic replacement targets");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
@@ -3153,9 +3281,13 @@ mod tests {
             }
 
             let envelope = rustfs_protos::heal_control::decode_envelope(&command).map_err(Status::invalid_argument)?;
-            let result =
-                execute_heal_control_envelope_with_manager(envelope, self.coordinator_epoch, Some(Arc::clone(&self.manager)))
-                    .await?;
+            let result = execute_heal_control_envelope_with_manager(
+                envelope,
+                self.coordinator_epoch,
+                Some(Arc::clone(&self.manager)),
+                &heal_control_test_endpoints_with_coordinator("node-d", true),
+            )
+            .await?;
             if matches!(self.fault, HealControlTransportFault::DropAfterAdmission) {
                 return Err(Status::unavailable("transport failed after heal admission"));
             }
@@ -3281,20 +3413,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_selector_rejection_preserves_existing_task_and_replay_state() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let original_id = request.id.clone();
+        let original = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("valid original start");
+        execute_heal_control_envelope_with_manager(original, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+            .await
+            .expect("original heal should be admitted");
+        for (pool, set) in [(99, 99), (1, 0), (0, 2)] {
+            for root in [false, true] {
+                let mut invalid = request.clone();
+                invalid.id = Uuid::new_v4().to_string();
+                invalid.pool_index = Some(pool);
+                invalid.set_index = Some(set);
+                if root {
+                    invalid.bucket.clear();
+                    invalid.object_prefix = None;
+                    invalid.disk = Some(rustfs_heal::heal::utils::format_set_disk_id(pool, set));
+                }
+                let invalid_id = invalid.id.clone();
+                let envelope = rustfs_protos::heal_control::Envelope::start(invalid, metadata).expect("invalid selector encodes");
+                let error = execute_heal_control_envelope_with_manager(
+                    envelope,
+                    metadata.coordinator_epoch,
+                    Some(manager.clone()),
+                    &endpoints,
+                )
+                .await
+                .expect_err("invalid forceStart must be rejected before cancelling or admitting work");
+                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+                manager
+                    .get_task_status(&original_id)
+                    .await
+                    .expect("original task must retain ownership");
+                assert!(matches!(
+                    manager.get_task_status(&invalid_id).await,
+                    Err(rustfs_heal::Error::TaskNotFound { .. })
+                ));
+                let cache = super::HEAL_CONTROL_REPLAY_CACHE
+                    .get()
+                    .expect("original request initialized replay cache")
+                    .lock()
+                    .await;
+                assert!(!cache.contains_key(&invalid_id), "rejected request must not consume replay admission");
+            }
+        }
+    }
+
+    #[test]
+    fn heal_selector_rpc_target_must_match_validated_selector() {
+        let (_, mut request, _) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        request.bucket.clear();
+        request.object_prefix = None;
+        request.pool_index = Some(0);
+        request.set_index = Some(0);
+        for disk in ["pool_99_set_99", "pool_0_set_1", "0_1", "invalid"] {
+            request.disk = Some(disk.to_string());
+            let err = validate_admin_heal_control_start(&request, &endpoints).expect_err("RPC target must match selector");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+        for disk in ["pool_0_set_0", "0_0"] {
+            request.disk = Some(disk.to_string());
+            validate_admin_heal_control_start(&request, &endpoints).expect("matching canonical or compact selector is valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_selector_transport_returns_invalid_argument_without_admission() {
+        let (manager, mut request, metadata) = heal_start_retry_fixture();
+        request.pool_index = Some(99);
+        request.set_index = Some(99);
+        let request_id = request.id.clone();
+        let command = encode_transport_start(request, metadata);
+        let fingerprint = "selector-validation-transport";
+        let mut client = connect_faulty_heal_control_client(
+            manager.clone(),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("loopback listener is required for selector transport regression");
+        let error = call_heal_control_transport(&mut client, fingerprint, command)
+            .await
+            .expect_err("peer must reject selector");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+        assert!(matches!(
+            manager.get_task_status(&request_id).await,
+            Err(rustfs_heal::Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn heal_start_retry_exact_forced_envelope_returns_cached_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let request_id = request.id.clone();
         let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("valid forced start");
-        let lost_response =
-            execute_heal_control_envelope_with_manager(envelope.clone(), metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect("first request is admitted before its response is lost");
+        let lost_response = execute_heal_control_envelope_with_manager(
+            envelope.clone(),
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("first request is admitted before its response is lost");
         assert_eq!(manager.operations_snapshot().await.queue_length, 1);
 
         // The caller sees no first response, but retries the original envelope.
-        let replayed = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("an exact envelope replay must recover its receipt");
+        let replayed = execute_heal_control_envelope_with_manager(
+            envelope,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("an exact envelope replay must recover its receipt");
         assert_eq!(replayed, lost_response);
         assert_eq!(
             manager.operations_snapshot().await.queue_length,
@@ -3310,13 +3547,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_control_admin_overlap_receipts_preserve_token_and_conflict_reason() {
+        use rustfs_protos::heal_control::{Admission, Envelope, Outcome, RequestMetadata};
+
+        let (manager, mut parent, metadata) = heal_start_retry_fixture();
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        parent.force_start = false;
+        parent.object_prefix = Some("scope/".to_string());
+        let parent_id = parent.id.clone();
+        let envelope = Envelope::start(parent.clone(), metadata).expect("parent start");
+        let response =
+            execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+                .await
+                .expect("admit parent scope");
+        assert!(
+            matches!(decode_transport_start_outcome(&response, &parent_id, metadata.coordinator_epoch),
+            Outcome::Start { task_id, admission: Admission::Accepted } if task_id == parent_id)
+        );
+
+        for (prefix, expected) in [
+            ("scope/", Admission::Merged),
+            ("scope/child/", Admission::DroppedOverlappingPaths),
+            ("other/", Admission::Accepted),
+        ] {
+            let mut request = parent.clone();
+            request.id = Uuid::new_v4().to_string();
+            request.object_prefix = Some(prefix.to_string());
+            let request_id = request.id.clone();
+            let request_metadata = RequestMetadata {
+                nonce: *Uuid::new_v4().as_bytes(),
+                ..metadata
+            };
+            let envelope = Envelope::start(request, request_metadata).expect("scoped start envelope");
+            let response = execute_heal_control_envelope_with_manager(
+                envelope,
+                metadata.coordinator_epoch,
+                Some(manager.clone()),
+                &endpoints,
+            )
+            .await
+            .expect("overlap remains a typed admission result across the RPC boundary");
+            let Outcome::Start { task_id, admission } =
+                decode_transport_start_outcome(&response, &request_id, metadata.coordinator_epoch)
+            else {
+                panic!("start must return an admission receipt")
+            };
+            assert_eq!(admission, expected, "prefix={prefix}");
+            assert_eq!(
+                task_id,
+                if expected == Admission::Accepted {
+                    request_id
+                } else {
+                    parent_id.clone()
+                }
+            );
+        }
+        assert_eq!(manager.operations_snapshot().await.queue_length, 2);
+        assert_eq!(
+            manager
+                .get_task_status(&parent_id)
+                .await
+                .expect("rejected child preserves parent"),
+            rustfs_heal::heal::task::HealTaskStatus::Pending
+        );
+
+        parent.id = Uuid::new_v4().to_string();
+        parent.force_start = true;
+        let replacement_id = parent.id.clone();
+        let envelope = Envelope::start(
+            parent,
+            RequestMetadata {
+                nonce: *Uuid::new_v4().as_bytes(),
+                ..metadata
+            },
+        )
+        .expect("force replacement envelope");
+        let response =
+            execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()), &endpoints)
+                .await
+                .expect("forceStart replaces the parent and preserves the disjoint scope");
+        assert!(
+            matches!(decode_transport_start_outcome(&response, &replacement_id, metadata.coordinator_epoch),
+            Outcome::Start { task_id, admission: Admission::Accepted } if task_id == replacement_id)
+        );
+        assert_ne!(replacement_id, parent_id);
+        assert_eq!(manager.operations_snapshot().await.queue_length, 2);
+    }
+
+    #[tokio::test]
     async fn heal_start_retry_new_forced_request_is_a_distinct_start() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let first_id = request.id.clone();
         let first = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("first start");
-        let _lost_response = execute_heal_control_envelope_with_manager(first, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("first admission");
+        let _lost_response = execute_heal_control_envelope_with_manager(
+            first,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("first admission");
 
         // A fresh HTTP forceStart request intentionally requests another start.
         let mut next_request = request;
@@ -3327,9 +3657,14 @@ mod tests {
             ..metadata
         };
         let next = rustfs_protos::heal_control::Envelope::start(next_request, next_metadata).expect("new forced start");
-        let response = execute_heal_control_envelope_with_manager(next, metadata.coordinator_epoch, Some(manager.clone()))
-            .await
-            .expect("forceStart preserves its explicit admission semantics");
+        let response = execute_heal_control_envelope_with_manager(
+            next,
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("forceStart preserves its explicit admission semantics");
         let outcome = rustfs_protos::heal_control::decode_result(&response)
             .and_then(|result| result.into_outcome(&next_id, metadata.coordinator_epoch))
             .expect("new receipt");
@@ -3347,10 +3682,14 @@ mod tests {
     async fn heal_start_retry_same_id_with_changed_envelope_conflicts_before_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let original = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("original start");
-        let receipt =
-            execute_heal_control_envelope_with_manager(original.clone(), metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect("original admission");
+        let receipt = execute_heal_control_envelope_with_manager(
+            original.clone(),
+            metadata.coordinator_epoch,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect("original admission");
         let mut changed_options = request.clone();
         changed_options.remove_corrupted = Some(true);
         let changed_metadata = rustfs_protos::heal_control::RequestMetadata {
@@ -3361,16 +3700,26 @@ mod tests {
             rustfs_protos::heal_control::Envelope::start(changed_options, metadata).expect("changed options"),
             rustfs_protos::heal_control::Envelope::start(request, changed_metadata).expect("changed nonce"),
         ] {
-            let error = execute_heal_control_envelope_with_manager(changed, metadata.coordinator_epoch, Some(manager.clone()))
-                .await
-                .expect_err("one request ID cannot identify different envelope bytes");
+            let error = execute_heal_control_envelope_with_manager(
+                changed,
+                metadata.coordinator_epoch,
+                Some(manager.clone()),
+                &heal_control_test_endpoints_with_coordinator("node-d", true),
+            )
+            .await
+            .expect_err("one request ID cannot identify different envelope bytes");
             assert_eq!(error.code(), tonic::Code::AlreadyExists);
             assert_eq!(manager.operations_snapshot().await.queue_length, 1);
         }
         assert_eq!(
-            execute_heal_control_envelope_with_manager(original, metadata.coordinator_epoch, Some(manager))
-                .await
-                .expect("conflicts must preserve the original receipt"),
+            execute_heal_control_envelope_with_manager(
+                original,
+                metadata.coordinator_epoch,
+                Some(manager),
+                &heal_control_test_endpoints_with_coordinator("node-d", true)
+            )
+            .await
+            .expect("conflicts must preserve the original receipt"),
             receipt
         );
     }
@@ -3380,9 +3729,14 @@ mod tests {
         let (manager, request, metadata) = heal_start_retry_fixture();
         let request_id = request.id.clone();
         let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("start envelope");
-        let error = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch + 1, Some(manager.clone()))
-            .await
-            .expect_err("a different coordinator epoch cannot accept the request");
+        let error = execute_heal_control_envelope_with_manager(
+            envelope,
+            metadata.coordinator_epoch + 1,
+            Some(manager.clone()),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .expect_err("a different coordinator epoch cannot accept the request");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(manager.operations_snapshot().await.queue_length, 0);
         assert!(matches!(
@@ -3682,9 +4036,14 @@ mod tests {
 
         let canonical_token = uuid::Uuid::new_v4().to_string();
         let first = rustfs_protos::heal_control::Envelope::start(start(canonical_token.clone()), metadata()).unwrap();
-        let first_result = execute_heal_control_envelope_with_manager(first, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let first_result = execute_heal_control_envelope_with_manager(
+            first,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let first_outcome = rustfs_protos::heal_control::decode_result(&first_result)
             .and_then(|result| result.into_outcome(&canonical_token, coordinator_epoch))
             .unwrap();
@@ -3698,10 +4057,14 @@ mod tests {
 
         let duplicate_id = uuid::Uuid::new_v4().to_string();
         let duplicate = rustfs_protos::heal_control::Envelope::start(start(duplicate_id.clone()), metadata()).unwrap();
-        let duplicate_result =
-            execute_heal_control_envelope_with_manager(duplicate, coordinator_epoch, Some(Arc::clone(&manager)))
-                .await
-                .unwrap();
+        let duplicate_result = execute_heal_control_envelope_with_manager(
+            duplicate,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let duplicate_outcome = rustfs_protos::heal_control::decode_result(&duplicate_result)
             .and_then(|result| result.into_outcome(&duplicate_id, coordinator_epoch))
             .unwrap();
@@ -3722,9 +4085,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let query_result = execute_heal_control_envelope_with_manager(
+            query,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let query_outcome = rustfs_protos::heal_control::decode_result(&query_result)
             .and_then(|result| result.into_outcome(&query_id, coordinator_epoch))
             .unwrap();
@@ -3741,9 +4109,14 @@ mod tests {
             canonical_token.clone(),
         )
         .unwrap();
-        let cancel_result = execute_heal_control_envelope_with_manager(cancel, coordinator_epoch, Some(Arc::clone(&manager)))
-            .await
-            .unwrap();
+        let cancel_result = execute_heal_control_envelope_with_manager(
+            cancel,
+            coordinator_epoch,
+            Some(Arc::clone(&manager)),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let cancel_outcome = rustfs_protos::heal_control::decode_result(&cancel_result)
             .and_then(|result| result.into_outcome(&cancel_id, coordinator_epoch))
             .unwrap();
@@ -3761,9 +4134,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))
-            .await
-            .unwrap();
+        let stopped_result = execute_heal_control_envelope_with_manager(
+            stopped_query,
+            coordinator_epoch,
+            Some(manager),
+            &heal_control_test_endpoints_with_coordinator("node-d", true),
+        )
+        .await
+        .unwrap();
         let stopped_outcome = rustfs_protos::heal_control::decode_result(&stopped_result)
             .and_then(|result| result.into_outcome(&stopped_query_id, coordinator_epoch))
             .unwrap();
@@ -3853,12 +4231,48 @@ mod tests {
 
     fn delete_request_message(options: &str) -> DeleteRequest {
         DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "http://node-a:9000/data/rustfs0".to_string(),
             volume: "bucket".to_string(),
             path: "object".to_string(),
             options: options.to_string(),
             scanner_publication_lease_token: Vec::new().into(),
         }
+    }
+
+    #[tokio::test]
+    async fn durable_rename_requires_its_own_authenticated_body_and_success() {
+        let service = make_server();
+        let mut message = RenameFileRequest {
+            disk: "http://node-a:9000/data/rustfs0".to_owned(),
+            src_volume: ".rustfs.sys/tmp".to_owned(),
+            src_path: "integrity-stage/index".to_owned(),
+            dst_volume: "bucket".to_owned(),
+            dst_path: "object/index".to_owned(),
+            durable: false,
+        };
+        let old_body = rustfs_protos::canonical_rename_file_request_body(&message).expect("ordinary rename body");
+        message.durable = true;
+        let mut tampered = Request::new(message.clone());
+        set_tonic_canonical_body_digest(&mut tampered, &old_body).expect("digest");
+        mark_v2_authenticated(&mut tampered);
+        let error = service
+            .rename_file(tampered)
+            .await
+            .expect_err("durability flag must be authenticated");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let body = rustfs_protos::canonical_rename_file_request_body(&message).expect("durable rename body");
+        let mut request = Request::new(message);
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .rename_file(request)
+            .await
+            .expect("valid digest passes the gate")
+            .into_inner();
+        assert!(!response.success, "unknown disk cannot apply the rename");
+        assert!(!response.durability_applied, "failed publication cannot acknowledge durability");
     }
 
     #[tokio::test]
@@ -3950,6 +4364,7 @@ mod tests {
         assert_gated!(
             rename_data,
             RenameDataRequest {
+                bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
                 src_volume: "src".into(),
                 src_path: "sp".into(),
@@ -3964,6 +4379,7 @@ mod tests {
         assert_gated!(
             delete_version,
             DeleteVersionRequest {
+                bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
                 volume: "v".into(),
                 path: "p".into(),
@@ -3974,6 +4390,53 @@ mod tests {
                 opts_bin: vec![0x80].into(),
             },
             rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            rename_data_at_incarnation,
+            RenameDataRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            delete_version_at_incarnation,
+            DeleteVersionRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            delete_retired_marker,
+            DeleteVersionRequest {
+                bucket_incarnation_id: Default::default(),
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                force_del_marker: false,
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            write_metadata_at_incarnation,
+            WriteMetadataRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_write_metadata_request_body
+        );
+        assert_gated!(
+            delete_at_incarnation,
+            DeleteRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_delete_request_body
         );
         assert_gated!(
             delete_versions,
@@ -3990,6 +4453,7 @@ mod tests {
         assert_gated!(
             write_metadata,
             WriteMetadataRequest {
+                bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
                 volume: "v".into(),
                 path: "p".into(),
@@ -4024,6 +4488,7 @@ mod tests {
         assert_gated!(
             delete,
             DeleteRequest {
+                bucket_incarnation_id: Default::default(),
                 disk: disk.clone(),
                 volume: "v".into(),
                 path: "p".into(),
@@ -4075,6 +4540,7 @@ mod tests {
         assert_gated!(
             rename_file,
             RenameFileRequest {
+                durable: false,
                 disk: disk.clone(),
                 src_volume: "src".into(),
                 src_path: "sp".into(),
@@ -4949,10 +5415,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_incarnation_rpcs_require_identity_digest_and_dedicated_method() {
+        let service = create_test_node_service();
+        macro_rules! assert_fenced {
+            ($fenced:ident, $legacy:ident, $message:ident, $canonical:path) => {{
+                let message = $message {
+                    bucket_incarnation_id: vec![1; 16].into(),
+                    ..Default::default()
+                };
+                for unsigned in [false, true] {
+                    let mut request = Request::new(message.clone());
+                    if unsigned {
+                        request
+                            .metadata_mut()
+                            .insert("x-rustfs-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+                    }
+                    mark_v2_authenticated(&mut request);
+                    assert_eq!(
+                        service
+                            .$fenced(request)
+                            .await
+                            .expect_err("digest is mandatory even for authenticated peers")
+                            .code(),
+                        tonic::Code::PermissionDenied
+                    );
+                }
+                let mut legacy = Request::new(message.clone());
+                let body = $canonical(legacy.get_ref()).unwrap();
+                set_tonic_canonical_body_digest(&mut legacy, &body).unwrap();
+                mark_v2_authenticated(&mut legacy);
+                assert_eq!(
+                    service
+                        .$legacy(legacy)
+                        .await
+                        .expect_err("cannot downgrade a fenced mutation")
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+                for invalid in [Vec::new(), vec![0; 16], vec![1; 15]] {
+                    let mut request = Request::new(message.clone());
+                    request.get_mut().bucket_incarnation_id = invalid.into();
+                    let body = $canonical(request.get_ref()).unwrap();
+                    set_tonic_canonical_body_digest(&mut request, &body).unwrap();
+                    mark_v2_authenticated(&mut request);
+                    assert_eq!(
+                        service
+                            .$fenced(request)
+                            .await
+                            .expect_err("missing, nil and malformed identities fail closed")
+                            .code(),
+                        tonic::Code::InvalidArgument
+                    );
+                }
+                let mut tampered = Request::new(message.clone());
+                let body = $canonical(tampered.get_ref()).unwrap();
+                set_tonic_canonical_body_digest(&mut tampered, &body).unwrap();
+                tampered.get_mut().bucket_incarnation_id = vec![2; 16].into();
+                mark_v2_authenticated(&mut tampered);
+                assert_eq!(
+                    service
+                        .$fenced(tampered)
+                        .await
+                        .expect_err("incarnation is authenticated")
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+            }};
+        }
+        assert_fenced!(
+            write_metadata_at_incarnation,
+            write_metadata,
+            WriteMetadataRequest,
+            rustfs_protos::canonical_write_metadata_request_body
+        );
+        assert_fenced!(delete_at_incarnation, delete, DeleteRequest, rustfs_protos::canonical_delete_request_body);
+        assert_fenced!(
+            heal_bucket_at_incarnation,
+            heal_bucket,
+            HealBucketRequest,
+            rustfs_protos::CanonicalMutationBody::canonical_body
+        );
+        assert_fenced!(
+            rename_data_at_incarnation,
+            rename_data,
+            RenameDataRequest,
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_fenced!(
+            delete_version_at_incarnation,
+            delete_version,
+            DeleteVersionRequest,
+            rustfs_protos::canonical_delete_version_request_body
+        );
+    }
+
+    #[tokio::test]
     async fn test_heal_bucket_invalid_options() {
         let service = create_test_node_service();
 
         let request = Request::new(HealBucketRequest {
+            bucket_incarnation_id: Default::default(),
             bucket: "test-bucket".to_string(),
             options: "invalid json".to_string(),
         });
@@ -5095,6 +5657,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
@@ -5115,6 +5678,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
@@ -5247,6 +5811,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(RenameFileRequest {
+            durable: false,
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
@@ -5287,6 +5852,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
@@ -5310,6 +5876,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
@@ -5952,6 +6519,7 @@ mod tests {
             );
 
             let mut request = Request::new(RenameDataRequest {
+                bucket_incarnation_id: Default::default(),
                 disk: disk_id.to_string(),
                 src_volume: volume.to_string(),
                 src_path: staging.to_string(),
@@ -6167,6 +6735,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
@@ -6187,6 +6756,7 @@ mod tests {
         let service = create_test_node_service();
 
         let request = Request::new(WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
@@ -6263,6 +6833,99 @@ mod tests {
         assert!(!read_response.success);
         assert!(read_response.error.is_some());
         assert!(read_response.raw_file_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_marker_rpc_rejects_missing_or_combined_conditions() {
+        use crate::storage::storage_api::ecstore_disk::DeleteOptions;
+        use rustfs_filemeta::{FileInfo, MetaDeleteMarker};
+        let service = create_test_node_service();
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        for opts in [
+            DeleteOptions::default(),
+            DeleteOptions {
+                undo_write: true,
+                expected_delete_marker: Some(MetaDeleteMarker::from(marker)),
+                ..Default::default()
+            },
+        ] {
+            let mut request = Request::new(DeleteVersionRequest {
+                disk: "invalid-disk-path".into(),
+                volume: "bucket".into(),
+                path: "marker.bin".into(),
+                file_info: serde_json::to_string(&FileInfo::default()).unwrap(),
+                opts: serde_json::to_string(&opts).unwrap(),
+                ..Default::default()
+            });
+            let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).unwrap();
+            set_tonic_canonical_body_digest(&mut request, &body).unwrap();
+            mark_v2_authenticated(&mut request);
+            let error = service
+                .delete_retired_marker(request)
+                .await
+                .expect_err("invalid conditional request must be rejected before disk lookup");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_marker_rpc_binds_bucket_incarnation() {
+        use crate::storage::storage_api::ecstore_disk::DeleteOptions;
+        use rustfs_filemeta::{FileInfo, MetaDeleteMarker};
+
+        let service = create_test_node_service();
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        let message = DeleteVersionRequest {
+            bucket_incarnation_id: vec![1; 16].into(),
+            volume: "bucket".into(),
+            path: "marker.bin".into(),
+            file_info: serde_json::to_string(&FileInfo::default()).expect("file info"),
+            opts: serde_json::to_string(&DeleteOptions {
+                expected_delete_marker: Some(MetaDeleteMarker::from(marker)),
+                ..Default::default()
+            })
+            .expect("marker precondition"),
+            ..Default::default()
+        };
+        for (identity, digest_identity, expected) in [
+            (vec![1; 16], None, tonic::Code::PermissionDenied),
+            (vec![0; 16], Some(vec![0; 16]), tonic::Code::InvalidArgument),
+            (vec![1; 15], Some(vec![1; 15]), tonic::Code::InvalidArgument),
+            (vec![2; 16], Some(vec![1; 16]), tonic::Code::PermissionDenied),
+            (Vec::new(), Some(vec![1; 16]), tonic::Code::PermissionDenied),
+            (vec![1; 16], Some(vec![1; 16]), tonic::Code::FailedPrecondition),
+        ] {
+            let mut request = Request::new(message.clone());
+            if let Some(digest_identity) = digest_identity {
+                request.get_mut().bucket_incarnation_id = digest_identity.into();
+                let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).expect("canonical body");
+                set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+            }
+            // Removing the wire field models a peer predating incarnation support:
+            // its canonical body must reject the new sender's signed identity.
+            request.get_mut().bucket_incarnation_id = identity.into();
+            mark_v2_authenticated(&mut request);
+            assert_eq!(
+                service
+                    .delete_retired_marker(request)
+                    .await
+                    .expect_err("incarnation and marker checks must precede disk mutation")
+                    .code(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -7466,6 +8129,13 @@ mod tests {
         }
 
         assert_tampered!(heal_bucket, HealBucketRequest::default());
+        assert_tampered!(
+            heal_bucket_at_incarnation,
+            HealBucketRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                ..Default::default()
+            }
+        );
         assert_tampered!(make_bucket, MakeBucketRequest::default());
         assert_tampered!(delete_bucket, DeleteBucketRequest::default());
         assert_tampered!(lock, GenerallyLockRequest::default());

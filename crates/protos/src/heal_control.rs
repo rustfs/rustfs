@@ -353,10 +353,10 @@ pub enum Admission {
     Full,
     DroppedQueueFull,
     DroppedPolicy,
-    /// HS-06: admin start rejected because the same target is already being
-    /// healed (RUSTFS_HEAL_OVERLAP_POLICY=minio_error only).
+    /// Admin start rejected because the same target is already owned and
+    /// cannot be merged under the selected overlap policy.
     DroppedAlreadyRunning,
-    /// HS-06: admin start rejected because its path overlaps an active heal.
+    /// Admin start rejected because its scope overlaps an existing owner.
     DroppedOverlappingPaths,
 }
 

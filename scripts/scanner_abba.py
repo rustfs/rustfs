@@ -650,6 +650,8 @@ def collect_live(prepared, request, request_path, adapter):
     connection = prepared["collector"]
     require(set(connection) == {"alias", "endpoint", "metrics_endpoints"}, "invalid collector connection")
     require(all(isinstance(value, str) and value for value in connection.values()), "missing collector endpoint")
+    require(os.environ.get("RUSTFS_ACCESS_KEY"), "collector requires RUSTFS_ACCESS_KEY")
+    require(os.environ.get("RUSTFS_SECRET_KEY"), "collector requires RUSTFS_SECRET_KEY")
     expected_metrics_endpoints = None
     if request.get("evidence") == "measured":
         expected_metrics_endpoints = request["release_evidence"]["distributed"]["metrics_endpoints"]

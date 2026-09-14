@@ -120,9 +120,9 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
         TableDataPlaneListCursorPosition, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
-        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_is_authorized,
+        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
@@ -1186,17 +1186,21 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store).await;
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
-pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) {
+pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) -> std::io::Result<()> {
     // MinIO encrypts IAM identity/service-account files at rest with a key derived
     // from the root credentials. Inject the IAM crate's decryption so those blobs
     // are decrypted before normalization instead of being skipped as "incompatible".
     let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
         Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
-    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn)).await;
+    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn))
+        .await
+        .map_err(ecstore_bucket::migration::migration_startup_error)
 }
 
 pub(crate) fn init_ecstore_config() {
@@ -1396,6 +1400,15 @@ pub(crate) trait StorageDiskRpcExt {
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
+    async fn rename_file_durable(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+    ) -> DiskResult<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(
         &self,
         src_volume: &str,
@@ -1549,6 +1562,10 @@ where
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
         ecstore_disk::DiskAPI::rename_file(self, src_volume, src_path, dst_volume, dst_path).await
+    }
+
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::rename_file_durable(self, src_volume, src_path, dst_volume, dst_path).await
     }
 
     async fn rename_part(

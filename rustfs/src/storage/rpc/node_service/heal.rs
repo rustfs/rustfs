@@ -63,6 +63,36 @@ pub(crate) struct HealControlCoordinator {
     pub is_local: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HealSelectorError {
+    #[error("heal start requires both pool and set")]
+    Incomplete,
+    #[error("heal pool index {pool} is out of range")]
+    InvalidPool { pool: usize },
+    #[error("heal set index {set} is out of range for pool {pool}")]
+    InvalidSet { pool: usize, set: usize },
+}
+
+/// Validate configured positions independently of disk health: an offline set
+/// remains a valid target for repair.
+pub(crate) fn validate_heal_selector(
+    endpoints: &EndpointServerPools,
+    pool: Option<usize>,
+    set: Option<usize>,
+) -> Result<(), HealSelectorError> {
+    match (pool, set) {
+        (None, None) => Ok(()),
+        (Some(pool), Some(set)) => {
+            let selected_pool = endpoints.as_ref().get(pool).ok_or(HealSelectorError::InvalidPool { pool })?;
+            if set >= selected_pool.set_count {
+                return Err(HealSelectorError::InvalidSet { pool, set });
+            }
+            Ok(())
+        }
+        _ => Err(HealSelectorError::Incomplete),
+    }
+}
+
 pub(crate) fn heal_control_coordinator(endpoint_pools: &EndpointServerPools) -> Result<HealControlCoordinator, String> {
     endpoint_pools
         .get_nodes()
@@ -469,10 +499,10 @@ pub(crate) fn decode_node_replacement_recovery_status(data: &[u8]) -> Result<Nod
 #[cfg(test)]
 mod tests {
     use super::{
-        NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_PREVIOUS_VERSION, NODE_HEAL_STATUS_VERSION, NodeHealProgress,
-        NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, decode_node_heal_status,
+        HealSelectorError, NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_PREVIOUS_VERSION, NODE_HEAL_STATUS_VERSION,
+        NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, decode_node_heal_status,
         decode_node_replacement_recovery_status, encode_node_heal_status, encode_node_replacement_recovery_status,
-        heal_control_coordinator, heal_topology_fingerprint,
+        heal_control_coordinator, heal_topology_fingerprint, validate_heal_selector,
     };
     use crate::storage::storage_api::{
         Endpoint,
@@ -504,6 +534,41 @@ mod tests {
             cmd_line: String::new(),
             platform: String::new(),
         }])
+    }
+
+    #[test]
+    fn heal_selector_uses_selected_pool_bounds_without_disk_health() {
+        let mut endpoints = topology_endpoints("node-d");
+        let mut second_pool = endpoints.as_ref()[0].clone();
+        second_pool.set_count = 1;
+        second_pool.endpoints.as_mut().truncate(2);
+        for endpoint in second_pool.endpoints.as_mut() {
+            endpoint.set_pool_index(1);
+        }
+        endpoints.as_mut().push(second_pool);
+        // These configured positions have no attached live disks. Validation
+        // must not probe their availability before accepting a repair target.
+        for (pool, set) in [(None, None), (Some(0), Some(0)), (Some(0), Some(1)), (Some(1), Some(0))] {
+            validate_heal_selector(&endpoints, pool, set).expect("configured selector should remain valid without disks");
+        }
+        for (pool, set, expected) in [
+            (Some(0), None, HealSelectorError::Incomplete),
+            (None, Some(0), HealSelectorError::Incomplete),
+            (Some(2), Some(0), HealSelectorError::InvalidPool { pool: 2 }),
+            (Some(usize::MAX), Some(0), HealSelectorError::InvalidPool { pool: usize::MAX }),
+            (Some(0), Some(2), HealSelectorError::InvalidSet { pool: 0, set: 2 }),
+            (Some(1), Some(1), HealSelectorError::InvalidSet { pool: 1, set: 1 }),
+            (
+                Some(0),
+                Some(usize::MAX),
+                HealSelectorError::InvalidSet {
+                    pool: 0,
+                    set: usize::MAX,
+                },
+            ),
+        ] {
+            assert_eq!(validate_heal_selector(&endpoints, pool, set), Err(expected));
+        }
     }
 
     #[test]
