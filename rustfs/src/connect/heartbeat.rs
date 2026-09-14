@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
-use super::diagnostics::DiagnosticCollectionPolicy;
+use super::diagnostics::{CONNECT_DIAGNOSTIC_CAPABILITIES, DiagnosticCollectionPolicy, DiagnosticJobEnvelope};
 use super::environment::ENVIRONMENT_CAPABILITY;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
@@ -101,7 +101,17 @@ impl PendingHeartbeat {
                         "heartbeat",
                         DiagnosticCollectionPolicy::policy_sync_capability(),
                         ENVIRONMENT_CAPABILITY,
-                    ])
+                    ]
+                || self.capabilities
+                    == [
+                        "heartbeat",
+                        DiagnosticCollectionPolicy::policy_sync_capability(),
+                        ENVIRONMENT_CAPABILITY,
+                        "jobs",
+                        super::diagnostics::CPU_PROFILE_CAPABILITY,
+                    ]
+                || self.capabilities == heartbeat_capabilities(false)
+                || self.capabilities == heartbeat_capabilities(true))
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)
@@ -119,12 +129,15 @@ struct HeartbeatResponse {
     capability_hints: Vec<String>,
     #[serde(default)]
     diagnostic_collection_policy: Option<DiagnosticCollectionPolicy>,
+    #[serde(default)]
+    diagnostic_job: Option<DiagnosticJobEnvelope>,
 }
 
 pub(crate) enum Delivery {
     Accepted {
         server_time: String,
         diagnostic_collection_policy: DiagnosticCollectionPolicy,
+        diagnostic_job: Option<Box<DiagnosticJobEnvelope>>,
     },
     Retry {
         retry_after: Option<Duration>,
@@ -172,6 +185,7 @@ impl HeartbeatSender {
                 Ok(Delivery::Accepted {
                     server_time: accepted.server_time,
                     diagnostic_collection_policy: policy,
+                    diagnostic_job: accepted.diagnostic_job.map(Box::new),
                 })
             }
             TelemetryDelivery::Retry { retry_after } => Ok(Delivery::Retry { retry_after }),
@@ -184,6 +198,7 @@ impl HeartbeatSender {
 #[derive(Clone)]
 pub(crate) struct HeartbeatStateStore {
     path: PathBuf,
+    job_capable: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -194,8 +209,8 @@ struct HeartbeatState {
 }
 
 impl HeartbeatStateStore {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub(crate) fn new(path: PathBuf, job_capable: bool) -> Self {
+        Self { path, job_capable }
     }
 
     pub(crate) fn try_runtime_lock(&self) -> Result<fs::File, HeartbeatError> {
@@ -243,15 +258,12 @@ impl HeartbeatStateStore {
         if state.next_sequence > MAX_SEQUENCE {
             return Err(HeartbeatError::SequenceExhausted);
         }
+        let capabilities = heartbeat_capabilities(self.job_capable);
         let pending = PendingHeartbeat {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             request_id: Uuid::new_v4().to_string(),
             agent_version: AGENT_VERSION.to_owned(),
-            capabilities: vec![
-                "heartbeat".to_owned(),
-                DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
-                ENVIRONMENT_CAPABILITY.to_owned(),
-            ],
+            capabilities,
             sequence: state.next_sequence,
             client_time: now.to_rfc3339_opts(SecondsFormat::Secs, true),
             coarse_node_summary: summary,
@@ -309,6 +321,23 @@ impl HeartbeatStateStore {
         }
         result
     }
+}
+
+fn heartbeat_capabilities(job_capable: bool) -> Vec<String> {
+    let mut capabilities = vec![
+        "heartbeat".to_owned(),
+        DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
+        ENVIRONMENT_CAPABILITY.to_owned(),
+    ];
+    if job_capable {
+        capabilities.push("jobs".to_owned());
+    }
+    capabilities.extend(
+        CONNECT_DIAGNOSTIC_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned()),
+    );
+    capabilities
 }
 
 fn parent(path: &Path) -> Result<&Path, HeartbeatError> {

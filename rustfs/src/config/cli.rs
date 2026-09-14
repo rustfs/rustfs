@@ -110,7 +110,7 @@ pub enum Commands {
     /// Offline, read-only inspection of on-disk data (no server required)
     Inspect(InspectOpts),
     /// Configure outbound RustFS Connect integration
-    Connect(ConnectOpts),
+    Connect(Box<ConnectOpts>),
 }
 
 /// RustFS Connect subcommand options
@@ -195,7 +195,7 @@ pub struct ConnectInspectObjectOpts {
     #[arg(long = "expires-at")]
     pub expires_at_unix: i64,
     /// Drive root containing the object's local erasure state; repeat for every local drive
-    #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
+    #[arg(long = "path", required = true)]
     pub paths: Vec<PathBuf>,
     /// Bucket containing the object
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -1556,11 +1556,11 @@ pub enum CommandResult {
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
     /// Consent-bound client-to-deployment performance export
-    ConnectClientPerformance(ConnectClientPerformanceOpts),
+    ConnectClientPerformance(Box<ConnectClientPerformanceOpts>),
     /// Consent-bound S3 object performance export
     ConnectObjectPerformance(ConnectObjectPerformanceOpts),
     /// Consent-bound site-replication performance export
-    ConnectSiteReplicationPerformance(ConnectSiteReplicationPerformanceOpts),
+    ConnectSiteReplicationPerformance(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
     /// Consent-bound local Connect log export
@@ -1614,9 +1614,48 @@ mod tests {
         Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, ConnectRelayMaterialKind,
         ConnectReportCommands, InspectCommands, preprocess_args_for_legacy,
     };
+    use crate::connect::CONNECT_DIAGNOSTIC_CAPABILITIES;
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn advertised_diagnostic_capabilities_have_cli_dispatch() {
+        let expected = [
+            ("performance.client@1", &["performance", "client"][..]),
+            ("performance.drive@1", &["performance", "drive"][..]),
+            ("performance.object@1", &["performance", "object"][..]),
+            ("performance.siteReplication@1", &["performance", "site-replication"][..]),
+            ("logs.capture@1", &["logs"][..]),
+            ("profile.cpu@1", &["profile"][..]),
+            ("profile.memory@1", &["profile"][..]),
+            ("profile.threads@1", &["profile"][..]),
+            ("telemetry.record@1", &["telemetry", "record"][..]),
+            ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
+            ("telemetry.replay@1", &["telemetry", "replay"][..]),
+            ("top.api@1", &["top", "api"][..]),
+            ("top.disk@1", &["top", "disk"][..]),
+            ("top.locks@1", &["top", "locks"][..]),
+            ("top.net@1", &["top", "net"][..]),
+            ("top.rpc@1", &["top", "rpc"][..]),
+            ("inspect.object@1", &["inspect", "object"][..]),
+        ];
+        assert_eq!(
+            CONNECT_DIAGNOSTIC_CAPABILITIES,
+            expected.iter().map(|(capability, _)| *capability).collect::<Vec<_>>()
+        );
+
+        let command = Cli::command();
+        let connect = command.find_subcommand("connect").expect("connect command");
+        for (capability, path) in expected {
+            let mut command = connect;
+            for segment in path {
+                command = command
+                    .find_subcommand(segment)
+                    .unwrap_or_else(|| panic!("{capability} is missing CLI dispatch at {segment}"));
+            }
+        }
+    }
 
     #[test]
     fn preprocess_help_command_displays_top_level_help() {

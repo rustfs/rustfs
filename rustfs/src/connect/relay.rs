@@ -307,7 +307,7 @@ pub enum RelayError {
 }
 
 pub trait RelayTransport {
-    fn deliver(&mut self, envelope: &[u8]) -> Result<Option<Vec<u8>>, ()>;
+    fn deliver(&mut self, envelope: &[u8]) -> Result<Option<Vec<u8>>, RelayError>;
 }
 
 #[derive(Debug)]
@@ -674,7 +674,7 @@ pub fn read_protected_relay_authentication(path: &Path) -> Result<String, RelayE
 
 #[cfg(unix)]
 fn read_protected_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, RelayError> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)

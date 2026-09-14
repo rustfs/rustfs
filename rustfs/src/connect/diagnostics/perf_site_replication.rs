@@ -33,13 +33,13 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
-use url::form_urlencoded;
 use uuid::{Uuid, Variant, Version};
 use zeroize::Zeroizing;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -334,6 +334,13 @@ pub trait SiteReplicationProbe: Send + Sync {
     ) -> SiteReplicationProbeFuture<'a>;
 }
 
+/// Static credential set for one site-replication endpoint connection.
+pub struct SiteReplicationCredentials {
+    pub access_key: Zeroizing<String>,
+    pub secret_key: Zeroizing<String>,
+    pub session_token: Zeroizing<String>,
+}
+
 pub struct SiteReplicationEndpoint {
     pub alias: String,
     pub deployment_id: String,
@@ -350,13 +357,11 @@ impl SiteReplicationEndpoint {
         deployment_id: impl Into<String>,
         endpoint: &str,
         root_ca_pem: Option<&[u8]>,
-        access_key: Zeroizing<String>,
-        secret_key: Zeroizing<String>,
-        session_token: Zeroizing<String>,
+        credentials: SiteReplicationCredentials,
         timeout: Duration,
     ) -> Result<Self, SiteReplicationPerformanceError> {
         let endpoint = deployment_endpoint(endpoint)?;
-        if access_key.is_empty() || secret_key.is_empty() {
+        if credentials.access_key.is_empty() || credentials.secret_key.is_empty() {
             return Err(SiteReplicationPerformanceError::InvalidCredential);
         }
         let mut builder = Client::builder()
@@ -376,9 +381,9 @@ impl SiteReplicationEndpoint {
             deployment_id: deployment_id.into(),
             endpoint,
             client,
-            access_key,
-            secret_key,
-            session_token,
+            access_key: credentials.access_key,
+            secret_key: credentials.secret_key,
+            session_token: credentials.session_token,
         })
     }
 }
@@ -1331,7 +1336,7 @@ fn list_versions_url(endpoint: &Url, bucket: &str, key: &str) -> Result<Url, Sit
 fn encode_path(value: &str) -> String {
     value
         .split('/')
-        .map(|segment| form_urlencoded::byte_serialize(segment.as_bytes()).collect::<String>())
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -1421,7 +1426,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn build_feature(value: &String) -> bool {
+fn build_feature(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -1565,7 +1570,7 @@ mod tests {
         let export = sign_site_replication_export(&request, &measured, &DeviceIdentity::generate(), &CancellationToken::new())
             .expect("signed site replication export");
         let envelope = String::from_utf8(export.envelope_json.clone()).expect("envelope UTF-8");
-        let result = String::from_utf8(export.result_json.clone()).expect("result UTF-8");
+        let result = String::from_utf8(export.result_json).expect("result UTF-8");
         let envelope_value: serde_json::Value = serde_json::from_str(&envelope).expect("envelope JSON");
         assert_eq!(envelope_value["targets"]["sourceDeployment"], request.cluster_name);
         assert_eq!(envelope_value["targets"]["destinationDeployment"], request.destination_cluster_name);

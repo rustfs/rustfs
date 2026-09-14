@@ -144,7 +144,11 @@ pub(crate) fn upload_source(
     }
     verify_envelope_signature(&identity, &envelope_bytes, &signature.value)?;
 
-    let produced_at = now.format(&Rfc3339).map_err(|_| ReportBundleError::Invalid)?;
+    let produced_at = now
+        .replace_nanosecond(0)
+        .map_err(|_| ReportBundleError::Invalid)?
+        .format(&Rfc3339)
+        .map_err(|_| ReportBundleError::Invalid)?;
     let entries = [
         manifest_entry(ENVELOPE_PATH, &envelope_bytes, &envelope.classification),
         manifest_entry(ENVELOPE_SIGNATURE_PATH, &envelope_signature_bytes, &envelope.classification),
@@ -201,7 +205,7 @@ fn original_source(path: &Path, bundle_uid: &str) -> Result<UploadSource, Report
 }
 
 fn read_member(archive: &mut ZipArchive<File>, name: &str, maximum: u64) -> Result<Vec<u8>, ReportBundleError> {
-    let mut entry = archive.by_name(name)?;
+    let entry = archive.by_name(name)?;
     let size = entry.size();
     if size == 0 || size > maximum || !entry.is_file() {
         return Err(ReportBundleError::Invalid);
@@ -418,6 +422,7 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
         assert_eq!(manifest["bundleUid"], bundle_uid);
         assert_eq!(manifest["nonce"], fixture.nonce);
+        assert_eq!(manifest["producedAt"].as_str().expect("producedAt").len(), 20);
         assert_eq!(manifest["entries"].as_array().expect("entries").len(), 3);
         for (index, (path, bytes)) in [
             ("envelope.json", fixture.envelope.as_slice()),
@@ -487,7 +492,7 @@ mod tests {
             let run_uid = Uuid::now_v7().to_string();
             let result = serde_json::to_vec(&json!({
                 "schemaVersion": 1,
-                "runUid": run_uid.clone(),
+                "runUid": run_uid,
                 "toolId": "top.net",
                 "capability": "top.net@1",
                 "outcome": "SUCCEEDED",
@@ -524,8 +529,8 @@ mod tests {
                 "policyRevision": 1,
                 "producedAt": now.format(&Rfc3339).expect("producedAt"),
                 "expiresAt": (now + validity).format(&Rfc3339).expect("expiresAt"),
-                "nonce": nonce.clone(),
-                "deviceKeyId": key_id.clone(),
+                "nonce": nonce,
+                "deviceKeyId": key_id,
                 "payload": {
                     "path": "result.json",
                     "mediaType": "application/json",
