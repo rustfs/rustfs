@@ -39,7 +39,7 @@ use walkdir::WalkDir;
 
 mod storage_api;
 
-use storage_api::integration::{BucketOperations, ECStore, MakeBucketOptions, ObjectIO as _};
+use storage_api::integration::{BucketOperations, ECStore, MakeBucketOptions, ObjectIO as _, WriteCompletion};
 
 /// 256 KiB + change: large enough to be stored as non-inline erasure shards, so
 /// deleting the `xl.meta` file does NOT delete the data (the `part.*` shards live
@@ -90,6 +90,8 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
     let mut reader = PutObjReader::from_vec(data.to_vec());
     let opts = ObjectOptions {
         versioned: true,
+        // These fixtures inspect or mutate physical shards after PUT returns.
+        write_completion: WriteCompletion::TailDrained,
         ..Default::default()
     };
     let info = (**ecstore)
