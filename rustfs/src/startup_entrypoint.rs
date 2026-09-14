@@ -918,9 +918,8 @@ async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpt
 
 async fn execute_connect_site_replication_performance(options: ConnectSiteReplicationPerformanceOpts) -> Result<()> {
     use crate::connect::{
-        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationCredentials,
-        SiteReplicationEndpoint, SiteReplicationOutcome,
-        SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
+        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationCredentials, SiteReplicationEndpoint,
+        SiteReplicationOutcome, SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
         read_protected_site_replication_credential, save_signed_site_replication_export, sign_site_replication_export,
         validate_site_replication_limits,
     };
