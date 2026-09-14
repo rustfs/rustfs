@@ -23,7 +23,9 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 mod storage_api;
-use storage_api::{endpoint_index::*, integration::*, pool_metadata::*};
+use storage_api::endpoint_index::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
+use storage_api::integration::{BucketOperations as _, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _};
+use storage_api::pool_metadata::{HEALING_MARKER_PATH, POOL_META_NAME, RUSTFS_META_BUCKET, init_bucket_metadata_sys};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replacement_pool_metadata_follows_real_two_set_placement() {
