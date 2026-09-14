@@ -179,9 +179,11 @@ fn replication_config_from_metadata(metadata: &BucketMetadata) -> Result<Option<
 }
 
 fn delete_request_snapshot_from_metadata(metadata: Arc<BucketMetadata>) -> Result<DeleteReplicationConfigSnapshot> {
-    if !metadata.versioning_config_xml.is_empty() && metadata.versioning_config.is_none() {
-        return Err(super::replication_error_boundary::Error::other(
-            "persisted bucket versioning configuration is invalid",
+    if let Some(raw_len) = metadata.xml_config_unreadable_len(crate::bucket::metadata::BUCKET_VERSIONING_CONFIG) {
+        return Err(crate::bucket::metadata::unreadable_config_error(
+            &metadata.name,
+            crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            raw_len,
         ));
     }
 

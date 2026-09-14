@@ -12691,9 +12691,8 @@ mod tests {
             .await
             .expect_err("malformed Object Lock metadata must reject lifecycle config resolution");
         assert!(
-            exact_error
-                .to_string()
-                .contains("persisted bucket Object Lock configuration is invalid")
+            crate::bucket::metadata::is_unreadable_config_error(&exact_error),
+            "malformed Object Lock metadata must surface as the typed unreadable-config refusal: {exact_error}"
         );
 
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;

@@ -3155,7 +3155,7 @@ async fn delete_object_versioning_config_failure_leaves_latest_object_intact() {
         .await
         .expect_err("versioning config failure must reject DeleteObject");
 
-    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
 }
 
