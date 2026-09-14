@@ -16,18 +16,31 @@ name: "Schedule Failure Issue"
 description: >-
   Open (or update) a tracking issue when a scheduled workflow run fails or
   does not complete normally.
+  Issues are filed in the target repository (default rustfs/backlog), not
+  the repository the workflow runs in.
   Dedupes by workflow name: if an open issue titled
-  "[scheduled-failure] <workflow name>" already exists, the result is
+  "[scheduled-failure] <workflow name>" already exists there, the result is
   appended as a comment; otherwise a new issue is created. This is the
   single alerting mechanism for all scheduled pipelines (backlog#1149 ci-8).
 
 inputs:
   github-token:
     description: >-
-      Token with issues:write on the repository. Pass secrets.GITHUB_TOKEN
-      from a job that declares `permissions: issues: write` (scope the
-      permission to the alert job only, never workflow-wide).
+      Token with issues:write on the target repository. The workflow-scoped
+      secrets.GITHUB_TOKEN is scoped to the code repository and cannot open
+      issues in rustfs/backlog, so pass a PAT / GitHub App token stored as a
+      repository secret (BACKLOG_ISSUE_TOKEN).
     required: true
+  target-repository:
+    description: "Repository the failure-tracking issue is filed in."
+    required: false
+    default: rustfs/backlog
+  source-token:
+    description: >-
+      Token used to read the failed-job list from the reported run. Defaults
+      to the workflow's own token, which can read runs of its own repository.
+    required: false
+    default: ${{ github.token }}
   workflow-name:
     description: "Workflow name used for the issue title (the dedupe key)."
     required: false
@@ -35,8 +48,8 @@ inputs:
   label:
     description: >-
       Label applied when a new issue is created. Must already exist in the
-      repository; if applying it fails, the issue is created without a label.
-      Set to an empty string to skip labeling.
+      target repository; if applying it fails, the issue is created without a
+      label. Set to an empty string to skip labeling.
     required: false
     default: "infrastructure"
   source-run-id:
@@ -71,6 +84,8 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        SOURCE_TOKEN: ${{ inputs.source-token }}
+        TARGET_REPOSITORY: ${{ inputs.target-repository }}
         WORKFLOW_NAME: ${{ inputs.workflow-name }}
         ISSUE_LABEL: ${{ inputs.label }}
         SOURCE_RUN_ID: ${{ inputs.source-run-id }}
@@ -86,8 +101,10 @@ runs:
         run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
 
         # Inspect the reported run attempt. It can be the current in-workflow
-        # failure or a completed run observed by the external watchdog.
-        failed_jobs="$(gh api \
+        # failure or a completed run observed by the external watchdog. The
+        # run lives in the repository running the workflow, so authenticate
+        # with the source token, not the target-repository token.
+        failed_jobs="$(GH_TOKEN="${SOURCE_TOKEN}" gh api \
           "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs" \
           --paginate \
           --jq '.jobs[]
@@ -109,6 +126,7 @@ runs:
         body="$(cat <<EOF
         Run of **${WORKFLOW_NAME}** did not complete successfully.
 
+        - Repository: ${GITHUB_REPOSITORY}
         - Run: ${run_url} (attempt ${SOURCE_RUN_ATTEMPT})
         - Event: \`${SOURCE_EVENT}\`
         - Ref: \`${SOURCE_REF_NAME}\` @ \`${SOURCE_SHA}\`
@@ -120,26 +138,26 @@ runs:
         EOF
         )"
 
-        # Dedupe by exact title among OPEN issues (a closed issue means the
-        # earlier breakage was resolved; a new failure gets a fresh issue).
-        # GitHub search strips the [] characters, so search loosely and match
-        # the exact title with jq.
-        existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --limit 100 \
+        # Dedupe by exact title among OPEN issues in the target repository (a
+        # closed issue means the earlier breakage was resolved; a new failure
+        # gets a fresh issue). GitHub search strips the [] characters, so
+        # search loosely and match the exact title with jq.
+        existing="$(gh issue list --repo "${TARGET_REPOSITORY}" --state open --limit 100 \
           --search "\"scheduled-failure\" in:title" --json number,title \
           | jq -r --arg title "${title}" 'map(select(.title == $title)) | (.[0].number // empty)')"
 
         if [ -n "${existing}" ]; then
-          echo "Appending comment to existing open issue #${existing}"
-          gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          echo "Appending comment to existing open issue rustfs/backlog#${existing}"
+          gh issue comment "${existing}" --repo "${TARGET_REPOSITORY}" --body "${body}"
           exit 0
         fi
 
-        echo "Creating new issue: ${title}"
+        echo "Creating new issue in ${TARGET_REPOSITORY}: ${title}"
         if [ -n "${ISSUE_LABEL}" ]; then
-          if gh issue create --repo "${GITHUB_REPOSITORY}" \
+          if gh issue create --repo "${TARGET_REPOSITORY}" \
                --title "${title}" --body "${body}" --label "${ISSUE_LABEL}"; then
             exit 0
           fi
           echo "::warning::issue creation with label '${ISSUE_LABEL}' failed (missing label?); retrying without a label"
         fi
-        gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+        gh issue create --repo "${TARGET_REPOSITORY}" --title "${title}" --body "${body}"

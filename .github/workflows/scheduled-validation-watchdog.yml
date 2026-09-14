@@ -55,7 +55,7 @@ jobs:
       - name: Open or update incomplete-run issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
           workflow-name: ${{ github.event.workflow_run.name }}
           source-run-id: ${{ github.event.workflow_run.id }}
           source-run-attempt: ${{ github.event.workflow_run.run_attempt }}
