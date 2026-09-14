@@ -28,6 +28,7 @@ pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
 pub(crate) mod storage_api;
+pub(crate) mod table_list_isolation;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;
