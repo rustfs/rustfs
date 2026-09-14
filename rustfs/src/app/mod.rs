@@ -28,6 +28,7 @@ pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
 pub(crate) mod storage_api;
+pub(crate) mod trailer_adapter;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;

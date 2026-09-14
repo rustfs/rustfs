@@ -18,8 +18,8 @@ use crate::{
     config::Config,
     connect::{
         CoarseNodeSummary, HeartbeatConfig, HeartbeatError, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime,
-        InventorySchedule, InventorySnapshot, runtime::heartbeat_failure_reason, spawn_heartbeat_runtime,
-        spawn_inventory_runtime,
+        InventorySchedule, InventorySnapshot, LocalTraceCaptureRuntime, runtime::heartbeat_failure_reason,
+        spawn_heartbeat_runtime, spawn_inventory_runtime, spawn_local_trace_capture_runtime,
     },
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
@@ -46,6 +46,7 @@ pub(crate) struct StartupServiceRuntime {
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
     pub(crate) inventory: Option<InventoryRuntime>,
+    pub(crate) local_trace_capture: Option<LocalTraceCaptureRuntime>,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
     pub(crate) enable_scanner: bool,
 }
@@ -85,6 +86,12 @@ pub(crate) async fn init_startup_runtime_services(
 
     let optional_runtimes = init_optional_runtime_services().await?;
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
+    let local_trace_capture = heartbeat_config
+        .as_ref()
+        .and_then(HeartbeatConfig::state_root)
+        .map(|state_root| spawn_local_trace_capture_runtime(state_root, &ctx))
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
     let inventory_drives = heartbeat_config
         .as_ref()
@@ -115,6 +122,7 @@ pub(crate) async fn init_startup_runtime_services(
         optional_runtimes,
         heartbeat,
         inventory,
+        local_trace_capture,
         iam_bootstrap,
         enable_scanner,
     })

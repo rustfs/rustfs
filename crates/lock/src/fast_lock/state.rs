@@ -307,6 +307,13 @@ impl AtomicLockState {
         ((state & WRITERS_WAITING_MASK) >> WRITERS_WAITING_SHIFT) as u16
     }
 
+    pub(crate) fn holder_and_waiter_counts(&self) -> (u64, u64) {
+        let state = self.state.load(Ordering::Acquire);
+        let holders = u64::from(self.readers_count(state)) + u64::from((state & WRITER_FLAG_MASK) != 0);
+        let waiters = u64::from(self.readers_waiting(state)) + u64::from(self.writers_waiting(state));
+        (holders, waiters)
+    }
+
     #[cfg(test)]
     pub fn readers_waiting_count(&self) -> u16 {
         let state = self.state.load(Ordering::Acquire);

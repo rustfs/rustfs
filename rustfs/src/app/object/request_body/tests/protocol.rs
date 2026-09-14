@@ -17,13 +17,16 @@ use crate::app::storage_api::s3::{
     Body as S3Body, S3, S3Config, S3Error, S3Request, S3Response, S3Result, S3Service, S3ServiceBuilder, SimpleAuth,
     StaticConfigProvider, UploadPartInput, UploadPartOutput,
 };
+use crate::app::trailer_adapter::trailer_source;
 use http_body_util::BodyExt;
+use rustfs_rio::{SharedTrailerSource, TrailerValue};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Default)]
 struct Consumer {
     received: Arc<AtomicUsize>,
     committed: Arc<Mutex<Option<Vec<u8>>>>,
+    trailer: Arc<Mutex<Option<SharedTrailerSource>>>,
 }
 
 #[async_trait::async_trait]
@@ -41,8 +44,10 @@ impl S3 for Consumer {
         let mut reader =
             rustfs_rio::HashReader::from_stream(DemandReader::new(inner, control), expected, expected, None, None, false)
                 .expect("logical body reader");
+        let trailer = trailer_source(req.trailing_headers);
+        *self.trailer.lock() = trailer.clone();
         reader
-            .add_checksum_from_s3s(&req.headers, req.trailing_headers, false)
+            .add_checksum(&req.headers, trailer, false)
             .expect("request checksum context");
         let mut output = Vec::new();
         let mut buffer = [0; 8192];
@@ -277,4 +282,34 @@ async fn unsigned_trailer_with_wrong_checksum_cannot_commit() {
     let xml = BodyExt::collect(response.into_body()).await.expect("error XML").to_bytes();
     assert!(String::from_utf8_lossy(&xml).contains("<Code>BadDigest</Code>"));
     assert!(consumer.committed.lock().is_none());
+}
+
+#[tokio::test]
+async fn trailer_adapter_is_pending_until_the_decoded_body_ends() {
+    let payload = b"123456789";
+    let SignedRequest {
+        request,
+        sender,
+        prefix,
+        suffix,
+    } = signed_request(payload, true);
+    let consumer = Consumer::default();
+    let service = service(consumer.clone());
+    sender.send(Ok(Frame::data(prefix))).expect("prefix");
+    sender.send(Ok(Frame::data(Bytes::from_static(payload)))).expect("payload");
+    sender.send(Ok(Frame::data(suffix.slice(..2)))).expect("chunk terminator");
+    let mut call = Box::pin(service.call(request));
+    assert!(poll!(call.as_mut()).is_pending());
+    assert_eq!(consumer.received.load(Ordering::Relaxed), payload.len());
+    let trailer = consumer.trailer.lock().clone().expect("declared trailer is adapted");
+    assert_eq!(trailer.lookup("x-amz-checksum-crc32"), TrailerValue::Pending);
+    assert!(consumer.committed.lock().is_none());
+
+    sender.send(Ok(Frame::data(suffix.slice(2..)))).expect("trailer section");
+    drop(sender);
+    let response = call.await.expect("S3 response");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(trailer.lookup("x-amz-checksum-crc32"), TrailerValue::Present("y/Q5Jg==".to_owned()));
+    assert_eq!(trailer.lookup("x-amz-checksum-sha256"), TrailerValue::Missing);
+    assert_eq!(*consumer.committed.lock(), Some(payload.to_vec()));
 }

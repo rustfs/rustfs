@@ -18,9 +18,11 @@ mod perf_client;
 mod perf_drive;
 mod perf_network;
 mod perf_object;
+mod perf_site_replication;
 mod profile_cpu;
 mod profile_memory;
 mod profile_threads;
+mod receipt_delivery;
 mod schedule;
 mod top_api;
 mod top_disk;
@@ -31,6 +33,11 @@ mod trace_analysis;
 mod trace_otlp;
 mod trace_record;
 mod trace_replay;
+#[cfg(unix)]
+mod trace_runtime;
+#[cfg(not(unix))]
+#[path = "trace_runtime_unsupported.rs"]
+mod trace_runtime;
 
 pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
@@ -75,14 +82,26 @@ pub use perf_object::{
     SignedObjectExport, measure_object, read_protected_object_credential, save_signed_object_export, sign_object_export,
     validate_object_limits,
 };
+pub use perf_site_replication::{
+    LocalSiteReplicationConsent, MAX_SITE_REPLICATION_DURATION, MAX_SITE_REPLICATION_TRAFFIC_BYTES, S3SiteReplicationProbe,
+    SITE_REPLICATION_CAPABILITY, SITE_REPLICATION_SCHEMA_VERSION, SITE_REPLICATION_TOOL_ID, SavedSiteReplicationExport,
+    SignedSiteReplicationExport, SiteReplicationDiagnosticResult, SiteReplicationEndpoint, SiteReplicationMeasurement,
+    SiteReplicationOutcome, SiteReplicationPerformanceData, SiteReplicationPerformanceError, SiteReplicationPerformanceRequest,
+    SiteReplicationProbe, SiteReplicationProbeError, SiteReplicationProbeFuture, SiteReplicationProbeMeasurement,
+    SiteReplicationProvenance, SiteReplicationReasonCode, SiteReplicationTargetReasonCode, SiteReplicationTargetResult,
+    measure_site_replication, read_protected_site_replication_credential, save_signed_site_replication_export,
+    sign_site_replication_export, validate_site_replication_limits,
+};
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
     ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
-    ProfileTool, SavedProfileExport, SignedProfileExport, THREAD_PROFILE_CAPABILITY, ThreadProfileScope, capture_cpu_profile,
-    encode_signed_profile_export, export_cpu_profile, save_signed_profile_export,
+    ProfileTool, SavedProfileExport, SignedProfileExport, THREAD_PROFILE_CAPABILITY, ThreadProfileData, ThreadProfileScope,
+    ThreadState, ThreadStateCount, capture_cpu_profile, encode_signed_profile_export, export_cpu_profile,
+    save_signed_profile_export,
 };
 pub use profile_memory::export_memory_profile;
 pub use profile_threads::{capture_thread_profile, export_thread_profile};
+pub(crate) use receipt_delivery::{DiagnosticReceiptDelivery, DiagnosticReceiptSender};
 pub use schedule::{
     DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticScheduleError, DiagnosticScheduleRuntime, DiagnosticScheduleStatus,
     ReceiptOutcome, run_local_environment_once, spawn_environment_schedule,
@@ -93,7 +112,7 @@ pub use top_api::{
     TopCoverage, TopOutcome, TopProvenance, TopReasonCode, TopResult, capture_top_api, save_signed_top_export, sign_top_export,
 };
 pub use top_disk::{DiskCounterSnapshot, TopDiskData, capture_top_disk, evaluate_disk_window};
-pub use top_locks::{TopLocksData, capture_top_locks};
+pub use top_locks::{TopLocksData, capture_top_locks, evaluate_lock_snapshot};
 pub use top_net::{NetworkCounterSnapshot, TopNetData, capture_top_net, evaluate_network_window};
 pub use top_rpc::{TopRpcData, capture_top_rpc};
 pub use trace_analysis::{OperationSummary, TraceAnalysis, TraceAnalysisError, analyze_trace};
@@ -110,3 +129,6 @@ pub use trace_record::{
     record_diagnostic_result, record_trace, record_trace_bus, save_signed_telemetry_export,
 };
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
+pub(crate) use trace_runtime::{
+    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+};

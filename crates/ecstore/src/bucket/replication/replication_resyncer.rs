@@ -19,6 +19,7 @@ use super::replication_error_boundary::{Error, Result, is_err_object_not_found, 
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 #[cfg(test)]
 use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
+use super::replication_filemeta_boundary::metadata_keys;
 use super::replication_filemeta_boundary::{
     REPLICATE_EXISTING, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
     ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
@@ -85,9 +86,9 @@ use metrics::counter;
 use rmp_serde;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX,
-    has_internal_suffix, insert_str, replication_target_versions,
+    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_TAGGING_DIRECTIVE,
+    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX, has_internal_suffix,
+    insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
@@ -202,7 +203,7 @@ fn metadata_requires_existing_target(op_type: ReplicationType, object_info: &Obj
     op_type == ReplicationType::Metadata
         && object_info
             .user_defined
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .get(metadata_keys::REPLICATION_STATUS)
             .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
 }
 
@@ -6274,7 +6275,7 @@ mod tests {
             version_id: roi.version_id,
             etag: Some("source-etag".to_string()),
             user_defined: Arc::new(HashMap::from([(
-                AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+                metadata_keys::REPLICATION_STATUS.to_string(),
                 ReplicationStatusType::Replica.as_str().to_string(),
             )])),
             ..Default::default()

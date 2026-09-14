@@ -1,0 +1,112 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "diagnostic-scheduler",
+  "capability": "diagnostics.policy.v1",
+  "toolCapability": "inventory.environment@1",
+  "classification": "L1",
+  "description": "Rejected consent-bound scheduler inputs and state. Rejection stops collection and never turns missing evidence into a successful receipt.",
+  "fixture": "reject-vectors",
+  "vectors": [
+    {
+      "id": "diagnostic-scheduler.interval-below-cap",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 11,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 299,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "expected": { "accepted": false, "reason": "connect_diagnostic_policy_invalid" }
+    },
+    {
+      "id": "diagnostic-scheduler.retention-above-cap",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 12,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 15,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "expected": { "accepted": false, "reason": "connect_diagnostic_policy_invalid" }
+    },
+    {
+      "id": "diagnostic-scheduler.unsupported-tool",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 13,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["logs.capture"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "expected": { "accepted": false, "reason": "connect_diagnostic_policy_invalid" }
+    },
+    {
+      "id": "diagnostic-scheduler.expired-consent",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 14,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2020-01-01T00:00:00Z"
+      },
+      "expected": { "accepted": false, "reason": "connect_diagnostic_policy_invalid" }
+    },
+    {
+      "id": "diagnostic-scheduler.changed-policy-with-same-revision",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 15,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 600,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "persistedState": {
+        "policyRevision": 15,
+        "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "nextDueAt": "2030-01-01T00:05:00Z",
+        "activeIntervalStartedAt": null,
+        "lastReceipt": null
+      },
+      "expected": { "accepted": false, "reason": "connect_diagnostic_state_corrupt" }
+    },
+    {
+      "id": "diagnostic-scheduler.result-over-size-cap",
+      "resultBytes": 65537,
+      "expected": {
+        "accepted": false,
+        "receiptOutcome": "FAILED",
+        "reason": "connect_diagnostic_result_too_large"
+      }
+    }
+  ]
+}

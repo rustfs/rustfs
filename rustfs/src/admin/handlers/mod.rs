@@ -25,6 +25,7 @@ pub mod diagnostics;
 pub mod durability;
 pub mod event;
 pub mod extensions;
+pub mod gateway_key_inventory;
 pub mod group;
 pub mod heal;
 pub mod health;

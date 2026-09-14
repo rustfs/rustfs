@@ -554,9 +554,11 @@ impl DefaultObjectUsecase {
         opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
         opts.preserve_etag = ctx.preserve_etag.clone();
         opts.preserve_delete_marker = ctx.preserve_delete_marker;
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        let (versioned, version_suspended) = BucketVersioningSys::write_state(&bucket, &key)
+            .await
+            .map_err(ApiError::from)?;
         opts.versioned = versioned;
-        opts.version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
+        opts.version_suspended = version_suspended;
         let capacity_scope_token = Uuid::new_v4();
         opts.capacity_scope_token = Some(capacity_scope_token);
 

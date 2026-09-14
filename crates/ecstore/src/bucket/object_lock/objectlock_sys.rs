@@ -19,9 +19,7 @@ use crate::bucket::object_lock::objectlock;
 use crate::bucket::object_lock::types::{DefaultRetention, LegalHoldStatus, RetentionMode};
 use crate::error::{Error, Result, StorageError};
 use crate::object_api::{ObjectInfo, ObjectOptions};
-use rustfs_utils::http::headers::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-};
+use rustfs_filemeta::metadata_keys;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -317,7 +315,7 @@ fn persisted_lock_value<'a>(obj_info: &'a ObjectInfo, key: &str) -> Option<&'a S
 /// Whether the version's persisted legal hold is ON. Any other non-empty
 /// value than ON/OFF is malformed metadata and fails closed.
 fn legal_hold_locks(obj_info: &ObjectInfo) -> Result<bool> {
-    let Some(status) = persisted_lock_value(obj_info, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER) else {
+    let Some(status) = persisted_lock_value(obj_info, metadata_keys::OBJECT_LOCK_LEGAL_HOLD) else {
         return Ok(false);
     };
     match LegalHoldStatus::parse(status) {
@@ -335,8 +333,8 @@ fn active_retention(
     default_retention: Option<&DefaultRetention>,
     obj_info: &ObjectInfo,
 ) -> Result<Option<(RetentionMode, OffsetDateTime)>> {
-    let mode = persisted_lock_value(obj_info, AMZ_OBJECT_LOCK_MODE_LOWER);
-    let retain_until = persisted_lock_value(obj_info, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
+    let mode = persisted_lock_value(obj_info, metadata_keys::OBJECT_LOCK_MODE);
+    let retain_until = persisted_lock_value(obj_info, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE);
     match (mode, retain_until) {
         (None, None) => {}
         (Some(mode), Some(retain_until)) => {
@@ -413,9 +411,6 @@ pub async fn check_object_lock_for_deletion(
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::configured_object_lock_state_for_tests;
-    use rustfs_utils::http::headers::{
-        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    };
     use time::{Date, Month, PrimitiveDateTime, Time};
 
     fn make_datetime(year: i32, month: u8, day: u8) -> OffsetDateTime {
@@ -509,7 +504,7 @@ mod tests {
     #[test]
     fn deletion_rejects_incomplete_persisted_retention_metadata() {
         let mut user_defined = std::collections::HashMap::new();
-        user_defined.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), RetentionMode::COMPLIANCE.to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), RetentionMode::COMPLIANCE.to_string());
         let obj_info = ObjectInfo {
             user_defined: Arc::new(user_defined),
             ..Default::default()
@@ -535,10 +530,10 @@ mod tests {
         for (case, mode, retain_until, expected) in cases {
             let mut user_defined = std::collections::HashMap::new();
             if let Some(mode) = mode {
-                user_defined.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.to_string());
+                user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string());
             }
             if let Some(retain_until) = retain_until {
-                user_defined.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until.to_string());
+                user_defined.insert(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until.to_string());
             }
             let obj_info = ObjectInfo {
                 user_defined: Arc::new(user_defined),
@@ -579,14 +574,14 @@ mod tests {
     /// source timestamp of every category that currently locks the version.
     #[test]
     fn replication_write_passes_worm_gate_only_with_every_locking_category_timestamp() {
-        let hold = [(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON")];
+        let hold = [(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "ON")];
         let retention = [
-            (AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
-            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2099-01-01T00:00:00Z"),
+            (metadata_keys::OBJECT_LOCK_MODE, "GOVERNANCE"),
+            (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE, "2099-01-01T00:00:00Z"),
         ];
         let expired = [
-            (AMZ_OBJECT_LOCK_MODE_LOWER, "COMPLIANCE"),
-            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2000-01-01T00:00:00Z"),
+            (metadata_keys::OBJECT_LOCK_MODE, "COMPLIANCE"),
+            (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE, "2000-01-01T00:00:00Z"),
         ];
         let absent = ObjectLockConfigState::ConfirmedAbsent;
         let passes = |state: &ObjectLockConfigState, entries: &[&[(&str, &str)]], opts: &ObjectOptions| {
@@ -606,7 +601,7 @@ mod tests {
         // Expired retention and a released hold no longer lock anything.
         assert!(passes(
             &absent,
-            &[&expired, &[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "OFF")]],
+            &[&expired, &[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "OFF")]],
             &replication_opts(false, false)
         ));
 
@@ -651,7 +646,7 @@ mod tests {
             );
 
             // Default retention plus a legal hold: both categories need a timestamp.
-            let held = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON")]]));
+            let held = lock_object_info(lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "ON")]]));
             assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(false, true)).expect("judged"));
             assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, false)).expect("judged"));
             assert!(replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, true)).expect("judged"));
@@ -672,7 +667,7 @@ mod tests {
             assert!(replication_write_may_pass_worm_gate(&state, &delete_marker, &tagging_only).expect("judged"));
 
             // Cleared (empty) explicit keys fall back to the bucket default.
-            let cleared = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_MODE_LOWER, "")]]));
+            let cleared = lock_object_info(lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_MODE, "")]]));
             assert!(!replication_write_may_pass_worm_gate(&state, &cleared, &tagging_only).expect("judged"));
         }
     }
@@ -690,7 +685,7 @@ mod tests {
         .expect_err("fabricated bucket lock metadata must not be judged");
         assert!(err.to_string().contains("not authoritative"));
 
-        let malformed = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "MAYBE")]]));
+        let malformed = lock_object_info(lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "MAYBE")]]));
         let err = replication_write_may_pass_worm_gate(&ObjectLockConfigState::ConfirmedAbsent, &malformed, &opts)
             .expect_err("malformed legal hold must not be judged");
         assert!(err.to_string().contains("legal-hold"));
@@ -738,15 +733,15 @@ mod tests {
         let cases: [(&str, &[&str]); 3] = [
             (
                 "cleared retention",
-                &[AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER],
+                &[metadata_keys::OBJECT_LOCK_MODE, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE],
             ),
-            ("cleared legal hold", &[AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER]),
+            ("cleared legal hold", &[metadata_keys::OBJECT_LOCK_LEGAL_HOLD]),
             (
                 "all cleared",
                 &[
-                    AMZ_OBJECT_LOCK_MODE_LOWER,
-                    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-                    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+                    metadata_keys::OBJECT_LOCK_MODE,
+                    metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE,
+                    metadata_keys::OBJECT_LOCK_LEGAL_HOLD,
                 ],
             ),
         ];
@@ -766,7 +761,7 @@ mod tests {
     #[test]
     fn deletion_rejects_invalid_persisted_legal_hold_metadata() {
         let mut user_defined = std::collections::HashMap::new();
-        user_defined.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "INVALID".to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "INVALID".to_string());
         let obj_info = ObjectInfo {
             user_defined: Arc::new(user_defined),
             ..Default::default()

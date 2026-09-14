@@ -127,6 +127,44 @@ pub struct TraceEvent {
     pub attrs: SmallVec<[TraceAttr; TRACE_ATTR_INLINE_CAPACITY]>,
 }
 
+/// A telemetry operation whose published shape cannot retain request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryTraceOperation {
+    GetObject,
+    PutObject,
+    HeadObject,
+    ListObjects,
+    InternalRpc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryTraceStatus {
+    Ok,
+    Error,
+}
+
+/// A pre-classified S3 or internode RPC observation.
+///
+/// This event deliberately has no request path, headers, object identity,
+/// payload, or free-form attributes. Producers must classify the operation
+/// and outcome before publishing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryTraceEvent {
+    pub operation: TelemetryTraceOperation,
+    pub duration: Duration,
+    pub status: TelemetryTraceStatus,
+}
+
+impl TelemetryTraceEvent {
+    pub const fn new(operation: TelemetryTraceOperation, duration: Duration, status: TelemetryTraceStatus) -> Self {
+        Self {
+            operation,
+            duration,
+            status,
+        }
+    }
+}
+
 impl TraceEvent {
     pub fn new(kind: TraceKind, func: TraceFunc) -> Self {
         Self {
@@ -174,15 +212,20 @@ impl TraceEvent {
 pub struct TraceBus {
     sender: broadcast::Sender<Arc<TraceEvent>>,
     subscriber_count: Arc<AtomicUsize>,
+    telemetry_sender: broadcast::Sender<Arc<TelemetryTraceEvent>>,
+    telemetry_subscriber_count: Arc<AtomicUsize>,
 }
 
 impl TraceBus {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let (sender, _receiver) = broadcast::channel(capacity);
+        let (telemetry_sender, _telemetry_receiver) = broadcast::channel(capacity);
         Self {
             sender,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
+            telemetry_sender,
+            telemetry_subscriber_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -205,6 +248,27 @@ impl TraceBus {
         }
 
         self.sender.send(Arc::new(build())).is_ok()
+    }
+
+    pub fn telemetry_subscriber_count(&self) -> usize {
+        self.telemetry_subscriber_count.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_telemetry(&self) -> TelemetryTraceSubscription {
+        let receiver = self.telemetry_sender.subscribe();
+        self.telemetry_subscriber_count.fetch_add(1, Ordering::AcqRel);
+        TelemetryTraceSubscription {
+            receiver,
+            subscriber_count: Arc::clone(&self.telemetry_subscriber_count),
+        }
+    }
+
+    pub fn emit_telemetry(&self, build: impl FnOnce() -> TelemetryTraceEvent) -> bool {
+        if self.telemetry_subscriber_count() == 0 {
+            return false;
+        }
+
+        self.telemetry_sender.send(Arc::new(build())).is_ok()
     }
 }
 
@@ -236,6 +300,28 @@ impl Drop for TraceSubscription {
     }
 }
 
+#[derive(Debug)]
+pub struct TelemetryTraceSubscription {
+    receiver: broadcast::Receiver<Arc<TelemetryTraceEvent>>,
+    subscriber_count: Arc<AtomicUsize>,
+}
+
+impl TelemetryTraceSubscription {
+    pub async fn recv(&mut self) -> Result<Arc<TelemetryTraceEvent>, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<Arc<TelemetryTraceEvent>, broadcast::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for TelemetryTraceSubscription {
+    fn drop(&mut self) {
+        self.subscriber_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub fn global_trace_bus() -> &'static TraceBus {
     GLOBAL_TRACE_BUS.get_or_init(TraceBus::default)
 }
@@ -250,6 +336,18 @@ pub fn trace_emit(build: impl FnOnce() -> TraceEvent) -> bool {
 
 pub fn trace_subscriber_count() -> usize {
     global_trace_bus().subscriber_count()
+}
+
+pub fn subscribe_telemetry_trace_events() -> TelemetryTraceSubscription {
+    global_trace_bus().subscribe_telemetry()
+}
+
+pub fn telemetry_trace_emit(build: impl FnOnce() -> TelemetryTraceEvent) -> bool {
+    global_trace_bus().emit_telemetry(build)
+}
+
+pub fn telemetry_trace_subscriber_count() -> usize {
+    global_trace_bus().telemetry_subscriber_count()
 }
 
 #[cfg(test)]
@@ -329,5 +427,31 @@ mod tests {
             .await
             .expect_err("receiver should observe lag instead of blocking publishers");
         assert!(matches!(err, broadcast::error::RecvError::Lagged(_)));
+    }
+
+    #[tokio::test]
+    async fn telemetry_subscription_exposes_only_classified_fields() {
+        let bus = TraceBus::new(4);
+        let _unrelated_subscription = bus.subscribe();
+        let built = AtomicUsize::new(0);
+        assert!(!bus.emit_telemetry(|| {
+            built.fetch_add(1, Ordering::Relaxed);
+            TelemetryTraceEvent::new(TelemetryTraceOperation::GetObject, Duration::ZERO, TelemetryTraceStatus::Ok)
+        }));
+        assert_eq!(built.load(Ordering::Relaxed), 0);
+
+        let mut subscription = bus.subscribe_telemetry();
+        assert_eq!(bus.telemetry_subscriber_count(), 1);
+
+        assert!(bus.emit_telemetry(|| {
+            TelemetryTraceEvent::new(TelemetryTraceOperation::GetObject, Duration::from_micros(7), TelemetryTraceStatus::Ok)
+        }));
+
+        let event = subscription.recv().await.expect("classified telemetry event");
+        assert_eq!(event.operation, TelemetryTraceOperation::GetObject);
+        assert_eq!(event.duration, Duration::from_micros(7));
+        assert_eq!(event.status, TelemetryTraceStatus::Ok);
+        drop(subscription);
+        assert_eq!(bus.telemetry_subscriber_count(), 0);
     }
 }

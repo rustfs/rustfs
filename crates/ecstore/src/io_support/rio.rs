@@ -560,7 +560,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
         reader
-            .add_checksum_from_s3s(&headers, None, false)
+            .add_checksum(&headers, None, false)
             .expect("attach trailing checksum metadata");
 
         let transformed = WritePlan::new()
