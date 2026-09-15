@@ -1,6 +1,0 @@
-allowed_external_types = [
-    "aws_smithy_runtime_api::http::request::Request",
-    "aws_smithy_runtime_api::http::response::Response",
-    "aws_smithy_types::*",
-    "aws_smithy_schema::*",
-]
