@@ -40,7 +40,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout repository (for report parser)
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
@@ -259,7 +259,7 @@ jobs:
 
       - name: Upload report and logs
         if: ${{ always() && steps.evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-table-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
