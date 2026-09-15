@@ -58,7 +58,7 @@ permissions:
 # The default performance nodes overlap the other suites' remote VMs, even
 # though the runner differs. Hold the shared lock through cleanup as well.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
