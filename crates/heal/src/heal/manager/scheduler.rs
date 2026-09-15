@@ -818,6 +818,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         MrfKind::DecodeFailure => HealObjectKind::Decode,
         MrfKind::MetadataCorruption => HealObjectKind::Metadata,
         MrfKind::PartialWrite => HealObjectKind::Object,
+        MrfKind::DeleteMarkerPurge => HealObjectKind::DeleteMarkerPurge,
     };
     if outcome.identity.kind != expected_kind
         || outcome.identity.bucket.as_str() != target.bucket.as_ref()
@@ -848,6 +849,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         object: target.object.clone(),
         version_id,
         scope,
+        delete_marker_purge: target.delete_marker_purge,
         lease: target.lease,
         bucket_incarnation_id,
         disposition,

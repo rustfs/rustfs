@@ -19,6 +19,7 @@ use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_lock::NamespaceLockGuard;
 use std::collections::BTreeSet;
 use tracing::trace;
@@ -143,6 +144,72 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    pub async fn purge_delete_marker_with_proof(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &MrfDeleteMarkerPurge,
+        opts: &HealOpts,
+    ) -> Result<bool> {
+        if opts.dry_run || opts.no_lock || !purge.is_valid() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let version = Uuid::parse_str(version_id)
+            .ok()
+            .filter(|version| !version.is_nil())
+            .ok_or(StorageError::PreconditionFailed)?;
+        let (Some(pool_index), Some(set_index)) = (opts.pool, opts.set) else {
+            return Err(StorageError::PreconditionFailed);
+        };
+        let mut marker = rustfs_filemeta::MetaDeleteMarker::default();
+        let consumed = marker.unmarshal_msg(&purge.marker)?;
+        if usize::try_from(consumed).ok() != Some(purge.marker.len())
+            || marker.version_id != Some(version)
+            || marker.stable_identity() != purge.marker_identity
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let marker_info = marker.clone().into_fileinfo(bucket, object, false)?;
+        if !marker_info.is_canonical_delete_marker()
+            || marker_info.delete_marker_incarnation() != Some(purge.marker_incarnation_id)
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+
+        let current = self.bucket_incarnation_id_from_disk(bucket).await?;
+        if current.is_nil() {
+            return Err(StorageError::BucketNotFound(bucket.to_owned()));
+        }
+        let original = purge.bucket_incarnation_id;
+        let object = object.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, current, opts, move |store, bucket, _opts| async move {
+            let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
+            scope.check()?;
+            if original != current {
+                let retirement_store = crate::bucket::metadata_sys::object_store_if_initialized_in(&store.ctx)
+                    .await
+                    .ok_or(StorageError::PreconditionFailed)?;
+                if !crate::bucket::retirement::is_retired(retirement_store, &bucket, original).await? {
+                    return Err(StorageError::PreconditionFailed);
+                }
+            }
+            let pool = store
+                .pools
+                .get(pool_index)
+                .ok_or_else(|| invalid_heal_pool_index(pool_index, store.pools.len()))?;
+            let set = pool.disk_set.get(set_index).cloned().ok_or_else(|| {
+                StorageError::InvalidArgument(
+                    "heal".to_string(),
+                    "set".to_string(),
+                    format!("invalid heal set index {set_index} for pool {pool_index}"),
+                )
+            })?;
+            set.purge_delete_marker_exact(&bucket, &object, version, marker).await
+        })
+        .await
+    }
+
     pub(super) async fn run_bucket_heal_at_incarnation<T, F, Fut>(
         self: &Arc<Self>,
         bucket: &str,

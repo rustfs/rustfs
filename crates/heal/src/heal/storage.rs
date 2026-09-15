@@ -15,6 +15,7 @@
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64_simd::URL_SAFE_NO_PAD;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
@@ -401,6 +402,18 @@ pub struct HealListItem {
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
+    /// Delete one exact marker from every member of its original erasure set.
+    async fn purge_delete_marker(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: &str,
+        _purge: &MrfDeleteMarkerPurge,
+        _opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        Err(Error::other("delete-marker purge is unsupported by this heal storage backend"))
+    }
+
     /// Get object meta
     ///
     /// Reserved for HS-01 MRF wiring (rustfs/backlog#1865): MRF intents
@@ -846,6 +859,41 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    async fn purge_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &MrfDeleteMarkerPurge,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let removed = self
+            .ecstore
+            .purge_delete_marker_with_proof(bucket, object, version_id, purge, opts)
+            .await
+            .map_err(Error::Storage)?;
+        Ok(HealStorageObjectResult {
+            item: HealResultItem::default(),
+            error: None,
+            receipt: Some(HealObjectReceipt {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::DeleteMarkerPurge,
+                    bucket: bucket.to_owned(),
+                    object: object.to_owned(),
+                    version_id: Some(version_id.to_owned()),
+                    bucket_incarnation_id: Some(purge.bucket_incarnation_id),
+                    pool_index: opts.pool,
+                    set_index: opts.set,
+                },
+                disposition: if removed {
+                    HealObjectDisposition::Repaired
+                } else {
+                    HealObjectDisposition::AuthoritativelyAbsent
+                },
+            }),
+        })
+    }
+
     async fn admit_bucket_incarnation(&self, bucket: &str) -> Result<Uuid> {
         match self.ecstore.bucket_incarnation_id_from_disk(bucket).await {
             Ok(id) if !id.is_nil() => Ok(id),

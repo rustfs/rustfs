@@ -20,6 +20,7 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use crate::core::pools::DecommissionCapacityAdmission;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
 #[cfg(test)]
@@ -63,6 +64,27 @@ use super::super::{
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+
+fn delete_marker_purge_candidate(
+    file_info: &FileInfo,
+    expected_bucket_incarnation_id: Option<Uuid>,
+) -> Option<MrfDeleteMarkerPurge> {
+    let bucket_incarnation_id = expected_bucket_incarnation_id.filter(|id| !id.is_nil())?;
+    let version_id = file_info.version_id.filter(|id| !id.is_nil())?;
+    if !file_info.is_canonical_delete_marker() {
+        return None;
+    }
+    let marker_incarnation_id = file_info.delete_marker_incarnation()?;
+    if marker_incarnation_id != bucket_incarnation_id {
+        return None;
+    }
+    let marker = rustfs_filemeta::MetaDeleteMarker::from(file_info.clone());
+    if marker.version_id != Some(version_id) {
+        return None;
+    }
+    let marker_identity = marker.stable_identity();
+    MrfDeleteMarkerPurge::new(bucket_incarnation_id, marker_incarnation_id, marker_identity, marker.marshal_msg().ok()?)
+}
 use crate::api::config::storageclass;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps;
 use crate::bucket::utils::is_meta_bucketname;
@@ -7529,6 +7551,168 @@ impl SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
+    #[tracing::instrument(skip(self, delete_marker_purge))]
+    async fn delete_object_version_with_purge(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        force_del_marker: bool,
+        delete_marker_purge: Option<MrfDeleteMarkerPurge>,
+    ) -> Result<()> {
+        let transported = delete_file_info_with_replication_transport_metadata(fi);
+        let fi = &transported;
+        let disks = self.disk_inventory().await;
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
+        let write_quorum = disks.len() / 2 + 1;
+        let rollback_dir = Uuid::new_v4();
+
+        let mut futures = Vec::with_capacity(disks.len());
+        let mut errs = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    match disk
+                        .delete_version_with_namespace_owner(
+                            bucket,
+                            object,
+                            fi.clone(),
+                            force_del_marker,
+                            DeleteOptions {
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                            disk_namespace_owner,
+                        )
+                        .await
+                    {
+                        Ok(r) => Ok(r),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(_) => {
+                    errs.push(None);
+                }
+                Err(e) => {
+                    errs.push(Some(e));
+                }
+            }
+        }
+
+        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        let should_rollback = quorum_result.is_err();
+        let mut rollback_futures = Vec::new();
+        for (index, err) in errs.iter().enumerate() {
+            // backlog#1158: when rolling back, fan the idempotent undo out to every
+            // online disk (each self-decides from its staged backup: restore if the
+            // rollback dir is present, no-op otherwise). This covers a disk that
+            // staged + applied the delete and *then* errored, which the plain
+            // `err.is_some()` skip would leave deleted while its peers were restored.
+            // On success only the successful disks' backup dirs need cleaning; errored
+            // disks' residue is reclaimed by heal/scanner.
+            if !should_rollback && err.is_some() {
+                continue;
+            }
+
+            let Some(disk) = disks[index].as_ref() else {
+                continue;
+            };
+
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let fi = fi.clone();
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            rollback_futures.push(async move {
+                if should_rollback {
+                    // The dedicated undo path never forwards the marker-only creation flag.
+                    if let Err(err) = disk
+                        .undo_write_with_namespace_owner(
+                            &bucket,
+                            &object,
+                            fi,
+                            DeleteOptions {
+                                undo_write: true,
+                                undo_delete: true,
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                            disk_namespace_owner,
+                        )
+                        .await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to roll back delete after write quorum failure"
+                        );
+                    }
+                } else {
+                    let rollback_path = format!("{object}/{rollback_dir}");
+                    if let Err(err) = disk
+                        .delete_with_namespace_owner(
+                            &bucket,
+                            &rollback_path,
+                            DeleteOptions {
+                                recursive: true,
+                                immediate: true,
+                                ..Default::default()
+                            },
+                            disk_namespace_owner,
+                        )
+                        .await
+                        && err != DiskError::FileNotFound
+                        && err != DiskError::VolumeNotFound
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to clean delete rollback state after quorum success"
+                        );
+                    }
+                }
+            });
+        }
+
+        join_all(rollback_futures).await;
+        drop(namespace_owner);
+        if quorum_result.is_ok()
+            && errs.iter().any(Option::is_some)
+            && let Some(purge) = delete_marker_purge
+            && let Some(version) = fi.version_id.filter(|version| !version.is_nil())
+        {
+            let _ = self.persist_delete_marker_purge(bucket, object, version, purge).await;
+        }
+        // An explicit purge can carry deleted=true for the existing marker.
+        // It must not create a repair intent that could reintroduce that marker.
+        if quorum_result.is_ok()
+            && fi.deleted
+            && (fi.mark_deleted || force_del_marker)
+            && !fi.tier_free_version()
+            && version_purge_status_from_filemeta(fi.version_purge_status()) != VersionPurgeStatusType::Complete
+            && errs.iter().any(Option::is_some)
+        {
+            let version_id = fi.version_id.map(|version| version.to_string());
+            let _ = self
+                .add_partial(bucket, object, version_id.as_deref().unwrap_or_default())
+                .await;
+        }
+        quorum_result
+    }
 }
 
 #[async_trait::async_trait]
@@ -7818,151 +8002,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let transported = delete_file_info_with_replication_transport_metadata(fi);
-        let fi = &transported;
-        let disks = self.disk_inventory().await;
-        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
-        let write_quorum = disks.len() / 2 + 1;
-        let rollback_dir = Uuid::new_v4();
-
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    match disk
-                        .delete_version_with_namespace_owner(
-                            bucket,
-                            object,
-                            fi.clone(),
-                            force_del_marker,
-                            DeleteOptions {
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
-                            disk_namespace_owner,
-                        )
-                        .await
-                    {
-                        Ok(r) => Ok(r),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errs.push(None);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                }
-            }
-        }
-
-        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
-        let should_rollback = quorum_result.is_err();
-        let mut rollback_futures = Vec::new();
-        for (index, err) in errs.iter().enumerate() {
-            // backlog#1158: when rolling back, fan the idempotent undo out to every
-            // online disk (each self-decides from its staged backup: restore if the
-            // rollback dir is present, no-op otherwise). This covers a disk that
-            // staged + applied the delete and *then* errored, which the plain
-            // `err.is_some()` skip would leave deleted while its peers were restored.
-            // On success only the successful disks' backup dirs need cleaning; errored
-            // disks' residue is reclaimed by heal/scanner.
-            if !should_rollback && err.is_some() {
-                continue;
-            }
-
-            let Some(disk) = disks[index].as_ref() else {
-                continue;
-            };
-
-            let disk = disk.clone();
-            let bucket = bucket.to_string();
-            let object = object.to_string();
-            let fi = fi.clone();
-            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
-            rollback_futures.push(async move {
-                if should_rollback {
-                    // The dedicated undo path never forwards the marker-only creation flag.
-                    if let Err(err) = disk
-                        .undo_write_with_namespace_owner(
-                            &bucket,
-                            &object,
-                            fi,
-                            DeleteOptions {
-                                undo_write: true,
-                                undo_delete: true,
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
-                            disk_namespace_owner,
-                        )
-                        .await
-                    {
-                        warn!(
-                            bucket = %bucket,
-                            object = %object,
-                            rollback_dir = %rollback_dir,
-                            error = ?err,
-                            "failed to roll back delete after write quorum failure"
-                        );
-                    }
-                } else {
-                    let rollback_path = format!("{object}/{rollback_dir}");
-                    if let Err(err) = disk
-                        .delete_with_namespace_owner(
-                            &bucket,
-                            &rollback_path,
-                            DeleteOptions {
-                                recursive: true,
-                                immediate: true,
-                                ..Default::default()
-                            },
-                            disk_namespace_owner,
-                        )
-                        .await
-                        && err != DiskError::FileNotFound
-                        && err != DiskError::VolumeNotFound
-                    {
-                        warn!(
-                            bucket = %bucket,
-                            object = %object,
-                            rollback_dir = %rollback_dir,
-                            error = ?err,
-                            "failed to clean delete rollback state after quorum success"
-                        );
-                    }
-                }
-            });
-        }
-
-        join_all(rollback_futures).await;
-        drop(namespace_owner);
-        // An explicit purge can carry deleted=true for the existing marker.
-        // It must not create a repair intent that could reintroduce that marker.
-        if quorum_result.is_ok()
-            && fi.deleted
-            && (fi.mark_deleted || force_del_marker)
-            && !fi.tier_free_version()
-            && version_purge_status_from_filemeta(fi.version_purge_status()) != VersionPurgeStatusType::Complete
-            && errs.iter().any(Option::is_some)
-        {
-            let version_id = fi.version_id.map(|version| version.to_string());
-            let _ = self
-                .add_partial(bucket, object, version_id.as_deref().unwrap_or_default())
-                .await;
-        }
-        quorum_result
+        self.delete_object_version_with_purge(bucket, object, fi, force_del_marker, None)
+            .await
     }
 
     #[tracing::instrument(skip(self, objects, opts))]
@@ -8081,6 +8122,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
+        let mut delete_marker_purge_candidates = vec![None; objects.len()];
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
@@ -8111,15 +8153,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
             let replication_needs_source = replicate_delete
                 && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (goi, gerr) = if object_lock_check_required
+            let (goi, authoritative_file_info, gerr) = if object_lock_check_required
                 || replication_needs_source
                 || opts.tier_delete_journal_api.is_some()
                 || dobj.expected_identity.is_some()
+                || dobj.version_id.is_some()
             {
-                let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
-                (goi, gerr)
+                let (goi, file_info, _write_quorum, gerr) = self
+                    .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
+                    .await;
+                (goi, file_info, gerr)
             } else {
-                (ObjectInfo::default(), None)
+                (ObjectInfo::default(), FileInfo::default(), None)
             };
             let source_missing = gerr
                 .as_ref()
@@ -8253,6 +8298,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // accounted as an object deletion (issue #6745).
             let removed_delete_marker =
                 goi.delete_marker && dobj.version_id.is_some() && delete_file_info_version_id(goi.version_id) == version_id;
+            if removed_delete_marker
+                && goi.version_purge_status.is_empty()
+                && vr.version_purge_status().is_empty()
+                && vr.delete_marker_replication_status().is_empty()
+                && version_id.is_some_and(|version| authoritative_file_info.version_id == Some(version))
+            {
+                delete_marker_purge_candidates[i] =
+                    delete_marker_purge_candidate(&authoritative_file_info, opts.expected_bucket_incarnation_id);
+            }
             // Response-side only for the null identity: a delete request marked
             // `deleted` with `version_id == None` makes `FileMeta::delete_version`
             // re-create the marker it just removed (the suspended-bucket
@@ -8616,6 +8670,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
         }
 
+        let purge_submissions = delete_marker_purge_candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, purge)| {
+                let purge = purge?;
+                if del_errs[index].is_some() || !del_obj_errs.iter().any(|errors| errors[index].is_some()) {
+                    return None;
+                }
+                let version = objects[index].version_id.filter(|version| !version.is_nil())?;
+                Some(self.persist_delete_marker_purge(bucket, objects[index].object_name.as_str(), version, purge))
+            });
+        let _ = join_all(purge_submissions).await;
+
         for (object, err) in objects.iter().zip(del_errs.iter()) {
             if err.is_none() {
                 self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
@@ -8848,7 +8915,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut version_found = true;
         // delete_object_version below derives its own majority quorum from the
         // disk array, so the object-derived quorum here is unused.
-        let (mut goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
+        let (mut goi, authoritative_file_info, _write_quorum, gerr) =
+            self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
@@ -8863,6 +8931,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             opts.precondition_check(&goi)?;
             check_object_lock_delete(&self.ctx, bucket, object, &goi, &opts).await?;
         }
+        let delete_marker_purge_candidate = opts
+            .version_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|version| !version.is_nil() && authoritative_file_info.version_id == Some(*version))
+            .and_then(|_| delete_marker_purge_candidate(&authoritative_file_info, opts.expected_bucket_incarnation_id));
 
         if opts.transition.expire_restored {
             // Restore-expiry (DeleteRestoredAction / DeleteRestoredVersionAction)
@@ -8921,6 +8995,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let (mark_delete, mut delete_marker) = resolve_delete_version_state(&opts, &goi, version_found);
+        let delete_marker_purge = explicit_delete_removed_marker(&opts, &goi, version_found)
+            .then_some(delete_marker_purge_candidate)
+            .flatten();
 
         let mod_time = if let Some(mt) = opts.mod_time {
             mt
@@ -8969,9 +9046,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if opts.skip_free_version {
                 fi.set_skip_tier_free_version();
             }
-            self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
-                .await
-                .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            self.delete_object_version_with_purge(
+                bucket,
+                object,
+                &fi,
+                should_force_delete_marker_for_missing_version(&opts),
+                delete_marker_purge.clone(),
+            )
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             #[cfg(test)]
             pause_delete_object_commit_after_publish(bucket, object).await;
 
@@ -9021,7 +9104,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if opts.skip_free_version {
             dfi.set_skip_tier_free_version();
         }
-        self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
+        self.delete_object_version_with_purge(bucket, object, &dfi, opts.delete_marker, delete_marker_purge)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
         #[cfg(test)]

@@ -753,6 +753,14 @@ impl NodeService {
             rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
             "delete_version",
         )?;
+        if require_marker_condition
+            && Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .is_none()
+        {
+            return Err(Status::invalid_argument("retired marker deletion requires a non-nil bucket incarnation"));
+        }
         let request = request.into_inner();
         let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
             Ok(file_info) => file_info,

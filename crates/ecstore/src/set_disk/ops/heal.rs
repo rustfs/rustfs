@@ -521,6 +521,77 @@ fn warn_heal_writer_failures(
 }
 
 impl SetDisks {
+    pub(crate) async fn purge_delete_marker_exact(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+    ) -> Result<bool> {
+        let disks = self.get_disks_internal().await;
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(StorageError::SlowDown);
+        }
+        let _object_guard = self.acquire_write_lock_diag("delete_marker_purge", bucket, object).await?;
+        let scope = crate::store::bucket_heal_scope(bucket).ok_or(StorageError::PreconditionFailed)?;
+        scope.check()?;
+
+        let request = FileInfo {
+            volume: bucket.to_owned(),
+            name: object.to_owned(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let results = join_all(disks.iter().enumerate().map(|(disk_index, disk)| {
+            let request = request.clone();
+            let marker = marker.clone();
+            async move {
+                if let Some(error) = injected_dangling_delete_error(bucket, object, disk_index) {
+                    return Err(error);
+                }
+                let Some(disk) = disk else { return Err(DiskError::DiskNotFound) };
+                disk.delete_version(
+                    bucket,
+                    object,
+                    request,
+                    false,
+                    DeleteOptions {
+                        expected_delete_marker: Some(marker),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        }))
+        .await;
+        let mut removed = false;
+        for result in results {
+            match result {
+                Ok(()) => removed = true,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        scope.check()?;
+        let (_, errors) =
+            Self::read_all_fileinfo(disks.as_slice(), "", bucket, object, &version.to_string(), false, false, false).await?;
+        let selected = self.get_disks_internal().await;
+        let same_targets = selected.len() == disks.len() && selected.iter().zip(&disks).all(|(current, original)| {
+            matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
+        });
+        if !same_targets
+            || !errors
+                .iter()
+                .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
+        {
+            return Err(StorageError::SlowDown);
+        }
+        scope.check()?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(removed)
+    }
+
     /// Read back one healed version from every explicitly admitted replacement
     /// target. This is intentionally separate from the normal heal result: a
     /// successful result describes the transaction attempt, while automatic

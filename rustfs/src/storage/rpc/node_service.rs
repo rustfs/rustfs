@@ -1783,6 +1783,14 @@ impl Node for NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        require_incarnation_body_digest(&request)?;
+        if Uuid::from_slice(&request.get_ref().bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .is_none()
+        {
+            return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
+        }
         self.handle_delete_version(request, true).await
     }
 
@@ -4423,7 +4431,7 @@ mod tests {
         assert_gated!(
             delete_retired_marker,
             DeleteVersionRequest {
-                bucket_incarnation_id: Default::default(),
+                bucket_incarnation_id: vec![1; 16].into(),
                 disk: disk.clone(),
                 volume: "v".into(),
                 path: "p".into(),
@@ -7382,7 +7390,8 @@ mod tests {
             (vec![0; 16], Some(vec![0; 16]), tonic::Code::InvalidArgument),
             (vec![1; 15], Some(vec![1; 15]), tonic::Code::InvalidArgument),
             (vec![2; 16], Some(vec![1; 16]), tonic::Code::PermissionDenied),
-            (Vec::new(), Some(vec![1; 16]), tonic::Code::PermissionDenied),
+            (Vec::new(), Some(vec![1; 16]), tonic::Code::InvalidArgument),
+            (Vec::new(), Some(Vec::new()), tonic::Code::InvalidArgument),
             (vec![1; 16], Some(vec![1; 16]), tonic::Code::FailedPrecondition),
         ] {
             let mut request = Request::new(message.clone());

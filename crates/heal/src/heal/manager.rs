@@ -134,6 +134,7 @@ pub(super) struct MrfRepairNoticeTarget {
     pub(super) version_id: Option<[u8; 16]>,
     pub(super) kind: rustfs_common::mrf_channel::MrfKind,
     pub(super) scope: Option<rustfs_common::mrf_channel::MrfScope>,
+    pub(super) delete_marker_purge: Option<rustfs_common::mrf_channel::MrfDeleteMarkerPurgeIdentity>,
     pub(super) lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
 }
 
@@ -493,7 +494,8 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
         HealType::Cluster => false,
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
-        | HealType::ECDecode { bucket, object, .. } => heal_path_matches_bucket_child(heal_path, bucket, object),
+        | HealType::ECDecode { bucket, object, .. }
+        | HealType::DeleteMarkerPurge { bucket, object, .. } => heal_path_matches_bucket_child(heal_path, bucket, object),
         HealType::Bucket { bucket } => heal_path == bucket,
         HealType::Prefix { bucket, prefix } => heal_path_matches_bucket_child(heal_path, bucket, prefix),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
@@ -629,7 +631,8 @@ fn heal_type_path_view(heal_type: &HealType) -> Option<(&str, &str, bool)> {
         HealType::Prefix { bucket, prefix } => Some((bucket, prefix, true)),
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
-        | HealType::ECDecode { bucket, object, .. } => Some((bucket, object, false)),
+        | HealType::ECDecode { bucket, object, .. }
+        | HealType::DeleteMarkerPurge { bucket, object, .. } => Some((bucket, object, false)),
         HealType::Cluster | HealType::ErasureSet { .. } => None,
     }
 }
@@ -1754,6 +1757,7 @@ impl HealManager {
         let kind = match &request.heal_type {
             HealType::Metadata { .. } => rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
             HealType::ECDecode { .. } => rustfs_common::mrf_channel::MrfKind::DecodeFailure,
+            HealType::DeleteMarkerPurge { .. } => rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge,
             _ => rustfs_common::mrf_channel::MrfKind::PartialWrite,
         };
         self.submit_mrf_heal_request_with_receipt_and_identity(
@@ -1764,6 +1768,7 @@ impl HealManager {
                 version_id,
                 kind,
                 scope: None,
+                delete_marker_purge: None,
                 lease: None,
             },
         )
@@ -1775,7 +1780,7 @@ impl HealManager {
         request: HealRequest,
         mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
-        let preserve_alias = mrf_notice_target.kind != rustfs_common::mrf_channel::MrfKind::PartialWrite;
+        let preserve_alias = !mrf_notice_target.kind.is_durable();
         self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, Some(mrf_notice_target))
             .await
     }
@@ -1784,6 +1789,9 @@ impl HealManager {
         &self,
         intent: &rustfs_common::mrf_channel::MrfIntent,
     ) -> Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor> {
+        if let Some(purge) = intent.delete_marker_purge.as_ref() {
+            return rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, purge.bucket_incarnation_id);
+        }
         match self.storage.mrf_bucket_incarnation_id(intent.bucket.as_ref()).await {
             Ok(Some(bucket_incarnation_id)) => {
                 rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, bucket_incarnation_id)
@@ -2030,10 +2038,7 @@ impl HealManager {
             // of the silent merge (MinIO's ErrHealAlreadyRunning).
             let admission = if (request.source == HealRequestSource::Admin
                 && config.overlap_policy == HealOverlapPolicy::MinioError)
-                || (duplicate_state != "queued"
-                    && mrf_notice_target
-                        .as_ref()
-                        .is_some_and(|target| target.kind == rustfs_common::mrf_channel::MrfKind::PartialWrite))
+                || (duplicate_state != "queued" && mrf_notice_target.as_ref().is_some_and(|target| target.kind.is_durable()))
             {
                 // A running/retrying task may have observed the object before
                 // this write committed. Its receipt cannot prove the new lease.

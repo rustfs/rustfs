@@ -149,9 +149,11 @@ impl RecoveryHealType {
     }
 }
 
-impl From<&HealType> for RecoveryHealType {
-    fn from(heal_type: &HealType) -> Self {
-        match heal_type {
+impl TryFrom<&HealType> for RecoveryHealType {
+    type Error = Error;
+
+    fn try_from(heal_type: &HealType) -> Result<Self> {
+        Ok(match heal_type {
             HealType::Cluster => Self::Cluster,
             HealType::Bucket { bucket } => Self::Bucket { bucket: bucket.clone() },
             HealType::Object {
@@ -185,7 +187,10 @@ impl From<&HealType> for RecoveryHealType {
                 object: object.clone(),
                 version_id: version_id.clone(),
             },
-        }
+            HealType::DeleteMarkerPurge { .. } => {
+                return Err(Error::Other("Delete-marker purge recovery is owned by the MRF journal".to_string()));
+            }
+        })
     }
 }
 
@@ -309,28 +314,28 @@ impl RootHealTerminal {
         Ok(())
     }
 
-    fn from_completed(task_id: &str, completed: &CompletedHealStatus) -> Self {
-        Self {
+    fn from_completed(task_id: &str, completed: &CompletedHealStatus) -> Result<Self> {
+        Ok(Self {
             schema: ROOT_TERMINAL_SCHEMA,
             task_id: task_id.to_owned(),
-            heal_type: RecoveryHealType::from(&completed.heal_type),
+            heal_type: RecoveryHealType::try_from(&completed.heal_type)?,
             status: completed.status.clone(),
             options: completed.options.clone(),
             progress: completed.progress.clone(),
             completed_at: completed.completed_at,
-        }
+        })
     }
 
-    fn cancelled(task_id: &str, heal_type: &HealType, options: HealOptions) -> Self {
-        Self {
+    fn cancelled(task_id: &str, heal_type: &HealType, options: HealOptions) -> Result<Self> {
+        Ok(Self {
             schema: ROOT_TERMINAL_SCHEMA,
             task_id: task_id.to_owned(),
-            heal_type: RecoveryHealType::from(heal_type),
+            heal_type: RecoveryHealType::try_from(heal_type)?,
             status: HealTaskStatus::Cancelled,
             options,
             progress: None,
             completed_at: SystemTime::now(),
-        }
+        })
     }
 
     fn into_completed(self) -> CompletedHealStatus {
@@ -357,17 +362,17 @@ impl RootHealTerminal {
 }
 
 impl RootHealIntent {
-    fn from_request(request: &HealRequest) -> Self {
-        Self {
+    fn from_request(request: &HealRequest) -> Result<Self> {
+        Ok(Self {
             schema: ROOT_RECOVERY_SCHEMA,
             task_id: request.id.clone(),
-            heal_type: RecoveryHealType::from(&request.heal_type),
+            heal_type: RecoveryHealType::try_from(&request.heal_type)?,
             bucket_incarnation_id: request.bucket_incarnation_id,
             options: request.options.clone(),
             priority: request.priority,
             retry_attempts: request.retry_attempts,
             created_at: request.created_at,
-        }
+        })
     }
 
     fn into_request(self) -> HealRequest {
@@ -919,7 +924,7 @@ impl RootHealRecovery {
         if request.options.no_lock {
             return Err(Error::Other("Administrator root heal cannot skip namespace locking".to_string()));
         }
-        let intent = RootHealIntent::from_request(request);
+        let intent = RootHealIntent::from_request(request)?;
         intent.heal_type.validate()?;
         let bytes =
             serde_json::to_vec(&intent).map_err(|error| Error::Other(format!("Serialize root heal recovery record: {error}")))?;
@@ -1076,7 +1081,7 @@ impl RootHealRecovery {
         };
         let pending = decode_intent(task_id, &bytes)?;
         let heal_type = HealType::from(pending.heal_type);
-        let terminal = RootHealTerminal::cancelled(task_id, &heal_type, pending.options);
+        let terminal = RootHealTerminal::cancelled(task_id, &heal_type, pending.options)?;
         let completed = terminal.clone().into_completed();
         let _ = Self::persist_terminal_locked(&disks, task_id, terminal, &completed).await?;
         match EcstoreDiskAPI::compare_and_update_file(
@@ -1110,7 +1115,7 @@ impl RootHealRecovery {
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let pending =
-            Self::persist_terminal_locked(&disks, task_id, RootHealTerminal::from_completed(task_id, completed), completed)
+            Self::persist_terminal_locked(&disks, task_id, RootHealTerminal::from_completed(task_id, completed)?, completed)
                 .await?;
         #[cfg(test)]
         if self
@@ -1373,7 +1378,7 @@ impl HealManager {
                 {
                     Ok(()) => {}
                     Err(error @ Error::StaleBucketIncarnation { .. }) => {
-                        let mut terminal = RootHealTerminal::cancelled(&request.id, &request.heal_type, request.options.clone());
+                        let mut terminal = RootHealTerminal::cancelled(&request.id, &request.heal_type, request.options.clone())?;
                         terminal.status = HealTaskStatus::Failed {
                             error: error.to_string(),
                         };
