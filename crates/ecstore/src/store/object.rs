@@ -7812,6 +7812,132 @@ mod tests {
         assert_eq!(marker_ids.len(), 2, "both delete markers must remain durable versions");
     }
 
+    #[tokio::test]
+    async fn versioned_delete_quorum_failure_rolls_back_and_retries_require_quorum() {
+        for marker_copies in [0, 2, 4] {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await);
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "versioned-delete-quorum-retry";
+            let object = "object.bin";
+            let opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+            let put_opts = ObjectOptions {
+                no_lock: true,
+                versioned: true,
+                ..Default::default()
+            };
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let set = store.pools[0].get_disks_by_key(object);
+            let payload = vec![0x5a; 4096];
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            let original = set
+                .put_object(bucket, object, &mut reader, &put_opts)
+                .await
+                .expect("the versioned 4 KiB object should be written");
+            let disks = set.disks.read().await.clone();
+            // Reproduce both committed markers and residue from a failed older writer.
+            let marker = rustfs_filemeta::FileInfo {
+                name: object.to_string(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mark_deleted: true,
+                mod_time: Some(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            for disk in disks.iter().take(marker_copies).flatten() {
+                disk.delete_version(bucket, object, marker.clone(), true, crate::disk::DeleteOptions::default())
+                    .await
+                    .expect("the initial marker should be persisted on the selected disks");
+            }
+            let mut baseline = Vec::new();
+            for disk in disks.iter().flatten() {
+                baseline.push(
+                    tokio::fs::read(disk.path().join(bucket).join(object).join("xl.meta"))
+                        .await
+                        .expect("initial metadata should exist"),
+                );
+            }
+            {
+                let mut online = set.disks.write().await;
+                online[2] = None;
+                online[3] = None;
+            }
+            for attempt in 1..=3 {
+                let err = store
+                    .handle_delete_object(bucket, object, opts.clone())
+                    .await
+                    .expect_err("every explicit retry must fail with only two of four disks available");
+                assert!(
+                    matches!(
+                        &err,
+                        StorageError::InsufficientWriteQuorum(error_bucket, error_object)
+                            if error_bucket == bucket && error_object == object
+                    ),
+                    "expected write quorum failure with {marker_copies} marker copies, attempt {attempt}: {err:?}"
+                );
+                for (index, disk) in disks.iter().enumerate() {
+                    let metadata_path = disk
+                        .as_ref()
+                        .expect("saved disk should exist")
+                        .path()
+                        .join(bucket)
+                        .join(object);
+                    let actual = tokio::fs::read(metadata_path.join("xl.meta"))
+                        .await
+                        .expect("rollback must preserve readable metadata");
+                    assert_eq!(
+                        actual, baseline[index],
+                        "failed DELETE must restore exact metadata on disk {index}, attempt {attempt}"
+                    );
+                    let mut entries = tokio::fs::read_dir(&metadata_path)
+                        .await
+                        .expect("the object directory should remain readable");
+                    while let Some(entry) = entries.next_entry().await.expect("directory entries should be readable") {
+                        assert!(
+                            entry.file_name() != "xl.meta.bkp" && !entry.path().join("xl.meta.bkp").exists(),
+                            "rollback must consume staged metadata backups on disk {index}"
+                        );
+                    }
+                }
+            }
+            *set.disks.write().await = disks;
+            if marker_copies != 0 {
+                continue;
+            }
+            let committed = store
+                .handle_delete_object(bucket, object, opts)
+                .await
+                .expect("DELETE should succeed after write quorum recovers");
+            assert!(committed.delete_marker);
+            assert_ne!(committed.version_id, marker.version_id);
+            let mut restored = Vec::new();
+            set.get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: original.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the original version must remain readable")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the original version should stream");
+            assert_eq!(restored, payload);
+        }
+    }
+
     #[test]
     fn latest_versioned_delete_marker_creation_excludes_specialized_deletes() {
         assert!(latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
