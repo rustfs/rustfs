@@ -18,7 +18,10 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ConnectCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{
+    Cli, CommandResult, Commands, ConnectCommands, ConnectInspectCommands, ConnectInventoryCommands, ConnectPerformanceCommands,
+    ConnectReportCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy,
+};
 use crate::apply_external_env_compat;
 use CommandResult::Server;
 use clap::Parser;
@@ -139,6 +142,29 @@ impl Opt {
             Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
             Some(Commands::Connect(opts)) => match opts.command {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
+                ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
+                ConnectCommands::Relay(opts) => Ok(CommandResult::ConnectRelay(opts)),
+                ConnectCommands::Report(opts) => match opts.command {
+                    ConnectReportCommands::Upload(opts) => Ok(CommandResult::ConnectReportUpload(opts)),
+                },
+                ConnectCommands::Inventory(opts) => match opts.command {
+                    ConnectInventoryCommands::Environment(opts) => Ok(CommandResult::ConnectEnvironmentInventory(opts)),
+                },
+                ConnectCommands::Performance(opts) => match opts.command {
+                    ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(opts)),
+                    ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
+                    ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
+                    ConnectPerformanceCommands::SiteReplication(opts) => {
+                        Ok(CommandResult::ConnectSiteReplicationPerformance(opts))
+                    }
+                },
+                ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
+                ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
+                ConnectCommands::Telemetry(opts) => Ok(CommandResult::ConnectTelemetry(opts.command)),
+                ConnectCommands::Top(opts) => Ok(CommandResult::ConnectTop(opts.command)),
+                ConnectCommands::Inspect(opts) => match opts.command {
+                    ConnectInspectCommands::Object(opts) => Ok(CommandResult::ConnectInspect(opts)),
+                },
             },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {

@@ -2133,8 +2133,8 @@ mod tests {
         }
     }
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
+    use rustfs_filemeta::metadata_keys;
     use rustfs_rio::{Checksum, ChecksumType};
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
@@ -2192,16 +2192,16 @@ mod tests {
         assert_eq!(source.version_purge_status_internal, target.version_purge_status_internal);
         assert_eq!(source.version_purge_status, target.version_purge_status);
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_MODE),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_MODE)
         );
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
         );
         assert_eq!(
-            source.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
-            target.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+            source.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD),
+            target.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
         );
         assert_eq!(source.parts.len(), target.parts.len());
         for (source_part, target_part) in source.parts.iter().zip(target.parts.iter()) {
@@ -2841,13 +2841,13 @@ mod tests {
         let mod_time = OffsetDateTime::UNIX_EPOCH;
         let metadata = Arc::new(HashMap::from([
             ("x-amz-meta-key".to_string(), "value".to_string()),
-            (rustfs_utils::http::AMZ_STORAGE_CLASS.to_string(), "STANDARD_IA".to_string()),
-            (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "GOVERNANCE".to_string()),
+            (rustfs_filemeta::metadata_keys::STORAGE_CLASS.to_string(), "STANDARD_IA".to_string()),
+            (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
             (
-                X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                 "2030-01-01T00:00:00Z".to_string(),
             ),
-            (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+            (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
         ]));
         let part = ObjectPartInfo {
             number: 1,
@@ -2887,12 +2887,12 @@ mod tests {
                     rustfs_utils::http::SUFFIX_REPLICATION_STATUS.to_string(),
                     "arn:minio:target=PENDING;".to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), "COMPLIANCE".to_string()),
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                 (
-                    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                     "2031-01-01T00:00:00Z".to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string()),
+                (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
             ])),
             ..Default::default()
         };
@@ -2905,15 +2905,15 @@ mod tests {
             Some(&"arn:minio:target=PENDING;".to_string())
         );
         assert_eq!(
-            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
+            new_multipart_opts.user_defined.get(metadata_keys::OBJECT_LOCK_MODE),
             Some(&"COMPLIANCE".to_string())
         );
         assert_eq!(
-            put_opts.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
+            put_opts.user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE),
             Some(&"2031-01-01T00:00:00Z".to_string())
         );
         assert_eq!(
-            new_multipart_opts.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()),
+            new_multipart_opts.user_defined.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD),
             Some(&"ON".to_string())
         );
     }

@@ -51,27 +51,31 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
         .await
         .expect("initial responsibility must commit");
     assert!(snapshot_contains("old.bin").await);
-    // Linux pins the disk root with a directory descriptor, so renaming that
-    // root does not interrupt I/O. Block the metadata volume below it instead.
-    let metadata_roots: Vec<_> = env.disk_paths.iter().map(|path| path.join(RUSTFS_META_BUCKET)).collect();
-    for path in &metadata_roots {
-        tokio::fs::rename(path, path.with_extension("offline"))
+    let snapshot = inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
+        .await
+        .expect("initial committed snapshot should validate")
+        .expect("initial responsibility should have a committed snapshot");
+    // Block only the successor manifest, preserving the committed anchor.
+    // Removing each empty blocker restores writes in one operation, so the
+    // consumer cannot recreate a directory between removal and restoration.
+    let manifest_path = format!(".heal-mrf-commit.{}.bin", 1 - snapshot.slot());
+    let manifest_blockers: Vec<_> = env
+        .disk_paths
+        .iter()
+        .map(|path| path.join(RUSTFS_META_BUCKET).join(&manifest_path))
+        .collect();
+    for path in &manifest_blockers {
+        tokio::fs::create_dir(path)
             .await
-            .expect("detach journal disk");
-        tokio::fs::write(path, b"unwritable journal root")
-            .await
-            .expect("prevent journal writes");
+            .expect("block successor checkpoint manifest");
     }
     assert_eq!(
         persist_partial_write_intent("partial-persistence", "new.bin", None, scope).await,
         Err(MrfDurableAdmissionError::Persistence),
         "failed checkpoint publication must not be acknowledged as durable success"
     );
-    for path in &metadata_roots {
-        tokio::fs::remove_file(path).await.expect("remove journal fault");
-        tokio::fs::rename(path.with_extension("offline"), path)
-            .await
-            .expect("restore journal disk");
+    for path in &manifest_blockers {
+        tokio::fs::remove_dir(path).await.expect("remove checkpoint manifest blocker");
     }
     for disk in env.ecstore.pools[0].get_disks(0).disks.read().await.iter().flatten() {
         disk.reset_health_for_store_init_retry();

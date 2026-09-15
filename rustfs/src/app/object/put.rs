@@ -16,6 +16,7 @@
 
 use super::*;
 
+use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
@@ -1749,7 +1750,7 @@ impl DefaultObjectUsecase {
             let mut hrd =
                 HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1799,7 +1800,7 @@ impl DefaultObjectUsecase {
         };
 
         if size >= 0 {
-            if let Err(err) = reader.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
+            if let Err(err) = reader.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 

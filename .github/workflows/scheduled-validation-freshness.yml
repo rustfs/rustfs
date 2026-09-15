@@ -54,5 +54,5 @@ jobs:
         if: failure()
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
           details-file: ${{ runner.temp }}/scheduled-validation-freshness.md

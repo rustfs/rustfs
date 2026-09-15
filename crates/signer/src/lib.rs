@@ -32,4 +32,5 @@ pub use request_signature_v4::sign_v4;
 pub use request_signature_v4::sign_v4_trailer;
 pub use request_signature_v4::try_pre_sign_v4;
 pub use request_signature_v4::try_sign_v4;
+pub use request_signature_v4::try_sign_v4_headers;
 pub use request_signature_v4::try_sign_v4_trailer;

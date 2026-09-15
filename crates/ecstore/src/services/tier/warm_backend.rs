@@ -35,6 +35,7 @@ use crate::services::tier::{
 };
 use bytes::Bytes;
 use http::StatusCode;
+use rustfs_filemeta::metadata_keys;
 use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
 use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
@@ -47,10 +48,6 @@ use rustfs_scanner_metrics::metrics::{TierRequestOperation, TierRequestOutcome, 
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
-};
-use s3s::header::{
-    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
-    X_AMZ_STORAGE_CLASS,
 };
 use s3s::{
     S3ErrorCode,
@@ -253,36 +250,39 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
         opts.expires = expires;
     }
 
-    if let Some(mode) = metadata.lookup(X_AMZ_OBJECT_LOCK_MODE.as_str()) {
+    if let Some(mode) = metadata.lookup(metadata_keys::OBJECT_LOCK_MODE) {
         opts.mode = ObjectLockRetentionMode::from(mode.to_ascii_uppercase());
     }
 
     if let Some(retain_until_date) = metadata
-        .lookup(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+        .lookup(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
         .and_then(parse_http_timestamp)
     {
         opts.retain_until_date = retain_until_date;
     }
 
-    if let Some(legalhold) = metadata.lookup(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
+    if let Some(legalhold) = metadata.lookup(metadata_keys::OBJECT_LOCK_LEGAL_HOLD) {
         opts.legalhold = ObjectLockLegalHoldStatus::from(legalhold.to_ascii_uppercase());
     }
 
-    for key in [
+    // Promoted keys are read above through `lookup`, which accepts more than
+    // one spelling, so strip every ASCII-case spelling here. The replication
+    // status is persisted as `X-Amz-Replication-Status`; the former exact
+    // lowercase removal left that spelling in the forwarded user metadata.
+    const PROMOTED_KEYS: [&str; 11] = [
         CONTENT_TYPE,
         CONTENT_ENCODING,
         CONTENT_LANGUAGE,
         CONTENT_DISPOSITION,
         CACHE_CONTROL,
         EXPIRES,
-        X_AMZ_OBJECT_LOCK_MODE.as_str(),
-        X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
-        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
-        X_AMZ_REPLICATION_STATUS.as_str(),
-        X_AMZ_STORAGE_CLASS.as_str(),
-    ] {
-        metadata.remove(key);
-    }
+        metadata_keys::OBJECT_LOCK_MODE,
+        metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE,
+        metadata_keys::OBJECT_LOCK_LEGAL_HOLD,
+        metadata_keys::REPLICATION_STATUS,
+        metadata_keys::STORAGE_CLASS,
+    ];
+    metadata.retain(|key, _| !PROMOTED_KEYS.iter().any(|promoted| key.eq_ignore_ascii_case(promoted)));
 
     for suffix in [
         rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
@@ -2157,9 +2157,18 @@ mod tests {
     #[test]
     fn build_transition_put_options_preserves_object_lock_headers_when_present() {
         let mut metadata = HashMap::new();
-        metadata.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), "2026-03-23T00:00:00Z".to_string());
-        metadata.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
-        metadata.insert(X_AMZ_OBJECT_LOCK_MODE.to_string(), ObjectLockRetentionMode::GOVERNANCE.to_string());
+        metadata.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2026-03-23T00:00:00Z".to_string(),
+        );
+        metadata.insert(
+            metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
+            ObjectLockLegalHoldStatus::ON.to_string(),
+        );
+        metadata.insert(
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
+            ObjectLockRetentionMode::GOVERNANCE.to_string(),
+        );
 
         let opts = build_transition_put_options("COLD".to_string(), metadata);
 
@@ -2173,15 +2182,35 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("name".to_string(), "object".to_string());
         metadata.insert(CONTENT_TYPE.to_string(), "text/plain".to_string());
-        metadata.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
-        metadata.insert(X_AMZ_REPLICATION_STATUS.to_string(), "PENDING".to_string());
+        metadata.insert(
+            metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
+            ObjectLockLegalHoldStatus::ON.to_string(),
+        );
+        metadata.insert("x-amz-replication-status".to_string(), "PENDING".to_string());
 
         let opts = build_transition_put_options("COLD".to_string(), metadata);
 
         assert_eq!(opts.user_metadata.get("name"), Some(&"object".to_string()));
         assert!(!opts.user_metadata.contains_key(CONTENT_TYPE));
-        assert!(!opts.user_metadata.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()));
-        assert!(!opts.user_metadata.contains_key(X_AMZ_REPLICATION_STATUS.as_str()));
+        assert!(!opts.user_metadata.contains_key(metadata_keys::OBJECT_LOCK_LEGAL_HOLD));
+        assert!(!opts.user_metadata.contains_key("x-amz-replication-status"));
+    }
+
+    /// Object metadata read back from xl.meta carries the replication status
+    /// under its persisted mixed-case key; it must not be forwarded to the
+    /// tier as user metadata either.
+    #[test]
+    fn build_transition_put_options_filters_persisted_replication_status_key() {
+        let metadata = HashMap::from([
+            ("name".to_string(), "object".to_string()),
+            (metadata_keys::REPLICATION_STATUS.to_string(), "COMPLETED".to_string()),
+            (metadata_keys::STORAGE_CLASS.to_string(), "STANDARD".to_string()),
+        ]);
+
+        let opts = build_transition_put_options("COLD".to_string(), metadata);
+
+        assert_eq!(opts.user_metadata.len(), 1, "{:?}", opts.user_metadata);
+        assert_eq!(opts.user_metadata.get("name"), Some(&"object".to_string()));
     }
 
     #[test]

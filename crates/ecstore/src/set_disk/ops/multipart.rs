@@ -29,23 +29,22 @@ use super::super::MetadataCacheInvalidationProbe;
 #[cfg(test)]
 use super::super::capacity_scope_from_disks;
 use super::super::{
-    AMZ_STORAGE_CLASS, Arc, Bytes, CompletePart, Cursor, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore,
-    EVENT_SET_DISK_MULTIPART, Error, FileInfo, GLOBAL_MIN_PART_SIZE, HashAlgorithm, HashMap, HashReader, HashSet,
-    HealChannelPriority, Instant, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, ListMultipartsInfo, ListPartsInfo,
-    MAX_PARTS_COUNT, MULTIPART_WRITE_QUORUM_RENAME_PART, MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
-    MULTIPART_WRITE_QUORUM_WRITER_SETUP, MultipartInfo, MultipartUploadResult, MultipartWriteQuorumContext, NamespaceLockFence,
-    OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectLockDiagGuard, ObjectOptions, ObjectPartInfo, OffsetDateTime, PartInfo,
-    PutObjReader, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY,
-    Result, SLASH_SEPARATOR, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID,
-    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
-    SmallWritePath, StorageError, Uuid, WriteLayout, check_object_lock_for_deletion_with_state,
-    classify_multipart_part_write_path, coding, complete_multipart_part_error, complete_multipart_part_error_result,
-    complete_part_checksum, completed_multipart_object_part, contains_key_str, create_bitrot_writer, debug, disk, error,
-    get_complete_multipart_md5, get_header_map, get_str, insert_str, is_err_object_not_found, is_err_version_not_found,
-    is_min_allowed_part_size, log_multipart_write_quorum_failure, parts_after_marker, path_join_buf,
-    record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
-    to_object_err, warn,
+    Arc, Bytes, CompletePart, Cursor, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore, EVENT_SET_DISK_MULTIPART, Error,
+    FileInfo, GLOBAL_MIN_PART_SIZE, HashAlgorithm, HashMap, HashReader, HashSet, HealChannelPriority, Instant,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, ListMultipartsInfo, ListPartsInfo, MAX_PARTS_COUNT,
+    MULTIPART_WRITE_QUORUM_RENAME_PART, MULTIPART_WRITE_QUORUM_UPLOAD_METADATA, MULTIPART_WRITE_QUORUM_WRITER_SETUP,
+    MultipartInfo, MultipartUploadResult, MultipartWriteQuorumContext, NamespaceLockFence, OBJECT_OP_IGNORED_ERRS, ObjectInfo,
+    ObjectLockDiagGuard, ObjectOptions, ObjectPartInfo, OffsetDateTime, PartInfo, PutObjReader, RUSTFS_META_MULTIPART_BUCKET,
+    RUSTFS_META_TMP_BUCKET, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, Result, SLASH_SEPARATOR,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError,
+    Uuid, WriteLayout, check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding,
+    complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, completed_multipart_object_part,
+    contains_key_str, create_bitrot_writer, debug, disk, error, get_complete_multipart_md5, get_header_map, get_str, insert_str,
+    is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure,
+    parts_after_marker, path_join_buf, record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    remove_header_map, resolve_write_layout, restore_commit_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 #[cfg(test)]
@@ -81,6 +80,7 @@ use crate::storage_api_contracts::object::ObjectOperations;
 use futures::{StreamExt, stream};
 #[cfg(test)]
 use http::HeaderMap;
+use rustfs_filemeta::metadata_keys;
 use rustfs_rio::EtagResolvable;
 use rustfs_rio::TryGetIndex;
 #[cfg(test)]
@@ -1924,7 +1924,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // Extract storage class from metadata, default to STANDARD if not found
         let storage_class = fi
             .metadata
-            .get(AMZ_STORAGE_CLASS)
+            .get(metadata_keys::STORAGE_CLASS)
             .cloned()
             .unwrap_or_else(|| storageclass::STANDARD.to_string());
 
@@ -2123,10 +2123,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             user_defined.insert("etag".to_owned(), etag.clone());
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+        if let Some(sc) = user_defined.get(metadata_keys::STORAGE_CLASS)
             && sc == storageclass::STANDARD
         {
-            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+            let _ = user_defined.remove(metadata_keys::STORAGE_CLASS);
         }
 
         let WriteLayout {
@@ -2138,7 +2138,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             self.pool_index,
             disks.len(),
             self.default_parity_count,
-            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
             opts.max_parity,
         )?;
 
@@ -2180,10 +2180,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // TODO(backlog): detect content-type from part data when header is missing
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+        if let Some(sc) = user_defined.get(metadata_keys::STORAGE_CLASS)
             && sc == storageclass::STANDARD
         {
-            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+            let _ = user_defined.remove(metadata_keys::STORAGE_CLASS);
         }
 
         if let Some(checksum) = &opts.want_checksum {
@@ -2418,7 +2418,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica;
             if !authorized_inbound_replica {
                 fi.metadata
-                    .retain(|key, _| !key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS));
+                    .retain(|key, _| !key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS));
                 for suffix in [
                     rustfs_utils::http::SUFFIX_REPLICA_STATUS,
                     rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
@@ -8837,8 +8837,7 @@ mod tests {
                 rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
                 "foreign-replica-time".to_string(),
             );
-            create_replication_metadata
-                .insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            create_replication_metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), "REPLICA".to_string());
             let (upload_id, parts) = stage_upload_with_create_opts(
                 &set_disks,
                 bucket,
@@ -8909,7 +8908,7 @@ mod tests {
                 completed
                     .user_defined
                     .iter()
-                    .filter(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS))
                     .all(|(_, value)| value != "REPLICA")
             );
 
@@ -8965,7 +8964,7 @@ mod tests {
                 rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
                 "authorized-inbound-time".to_string(),
             );
-            inbound_replica_metadata.insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            inbound_replica_metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), "REPLICA".to_string());
             let (upload_id, parts) = stage_upload_with_create_opts(
                 &set_disks,
                 bucket,
@@ -9006,7 +9005,7 @@ mod tests {
                 inbound
                     .user_defined
                     .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .find(|(key, _)| key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS))
                     .map(|(_, value)| value.as_str()),
                 Some("REPLICA")
             );
