@@ -14,8 +14,9 @@
 
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
+    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
+    validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
@@ -23,12 +24,13 @@ use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
-    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ,
-    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE,
-    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_STAGE_READ_VERSION_DISK_READ,
-    INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE,
-    INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_DISK_READ, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -1887,6 +1889,70 @@ impl NodeService {
             metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(WriteAllResponse {
                 success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_compare_and_update_file(
+        &self,
+        request: Request<CompareAndUpdateFileRequest>,
+    ) -> Result<Response<CompareAndUpdateFileResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref()),
+            "compare_and_update_file",
+        )?;
+        let request = request.into_inner();
+        let data_len = request
+            .expected
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .saturating_add(request.replacement.as_ref().map_or(0, Bytes::len));
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            data_len,
+        );
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk
+                .compare_and_update_file(&request.volume, &request.path, request.expected, request.replacement)
+                .await
+            {
+                Ok(outcome) => Ok(Response::new(CompareAndUpdateFileResponse {
+                    success: true,
+                    outcome: match outcome {
+                        ConditionalFileUpdate::Updated => CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32,
+                        ConditionalFileUpdate::Missing => CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing as i32,
+                        ConditionalFileUpdate::Mismatch => CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch as i32,
+                    },
+                    error: None,
+                })),
+                Err(err) => {
+                    metrics.record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Ok(Response::new(CompareAndUpdateFileResponse {
+                        success: false,
+                        outcome: CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32,
+                        error: Some(err.into()),
+                    }))
+                }
+            }
+        } else {
+            metrics.record_error_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            Ok(Response::new(CompareAndUpdateFileResponse {
+                success: false,
+                outcome: CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }

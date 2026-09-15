@@ -20,6 +20,7 @@ mod filemeta_inline;
 mod metacache;
 mod replication;
 
+pub mod metadata_keys;
 pub mod test_data;
 
 pub use error::*;

@@ -82,18 +82,16 @@ use rustfs_config::{
     ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
+use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
+    is_restored_object_on_disk,
 };
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    Timestamp,
-};
-use s3s::header::X_AMZ_RESTORE;
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5174,10 +5172,10 @@ pub async fn put_restore_opts(
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
-        X_AMZ_RESTORE.as_str().to_string(),
+        metadata_keys::RESTORE.to_string(),
         RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+            restore_expiry_date: Some(restore_expiry),
         }
         .to_string(),
     );
@@ -5913,6 +5911,7 @@ mod tests {
     use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
+    use rustfs_filemeta::metadata_keys;
     use rustfs_filemeta::{FileInfo, FileMeta};
     #[cfg(feature = "test-util")]
     use rustfs_s3_client::transition_api::ReaderImpl;
@@ -5922,7 +5921,6 @@ mod tests {
         NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
         OutputLocation, RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -12243,7 +12241,7 @@ mod tests {
                 "locked historical null",
                 ObjectInfo {
                     user_defined: Arc::new(HashMap::from([(
-                        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                         "ON".to_string(),
                     )])),
                     ..historical_null.clone()
@@ -13021,7 +13019,7 @@ mod tests {
         let lc = latest_expiration_lifecycle();
         let object = current_object_with_metadata(
             ReplicationStatusType::Completed,
-            HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+            HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
         );
 
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
@@ -13039,10 +13037,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
 
@@ -13064,10 +13062,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
         object.transitioned_object.status = TRANSITION_COMPLETE.to_string();

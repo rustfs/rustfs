@@ -54,9 +54,10 @@
 //! dimension, whose key space (bucket names) is attacker-chosen.
 
 use crate::server::{
-    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH,
+    FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH,
     MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    RPC_PREFIX, RemoteAddr, TONIC_PREFIX, has_path_prefix, is_admin_path, is_table_catalog_path, strip_valid_port_suffix,
+    RPC_PREFIX, RemoteAddr, TONIC_PREFIX, console_prefix, has_path_prefix, is_admin_path, is_table_catalog_path,
+    strip_valid_port_suffix,
 };
 use crate::storage_api::server::layer::request_context::RequestContext;
 use bytes::Bytes;
@@ -405,7 +406,7 @@ fn is_rate_limit_exempt_path(path: &str) -> bool {
             | FAVICON_PATH
     ) || has_path_prefix(path, RPC_PREFIX)
         || has_path_prefix(path, TONIC_PREFIX)
-        || has_path_prefix(path, CONSOLE_PREFIX)
+        || has_path_prefix(path, console_prefix())
 }
 
 /// Apply the standard throttling headers shared by every rate-limited scope.
@@ -630,6 +631,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_prefix_process_case_classification() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = crate::server::console_prefix();
+        assert!(is_rate_limit_exempt_path(&format!("{prefix}/version")));
+        assert!(!is_rate_limit_exempt_path(&format!("{prefix}-other/version")));
+        assert!(!is_rate_limit_exempt_path("/bucket/object"));
+    }
+
     use super::*;
     use http_body_util::BodyExt;
     use serial_test::serial;
@@ -779,7 +792,7 @@ mod tests {
             "/favicon.ico",
             "/rustfs/rpc/anything",
             "/node_service.NodeService/Ping",
-            "/rustfs/console/index.html",
+            &format!("{}/index.html", console_prefix()),
         ] {
             assert!(is_rate_limit_exempt_path(path), "{path} must be exempt");
         }

@@ -1087,6 +1087,20 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_compare_and_update_file_request_body(
+    request: &proto_gen::node_service::CompareAndUpdateFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-compare-and-update-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.expected.is_some());
+    body.push_bytes(request.expected.as_deref().unwrap_or_default())?;
+    body.push_bool(request.replacement.is_some());
+    body.push_bytes(request.replacement.as_deref().unwrap_or_default())?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_request_body(
     request: &proto_gen::node_service::DeleteRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1242,10 +1256,10 @@ pub fn canonical_make_volumes_request_body(
 #[cfg(test)]
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
-        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -1440,6 +1454,31 @@ mod disk_mutation_canonical_tests {
             let mut request = write_all.clone();
             mutate(&mut request);
             bodies.push(canonical_write_all_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let compare_and_update_file = CompareAndUpdateFileRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            expected: Some(vec![0xAA, 0xBB].into()),
+            replacement: Some(vec![0xCC, 0xDD].into()),
+        };
+        let mut bodies = vec![canonical_compare_and_update_file_request_body(&compare_and_update_file).unwrap()];
+        for mutate in [
+            |r: &mut CompareAndUpdateFileRequest| r.disk = "d2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.volume = "v2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.path = "p2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = None,
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(vec![0xAA, 0xBC].into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = None,
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(vec![0xCC, 0xDE].into()),
+        ] {
+            let mut request = compare_and_update_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_compare_and_update_file_request_body(&request).unwrap());
         }
         assert_all_distinct(&bodies);
 

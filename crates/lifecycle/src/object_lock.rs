@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
+use rustfs_storage_api::metadata_keys;
 use s3s::dto::{ObjectLockConfiguration, ObjectLockRetentionMode};
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use time::{OffsetDateTime, format_description};
 
 pub fn is_object_locked_by_metadata(user_defined: &HashMap<String, String>, is_delete_marker: bool) -> bool {
@@ -24,13 +24,13 @@ pub fn is_object_locked_by_metadata(user_defined: &HashMap<String, String>, is_d
     }
 
     if user_defined
-        .get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+        .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
         .is_some_and(|value| value.eq_ignore_ascii_case("ON"))
     {
         return true;
     }
 
-    let Some(mode) = user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()) else {
+    let Some(mode) = user_defined.get(metadata_keys::OBJECT_LOCK_MODE) else {
         return false;
     };
     if !is_retention_mode(mode) {
@@ -38,7 +38,7 @@ pub fn is_object_locked_by_metadata(user_defined: &HashMap<String, String>, is_d
     }
 
     user_defined
-        .get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+        .get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
         .and_then(|value| OffsetDateTime::parse(value, &format_description::well_known::Iso8601::DEFAULT).ok())
         .is_some_and(|retain_until| retain_until.unix_timestamp() > OffsetDateTime::now_utc().unix_timestamp())
 }
@@ -85,22 +85,22 @@ pub fn is_object_locked(
 }
 
 fn has_explicit_lock_metadata(user_defined: &HashMap<String, String>) -> bool {
-    user_defined.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
-        || user_defined.contains_key(X_AMZ_OBJECT_LOCK_MODE.as_str())
-        || user_defined.contains_key(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str())
+    user_defined.contains_key(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+        || user_defined.contains_key(metadata_keys::OBJECT_LOCK_MODE)
+        || user_defined.contains_key(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
 }
 
 fn explicit_lock_metadata_is_well_formed(user_defined: &HashMap<String, String>) -> bool {
     if user_defined
-        .get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+        .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
         .is_some_and(|value| !value.eq_ignore_ascii_case("ON") && !value.eq_ignore_ascii_case("OFF"))
     {
         return false;
     }
 
     match (
-        user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str()),
-        user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()),
+        user_defined.get(metadata_keys::OBJECT_LOCK_MODE),
+        user_defined.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE),
     ) {
         (None, None) => true,
         (Some(mode), Some(retain_until)) => {
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn is_object_locked_by_metadata_preserves_object_lock_parser_behavior() {
         let mut user_defined = HashMap::new();
-        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
 
         assert!(is_object_locked_by_metadata(&user_defined, false));
         assert!(!is_object_locked_by_metadata(&user_defined, true));
@@ -231,11 +231,11 @@ mod tests {
         let config = default_retention_config(30);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             ObjectLockRetentionMode::GOVERNANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             (OffsetDateTime::now_utc() - Duration::days(1))
                 .format(&format_description::well_known::Iso8601::DEFAULT)
                 .expect("expired retention date should format"),
@@ -249,7 +249,7 @@ mod tests {
         let config = default_retention_config(1);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             ObjectLockRetentionMode::GOVERNANCE.to_string(),
         );
         let created = OffsetDateTime::now_utc() - Duration::days(2);

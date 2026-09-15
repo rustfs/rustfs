@@ -46,7 +46,7 @@ pub(crate) mod s3 {
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
     pub(crate) use s3s::{Body, S3, S3Response};
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
 pub(crate) mod admin {

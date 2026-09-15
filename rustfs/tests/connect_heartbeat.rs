@@ -28,8 +28,8 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use rustfs::connect::{
-    CoarseNodeSummary, CredentialStore, DeviceCredential, HeartbeatConfig, HeartbeatSchedule, HeartbeatStatus, IdentityStore,
-    spawn_heartbeat_runtime,
+    CONNECT_DIAGNOSTIC_CAPABILITIES, CoarseNodeSummary, CredentialStore, DeviceCredential, ENVIRONMENT_CAPABILITY,
+    HeartbeatConfig, HeartbeatSchedule, HeartbeatStatus, IdentityStore, spawn_heartbeat_runtime,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -218,16 +218,29 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
                     let replies = replies.clone();
                     let seen = seen.clone();
                     async move {
-                        assert_eq!(request.uri().path(), format!("/agent/clusters/{CLUSTER_UID}/heartbeats"));
+                        let path = request.uri().path().to_owned();
+                        assert!(
+                            path == format!("/agent/clusters/{CLUSTER_UID}/heartbeats")
+                                || path == format!("/agent/clusters/{CLUSTER_UID}/diagnosticExecutionReceipts")
+                        );
                         let body = request.into_body().collect().await.expect("request body").to_bytes();
                         seen.lock()
                             .expect("seen lock")
                             .push(serde_json::from_slice(&body).expect("request JSON"));
-                        let reply = replies
-                            .lock()
-                            .expect("reply lock")
-                            .pop_front()
-                            .unwrap_or_else(|| Reply::error(StatusCode::SERVICE_UNAVAILABLE));
+                        let reply = if path.ends_with("/diagnosticExecutionReceipts") {
+                            Reply {
+                                status: StatusCode::OK,
+                                body: json!({"acceptedVersion": "v1"}),
+                                retry_after: None,
+                                delay: Duration::ZERO,
+                            }
+                        } else {
+                            replies
+                                .lock()
+                                .expect("reply lock")
+                                .pop_front()
+                                .unwrap_or_else(|| Reply::error(StatusCode::SERVICE_UNAVAILABLE))
+                        };
                         if !reply.delay.is_zero() {
                             tokio::time::sleep(reply.delay).await;
                         }
@@ -282,6 +295,8 @@ fn config_with_stores(
             initial_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(80),
         },
+        proxy: None,
+        diagnostic_job_signer: None,
     }
 }
 
@@ -514,10 +529,79 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "sequence"
         ]
     );
-    assert_eq!(request["capabilities"], json!(["heartbeat"]));
+    assert_eq!(ENVIRONMENT_CAPABILITY, "inventory.environment@1");
+    assert_eq!(
+        request["capabilities"],
+        json!([
+            "heartbeat",
+            "diagnostics.policy.v1",
+            "inventory.environment@1",
+            "performance.client@1",
+            "performance.drive@1",
+            "performance.network@1",
+            "performance.object@1",
+            "performance.siteReplication@1",
+            "logs.capture@1",
+            "profile.cpu@1",
+            "profile.memory@1",
+            "profile.threads@1",
+            "telemetry.record@1",
+            "telemetry.otlp@1",
+            "telemetry.replay@1",
+            "top.api@1",
+            "top.disk@1",
+            "top.locks@1",
+            "top.net@1",
+            "top.rpc@1",
+            "inspect.object@1"
+        ])
+    );
+    assert_eq!(
+        request["capabilities"].as_array().expect("capabilities").len(),
+        CONNECT_DIAGNOSTIC_CAPABILITIES.len() + 3
+    );
     assert_eq!(request["coarseNodeSummary"], json!({"total": 8, "healthy": 7, "degraded": 1}));
     assert_ne!(request["clientTime"], "2038-01-19T03:14:07Z");
     assert!(request.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn restart_replays_a_pending_heartbeat_from_before_environment_collection() {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shutdown = CancellationToken::new();
+    let config = config(&temp, &pki, &server);
+    let directory = config.state_path.parent().expect("state directory");
+    fs::create_dir_all(directory).expect("create state directory");
+    let state = json!({
+        "nextSequence": 0,
+        "pending": {
+            "protocolVersion": "v1",
+            "requestId": "550e8400-e29b-41d4-a716-446655440000",
+            "agentVersion": format!("rustfs-agent/{}", env!("CARGO_PKG_VERSION")),
+            "capabilities": ["heartbeat", "diagnostics.policy.v1"],
+            "sequence": 0,
+            "clientTime": "2026-08-22T01:02:03Z",
+            "coarseNodeSummary": {"total": 1, "healthy": 1, "degraded": 0}
+        }
+    });
+    fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
+    private_mode(&config.state_path);
+
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+        .expect("start runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    let seen = server.seen.lock().expect("seen lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["capabilities"], json!(["heartbeat", "diagnostics.policy.v1"]));
 }
 
 #[tokio::test]
@@ -556,6 +640,71 @@ async fn restart_replays_pending_request_then_advances_sequence() {
     assert_eq!(seen[0]["sequence"], first["sequence"]);
     assert_ne!(seen[1]["requestId"], seen[0]["requestId"]);
     assert_eq!(seen[1]["sequence"].as_u64(), seen[0]["sequence"].as_u64().map(|value| value + 1));
+}
+
+#[tokio::test]
+async fn restart_sends_the_last_durable_diagnostic_receipt_outbound() {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let diagnostics = temp.path().join("diagnostics");
+    fs::create_dir_all(&diagnostics).expect("diagnostics directory");
+    fs::write(
+        diagnostics.join("schedule.json"),
+        serde_json::to_vec(&json!({
+            "policyRevision": null,
+            "policyFingerprint": null,
+            "nextDueAt": null,
+            "activeIntervalStartedAt": null,
+            "lastReceipt": {
+                "receiptId": "123e4567-e89b-42d3-a456-426614174001",
+                "policyRevision": 8,
+                "toolId": "inventory.environment",
+                "intervalStartedAt": "2030-01-01T00:00:00Z",
+                "completedAt": "2030-01-01T00:00:07Z",
+                "outcome": "FAILED",
+                "attemptCount": 3,
+                "reason": "connect_diagnostic_inventory_unavailable",
+                "resultSha256": null,
+                "resultBytes": null
+            }
+        }))
+        .expect("schedule state"),
+    )
+    .expect("write schedule state");
+    private_mode(&diagnostics.join("schedule.json"));
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config(&temp, &pki, &server)), &shutdown, summary)
+        .expect("start runtime")
+        .expect("configured runtime");
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if server
+                .seen
+                .lock()
+                .expect("seen lock")
+                .iter()
+                .any(|request| request["receiptId"] == "123e4567-e89b-42d3-a456-426614174001")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receipt delivery");
+    runtime.shutdown().await;
+
+    let seen = server.seen.lock().expect("seen lock");
+    let receipt = seen
+        .iter()
+        .find(|request| request.get("receiptId").is_some())
+        .expect("receipt request");
+    assert_eq!(receipt["protocolVersion"], "v1");
+    assert_eq!(receipt["requestId"], receipt["receiptId"]);
+    assert_eq!(receipt["attemptCount"], 3);
+    assert!(receipt.get("command").is_none());
 }
 
 #[tokio::test]

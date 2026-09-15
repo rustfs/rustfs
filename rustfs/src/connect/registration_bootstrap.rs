@@ -25,7 +25,7 @@ use std::{
 
 use super::TokenError;
 #[cfg(unix)]
-use super::{ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken};
+use super::{ConnectClient, ConnectConfig, CredentialStore, IdentityStore, ProxyConfig, RegistrationToken};
 
 #[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -58,6 +58,16 @@ pub enum RegistrationBootstrapError {
     Input(#[source] io::Error),
     #[error("Connect registration configuration is invalid")]
     Configuration,
+    #[error("Connect registration proxy configuration is invalid")]
+    ProxyConfiguration,
+    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error("Connect registration exchange failed")]
     Exchange,
     #[error("Connect registration bootstrap requires Unix owner and permission guarantees")]
@@ -85,10 +95,12 @@ pub async fn register_from_protected_input(
     token_file: Option<&Path>,
 ) -> Result<RegistrationBootstrapResult, RegistrationBootstrapError> {
     let root_ca_pem = read_regular_file(root_ca_file, false)?;
+    let proxy = ProxyConfig::from_env().map_err(|_| RegistrationBootstrapError::ProxyConfiguration)?;
     let client = ConnectClient::new(ConnectConfig {
         endpoint,
         root_ca_pem: &root_ca_pem,
         timeout: REQUEST_TIMEOUT,
+        proxy: proxy.as_ref(),
     })
     .map_err(|_| RegistrationBootstrapError::Configuration)?;
 
@@ -105,7 +117,12 @@ pub async fn register_from_protected_input(
             &token,
         )
         .await
-        .map_err(|_| RegistrationBootstrapError::Exchange)?;
+        .map_err(|error| match error {
+            super::ClientError::ProxyAuthentication => RegistrationBootstrapError::ProxyAuthentication,
+            super::ClientError::ProxyRejected => RegistrationBootstrapError::ProxyRejected,
+            super::ClientError::TlsPeer => RegistrationBootstrapError::TlsPeer,
+            _ => RegistrationBootstrapError::Exchange,
+        })?;
     if credential.name != format!("{cluster_name}/clusterDevices/{}", credential.uid) {
         return Err(RegistrationBootstrapError::Exchange);
     }

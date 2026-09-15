@@ -54,6 +54,13 @@ pub(super) fn replacement_discovery_error_is_expected_for_deferred_endpoint(
     matches!(error, Error::Disk(DiskError::UnformattedDisk)) && deferred_replacement_endpoints.contains(endpoint)
 }
 
+pub(super) fn replacement_targets_belong_to_local_node(
+    replacement_targets: &[String],
+    local_endpoints: &HashSet<String>,
+) -> bool {
+    !replacement_targets.is_empty() && replacement_targets.iter().all(|target| local_endpoints.contains(target))
+}
+
 pub(super) fn unblock_replacement_recovery_sets_after_validation(
     blocked_sets: &mut HashSet<String>,
     retry_succeeded: HashSet<String>,
@@ -83,6 +90,11 @@ impl HealManager {
                 let local_disk_map = local_disk_map_read().await;
                 local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
             };
+            let local_endpoints = local_disks
+                .iter()
+                .map(|disk| disk.endpoint().to_string())
+                .collect::<HashSet<_>>();
+            let mut recovery_disks = Vec::new();
             for disk in &local_disks {
                 let endpoint = disk.endpoint();
                 match disk
@@ -132,6 +144,11 @@ impl HealManager {
                     set_disk_ids.insert(set_disk_id.clone());
                 }
 
+                if !matches!(disk.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                    continue;
+                }
+                recovery_disks.push(disk.clone());
+
                 // Legacy flat records are inspected only while starting. The
                 // periodic scanner lists the dedicated replacement directory.
                 let migration = match ResumeUtils::migrate_approved_legacy_replacements(disk, self.storage.as_ref()).await {
@@ -152,6 +169,31 @@ impl HealManager {
                         "Legacy replacement recovery migration failed"
                     );
                 }
+            }
+
+            for set_disk_id in &set_disk_ids {
+                match self.storage.replacement_intent_disks(set_disk_id).await {
+                    Ok(disks) => recovery_disks.extend(disks),
+                    Err(error) => {
+                        self.block_replacement_recovery_set(set_disk_id);
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            set_disk_id,
+                            error = %error,
+                            "Replacement recovery disk discovery failed"
+                        );
+                    }
+                }
+            }
+            recovery_disks.sort_by_key(|disk| disk.endpoint().to_string());
+            recovery_disks.dedup_by(|left, right| left.endpoint().to_string() == right.endpoint().to_string());
+
+            for disk in &recovery_disks {
+                let endpoint = disk.endpoint();
+                let disk_set_disk_id = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
                 let replacement_task_ids = match ResumeUtils::get_replacement_intent_tasks(disk).await {
                     Ok(task_ids) => task_ids,
                     Err(error) => {
@@ -193,6 +235,9 @@ impl HealManager {
                     let state = manager.get_state().await;
                     if durable_replacement_reserves_targets(&state) {
                         reserved_replacement_sets.insert(state.set_disk_id.clone());
+                    }
+                    if !replacement_targets_belong_to_local_node(&state.replacement_targets, &local_endpoints) {
+                        continue;
                     }
                     let active_replacement = !state.completed
                         && matches!(
@@ -393,5 +438,27 @@ impl HealManager {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replacement_targets_belong_to_local_node;
+    use std::collections::HashSet;
+
+    #[test]
+    fn replacement_replay_requires_every_target_to_be_local() {
+        let local = HashSet::from(["http://node-b:9000/disk".to_string()]);
+
+        assert!(replacement_targets_belong_to_local_node(&["http://node-b:9000/disk".to_string()], &local));
+        assert!(!replacement_targets_belong_to_local_node(&[], &local));
+        assert!(!replacement_targets_belong_to_local_node(
+            &["http://node-a:9000/disk".to_string()],
+            &local
+        ));
+        assert!(!replacement_targets_belong_to_local_node(
+            &["http://node-b:9000/disk".to_string(), "http://node-c:9000/disk".to_string(),],
+            &local
+        ));
     }
 }

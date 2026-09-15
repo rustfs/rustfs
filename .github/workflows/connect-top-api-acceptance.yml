@@ -1,0 +1,192 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Connect top.api service-job acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Main-branch Build and Release workflow run ID
+        required: true
+        type: string
+      artifact_id:
+        description: Linux x86_64 GNU artifact ID from that run
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character source commit
+        required: true
+        type: string
+      artifact_digest:
+        description: GitHub artifact digest including sha256 prefix
+        required: true
+        type: string
+      binary_sha256:
+        description: Expected rustfs binary SHA-256
+        required: true
+        type: string
+      connect_sha:
+        description: Exact 40-character RustFS Connect harness commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  top-api:
+    name: Verify native Linux x86_64 top.api service job
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout acceptance harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact RustFS source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: rustfs-source
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Checkout exact Connect harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/connect
+          path: connect-harness
+          persist-credentials: false
+          ref: ${{ inputs.connect_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: connect-harness/web/package-lock.json
+
+      - name: Verify source run and artifact identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          CONNECT_SHA: ${{ inputs.connect_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$CONNECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ $(git -C rustfs-source rev-parse HEAD) == "$SOURCE_SHA" ]]
+          [[ $(git -C connect-harness rev-parse HEAD) == "$CONNECT_SHA" ]]
+          [[ $(git -C rustfs-source remote get-url origin) == https://github.com/rustfs/rustfs ]]
+          [[ $(git -C connect-harness remote get-url origin) == https://github.com/rustfs/connect ]]
+
+          run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")
+          [[ $(jq -r '.head_sha' <<<"$run") == "$SOURCE_SHA" ]]
+          [[ $(jq -r '.head_branch' <<<"$run") == main ]]
+          [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
+          [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
+
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
+          jq -e --arg name "$expected_job" '
+            [.[].jobs[] | select(.name == $name)] as $matches
+            | (($matches | length) == 1 and $matches[0].conclusion == "success")
+          ' <<<"$jobs" >/dev/null
+
+          artifact=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")
+          [[ $(jq -r '.workflow_run.id' <<<"$artifact") == "$BUILD_RUN_ID" ]]
+          [[ $(jq -r '.workflow_run.head_sha' <<<"$artifact") == "$SOURCE_SHA" ]]
+          [[ $(jq -r '.name' <<<"$artifact") == rustfs-linux-x86_64-gnu-* ]]
+          [[ $(jq -r '.digest' <<<"$artifact") == "$ARTIFACT_DIGEST" ]]
+          [[ $(jq -r '.expired' <<<"$artifact") == false ]]
+
+      - name: Download exact build artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          path: artifact
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Extract exact RustFS binary
+        shell: bash
+        env:
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          short_sha=${SOURCE_SHA:0:7}
+          package=$(find artifact -type f -name "rustfs-linux-x86_64-gnu-dev-${short_sha}.zip" -print -quit)
+          [[ -n "$package" ]]
+          mkdir -p binary
+          unzip -qq "$package" rustfs -d binary
+          chmod +x binary/rustfs
+          printf '%s  %s\n' "$BINARY_SHA256" binary/rustfs | sha256sum --check --strict
+
+      - name: Run signed service job acceptance
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SOURCE_SHA" >connect-harness/tests/e2e/connected/rustfs-ref
+          npm --prefix connect-harness/web ci
+          connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
+          make -C connect-harness e2e-connected-dispatch-check
+          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+            RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
+            CONNECT_E2E_TOP_API_EVIDENCE="$GITHUB_WORKSPACE/top-api-service-job-evidence.json" \
+            make -C connect-harness e2e-connected E2E_SCENARIO=top-api
+
+      - name: Bind workflow and artifact provenance
+        if: ${{ always() && hashFiles('top-api-service-job-evidence.json') != '' }}
+        shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          CONNECT_SHA: ${{ inputs.connect_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          jq \
+            --arg workflowRunId "$GITHUB_RUN_ID" \
+            --arg buildRunId "$BUILD_RUN_ID" \
+            --arg artifactId "$ARTIFACT_ID" \
+            --arg artifactDigest "$ARTIFACT_DIGEST" \
+            --arg connectSha "$CONNECT_SHA" \
+            --arg sourceSha "$SOURCE_SHA" \
+            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha}' \
+            top-api-service-job-evidence.json >top-api-service-job-evidence.bound.json
+          mv top-api-service-job-evidence.bound.json top-api-service-job-evidence.json
+
+      - name: Upload acceptance evidence
+        if: ${{ always() && hashFiles('top-api-service-job-evidence.json') != '' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: connect-top-api-evidence-${{ github.run_id }}
+          path: |
+            top-api-service-job-evidence.json
+          retention-days: 14
+          if-no-files-found: error

@@ -31,6 +31,11 @@ require_absent() {
   fi
 }
 
+require_line "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "cross builds must keep matrix features"
+require_line "$build_workflow" "              cargo build --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "native builds must keep matrix features"
+require_absent "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "cross builds must not drop matrix features"
+require_absent "$build_workflow" "              cargo build --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "native builds must not drop matrix features"
+
 extract_job_if() {
   local file="$1"
   local job="$2"

@@ -131,7 +131,7 @@ md-5 = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true
 sha2 = { workspace = true }
-astral-tokio-tar = { workspace = true }
+rustfs-tokio-tar = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 zstd.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }

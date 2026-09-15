@@ -1,6 +1,12 @@
 name: RustFS Table Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       package_url:
@@ -40,7 +46,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout repository (for report parser)
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
@@ -58,23 +64,21 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      - name: Checkout auto-testing scripts
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -101,15 +105,22 @@ jobs:
             ' || echo "pre-cleanup failed on ${node} (continuing)"
           done
 
+      - name: Stage verified candidate package
+        id: chain_package
+        if: ${{ inputs.chain_manifest != '' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py prepare
+
       - name: Run table suite
         id: test
-        # Case failures keep the run green: the report and the backlog issue
-        # manager carry the product signal.
+        # Standalone case failures are reported by the backlog manager.
+        # Chain evidence separately requires complete passing cases.
         continue-on-error: true
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-table-test.sh
-          PACKAGE_URL='${{ inputs.package_url }}'
+          PACKAGE_URL='${{ steps.chain_package.outputs.package_url || inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
           SMOKE_PATH="${GITHUB_WORKSPACE:-$PWD}/scripts/table-catalog/pyiceberg_smoke.py"
           ARGS=(-y --smoke-script "${SMOKE_PATH}")
@@ -126,6 +137,7 @@ jobs:
           ./auto-testing/rustfs-table-test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Generate report
+        id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -247,7 +259,9 @@ jobs:
           python3 auto-testing/scripts/issue_manager.py handle \
             --repo rustfs/backlog \
             --suite table --category table --suite-label "S3 Tables" \
-            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --outcome '${{ steps.test.outcome }}' \
+            --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
             --run-id "${GITHUB_RUN_ID}" \
             --attempt "${GITHUB_RUN_ATTEMPT}" \
             --commit "${GITHUB_SHA}" \
@@ -259,7 +273,7 @@ jobs:
 
       - name: Upload report and logs
         if: ${{ always() && steps.evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-table-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -308,3 +322,30 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: echo "RustFS table test workflow failed (harness/environment breakdown); see logs and report artifact."
+
+      - name: Remove verified candidate package
+        if: ${{ always() && inputs.chain_manifest != '' && steps.chain.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py cleanup
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite table
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
+          --output "${RUNNER_TEMP}/chain-table-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/table.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-table-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-table-${{ github.run_id }}-${{ github.run_attempt }}/table.json
+          if-no-files-found: error

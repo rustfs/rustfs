@@ -5,19 +5,37 @@ This is the single alerting mechanism for all timed pipelines
 (rustfs/backlog#1149 ci-8, arbitration G3): scheduled workflows must consume
 this action instead of inventing their own notification paths.
 
+Issues are filed in **rustfs/backlog** (override with `target-repository`),
+not the repository the workflow runs in, so scheduled-failure noise stays
+out of the code repository's issue tracker.
+
 ## Behavior
 
 - Issue title: `[scheduled-failure] <workflow name>` — the workflow name is
   the dedupe key.
-- If an **open** issue with that exact title exists, the failure is appended
-  as a comment; otherwise a new issue is created (labeled `infrastructure` by
-  default). Closing the issue resets the cycle: the next failure opens a
-  fresh one.
-- The issue body / comment includes the run URL, run attempt, event, ref and
-  the names of the failed (or timed-out/cancelled) jobs of the current run
-  attempt.
+- If an **open** issue with that exact title exists in the target
+  repository, the failure is appended as a comment; otherwise a new issue is
+  created (labeled `infrastructure` by default; the label must exist in the
+  target repository). Closing the issue resets the cycle: the next failure
+  opens a fresh one.
+- The issue body / comment includes the source repository, run URL, run
+  attempt, event, ref and the names of the failed (or timed-out/cancelled)
+  jobs of the current run attempt.
 - Requires `gh` and `jq` on the runner (both preinstalled on GitHub-hosted
   runners such as `ubuntu-latest`).
+
+## Tokens
+
+Two tokens are involved:
+
+- `github-token` authenticates issue create/comment/search against the
+  target repository. The workflow-scoped `secrets.GITHUB_TOKEN` is scoped to
+  the code repository and **cannot** open issues in rustfs/backlog, so this
+  must be a PAT or GitHub App token with `issues: write` on the target
+  repository, stored as the `BACKLOG_ISSUE_TOKEN` repository secret.
+- `source-token` (defaults to `${{ github.token }}`) reads the failed-job
+  list from the reported run, which lives in the repository running the
+  workflow.
 
 ## Usage
 
@@ -41,7 +59,7 @@ this job only; no other job may gain permissions.
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
 ```
 
 Notes:

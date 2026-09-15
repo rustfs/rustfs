@@ -1,0 +1,169 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "diagnostic-scheduler",
+  "capability": "diagnostics.policy.v1",
+  "toolCapability": "inventory.environment@1",
+  "classification": "L1",
+  "description": "Frozen vectors for the consent-bound RustFS diagnostic scheduler. Receipts describe local producer execution and do not claim Connect delivery.",
+  "fixture": "accept-vectors",
+  "producerEvidence": {
+    "repository": "rustfs/rustfs",
+    "sourceCommit": "37250f649a92fc816a7b45e1cae096bef6943a77",
+    "executableSha256": "236066133e15d5f3fb9ffd36702069959527c97be184b1b757c1375ea0ebfb9a",
+    "testCommand": "cargo test -p rustfs --test connect_diagnostic_schedule -- --nocapture",
+    "testsPassed": 4,
+    "testsFailed": 0
+  },
+  "limits": {
+    "minimumIntervalSeconds": 300,
+    "maximumIntervalSeconds": 86400,
+    "maximumRetentionDays": 14,
+    "maximumAttempts": 3,
+    "maximumResultBytes": 65536
+  },
+  "vectors": [
+    {
+      "id": "diagnostic-scheduler.periodic-success",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 7,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "receipt": {
+        "receiptId": "123e4567-e89b-42d3-a456-426614174000",
+        "policyRevision": 7,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:01Z",
+        "outcome": "SUCCEEDED",
+        "attemptCount": 1,
+        "reason": null,
+        "resultSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "resultBytes": 256
+      },
+      "expected": {
+        "scheduled": true,
+        "nextIntervalStartedAt": "2030-01-01T00:05:00Z",
+        "receiptPersistence": "LOCAL_DURABLE_STATE",
+        "connectVisibility": false
+      }
+    },
+    {
+      "id": "diagnostic-scheduler.failure-after-bounded-retries",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 8,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "receipt": {
+        "receiptId": "123e4567-e89b-42d3-a456-426614174001",
+        "policyRevision": 8,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:07Z",
+        "outcome": "FAILED",
+        "attemptCount": 3,
+        "reason": "connect_diagnostic_inventory_unavailable",
+        "resultSha256": null,
+        "resultBytes": null
+      },
+      "expected": {
+        "scheduled": true,
+        "retryDelaysSeconds": [1, 2],
+        "receiptPersistence": "LOCAL_DURABLE_STATE",
+        "connectVisibility": false
+      }
+    },
+    {
+      "id": "diagnostic-scheduler.disable-cancels-active-run",
+      "policy": {
+        "policyName": null,
+        "revision": 9,
+        "supportState": "SUPPORTED",
+        "desiredState": "STOPPED",
+        "reasonCode": "DISABLED",
+        "toolIds": [],
+        "intervalSeconds": null,
+        "scope": "CLUSTER",
+        "retentionDays": null,
+        "consentReference": null,
+        "consentExpiresAt": null
+      },
+      "receipt": {
+        "receiptId": "123e4567-e89b-42d3-a456-426614174002",
+        "policyRevision": 8,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:01Z",
+        "outcome": "CANCELLED",
+        "attemptCount": 1,
+        "reason": "connect_diagnostic_cancelled",
+        "resultSha256": null,
+        "resultBytes": null
+      },
+      "expected": {
+        "scheduled": false,
+        "activeRunCancelled": true,
+        "nextDueAt": null,
+        "receiptPersistence": "LOCAL_DURABLE_STATE",
+        "connectVisibility": false
+      }
+    },
+    {
+      "id": "diagnostic-scheduler.restart-does-not-repeat-interval",
+      "policy": {
+        "policyName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/diagnosticCollectionPreference",
+        "revision": 10,
+        "supportState": "SUPPORTED",
+        "desiredState": "RUNNING",
+        "reasonCode": null,
+        "toolIds": ["inventory.environment"],
+        "intervalSeconds": 300,
+        "scope": "CLUSTER",
+        "retentionDays": 7,
+        "consentReference": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/diagnosticCollectionConsents/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+        "consentExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "persistedState": {
+        "policyRevision": 10,
+        "policyFingerprint": "81f75b115ea87f4d2eb90ae5e5c94ae8b0aead668a6a5a324af8ccfb265bbee1",
+        "nextDueAt": "2030-01-01T00:05:00Z",
+        "activeIntervalStartedAt": null,
+        "lastReceipt": {
+          "receiptId": "123e4567-e89b-42d3-a456-426614174003",
+          "policyRevision": 10,
+          "toolId": "inventory.environment",
+          "intervalStartedAt": "2030-01-01T00:00:00Z",
+          "completedAt": "2030-01-01T00:00:01Z",
+          "outcome": "FAILED",
+          "attemptCount": 3,
+          "reason": "connect_diagnostic_inventory_unavailable",
+          "resultSha256": null,
+          "resultBytes": null
+        }
+      },
+      "expected": {
+        "scheduled": true,
+        "rerunLastInterval": false,
+        "nextIntervalStartedAt": "2030-01-01T00:05:00Z",
+        "connectVisibility": false
+      }
+    }
+  ]
+}

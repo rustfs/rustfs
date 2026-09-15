@@ -19,7 +19,9 @@
 # 'failure')` wiring used by the real consumers (e2e-s3tests, mint, fuzz,
 # performance-ab). Dispatch it twice to verify both the issue-creation and
 # the dedupe-comment paths, then close the resulting
-# "[scheduled-failure] Schedule Failure Alert Drill" issue.
+# "[scheduled-failure] Schedule Failure Alert Drill" issue in rustfs/backlog
+# (the default target repository). Requires the BACKLOG_ISSUE_TOKEN secret
+# (a token with issues:write on rustfs/backlog).
 #
 # The run itself is expected to end red (the forced failure); only the
 # alert-on-failure job result matters.
@@ -68,4 +70,4 @@ jobs:
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

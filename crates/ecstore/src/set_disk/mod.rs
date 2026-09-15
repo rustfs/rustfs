@@ -122,6 +122,7 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use regex::Regex;
 use rustfs_config::MI_B;
+use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, ObjectPartInfo, RawFileInfo,
     merge_file_meta_versions,
@@ -148,7 +149,6 @@ use rustfs_s3_types::EventName;
 #[cfg(test)]
 use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES,
 };
@@ -162,7 +162,6 @@ use rustfs_utils::{
     crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::Sha256;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
@@ -214,7 +213,7 @@ pub(super) fn require_restore_operation_id(metadata: &HashMap<String, String>, e
 }
 
 pub(super) fn restore_commit_operation_id_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
-    if !metadata.contains_key(X_AMZ_RESTORE.as_str()) {
+    if !metadata.contains_key(metadata_keys::RESTORE) {
         return Ok(None);
     }
     restore_operation_id_from_metadata(metadata)
@@ -4461,6 +4460,37 @@ impl SetDisks {
         .with_attempt(attempt))
     }
 
+    pub(crate) async fn read_listing_metadata_after_namespace_barrier(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+    ) -> Result<(MetaCacheEntries, usize)> {
+        // This is only called after the lock-free LIST fast path observes an
+        // unresolved metadata generation. Waiting on the ordinary object read
+        // lock establishes a publication boundary with concurrent overwrites.
+        let _guard = self.acquire_read_lock_diag("list_object_reconcile", bucket, object).await?;
+        let (raw_entries, errors) = Self::read_all_raw_file_info(disks, bucket, object, false).await;
+        let confirmed_absent = errors
+            .iter()
+            .flatten()
+            .filter(|err| DiskError::is_err_object_not_found(err) || DiskError::is_err_version_not_found(err))
+            .count();
+        let entries = raw_entries
+            .into_iter()
+            .map(|raw| {
+                raw.filter(|raw| !raw.buf.is_empty()).map(|raw| MetaCacheEntry {
+                    name: object.to_owned(),
+                    metadata: raw.buf,
+                    cached: None,
+                    reusable: false,
+                })
+            })
+            .collect();
+
+        Ok((MetaCacheEntries(entries), confirmed_absent))
+    }
+
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
@@ -6050,7 +6080,7 @@ impl SetDisks {
         }
 
         let disks = self.disks.read().await.clone();
-        let storage_class = opts.user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str);
+        let storage_class = opts.user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str);
         let layout = resolve_write_layout(
             &storage_class_config,
             self.pool_index,
@@ -10553,10 +10583,7 @@ mod tests {
         );
         assert!(meta_a.replication_state_internal.is_some());
         assert_eq!(
-            meta_a
-                .metadata
-                .get(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS)
-                .map(String::as_str),
+            meta_a.metadata.get(metadata_keys::REPLICATION_STATUS).map(String::as_str),
             Some("COMPLETED")
         );
 
@@ -11941,11 +11968,11 @@ mod tests {
 
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
 
@@ -11976,11 +12003,11 @@ mod tests {
 
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
 
@@ -12006,11 +12033,11 @@ mod tests {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
 
@@ -12051,11 +12078,11 @@ mod tests {
             restore_expires: Some(restore_expiry),
             user_defined: Arc::new(HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
                 (
-                    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                     retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
                 ),
             ])),
@@ -12125,11 +12152,11 @@ mod tests {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
 
@@ -12153,11 +12180,11 @@ mod tests {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
         ObjectInfo {
@@ -12206,11 +12233,11 @@ mod tests {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
         );
         let obj_info = ObjectInfo {
@@ -12229,7 +12256,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_object_lock_delete_blocks_replicated_legal_hold_version_purge() {
         let mut user_defined = HashMap::new();
-        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
         let obj_info = ObjectInfo {
             user_defined: Arc::new(user_defined),
             ..Default::default()
@@ -14608,6 +14635,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_metadata_reconcile_waits_for_namespace_writer() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-list-reconcile-lock";
+        let object = "object";
+        let namespace_lock = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("namespace lock should be created");
+        let writer_guard = namespace_lock
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("writer lock should be acquired");
+        let read = set_disks.read_listing_metadata_after_namespace_barrier(&[], bucket, object);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut read)
+                .await
+                .is_err(),
+            "LIST reconciliation must wait for the publishing writer"
+        );
+        drop(writer_guard);
+
+        let (entries, confirmed_absent) = tokio::time::timeout(std::time::Duration::from_secs(30), read)
+            .await
+            .expect("LIST reconciliation should resume after writer release")
+            .expect("LIST reconciliation should read after the namespace barrier");
+        assert!(entries.0.is_empty());
+        assert_eq!(confirmed_absent, 0);
+    }
+
+    #[tokio::test]
     async fn repeated_body_write_keeps_etag_but_changes_data_dir_generation() {
         let set_disks = make_local_bucket_test_set_disks().await;
         let bucket = "bucket-write-generation";
@@ -14941,7 +14999,7 @@ mod tests {
         let object = "object.txt";
         let mod_time = OffsetDateTime::from_unix_timestamp(1_717_171_717).expect("fixed timestamp should parse");
         let mut user_defined = HashMap::new();
-        user_defined.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
+        user_defined.insert(metadata_keys::STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
         user_defined.insert(SUFFIX_COMPRESSION.to_string(), "zstd".to_string());
         let mut eval_metadata = HashMap::new();
         eval_metadata.insert("x-amz-meta-evaluated".to_string(), "yes".to_string());
@@ -14965,7 +15023,7 @@ mod tests {
         assert_eq!(written.etag.as_deref(), Some("preserved-etag"));
         assert_eq!(written.mod_time, Some(mod_time));
         assert_eq!(written.user_defined.get("x-amz-meta-evaluated").map(String::as_str), Some("yes"));
-        assert!(!written.user_defined.contains_key(AMZ_STORAGE_CLASS));
+        assert!(!written.user_defined.contains_key(metadata_keys::STORAGE_CLASS));
 
         let info = set_disks
             .get_object_info(bucket, object, &opts)
@@ -14974,7 +15032,7 @@ mod tests {
         assert_eq!(info.etag.as_deref(), Some("preserved-etag"));
         assert_eq!(info.mod_time, Some(mod_time));
         assert_eq!(info.user_defined.get("x-amz-meta-evaluated").map(String::as_str), Some("yes"));
-        assert!(!info.user_defined.contains_key(AMZ_STORAGE_CLASS));
+        assert!(!info.user_defined.contains_key(metadata_keys::STORAGE_CLASS));
     }
 
     #[tokio::test]

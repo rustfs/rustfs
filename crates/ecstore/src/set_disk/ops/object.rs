@@ -21,27 +21,27 @@
 
 use crate::core::pools::DecommissionCapacityAdmission;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
+use rustfs_filemeta::metadata_keys;
 
 #[cfg(test)]
 use super::super::MetadataCacheInvalidationProbe;
 use super::super::{
-    AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS, Arc, AsyncWrite, AtomicU64, BufReader, Bytes, CACHE_CONTROL, CONTENT_DISPOSITION,
-    CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, CompletePart, Cursor, DeleteAccounting, DeleteOptions, DeletedObject,
-    DiskError, DiskStore, EVENT_SET_DISK_COMMIT_TAIL_SLOW, EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY, EVENT_SET_DISK_WRITE,
-    EXPIRES, Error, EventArgs, EventName, FastLockGuard, FileInfo, FileInfoVersions,
-    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT,
-    GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION,
-    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision,
-    GetObjectReader, HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext,
-    Instant, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
+    AMZ_OBJECT_TAGGING, Arc, AsyncWrite, AtomicU64, BufReader, Bytes, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING,
+    CONTENT_LANGUAGE, CONTENT_TYPE, CompletePart, Cursor, DeleteAccounting, DeleteOptions, DeletedObject, DiskError, DiskStore,
+    EVENT_SET_DISK_COMMIT_TAIL_SLOW, EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY, EVENT_SET_DISK_WRITE, EXPIRES, Error, EventArgs,
+    EventName, FastLockGuard, FileInfo, FileInfoVersions, GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+    GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY,
+    GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX,
+    GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE,
+    GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION, GET_STAGE_READER_SETUP,
+    GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision, GetObjectReader,
+    HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
     ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
     PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
-    SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD,
-    X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE, adaptive_duplex_buffer_size,
+    SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
     build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
     check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
     classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
@@ -1871,9 +1871,9 @@ mod duration_metrics_tests {
 }
 
 fn is_restore_control_metadata(key: &str) -> bool {
-    key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str())
-        || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS)
-        || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE)
+    key.eq_ignore_ascii_case(metadata_keys::RESTORE)
+        || key.eq_ignore_ascii_case(metadata_keys::RESTORE_EXPIRY_DAYS)
+        || key.eq_ignore_ascii_case(metadata_keys::RESTORE_REQUEST_DATE)
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_OPERATION_ID)
             .is_some_and(|remainder| remainder.is_empty())
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_WORKER_LOCK)
@@ -1901,6 +1901,43 @@ fn restore_metadata_update_preserves_protected_metadata(
 mod restore_metadata_update_tests {
     use super::*;
 
+    /// The restore keys in pre-`metadata_keys` xl.meta are exactly the ones
+    /// a restore metadata update may change; every other persisted key is
+    /// protected (backlog#1735 A3b).
+    #[test]
+    fn pre_module_xlmeta_restore_keys_are_the_restore_control_keys() {
+        let fi = rustfs_filemeta::FileMeta::load(
+            &rustfs_filemeta::test_data::create_pre_metadata_keys_xlmeta().expect("decode fixture hex"),
+        )
+        .expect("load fixture xl.meta")
+        .into_fileinfo("bucket", "object", "0b1e5a3a-1735-4a3a-8000-00000000a3a0", false, false, false)
+        .expect("fixture version to FileInfo");
+
+        let mut control: Vec<&str> = fi
+            .metadata
+            .keys()
+            .map(String::as_str)
+            .filter(|key| is_restore_control_metadata(key))
+            .collect();
+        control.sort_unstable();
+        assert_eq!(
+            control,
+            ["X-Amz-Restore-Expiry-Days", "X-Amz-Restore-Request-Date", "x-amz-restore"],
+            "restore control keys in the pre-module bytes"
+        );
+        for key in [
+            metadata_keys::OBJECT_LOCK_LEGAL_HOLD,
+            metadata_keys::OBJECT_LOCK_MODE,
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE,
+            metadata_keys::SERVER_SIDE_ENCRYPTION,
+            metadata_keys::STORAGE_CLASS,
+            metadata_keys::REPLICATION_STATUS,
+        ] {
+            assert!(fi.metadata.contains_key(key), "{key:?}");
+            assert!(!is_restore_control_metadata(key), "{key:?} must stay protected");
+        }
+    }
+
     #[test]
     fn restore_metadata_update_cannot_change_retention_or_user_metadata() {
         let mut existing = HashMap::from([
@@ -1909,7 +1946,7 @@ mod restore_metadata_update_tests {
             ("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string()),
         ]);
         let mut replacement = existing.clone();
-        replacement.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        replacement.insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
         rustfs_utils::http::metadata_compat::insert_str(
             &mut replacement,
             SUFFIX_RESTORE_OPERATION_ID,
@@ -1929,9 +1966,9 @@ mod restore_metadata_update_tests {
         replacement.insert("x-amz-meta-owner".to_string(), "mallory".to_string());
         assert!(!restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
 
-        existing.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+        existing.insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"false\"".to_string());
         replacement.clone_from(&existing);
-        replacement.remove(X_AMZ_RESTORE.as_str());
+        replacement.remove(metadata_keys::RESTORE);
         assert!(restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
     }
 }
@@ -3201,9 +3238,7 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
     existing: &HashMap<String, String>,
     opts: &ObjectOptions,
 ) -> bool {
-    use rustfs_utils::http::headers::{
-        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING,
-    };
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
     use rustfs_utils::http::metadata_compat::{
         SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
         remove_str,
@@ -3215,12 +3250,12 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
         (
             opts.replication_retention_timestamp,
             SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
-            &[AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER],
+            &[metadata_keys::OBJECT_LOCK_MODE, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE],
         ),
         (
             opts.replication_legalhold_timestamp,
             SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-            &[AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER],
+            &[metadata_keys::OBJECT_LOCK_LEGAL_HOLD],
         ),
     ];
 
@@ -3528,7 +3563,7 @@ impl SetDisks {
             self.pool_index,
             disks.len(),
             self.default_parity_count,
-            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
             opts.max_parity,
         )?;
 
@@ -3805,10 +3840,10 @@ impl SetDisks {
                 fi.checksum = Some(content_hash.to_bytes(&[]));
             }
 
-            if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            if let Some(sc) = user_defined.get(metadata_keys::STORAGE_CLASS)
                 && sc == storageclass::STANDARD
             {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+                let _ = user_defined.remove(metadata_keys::STORAGE_CLASS);
             }
 
             let mod_time = opts.mod_time;
@@ -7815,7 +7850,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             && src_info
                 .user_defined
                 .keys()
-                .any(|key| key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str()))
+                .any(|key| key.eq_ignore_ascii_case(metadata_keys::RESTORE))
             && restore_metadata_update_preserves_protected_metadata(&fi.metadata, src_info.user_defined.as_ref());
         if let Some(dst_version_id) = dst_opts.version_id.as_deref()
             && !is_meta_bucketname(dst_bucket)
@@ -9424,9 +9459,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             CONTENT_DISPOSITION,
             CACHE_CONTROL,
             EXPIRES,
-            X_AMZ_OBJECT_LOCK_MODE.as_str(),
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
-            X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
+            metadata_keys::OBJECT_LOCK_MODE,
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE,
+            metadata_keys::OBJECT_LOCK_LEGAL_HOLD,
         ] {
             if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
                 transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
@@ -9874,7 +9909,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             let mut restore_commit_metadata = if let Some(expected_operation_id) = expected_operation_id {
                 let mut metadata = HashMap::new();
-                metadata.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+                metadata.insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"false\"".to_string());
                 rustfs_utils::http::metadata_compat::insert_str(
                     &mut metadata,
                     SUFFIX_RESTORE_OPERATION_ID,
@@ -10861,9 +10896,7 @@ mod replication_lww_tests {
 
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use rustfs_utils::http::headers::{
-        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING,
-    };
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
     use rustfs_utils::http::{
         SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
         insert_str,
@@ -11041,8 +11074,11 @@ mod replication_lww_tests {
         let mut inbound = HashMap::new();
         inbound.insert(AMZ_OBJECT_TAGGING.to_string(), "site=remote".to_string());
         insert_str(&mut inbound, SUFFIX_TAGGING_TIMESTAMP, T_OLD.to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2028-01-01T00:00:00Z".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2028-01-01T00:00:00Z".to_string(),
+        );
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_NEW.to_string());
         let opts = ObjectOptions {
             replication_request: true,
@@ -11055,7 +11091,7 @@ mod replication_lww_tests {
         let info = version_info(&set_disks, bucket, object, &version_id).await;
         assert_eq!(info.user_tags.as_str(), "site=local", "the stale tagging category must keep local values");
         assert_eq!(
-            info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            info.user_defined.get(metadata_keys::OBJECT_LOCK_MODE).map(String::as_str),
             Some("COMPLIANCE"),
             "the newer retention category must be applied in the same write"
         );
@@ -11075,12 +11111,12 @@ mod replication_lww_tests {
         // LWW-reachable divergence is a stale inbound ON resurrecting a hold
         // that was released more recently on this site.)
         let mut local = HashMap::new();
-        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        local.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string());
         insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_LOCAL.to_string());
         put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
 
         let mut inbound = HashMap::new();
-        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_string());
         let opts = ObjectOptions {
             replication_request: true,
@@ -11091,7 +11127,9 @@ mod replication_lww_tests {
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
         assert_eq!(
-            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
             Some("OFF"),
             "a stale inbound legal hold must not resurrect a hold released more recently"
         );
@@ -11151,8 +11189,11 @@ mod replication_lww_tests {
         // path's eval_metadata stomped the metadata key with receiver-now
         // (simulated by T_NEW here).
         let mut inbound = HashMap::new();
-        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2028-01-01T00:00:00Z".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string());
+        inbound.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2028-01-01T00:00:00Z".to_string(),
+        );
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_NEW.to_string());
         let opts = ObjectOptions {
             replication_request: true,
@@ -11167,7 +11208,10 @@ mod replication_lww_tests {
             Some(T_LOCAL),
             "the stored category timestamp must be the source-authored time, not the receiver's clock"
         );
-        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+        assert_eq!(
+            info.user_defined.get(metadata_keys::OBJECT_LOCK_MODE).map(String::as_str),
+            Some("GOVERNANCE")
+        );
     }
 
     #[tokio::test]
@@ -11179,7 +11223,7 @@ mod replication_lww_tests {
         make_bucket(&disk_stores, bucket).await;
 
         let mut inbound = HashMap::new();
-        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string());
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_string());
         let mut evaluated = inbound.clone();
         insert_str(&mut evaluated, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_NEW.to_string());
@@ -11233,10 +11277,13 @@ mod replication_lww_tests {
     /// plus an active COMPLIANCE retention (no retention timestamp).
     async fn seed_locked_version(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str, hold_timestamp: &str) {
         let mut local = HashMap::new();
-        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
+        local.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
         insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, hold_timestamp.to_string());
-        local.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
-        local.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        local.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+        local.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2099-01-01T00:00:00Z".to_string(),
+        );
         put_version(set_disks, bucket, object, version_id, &versioned_opts(version_id, local)).await;
     }
 
@@ -11245,10 +11292,13 @@ mod replication_lww_tests {
     /// category the source version has.
     fn inbound_legal_hold_release_opts(version_id: &str, timestamp: &str) -> ObjectOptions {
         let mut inbound = HashMap::new();
-        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string());
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, timestamp.to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2099-01-01T00:00:00Z".to_string(),
+        );
         insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_string());
         ObjectOptions {
             replication_request: true,
@@ -11282,13 +11332,15 @@ mod replication_lww_tests {
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
         assert_eq!(
-            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
             Some("OFF"),
             "a newer source-side legal hold release must be applied to the locked replica"
         );
         assert_eq!(get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(), Some(T_NEW));
         assert_eq!(
-            info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            info.user_defined.get(metadata_keys::OBJECT_LOCK_MODE).map(String::as_str),
             Some("COMPLIANCE"),
             "the untouched retention category must survive the write"
         );
@@ -11316,7 +11368,9 @@ mod replication_lww_tests {
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
         assert_eq!(
-            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
             Some("ON"),
             "a stale inbound release must not lift a hold applied more recently on this site"
         );
@@ -11342,8 +11396,11 @@ mod replication_lww_tests {
         let mut inbound = HashMap::new();
         inbound.insert(AMZ_OBJECT_TAGGING.to_string(), "k=v".to_string());
         insert_str(&mut inbound, SUFFIX_TAGGING_TIMESTAMP, T_NEW.to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
-        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        inbound.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+            "2099-01-01T00:00:00Z".to_string(),
+        );
         let opts = ObjectOptions {
             replication_request: true,
             replication_tagging_timestamp: Some(parse_ts(T_NEW)),
@@ -11359,7 +11416,12 @@ mod replication_lww_tests {
         assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
-        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
+        assert_eq!(
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
+            Some("ON")
+        );
     }
 
     fn default_retention_snapshot(mode: &'static str) -> Arc<ObjectLockConfigSnapshot> {
@@ -11397,7 +11459,7 @@ mod replication_lww_tests {
             seed_local_tagged_version(&set_disks, bucket, object, &version_id).await;
             let seeded = version_info(&set_disks, bucket, object, &version_id).await;
             assert!(
-                !seeded.user_defined.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER),
+                !seeded.user_defined.contains_key(metadata_keys::OBJECT_LOCK_MODE),
                 "the seeded version must be protected by the bucket default only"
             );
 
@@ -11442,7 +11504,7 @@ mod replication_lww_tests {
         let version_id = Uuid::new_v4().to_string();
         make_bucket(&disk_stores, bucket).await;
         let mut local = HashMap::new();
-        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "MAYBE".to_string());
+        local.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "MAYBE".to_string());
         put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
 
         let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
@@ -11453,7 +11515,12 @@ mod replication_lww_tests {
         assert!(!matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
-        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("MAYBE"));
+        assert_eq!(
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
+            Some("MAYBE")
+        );
     }
 
     /// The bypass is scoped to authorized replication writes: the same
@@ -11479,7 +11546,12 @@ mod replication_lww_tests {
         assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
-        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
+        assert_eq!(
+            info.user_defined
+                .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                .map(String::as_str),
+            Some("ON")
+        );
     }
 }
 
@@ -13411,7 +13483,10 @@ mod transition_commit_failure_tests {
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
             rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
         );
-        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
+        metadata.insert(
+            rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+            format!("ongoing-request=\"{ongoing}\""),
+        );
         metadata
     }
 
@@ -13604,7 +13679,7 @@ mod transition_commit_failure_tests {
                 .await
                 .expect("failed restore cleanup should leave the transitioned object readable");
             assert!(
-                !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                !cleaned.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE),
                 "{point:?}: every post-snapshot failure must clean the public ongoing marker"
             );
             assert!(
@@ -13680,7 +13755,7 @@ mod transition_commit_failure_tests {
         );
         let restore_header = restored
             .user_defined
-            .get(s3s::header::X_AMZ_RESTORE.as_str())
+            .get(rustfs_filemeta::metadata_keys::RESTORE)
             .expect("successful multipart restore must persist restore status");
         let restore_status = parse_restore_obj_status(restore_header).expect("successful restore status must be valid");
         assert!(!restore_status.on_going(), "successful multipart restore must not remain in progress");
@@ -14166,7 +14241,7 @@ mod transition_commit_failure_tests {
             }
             return;
         }
-        assert!(!cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()));
+        assert!(!cleaned.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE));
         assert!(
             rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID,)
                 .is_none()
@@ -14272,7 +14347,7 @@ mod transition_commit_failure_tests {
             assert_eq!(restored.version_id, Some(version_id), "restore must preserve the selected {case} version");
             let restore_header = restored
                 .user_defined
-                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .get(rustfs_filemeta::metadata_keys::RESTORE)
                 .expect("restored version must carry its completed restore status");
             let restore_status = parse_restore_obj_status(restore_header).expect("restore status must be valid");
             assert!(!restore_status.on_going(), "restored {case} version must not remain in progress");
@@ -14932,7 +15007,7 @@ mod transition_commit_failure_tests {
         assert!(
             current_operation_b
                 .user_defined
-                .contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                .contains_key(rustfs_filemeta::metadata_keys::RESTORE),
             "stale cleanup for operation A must not remove operation B's restore header"
         );
         assert_eq!(
@@ -14967,7 +15042,7 @@ mod transition_commit_failure_tests {
             .await
             .expect("cleaned object metadata should remain readable");
         assert!(
-            !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            !cleaned.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE),
             "matching cleanup must remove the restore header"
         );
         assert!(
@@ -15036,7 +15111,7 @@ mod transition_commit_failure_tests {
         let restore_status = parse_restore_obj_status(
             current
                 .user_defined
-                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .get(rustfs_filemeta::metadata_keys::RESTORE)
                 .expect("restore header must remain pending"),
         )
         .expect("restore header should remain parseable");
@@ -15100,7 +15175,7 @@ mod transition_commit_failure_tests {
             .await
             .expect("restore metadata should remain readable");
         assert!(
-            current.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            current.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE),
             "lost no_lock cleanup must not remove the restore header"
         );
         assert_eq!(
@@ -15318,7 +15393,7 @@ mod transition_commit_failure_tests {
             parse_restore_obj_status(
                 current
                     .user_defined
-                    .get(s3s::header::X_AMZ_RESTORE.as_str())
+                    .get(rustfs_filemeta::metadata_keys::RESTORE)
                     .expect("operation B restore header should remain pending"),
             )
             .expect("operation B restore header should parse")
@@ -15986,7 +16061,7 @@ mod transition_upload_integrity_tests {
             rustfs_filemeta::parse_restore_obj_status(
                 current
                     .user_defined
-                    .get(s3s::header::X_AMZ_RESTORE.as_str())
+                    .get(rustfs_filemeta::metadata_keys::RESTORE)
                     .expect("pending restore header should remain"),
             )
             .expect("restore header should parse")
@@ -18078,10 +18153,14 @@ mod heterogeneous_pool_put_tests {
         let bucket = "put-cleanup-receipt-gate-off";
         let object = "object.bin";
         make_bucket(&disk_stores, bucket).await;
+        let opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
 
         let mut first_reader = PutObjReader::from_vec(large_payload(0x41));
         set_disks
-            .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+            .put_object(bucket, object, &mut first_reader, &opts)
             .await
             .expect("default-gate first PUT should commit");
         let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
@@ -18089,7 +18168,7 @@ mod heterogeneous_pool_put_tests {
         let _fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
         let mut second_reader = PutObjReader::from_vec(large_payload(0x42));
         set_disks
-            .put_object(bucket, object, &mut second_reader, &ObjectOptions::default())
+            .put_object(bucket, object, &mut second_reader, &opts)
             .await
             .expect("default-gate overwrite should commit");
 
@@ -20027,26 +20106,26 @@ mod put_object_tmp_cleanup_tests {
                 "compliance",
                 HashMap::from([
                     (
-                        X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
                         s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                     ),
-                    (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until.clone()),
+                    (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until.clone()),
                 ]),
             ),
             (
                 "governance",
                 HashMap::from([
                     (
-                        X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
                         s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
                     ),
-                    (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                    (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
                 ]),
             ),
             (
                 "legal-hold",
                 HashMap::from([(
-                    X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                     s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
                 )]),
             ),
@@ -20347,9 +20426,9 @@ mod put_object_tmp_cleanup_tests {
                 object,
                 &ObjectOptions {
                     eval_metadata: Some(HashMap::from([
-                        (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), String::new()),
-                        (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), String::new()),
-                        (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), String::new()),
+                        (metadata_keys::OBJECT_LOCK_MODE.to_string(), String::new()),
+                        (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), String::new()),
+                        (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), String::new()),
                     ])),
                     ..version_opts.clone()
                 },
@@ -20416,7 +20495,7 @@ mod put_object_tmp_cleanup_tests {
                     version_id: Some(destination_version.clone()),
                     versioned: true,
                     eval_metadata: Some(HashMap::from([(
-                        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                         s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
                     )])),
                     ..Default::default()
@@ -21377,11 +21456,11 @@ mod delete_objects_lock_gating_tests {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 30);
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until
                 .format(&time::format_description::well_known::Rfc3339)
                 .expect("retain-until date should format"),

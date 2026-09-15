@@ -22,9 +22,9 @@ use crate::server::rate_limit::{
     apply_throttle_headers, client_ip,
 };
 use crate::server::{
-    APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH,
-    HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX, RequestContextLayer, VERSION, build_health_response_parts,
-    collect_probe_readiness,
+    APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier,
+    HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX, RequestContextLayer, VERSION, build_health_response_parts,
+    collect_probe_readiness, console_prefix,
 };
 use crate::version::{self, build};
 use axum::{
@@ -83,7 +83,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.data))
+            .body(Body::from(rewrite_console_asset(path, file.data, crate::server::console_prefix())))
             .unwrap();
     }
 
@@ -95,7 +95,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             return Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", mime_type.to_string())
-                .body(Body::from(file.data))
+                .body(Body::from(rewrite_console_asset(&index_path, file.data, crate::server::console_prefix())))
                 .unwrap();
         }
     }
@@ -106,13 +106,68 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.data))
+            .body(Body::from(rewrite_console_asset(
+                "index.html",
+                file.data,
+                crate::server::console_prefix(),
+            )))
             .unwrap()
     } else {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(" 404 Not Found \n RustFS "))
             .unwrap()
+    }
+}
+
+// Next exports bake the base path into HTML, chunk loaders, and RSC text payloads.
+// Rewrite only path references, preserving external URLs such as the source repository.
+fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+
+    if prefix == crate::server::CONSOLE_PREFIX
+        || !matches!(
+            path.rsplit('.').next(),
+            Some("html" | "js" | "css" | "json" | "txt" | "webmanifest" | "svg")
+        )
+    {
+        return data;
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return data;
+    };
+    let mut rewritten = Cow::Borrowed(text);
+    let escaped_default = crate::server::CONSOLE_PREFIX.replace('/', "\\/");
+    let escaped_prefix = prefix.replace('/', "\\/");
+    for (source, target) in [
+        (crate::server::CONSOLE_PREFIX, prefix),
+        (escaped_default.as_str(), escaped_prefix.as_str()),
+    ] {
+        let mut output = String::new();
+        let mut copied = 0;
+        for (offset, _) in rewritten.match_indices(source) {
+            let end = offset + source.len();
+            let before = rewritten.as_bytes().get(offset.wrapping_sub(1)).copied();
+            let after = rewritten.as_bytes().get(end).copied();
+            let starts_path = before
+                .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'`' | b'(' | b'=' | b'}' | b'>'));
+            let ends_prefix = after.is_none_or(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'"' | b'\'' | b'`' | b'?' | b'#' | b')' | b'<')
+            });
+            if starts_path && ends_prefix {
+                output.push_str(&rewritten[copied..offset]);
+                output.push_str(target);
+                copied = end;
+            }
+        }
+        if copied != 0 {
+            output.push_str(&rewritten[copied..]);
+            rewritten = Cow::Owned(output);
+        }
+    }
+    match rewritten {
+        Cow::Borrowed(_) => data,
+        Cow::Owned(text) => Cow::Owned(text.into_bytes()),
     }
 }
 
@@ -468,7 +523,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
     matches!(path, FAVICON_PATH | APPLE_TOUCH_ICON_PATH | APPLE_TOUCH_ICON_PRECOMPOSED_PATH)
-        || has_path_prefix(path, CONSOLE_PREFIX)
+        || has_path_prefix(path, console_prefix())
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -487,34 +542,35 @@ fn setup_console_middleware_stack(
     rate_limit_rpm: u32,
     auth_timeout: u64,
 ) -> Router {
+    let console_prefix = console_prefix();
     let mut app = Router::new()
         .route(FAVICON_PATH, get(static_handler))
-        .route(&format!("{CONSOLE_PREFIX}{LICENSE}"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}{VERSION}"), get(version_handler))
-        .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
+        .route(&format!("{console_prefix}{LICENSE}"), get(license_handler))
+        .route(&format!("{console_prefix}{VERSION}"), get(version_handler))
+        .nest(console_prefix, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         app = app
-            .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+            .route(&format!("{console_prefix}{HEALTH_PREFIX}"), get(health_check).head(health_check))
             .route(
-                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
+                &format!("{console_prefix}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
                 get(health_check).head(health_check),
             )
-            .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
+            .route(&format!("{console_prefix}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
     } else {
         // Keep disabled health probes from falling through to the SPA fallback.
         app = app
             .route(
-                &format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+                &format!("{console_prefix}{HEALTH_PREFIX}"),
                 get(health_route_disabled).head(health_route_disabled),
             )
             .route(
-                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
+                &format!("{console_prefix}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
                 get(health_route_disabled).head(health_route_disabled),
             )
             .route(
-                &format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+                &format!("{console_prefix}{HEALTH_READY_PATH}"),
                 get(health_route_disabled).head(health_route_disabled),
             );
     }
@@ -624,7 +680,7 @@ async fn health_check(
     uri: Uri,
     server_ctx: Option<Extension<Arc<crate::runtime_sources::ServerContextSlot>>>,
 ) -> Response {
-    let probe = if uri.path().strip_prefix(CONSOLE_PREFIX) == Some(HEALTH_READY_PATH) {
+    let probe = if uri.path().strip_prefix(console_prefix()) == Some(HEALTH_READY_PATH) {
         HealthProbe::Readiness
     } else {
         HealthProbe::Liveness
@@ -786,6 +842,7 @@ pub(crate) fn make_console_server() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::CONSOLE_PREFIX;
     use axum::body::Body;
     use axum::routing::get;
     use http::{Request, StatusCode};
@@ -867,9 +924,14 @@ mod tests {
     async fn console_config_handler_serializes_admin_discovery_paths() {
         init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
 
-        let response = config_handler(Uri::from_static("http://127.0.0.1:9001/rustfs/console/api/v1/config"), HeaderMap::new())
-            .await
-            .into_response();
+        let response = config_handler(
+            format!("http://127.0.0.1:9001{CONSOLE_PREFIX}/api/v1/config")
+                .parse()
+                .expect("console URI"),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body();
@@ -889,7 +951,8 @@ mod tests {
 
     #[test]
     fn external_admin_paths_are_not_console_paths() {
-        assert!(is_console_path("/rustfs/console/"));
+        assert!(is_console_path(&format!("{CONSOLE_PREFIX}/")));
+        assert!(!is_console_path(&format!("{CONSOLE_PREFIX}-other/index.html")));
         assert!(is_console_path("/apple-touch-icon.png"));
         assert!(is_console_path("/apple-touch-icon-precomposed.png"));
         assert!(!is_console_path("/minio/admin/v3/info"));
@@ -1271,5 +1334,89 @@ mod tests {
         assert_eq!(value, serde_json::json!({ "licensed": false }));
         assert!(value.get("name").is_none());
         assert!(value.get("expired").is_none());
+    }
+}
+
+#[cfg(test)]
+mod console_asset_prefix_tests {
+    use super::rewrite_console_asset;
+    use crate::server::CONSOLE_PREFIX;
+    use std::borrow::Cow;
+
+    #[test]
+    fn rewrites_exported_assets_and_client_routes() {
+        let fixtures = [
+            (
+                "index.html",
+                r#"<script src="/rustfs/console/_next/app.js"></script>"#,
+                r#"<script src="/console/_next/app.js"></script>"#,
+            ),
+            (
+                "app.js",
+                r#"let base="/rustfs/console";fetch(`${host}/rustfs/console/version`)"#,
+                r#"let base="/console";fetch(`${host}/console/version`)"#,
+            ),
+            ("app.css", "url(/rustfs/console/logo.svg)", "url(/console/logo.svg)"),
+            (
+                "route.txt",
+                r#"2:I[1,["/rustfs/console/_next/app.js"],"default"]"#,
+                r#"2:I[1,["/console/_next/app.js"],"default"]"#,
+            ),
+            ("config.json", r#"{"url":"\/rustfs\/console\/login"}"#, r#"{"url":"\/console\/login"}"#),
+            ("site.webmanifest", r#"{"start_url":"/rustfs/console/"}"#, r#"{"start_url":"/console/"}"#),
+            (
+                "logo.svg",
+                r#"<image href="/rustfs/console/logo.png"/>"#,
+                r#"<image href="/console/logo.png"/>"#,
+            ),
+        ];
+        for (path, input, expected) in fixtures {
+            let input = input
+                .replace("/rustfs/console", CONSOLE_PREFIX)
+                .replace("\\/rustfs\\/console", &CONSOLE_PREFIX.replace('/', "\\/"));
+            assert_eq!(
+                rewrite_console_asset(path, Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
+                expected.as_bytes(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn restores_the_standard_path_from_an_oem_build() {
+        let input = format!(r#"<script src="{CONSOLE_PREFIX}/_next/app.js"></script>"#);
+        let output = rewrite_console_asset("index.html", Cow::Borrowed(input.as_bytes()), rustfs_config::DEFAULT_CONSOLE_PREFIX);
+        assert_eq!(output.as_ref(), br#"<script src="/rustfs/console/_next/app.js"></script>"#);
+    }
+
+    #[test]
+    fn preserves_unrelated_urls_paths_and_default_bytes() {
+        let input = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","{CONSOLE_PREFIX}/index.html"]"#
+        );
+        let expected = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","/console/index.html"]"#
+        );
+        assert_eq!(
+            rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
+            expected.as_bytes()
+        );
+        let unchanged = rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), CONSOLE_PREFIX);
+        assert!(matches!(unchanged, Cow::Borrowed(_)));
+        assert_eq!(unchanged.as_ref(), input.as_bytes());
+    }
+
+    #[test]
+    fn preserves_binary_invalid_utf8_and_text_without_paths() {
+        let invalid_utf8 = [b"\xff".as_slice(), CONSOLE_PREFIX.as_bytes()].concat();
+        for (path, bytes) in [
+            ("image.png", CONSOLE_PREFIX.as_bytes()),
+            ("app.js", invalid_utf8.as_slice()),
+            ("app.js", b"https://github.com/rustfs/console".as_slice()),
+        ] {
+            let output = rewrite_console_asset(path, Cow::Borrowed(bytes), "/console");
+            assert!(matches!(output, Cow::Borrowed(_)), "{path}");
+            assert_eq!(output.as_ref(), bytes);
+        }
     }
 }

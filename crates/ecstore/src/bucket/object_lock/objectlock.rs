@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use super::types::{LegalHoldStatus, ObjectLegalHold, ObjectRetention, RetentionMode};
-use rustfs_utils::http::headers::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-};
+use rustfs_filemeta::metadata_keys;
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description};
 
@@ -35,7 +33,7 @@ pub fn utc_now_ntp() -> OffsetDateTime {
 
 pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectRetention {
     // The persisted metadata keys are the lowercase wire header names.
-    let mode_str = meta.get(AMZ_OBJECT_LOCK_MODE_LOWER);
+    let mode_str = meta.get(metadata_keys::OBJECT_LOCK_MODE);
 
     let Some(mode_str) = mode_str else {
         return ObjectRetention::default();
@@ -46,7 +44,7 @@ pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectRetent
         return ObjectRetention::default();
     };
 
-    let till_str = meta.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
+    let till_str = meta.get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE);
 
     let retain_until_date =
         till_str.and_then(|s| OffsetDateTime::parse(s, &format_description::well_known::Iso8601::DEFAULT).ok());
@@ -58,7 +56,7 @@ pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectRetent
 }
 
 pub fn get_object_legalhold_meta(meta: &HashMap<String, String>) -> ObjectLegalHold {
-    let hold_str = meta.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
+    let hold_str = meta.get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD);
 
     ObjectLegalHold {
         status: hold_str.and_then(|s| parse_legalhold_status(s)),

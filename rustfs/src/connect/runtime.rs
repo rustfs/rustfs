@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{ClientError, ConnectClient, ConnectConfig, RotationAttempt};
 use super::config::HeartbeatConfig;
+use super::diagnostics::job_delivery::DiagnosticJobRuntime;
+use super::diagnostics::{
+    DiagnosticCollectionPolicy, DiagnosticReceipt, DiagnosticReceiptDelivery, DiagnosticReceiptSender, DiagnosticScheduleRuntime,
+    DiagnosticScheduleStatus, spawn_environment_schedule,
+};
 use super::heartbeat::{CoarseNodeSummary, Delivery, HeartbeatError, HeartbeatSender, HeartbeatStateStore, HeartbeatStatus};
 use super::inventory::{
     InventoryDelivery, InventoryError, InventorySchedule, InventorySender, InventorySnapshot, InventoryStateStore,
@@ -35,6 +40,9 @@ pub struct HeartbeatRuntime {
     shutdown: CancellationToken,
     status: watch::Receiver<HeartbeatStatus>,
     task: Option<JoinHandle<()>>,
+    diagnostic_status: watch::Receiver<DiagnosticScheduleStatus>,
+    diagnostic_task: Option<DiagnosticScheduleRuntime>,
+    diagnostic_receipt_task: Option<JoinHandle<()>>,
 }
 
 impl HeartbeatRuntime {
@@ -42,9 +50,19 @@ impl HeartbeatRuntime {
         self.status.clone()
     }
 
+    pub fn diagnostic_status(&self) -> watch::Receiver<DiagnosticScheduleStatus> {
+        self.diagnostic_status.clone()
+    }
+
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
         if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.diagnostic_task.take() {
+            task.shutdown().await;
+        }
+        if let Some(task) = self.diagnostic_receipt_task.take() {
             let _ = task.await;
         }
     }
@@ -111,20 +129,41 @@ where
         return Ok(None);
     }
     let sender = HeartbeatSender::new(config.clone())?;
+    let receipt_sender = DiagnosticReceiptSender::new(config.clone())?;
     let rotation = ConnectClient::new(ConnectConfig {
         endpoint: &config.endpoint,
         root_ca_pem: &config.root_ca_pem,
         timeout: config.schedule.timeout,
+        proxy: config.proxy.as_ref(),
     })
     .map_err(rotation_failure)?;
     let identity_store = config.identity_store.clone();
     let credential_store = config.credential_store.clone();
-    let store = HeartbeatStateStore::new(config.state_path.clone());
+    let diagnostic_job_runtime = DiagnosticJobRuntime::from_config(&config);
+    let store = HeartbeatStateStore::new(config.state_path.clone(), diagnostic_job_runtime.is_some());
     let lock = store.try_runtime_lock()?;
     let schedule = config.schedule;
+    let state_root = config.state_root().ok_or(HeartbeatError::StateConflict)?.to_path_buf();
     let shutdown = parent_shutdown.child_token();
     let task_shutdown = shutdown.clone();
     let (status_tx, status_rx) = watch::channel(HeartbeatStatus::Starting);
+    let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+    let diagnostic_task =
+        spawn_environment_schedule(&state_root, policy_rx, shutdown.clone()).map_err(|_| HeartbeatError::StateConflict)?;
+    let diagnostic_status = diagnostic_task.status();
+    let receipt_status = diagnostic_task.receipts();
+    let receipt_shutdown = shutdown.clone();
+    let retry_schedule = schedule;
+    let diagnostic_receipt_task = tokio::spawn(async move {
+        run_diagnostic_receipt_delivery(
+            receipt_sender,
+            receipt_status,
+            retry_schedule.initial_backoff,
+            retry_schedule.max_backoff,
+            receipt_shutdown,
+        )
+        .await;
+    });
     let task = tokio::spawn(async move {
         let _lock = lock;
         let mut backoff = schedule.initial_backoff;
@@ -178,11 +217,19 @@ where
                 None => break,
             };
             let delay = match delivery {
-                Delivery::Accepted { server_time } => {
+                Delivery::Accepted {
+                    server_time,
+                    diagnostic_collection_policy,
+                    diagnostic_job,
+                } => {
                     if let Err(error) = store.mark_accepted(&pending).await {
                         return failed(&status_tx, error);
                     }
                     backoff = schedule.initial_backoff;
+                    let _ = policy_tx.send(diagnostic_collection_policy);
+                    if let (Some(runtime), Some(job)) = (&diagnostic_job_runtime, diagnostic_job) {
+                        runtime.offer(*job, &task_shutdown);
+                    }
                     let _ = status_tx.send(HeartbeatStatus::Online { server_time });
                     schedule.cadence.saturating_add(jitter(schedule.jitter))
                 }
@@ -216,7 +263,58 @@ where
         shutdown,
         status: status_rx,
         task: Some(task),
+        diagnostic_status,
+        diagnostic_task: Some(diagnostic_task),
+        diagnostic_receipt_task: Some(diagnostic_receipt_task),
     }))
+}
+
+async fn run_diagnostic_receipt_delivery(
+    sender: DiagnosticReceiptSender,
+    mut receipts: watch::Receiver<Option<DiagnosticReceipt>>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    shutdown: CancellationToken,
+) {
+    let mut last_accepted = None;
+    let mut backoff = initial_backoff;
+    loop {
+        let Some(receipt) = receipts.borrow_and_update().clone() else {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                changed = receipts.changed() => if changed.is_err() { break; },
+            }
+            continue;
+        };
+        if last_accepted.as_deref() == Some(receipt.receipt_id.as_str()) {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                changed = receipts.changed() => if changed.is_err() { break; },
+            }
+            continue;
+        }
+        let delivery = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            delivery = sender.send(&receipt) => delivery,
+        };
+        match delivery {
+            Ok(DiagnosticReceiptDelivery::Accepted) => {
+                last_accepted = Some(receipt.receipt_id.clone());
+                backoff = initial_backoff;
+            }
+            Ok(DiagnosticReceiptDelivery::Retry { retry_after }) => {
+                let delay = retry_after.unwrap_or(backoff).clamp(initial_backoff, max_backoff);
+                backoff = backoff.saturating_mul(2).min(max_backoff);
+                if sleep_or_cancel(&shutdown, delay).await {
+                    break;
+                }
+            }
+            Ok(DiagnosticReceiptDelivery::AuthenticationStopped | DiagnosticReceiptDelivery::Rejected) | Err(_) => break,
+        }
+    }
 }
 
 pub fn spawn_inventory_runtime<F, Fut>(
@@ -394,6 +492,10 @@ fn rotation_failure(error: ClientError) -> HeartbeatError {
     match error {
         ClientError::Endpoint => HeartbeatError::Endpoint,
         ClientError::RootCertificate => HeartbeatError::RootCertificate,
+        ClientError::ProxyConfiguration(_) => HeartbeatError::ProxyConfiguration,
+        ClientError::ProxyAuthentication => HeartbeatError::ProxyAuthentication,
+        ClientError::ProxyRejected => HeartbeatError::ProxyRejected,
+        ClientError::TlsPeer => HeartbeatError::TlsPeer,
         ClientError::NotRegistered => HeartbeatError::NotRegistered,
         ClientError::IdentityMissing => HeartbeatError::IdentityMissing,
         ClientError::CredentialExpired | ClientError::CredentialNotYetValid => HeartbeatError::CredentialExpired,
@@ -418,6 +520,10 @@ pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
     match error {
         HeartbeatError::Endpoint => "connect_heartbeat_endpoint",
         HeartbeatError::RootCertificate => "connect_heartbeat_root_certificate",
+        HeartbeatError::ProxyConfiguration => "connect_heartbeat_proxy_configuration",
+        HeartbeatError::ProxyAuthentication => "connect_heartbeat_proxy_authentication",
+        HeartbeatError::ProxyRejected => "connect_heartbeat_proxy_rejected",
+        HeartbeatError::TlsPeer => "connect_heartbeat_tls_peer",
         HeartbeatError::Schedule => "connect_heartbeat_schedule",
         HeartbeatError::NotRegistered => "connect_heartbeat_not_registered",
         HeartbeatError::IdentityMissing => "connect_heartbeat_identity_missing",
@@ -547,6 +653,7 @@ mod tests {
         let (release_heartbeat, wait_for_release) = tokio::sync::oneshot::channel();
         let (inventory_stopped, stopped) = tokio::sync::oneshot::channel();
         let (_, heartbeat_status) = watch::channel(HeartbeatStatus::Starting);
+        let (_, diagnostic_status) = watch::channel(DiagnosticScheduleStatus::Waiting);
         let (_, inventory_status) = watch::channel(InventoryStatus::Starting);
         let heartbeat_task = tokio::spawn(async move {
             let _ = wait_for_release.await;
@@ -560,6 +667,9 @@ mod tests {
             shutdown: heartbeat_shutdown,
             status: heartbeat_status,
             task: Some(heartbeat_task),
+            diagnostic_status,
+            diagnostic_task: None,
+            diagnostic_receipt_task: None,
         };
         let inventory = InventoryRuntime {
             shutdown: inventory_shutdown,

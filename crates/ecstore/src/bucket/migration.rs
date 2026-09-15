@@ -20,7 +20,7 @@ use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET}
 use crate::error::{Error, Result, is_err_strict_not_found, is_err_strict_volume_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{
-    bucket::{BucketOperations, BucketOptions},
+    bucket::{BucketInfo, BucketOperations, BucketOptions},
     list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
     range::HTTPRangeSpec,
@@ -382,22 +382,19 @@ where
             DeletedObject = DeletedObject,
         >,
 {
-    // Older peers abort walk_dir streams when the legacy volume is absent,
-    // which loses the typed not-found error before listing quorum resolution.
-    // Stat the namespace first; only a confirmed missing volume skips migration.
-    match store
-        .get_bucket_info(
-            MIGRATING_META_BUCKET,
-            &BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(err) if is_err_strict_volume_not_found(&err) => return Ok(()),
-        Err(err) => return Err(err),
+    if !legacy_iam_source_exists(
+        store
+            .get_bucket_info(
+                MIGRATING_META_BUCKET,
+                &BucketOptions {
+                    no_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .await,
+    )? {
+        debug!("No legacy IAM volume found");
+        return Ok(());
     }
 
     let opts = ObjectOptions {
@@ -477,6 +474,14 @@ where
     Ok(())
 }
 
+fn legacy_iam_source_exists(result: Result<BucketInfo>) -> Result<bool> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(error) if is_err_strict_volume_not_found(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn next_iam_migration_page(truncated: bool, previous: Option<String>, next: Option<String>) -> Result<Option<String>> {
     if !truncated {
         return Ok(None);
@@ -490,6 +495,18 @@ fn next_iam_migration_page(truncated: bool, previous: Option<String>, next: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_iam_source_probe_skips_only_an_absent_volume() {
+        use super::{BucketInfo, Error, legacy_iam_source_exists};
+
+        assert!(!legacy_iam_source_exists(Err(Error::VolumeNotFound)).expect("absent legacy volume is a no-op"));
+        assert!(legacy_iam_source_exists(Ok(BucketInfo::default())).expect("existing legacy volume must be migrated"));
+        assert!(matches!(
+            legacy_iam_source_exists(Err(Error::ErasureReadQuorum)),
+            Err(Error::ErasureReadQuorum)
+        ));
+    }
+
     #[test]
     fn migration_errors_group_by_cause_and_retain_typed_record_context() {
         use super::{Error, MigrationMetadataError};

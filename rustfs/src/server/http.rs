@@ -26,7 +26,7 @@ use crate::server::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
         ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
         PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
-        StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     ssec_transport::SsecTransportLayer,
@@ -57,10 +57,14 @@ use hyper_util::{
 use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
-use rustfs_common::GlobalReadiness;
+use rustfs_common::{
+    GlobalReadiness,
+    trace_bus::{TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit},
+};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
+    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
@@ -84,7 +88,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::service::Routes;
@@ -258,6 +262,93 @@ struct RpcRequestPathService<S> {
     inner: S,
 }
 
+struct RpcCompletionBody<B> {
+    inner: B,
+    started_at: Instant,
+    header_status: Option<TelemetryTraceStatus>,
+    complete: bool,
+}
+
+impl<B> RpcCompletionBody<B> {
+    fn new(inner: B, started_at: Instant, header_status: Option<TelemetryTraceStatus>) -> Self {
+        Self {
+            inner,
+            started_at,
+            header_status,
+            complete: false,
+        }
+    }
+
+    fn complete(&mut self, status: TelemetryTraceStatus) {
+        if self.complete {
+            return;
+        }
+        self.complete = true;
+        telemetry_trace_emit(|| {
+            TelemetryTraceEvent::new(TelemetryTraceOperation::InternalRpc, self.started_at.elapsed(), status)
+        });
+    }
+}
+
+impl<B> http_body::Body for RpcCompletionBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn is_end_stream(&self) -> bool {
+        self.complete || self.inner.is_end_stream()
+    }
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    let status = grpc_telemetry_status(trailers).unwrap_or(TelemetryTraceStatus::Error);
+                    self.complete(status);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.complete(TelemetryTraceStatus::Error);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                let status = self.header_status.unwrap_or(TelemetryTraceStatus::Error);
+                self.complete(status);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for RpcCompletionBody<B> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.complete(self.header_status.unwrap_or(TelemetryTraceStatus::Error));
+        }
+    }
+}
+
+fn grpc_telemetry_status(headers: &HeaderMap) -> Option<TelemetryTraceStatus> {
+    headers.get("grpc-status").map(|status| {
+        if status == "0" {
+            TelemetryTraceStatus::Ok
+        } else {
+            TelemetryTraceStatus::Error
+        }
+    })
+}
+
 impl<S> RpcRequestPathService<S> {
     fn new(inner: S) -> Self {
         Self { inner }
@@ -270,9 +361,9 @@ where
     S::Error: Send + 'static,
     S::Future: Send + 'static,
     B: Send + 'static,
-    ResBody: Send + 'static,
+    ResBody: http_body::Body<Data = Bytes> + Unpin + Send + 'static,
 {
-    type Response = Response<ResBody>;
+    type Response = Response<RpcCompletionBody<ResBody>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -281,6 +372,7 @@ where
     }
 
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let started_at = Instant::now();
         let target = RpcRequestTarget {
             uri: req.uri().clone(),
             method: req.method().clone(),
@@ -300,7 +392,10 @@ where
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
-            Ok(response)
+            let header_status = grpc_telemetry_status(response.headers());
+            let (parts, body) = response.into_parts();
+            let tracked = RpcCompletionBody::new(body, started_at, header_status);
+            Ok(Response::from_parts(parts, tracked))
         })
     }
 }
@@ -963,6 +1058,7 @@ pub async fn start_http_server(
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<(ShutdownHandle, SocketAddr)> {
+    crate::server::init_console_prefix()?;
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
 
     // The listening address and port are obtained from the parameters
@@ -1210,6 +1306,7 @@ pub async fn start_http_server(
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
         admin::console::init_console_cfg(local_ip, local_port);
+        let console_prefix = crate::server::console_prefix();
 
         info!(
             target: "rustfs::console::startup",
@@ -1217,7 +1314,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console",
-            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"),
+            endpoint = %format!("{protocol}://{local_ip_str}:{local_port}{console_prefix}/index.html"),
             "Startup endpoint available"
         );
         info!(
@@ -1226,7 +1323,7 @@ pub async fn start_http_server(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             service = "console_localhost",
-            endpoint = %format!("{protocol}://127.0.0.1:{local_port}/rustfs/console/index.html"),
+            endpoint = %format!("{protocol}://127.0.0.1:{local_port}{console_prefix}/index.html"),
             "Startup endpoint available"
         );
     } else {
@@ -1940,6 +2037,7 @@ fn process_connection(
         // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -2059,6 +2157,7 @@ fn process_connection(
                 ))
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .layer(DoubleSlashListBucketsCompatLayer)
+                .layer(SigV4HeaderGuardLayer)
                 .service(service)
         };
         let build_internode_stack = |service| {
@@ -2327,6 +2426,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
             "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
             "WriteAll" => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            "CompareAndUpdateFile" => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
             _ => INTERNODE_OPERATION_GRPC_OTHER,
         };
         global_internode_metrics().record_rpc_auth_failure_for_operation_and_backend(
@@ -3434,6 +3534,49 @@ mod tests {
         assert_eq!(captured.uri.path(), expected_path);
         assert_eq!(captured.uri.authority().map(|authority| authority.as_str()), Some("node-a:9000"));
         assert_eq!(captured.method, Method::POST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_completion_waits_for_the_grpc_stream_trailer() {
+        use http_body_util::StreamBody;
+        use rustfs_common::trace_bus::subscribe_telemetry_trace_events;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let mut subscription = subscribe_telemetry_trace_events();
+        let (tx, rx) = mpsc::channel::<std::result::Result<Frame<Bytes>, Infallible>>(2);
+        let mut body = RpcCompletionBody::new(StreamBody::new(ReceiverStream::new(rx)), Instant::now(), None);
+
+        tx.send(Ok(Frame::data(Bytes::from_static(b"rpc-data"))))
+            .await
+            .expect("response data frame should send");
+        let frame = body
+            .frame()
+            .await
+            .expect("response data frame")
+            .expect("response body should remain valid");
+        assert!(frame.is_data());
+        assert!(matches!(subscription.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        tx.send(Ok(Frame::trailers(trailers)))
+            .await
+            .expect("response trailer should send");
+        let frame = body
+            .frame()
+            .await
+            .expect("response trailer frame")
+            .expect("response body should remain valid");
+        assert!(frame.is_trailers());
+
+        let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("RPC completion event should arrive")
+            .expect("telemetry source should remain open");
+        assert_eq!(event.operation, TelemetryTraceOperation::InternalRpc);
+        assert_eq!(event.status, TelemetryTraceStatus::Ok);
+        assert!(event.duration > Duration::ZERO);
     }
 
     #[tokio::test]
