@@ -4431,7 +4431,7 @@ mod tests {
         assert_gated!(
             delete_retired_marker,
             DeleteVersionRequest {
-                bucket_incarnation_id: Default::default(),
+                bucket_incarnation_id: vec![1; 16].into(),
                 disk: disk.clone(),
                 volume: "v".into(),
                 path: "p".into(),
