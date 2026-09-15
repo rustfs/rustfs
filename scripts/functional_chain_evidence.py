@@ -101,10 +101,65 @@ def record(chain, suite, report, output):
         result["valid"] = True
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         error = exc
+        result["error"] = str(exc)
     output.parent.mkdir(parents=True, exist_ok=False)
     output.write_text(json.dumps(result, sort_keys=True) + "\n")
+    # A failed validation may still produce fresh diagnostics. A failed write
+    # or directory collision must never authorize uploading a leftover file.
+    with open(os.environ["GITHUB_OUTPUT"], "a") as step_output:
+        step_output.write("written=true\n")
     if error:
         raise error
+
+
+def summarize(chain, directory, needs):
+    """Retain failed/missing lanes without granting complete-success evidence."""
+    lanes = []
+    for suite in SUITES:
+        lane = {"suite": suite, "result": needs.get(suite, {}).get("result", "missing"),
+                "evidence": None, "error": None}
+        try:
+            record = json.loads((directory / (suite + ".json")).read_text())
+            require(chain is not None and record.get("chain") == chain and record.get("suite") == suite,
+                    "suite evidence identity mismatch")
+            lane["evidence"] = record
+        except (OSError, ValueError, AttributeError) as error:
+            lane["error"] = str(error)
+        lanes.append(lane)
+    result = {"schema": 1, "chain": chain, "needs": needs, "lanes": lanes,
+              "complete": False, "error": None, "completed_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        require(chain is not None, "candidate preparation did not complete")
+        aggregate(chain, directory, {suite: value for suite, value in needs.items() if suite != "prepare"})
+        result["complete"] = True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def render_summary(result):
+    lines = ["# RustFS functional chain report", "",
+             "- All required suites passed with verified evidence: " + str(result["complete"]).lower(),
+             "- Preparation: " + result["needs"].get("prepare", {}).get("result", "missing")]
+    if result["chain"]:
+        chain = result["chain"]
+        manifest = chain["candidate"]["manifest"]
+        lines += [f"- Chain run / attempt: {chain['run_id']} / {chain['attempt']}",
+                  f"- Build run / attempt: {manifest['build_run_id']} / {manifest['build_run_attempt']}",
+                  f"- Source: {manifest.get('source_ref', 'main')} @ {manifest['source_sha']}",
+                  f"- Package SHA256: {manifest['package_sha256']}", f"- Test scripts: {chain['testing_sha']}"]
+    lines += ["", "| Suite | Job result | Evidence | PASS | FAIL | SKIP | UNSUPPORTED | RUNNING |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for lane in result["lanes"]:
+        record = lane["evidence"] or {}
+        counts = record.get("counts", {})
+        state = "valid" if record.get("valid") is True else ("invalid" if record else "missing")
+        values = [lane["suite"], lane["result"], state] + [str(counts.get(key, "—")) for key in
+                  ("PASS", "FAIL", "SKIP", "UNSUPPORTED", "RUNNING")]
+        lines.append("| " + " | ".join(values) + " |")
+    lines += ["", "Missing, skipped, cancelled or invalid evidence is NOT a passing test or proof of a fix.",
+              "See the suite artifacts for case results and diagnostics; this report does not replace the complete-success gate."]
+    return "\n".join(lines) + "\n"
 
 
 def aggregate(chain, directory, needs):
@@ -129,12 +184,21 @@ def validate_records(chain, records):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("consume", "record", "aggregate"))
+    parser.add_argument("mode", choices=("consume", "record", "aggregate", "summarize"))
     parser.add_argument("--suite", choices=SUITES)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--directory", type=Path)
     args = parser.parse_args()
+    if args.mode == "summarize":
+        chain = current_chain() if os.environ.get("CHAIN_MANIFEST") else None
+        result = summarize(chain, args.directory, json.loads(os.environ["CHAIN_NEEDS"]))
+        args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
+        args.output.with_suffix(".md").write_text(render_summary(result))
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                summary.write(render_summary(result))
+        return
     chain = current_chain()
     if args.mode == "consume":
         consume(chain)

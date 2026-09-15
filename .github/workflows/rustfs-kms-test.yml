@@ -249,10 +249,10 @@ jobs:
             echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
           EXISTING="$(gh issue list -R rustfs/backlog --state all \
             --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
+            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
           if [ -n "${EXISTING}" ]; then
             echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
             exit 0
@@ -393,7 +393,7 @@ jobs:
           --output "${RUNNER_TEMP}/chain-kms-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/kms.json"
 
       - name: Upload chain evidence
-        if: ${{ always() && steps.chain_record.outcome == 'success' }}
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: functional-chain-kms-${{ github.run_id }}-${{ github.run_attempt }}

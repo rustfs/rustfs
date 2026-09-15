@@ -94,6 +94,35 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["chain"], self.chain)
         self.assertEqual(len(result["suites"]), 10)
 
+    def test_failure_report_preserves_counts_without_weakening_success_gate(self):
+        path = self.directory / "s3.json"
+        record = json.loads(path.read_text())
+        record.update(valid=False, counts={**record["counts"], "FAIL": 2}, error="failed cases")
+        path.write_text(json.dumps(record))
+        needs = {**self.needs, "s3": {"result": "failure"}, "performance": {"result": "cancelled"}}
+        (self.directory / "performance.json").unlink()
+        result = evidence.summarize(self.chain, self.directory, needs)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["lanes"][1]["evidence"]["counts"]["FAIL"], 2)
+        self.assertEqual(result["lanes"][-1]["result"], "cancelled")
+        self.assertIsNone(result["lanes"][-1]["evidence"])
+        with self.assertRaises(ValueError):
+            evidence.aggregate(self.chain, self.directory, needs)
+
+    def test_preparation_failure_still_has_all_ten_lanes(self):
+        result = evidence.summarize(None, self.directory / "absent", {"prepare": {"result": "failure"}})
+        self.assertFalse(result["complete"])
+        self.assertEqual(len(result["lanes"]), 10)
+        self.assertIn("| performance | missing | missing |", evidence.render_summary(result))
+        self.assertIn("Preparation: failure", evidence.render_summary(result))
+
+    def test_malformed_or_cross_attempt_record_is_not_reused(self):
+        for payload in ("broken json", "[]", json.dumps({"suite": "s3", "chain": {"attempt": 9}})):
+            (self.directory / "s3.json").write_text(payload)
+            result = evidence.summarize(self.chain, self.directory, self.needs)
+            self.assertFalse(result["complete"])
+            self.assertIsNone(result["lanes"][1]["evidence"])
+
     def test_missing_failed_cancelled_or_skipped_lane_never_passes(self):
         for state in ("failure", "cancelled", "skipped", "pending"):
             with self.subTest(state=state), self.assertRaises(ValueError):
@@ -172,13 +201,31 @@ class EnvelopeTests(unittest.TestCase):
         report.write_text("| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n")
         for index, (key, status) in enumerate((("CHAIN_TEST_OUTCOME", "failure"), ("CHAIN_REPORT_OUTCOME", "failure"), ("CHAIN_JOB_STATUS", "cancelled"))):
             output = self.root / str(index) / "kms.json"
+            Path(self.env["GITHUB_OUTPUT"]).unlink(missing_ok=True)
             with mock.patch.dict(evidence.os.environ, {**self.env, key: status}), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40), self.assertRaises(ValueError):
                 evidence.record(self.chain, "kms", report, output)
             self.assertFalse(json.loads(output.read_text())["valid"])
+            self.assertIn("error", json.loads(output.read_text()))
+            self.assertEqual(Path(self.env["GITHUB_OUTPUT"]).read_text(), "written=true\n")
         output = self.root / "success" / "kms.json"
         with mock.patch.dict(evidence.os.environ, self.env), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40):
             evidence.record(self.chain, "kms", report, output)
         self.assertTrue(json.loads(output.read_text())["valid"])
+
+    def test_collision_or_failed_write_never_authorizes_evidence_upload(self):
+        report = self.root / "cases.md"
+        report.write_text("| Case | Status |\n| --- | --- |\n| KMS-1 | PASS |\n")
+        output = self.root / "stale" / "kms.json"
+        output.parent.mkdir()
+        output.write_text("OLD RUN EVIDENCE")
+        with mock.patch.dict(evidence.os.environ, self.env), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40):
+            with self.assertRaises(FileExistsError):
+                evidence.record(self.chain, "kms", report, output)
+            self.assertEqual(output.read_text(), "OLD RUN EVIDENCE")
+            self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+            with mock.patch.object(Path, "write_text", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                evidence.record(self.chain, "kms", report, self.root / "new" / "kms.json")
+            self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
 
     def test_unknown_status_cannot_hide_among_passing_cases(self):
         text = "| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n| KMS-2 | fixture | NOT RUN |\n"
@@ -198,6 +245,53 @@ class EnvelopeTests(unittest.TestCase):
         complete = "\n".join(yaml_block(lines, "complete-chain", 2))
         self.assertIn("needs: [prepare, " + ", ".join(evidence.SUITES) + "]", complete)
         self.assertIn("functional_chain_evidence.py aggregate", complete)
+        self.assertIn("functional_chain_evidence.py summarize", complete)
+        self.assertIn("functional-chain-report-", complete)
+        self.assertIn("needs.prepare.result != 'skipped'", complete)
+
+    def test_every_lane_retains_failed_evidence_and_deduplicates_its_own_attempt(self):
+        paths = list((candidate.ROOT / ".github/workflows").glob("rustfs-*-test.yml"))
+        lanes = [path for path in paths if "name: Upload chain evidence" in path.read_text()]
+        self.assertEqual(len(lanes), 10)
+        for path in lanes:
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertIn("if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", text)
+                self.assertIn("attempt ${GITHUB_RUN_ATTEMPT})", text)
+                self.assertIn('select(.title == \\"${TITLE}\\")', text)
+
+    def test_table_issue_manager_receives_outcome_and_case_evidence(self):
+        text = (candidate.ROOT / ".github/workflows/rustfs-table-test.yml").read_text()
+        self.assertIn("--outcome '${{ steps.test.outcome }}'", text)
+        self.assertIn('--report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"', text)
+
+    def test_pool_topology_is_checked_before_cleanup_with_four_node_defaults(self):
+        text = (candidate.ROOT / ".github/workflows/rustfs-pool-expand-test.yml").read_text()
+        self.assertIn("http://rustfs-node4:9000", text)
+        self.assertIn("vars.RUSTFS_NODES || 'vm000 vm001 vm002'", text)
+        self.assertLess(text.index("name: Validate pool topology"), text.index("name: Cleanup environment (before)"))
+        self.assertIn("steps.topology.outcome == 'success' && inputs.cleanup_after", text)
+
+
+class RunnerTests(unittest.TestCase):
+    def test_offline_or_missing_runner_fails_before_dispatch(self):
+        import check_functional_runners as runners
+        for inventory in ([], [{"status": "offline", "labels": [{"name": "pf-testing"}]}]):
+            with mock.patch.object(runners, "api", return_value={"runners": inventory}), self.assertRaisesRegex(ValueError, "pf-testing"):
+                runners.check(["pf-testing"])
+
+    def test_busy_online_runner_is_available_and_inventory_is_paginated(self):
+        import check_functional_runners as runners
+        pages = [{"runners": [{"status": "online", "labels": []}] * 100},
+                 {"runners": [{"status": "online", "busy": True, "labels": [{"name": "pf-testing"}]}]}]
+        with mock.patch.object(runners, "api", side_effect=pages) as api:
+            runners.check(["pf-testing"])
+        self.assertIn("page=2", api.call_args.args[0])
+
+    def test_unavailable_inventory_does_not_assume_online(self):
+        import check_functional_runners as runners
+        with mock.patch.object(runners, "api", side_effect=OSError("forbidden")), self.assertRaises(OSError):
+            runners.check(["pf-testing"])
 
 
 if __name__ == "__main__":

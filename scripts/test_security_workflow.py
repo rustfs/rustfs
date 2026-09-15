@@ -398,11 +398,17 @@ class FunctionalWorkflowTests(unittest.TestCase):
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
-                self.assertIn(condition, (
-                    "if: always()",
-                    "if: ${{ always() && inputs.cleanup_after != 'false' }}",
-                    "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
-                ))
+                if suite == "pool-expand":
+                    self.assertEqual(condition, "if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' }}")
+                    self.assertIn("        id: topology", steps["Validate pool topology before destructive cleanup"])
+                    self.assertLess(list(steps).index("Validate pool topology before destructive cleanup"),
+                                    list(steps).index("Cleanup environment (before)"))
+                else:
+                    self.assertIn(condition, (
+                        "if: always()",
+                        "if: ${{ always() && inputs.cleanup_after != 'false' }}",
+                        "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
+                    ))
                 if suite != "performance":
                     handoff = next(
                         value for name, value in steps.items() if name.startswith("Continue functional chain")
@@ -567,7 +573,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts"))
                 for name, lines in self.steps.items():
                     if name == "Upload chain evidence":
-                        self.assertIn("        if: ${{ always() && steps.chain_record.outcome == 'success' }}", lines)
+                        self.assertIn("        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", lines)
                         self.assertIn("        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}", self.steps["Record chain evidence"])
                         self.assertIn("          if-no-files-found: error", lines)
                         continue

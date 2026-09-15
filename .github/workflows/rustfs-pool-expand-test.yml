@@ -69,7 +69,7 @@ env:
   RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
   RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
   RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
-  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES || 'vm000 vm001 vm002' }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
   # Package used by the nightly run (workflow_dispatch inputs are empty for
@@ -89,7 +89,7 @@ jobs:
       RUSTFS_POOL_PROXY_ENDPOINT: http://127.0.0.1:19000
       RUSTFS_POOL_WARP_ENDPOINT: http://127.0.0.1:19000
       RUSTFS_SHARED_PROXY_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
-      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000' }}
+      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000 http://rustfs-node4:9000' }}
     steps:
       - name: Checkout chain tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -127,6 +127,17 @@ jobs:
           openssl version
           warp --version || true
           df -h /data | tail -1
+
+      - name: Validate pool topology before destructive cleanup
+        id: topology
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES}"
+          read -r -a ENDPOINTS <<< "${RUSTFS_POOL_NODE_ENDPOINTS}"
+          if [ "${#NODES[@]}" -lt 3 ] || [ "${#ENDPOINTS[@]}" -lt "${#NODES[@]}" ]; then
+            echo "Pool tests require at least three nodes and a direct endpoint for every node" >&2
+            exit 1
+          fi
 
       - name: Cleanup environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
@@ -581,10 +592,10 @@ jobs:
             echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
           EXISTING="$(gh issue list -R rustfs/backlog --state all \
             --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
+            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
           if [ -n "${EXISTING}" ]; then
             echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
             exit 0
@@ -643,7 +654,7 @@ jobs:
             ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
 
       - name: Cleanup environment (after)
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -731,7 +742,7 @@ jobs:
           --output "${RUNNER_TEMP}/chain-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/pool.json"
 
       - name: Upload chain evidence
-        if: ${{ always() && steps.chain_record.outcome == 'success' }}
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: functional-chain-pool-${{ github.run_id }}-${{ github.run_attempt }}
