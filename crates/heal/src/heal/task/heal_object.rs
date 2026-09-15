@@ -180,6 +180,9 @@ impl HealTask {
 
         match heal_result {
             Ok(storage_result) => {
+                if let Some(resolved_version_id) = storage_result.item.resolved_version_id {
+                    expected_identity.version_id = Some(Uuid::from_bytes(resolved_version_id).to_string());
+                }
                 let result = storage_result.item;
                 let error = storage_result.error;
                 if let Some(e) = error {

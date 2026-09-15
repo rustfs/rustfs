@@ -128,7 +128,7 @@ fn verified_object_receipt(
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
             object: object.to_string(),
-            version_id: version_id.map(ToOwned::to_owned),
+            version_id: Some(resolved_version.to_string()),
             bucket_incarnation_id: Some(bucket_incarnation_id),
             pool_index: opts.pool,
             set_index: opts.set,
@@ -1807,6 +1807,7 @@ mod tests {
         let incarnation = Uuid::new_v4();
         let null = Uuid::nil().to_string();
         let latest = Uuid::new_v4();
+        let latest_version = latest.to_string();
         let options = HealOpts::default();
         let mut item = HealResultItem {
             integrity_verified: true,
@@ -1824,16 +1825,20 @@ mod tests {
             verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation).is_none(),
             "echoing null cannot certify a different resolved version"
         );
-        assert!(
-            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_some(),
-            "an omitted selector still means latest"
-        );
-        assert!(verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation).is_some());
+        let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("an omitted selector still means latest");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
+        let receipt = verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation)
+            .expect("an empty selector still means latest");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
         assert!(
             verified_object_receipt("bucket", "object", Some("null"), &options, &item, incarnation).is_none(),
             "the internal boundary requires a UUID, not an S3 spelling"
         );
-        assert!(verified_object_receipt("bucket", "object", Some(&latest.to_string()), &options, &item, incarnation).is_some());
+        let requested_latest = latest_version.to_uppercase();
+        let receipt = verified_object_receipt("bucket", "object", Some(&requested_latest), &options, &item, incarnation)
+            .expect("the exact UUID selector should be certifiable");
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
 
         item.resolved_version_id = Some([0; 16]);
         let receipt = verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
