@@ -375,11 +375,13 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "kms-test", "storage": "storage-test", "s3-compat": "s3-compat-test",
         "upgrade": "upgrade-test", "replication": "replication-test", "heal": "heal-test",
         "tier": "tier-test", "pool-expand": "pool-expansion-test", "performance": "performance-test",
+        "table": "table-test",
     }
     DIRECT_TESTS = {
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
+        "table": "Run table suite",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
@@ -669,7 +671,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
     def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
         extra = {
             "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
-            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"],
             "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
                             "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
         }
