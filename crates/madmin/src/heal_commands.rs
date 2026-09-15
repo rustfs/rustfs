@@ -40,6 +40,11 @@ pub struct HealResultItem {
     /// or old-peer results default to unproven and cannot advance heal receipts.
     #[serde(skip)]
     pub integrity_verified: bool,
+    /// Storage-owner proof that a protected missing shard was reconstructed and
+    /// committed. This is intentionally in-process only and does not certify a
+    /// healthy or unchanged object.
+    #[serde(skip)]
+    pub repair_verified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]
@@ -113,6 +118,8 @@ mod tests {
         let mut wire = serde_json::to_value(&item).expect("heal result should serialize");
         assert!(wire.get("resolved_version_id").is_none());
         assert!(wire.get("resolvedVersionId").is_none());
+        assert!(wire.get("repair_verified").is_none());
+        assert!(wire.get("repairVerified").is_none());
         wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
         let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
         assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");

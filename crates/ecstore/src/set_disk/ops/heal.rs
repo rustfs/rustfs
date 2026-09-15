@@ -1732,6 +1732,17 @@ impl SetDisks {
                             return Ok((result, Some(error)));
                         }
 
+                        result.repair_verified = protected
+                            && !latest_meta.deleted
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && result.drives_healed().is_some_and(|healed| healed > 0)
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+
                         // The object is healthy here; sweep any data dirs left behind
                         // by pre-#3510 unversioned overwrites, which the dangling paths
                         // above never touch (issues #3231, #3191). Best effort — a
