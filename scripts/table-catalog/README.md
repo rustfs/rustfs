@@ -649,8 +649,8 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --cleanup
 ```
 
-The generated SQL covers namespace creation, table creation, append, refresh,
-count, and optional cleanup. Until Spark execution is enabled in CI through the
+The generated SQL covers namespace creation, atomic CTAS through the Iceberg
+REST staged-create flow, refresh, count, and optional cleanup. Until Spark execution is enabled in CI through the
 explicit live-conformance gate, do not claim Spark support beyond a manually
 verified run with the exact RustFS build, Spark version, Iceberg version, and
 expected output recorded.

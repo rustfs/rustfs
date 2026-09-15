@@ -136,8 +136,8 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
             "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
             "scenarios": [
                 scenario("create-namespace", "manual-live-harness", "CREATE NAMESPACE IF NOT EXISTS"),
-                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg"),
-                scenario("append", "manual-live-harness", "INSERT INTO"),
+                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg AS SELECT"),
+                scenario("staged-create", "manual-live-harness", "atomic CTAS through the REST staged-create flow"),
                 scenario("reload-table", "manual-live-harness", "REFRESH TABLE and SELECT COUNT"),
                 scenario("drop-table", "manual-live-harness", "DROP TABLE and optional DROP NAMESPACE"),
                 scenario("commit-conflict", "manual-validation-required", "requires a two-writer Spark or REST conflict harness"),
@@ -162,7 +162,7 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
                 scenario("catalog-attach", "automated", "attach `/iceberg` with s3 signing and `/_iceberg` with s3tables signing"),
                 scenario("read-table", "automated", "read a PyIceberg-created table through the attached catalog"),
                 scenario("write-table", "automated", "exercise single-table DDL, DML, schema evolution, snapshots, and PyIceberg cross-read"),
-                scenario("unsupported-boundaries", "automated", "verify staged create, purge, and format v3 fail closed"),
+                scenario("unsupported-boundaries", "automated", "verify purge and format v3 fail closed"),
                 scenario("multi-table-mode", "automated", "verify DuckDB can avoid the multi-table commit endpoint without claiming cross-table atomicity"),
             ],
         },
@@ -363,8 +363,8 @@ def spark_sql_smoke(
     statements = [
         f"CREATE NAMESPACE IF NOT EXISTS {namespace_identifier};",
         f"DROP TABLE IF EXISTS {table_identifier};",
-        f"CREATE TABLE {table_identifier} (id BIGINT, payload STRING) USING iceberg;",
-        f"INSERT INTO {table_identifier} VALUES (1, 'alpha'), (2, 'beta');",
+        f"CREATE TABLE {table_identifier} USING iceberg AS "
+        "SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta') AS source(id, payload);",
         f"REFRESH TABLE {table_identifier};",
         f"SELECT COUNT(*) AS row_count FROM {table_identifier};",
     ]
@@ -665,7 +665,7 @@ def live_conformance_evidence(
                     OrderedDict(
                         [
                             ("client", "Spark Iceberg REST catalog"),
-                            ("scenario", "create-namespace-create-table-append-refresh-count-cleanup"),
+                            ("scenario", "create-namespace-staged-ctas-refresh-count-cleanup"),
                             ("expected_status", "pass"),
                             ("expected_row_count", 2),
                             ("claim_after_pass", "manual-live-verified"),
