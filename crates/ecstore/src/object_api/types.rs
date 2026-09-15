@@ -2105,6 +2105,18 @@ impl ObjectInfo {
         let mut prev_prefix = "";
         for entry in entries.entries() {
             if entry.is_object() {
+                let fi = match entry.to_fileinfo(bucket) {
+                    Ok(res) => Some(res),
+                    Err(err) => {
+                        warn!("file_info_versions err {:?}", err);
+                        None
+                    }
+                };
+
+                if fi.as_ref().is_some_and(|fi| !fi.version_purge_status().is_empty()) {
+                    continue;
+                }
+
                 if let Some(delimiter) = &delimiter {
                     let remaining = if entry.name.starts_with(prefix) {
                         &entry.name[prefix.len()..]
@@ -2131,15 +2143,10 @@ impl ObjectInfo {
                     }
                 }
 
-                let fi = match entry.to_fileinfo(bucket) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        warn!("file_info_versions err {:?}", err);
-                        continue;
-                    }
+                let Some(fi) = fi else {
+                    continue;
                 };
 
-                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 
@@ -2670,6 +2677,66 @@ mod tests {
                 .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
         );
         assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_hides_objects_pending_version_purge() {
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+        let object = "folder/object";
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: object.to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let list_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", None).await;
+        let delimiter_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        let public_versions = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_versions =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert!(
+            list_objects.is_empty(),
+            "ListObjectsV2 must not publish a key hidden from public versions"
+        );
+        assert!(
+            delimiter_objects.is_empty(),
+            "delimiter ListObjectsV2 must not synthesize a prefix from a hidden key"
+        );
+        assert!(
+            public_versions.is_empty(),
+            "public ListObjectVersions hides pending version-purge records"
+        );
+        assert_eq!(lifecycle_versions.len(), 1, "lifecycle cleanup still needs the pending purge record");
+        assert_eq!(lifecycle_versions[0].version_purge_status, VersionPurgeStatusType::Pending);
     }
 
     #[test]
