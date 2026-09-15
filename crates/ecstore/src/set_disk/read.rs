@@ -625,17 +625,6 @@ impl SetDisks {
         }
     }
 
-    #[hotpath::measure(impl_type = "SetDisks")]
-    pub(super) async fn get_object_info_and_quorum(
-        &self,
-        bucket: &str,
-        object: &str,
-        opts: &ObjectOptions,
-    ) -> (ObjectInfo, usize, Option<StorageError>) {
-        let (object_info, _, write_quorum, error) = self.get_object_info_fileinfo_and_quorum(bucket, object, opts).await;
-        (object_info, write_quorum, error)
-    }
-
     pub(super) async fn get_object_info_fileinfo_and_quorum(
         &self,
         bucket: &str,
@@ -2819,7 +2808,7 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    async fn get_object_info_and_quorum_maps_delete_marker_and_purge_states() {
+    async fn get_object_info_fileinfo_and_quorum_maps_delete_marker_and_purge_states() {
         let bucket = "get-object-info-marker-bucket";
         let (_dir, disk) = new_read_version_test_disk(bucket).await;
         let set = SetDisks::new(
@@ -2846,8 +2835,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "latest-delete-marker", latest_marker)
             .await
             .expect("latest marker metadata should be written");
-        let (_, _, latest_err) = set
-            .get_object_info_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
+        let (_, _, _, latest_err) = set
+            .get_object_info_fileinfo_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
             .await;
         assert!(
             matches!(latest_err, Some(StorageError::ObjectNotFound(_, _))),
@@ -2866,8 +2855,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "version-delete-marker", version_marker)
             .await
             .expect("version marker metadata should be written");
-        let (_, _, version_err) = set
-            .get_object_info_and_quorum(
+        let (_, _, _, version_err) = set
+            .get_object_info_fileinfo_and_quorum(
                 bucket,
                 "version-delete-marker",
                 &ObjectOptions {

@@ -15150,8 +15150,8 @@ mod tests {
             "a stale null-marker lifecycle target must not delete its replacement: {stale_errors:?}"
         );
 
-        let (current_marker, _, current_error) = set_disks
-            .get_object_info_and_quorum(
+        let (current_marker, _, _, current_error) = set_disks
+            .get_object_info_fileinfo_and_quorum(
                 bucket,
                 object,
                 &ObjectOptions {
