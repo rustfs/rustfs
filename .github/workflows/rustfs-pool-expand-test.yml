@@ -742,7 +742,7 @@ jobs:
           --output "${RUNNER_TEMP}/chain-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/pool.json"
 
       - name: Upload chain evidence
-        if: ${{ always() && (steps.chain_record.outcome == 'success' || steps.chain_record.outcome == 'failure') }}
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: functional-chain-pool-${{ github.run_id }}-${{ github.run_attempt }}

@@ -201,14 +201,31 @@ class EnvelopeTests(unittest.TestCase):
         report.write_text("| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n")
         for index, (key, status) in enumerate((("CHAIN_TEST_OUTCOME", "failure"), ("CHAIN_REPORT_OUTCOME", "failure"), ("CHAIN_JOB_STATUS", "cancelled"))):
             output = self.root / str(index) / "kms.json"
+            Path(self.env["GITHUB_OUTPUT"]).unlink(missing_ok=True)
             with mock.patch.dict(evidence.os.environ, {**self.env, key: status}), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40), self.assertRaises(ValueError):
                 evidence.record(self.chain, "kms", report, output)
             self.assertFalse(json.loads(output.read_text())["valid"])
             self.assertIn("error", json.loads(output.read_text()))
+            self.assertEqual(Path(self.env["GITHUB_OUTPUT"]).read_text(), "written=true\n")
         output = self.root / "success" / "kms.json"
         with mock.patch.dict(evidence.os.environ, self.env), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40):
             evidence.record(self.chain, "kms", report, output)
         self.assertTrue(json.loads(output.read_text())["valid"])
+
+    def test_collision_or_failed_write_never_authorizes_evidence_upload(self):
+        report = self.root / "cases.md"
+        report.write_text("| Case | Status |\n| --- | --- |\n| KMS-1 | PASS |\n")
+        output = self.root / "stale" / "kms.json"
+        output.parent.mkdir()
+        output.write_text("OLD RUN EVIDENCE")
+        with mock.patch.dict(evidence.os.environ, self.env), mock.patch.object(evidence.subprocess, "check_output", return_value="d" * 40):
+            with self.assertRaises(FileExistsError):
+                evidence.record(self.chain, "kms", report, output)
+            self.assertEqual(output.read_text(), "OLD RUN EVIDENCE")
+            self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+            with mock.patch.object(Path, "write_text", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                evidence.record(self.chain, "kms", report, self.root / "new" / "kms.json")
+            self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
 
     def test_unknown_status_cannot_hide_among_passing_cases(self):
         text = "| Case | Name | Status |\n| --- | --- | --- |\n| KMS-1 | fixture | PASS |\n| KMS-2 | fixture | NOT RUN |\n"
@@ -239,7 +256,7 @@ class EnvelopeTests(unittest.TestCase):
         for path in lanes:
             with self.subTest(path=path.name):
                 text = path.read_text()
-                self.assertIn("steps.chain_record.outcome == 'failure'", text)
+                self.assertIn("if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", text)
                 self.assertIn("attempt ${GITHUB_RUN_ATTEMPT})", text)
                 self.assertIn('select(.title == \\"${TITLE}\\")', text)
 

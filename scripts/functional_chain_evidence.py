@@ -104,6 +104,10 @@ def record(chain, suite, report, output):
         result["error"] = str(exc)
     output.parent.mkdir(parents=True, exist_ok=False)
     output.write_text(json.dumps(result, sort_keys=True) + "\n")
+    # A failed validation may still produce fresh diagnostics. A failed write
+    # or directory collision must never authorize uploading a leftover file.
+    with open(os.environ["GITHUB_OUTPUT"], "a") as step_output:
+        step_output.write("written=true\n")
     if error:
         raise error
 
