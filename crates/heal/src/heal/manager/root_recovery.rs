@@ -467,13 +467,11 @@ fn parse_quarantine_entry(entry: &str) -> Option<(RootHealRecordKind, &str)> {
         .and_then(|entry| entry.strip_suffix(".json"))
     {
         (RootHealRecordKind::Intent, suffix)
-    } else if let Some(suffix) = entry
-        .strip_prefix(ROOT_QUARANTINE_TERMINAL_PREFIX)
-        .and_then(|entry| entry.strip_suffix(".json"))
-    {
-        (RootHealRecordKind::Terminal, suffix)
     } else {
-        return None;
+        let suffix = entry
+            .strip_prefix(ROOT_QUARANTINE_TERMINAL_PREFIX)
+            .and_then(|entry| entry.strip_suffix(".json"))?;
+        (RootHealRecordKind::Terminal, suffix)
     };
     Uuid::parse_str(suffix).ok().filter(|id| id.to_string() == suffix)?;
     Some((record_kind, suffix))
@@ -647,15 +645,12 @@ impl RootHealRecovery {
             // read_all reports FileNotFound even when the whole metadata
             // volume is absent; that is an unknown owner, not empty state.
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
-            match read_bounded(disk, &path).await? {
-                Some(bytes) => {
-                    decode_intent(task_id, &bytes)?;
-                    if found.is_some() {
-                        return Err(Error::Other(format!("Multiple root heal recovery owners for {task_id}")));
-                    }
-                    found = Some((disk.clone(), bytes));
+            if let Some(bytes) = read_bounded(disk, &path).await? {
+                decode_intent(task_id, &bytes)?;
+                if found.is_some() {
+                    return Err(Error::Other(format!("Multiple root heal recovery owners for {task_id}")));
                 }
-                None => {}
+                found = Some((disk.clone(), bytes));
             }
         }
         Ok(found)
@@ -666,15 +661,12 @@ impl RootHealRecovery {
         let mut found = None;
         for disk in disks {
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
-            match read_bounded(disk, &path).await? {
-                Some(bytes) => {
-                    decode_terminal(task_id, &bytes)?;
-                    if found.is_some() {
-                        return Err(Error::Other(format!("Multiple root heal terminal owners for {task_id}")));
-                    }
-                    found = Some((disk.clone(), bytes));
+            if let Some(bytes) = read_bounded(disk, &path).await? {
+                decode_terminal(task_id, &bytes)?;
+                if found.is_some() {
+                    return Err(Error::Other(format!("Multiple root heal terminal owners for {task_id}")));
                 }
-                None => {}
+                found = Some((disk.clone(), bytes));
             }
         }
         Ok(found)
