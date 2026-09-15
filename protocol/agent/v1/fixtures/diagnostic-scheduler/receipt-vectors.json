@@ -1,0 +1,69 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "diagnostic-scheduler",
+  "classification": "L1",
+  "description": "Outbound-only diagnostic execution receipt ingestion. Connect binds the route to the authenticated device, retains exact replays, and rejects changed or expired claims.",
+  "fixture": "receipt-vectors",
+  "accepted": [
+    {
+      "id": "diagnostic-receipt.success",
+      "request": {
+        "protocolVersion": "v1",
+        "requestId": "123e4567-e89b-42d3-a456-426614174000",
+        "receiptId": "123e4567-e89b-42d3-a456-426614174000",
+        "policyRevision": 7,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:01Z",
+        "outcome": "SUCCEEDED",
+        "attemptCount": 1,
+        "reason": null,
+        "resultSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "resultBytes": 256
+      },
+      "expected": { "httpStatus": 200, "connectVisible": true }
+    },
+    {
+      "id": "diagnostic-receipt.failure-after-three-attempts",
+      "request": {
+        "protocolVersion": "v1",
+        "requestId": "123e4567-e89b-42d3-a456-426614174001",
+        "receiptId": "123e4567-e89b-42d3-a456-426614174001",
+        "policyRevision": 8,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:07Z",
+        "outcome": "FAILED",
+        "attemptCount": 3,
+        "reason": "connect_diagnostic_inventory_unavailable",
+        "resultSha256": null,
+        "resultBytes": null
+      },
+      "expected": { "httpStatus": 200, "connectVisible": true }
+    },
+    {
+      "id": "diagnostic-receipt.disable-or-revoke-cancelled",
+      "request": {
+        "protocolVersion": "v1",
+        "requestId": "123e4567-e89b-42d3-a456-426614174002",
+        "receiptId": "123e4567-e89b-42d3-a456-426614174002",
+        "policyRevision": 8,
+        "toolId": "inventory.environment",
+        "intervalStartedAt": "2030-01-01T00:00:00Z",
+        "completedAt": "2030-01-01T00:00:01Z",
+        "outcome": "CANCELLED",
+        "attemptCount": 1,
+        "reason": "connect_diagnostic_cancelled",
+        "resultSha256": null,
+        "resultBytes": null
+      },
+      "expected": { "httpStatus": 200, "connectVisible": true }
+    }
+  ],
+  "rejected": [
+    { "id": "diagnostic-receipt.changed-replay", "expected": { "httpStatus": 409, "reason": "REQUEST_ID_REUSED" } },
+    { "id": "diagnostic-receipt.expired", "expected": { "httpStatus": 400, "reason": "DIAGNOSTIC_RECEIPT_INVALID" } },
+    { "id": "diagnostic-receipt.wrong-cluster", "expected": { "httpStatus": 403, "reason": "CLUSTER_MISMATCH" } },
+    { "id": "diagnostic-receipt.expired-device", "expected": { "httpStatus": 401, "reason": "CREDENTIAL_EXPIRED" } }
+  ]
+}

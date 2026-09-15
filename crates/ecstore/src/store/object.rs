@@ -1687,6 +1687,15 @@ fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool 
     (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
+fn latest_versioned_delete_creates_distinct_marker(opts: &ObjectOptions) -> bool {
+    opts.versioned
+        && !opts.version_suspended
+        && opts.version_id.is_none()
+        && !opts.delete_marker
+        && !opts.data_movement
+        && !opts.replication_request
+}
+
 #[cfg(any(test, feature = "test-util"))]
 struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
@@ -4894,7 +4903,8 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let creates_latest_marker = should_create_delete_marker_for_missing_object(&opts);
+        let creates_latest_marker = latest_versioned_delete_creates_distinct_marker(&opts)
+            || (opts.version_suspended && should_create_delete_marker_for_missing_object(&opts));
         let mut gopts = delete_pool_lookup_opts(&opts, true);
         if creates_latest_marker {
             // An unwritable source still owns its current version. Hiding it
@@ -7816,6 +7826,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_versioned_delete_creates_a_new_marker_after_a_current_marker() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "versioned-delete-marker-identity";
+        let object = "object.bin";
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let first = store
+            .handle_delete_object(bucket, object, opts.clone())
+            .await
+            .expect("first versioned delete should create a marker");
+        let second = store
+            .handle_delete_object(bucket, object, opts)
+            .await
+            .expect("second versioned delete should create a marker");
+
+        assert!(first.delete_marker);
+        assert!(second.delete_marker);
+        assert_ne!(
+            first.version_id, second.version_id,
+            "each latest versioned delete must persist a distinct delete marker"
+        );
+
+        let versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("delete-marker metadata should decode")
+            .expect("delete-marker metadata should be persisted");
+        let marker_ids = versions
+            .versions
+            .iter()
+            .filter(|version| version.deleted)
+            .filter_map(|version| version.version_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(marker_ids.contains(&first.version_id.expect("first marker should have a version id")));
+        assert!(marker_ids.contains(&second.version_id.expect("second marker should have a version id")));
+        assert_eq!(marker_ids.len(), 2, "both delete markers must remain durable versions");
+    }
+
+    #[tokio::test]
     async fn versioned_delete_quorum_failure_rolls_back_and_retries_require_quorum() {
         for marker_copies in [0, 2, 4] {
             let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
@@ -7939,6 +8000,39 @@ mod tests {
             .expect("the original version should stream");
             assert_eq!(restored, payload);
         }
+    }
+
+    #[test]
+    fn latest_versioned_delete_marker_creation_excludes_specialized_deletes() {
+        assert!(latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        }));
+        assert!(!latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        }));
+        assert!(!latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            delete_marker: true,
+            ..Default::default()
+        }));
+        assert!(!latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            ..Default::default()
+        }));
+        assert!(!latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            replication_request: true,
+            ..Default::default()
+        }));
+        assert!(!latest_versioned_delete_creates_distinct_marker(&ObjectOptions {
+            versioned: true,
+            version_suspended: true,
+            ..Default::default()
+        }));
     }
 
     #[test]

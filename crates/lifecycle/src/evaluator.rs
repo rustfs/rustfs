@@ -206,12 +206,12 @@ mod tests {
     use std::sync::Arc;
 
     use rustfs_scanner_metrics::metrics::IlmAction;
+    use rustfs_storage_api::metadata_keys;
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule,
         NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
         Transition, TransitionStorageClass,
     };
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -251,7 +251,7 @@ mod tests {
         for object in &mut objects {
             object
                 .user_defined
-                .insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+                .insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
         }
         let locked = evaluator
             .eval(&objects)
@@ -485,7 +485,7 @@ mod tests {
 
     fn locked_current_object_opts(replication_status: ReplicationStatusType) -> ObjectOpts {
         let mut user_defined = HashMap::new();
-        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
 
         ObjectOpts {
             user_defined,
@@ -507,10 +507,10 @@ mod tests {
             .expect("future retain-until date should format");
         let mut user_defined = HashMap::new();
         user_defined.insert(
-            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            metadata_keys::OBJECT_LOCK_MODE.to_string(),
             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
         );
-        user_defined.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until);
+        user_defined.insert(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until);
 
         ObjectOpts {
             user_defined,
@@ -717,7 +717,7 @@ mod tests {
             .eval(&version_group(
                 Some(Uuid::nil()),
                 ReplicationStatusType::Completed,
-                HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+                HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
             ))
             .await
             .expect("locked null-version lifecycle evaluation should fail closed without aborting evaluation");

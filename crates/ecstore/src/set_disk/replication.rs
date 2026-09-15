@@ -14,13 +14,12 @@
 
 use super::{
     Error, FileInfo, NamespaceLockFence, ObjectInfo, ObjectOptions, OffsetDateTime, Result, SetDisks, StorageError,
-    UpdateMetadataOpts, Uuid, X_AMZ_RESTORE, get_raw_etag, restore_operation_id_from_metadata,
+    UpdateMetadataOpts, Uuid, get_raw_etag, restore_operation_id_from_metadata,
 };
 use crate::bucket::lifecycle::lifecycle;
 use crate::core::pools::DecommissionCapacityAdmission;
-use rustfs_filemeta::RestoreStatusOps;
-use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
-use s3s::dto::{RestoreStatus, Timestamp};
+use rustfs_filemeta::metadata_keys;
+use rustfs_filemeta::{RestoreStatus, RestoreStatusOps};
 #[cfg(all(test, feature = "test-util"))]
 use std::sync::Arc;
 
@@ -213,10 +212,10 @@ impl SetDisks {
         let restore_expiry =
             lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
         fi.metadata.insert(
-            X_AMZ_RESTORE.as_str().to_string(),
+            metadata_keys::RESTORE.to_string(),
             RestoreStatus {
                 is_restore_in_progress: Some(false),
-                restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                restore_expiry_date: Some(restore_expiry),
             }
             .to_string(),
         );
@@ -317,9 +316,9 @@ impl SetDisks {
             return Ok(());
         }
         ensure_restore_metadata_lock_held(bucket, object, opts, "restore_cleanup_metadata")?;
-        fi.metadata.remove(X_AMZ_RESTORE.as_str());
-        fi.metadata.remove(AMZ_RESTORE_EXPIRY_DAYS);
-        fi.metadata.remove(AMZ_RESTORE_REQUEST_DATE);
+        fi.metadata.remove(metadata_keys::RESTORE);
+        fi.metadata.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
+        fi.metadata.remove(metadata_keys::RESTORE_REQUEST_DATE);
         rustfs_utils::http::metadata_compat::remove_str(
             &mut fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,

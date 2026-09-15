@@ -13,7 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    config::{CommandResult, Config, Opt},
+    config::{
+        CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
+        ConnectEnvironmentInventoryOpts, ConnectInspectObjectOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts,
+        ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts,
+        ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts,
+        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
+        ConnectTopCommands, Opt,
+    },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
@@ -22,7 +29,9 @@ use crate::{
     storage_api::server::http::ServerContextSlot,
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
-use std::io::{Error, Result};
+use std::io::{Error, Read as _, Result, Write as _};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, instrument};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -129,6 +138,21 @@ async fn async_main() -> Result<()> {
             println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
             return Ok(());
         }
+        CommandResult::ConnectLicense(command) => return execute_connect_license(command).await,
+        CommandResult::ConnectRelay(options) => return execute_connect_relay(*options).await,
+        CommandResult::ConnectReportUpload(options) => return execute_connect_report_upload(options).await,
+        CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
+        CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(*options).await,
+        CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
+        CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
+        CommandResult::ConnectSiteReplicationPerformance(options) => {
+            return execute_connect_site_replication_performance(*options).await;
+        }
+        CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
+        CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
+        CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
+        CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
+        CommandResult::ConnectInspect(options) => return execute_connect_inspect(options).await,
         CommandResult::Server(config) => config,
     };
 
@@ -156,6 +180,1542 @@ async fn async_main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+async fn execute_connect_inspect(options: ConnectInspectObjectOpts) -> Result<()> {
+    use crate::connect::IdentityStore;
+    use crate::connect::diagnostics::{
+        InspectArtifactConsent, InspectProvenance, InspectRequest, InspectRule, InspectRun, export_inspect_summary,
+        save_signed_inspect_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let identity = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect inspect requires an enrolled device identity"))?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = InspectRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: InspectArtifactConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        drive_roots: options.paths,
+        bucket: options.bucket,
+        object: options.object,
+        version_id: options.version_id,
+        rules: vec![
+            InspectRule::ShardBitrot,
+            InspectRule::ShardAvailability,
+            InspectRule::MetadataIdentity,
+        ],
+        max_duration: Duration::from_millis(options.duration_millis),
+        max_read_bytes: options.max_read_bytes,
+        max_memory_bytes: options.max_memory_bytes,
+        provenance: InspectProvenance::new(
+            crate::version::build::COMMIT_HASH.to_string(),
+            hash_current_executable()?,
+            env!("CARGO_PKG_VERSION").to_string(),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker_request = request.clone();
+    let mut worker = tokio::task::spawn_blocking(move || export_inspect_summary(&worker_request, &identity, &worker_cancel));
+    let run = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            worker.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut worker => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    match run {
+        InspectRun::Terminal(result) => {
+            println!("result={}", serde_json::to_string(&result).map_err(Error::other)?);
+            Err(Error::other("inspect collection did not produce an artifact"))
+        }
+        InspectRun::Signed(export) => {
+            let output = options.output;
+            let writer_cancel = cancel.clone();
+            let mut writer = tokio::task::spawn_blocking(move || save_signed_inspect_export(&output, &export, &writer_cancel));
+            let receipt = tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    writer.await.map_err(Error::other)?.map_err(Error::other)?
+                }
+                result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+            };
+            println!(
+                "artifact={} bytes={} sha256={}",
+                receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+            );
+            println!("upload=not-performed");
+            Ok(())
+        }
+    }
+}
+
+async fn execute_connect_environment_inventory(options: ConnectEnvironmentInventoryOpts) -> Result<()> {
+    use crate::connect::environment::collect_environment;
+    use crate::connect::inventory::InventoryStateStore;
+    use crate::connect::{EnvironmentCollectionRequest, EnvironmentError};
+
+    let request = EnvironmentCollectionRequest::negotiate(
+        options.schema_version,
+        &options.capability,
+        Duration::from_secs(options.timeout_seconds),
+    )
+    .map_err(Error::other)?;
+    let store = InventoryStateStore::from_state_root(&options.state_dir).map_err(Error::other)?;
+    let persisted = tokio::task::spawn_blocking(move || store.read_latest(chrono::Utc::now()))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    let cancel = CancellationToken::new();
+    let collection = collect_environment(&persisted.snapshot, request, &cancel);
+    tokio::pin!(collection);
+    let inventory = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            collection.await.map_err(Error::other)?
+        }
+        result = collection.as_mut() => result.map_err(|error| match error {
+            EnvironmentError::Cancelled => Error::other("inventory environment collection cancelled"),
+            error => Error::other(error),
+        })?,
+    };
+    let Some(output) = options.output else {
+        println!("{}", serde_json::to_string(&inventory).map_err(Error::other)?);
+        return Ok(());
+    };
+    use crate::connect::{EnvironmentExportRequest, IdentityStore, save_signed_environment_export, sign_environment_inventory};
+    use rand::{TryRng as _, rngs::SysRng};
+    let required =
+        |value: Option<String>, name: &str| value.ok_or_else(|| Error::other(format!("--{name} is required with --output")));
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect environment export requires an enrolled device identity"))?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|d| i64::try_from(d.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = EnvironmentExportRequest {
+        confirmed: options.acknowledge_l1,
+        organization_name: required(options.organization, "organization")?,
+        cluster_name: required(options.cluster, "cluster")?,
+        device_name: required(options.device, "device")?,
+        run_uid: required(options.run_uid, "run-uid")?,
+        artifact_uid: required(options.artifact_uid, "artifact-uid")?,
+        consent_uid: required(options.consent_uid, "consent-uid")?,
+        policy_revision: options
+            .policy_revision
+            .ok_or_else(|| Error::other("--policy-revision is required with --output"))?,
+        produced_at_unix,
+        expires_at_unix: options
+            .expires_at_unix
+            .ok_or_else(|| Error::other("--expires-at is required with --output"))?,
+        nonce,
+        source_commit: crate::version::build::COMMIT_HASH.to_owned(),
+        executable_sha256: hash_current_executable()?,
+        rustfs_version: env!("CARGO_PKG_VERSION").to_owned(),
+        build_features: enabled_build_features(),
+    };
+    let export = sign_environment_inventory(&inventory, &request, &key, Duration::from_secs(options.timeout_seconds), &cancel)
+        .map_err(Error::other)?;
+    let writer_cancel = cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || save_signed_environment_export(&output, &export, &writer_cancel))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    println!("tool=inventory.environment outcome=SUCCEEDED reason=COMPLETE");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_logs(options: ConnectLogsOpts) -> Result<()> {
+    use crate::connect::{
+        CaptureMode, IdentityStore, LocalLogConsent, LogCaptureRequest, LogProvenance, export_logs, save_signed_log_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect logs requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = LogCaptureRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalLogConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        mode: match options.mode {
+            ConnectLogsMode::Batch => CaptureMode::Batch,
+            ConnectLogsMode::Live => CaptureMode::Live,
+        },
+        duration: Duration::from_millis(options.duration_millis),
+        max_events: options.max_events,
+        provenance: LogProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let export = {
+        let capture = export_logs(&request, &key, &cancel);
+        tokio::pin!(capture);
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return Err(Error::other("log collection cancelled"));
+            }
+            result = capture.as_mut() => result.map_err(Error::other)?,
+        }
+    };
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_log_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+
+    println!("tool=logs.capture outcome=SUCCEEDED reason=COMPLETE");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_telemetry(command: ConnectTelemetryCommands) -> Result<()> {
+    use crate::connect::{
+        LocalOtlpHeaders, LocallyReviewedTraceArtifact, MAX_OTLP_BODY_BYTES, MAX_TELEMETRY_RESULT_BYTES, OtlpBatch,
+        RecordedTrace, TelemetryDiagnosticResult, TelemetryProducerError, TelemetryTool, TraceRecordLimits, analyze_trace,
+        export_trace_otlp_result, record_diagnostic_result, replay_trace_result, request_local_trace_capture,
+    };
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    match command {
+        ConnectTelemetryCommands::Record(options) => {
+            let (key, request, _consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            if options.duration_millis == 0
+                || options.duration_millis > 30_000
+                || options.max_spans == 0
+                || options.max_spans > 1_024
+            {
+                return Err(Error::other("telemetry record limits are invalid"));
+            }
+            let cancel = CancellationToken::new();
+            let started = Instant::now();
+            let capture = request_local_trace_capture(
+                &options.artifact.state_dir,
+                options.artifact.consent_expires_at_unix,
+                TraceRecordLimits {
+                    duration: Duration::from_millis(options.duration_millis),
+                    max_spans: options.max_spans,
+                },
+                &cancel,
+            );
+            tokio::pin!(capture);
+            let capture = tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    return Err(Error::other("telemetry record cancelled"));
+                }
+                result = capture.as_mut() => result,
+            };
+            match capture {
+                Ok(capture) => {
+                    let result = record_diagnostic_result(&request, capture, started.elapsed());
+                    save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
+                }
+                Err(crate::connect::LocalTraceCaptureError::Producer(TelemetryProducerError::SourceUnavailable)) => {
+                    let result = TelemetryDiagnosticResult::<RecordedTrace>::unsupported(
+                        &request,
+                        TelemetryTool::Record,
+                        started.elapsed(),
+                    );
+                    println!("{}", serde_json::to_string(&result).map_err(Error::other)?);
+                    Ok(())
+                }
+                Err(error) => Err(Error::other(error)),
+            }
+        }
+        ConnectTelemetryCommands::Otlp(options) => {
+            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            let body = read_bounded_stdin(MAX_OTLP_BODY_BYTES)?;
+            let batch = OtlpBatch::new(body).map_err(Error::other)?;
+            let endpoint = reqwest::Url::parse(&options.endpoint).map_err(|_| Error::other("invalid OTLP endpoint"))?;
+            let mut headers = HeaderMap::new();
+            if let Some(name) = options.authorization_env.as_deref() {
+                if !valid_environment_name(name) {
+                    return Err(Error::other("invalid OTLP authorization environment variable name"));
+                }
+                let value = std::env::var(name).map_err(|_| Error::other("OTLP authorization is unavailable"))?;
+                let value = HeaderValue::from_str(&value).map_err(|_| Error::other("OTLP authorization is invalid"))?;
+                headers.insert(AUTHORIZATION, value);
+            }
+            let cancel = CancellationToken::new();
+            let result = export_trace_otlp_result(
+                &request,
+                endpoint,
+                LocalOtlpHeaders::new(headers),
+                batch,
+                consent,
+                Duration::from_millis(options.timeout_millis),
+                &cancel,
+            )
+            .await
+            .map_err(Error::other)?;
+            save_telemetry_result(&options.artifact, &request, &result, &key, &cancel, None)
+        }
+        ConnectTelemetryCommands::Replay(options) => {
+            let (key, request, consent) = telemetry_context(&options.artifact)?;
+            request.validate().map_err(Error::other)?;
+            let bytes = read_bounded_stdin(MAX_TELEMETRY_RESULT_BYTES)?;
+            let cancel = CancellationToken::new();
+            let result = replay_trace_result(
+                &request,
+                LocallyReviewedTraceArtifact::new(&bytes).map_err(Error::other)?,
+                consent,
+                &cancel,
+            )
+            .map_err(Error::other)?;
+            let analysis = analyze_trace(
+                result
+                    .data()
+                    .ok_or_else(|| Error::other("telemetry replay returned no data"))?,
+                consent,
+                &cancel,
+            )
+            .map_err(Error::other)?;
+            save_telemetry_result(
+                &options.artifact,
+                &request,
+                &result,
+                &key,
+                &cancel,
+                Some(serde_json::to_value(analysis).map_err(Error::other)?),
+            )
+        }
+    }
+}
+
+fn telemetry_context(
+    options: &ConnectTelemetryArtifactOpts,
+) -> Result<(
+    crate::connect::DeviceIdentity,
+    crate::connect::TelemetryArtifactRequest,
+    crate::connect::LocalTelemetryConsent,
+)> {
+    use crate::connect::{
+        IdentityStore, LocalTelemetryConsent, TelemetryArtifactConsent, TelemetryArtifactRequest, TelemetryProvenance,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect telemetry requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let remaining = options
+        .consent_expires_at_unix
+        .checked_sub(produced_at_unix)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| Error::other("local telemetry consent is expired"))?;
+    let consent = LocalTelemetryConsent::new(
+        Instant::now()
+            .checked_add(Duration::from_secs(remaining))
+            .ok_or_else(|| Error::other("local telemetry consent is expired"))?,
+    )
+    .map_err(Error::other)?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = TelemetryArtifactRequest {
+        organization_name: options.organization.clone(),
+        cluster_name: options.cluster.clone(),
+        device_name: options.device.clone(),
+        run_uid: options.run_uid.clone(),
+        artifact_uid: options.artifact_uid.clone(),
+        schema_version: crate::connect::TELEMETRY_SCHEMA_VERSION,
+        consent: TelemetryArtifactConsent {
+            consent_uid: options.consent_uid.clone(),
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        provenance: TelemetryProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    Ok((key, request, consent))
+}
+
+fn save_telemetry_result<T: serde::Serialize>(
+    options: &ConnectTelemetryArtifactOpts,
+    request: &crate::connect::TelemetryArtifactRequest,
+    result: &crate::connect::TelemetryDiagnosticResult<T>,
+    key: &crate::connect::DeviceIdentity,
+    cancel: &CancellationToken,
+    analysis: Option<serde_json::Value>,
+) -> Result<()> {
+    let export = crate::connect::encode_signed_telemetry_export(request, result, key, cancel).map_err(Error::other)?;
+    let receipt = crate::connect::save_signed_telemetry_export(&options.output, &export, cancel).map_err(Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "toolId": export.tool.id(),
+            "outcome": export.outcome.as_str(),
+            "reasonCode": export.reason_code.as_str(),
+            "artifactUid": receipt.artifact_uid,
+            "archiveSizeBytes": receipt.archive_size_bytes,
+            "archiveSha256": receipt.archive_sha256,
+            "analysis": analysis,
+            "upload": "NOT_PERFORMED",
+        })
+    );
+    Ok(())
+}
+
+fn read_bounded_stdin(limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    std::io::stdin()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err(Error::other("telemetry stdin is empty or exceeds its limit"));
+    }
+    Ok(bytes)
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn unix_now() -> Result<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(Error::other)?;
+    i64::try_from(duration.as_secs()).map_err(Error::other)
+}
+
+async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
+        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_disk, capture_top_locks,
+        capture_top_net, capture_top_rpc,
+    };
+
+    let (tool_id, options) = match command {
+        ConnectTopCommands::Api(options) => ("top.api", options),
+        ConnectTopCommands::Disk(options) => ("top.disk", options),
+        ConnectTopCommands::Locks(options) => ("top.locks", options),
+        ConnectTopCommands::Net(options) => ("top.net", options),
+        ConnectTopCommands::Rpc(options) => ("top.rpc", options),
+    };
+    let window = Duration::from_millis(options.window_millis);
+    let export_validity = Duration::from_secs(options.export_validity_seconds);
+    if window.is_zero() || window > MAX_TOP_DURATION || export_validity.is_zero() || export_validity > MAX_TOP_EXPORT_VALIDITY {
+        return Err(Error::other("connect_top_limits_invalid"));
+    }
+
+    let identity = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect top requires an enrolled device identity"))?;
+    let request = TopCaptureRequest {
+        scope: TopCaptureScope {
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            policy_revision: options.policy_revision,
+            run_expires_at_unix: options.run_expires_at_unix,
+            executable_sha256: hash_current_executable()?,
+            build_features: enabled_build_features(),
+            consent: LocalTopConsent {
+                uid: options.consent_uid,
+                tool_id: tool_id.to_owned(),
+                classification: TOP_CLASSIFICATION.to_owned(),
+                active: options.acknowledge_l3,
+                expires_at_unix: options.consent_expires_at_unix,
+            },
+        },
+        limits: TopCaptureLimits::default(),
+        window,
+        export_validity,
+    };
+    let cancel = CancellationToken::new();
+    match tool_id {
+        "top.api" => {
+            let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.disk" => {
+            let result = await_top_capture(capture_top_disk(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.locks" => {
+            let result = await_top_capture(capture_top_locks(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.net" => {
+            let result = await_top_capture(capture_top_net(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        "top.rpc" => {
+            let result = await_top_capture(capture_top_rpc(&request, &cancel), &cancel).await?;
+            finish_top_capture(&request, result, &identity, options.output, &cancel).await
+        }
+        _ => unreachable!("closed top command"),
+    }
+}
+
+async fn await_top_capture<T, F>(future: F, cancel: &CancellationToken) -> Result<crate::connect::TopResult<T>>
+where
+    T: serde::Serialize,
+    F: std::future::Future<Output = std::result::Result<crate::connect::TopResult<T>, crate::connect::TopCaptureError>>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            future.await.map_err(Error::other)
+        }
+        result = future.as_mut() => result.map_err(Error::other),
+    }
+}
+
+async fn finish_top_capture<T: serde::Serialize>(
+    request: &crate::connect::TopCaptureRequest,
+    result: crate::connect::TopResult<T>,
+    identity: &crate::connect::DeviceIdentity,
+    output: std::path::PathBuf,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    use crate::connect::{TopOutcome, save_signed_top_export, sign_top_export};
+
+    println!("result={}", serde_json::to_string(&result).map_err(Error::other)?);
+    std::io::stdout().flush()?;
+    if !matches!(result.outcome, TopOutcome::Succeeded | TopOutcome::Partial) {
+        return Err(Error::other(format!(
+            "top capture ended with {} ({})",
+            result.outcome.as_str(),
+            result.reason_code.as_str()
+        )));
+    }
+
+    let export = sign_top_export(request, &result, identity, cancel).map_err(Error::other)?;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_top_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_client_performance(options: ConnectClientPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        ClientOperation, ClientOutcome, ClientPerformanceRequest, ClientProvenance, HttpClientProbe, IdentityStore,
+        LocalClientConsent, measure_client, read_protected_client_credential, save_signed_client_export, sign_client_export,
+        validate_client_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    validate_client_limits(duration, options.traffic_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?;
+    let access_key = read_protected_client_credential(&options.access_key_file).map_err(Error::other)?;
+    let secret_key = read_protected_client_credential(&options.secret_key_file).map_err(Error::other)?;
+    let session_token = options
+        .session_token_file
+        .as_deref()
+        .map(read_protected_client_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let root_ca = if let Some(path) = options.ca_file.as_deref() {
+        const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        std::fs::File::open(path)?
+            .take(MAX_ROOT_CA_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+        if bytes.len() > max_bytes {
+            return Err(Error::other("connect client root CA exceeds the 1048576-byte limit"));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let probe = HttpClientProbe::new(
+        &options.endpoint,
+        root_ca.as_deref(),
+        options.proxy.as_deref(),
+        access_key,
+        secret_key,
+        session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ClientPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalClientConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        operation: match options.operation {
+            ConnectClientPerformanceOperation::Get => ClientOperation::GetObject,
+            ConnectClientPerformanceOperation::Put => ClientOperation::PutObject,
+        },
+        traffic_bytes: options.traffic_bytes,
+        target_alias: options.target_alias,
+        provenance: ClientProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_client(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.client outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != ClientOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "client performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_client_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_client_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_object_performance(options: ConnectObjectPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalObjectConsent, ObjectOperation, ObjectOutcome, ObjectPerformanceRequest, ObjectProvenance,
+        S3ObjectProbe, measure_object, read_protected_object_credential, save_signed_object_export, sign_object_export,
+        validate_object_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    let operation = match options.operation {
+        ConnectObjectPerformanceOperation::Get => ObjectOperation::GetObject,
+        ConnectObjectPerformanceOperation::Put => ObjectOperation::PutObject,
+    };
+    validate_object_limits(duration, operation, options.traffic_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect object performance requires an enrolled device identity"))?;
+    let access_key = read_protected_object_credential(&options.access_key_file).map_err(Error::other)?;
+    let secret_key = read_protected_object_credential(&options.secret_key_file).map_err(Error::other)?;
+    let session_token = options
+        .session_token_file
+        .as_deref()
+        .map(read_protected_object_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let root_ca = if let Some(path) = options.ca_file.as_deref() {
+        const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        std::fs::File::open(path)?
+            .take(MAX_ROOT_CA_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+        if bytes.len() > max_bytes {
+            return Err(Error::other("connect object root CA exceeds the 1048576-byte limit"));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let probe = S3ObjectProbe::new(
+        &options.endpoint,
+        root_ca.as_deref(),
+        options.proxy.as_deref(),
+        access_key,
+        secret_key,
+        session_token,
+        duration,
+    )
+    .map_err(Error::other)?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ObjectPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalObjectConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        operation,
+        traffic_bytes: options.traffic_bytes,
+        target_alias: options.target_alias,
+        provenance: ObjectProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_object(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.object outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != ObjectOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "object performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_object_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_object_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_site_replication_performance(options: ConnectSiteReplicationPerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalSiteReplicationConsent, S3SiteReplicationProbe, SiteReplicationCredentials, SiteReplicationEndpoint,
+        SiteReplicationOutcome, SiteReplicationPerformanceRequest, SiteReplicationProvenance, measure_site_replication,
+        read_protected_site_replication_credential, save_signed_site_replication_export, sign_site_replication_export,
+        validate_site_replication_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+    use zeroize::Zeroizing;
+
+    let duration = Duration::from_millis(options.duration_millis);
+    let late_arrival_cleanup = Duration::from_millis(options.late_arrival_cleanup_millis);
+    validate_site_replication_limits(duration, options.traffic_bytes, late_arrival_cleanup).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect site-replication performance requires an enrolled device identity"))?;
+    let source_access_key = read_protected_site_replication_credential(&options.source_access_key_file).map_err(Error::other)?;
+    let source_secret_key = read_protected_site_replication_credential(&options.source_secret_key_file).map_err(Error::other)?;
+    let source_session_token = options
+        .source_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let destination_access_key =
+        read_protected_site_replication_credential(&options.destination_access_key_file).map_err(Error::other)?;
+    let destination_secret_key =
+        read_protected_site_replication_credential(&options.destination_secret_key_file).map_err(Error::other)?;
+    let destination_session_token = options
+        .destination_session_token_file
+        .as_deref()
+        .map(read_protected_site_replication_credential)
+        .transpose()
+        .map_err(Error::other)?
+        .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let source_ca = read_optional_root_ca(options.source_ca_file.as_deref(), "source")?;
+    let destination_ca = read_optional_root_ca(options.destination_ca_file.as_deref(), "destination")?;
+    let source = SiteReplicationEndpoint::new(
+        options.source_alias.clone(),
+        options.source_deployment_id.clone(),
+        &options.source_endpoint,
+        source_ca.as_deref(),
+        SiteReplicationCredentials {
+            access_key: source_access_key,
+            secret_key: source_secret_key,
+            session_token: source_session_token,
+        },
+        duration,
+    )
+    .map_err(Error::other)?;
+    let destination = SiteReplicationEndpoint::new(
+        options.destination_alias.clone(),
+        options.destination_deployment_id.clone(),
+        &options.destination_endpoint,
+        destination_ca.as_deref(),
+        SiteReplicationCredentials {
+            access_key: destination_access_key,
+            secret_key: destination_secret_key,
+            session_token: destination_session_token,
+        },
+        duration,
+    )
+    .map_err(Error::other)?;
+    let probe = S3SiteReplicationProbe::new(source, destination);
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = SiteReplicationPerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        destination_cluster_name: options.destination_cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalSiteReplicationConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            nonce,
+            confirmed: options.acknowledge_l2,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        duration,
+        traffic_bytes: options.traffic_bytes,
+        source_alias: options.source_alias,
+        source_deployment_id: options.source_deployment_id,
+        destination_alias: options.destination_alias,
+        destination_deployment_id: options.destination_deployment_id,
+        scratch_bucket: options.scratch_bucket,
+        late_arrival_cleanup,
+        provenance: SiteReplicationProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_site_replication(&request, &probe, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.siteReplication outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+
+    // Measurement cancellation has already completed bounded late-arrival
+    // cleanup. Preserve that terminal result in the signed offline artifact.
+    let writer_cancel = CancellationToken::new();
+    let export = sign_site_replication_export(&request, &measurement, &key, &writer_cancel).map_err(Error::other)?;
+    let output = options.output;
+    let save_cancel = writer_cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || save_signed_site_replication_export(&output, &export, &save_cancel))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    if measurement.result.outcome() != SiteReplicationOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "site-replication performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn read_optional_root_ca(path: Option<&std::path::Path>, label: &str) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let max_bytes = usize::try_from(MAX_ROOT_CA_BYTES).map_err(Error::other)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::other(format!(
+            "connect site-replication {label} root CA exceeds the 1048576-byte limit"
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_relay_root_ca(path: &std::path::Path) -> Result<Vec<u8>> {
+    const MAX_ROOT_CA_BYTES: u64 = 1_048_576;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    std::fs::File::open(path)?
+        .take(MAX_ROOT_CA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ROOT_CA_BYTES {
+        return Err(Error::other("connect relay root CA is empty or exceeds the 1048576-byte limit"));
+    }
+    Ok(bytes)
+}
+
+async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts) -> Result<()> {
+    use crate::connect::{
+        DriveOutcome, DrivePerformanceRequest, DriveProvenance, IdentityStore, LocalDriveConsent, measure_drive,
+        save_signed_drive_export, sign_drive_export, validate_drive_limits,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let duration = Duration::from_millis(options.duration_millis);
+    validate_drive_limits(duration, options.scratch_bytes, options.block_bytes).map_err(Error::other)?;
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect drive performance requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = unix_now()?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = DrivePerformanceRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalDriveConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l1,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration,
+        target_alias: "drive-1".to_owned(),
+        scratch_root: options.scratch_dir,
+        scratch_bytes: options.scratch_bytes,
+        block_bytes: options.block_bytes,
+        provenance: DriveProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+    let measurement = measure_drive(&request, &cancel);
+    tokio::pin!(measurement);
+    let measurement = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            measurement.await.map_err(Error::other)?
+        }
+        result = measurement.as_mut() => result.map_err(Error::other)?,
+    };
+    let target_json = serde_json::to_string(&measurement.target).map_err(Error::other)?;
+    println!(
+        "tool=performance.drive outcome={} reason={}",
+        measurement.result.outcome().as_str(),
+        measurement.result.reason_code().as_str()
+    );
+    println!("target={target_json}");
+    std::io::stdout().flush()?;
+    if measurement.result.outcome() != DriveOutcome::Succeeded {
+        return Err(Error::other(format!(
+            "drive performance collection ended with {}",
+            measurement.result.outcome().as_str()
+        )));
+    }
+
+    let export = sign_drive_export(&request, &measurement, &key, &cancel).map_err(Error::other)?;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_drive_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
+    use crate::connect::{
+        IdentityStore, LocalProfileConsent, ProfileCaptureRequest, ProfileProvenance, ThreadProfileScope, export_cpu_profile,
+        export_memory_profile, export_thread_profile, save_signed_profile_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
+    let executable_sha256 = hash_current_executable()?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = ProfileCaptureRequest {
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: options.schema_version,
+        capability: options.capability,
+        consent: LocalProfileConsent {
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            expires_at_unix: options.consent_expires_at_unix,
+            confirmed: options.acknowledge_l3,
+        },
+        produced_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        nonce,
+        duration: Duration::from_millis(options.duration_millis),
+        sample_period: Duration::from_micros(options.sample_period_micros),
+        provenance: ProfileProvenance::new(
+            crate::version::build::COMMIT_HASH,
+            executable_sha256,
+            env!("CARGO_PKG_VERSION"),
+            enabled_build_features(),
+        ),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let export = {
+        let capture = async {
+            match options.tool {
+                ConnectProfileTool::Cpu => {
+                    if options.thread_scope.is_some() {
+                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                    }
+                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
+                }
+                ConnectProfileTool::Memory => {
+                    if options.thread_scope.is_some() {
+                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                    }
+                    export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
+                }
+                ConnectProfileTool::Threads => {
+                    let scope = match options.thread_scope {
+                        Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
+                        Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
+                        None => return Err(Error::other("--thread-scope is required for the threads profile")),
+                    };
+                    export_thread_profile(&request, scope, &key, &cancel)
+                        .await
+                        .map_err(Error::other)
+                }
+            }
+        };
+        tokio::pin!(capture);
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return Err(Error::other("profile collection cancelled"));
+            }
+            result = capture.as_mut() => result?,
+        }
+    };
+    let tool = export.tool;
+    let outcome = export.outcome;
+    let reason_code = export.reason_code;
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || save_signed_profile_export(&output, &export, &writer_cancel));
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+
+    println!("tool={} outcome={} reason={}", tool.id(), outcome.as_str(), reason_code.as_str());
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+fn hash_current_executable() -> Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    const MAX_EXECUTABLE_BYTES: u64 = 2_147_483_648;
+    let path = std::env::current_exe().map_err(Error::other)?;
+    let mut file = std::fs::File::open(path).map_err(Error::other)?;
+    let metadata = file.metadata().map_err(Error::other)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
+        return Err(Error::other("current executable is outside the diagnostic provenance limit"));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_bytes = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(Error::other)?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(u64::try_from(count).map_err(Error::other)?)
+            .ok_or_else(|| Error::other("current executable is outside the diagnostic provenance limit"))?;
+        if read_bytes > MAX_EXECUTABLE_BYTES {
+            return Err(Error::other("current executable is outside the diagnostic provenance limit"));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if read_bytes != metadata.len() {
+        return Err(Error::other("current executable changed while hashing diagnostic provenance"));
+    }
+    Ok(hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower))
+}
+
+fn enabled_build_features() -> Vec<String> {
+    let mut features = Vec::new();
+    for (enabled, name) in [
+        (cfg!(feature = "connect-e2e-short-credentials"), "connect-e2e-short-credentials"),
+        (cfg!(feature = "dial9"), "dial9"),
+        (cfg!(feature = "e2e-test-hooks"), "e2e-test-hooks"),
+        (cfg!(feature = "ftps"), "ftps"),
+        (cfg!(feature = "full"), "full"),
+        (cfg!(feature = "gcs"), "gcs"),
+        (cfg!(feature = "hotpath"), "hotpath"),
+        (cfg!(feature = "hotpath-alloc"), "hotpath-alloc"),
+        (cfg!(feature = "hotpath-cpu"), "hotpath-cpu"),
+        (cfg!(feature = "io-scheduler-debug"), "io-scheduler-debug"),
+        (cfg!(feature = "license"), "license"),
+        (cfg!(feature = "metrics-gpu"), "metrics-gpu"),
+        (cfg!(feature = "offline-enrollment-e2e-root"), "offline-enrollment-e2e-root"),
+        (cfg!(feature = "pyroscope"), "pyroscope"),
+        (cfg!(feature = "rio-v2"), "rio-v2"),
+        (cfg!(feature = "sftp"), "sftp"),
+        (cfg!(feature = "swift"), "swift"),
+        (cfg!(feature = "tracing-chunk-debug"), "tracing-chunk-debug"),
+        (cfg!(feature = "webdav"), "webdav"),
+    ] {
+        if enabled {
+            features.push(name.to_owned());
+        }
+    }
+    features
+}
+
+async fn execute_connect_license(command: ConnectLicenseCommands) -> Result<()> {
+    use crate::connect::{
+        CredentialStore, HeartbeatConfig, IdentityStore, LicenseRenewalClient, LicenseRenewalOutcome, ProxyConfig,
+        apply_license_artifact, inspect_installed_license, verify_license_artifact,
+    };
+
+    let scope = match &command {
+        ConnectLicenseCommands::Import(options) | ConnectLicenseCommands::Verify(options) => &options.scope,
+        ConnectLicenseCommands::Show(options) => options,
+        ConnectLicenseCommands::Renew(options) => &options.scope,
+        ConnectLicenseCommands::RelayExport(options) => &options.scope,
+        ConnectLicenseCommands::RelayImport(options) => &options.scope,
+    };
+    if let ConnectLicenseCommands::Renew(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+        let mut config = HeartbeatConfig::new(
+            &options.endpoint,
+            root_ca_pem,
+            IdentityStore::new(scope.state_dir.join("identity")),
+            CredentialStore::new(scope.state_dir.join("credential")),
+            scope.state_dir.join("heartbeat/state.json"),
+        );
+        config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+        let outcome = LicenseRenewalClient::new(config)
+            .map_err(Error::other)?
+            .renew_installed(&scope.state_dir, &context)
+            .await
+            .map_err(Error::other)?;
+        match outcome {
+            LicenseRenewalOutcome::Requested => println!("{{\"status\":\"REQUESTED\"}}"),
+            LicenseRenewalOutcome::Pending { replacement_license_uid } => println!(
+                "{}",
+                serde_json::json!({
+                    "status": "PENDING",
+                    "replacementLicenseUid": replacement_license_uid,
+                })
+            ),
+            LicenseRenewalOutcome::Installed(report) => print_license_report(&report)?,
+        }
+        return Ok(());
+    }
+    if let ConnectLicenseCommands::RelayExport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let exported = crate::connect::export_service_license_relay(
+            &options.artifact,
+            &options.envelope,
+            &options.transfer_uid,
+            &scope.state_dir,
+            &context,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        println!("{}", serde_json::to_string(&exported).map_err(Error::other)?);
+        return Ok(());
+    }
+    if let ConnectLicenseCommands::RelayImport(options) = &command {
+        let context = license_context(scope).map_err(Error::other)?;
+        let signer = crate::connect::DestinationReceiptSigner::from_private_key_file(
+            &options.receipt_signing_key_file,
+            options.receipt_key_id.clone(),
+        )
+        .map_err(Error::other)?;
+        let received = crate::connect::receive_service_license_relay(
+            &options.envelope,
+            &scope.state_dir,
+            &context,
+            &signer,
+            options.acknowledge_reviewed,
+        )
+        .map_err(Error::other)?;
+        std::io::stdout().write_all(&received.receipt_bytes)?;
+        std::io::stdout().write_all(b"\n")?;
+        return Ok(());
+    }
+    let context = license_context(scope);
+    let report = match context {
+        Ok(context) => match &command {
+            ConnectLicenseCommands::Import(options) => apply_license_artifact(&options.artifact, &scope.state_dir, &context),
+            ConnectLicenseCommands::Verify(options) => verify_license_artifact(&options.artifact, &scope.state_dir, &context),
+            ConnectLicenseCommands::Show(_) => inspect_installed_license(&scope.state_dir, &context),
+            ConnectLicenseCommands::Renew(_) => unreachable!("renewal is handled before local license commands"),
+            ConnectLicenseCommands::RelayExport(_) | ConnectLicenseCommands::RelayImport(_) => {
+                unreachable!("relay commands are handled before local license commands")
+            }
+        }
+        .unwrap_or_else(|error| {
+            let installed = matches!(&command, ConnectLicenseCommands::Show(_))
+                && error.status != crate::connect::LicenseArtifactStatus::Missing;
+            error.report(installed)
+        }),
+        Err(error) => error.report(false),
+    };
+    print_license_report(&report)?;
+    if report.is_valid() {
+        Ok(())
+    } else {
+        Err(Error::other(format!("Connect service license status is {}", report.status)))
+    }
+}
+
+async fn execute_connect_report_upload(options: ConnectReportUploadOpts) -> Result<()> {
+    use crate::connect::{CredentialStore, HeartbeatConfig, IdentityStore, ProxyConfig, ReportUploadClient};
+
+    let root_ca_pem = std::fs::read(&options.ca_file).map_err(Error::other)?;
+    let mut config = HeartbeatConfig::new(
+        &options.endpoint,
+        root_ca_pem,
+        IdentityStore::new(options.state_dir.join("identity")),
+        CredentialStore::new(options.state_dir.join("credential")),
+        options.state_dir.join("heartbeat/state.json"),
+    );
+    config.proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = ReportUploadClient::new(config, Duration::from_secs(options.upload_timeout_seconds)).map_err(Error::other)?;
+    let cancellation = CancellationToken::new();
+    let upload = client.upload(&options.archive, &cancellation);
+    tokio::pin!(upload);
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancellation.cancel();
+            return Err(Error::other("connect report upload cancelled"));
+        }
+        result = upload.as_mut() => result.map_err(Error::other)?,
+    };
+    println!("{}", serde_json::to_string(&receipt).map_err(Error::other)?);
+    Ok(())
+}
+
+async fn execute_connect_relay(options: ConnectRelayOpts) -> Result<()> {
+    use crate::connect::{
+        ProxyConfig, RelayHttpClient, RelayMaterialKind, RelayParty, TrustedReceiptSigner, prepare_approved_artifact,
+        read_protected_relay_artifact, read_protected_relay_authentication,
+    };
+
+    if options.timeout_seconds == 0 || options.timeout_seconds > 300 {
+        return Err(Error::other("relay timeout must be between 1 and 300 seconds"));
+    }
+    let artifact = read_protected_relay_artifact(&options.artifact).map_err(Error::other)?;
+    let root_ca_pem = read_relay_root_ca(&options.ca_file)?;
+    let cookie = read_protected_relay_authentication(&options.session_cookie_file).map_err(Error::other)?;
+    let csrf_token = read_protected_relay_authentication(&options.csrf_token_file).map_err(Error::other)?;
+    let receipt_trust = TrustedReceiptSigner::from_public_key_file(&options.receipt_public_key_file, options.receipt_key_id)
+        .map_err(Error::other)?;
+    let material_kind = match options.material_kind {
+        ConnectRelayMaterialKind::OfflineEnrollmentResponse => RelayMaterialKind::OfflineEnrollmentResponse,
+        ConnectRelayMaterialKind::DiagnosticBundleManifest => RelayMaterialKind::DiagnosticBundleManifest,
+    };
+    let organization_name = format!("organizations/{}", options.organization_uid);
+    let prepared = prepare_approved_artifact(
+        &options.transfer_uid,
+        material_kind,
+        &artifact,
+        RelayParty {
+            party_type: "DEVICE".to_owned(),
+            name: options.producer_name,
+            key_id: Some(options.producer_key_id),
+        },
+        RelayParty {
+            party_type: "CONNECT".to_owned(),
+            name: organization_name,
+            key_id: None,
+        },
+        |_| options.acknowledge_reviewed,
+    )
+    .map_err(Error::other)?;
+    let proxy = ProxyConfig::from_env().map_err(Error::other)?;
+    let client = RelayHttpClient::new(
+        &options.endpoint,
+        &root_ca_pem,
+        &options.organization_uid,
+        options.approval_reference,
+        &cookie,
+        &csrf_token,
+        Duration::from_secs(options.timeout_seconds),
+        proxy.as_ref(),
+    )
+    .map_err(Error::other)?;
+    let delivery = client.deliver(prepared, &receipt_trust).await.map_err(Error::other)?;
+    let receipt: serde_json::Value = serde_json::from_slice(&delivery.receipt_bytes).map_err(Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "attempts": delivery.attempts,
+            "receipt": receipt,
+            "review": delivery.review,
+        })
+    );
+    Ok(())
+}
+
+fn license_context(
+    scope: &ConnectLicenseScopeOpts,
+) -> std::result::Result<crate::connect::LicenseVerificationContext, crate::connect::LicenseArtifactError> {
+    crate::connect::LicenseVerificationContext::from_public_key_file(
+        &scope.public_key_file,
+        scope.key_id.clone(),
+        scope.issuer.clone(),
+        scope.audience.clone(),
+        scope.organization.clone(),
+        scope.deployment.clone(),
+        scope.service_code.clone(),
+    )
+}
+
+fn print_license_report(report: &crate::connect::LicenseReport) -> Result<()> {
+    let output = serde_json::to_string(report).map_err(Error::other)?;
+    println!("{output}");
+    Ok(())
 }
 
 #[instrument(skip(config))]

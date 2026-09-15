@@ -20,6 +20,12 @@
 name: RustFS Fault-Tolerance Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       package_url:
@@ -49,7 +55,7 @@ permissions:
 # The suite stops services and hides drive dirs on the shared fleet; only one
 # functional suite may touch the environment at a time.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
@@ -68,8 +74,13 @@ jobs:
   fault-tolerance-test:
     runs-on: smoke-testing
     timeout-minutes: 480
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout repository (for report parser)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
       - name: Initialize functional evidence
         id: evidence
         run: |
@@ -84,25 +95,22 @@ jobs:
             printf 'EVIDENCE_DIR=%s/evidence\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      # auto-testing is private: clone it with the dedicated PF token (not
-      # GITHUB_TOKEN) and retry transient GitHub/network failures.
-      - name: Checkout auto-testing scripts (with retry)
+      # Pin the private suite checkout when the chain supplies a candidate.
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -116,19 +124,27 @@ jobs:
         run: |
           ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}"
 
+      - name: Stage verified candidate package
+        id: chain_package
+        if: ${{ inputs.chain_manifest != '' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py prepare
+
       - name: Run fault-tolerance scenarios (A, B, C, C2)
         id: test
-        # Case failures keep the run green: the report and the backlog
-        # issue manager carry the product signal.
+        # Standalone case failures are reported by the backlog manager.
+        # Chain evidence separately requires complete passing cases.
         continue-on-error: true
         run: |
-          ARGS=(--all -y --package-url "${{ inputs.package_url || env.RUSTFS_NIGHTLY_PACKAGE_URL }}" --log-file "${LOG_FILE}")
+          ARGS=(--all -y --package-url "${{ steps.chain_package.outputs.package_url || inputs.package_url || env.RUSTFS_NIGHTLY_PACKAGE_URL }}" --log-file "${LOG_FILE}")
           if [ "${{ inputs.strict }}" = "true" ]; then
             ARGS+=(--strict)
           fi
           ./auto-testing/rustfs-fault-tolerance-test.sh "${ARGS[@]}"
 
       - name: Generate report
+        id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -204,7 +220,7 @@ jobs:
             --outcome "${{ steps.test.outcome }}" \
             --report-file "${REPORT_FILE}" \
             --log "${LOG_FILE}" \
-            --run-url "${RUN_URL}" \
+            --run-url "${RUN_URL}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
             --run-id "${GITHUB_RUN_ID}" \
             --attempt "${GITHUB_RUN_ATTEMPT}" \
             --commit "${GITHUB_SHA}" \
@@ -282,3 +298,30 @@ jobs:
           echo "RustFS fault-tolerance test failed"
           echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
           echo "See the uploaded log artifact and FT-CASE lines for details."
+
+      - name: Remove verified candidate package
+        if: ${{ always() && inputs.chain_manifest != '' && steps.chain.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py cleanup
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite fault-tolerance
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/suite.log"
+          --output "${RUNNER_TEMP}/chain-fault-tolerance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/fault-tolerance.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}/fault-tolerance.json
+          if-no-files-found: error

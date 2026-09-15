@@ -5937,7 +5937,7 @@ mod tests {
                             metadata_acknowledged_target,
                             &ObjectOptions {
                                 eval_metadata: Some(HashMap::from([(
-                                    s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                                    rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                                     s3s::dto::ObjectLockLegalHoldStatus::OFF.to_string(),
                                 )])),
                                 ..target_version_opts.clone()
@@ -5966,7 +5966,7 @@ mod tests {
                     assert_eq!(
                         metadata_acknowledged
                             .user_defined
-                            .get(s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+                            .get(rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
                             .map(String::as_str),
                         Some("OFF")
                     );
@@ -5996,9 +5996,9 @@ mod tests {
                         ("governance-target.bin", s3s::dto::ObjectLockRetentionMode::GOVERNANCE),
                     ] {
                         let retained_metadata = HashMap::from([
-                            (s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), mode.to_string()),
+                            (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string()),
                             (
-                                s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                                rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                                 retain_until.clone(),
                             ),
                         ]);
@@ -12606,6 +12606,24 @@ mod tests {
         })
         .await
         .expect("tier free-version recovery should complete");
+        wait_for_expiry_workers_idle(&store).await;
+    }
+
+    /// Unlocked poll for exact metadata absence while asynchronous free-version
+    /// cleanup removes the per-disk copies. Mid-cleanup, fewer than a read
+    /// quorum of disks may still hold the record, so that transient result
+    /// means "not converged yet"; every other error still fails the test.
+    #[cfg(feature = "test-util")]
+    async fn exact_metadata_absent_during_cleanup(store: &crate::store::ECStore, bucket: &str, object: &str) -> bool {
+        match store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+        {
+            Ok(metadata) => metadata.is_none(),
+            Err(StorageError::InsufficientReadQuorum(_, _)) => false,
+            Err(error) => panic!("{object} cleanup metadata should remain readable: {error:?}"),
+        }
     }
 
     #[cfg(feature = "test-util")]
@@ -12702,7 +12720,7 @@ mod tests {
                 .await
                 .expect("restored transitioned source should remain readable");
             assert!(
-                restored.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                restored.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE),
                 "restore completion metadata must be present before the delete regression"
             );
         }
@@ -15807,20 +15825,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = {
-                    // Synchronize with cleanup so the snapshot cannot span per-disk marker removal.
-                    let mut read_opts = ObjectOptions::default();
-                    let _guards = store
-                        .acquire_all_physical_object_read_locks("batch_transitioned_delete_test", bucket, causal, &mut read_opts)
-                        .await
-                        .expect("causal batch cleanup observation should acquire object read locks");
-                    store.pools[0]
-                        .get_disks_by_key(causal)
-                        .load_file_info_versions_exact(bucket, causal)
-                        .await
-                        .expect("causal batch cleanup metadata should remain readable")
-                        .is_none()
-                };
+                let metadata_absent = exact_metadata_absent_during_cleanup(&store, bucket, causal).await;
                 if metadata_absent && backend.remove_versions().await.len() >= 2 {
                     return;
                 }
@@ -15899,24 +15904,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let metadata_absent = {
-                    let mut read_opts = ObjectOptions::default();
-                    let _guards = store
-                        .acquire_all_physical_object_read_locks(
-                            "batch_transitioned_delete_test",
-                            bucket,
-                            versioned_causal,
-                            &mut read_opts,
-                        )
-                        .await
-                        .expect("versioned causal batch cleanup observation should acquire object read locks");
-                    store.pools[0]
-                        .get_disks_by_key(versioned_causal)
-                        .load_file_info_versions_exact(bucket, versioned_causal)
-                        .await
-                        .expect("versioned causal batch cleanup metadata should remain readable")
-                        .is_none()
-                };
+                let metadata_absent = exact_metadata_absent_during_cleanup(&store, bucket, versioned_causal).await;
                 if metadata_absent && backend.remove_versions().await.len() == 3 {
                     return;
                 }
@@ -17067,11 +17055,11 @@ mod tests {
                 &ObjectOptions {
                     user_defined: HashMap::from([
                         (
-                            s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(),
                             s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                         ),
                         (
-                            s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                             "2099-01-01T00:00:00Z".to_string(),
                         ),
                     ]),

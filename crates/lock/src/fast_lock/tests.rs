@@ -112,6 +112,40 @@ mod fast_lock_tests {
     }
 
     #[tokio::test]
+    async fn current_lock_counts_report_live_holders_and_waiters() {
+        let manager = Arc::new(create_test_manager());
+        let key = ObjectKey::new("test-bucket", "contended-object");
+        let holder = manager
+            .acquire_read_lock(key.clone(), Arc::<str>::from("holder"))
+            .await
+            .expect("read holder");
+        let second_holder = manager
+            .acquire_read_lock(key.clone(), Arc::<str>::from("second-holder"))
+            .await
+            .expect("second read holder");
+
+        let waiter_manager = manager.clone();
+        let waiter = tokio::spawn(async move { waiter_manager.acquire_write_lock(key, Arc::<str>::from("waiter")).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.current_lock_counts() == (2, 1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer waiter should be observed");
+
+        drop(holder);
+        drop(second_holder);
+        let acquired = waiter.await.expect("waiter task").expect("waiting writer should acquire");
+        assert_eq!(manager.current_lock_counts(), (1, 0));
+        drop(acquired);
+        assert_eq!(manager.current_lock_counts(), (0, 0));
+    }
+
+    #[tokio::test]
     async fn test_lock_auto_release_on_drop() {
         let manager = create_test_manager();
         let key = ObjectKey::new("test-bucket", "test-object");

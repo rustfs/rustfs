@@ -358,11 +358,13 @@ async fn crash_child(root: PathBuf, replay: bool) {
                 && processed > 0
             {
                 assert!(processed < 64, "crash must interrupt a partial traversal");
-                std::fs::write(
-                    root.join("acknowledged.json"),
-                    serde_json::to_vec(&value["outcome"]).expect("acknowledged outcome"),
-                )
-                .expect("signal committed work");
+                // The parent may kill us as soon as the final path exists.
+                let mut acknowledged = tempfile::NamedTempFile::new_in(&root).expect("acknowledgement staging file");
+                serde_json::to_writer(acknowledged.as_file_mut(), &value["outcome"]).expect("write acknowledged outcome");
+                acknowledged.as_file().sync_all().expect("sync acknowledged outcome");
+                acknowledged
+                    .persist(root.join("acknowledged.json"))
+                    .expect("signal committed work");
                 // Freeze the current-thread executor at an acknowledged boundary
                 // until the parent kills the process without running destructors.
                 loop {

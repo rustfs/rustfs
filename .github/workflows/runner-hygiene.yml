@@ -78,4 +78,4 @@ jobs:
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

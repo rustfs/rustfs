@@ -140,7 +140,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
 
     def test_workflow_wiring(self) -> None:
         names = list(self.steps)
-        self.assertLess(names.index("Checkout repository (for the OIDC live gate script)"), names.index("Checkout auto-testing scripts (with retry)"))
+        self.assertLess(names.index("Checkout repository (for the OIDC live gate script)"), names.index("Checkout auto-testing scripts"))
         self.assertNotIn("    continue-on-error: true", self.job)
         self.assertIn("        continue-on-error: true", self.steps["Run security suite"])
         for name in ("Initialize security evidence", "Generate report"):
@@ -297,7 +297,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertIn("issue_manager.py not found", result.stdout + result.stderr)
             self.assertFalse(body.exists())
 
-    def test_all_ten_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
+    def test_all_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
         for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
@@ -315,7 +315,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 cleanup = named_steps(yaml_block(source, "jobs", 0))[cleanup_name]
                 self.assertTrue(any(line.startswith("        if:") and "always()" in line for line in cleanup))
 
-    def test_root_dispatches_only_upgrade_and_replication_hands_off_after_failure(self) -> None:
+    def test_legacy_replication_hands_off_after_failure(self) -> None:
         for failed_attempts, issue_exit, token in ((0, 0, "fixture"), (2, 0, "fixture"), (3, 0, "fixture"), (3, 7, "fixture"), (0, 0, "")):
             with self.subTest(failed_attempts=failed_attempts, issue_exit=issue_exit, token=bool(token)):
                 self.setUp()
@@ -361,16 +361,6 @@ fi
                     RUSTFS_NIGHTLY_PACKAGE_URL="https://example.invalid/package.deb",
                 )
                 self.context.update({"secrets.PF_TESTING_GH_TOKEN": "fixture", "inputs.suite": "all"})
-                driver = (ROOT / ".github/workflows/rustfs-functional-chain.yml").read_text()
-                self.steps = named_steps(yaml_block(driver.splitlines(), "start-chain", 2))
-                self.assertEqual(list(self.steps), ["Dispatch first suite (upgrade)"])
-                started = self.run_step("Dispatch first suite (upgrade)")
-                self.assertEqual(started.returncode, 0, started.stderr)
-                self.assertEqual(dispatches.read_text().splitlines(), [
-                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-upgrade -F client_payload[from_suite]=nightly-build",
-                ])
-                dispatches.unlink()
-
                 replication = (ROOT / ".github/workflows/rustfs-replication-test.yml").read_text()
                 job = yaml_block(replication.splitlines(), "replication-test", 2)
                 self.assertFalse(any(line.startswith("    continue-on-error:") for line in job))
@@ -434,11 +424,17 @@ class FunctionalWorkflowTests(unittest.TestCase):
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
-                self.assertIn(condition, (
-                    "if: always()",
-                    "if: ${{ always() && inputs.cleanup_after != 'false' }}",
-                    "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
-                ))
+                if suite == "pool-expand":
+                    self.assertEqual(condition, "if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' }}")
+                    self.assertIn("        id: topology", steps["Validate pool topology before destructive cleanup"])
+                    self.assertLess(list(steps).index("Validate pool topology before destructive cleanup"),
+                                    list(steps).index("Cleanup environment (before)"))
+                else:
+                    self.assertIn(condition, (
+                        "if: always()",
+                        "if: ${{ always() && inputs.cleanup_after != 'false' }}",
+                        "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
+                    ))
                 if suite != "performance":
                     handoff = next(
                         value for name, value in steps.items() if name.startswith("Continue functional chain")
@@ -468,6 +464,8 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 steps = named_steps(yaml_block(source.splitlines(), self.JOBS[suite], 2))
                 context = {"github.event_name": "repository_dispatch", "steps.test.outcome": "failure"}
+                if suite == "table":
+                    context["steps.chain_package.outputs.package_url || inputs.package_url"] = env["RUSTFS_NIGHTLY_PACKAGE_URL"]
                 for expression in re.findall(r"\$\{\{\s*(.*?)\s*\}\}", source):
                     if expression.startswith("inputs.") and re.fullmatch(r"inputs\.\w+", expression):
                         context[expression] = ""
@@ -601,10 +599,15 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 self.prepare(suite)
                 self.assertNotIn("/tmp/rustfs-", self.source)
                 names = list(self.steps)
-                self.assertLess(names.index("Initialize functional evidence"), names.index("Checkout auto-testing scripts (with retry)"))
+                self.assertLess(names.index("Initialize functional evidence"), names.index("Checkout auto-testing scripts"))
                 if suite in FunctionalWorkflowTests.DIRECT_TESTS:
-                    self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts (with retry)"))
+                    self.assertLess(names.index("Checkout repository (for report parser)"), names.index("Checkout auto-testing scripts"))
                 for name, lines in self.steps.items():
+                    if name == "Upload chain evidence":
+                        self.assertIn("        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}", lines)
+                        self.assertIn("        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}", self.steps["Record chain evidence"])
+                        self.assertIn("          if-no-files-found: error", lines)
+                        continue
                     if name in ("Generate report", "Upload functional report to dashboard") or any("uses: actions/upload-artifact@" in line for line in lines):
                         self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", lines)
                     if any("uses: actions/upload-artifact@" in line for line in lines):
