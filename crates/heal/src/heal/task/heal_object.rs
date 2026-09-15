@@ -181,7 +181,10 @@ impl HealTask {
         match heal_result {
             Ok(storage_result) => {
                 if let Some(resolved_version_id) = storage_result.item.resolved_version_id {
-                    expected_identity.version_id = Some(Uuid::from_bytes(resolved_version_id).to_string());
+                    let resolved_version = Uuid::from_bytes(resolved_version_id);
+                    if !resolved_version.is_nil() {
+                        expected_identity.version_id = Some(resolved_version.to_string());
+                    }
                 }
                 let result = storage_result.item;
                 let error = storage_result.error;

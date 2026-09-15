@@ -123,12 +123,17 @@ fn verified_object_receipt(
     if !item.after.drives.iter().all(|drive| drive.state == ok_drive_state) {
         return None;
     }
+    let receipt_version_id = if resolved_version.is_nil() {
+        version_id.filter(|version| !version.is_empty()).map(ToOwned::to_owned)
+    } else {
+        Some(resolved_version.to_string())
+    };
     Some(HealObjectReceipt {
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
             object: object.to_string(),
-            version_id: Some(resolved_version.to_string()),
+            version_id: receipt_version_id,
             bucket_incarnation_id: Some(bucket_incarnation_id),
             pool_index: opts.pool,
             set_index: opts.set,
@@ -1841,6 +1846,12 @@ mod tests {
         assert_eq!(receipt.identity.version_id.as_deref(), Some(latest_version.as_str()));
 
         item.resolved_version_id = Some([0; 16]);
+        let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("an omitted selector should preserve unversioned identity");
+        assert_eq!(receipt.identity.version_id, None);
+        let receipt = verified_object_receipt("bucket", "object", Some(""), &options, &item, incarnation)
+            .expect("an empty selector should preserve unversioned identity");
+        assert_eq!(receipt.identity.version_id, None);
         let receipt = verified_object_receipt("bucket", "object", Some(&null), &options, &item, incarnation)
             .expect("the exact healthy null version should be certifiable");
         assert_eq!(receipt.identity.version_id.as_deref(), Some(null.as_str()));
