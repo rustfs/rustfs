@@ -121,6 +121,27 @@ message WriteAllResponse {
   optional Error error = 2;
 }
 
+message CompareAndUpdateFileRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  optional bytes expected = 4;
+  optional bytes replacement = 5;
+}
+
+enum CompareAndUpdateFileOutcome {
+  COMPARE_AND_UPDATE_FILE_UNSPECIFIED = 0;
+  COMPARE_AND_UPDATE_FILE_UPDATED = 1;
+  COMPARE_AND_UPDATE_FILE_MISSING = 2;
+  COMPARE_AND_UPDATE_FILE_MISMATCH = 3;
+}
+
+message CompareAndUpdateFileResponse {
+  bool success = 1;
+  CompareAndUpdateFileOutcome outcome = 2;
+  optional Error error = 3;
+}
+
 message DeleteRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
@@ -1190,6 +1211,7 @@ service NodeService {
 
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
+  rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound

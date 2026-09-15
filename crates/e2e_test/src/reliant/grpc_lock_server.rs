@@ -409,6 +409,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn compare_and_update_file(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::CompareAndUpdateFileRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::CompareAndUpdateFileResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn delete(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::DeleteRequest>,

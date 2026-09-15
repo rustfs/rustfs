@@ -59,8 +59,9 @@ use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
+    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
@@ -2327,6 +2328,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
             "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
             "WriteAll" => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            "CompareAndUpdateFile" => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
             _ => INTERNODE_OPERATION_GRPC_OTHER,
         };
         global_internode_metrics().record_rpc_auth_failure_for_operation_and_backend(
