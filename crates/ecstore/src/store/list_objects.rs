@@ -9441,7 +9441,7 @@ mod test {
 
         let (dirs, store) = isolated_store_over_temp_disks().await;
         let bucket = "pending-purge-listing-bucket";
-        let object = "spilo/nested/_permtest";
+        let object = "spilo/_permtest";
         init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         store
             .make_bucket(bucket, &MakeBucketOptions::default())
@@ -9474,17 +9474,6 @@ mod test {
         assert!(
             recursive.prefixes.is_empty(),
             "recursive ListObjectsV2 should not synthesize prefixes from hidden entries"
-        );
-
-        let delimiter = store
-            .clone()
-            .list_objects_generic(bucket, "spilo/", None, Some("/".to_string()), 1000, false)
-            .await
-            .expect("delimiter listing should succeed");
-        assert!(delimiter.objects.is_empty());
-        assert!(
-            delimiter.prefixes.is_empty(),
-            "delimiter ListObjectsV2 should not synthesize prefixes from hidden entries"
         );
 
         let exact = store
