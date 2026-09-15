@@ -625,6 +625,7 @@ impl SetDisks {
         }
     }
 
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_info_fileinfo_and_quorum(
         &self,
         bucket: &str,

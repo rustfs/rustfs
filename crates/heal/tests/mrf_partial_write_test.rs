@@ -30,7 +30,7 @@ use tokio::io::AsyncReadExt;
 mod storage_api;
 use storage_api::endpoint_index::{EndpointServerPools, Endpoints, init_local_disks};
 use storage_api::integration::{
-    DiskAPI, DiskStore, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
+    DiskAPI, DiskError, DiskStore, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
 };
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
@@ -348,15 +348,12 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
             );
             assert!(snapshot_contains("new.bin").await);
             assert!(snapshot_contains("versioned.bin").await);
-            manager.stop().await.expect("test manager should stop");
             let before_purge = inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
                 .await
                 .expect("legacy checkpoint must validate")
-                .expect("unverified legacy responsibility must remain")
-                .payload()
-                .to_vec();
+                .expect("unverified legacy responsibility must remain");
             // Deleting an existing marker by VersionId removes a version; it
-            // must not create a new partial-write repair responsibility.
+            // must persist a purge so the returning members cannot resurrect it.
             for path in &env.disk_paths[12..] {
                 tokio::fs::rename(path, path.with_extension("offline"))
                     .await
@@ -380,14 +377,14 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
                 )
                 .await
                 .expect("explicit marker purge should retain quorum");
-            assert_eq!(
+            assert!(
                 inspect_local_committed_snapshot(SNAPSHOT_LIMIT)
                     .await
                     .expect("purge checkpoint must validate")
-                    .expect("existing legacy checkpoint must remain")
-                    .payload(),
-                before_purge,
-                "a physical marker purge must not add a marker creation repair"
+                    .expect("purge responsibility must be committed")
+                    .sequence()
+                    > before_purge.sequence(),
+                "a degraded marker purge must commit a successor checkpoint"
             );
             for (path, disk) in env.disk_paths[12..].iter().zip(&all[12..]) {
                 tokio::fs::remove_file(path).await.expect("remove purge outage sentinel");
@@ -397,6 +394,23 @@ async fn partial_write_ec12_4_ack_rejoin_repairs_versions_and_delete_marker_inne
                 disk.reset_health_for_store_init_retry();
             }
             *set.disks.write().await = all.iter().cloned().map(Some).collect();
+            assert!(
+                wait_until(|| async {
+                    let results = futures::future::join_all(all.iter().map(|disk| async {
+                        disk.read_version("", "partial-versions", "versioned.bin", &marker, &ReadOptions::default())
+                            .await
+                    }))
+                    .await;
+                    results
+                        .iter()
+                        .all(|result| matches!(result, Err(DiskError::FileVersionNotFound)))
+                })
+                .await,
+                "MRF must complete the marker purge on the returning members"
+            );
+            assert_payload(&env, "partial-versions", "versioned.bin", Some(&first), &payload1).await;
+            assert_payload(&env, "partial-versions", "versioned.bin", Some(&second), &payload2).await;
+            manager.stop().await.expect("test manager should stop");
         },
     )
     .await;
