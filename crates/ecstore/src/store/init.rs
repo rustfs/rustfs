@@ -12465,12 +12465,25 @@ mod tests {
         if causal_enqueue {
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    let metadata_absent = store.pools[0]
-                        .get_disks_by_key(object)
-                        .load_file_info_versions_exact(bucket, object)
-                        .await
-                        .expect("causal free-version cleanup metadata should remain readable")
-                        .is_none();
+                    let metadata_absent = {
+                        // Observe one cleanup state, without spanning per-disk marker removal.
+                        let mut read_opts = ObjectOptions::default();
+                        let _guards = store
+                            .acquire_all_physical_object_read_locks(
+                                "transitioned_delete_cleanup_test",
+                                bucket,
+                                object,
+                                &mut read_opts,
+                            )
+                            .await
+                            .expect("causal free-version cleanup observation should acquire object read locks");
+                        store.pools[0]
+                            .get_disks_by_key(object)
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .expect("causal free-version cleanup metadata should remain readable")
+                            .is_none()
+                    };
                     if metadata_absent && backend.remove_versions().await.len() == 1 {
                         return;
                     }
