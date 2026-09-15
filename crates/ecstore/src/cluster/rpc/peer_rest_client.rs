@@ -48,14 +48,14 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
-    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
-    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
-    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
-    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
-    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
-    tier_mutation_control_service_client::TierMutationControlServiceClient,
+    LocalStorageInfoRequest, Mss, PingRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
+    ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest,
+    ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+    ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse,
+    ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
+    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
@@ -2760,6 +2760,21 @@ impl PeerRestClient {
 
         let response = match client.load_transition_tier_config(request).await {
             Ok(response) => response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated && status.message() == "RPC peer replay capability changed" =>
+            {
+                // A restart can revoke the pinned capability. A signed read-only probe
+                // lets the peer prove its new epoch without bypassing the mutation guard.
+                let mut probe = Request::new(PingRequest {
+                    version: 1,
+                    body: Bytes::new(),
+                });
+                probe.set_timeout(rustfs_protos::heal_control_execution_timeout());
+                return match client.ping(probe).await {
+                    Ok(_) => TierConfigReloadOutcome::TransientRetrySameChannel(status.into()),
+                    Err(probe_status) => tier_config_reload_status_outcome(probe_status),
+                };
+            }
             Err(status) => return tier_config_reload_status_outcome(status),
         };
         if !response.success {
