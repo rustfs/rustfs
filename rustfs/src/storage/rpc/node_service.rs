@@ -5592,6 +5592,201 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn target_delete_quorum_failure_restores_remote_marker_and_retries_fail() {
+        use crate::storage::storage_api::{
+            contract::object::ObjectOperations,
+            ecstore_disk::{DeleteOptions, DiskOption, ReadOptions, new_disk},
+            ecstore_error::StorageError,
+            init_local_disks_with_instance_ctx,
+        };
+
+        let fixture = target_rpc_fixture().await;
+        let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind DELETE target");
+        let addr = listener.local_addr().expect("target address");
+        let set = fixture.env.ecstore.all_set_disks().into_iter().next().expect("erasure set");
+        let mut endpoints = fixture.env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut remote_endpoint = Endpoint::try_from(format!("http://{addr}{}", fixture.env.disk_paths[0].display()).as_str())
+            .expect("remote endpoint");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(0);
+        remote_endpoint.is_local = true;
+        endpoints[0] = remote_endpoint.clone();
+        let mut pool = fixture.env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints.clone());
+        init_local_disks_with_instance_ctx(&fixture.instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register target endpoint using the same disk directories");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let mut local_disks = Vec::new();
+        for endpoint in &endpoints {
+            local_disks.push(service.find_disk(&endpoint.to_string()).await.expect("registered disk"));
+        }
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // The production handler and protobuf transport are exercised here; authentication
+            // middleware has separate coverage. The client still supplies the canonical digest.
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("DELETE target server");
+        });
+        remote_endpoint.is_local = false;
+        let remote = new_disk(
+            &remote_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("remote disk client");
+        assert!(!remote.is_local());
+
+        let bucket = "delete-quorum-rpc";
+        let object = "versioned-object";
+        let payload = Bytes::from(vec![b'x'; 4096]);
+        let mut original = rustfs_filemeta::FileInfo::new(object, 1, 0);
+        original.erasure.index = 1;
+        original.version_id = Some(Uuid::new_v4());
+        original.mod_time = Some(OffsetDateTime::now_utc());
+        original.size = i64::try_from(payload.len()).expect("payload length fits metadata");
+        original.parts = vec![rustfs_filemeta::ObjectPartInfo {
+            number: 1,
+            size: payload.len(),
+            actual_size: original.size,
+            ..Default::default()
+        }];
+        original.data = Some(payload.clone());
+        original.set_inline_data();
+        let mut before = Vec::new();
+        for disk in &local_disks {
+            disk.make_volume(bucket).await.expect("create target bucket");
+            disk.write_metadata(bucket, bucket, object, original.clone())
+                .await
+                .expect("seed existing version");
+            before.push(
+                tokio::fs::read(disk.path().join(bucket).join(object).join("xl.meta"))
+                    .await
+                    .expect("original metadata"),
+            );
+        }
+        let marker = rustfs_filemeta::FileInfo {
+            name: object.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mark_deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let rollback_dir = Uuid::new_v4();
+        remote
+            .delete_version(
+                bucket,
+                object,
+                marker.clone(),
+                true,
+                DeleteOptions {
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("forward RPC must really publish a marker");
+        let remote_object_dir = local_disks[0].path().join(bucket).join(object);
+        assert_ne!(
+            tokio::fs::read(remote_object_dir.join("xl.meta"))
+                .await
+                .expect("remote metadata"),
+            before[0]
+        );
+        assert!(remote_object_dir.join(rollback_dir.to_string()).join("xl.meta.bkp").exists());
+        let undo = DeleteOptions {
+            undo_write: true,
+            undo_delete: true,
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+        let rejected = remote
+            .delete_version(bucket, object, marker.clone(), true, undo.clone())
+            .await
+            .expect_err("forward marker flag must remain forbidden for RPC undo");
+        assert!(rejected.to_string().contains("undo_write cannot force a delete marker"));
+        remote
+            .delete_version(bucket, object, marker, false, undo)
+            .await
+            .expect("legal RPC undo must restore the existing version");
+        assert_eq!(
+            tokio::fs::read(remote_object_dir.join("xl.meta"))
+                .await
+                .expect("remote metadata"),
+            before[0]
+        );
+        assert!(!remote_object_dir.join(rollback_dir.to_string()).exists());
+
+        *set.disks.write().await = vec![Some(remote.clone()), Some(local_disks[1].clone()), None, None];
+        for _ in 0..3 {
+            let marker = rustfs_filemeta::FileInfo {
+                name: object.to_string(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mark_deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let result = set.delete_object_version(bucket, object, &marker, true).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(StorageError::InsufficientWriteQuorum(error_bucket, error_object))
+                        if error_bucket == bucket && error_object == object
+                ),
+                "{result:?}"
+            );
+            for (disk, expected) in local_disks.iter().zip(&before) {
+                let object_dir = disk.path().join(bucket).join(object);
+                assert_eq!(
+                    tokio::fs::read(object_dir.join("xl.meta")).await.expect("restored metadata"),
+                    *expected,
+                    "failed quorum must restore local and remote metadata exactly"
+                );
+                let mut entries = tokio::fs::read_dir(&object_dir).await.expect("object directory");
+                while let Some(entry) = entries.next_entry().await.expect("object entry") {
+                    assert_eq!(entry.file_name(), "xl.meta", "no rollback directory may remain");
+                }
+                let restored = disk
+                    .read_version(
+                        bucket,
+                        bucket,
+                        object,
+                        "",
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("latest must remain the original version");
+                assert_eq!(restored.version_id, original.version_id);
+                assert!(!restored.deleted);
+                assert_eq!(restored.data, Some(payload.clone()));
+            }
+        }
+        *set.disks.write().await = local_disks.into_iter().map(Some).collect();
+        remote.close().await.expect("close remote client");
+        let _ = shutdown.send(());
+        super::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server shuts down")
+            .expect("server task");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn target_handler_cancellation_retains_namespace_through_physical_rename() {
         use crate::storage::storage_api::{
             LocalPublicationPause, LocalPublicationStage,
