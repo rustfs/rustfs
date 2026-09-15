@@ -41,6 +41,11 @@ const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub(crate) type PartialResultFn = Box<
+    dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = disk::error::Result<()>> + Send>>
+        + Send
+        + 'static,
+>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Clone, Default)]
@@ -294,7 +299,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, None).await
+    list_path_raw_inner(rx, opts, None, None).await
 }
 
 pub(crate) async fn list_path_raw_with_claim_tracker(
@@ -304,13 +309,25 @@ pub(crate) async fn list_path_raw_with_claim_tracker(
 ) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, Some(claim_tracker)).await
+    list_path_raw_inner(rx, opts, Some(claim_tracker), None).await
+}
+
+pub(crate) async fn list_path_raw_with_partial_result(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+    claim_tracker: FallbackClaimTracker,
+    partial_result: PartialResultFn,
+) -> disk::error::Result<()> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
+    list_path_raw_inner(rx, opts, Some(claim_tracker), Some(partial_result)).await
 }
 
 async fn list_path_raw_inner(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     fallback_claim_tracker: Option<FallbackClaimTracker>,
+    partial_result: Option<PartialResultFn>,
 ) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
         return Err(DiskError::ErasureReadQuorum);
@@ -947,7 +964,13 @@ async fn list_path_raw_inner(
                 }
             }
 
-            if let Some(partial_fn) = opts.partial.as_ref() {
+            if let Some(partial_fn) = partial_result.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = revjob_rx.cancelled() => return Ok(()),
+                    result = partial_fn(MetaCacheEntries(top_entries), &errs) => result?,
+                }
+            } else if let Some(partial_fn) = opts.partial.as_ref() {
                 tokio::select! {
                     biased;
                     _ = revjob_rx.cancelled() => return Ok(()),
@@ -1586,6 +1609,39 @@ mod tests {
         timeout(Duration::from_secs(1), stopped.notified())
             .await
             .expect("aborting the listing should drop the blocked producer");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_propagates_partial_callback_failure() {
+        let first = MetaCacheEntry {
+            name: "bucket/object-a".to_string(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let second = MetaCacheEntry {
+            name: "bucket/object-b".to_string(),
+            metadata: vec![2],
+            ..Default::default()
+        };
+
+        let err = list_path_raw_with_partial_result(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![first]),
+                    TestReaderBehavior::Entries(vec![second]),
+                ],
+                ..Default::default()
+            },
+            FallbackClaimTracker::default(),
+            Box::new(move |_, _| Box::pin(async { Err(DiskError::ErasureReadQuorum) })),
+        )
+        .await
+        .expect_err("a resolution failure after reader advancement must fail the listing");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[tokio::test]
