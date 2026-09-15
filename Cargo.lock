@@ -4036,7 +4036,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-utils",
  "rustls",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -4989,6 +4989,36 @@ dependencies = [
  "http 1.5.0",
  "indexmap 2.14.2",
  "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "h3"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http 1.5.0",
+ "pin-project-lite",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "h3-quinn"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
+dependencies = [
+ "bytes",
+ "futures",
+ "h3",
+ "quinn",
  "tokio",
  "tokio-util",
  "tracing",
@@ -8650,6 +8680,16 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
@@ -8668,6 +8708,7 @@ checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
 dependencies = [
  "bytes",
  "cfg_aliases",
+ "futures-io",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
@@ -9537,7 +9578,7 @@ dependencies = [
  "proptest",
  "prost 0.14.4",
  "pyroscope",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rand 0.10.2",
  "rcgen",
  "regex",
@@ -9594,7 +9635,8 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
- "s3s",
+ "s3s 0.16.0",
+ "s3s-http3",
  "s3s-sigv4",
  "serde",
  "serde_json",
@@ -9838,7 +9880,7 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "serial_test",
@@ -10192,7 +10234,7 @@ dependencies = [
  "rustfs-replication",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
- "s3s",
+ "s3s 0.16.0",
  "serial_test",
  "temp-env",
  "time",
@@ -10255,7 +10297,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rustfs-signer",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "sysinfo",
@@ -10295,7 +10337,7 @@ dependencies = [
  "jiff",
  "metrics",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rayon",
  "rustc-hash",
  "rustfs-config",
@@ -10482,7 +10524,7 @@ dependencies = [
  "rustfs-trusted-proxies",
  "rustfs-utils",
  "rustls",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -10538,7 +10580,7 @@ dependencies = [
  "regex",
  "rmp",
  "rmp-serde",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "time",
  "tokio",
@@ -10630,7 +10672,7 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rand 0.10.2",
  "rustfs-checksums",
  "rustfs-config",
@@ -10641,7 +10683,7 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "rustls-pki-types",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -10695,7 +10737,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-storage-api",
  "rustfs-test-utils",
- "s3s",
+ "s3s 0.16.0",
  "serde_json",
  "serial_test",
  "thiserror 2.0.20",
@@ -10722,7 +10764,7 @@ dependencies = [
  "parking_lot",
  "rustfs-s3select-api",
  "rustfs-test-utils",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "tokio",
@@ -10759,7 +10801,7 @@ dependencies = [
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
  "rustfs-utils",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "serial_test",
@@ -10808,7 +10850,7 @@ dependencies = [
  "http 1.5.0",
  "hyper",
  "rustfs-utils",
- "s3s",
+ "s3s 0.16.0",
  "serde_urlencoded",
  "thiserror 2.0.20",
  "time",
@@ -10866,7 +10908,7 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "rustls-native-certs",
- "s3s",
+ "s3s 0.16.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -11094,6 +11136,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -11211,6 +11254,60 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3s"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "652451a66fefda01a13dc7df24aa2af9e70c7058f98bc08fe2f7c552eaa9f1e3"
+dependencies = [
+ "arc-swap",
+ "arrayvec",
+ "async-trait",
+ "atoi 3.1.0",
+ "base64-simd",
+ "bytes",
+ "bytestring",
+ "cfg-if",
+ "chrono",
+ "crc-fast",
+ "futures",
+ "hex-simd",
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "itoa",
+ "md-5 0.11.0",
+ "memchr",
+ "mime",
+ "nom 8.0.0",
+ "numeric_cast",
+ "pin-project-lite",
+ "quick-xml 0.41.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "smallvec",
+ "std-next",
+ "subtle",
+ "sync_wrapper",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "transform-stream",
+ "url",
+ "urlencoding",
+ "xxhash-rust",
+ "zeroize",
+]
+
+[[package]]
+name = "s3s"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d29a4db6a51f1cd3269a36354ce4aa7db2be8816cee42a642b9c85cd3769577"
@@ -11242,7 +11339,7 @@ dependencies = [
  "numeric_cast",
  "phf 0.14.0",
  "pin-project-lite",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "s3s-rfc2047",
  "s3s-sigv2",
@@ -11266,6 +11363,25 @@ dependencies = [
  "urlencoding",
  "xxhash-rust",
  "zeroize",
+]
+
+[[package]]
+name = "s3s-http3"
+version = "0.16.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eccfc022764a1f21ba6e8b589b4428771c465b3110808296bb23e73a5dcf922b"
+dependencies = [
+ "bytes",
+ "h3",
+ "h3-quinn",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "quinn",
+ "s3s 0.15.0",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
