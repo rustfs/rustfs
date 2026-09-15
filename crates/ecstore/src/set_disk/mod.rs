@@ -4408,6 +4408,37 @@ impl SetDisks {
         .with_attempt(attempt))
     }
 
+    pub(crate) async fn read_listing_metadata_after_namespace_barrier(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+    ) -> Result<(MetaCacheEntries, usize)> {
+        // This is only called after the lock-free LIST fast path observes an
+        // unresolved metadata generation. Waiting on the ordinary object read
+        // lock establishes a publication boundary with concurrent overwrites.
+        let _guard = self.acquire_read_lock_diag("list_object_reconcile", bucket, object).await?;
+        let (raw_entries, errors) = Self::read_all_raw_file_info(disks, bucket, object, false).await;
+        let confirmed_absent = errors
+            .iter()
+            .flatten()
+            .filter(|err| DiskError::is_err_object_not_found(err) || DiskError::is_err_version_not_found(err))
+            .count();
+        let entries = raw_entries
+            .into_iter()
+            .map(|raw| {
+                raw.filter(|raw| !raw.buf.is_empty()).map(|raw| MetaCacheEntry {
+                    name: object.to_owned(),
+                    metadata: raw.buf,
+                    cached: None,
+                    reusable: false,
+                })
+            })
+            .collect();
+
+        Ok((MetaCacheEntries(entries), confirmed_absent))
+    }
+
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
@@ -14552,6 +14583,37 @@ mod tests {
             .await
             .expect_err("the old ETag must fail after the fenced replacement commits");
         assert_eq!(err, StorageError::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn listing_metadata_reconcile_waits_for_namespace_writer() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-list-reconcile-lock";
+        let object = "object";
+        let namespace_lock = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("namespace lock should be created");
+        let writer_guard = namespace_lock
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("writer lock should be acquired");
+        let read = set_disks.read_listing_metadata_after_namespace_barrier(&[], bucket, object);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut read)
+                .await
+                .is_err(),
+            "LIST reconciliation must wait for the publishing writer"
+        );
+        drop(writer_guard);
+
+        let (entries, confirmed_absent) = tokio::time::timeout(std::time::Duration::from_secs(30), read)
+            .await
+            .expect("LIST reconciliation should resume after writer release")
+            .expect("LIST reconciliation should read after the namespace barrier");
+        assert!(entries.0.is_empty());
+        assert_eq!(confirmed_absent, 0);
     }
 
     #[tokio::test]

@@ -26,7 +26,9 @@ use crate::bucket::metadata_sys::{
 };
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
-use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
+use crate::cache_value::metacache_set::{
+    FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
+};
 use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
@@ -2628,20 +2630,74 @@ struct ListingSupplementOptions {
     walkdir_stall_timeout: Option<Duration>,
 }
 
+struct ListingReconciler {
+    set: SetDisks,
+    primary_disks: Arc<Vec<DiskStore>>,
+    fallback_disks: Arc<Vec<DiskStore>>,
+}
+
+impl ListingReconciler {
+    async fn read_after_namespace_barrier(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> std::result::Result<(MetaCacheEntries, usize), DiskError> {
+        let disks = self
+            .primary_disks
+            .iter()
+            .chain(self.fallback_disks.iter())
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>();
+
+        self.set
+            .read_listing_metadata_after_namespace_barrier(&disks, bucket, object)
+            .await
+            .map_err(|_| DiskError::ErasureReadQuorum)
+    }
+}
+
 struct ListingSupplement {
     options: ListingSupplementOptions,
     fallback_disks: Arc<Vec<DiskStore>>,
     claim_tracker: FallbackClaimTracker,
     entries: Option<Arc<OnceCell<FallbackListingEntries>>>,
+    reconciler: Option<ListingReconciler>,
 }
 
 impl ListingSupplement {
+    #[cfg(test)]
     fn new(
         options: ListingSupplementOptions,
         fallback_disks: Arc<Vec<DiskStore>>,
         claim_tracker: FallbackClaimTracker,
     ) -> Arc<Self> {
-        let entries = if options.per_disk_limit > 0 {
+        Self::new_inner(options, fallback_disks, claim_tracker, None)
+    }
+
+    fn new_with_reconciler(
+        options: ListingSupplementOptions,
+        fallback_disks: Arc<Vec<DiskStore>>,
+        claim_tracker: FallbackClaimTracker,
+        set: SetDisks,
+        primary_disks: Arc<Vec<DiskStore>>,
+    ) -> Arc<Self> {
+        let reconciler = ListingReconciler {
+            set,
+            primary_disks,
+            fallback_disks: fallback_disks.clone(),
+        };
+
+        Self::new_inner(options, fallback_disks, claim_tracker, Some(reconciler))
+    }
+
+    fn new_inner(
+        options: ListingSupplementOptions,
+        fallback_disks: Arc<Vec<DiskStore>>,
+        claim_tracker: FallbackClaimTracker,
+        reconciler: Option<ListingReconciler>,
+    ) -> Arc<Self> {
+        let entries: Option<Arc<OnceCell<FallbackListingEntries>>> = if options.per_disk_limit > 0 {
             Some(Arc::new(OnceCell::new()))
         } else {
             None
@@ -2652,11 +2708,32 @@ impl ListingSupplement {
             fallback_disks,
             claim_tracker,
             entries,
+            reconciler,
         })
     }
 
     fn is_empty(&self) -> bool {
         self.fallback_disks.is_empty()
+    }
+
+    async fn reconcile_object(
+        &self,
+        object: &str,
+        resolver: MetadataResolutionParams,
+        enforce_write_quorum: bool,
+    ) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
+        let Some(reconciler) = &self.reconciler else {
+            return Ok(None);
+        };
+        let (entries, confirmed_absent) = reconciler.read_after_namespace_barrier(&self.options.bucket, object).await?;
+        if let Some(entry) = resolve_listing_entries(entries, resolver.clone(), enforce_write_quorum) {
+            return Ok(Some(entry));
+        }
+        if confirmed_absent >= resolver.obj_quorum {
+            return Ok(None);
+        }
+
+        Err(DiskError::ErasureReadQuorum)
     }
 
     async fn entries_for(&self, object: &str) -> Vec<Option<MetaCacheEntry>> {
@@ -2896,11 +2973,25 @@ fn cached_entry_needs_supplement(
     false
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ListingSupplementTarget {
+    Directory(String),
+    Object(String),
+}
+
+impl ListingSupplementTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::Directory(name) | Self::Object(name) => name,
+        }
+    }
+}
+
 fn listing_entries_supplement_target(
     entries: &MetaCacheEntries,
     resolver: &MetadataResolutionParams,
     enforce_write_quorum: bool,
-) -> Option<String> {
+) -> Option<ListingSupplementTarget> {
     if !enforce_write_quorum {
         return None;
     }
@@ -2915,7 +3006,7 @@ fn listing_entries_supplement_target(
         // A committed child may have some of its directory copies only on
         // fallback disks, just like object metadata in a partial primary sample.
         if directory_copies < resolver.dir_quorum {
-            return Some(directory.name.clone());
+            return Some(ListingSupplementTarget::Directory(directory.name.clone()));
         }
     }
 
@@ -2946,14 +3037,14 @@ fn listing_entries_supplement_target(
         // A split primary sample can fall back to an older version even when a
         // newer version reaches write quorum only after the fallback disks join.
         if entries_disagree {
-            return Some(entry.name.clone());
+            return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
 
         let mut entry = entry.clone();
         if let Ok(cached) = entry.xl_meta()
             && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
         {
-            return Some(entry.name);
+            return Some(ListingSupplementTarget::Object(entry.name));
         }
     }
 
@@ -2965,16 +3056,22 @@ async fn resolve_listing_entries_with_supplement(
     resolver: MetadataResolutionParams,
     enforce_write_quorum: bool,
     supplement: Arc<ListingSupplement>,
-) -> Option<MetaCacheEntry> {
-    if !supplement.is_empty()
-        && let Some(object) = listing_entries_supplement_target(&entries, &resolver, enforce_write_quorum)
-    {
+) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
+    if let Some(target) = listing_entries_supplement_target(&entries, &resolver, enforce_write_quorum) {
         let mut candidates = entries.0;
-        candidates.extend(supplement.entries_for(&object).await);
-        return resolve_listing_entries(MetaCacheEntries(candidates), resolver, enforce_write_quorum);
+        if !supplement.is_empty() {
+            candidates.extend(supplement.entries_for(target.name()).await);
+        }
+        if let Some(entry) = resolve_listing_entries(MetaCacheEntries(candidates), resolver.clone(), enforce_write_quorum) {
+            return Ok(Some(entry));
+        }
+        return match target {
+            ListingSupplementTarget::Directory(_) => Ok(None),
+            ListingSupplementTarget::Object(object) => supplement.reconcile_object(&object, resolver, enforce_write_quorum).await,
+        };
     }
 
-    resolve_listing_entries(entries, resolver, enforce_write_quorum)
+    Ok(resolve_listing_entries(entries, resolver, enforce_write_quorum))
 }
 
 async fn resolve_agreed_listing_entry_with_supplement(
@@ -4499,6 +4596,7 @@ impl ECStore {
                         }
                     };
                     let fallback_disks = Arc::new(fallback_disks);
+                    let disks = Arc::new(disks);
                     let claim_tracker = FallbackClaimTracker::default();
 
                     let obj_quorum = latest_listing_object_quorum(
@@ -4540,7 +4638,7 @@ impl ECStore {
 
                     let tx1 = sender.clone();
                     let tx2 = sender.clone();
-                    let supplement = ListingSupplement::new(
+                    let supplement = ListingSupplement::new_with_reconciler(
                         ListingSupplementOptions {
                             bucket: bucket.to_owned(),
                             path: path.clone(),
@@ -4556,11 +4654,13 @@ impl ECStore {
                         },
                         fallback_disks.clone(),
                         claim_tracker.clone(),
+                        set.as_ref().clone(),
+                        disks.clone(),
                     );
                     let agreed_supplement = supplement.clone();
                     let partial_supplement = supplement;
 
-                    list_path_raw_with_claim_tracker(
+                    list_path_raw_with_partial_result(
                         rx_clone,
                         ListPathRawOptions {
                             disks: disks.iter().cloned().map(Some).collect(),
@@ -4619,30 +4719,31 @@ impl ECStore {
                                     }
                                 })
                             })),
-                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                                Box::pin({
-                                    let value = tx2.clone();
-                                    let resolver = partial_resolver.clone();
-                                    let supplement = partial_supplement.clone();
-                                    async move {
-                                        if let Some(entry) = resolve_listing_entries_with_supplement(
-                                            entries,
-                                            resolver,
-                                            enforce_write_quorum,
-                                            supplement,
-                                        )
-                                        .await
-                                            && let Err(err) = value.send(entry).await
-                                        {
-                                            error!("list_path send fail {:?}", err);
-                                        }
-                                    }
-                                })
-                            })),
                             finished: None,
                             ..Default::default()
                         },
                         claim_tracker,
+                        Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                            Box::pin({
+                                let value = tx2.clone();
+                                let resolver = partial_resolver.clone();
+                                let supplement = partial_supplement.clone();
+                                async move {
+                                    if let Some(entry) = resolve_listing_entries_with_supplement(
+                                        entries,
+                                        resolver,
+                                        enforce_write_quorum,
+                                        supplement,
+                                    )
+                                    .await?
+                                        && let Err(err) = value.send(entry).await
+                                    {
+                                        error!("list_path send fail {:?}", err);
+                                    }
+                                    Ok(())
+                                }
+                            })
+                        }),
                     )
                     .await
                 });
@@ -5882,6 +5983,7 @@ impl Sets {
                     Vec::new()
                 };
                 let fallback_disks = Arc::new(fallback_disks);
+                let disks = Arc::new(disks);
                 let claim_tracker = FallbackClaimTracker::default();
 
                 let obj_quorum = latest_listing_object_quorum(
@@ -5917,7 +6019,7 @@ impl Sets {
 
                 let tx1 = sender.clone();
                 let tx2 = sender.clone();
-                let supplement = ListingSupplement::new(
+                let supplement = ListingSupplement::new_with_reconciler(
                     ListingSupplementOptions {
                         bucket: bucket.to_owned(),
                         path: path.clone(),
@@ -5933,11 +6035,13 @@ impl Sets {
                     },
                     fallback_disks.clone(),
                     claim_tracker.clone(),
+                    set.as_ref().clone(),
+                    disks.clone(),
                 );
                 let agreed_supplement = supplement.clone();
                 let partial_supplement = supplement;
 
-                list_path_raw_with_claim_tracker(
+                list_path_raw_with_partial_result(
                     rx_clone,
                     ListPathRawOptions {
                         disks: disks.iter().cloned().map(Some).collect(),
@@ -5996,30 +6100,27 @@ impl Sets {
                                 }
                             })
                         })),
-                        partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                            Box::pin({
-                                let value = tx2.clone();
-                                let resolver = partial_resolver.clone();
-                                let supplement = partial_supplement.clone();
-                                async move {
-                                    if let Some(entry) = resolve_listing_entries_with_supplement(
-                                        entries,
-                                        resolver,
-                                        enforce_write_quorum,
-                                        supplement,
-                                    )
-                                    .await
-                                        && let Err(err) = value.send(entry).await
-                                    {
-                                        error!("list_path send fail {:?}", err);
-                                    }
-                                }
-                            })
-                        })),
                         finished: None,
                         ..Default::default()
                     },
                     claim_tracker,
+                    Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                        Box::pin({
+                            let value = tx2.clone();
+                            let resolver = partial_resolver.clone();
+                            let supplement = partial_supplement.clone();
+                            async move {
+                                if let Some(entry) =
+                                    resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement)
+                                        .await?
+                                    && let Err(err) = value.send(entry).await
+                                {
+                                    error!("list_path send fail {:?}", err);
+                                }
+                                Ok(())
+                            }
+                        })
+                    }),
                 )
                 .await
             });
@@ -6910,6 +7011,7 @@ impl SetDisks {
             fallback_disks = disks.split_off(asked_disks);
         }
         let fallback_disks = Arc::new(fallback_disks);
+        let disks = Arc::new(disks);
         let claim_tracker = FallbackClaimTracker::default();
 
         let bucket = opts.bucket.clone();
@@ -6960,7 +7062,7 @@ impl SetDisks {
         let tx2 = sender.clone();
         let cancel_for_send1 = rx.clone();
         let cancel_for_send2 = rx.clone();
-        let supplement = ListingSupplement::new(
+        let supplement = ListingSupplement::new_with_reconciler(
             ListingSupplementOptions {
                 bucket: bucket.clone(),
                 path: opts.base_dir.clone(),
@@ -6976,11 +7078,13 @@ impl SetDisks {
             },
             fallback_disks.clone(),
             claim_tracker.clone(),
+            self.clone(),
+            disks.clone(),
         );
         let agreed_supplement = supplement.clone();
         let partial_supplement = supplement;
 
-        let result = list_path_raw_with_claim_tracker(
+        let result = list_path_raw_with_partial_result(
             rx,
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
@@ -7043,31 +7147,32 @@ impl SetDisks {
                         }
                     })
                 })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                    Box::pin({
-                        let value = tx2.clone();
-                        let resolver = partial_resolver.clone();
-                        let cancel_token = cancel_for_send2.clone();
-                        let supplement = partial_supplement.clone();
-                        async move {
-                            if cancel_token.is_cancelled() {
-                                return;
-                            }
-
-                            if let Some(entry) =
-                                resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await
-                                && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
-                                && !cancel_token.is_cancelled()
-                            {
-                                error!("list_path send fail {:?}", err);
-                            }
-                        }
-                    })
-                })),
                 finished: None,
                 ..Default::default()
             },
             claim_tracker,
+            Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                Box::pin({
+                    let value = tx2.clone();
+                    let resolver = partial_resolver.clone();
+                    let cancel_token = cancel_for_send2.clone();
+                    let supplement = partial_supplement.clone();
+                    async move {
+                        if cancel_token.is_cancelled() {
+                            return Ok(());
+                        }
+
+                        if let Some(entry) =
+                            resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await?
+                            && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
+                            && !cancel_token.is_cancelled()
+                        {
+                            error!("list_path send fail {:?}", err);
+                        }
+                        Ok(())
+                    }
+                })
+            }),
         )
         .await;
 
@@ -7183,11 +7288,11 @@ mod test {
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexHealth, ListObjectsIndexProviderKind,
         ListObjectsIndexProviderState, ListObjectsInfo, ListPathOptions, ListPathRawOptions, ListSourceMode,
-        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
-        NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER,
-        PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-        PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex,
-        PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
+        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, ListingSupplementTarget, MAX_OBJECT_LIST,
+        NamespaceMutationJournalBackend, NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus,
+        PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER, PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER,
+        PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER,
+        PersistentKeyOnlyIndex, PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
         cached_entry_needs_supplement, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
         enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
@@ -7212,10 +7317,11 @@ mod test {
     };
     use crate::bucket::replication::ReplicationState;
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
-    use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
+    use crate::disk::{DeleteOptions, DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::{Result, StorageError};
     use crate::object_api::ObjectInfo;
-    use crate::set_disk::SetDisks;
+    use crate::set_disk::{SetDisks, hermetic_set_disks_isolated};
+    use bytes::Bytes;
     use rustfs_filemeta::{
         FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
         ObjectPartInfo, VersionType,
@@ -7355,6 +7461,38 @@ mod test {
         fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
         fi.metadata = metadata;
         meta.add_version(fi).expect("test metadata should accept object version");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_unversioned_object_meta_entry(
+        name: &str,
+        mod_time: time::OffsetDateTime,
+        etag: &str,
+        data_dir: Uuid,
+    ) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(data_dir);
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), etag.to_string());
+        meta.add_version(fi).expect("test metadata should accept unversioned object");
         let metadata = meta.marshal_msg().expect("test metadata should marshal");
 
         MetaCacheEntry {
@@ -10130,7 +10268,10 @@ mod test {
         ]);
         let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false, 0);
 
-        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+        assert_eq!(
+            listing_entries_supplement_target(&entries, &resolver, true),
+            Some(ListingSupplementTarget::Object("object".to_string()))
+        );
         assert_eq!(listing_entries_supplement_target(&entries, &resolver, false), None);
 
         let mut primary = resolve_listing_entries(MetaCacheEntries(entries.0.clone()), resolver.clone(), true)
@@ -10183,8 +10324,85 @@ mod test {
 
         let mut supplemented = resolve_listing_entries_with_supplement(entries, resolver, true, supplement)
             .await
+            .expect("supplemented metadata should not remain ambiguous")
             .expect("the supplemented sample should resolve the committed delete marker");
         assert!(supplemented.is_latest_delete_marker());
+    }
+
+    #[tokio::test]
+    async fn latest_listing_fails_closed_for_unversioned_two_by_two_metadata_split() {
+        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<()>, Vec<String>) {
+            let (sender, mut receiver) = mpsc::channel(4);
+            let walk = set.list_path(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: bucket.to_string(),
+                    recursive: true,
+                    ask_disks: "optimal".to_string(),
+                    limit: 100,
+                    ..Default::default()
+                },
+                sender,
+            );
+            let drain = async {
+                let mut names = Vec::new();
+                while let Some(entry) = receiver.recv().await {
+                    if !entry.is_dir() {
+                        names.push(entry.name);
+                    }
+                }
+                names
+            };
+
+            tokio::join!(walk, drain)
+        }
+
+        let bucket = "list-two-by-two-overwrite";
+        let object = "object";
+        let old_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old = test_unversioned_object_meta_entry(object, old_mod_time, "old-etag", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry(object, new_mod_time, "new-etag", Uuid::from_u128(2));
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        for (index, disk) in disks.iter().enumerate() {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+            let metadata = if index < 2 { &old.metadata } else { &new.metadata };
+            disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::copy_from_slice(metadata))
+                .await
+                .expect("split metadata should be written");
+        }
+
+        let (split_result, split_names) = collect_listing(&set, bucket).await;
+        assert!(
+            matches!(split_result, Err(StorageError::ErasureReadQuorum)),
+            "an unresolved 2+2 generation must fail the listing, got {split_result:?}"
+        );
+        assert!(split_names.is_empty(), "an unresolved key must not be emitted from either generation");
+
+        disks[0]
+            .write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::copy_from_slice(&new.metadata))
+            .await
+            .expect("third new-generation copy should be written");
+        let (committed_result, committed_names) = collect_listing(&set, bucket).await;
+        committed_result.expect("a 3+1 committed generation should list successfully");
+        assert_eq!(committed_names, [object.to_string()]);
+
+        for disk in disks.iter().skip(1) {
+            disk.delete(
+                bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("quorum deletion should remove the object copy");
+        }
+        let (deleted_result, deleted_names) = collect_listing(&set, bucket).await;
+        deleted_result.expect("a quorum-deleted object should remain a successful empty listing");
+        assert!(deleted_names.is_empty(), "one stale copy must not resurrect a quorum-deleted object");
     }
 
     #[tokio::test]
@@ -10243,7 +10461,8 @@ mod test {
             primary.extend([None, None, None, None]);
             let entry =
                 resolve_listing_entries_with_supplement(MetaCacheEntries(primary), resolver.clone(), true, supplement.clone())
-                    .await;
+                    .await
+                    .expect("directory supplementation should not fail");
             assert_eq!(
                 entry.map(|entry| entry.name),
                 (fallback_copies == 4).then_some(prefix),
@@ -10266,7 +10485,10 @@ mod test {
             Some(deleted.clone()),
         ]);
 
-        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+        assert_eq!(
+            listing_entries_supplement_target(&entries, &resolver, true),
+            Some(ListingSupplementTarget::Object("object".to_string()))
+        );
 
         let mut resolved = resolve_listing_entries(
             MetaCacheEntries(vec![
@@ -10431,7 +10653,9 @@ mod test {
                         let entry = match resolve_agreed_listing_entry(entry, 5, resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
                             ListingEntryResolution::NeedsSupplement(_, Some(entry)) => entry,
-                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => return,
+                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => {
+                                return;
+                            }
                         };
                         let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
                         seen.lock().expect("seen mutex poisoned").push((
