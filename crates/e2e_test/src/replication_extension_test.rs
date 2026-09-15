@@ -3875,11 +3875,10 @@ async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket
         .body(ByteStream::from_static(body))
         .send()
         .await?;
-    assert!(
-        put.version_id()
-            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
-        "a directory marker is the null version even in a versioned bucket: {:?}",
-        put.version_id()
+    assert_eq!(
+        put.version_id(),
+        Some("null"),
+        "a directory marker must expose its null version without leaking the internal nil UUID"
     );
 
     wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;

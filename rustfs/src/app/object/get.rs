@@ -3692,7 +3692,7 @@ impl DefaultObjectUsecase {
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
-        let output_version_id = read_response_version_id(info.version_id);
+        let output_version_id = s3_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
         let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
@@ -4430,7 +4430,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let version_id = read_response_version_id(info.version_id);
+        let version_id = s3_response_version_id(info.version_id);
 
         let output = GetObjectAttributesOutput {
             checksum,

@@ -16,8 +16,12 @@ identity becomes a durable `Failed` terminal result containing
 `stale_bucket_incarnation`. The original token remains queryable under the existing
 terminal retention policy. Recovery never fills a legacy task with the identity of
 the bucket currently using its name. Existing schema 1 cluster records and schema 2
-non-bucket records keep their recovery behavior. Unsupported or corrupt records
-continue to defer recovery; transient metadata failures do not retire a valid task.
+non-bucket records keep their recovery behavior. Unsupported, corrupt, and oversized
+records remain intact and receive a sibling
+`quarantined-root-heal-{intent|terminal}-<task-id>.json` marker. The marker fences the
+original task ID while allowing an independent compensation heal with a fresh ID.
+Do not edit either file: a missing source, malformed marker, changed source digest,
+duplicate owner, or transient metadata failure continues to defer recovery.
 
 If a task is stale, submit a new bucket heal for the current bucket and use the new
 token. Do not edit recovery files to replace the incarnation. A retained terminal
