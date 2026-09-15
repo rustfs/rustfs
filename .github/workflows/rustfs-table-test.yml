@@ -247,6 +247,8 @@ jobs:
           python3 auto-testing/scripts/issue_manager.py handle \
             --repo rustfs/backlog \
             --suite table --category table --suite-label "S3 Tables" \
+            --outcome '${{ steps.test.outcome }}' \
+            --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md" \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --run-id "${GITHUB_RUN_ID}" \
             --attempt "${GITHUB_RUN_ATTEMPT}" \

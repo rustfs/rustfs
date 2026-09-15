@@ -20,7 +20,8 @@ jobs:
       - name: Collect and publish verified chain health
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: python3 scripts/functional_chain_health.py --publish --output "${RUNNER_TEMP}/chain-health.json"
+          NIGHTLY_SOURCE_REF: ${{ vars.NIGHTLY_BRANCH || 'main' }}
+        run: python3 scripts/functional_chain_health.py --source-ref "${NIGHTLY_SOURCE_REF}" --publish --output "${RUNNER_TEMP}/chain-health.json"
       - name: Retain health observation
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

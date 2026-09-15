@@ -65,6 +65,11 @@ jobs:
           path: ${{ runner.temp }}/chain-candidate.json
           if-no-files-found: error
 
+      - name: Check shared functional runners before scheduling suites
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: python3 scripts/check_functional_runners.py smoke-testing pf-testing
+
   upgrade:
     needs: [prepare]
     if: ${{ always() && needs.prepare.result == 'success' }}
@@ -147,7 +152,7 @@ jobs:
 
   complete-chain:
     needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, performance]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -155,12 +160,33 @@ jobs:
         with:
           persist-credentials: false
       - name: Download suite evidence
+        id: download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: functional-chain-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-evidence
           merge-multiple: true
+      - name: Summarize every suite including failures and missing evidence
+        if: always()
+        env:
+          CHAIN_MANIFEST: ${{ needs.prepare.outputs.manifest }}
+          CHAIN_NEEDS: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py summarize
+          --directory "${RUNNER_TEMP}/chain-evidence"
+          --output "${RUNNER_TEMP}/chain-report.json"
+      - name: Retain chain report regardless of test verdict
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: functional-chain-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chain-report.json
+            ${{ runner.temp }}/chain-report.md
+          if-no-files-found: error
       - name: Verify every required suite
+        if: always()
         env:
           CHAIN_MANIFEST: ${{ needs.prepare.outputs.manifest }}
           CHAIN_NEEDS: ${{ toJSON(needs) }}

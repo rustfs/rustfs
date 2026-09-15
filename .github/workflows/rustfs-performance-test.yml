@@ -85,7 +85,21 @@ env:
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
+  runner-check:
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Check performance runner before entering its queue
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: python3 scripts/check_functional_runners.py pf-testing
+
   performance-test:
+    needs: runner-check
     runs-on: pf-testing
     timeout-minutes: 900
     env:
@@ -260,10 +274,10 @@ jobs:
             echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
           EXISTING="$(gh issue list -R rustfs/backlog --state all \
             --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
+            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
           if [ -n "${EXISTING}" ]; then
             echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
             exit 0
@@ -348,7 +362,7 @@ jobs:
           --output "${RUNNER_TEMP}/chain-performance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/performance.json"
 
       - name: Upload chain evidence
-        if: ${{ always() && steps.chain_record.outcome == 'success' }}
+        if: ${{ always() && (steps.chain_record.outcome == 'success' || steps.chain_record.outcome == 'failure') }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: functional-chain-performance-${{ github.run_id }}-${{ github.run_attempt }}
