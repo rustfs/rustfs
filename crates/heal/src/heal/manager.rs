@@ -1384,7 +1384,9 @@ impl HealManager {
     }
 
     async fn validate_replacement_recovery_records(disk: &crate::heal::DiskStore) -> Result<()> {
-        ResumeUtils::migrate_legacy_replacement_records(disk).await?;
+        if disk.endpoint().is_local {
+            ResumeUtils::migrate_legacy_replacement_records(disk).await?;
+        }
         for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await? {
             ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
         }

@@ -83,36 +83,50 @@ impl HealManager {
                             .lock()
                             .expect("replacement recovery blocked set lock poisoned")
                             .clone();
+                        let mut retry_recovery_disks = Vec::new();
                         if !blocked_sets.is_empty() {
                             let mut retry_succeeded = HashSet::new();
                             let mut retry_failed = HashSet::new();
-                            for disk in &local_disks {
-                                let endpoint = disk.endpoint();
-                                let Some(set_disk_id) =
-                                    crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
-                                else {
-                                    continue;
-                                };
-                                if !blocked_sets.contains(&set_disk_id) {
-                                    continue;
-                                }
-                                match Self::validate_replacement_recovery_records(disk).await {
-                                    Ok(()) => {
-                                        retry_succeeded.insert(set_disk_id);
-                                    }
+                            for set_disk_id in blocked_sets {
+                                let disks = match storage.replacement_intent_disks(&set_disk_id).await {
+                                    Ok(disks) => disks,
                                     Err(error) => {
                                         retry_failed.insert(set_disk_id.clone());
-                                        conflicted_recovery_sets.insert(set_disk_id);
+                                        conflicted_recovery_sets.insert(set_disk_id.clone());
                                         warn!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                            endpoint = %endpoint,
+                                            set_disk_id,
+                                            error = %error,
+                                            "Replacement recovery disk retry failed"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mut valid = true;
+                                for disk in &disks {
+                                    if let Err(error) = Self::validate_replacement_recovery_records(disk).await {
+                                        valid = false;
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            set_disk_id,
+                                            endpoint = %disk.endpoint(),
                                             error = %error,
                                             "Replacement recovery retry failed"
                                         );
                                     }
+                                }
+                                if valid {
+                                    retry_succeeded.insert(set_disk_id);
+                                    retry_recovery_disks.extend(disks);
+                                } else {
+                                    retry_failed.insert(set_disk_id.clone());
+                                    conflicted_recovery_sets.insert(set_disk_id);
                                 }
                             }
                             let mut blocked = replacement_recovery_blocked_sets
@@ -122,9 +136,9 @@ impl HealManager {
                         }
                         for disk in &local_disks {
                             let endpoint = disk.endpoint();
-                                let runtime_state = disk.runtime_state();
-                                let set_disk_id =
-                                    crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
+                            let runtime_state = disk.runtime_state();
+                            let set_disk_id =
+                                crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
                             if set_disk_id.as_ref().is_some_and(|set_disk_id| {
                                 replacement_recovery_blocked_sets
                                     .lock()
@@ -212,6 +226,29 @@ impl HealManager {
                             }
                         }
 
+                        let mut recovery_disks = local_disks.clone();
+                        recovery_disks.extend(retry_recovery_disks);
+                        for set_disk_id in endpoints.keys() {
+                            match storage.replacement_intent_disks(set_disk_id).await {
+                                Ok(disks) => recovery_disks.extend(disks),
+                                Err(error) => {
+                                    conflicted_recovery_sets.insert(set_disk_id.clone());
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                        set_disk_id,
+                                        error = %error,
+                                        "Replacement recovery disk discovery failed"
+                                    );
+                                }
+                            }
+                        }
+                        recovery_disks.sort_by_key(|disk| disk.endpoint().to_string());
+                        recovery_disks
+                            .dedup_by(|left, right| left.endpoint().to_string() == right.endpoint().to_string());
+
                         // Once formatting succeeds a replacement is no longer
                         // discoverable as UnformattedDisk. Re-admit exactly one
                         // incomplete durable generation per set within its
@@ -219,7 +256,7 @@ impl HealManager {
                         // verified terminal cleanup. Multiple generations are a
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
-                        for disk in &local_disks {
+                        for disk in &recovery_disks {
                             let endpoint = disk.endpoint();
                             let disk_set_disk_id =
                                 crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
@@ -280,6 +317,21 @@ impl HealManager {
                                     }
                                 };
                                 let state = resume_manager.get_state().await;
+                                let targets = state
+                                    .replacement_targets
+                                    .iter()
+                                    .filter_map(|target| {
+                                        local_endpoints
+                                            .iter()
+                                            .find(|endpoint| endpoint.to_string() == *target)
+                                            .cloned()
+                                    })
+                                    .collect::<Vec<_>>();
+                                // A remote survivor may own the durable intent, but only the
+                                // node mounting every replacement target may advance or replay it.
+                                if targets.len() != state.replacement_targets.len() {
+                                    continue;
+                                }
                                 if !durable_replacement_recovery_is_due(&state, &task_id) {
                                     if durable_replacement_reserves_targets(&state) {
                                         conflicted_recovery_sets.insert(state.set_disk_id.clone());
@@ -294,20 +346,6 @@ impl HealManager {
                                     }
                                 };
                                 let task_id = state.task_id.clone();
-                                let targets = state
-                                    .replacement_targets
-                                    .iter()
-                                    .filter_map(|target| {
-                                        local_endpoints
-                                            .iter()
-                                            .find(|endpoint| endpoint.to_string() == *target)
-                                            .cloned()
-                                    })
-                                    .collect::<Vec<_>>();
-                                if targets.len() != state.replacement_targets.len() {
-                                    conflicted_recovery_sets.insert(state.set_disk_id.clone());
-                                    continue;
-                                }
                                 let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(
                                     targets[0].pool_idx,
                                     targets[0].set_idx,

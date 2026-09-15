@@ -134,6 +134,29 @@ pub struct WriteAllResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CompareAndUpdateFileRequest {
+    /// indicate which one in the disks
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", optional, tag = "4")]
+    pub expected: ::core::option::Option<::prost::bytes::Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "5")]
+    pub replacement: ::core::option::Option<::prost::bytes::Bytes>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CompareAndUpdateFileResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(enumeration = "CompareAndUpdateFileOutcome", tag = "2")]
+    pub outcome: i32,
+    #[prost(message, optional, tag = "3")]
+    pub error: ::core::option::Option<Error>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteRequest {
     /// indicate which one in the disks
     #[prost(string, tag = "1")]
@@ -1702,6 +1725,38 @@ impl ControlPlaneErrorCode {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum CompareAndUpdateFileOutcome {
+    CompareAndUpdateFileUnspecified = 0,
+    CompareAndUpdateFileUpdated = 1,
+    CompareAndUpdateFileMissing = 2,
+    CompareAndUpdateFileMismatch = 3,
+}
+impl CompareAndUpdateFileOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::CompareAndUpdateFileUnspecified => "COMPARE_AND_UPDATE_FILE_UNSPECIFIED",
+            Self::CompareAndUpdateFileUpdated => "COMPARE_AND_UPDATE_FILE_UPDATED",
+            Self::CompareAndUpdateFileMissing => "COMPARE_AND_UPDATE_FILE_MISSING",
+            Self::CompareAndUpdateFileMismatch => "COMPARE_AND_UPDATE_FILE_MISMATCH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPARE_AND_UPDATE_FILE_UNSPECIFIED" => Some(Self::CompareAndUpdateFileUnspecified),
+            "COMPARE_AND_UPDATE_FILE_UPDATED" => Some(Self::CompareAndUpdateFileUpdated),
+            "COMPARE_AND_UPDATE_FILE_MISSING" => Some(Self::CompareAndUpdateFileMissing),
+            "COMPARE_AND_UPDATE_FILE_MISMATCH" => Some(Self::CompareAndUpdateFileMismatch),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum TierMutationPeerState {
     Unspecified = 0,
     Prepared = 1,
@@ -1974,6 +2029,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "WriteAll"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn compare_and_update_file(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CompareAndUpdateFileRequest>,
+        ) -> std::result::Result<tonic::Response<super::CompareAndUpdateFileResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/CompareAndUpdateFile");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "CompareAndUpdateFile"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn delete(
@@ -3375,6 +3445,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::WriteAllRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status>;
+        async fn compare_and_update_file(
+            &self,
+            request: tonic::Request<super::CompareAndUpdateFileRequest>,
+        ) -> std::result::Result<tonic::Response<super::CompareAndUpdateFileResponse>, tonic::Status>;
         async fn delete(
             &self,
             request: tonic::Request<super::DeleteRequest>,
@@ -4064,6 +4138,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WriteAllSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/CompareAndUpdateFile" => {
+                    #[allow(non_camel_case_types)]
+                    struct CompareAndUpdateFileSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::CompareAndUpdateFileRequest> for CompareAndUpdateFileSvc<T> {
+                        type Response = super::CompareAndUpdateFileResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::CompareAndUpdateFileRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::compare_and_update_file(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CompareAndUpdateFileSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

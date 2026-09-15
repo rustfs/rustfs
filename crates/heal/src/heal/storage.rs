@@ -30,7 +30,7 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
     ObjectIO as _, ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
+use super::{DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -613,6 +613,13 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-excluding resume disk selection is unsupported"))
     }
 
+    /// Return every formatted disk that may durably host or expose a
+    /// replacement intent. Implementations should order local disks first so
+    /// discovery remains deterministic and preserves the local preference.
+    async fn replacement_intent_disks(&self, _set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        Ok(Vec::new())
+    }
+
     /// Reopen the exact surviving disk that owns an existing replacement
     /// intent. Falling back to another disk would create a second copy of the
     /// same generation and split its progress.
@@ -643,6 +650,16 @@ pub struct ECStoreHealStorage {
 impl ECStoreHealStorage {
     pub fn new(ecstore: Arc<ECStore>) -> Self {
         Self { ecstore }
+    }
+
+    async fn resume_disk_inventory(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
+            })?;
+        Ok(disks.into_iter().flatten().collect())
     }
 
     async fn object_result_with_receipt(
@@ -1699,7 +1716,14 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
-        self.get_disk_for_resume_excluding(set_disk_id, &[]).await
+        for disk in self.resume_disk_inventory(set_disk_id).await? {
+            if disk.endpoint().is_local && matches!(disk.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                return Ok(disk);
+            }
+        }
+        Err(Error::TaskExecutionFailed {
+            message: format!("No available disk found for set_disk_id: {set_disk_id}"),
+        })
     }
 
     async fn get_disk_for_resume_excluding(&self, set_disk_id: &str, excluded_targets: &[String]) -> Result<DiskStore> {
@@ -1714,45 +1738,60 @@ impl HealStorageAPI for ECStoreHealStorage {
             "Heal storage admin operation started"
         );
 
-        // Parse set_disk_id to extract pool and set indices
-        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
-
-        // Get the first available disk from the set
-        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
-            })?;
-
         // The replacement target is unformatted before repair and must never
         // host the intent that authorizes its own formatting.
-        for disk_store in disks.into_iter().flatten() {
-            if !disk_store.endpoint().is_local {
-                continue;
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
+        for prefer_local in [true, false] {
+            for disk_store in &disks {
+                if disk_store.endpoint().is_local != prefer_local
+                    || excluded_targets.contains(&disk_store.endpoint().to_string())
+                    || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
+                {
+                    continue;
+                }
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "get_disk_for_resume",
+                    set_disk_id,
+                    result = "ok",
+                    disk = ?disk_store,
+                    "Heal storage resume disk resolved"
+                );
+                return Ok(disk_store.clone());
             }
-            if excluded_targets.contains(&disk_store.endpoint().to_string()) {
-                continue;
-            }
-            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
-                continue;
-            }
-            debug!(
-                target: "rustfs::heal::storage",
-                event = EVENT_HEAL_STORAGE_ADMIN_OP,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_STORAGE,
-                operation = "get_disk_for_resume",
-                set_disk_id,
-                result = "ok",
-                disk = ?disk_store,
-                "Heal storage resume disk resolved"
-            );
-            return Ok(disk_store);
         }
 
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+
+    async fn replacement_intent_disks(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
+        let mut formatted = Vec::with_capacity(disks.len());
+        for prefer_local in [true, false] {
+            for disk in &disks {
+                if disk.endpoint().is_local != prefer_local {
+                    continue;
+                }
+                match disk.get_disk_id().await {
+                    Ok(Some(id)) if !id.is_nil() => formatted.push(disk.clone()),
+                    Ok(_) | Err(DiskError::UnformattedDisk) => {}
+                    Err(error) => {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!(
+                                "Failed to inspect replacement intent disk {} for set_disk_id {set_disk_id}: {error}",
+                                disk.endpoint()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(formatted)
     }
 
     async fn get_replacement_resume_disk(
@@ -1761,26 +1800,31 @@ impl HealStorageAPI for ECStoreHealStorage {
         task_id: &str,
         excluded_targets: &[String],
     ) -> Result<ReplacementResumeDisk> {
-        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
-        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
-            })?;
+        let disks = self.resume_disk_inventory(set_disk_id).await?;
         let mut existing = None;
-        for disk_store in disks.into_iter().flatten() {
-            if !disk_store.endpoint().is_local || excluded_targets.contains(&disk_store.endpoint().to_string()) {
-                continue;
+        for prefer_local in [true, false] {
+            for disk_store in &disks {
+                if disk_store.endpoint().is_local != prefer_local
+                    || excluded_targets.contains(&disk_store.endpoint().to_string())
+                    || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
+                {
+                    continue;
+                }
+                let replacement_tasks = super::resume::ResumeUtils::get_replacement_intent_tasks(disk_store).await?;
+                let has_intent = replacement_tasks.iter().any(|candidate| candidate == task_id)
+                    || (prefer_local && super::resume::ResumeManager::has_replacement_intent(disk_store, task_id).await);
+                if has_intent && existing.replace(disk_store.clone()).is_some() {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
+                    });
+                }
             }
-            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
-                continue;
-            }
-            if super::resume::ResumeManager::has_replacement_intent(&disk_store, task_id).await
-                && existing.replace(disk_store).is_some()
-            {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
-                });
+            // Existing releases only write replacement intents locally, and
+            // this release also prefers a local survivor. Keep that path free
+            // of remote availability and latency; remote discovery is needed
+            // only when no local survivor owns the task.
+            if existing.is_some() {
+                break;
             }
         }
         Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))

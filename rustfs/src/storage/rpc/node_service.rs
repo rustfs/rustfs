@@ -1442,6 +1442,13 @@ impl Node for NodeService {
         self.handle_write_all(request).await
     }
 
+    async fn compare_and_update_file(
+        &self,
+        request: Request<CompareAndUpdateFileRequest>,
+    ) -> Result<Response<CompareAndUpdateFileResponse>, Status> {
+        self.handle_compare_and_update_file(request).await
+    }
+
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound mutation requires its dedicated RPC"));
@@ -2975,7 +2982,11 @@ mod tests {
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use bytes::Bytes;
-    use rustfs_heal::heal::{manager::HealManager, storage::HealStorageAPI};
+    use rustfs_heal::heal::{
+        manager::HealManager,
+        resume::{ReplacementTargetIdentity, ResumeManager, ResumeUtils},
+        storage::{ECStoreHealStorage, HealStorageAPI, ReplacementResumeDisk},
+    };
     use rustfs_iam::{
         store::{
             Store as _,
@@ -2989,18 +3000,19 @@ mod tests {
     use rustfs_protos::proto_gen::node_service::scanner_control_service_server::ScannerControlService as _;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
-        ClearDecommissionRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
-        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
-        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
-        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
-        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
-        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
-        HealBucketRequest, HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
-        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
-        LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
-        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest,
-        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
-        RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
+        ClearDecommissionRequest, CompareAndUpdateFileRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest,
+        DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest,
+        DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest,
+        DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest, GetBucketInfoRequest,
+        GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest, GetMetricsRequest,
+        GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
+        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
+        HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
+        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
+        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
         ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
         SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
         StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
@@ -3023,7 +3035,7 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 23] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 24] = [
         "renamedata",
         "renamedataatincarnation",
         "writemetadataatincarnation",
@@ -3035,6 +3047,7 @@ mod tests {
         "writemetadata",
         "updatemetadata",
         "writeall",
+        "compareandupdatefile",
         "delete",
         "deletepaths",
         "renamefile",
@@ -4484,6 +4497,17 @@ mod tests {
                 data: vec![0x01, 0x02].into(),
             },
             rustfs_protos::canonical_write_all_request_body
+        );
+        assert_gated!(
+            compare_and_update_file,
+            CompareAndUpdateFileRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                expected: Some(vec![0x01].into()),
+                replacement: Some(vec![0x02].into()),
+            },
+            rustfs_protos::canonical_compare_and_update_file_request_body
         );
         assert_gated!(
             delete,
@@ -5945,6 +5969,265 @@ mod tests {
         })
         .await
         .expect("bounded real fixture initialization")
+    }
+
+    fn signed_compare_and_update_file_request(
+        disk: String,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Request<CompareAndUpdateFileRequest> {
+        let mut request = Request::new(CompareAndUpdateFileRequest {
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            expected,
+            replacement,
+        });
+        let body = rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref())
+            .expect("compare-and-update request body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("compare-and-update digest");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    #[tokio::test]
+    async fn compare_and_update_file_handler_preserves_atomic_outcomes() {
+        use rustfs_protos::proto_gen::node_service::CompareAndUpdateFileOutcome;
+
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let disk = set.disks.read().await.iter().find_map(Clone::clone).expect("local target");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let volume = crate::storage::storage_api::ecstore_disk::RUSTFS_META_BUCKET;
+        if let Err(error) = disk.make_volume(volume).await {
+            assert_eq!(error, DiskError::VolumeExists, "create metadata volume");
+        }
+        let path = format!("compare-and-update-{}", Uuid::new_v4());
+        let old = Bytes::from_static(b"old-intent");
+        let new = Bytes::from_static(b"new-intent");
+
+        let created = service
+            .compare_and_update_file(signed_compare_and_update_file_request(
+                disk.endpoint().to_string(),
+                volume,
+                &path,
+                None,
+                Some(old.clone()),
+            ))
+            .await
+            .expect("create compare-and-update response")
+            .into_inner();
+        assert!(created.success, "create compare-and-update failed: {:?}", created.error);
+        assert_eq!(
+            CompareAndUpdateFileOutcome::try_from(created.outcome).expect("created outcome"),
+            CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated
+        );
+
+        let mismatched = service
+            .compare_and_update_file(signed_compare_and_update_file_request(
+                disk.endpoint().to_string(),
+                volume,
+                &path,
+                None,
+                Some(new.clone()),
+            ))
+            .await
+            .expect("mismatched compare-and-update response")
+            .into_inner();
+        assert!(mismatched.success);
+        assert_eq!(
+            CompareAndUpdateFileOutcome::try_from(mismatched.outcome).expect("mismatched outcome"),
+            CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch
+        );
+        assert_eq!(disk.read_all(volume, &path).await.expect("unchanged intent"), old);
+
+        let updated = service
+            .compare_and_update_file(signed_compare_and_update_file_request(
+                disk.endpoint().to_string(),
+                volume,
+                &path,
+                Some(old),
+                Some(new.clone()),
+            ))
+            .await
+            .expect("update compare-and-update response")
+            .into_inner();
+        assert!(updated.success);
+        assert_eq!(
+            CompareAndUpdateFileOutcome::try_from(updated.outcome).expect("updated outcome"),
+            CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated
+        );
+        assert_eq!(disk.read_all(volume, &path).await.expect("updated intent"), new.clone());
+
+        let deleted = service
+            .compare_and_update_file(signed_compare_and_update_file_request(
+                disk.endpoint().to_string(),
+                volume,
+                &path,
+                Some(new.clone()),
+                None,
+            ))
+            .await
+            .expect("delete compare-and-update response")
+            .into_inner();
+        assert!(deleted.success);
+        assert_eq!(
+            CompareAndUpdateFileOutcome::try_from(deleted.outcome).expect("deleted outcome"),
+            CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated
+        );
+
+        let missing = service
+            .compare_and_update_file(signed_compare_and_update_file_request(
+                disk.endpoint().to_string(),
+                volume,
+                &path,
+                Some(new),
+                None,
+            ))
+            .await
+            .expect("missing compare-and-update response")
+            .into_inner();
+        assert!(missing.success);
+        assert_eq!(
+            CompareAndUpdateFileOutcome::try_from(missing.outcome).expect("missing outcome"),
+            CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing
+        );
+        assert!(matches!(disk.read_all(volume, &path).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn replacement_resume_selection_falls_back_to_a_remote_survivor() {
+        use crate::storage::storage_api::{
+            ecstore_disk::{DiskOption, new_disk},
+            init_local_disks_with_instance_ctx,
+        };
+
+        let fixture = target_rpc_fixture().await;
+        let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replacement intent target");
+        let addr = listener.local_addr().expect("replacement intent target address");
+        let set = fixture.env.ecstore.all_set_disks().into_iter().next().expect("erasure set");
+        let original_disks = set.disks.read().await.clone();
+        let mut endpoints = fixture.env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut survivor_endpoint = Endpoint::try_from(format!("http://{addr}{}", fixture.env.disk_paths[0].display()).as_str())
+            .expect("remote survivor endpoint");
+        survivor_endpoint.set_pool_index(0);
+        survivor_endpoint.set_set_index(0);
+        survivor_endpoint.set_disk_index(0);
+        survivor_endpoint.is_local = true;
+        endpoints[0] = survivor_endpoint.clone();
+        let mut pool = fixture.env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints.clone());
+        init_local_disks_with_instance_ctx(&fixture.instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register replacement intent target disks");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let survivor = service
+            .find_disk(&survivor_endpoint.to_string())
+            .await
+            .expect("registered survivor disk");
+        if let Err(error) = survivor
+            .make_volume(crate::storage::storage_api::ecstore_disk::RUSTFS_META_BUCKET)
+            .await
+        {
+            assert_eq!(error, DiskError::VolumeExists, "create survivor metadata volume");
+        }
+        let replacement = service
+            .find_disk(&endpoints[1].to_string())
+            .await
+            .expect("registered replacement disk");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("replacement intent target server");
+        });
+
+        survivor_endpoint.is_local = false;
+        let remote_survivor = new_disk(
+            &survivor_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("remote survivor client");
+        let survivor_id = survivor
+            .get_disk_id()
+            .await
+            .expect("survivor disk id")
+            .filter(|id| !id.is_nil())
+            .expect("formatted survivor disk id");
+        remote_survivor
+            .set_disk_id(Some(survivor_id))
+            .await
+            .expect("seed remote survivor disk id");
+        *set.disks.write().await = vec![Some(remote_survivor.clone()), Some(replacement.clone()), None, None];
+
+        let storage = ECStoreHealStorage::new(fixture.env.ecstore.clone());
+        let replacement_endpoint = replacement.endpoint().to_string();
+        let selected = storage
+            .get_disk_for_resume_excluding("pool_0_set_0", std::slice::from_ref(&replacement_endpoint))
+            .await
+            .expect("remote survivor should host the replacement intent");
+        assert!(!selected.endpoint().is_local);
+        assert_eq!(selected.endpoint().to_string(), remote_survivor.endpoint().to_string());
+
+        let task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            selected,
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec![replacement_endpoint.clone()],
+            vec![ReplacementTargetIdentity {
+                endpoint: replacement_endpoint.clone(),
+                canonical_path: fixture.env.disk_paths[1].display().to_string(),
+                physical_device_ids: vec!["replacement-device".to_string()],
+                filesystem_identity: "replacement-filesystem".to_string(),
+            }],
+        )
+        .await
+        .expect("remote survivor intent should persist atomically");
+        assert!(ResumeManager::has_replacement_intent(&survivor, &task_id).await);
+        let reopened = storage
+            .get_replacement_resume_disk("pool_0_set_0", &task_id, std::slice::from_ref(&replacement_endpoint))
+            .await
+            .expect("remote survivor intent should be discoverable after restart");
+        let ReplacementResumeDisk::Existing(reopened) = reopened else {
+            panic!("persisted remote replacement intent must be reopened");
+        };
+        assert_eq!(reopened.endpoint().to_string(), remote_survivor.endpoint().to_string());
+        let reopened_state = ResumeManager::load_replacement_intent(reopened, &task_id)
+            .await
+            .expect("remote replacement intent should replay")
+            .get_state()
+            .await;
+        assert_eq!(reopened_state.replacement_targets, vec![replacement_endpoint]);
+
+        *set.disks.write().await = original_disks;
+        remote_survivor.close().await.expect("close remote survivor");
+        let _ = shutdown.send(());
+        super::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("replacement intent server shuts down")
+            .expect("replacement intent server task");
     }
 
     async fn stage_target_rpc(fixture: &TargetRpcFixture) -> (super::DiskStore, rustfs_filemeta::FileInfo, Vec<u8>) {

@@ -22,9 +22,10 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -54,13 +55,14 @@ use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
-    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
-    DeleteVersionRequest, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest,
-    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
-    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-    WriteMetadataRequest, node_service_client::NodeServiceClient,
+    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
+    CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+    DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
+    MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
+    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -148,6 +150,18 @@ fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result
         return Err(Error::other("remote snapshot lease protocol is incompatible"));
     }
     SnapshotLeaseToken::from_slice(&response.token)
+}
+
+fn conditional_file_update_from_wire(outcome: i32) -> Result<ConditionalFileUpdate> {
+    match CompareAndUpdateFileOutcome::try_from(outcome) {
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated) => Ok(ConditionalFileUpdate::Updated),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing) => Ok(ConditionalFileUpdate::Missing),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch) => Ok(ConditionalFileUpdate::Mismatch),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified) => {
+            Err(Error::other("unspecified compare-and-update-file outcome"))
+        }
+        Err(_) => Err(Error::other("invalid compare-and-update-file outcome")),
+    }
 }
 
 /// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
@@ -1836,7 +1850,7 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
-    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
+    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion).
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
@@ -3816,6 +3830,58 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        self.execute_with_timeout(
+            || async {
+                let data_len = expected
+                    .as_ref()
+                    .map_or(0, Bytes::len)
+                    .saturating_add(replacement.as_ref().map_or(0, Bytes::len));
+                let disk = self.disk_ref().await;
+                let mut client = self.get_bulk_client().await.inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })?;
+                let mut request = Request::new(CompareAndUpdateFileRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    expected,
+                    replacement,
+                });
+                let canonical_body = rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "compare_and_update_file")?;
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_request();
+                let response = match client.compare_and_update_file(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                        return Err(err.into());
+                    }
+                };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_sent_bytes(data_len);
+
+                if !response.success {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                conditional_file_update_from_wire(response.outcome).inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         trace!(
@@ -3932,6 +3998,17 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[test]
+    fn compare_and_update_wire_outcome_fails_closed() {
+        assert_eq!(
+            conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32)
+                .expect("updated outcome"),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32).is_err());
+        assert!(conditional_file_update_from_wire(i32::MAX).is_err());
+    }
 
     #[test]
     fn request_compat_send_sites_keep_manifest_json_encoders() {
