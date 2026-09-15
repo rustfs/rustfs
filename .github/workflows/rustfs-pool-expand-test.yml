@@ -52,7 +52,7 @@ permissions:
 # environment (vm000/vm001/vm002), so concurrent runs must not clobber each
 # other.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:

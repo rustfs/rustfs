@@ -18,7 +18,7 @@ on:
         default: false
 
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 permissions:
@@ -58,7 +58,7 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      - name: Checkout auto-testing scripts (with retry)
+      - name: Checkout auto-testing scripts
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
@@ -287,7 +287,7 @@ jobs:
             ' || echo "cleanup failed on ${node} (continuing)"
           done
 
-      - name: "Continue functional chain (next: Pool expansion)"
+      - name: "Continue functional chain (next: Performance)"
         # Only chain-triggered runs forward to the next suite; standalone
         # workflow_dispatch runs stop after their own cleanup.
         if: ${{ always() && github.event_name == 'repository_dispatch' }}
@@ -300,9 +300,9 @@ jobs:
             echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
             exit 1
           fi
-          echo "Dispatching next functional suite: Pool expansion"
+          echo "Dispatching next functional suite: Performance"
           gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-pool-expand' \
+            -f event_type='rustfs-chain-performance' \
             -F 'client_payload[from_suite]=table'
 
       - name: Notify on failure

@@ -55,7 +55,7 @@ permissions:
 # The security suite uses the same shared VMs as the other functional tests,
 # so it must serialize with them instead of running in parallel.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:

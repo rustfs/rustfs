@@ -38,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
