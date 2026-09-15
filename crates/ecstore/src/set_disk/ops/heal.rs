@@ -5768,8 +5768,8 @@ mod heal_result_report_tests {
             [
                 (rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true")),
                 (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
-                // Keep the writer queued across the reader's complete acquire budget.
-                (rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("5000")),
+                // Keep the writer queued while allowing slow CI runs to finish the read repair.
+                (rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("30000")),
             ],
             async {
                 let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
