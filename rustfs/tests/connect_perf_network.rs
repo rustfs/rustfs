@@ -252,17 +252,18 @@ async fn controlled_peer_reports_exact_bytes_duration_latency_and_attributed_fai
     assert!(aggregate.get("peers").is_none(), "frozen aggregate schema has no per-peer field");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_peer_is_attributed_and_stops_at_the_wall_clock_limit() {
     let _guard = TEST_HARNESS_LOCK.lock().await;
     let mut request = request(1);
     request.duration = Duration::from_millis(20);
     request.traffic_bytes_per_peer = 1_000;
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     let measurement = measure_network_with_harness(&request, &BlockingHarness, &CancellationToken::new())
         .await
         .expect("typed timeout result");
     assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(started.elapsed() >= request.duration);
     assert_eq!(measurement.result.outcome(), NetworkOutcome::Failed);
     assert_eq!(measurement.result.reason_code(), NetworkReasonCode::CollectionFailed);
     assert!(measurement.result.data().is_none());
