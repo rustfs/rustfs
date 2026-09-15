@@ -7858,12 +7858,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             rollback_futures.push(async move {
                 if should_rollback {
+                    // The dedicated undo path never forwards the marker-only creation flag.
                     if let Err(err) = disk
-                        .delete_version_with_namespace_owner(
+                        .undo_write_with_namespace_owner(
                             &bucket,
                             &object,
                             fi,
-                            force_del_marker,
                             DeleteOptions {
                                 undo_write: true,
                                 undo_delete: true,
