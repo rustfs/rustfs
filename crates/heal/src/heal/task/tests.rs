@@ -1567,6 +1567,35 @@ async fn object_heal_records_matching_positive_storage_receipt() {
 }
 
 #[tokio::test]
+async fn object_heal_binds_omitted_selector_to_storage_resolved_version() {
+    let incarnation = Uuid::new_v4();
+    let resolved_version = Uuid::new_v4();
+    let resolved_version_id = resolved_version.to_string();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some(&resolved_version_id),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None), storage);
+
+    task.execute().await.expect("latest object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("resolved latest receipt should be recorded");
+    assert_eq!(object.identity.version_id.as_deref(), Some(resolved_version_id.as_str()));
+}
+
+#[tokio::test]
 async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
     let incarnation = Uuid::new_v4();
     let storage = Arc::new(MockStorage::default());
@@ -2110,13 +2139,21 @@ impl HealStorageAPI for MockStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let (item, error) = self.heal_object(bucket, object, version_id, opts).await?;
+        let (mut item, error) = self.heal_object(bucket, object, version_id, opts).await?;
         let receipt = self
             .heal_object_receipts
             .lock()
             .unwrap()
             .get_mut(object)
             .and_then(VecDeque::pop_front);
+        if let Some(resolved_version_id) = receipt
+            .as_ref()
+            .and_then(|receipt| receipt.identity.version_id.as_deref())
+            .and_then(|version| Uuid::parse_str(version).ok())
+            .map(|version| *version.as_bytes())
+        {
+            item.resolved_version_id = Some(resolved_version_id);
+        }
         Ok(HealStorageObjectResult { item, error, receipt })
     }
 

@@ -2710,6 +2710,29 @@ impl SetDisks {
     }
 }
 
+fn finalize_object_heal_result(
+    mut result: HealResultItem,
+    mut error: Option<Error>,
+    absence: &mut Option<HealedObjectAbsence>,
+    lock_lost: bool,
+    bucket: &str,
+    object: &str,
+) -> (HealResultItem, Option<Error>) {
+    if lock_lost {
+        result.integrity_verified = false;
+        result.repair_verified = false;
+        *absence = None;
+        error = Some(Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    (result, error)
+}
+
 impl SetDisks {
     #[cfg(test)]
     pub(crate) async fn heal_replacement_format(
@@ -3095,18 +3118,26 @@ impl SetDisks {
                         )
                         .await
                         .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-                    if _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
-                        *absence = None;
-                    }
-                    return Ok((result, err.map(|e| e.into())));
+                    return Ok(finalize_object_heal_result(
+                        result,
+                        err.map(Into::into),
+                        absence,
+                        _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+                        bucket,
+                        object,
+                    ));
                 }
                 _ => {}
             }
         }
-        if _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
-            *absence = None;
-        }
-        Ok((result, err.map(|e| e.into())))
+        Ok(finalize_object_heal_result(
+            result,
+            err.map(Into::into),
+            absence,
+            _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()),
+            bucket,
+            object,
+        ))
     }
 }
 
@@ -3161,6 +3192,36 @@ mod heal_result_report_tests {
     use tokio::sync::RwLock;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
+
+    #[test]
+    fn lost_object_lock_revokes_storage_proofs_and_returns_retryable_error() {
+        let mut absence = Some(super::HealedObjectAbsence {
+            pool_index: 2,
+            set_index: 3,
+            removed: true,
+        });
+        let result = rustfs_madmin::heal_commands::HealResultItem {
+            integrity_verified: true,
+            repair_verified: true,
+            ..Default::default()
+        };
+
+        let (result, error) = super::finalize_object_heal_result(result, None, &mut absence, true, "bucket", "object");
+
+        assert!(!result.integrity_verified);
+        assert!(!result.repair_verified);
+        assert!(absence.is_none());
+        assert!(matches!(
+            error,
+            Some(Error::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket,
+                object,
+                required: 1,
+                achieved: 0,
+            }) if bucket == "bucket" && object == "object"
+        ));
+    }
 
     #[test]
     fn metadata_less_part_file_accepts_positive_part_numbers_only() {
