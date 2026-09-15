@@ -82,7 +82,7 @@ jobs:
   pool-expansion-test:
     name: Pool expansion / decommission test
     runs-on: smoke-testing
-    timeout-minutes: 360
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     env:
       RUSTFS_POOL_ADMIN_ENDPOINT: ${{ secrets.RUSTFS_POOL_ADMIN_ENDPOINT || vars.RUSTFS_POOL_ADMIN_ENDPOINT || 'http://rustfs-node1:9000' }}
@@ -140,6 +140,7 @@ jobs:
           fi
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
           set -euo pipefail
@@ -159,6 +160,7 @@ jobs:
           done
 
       - name: Install RustFS package & start cluster
+        timeout-minutes: 5
         run: |
           ARGS=(--steps "1,2,3" -y \
             --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
@@ -175,6 +177,7 @@ jobs:
           ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
 
       - name: Preflight checks
+        timeout-minutes: 5
         run: |
           ARGS=(--preflight \
             --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
@@ -191,6 +194,7 @@ jobs:
           ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
 
       - name: Reset dedicated pool proxy
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
@@ -200,6 +204,7 @@ jobs:
             ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
 
       - name: Capture pool test baseline
+        timeout-minutes: 2
         run: |
           set -uo pipefail
           BASELINE_FILE="${POOL_ARTIFACT_DIR}/pool-baseline.log"
@@ -246,6 +251,7 @@ jobs:
 
       - name: Run pool expansion & decommission test
         id: pool_test
+        timeout-minutes: 45
         run: |
           set -o pipefail
           STEPS="4,5,6"
@@ -282,6 +288,7 @@ jobs:
             ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
 
       - name: Collect pool test diagnostics
+        timeout-minutes: 2
         if: always()
         run: |
           set -uo pipefail
@@ -383,6 +390,7 @@ jobs:
 
       - name: Generate report
         id: chain_report
+        timeout-minutes: 2
         if: always()
         run: |
           set -euo pipefail
@@ -470,6 +478,7 @@ jobs:
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Validate pool diagnostic completeness
+        timeout-minutes: 2
         if: always()
         run: |
           set -euo pipefail
@@ -545,6 +554,7 @@ jobs:
           [ "${failed}" -eq 0 ] || exit 1
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: always()
         continue-on-error: true
         env:
@@ -577,6 +587,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
+        timeout-minutes: 2
         if: ${{ always() && (failure() || steps.pool_test.outcome == 'failure' || steps.pool_test.outcome == 'cancelled') }}
         continue-on-error: true
         env:
@@ -636,6 +647,7 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload test logs
+        timeout-minutes: 2
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -644,6 +656,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Restore dedicated pool proxy
+        timeout-minutes: 2
         if: always()
         run: |
           set -euo pipefail
@@ -654,6 +667,7 @@ jobs:
             ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: ${{ always() && steps.topology.outcome == 'success' && inputs.cleanup_after != 'false' }}
         run: |
           set -euo pipefail

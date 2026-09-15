@@ -39,9 +39,9 @@ on:
           - 64MiB
         default: 'all'
       warp_duration:
-        description: 'warp duration per round (e.g. 5m, 30s)'
+        description: 'warp duration per round (full matrix defaults to 1m; benchmark limit is 45m)'
         required: false
-        default: '5m'
+        default: '1m'
       warp_concurrency:
         description: 'warp concurrency'
         required: false
@@ -101,12 +101,14 @@ jobs:
   performance-test:
     needs: runner-check
     runs-on: pf-testing
-    timeout-minutes: 900
+    timeout-minutes: 60
     env:
       RUSTFS_BENCH_SCRIPT: ${{ github.workspace }}/auto-testing/rustfs_performance_testing.sh
       RUSTFS_WARP_METHODS: ${{ inputs.test_method }}
       RUSTFS_WARP_SIZES: ${{ inputs.object_size }}
-      RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '5m' }}
+      RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '1m' }}
+      # Keep all 30 method/size rounds within the bounded nightly lane.
+      RUSTFS_WARP_SLEEP: '10'
       RUSTFS_WARP_CONCURRENCY: ${{ inputs.warp_concurrency || '64' }}
     # Run on manual dispatch, or when the nightly build completed successfully.
     # Skipped when nightly failed.
@@ -157,12 +159,14 @@ jobs:
           df -h /data | tail -1
 
       - name: Reset test environment (before)
+        timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
           chmod +x auto-testing/rustfs_performance_test.sh
           ./auto-testing/rustfs_performance_test.sh --step 1 -y --log-file "${LOG_FILE:-/dev/null}"
 
       - name: Install RustFS package & start cluster (4x4)
+        timeout-minutes: 5
         run: |
           ARGS=(--steps "2,3,4" -y)
           if [ -n "${{ inputs.package_url }}" ]; then
@@ -173,6 +177,7 @@ jobs:
           ./auto-testing/rustfs_performance_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Preflight checks
+        timeout-minutes: 5
         run: |
           ARGS=(--preflight)
           if [ -n "${{ inputs.package_url }}" ]; then
@@ -184,12 +189,14 @@ jobs:
 
       - name: Run benchmark (GET/PUT/MIXED)
         id: benchmark
+        timeout-minutes: 45
         run: |
           ./auto-testing/rustfs_performance_test.sh \
             --step 5 -y \
             --log-file "${LOG_FILE}"
 
       - name: Analyze results
+        timeout-minutes: 2
         if: ${{ steps.benchmark.conclusion == 'success' }}
         run: |
           export WARP_METHODS="${RUSTFS_WARP_METHODS}" WARP_SIZES="${RUSTFS_WARP_SIZES}"
@@ -197,6 +204,7 @@ jobs:
           ./auto-testing/rustfs_performance_test.sh --step 6 -y --log-file "${LOG_FILE:-/dev/null}"
 
       - name: Collect RustFS version info
+        timeout-minutes: 2
         if: ${{ steps.benchmark.conclusion == 'success' }}
         run: |
           set -euo pipefail
@@ -214,6 +222,7 @@ jobs:
 
       - name: Upload report to dashboard (reports/YYYY-MM-DD.md)
         id: chain_report
+        timeout-minutes: 2
         if: ${{ steps.benchmark.conclusion == 'success' }}
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
@@ -260,6 +269,7 @@ jobs:
           fi
 
       - name: File failure issue in rustfs/backlog
+        timeout-minutes: 2
         if: ${{ always() && (failure() || steps.benchmark.outcome == 'failure' || steps.benchmark.outcome == 'cancelled') }}
         continue-on-error: true
         env:
@@ -320,6 +330,7 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload test logs & results
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -337,6 +348,7 @@ jobs:
           if-no-files-found: error
 
       - name: Reset test environment (after)
+        timeout-minutes: 5
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
           ./auto-testing/rustfs_performance_test.sh --step 7 -y --log-file "${LOG_FILE:-/dev/null}"

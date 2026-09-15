@@ -294,5 +294,48 @@ class RunnerTests(unittest.TestCase):
             runners.check(["pf-testing"])
 
 
+class WorkflowTimeoutTests(unittest.TestCase):
+    def test_all_suites_have_hard_and_step_deadlines(self):
+        from check_test_wiring import yaml_block
+        from test_security_workflow import FunctionalWorkflowTests, named_steps
+        jobs = {**FunctionalWorkflowTests.JOBS, "security": "security-test"}
+        self.assertEqual(len(jobs), 11)
+        for suite, job_id in jobs.items():
+            with self.subTest(suite=suite):
+                source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
+                job = yaml_block(source.splitlines(), job_id, 2)
+                self.assertIn("    timeout-minutes: 60", job)
+                steps = named_steps(job)
+                primary = [step for step in steps.values() if any(
+                    line in ("        id: test", "        id: pool_test", "        id: benchmark") for line in step)]
+                self.assertEqual(len(primary), 1)
+                self.assertIn("        timeout-minutes: 45", primary[0])
+                cleanup = "Reset test environment" if suite == "performance" else "Cleanup environment"
+                for phase in ("before", "after"):
+                    self.assertIn("        timeout-minutes: 5", steps[f"{cleanup} ({phase})"])
+                self.assertTrue(any("always()" in line for line in steps[f"{cleanup} (after)"]))
+                for name, step in steps.items():
+                    if name.startswith(("Generate report", "Upload functional report", "File failure issue",
+                                        "Upload report", "Upload test logs", "Manage backlog issues")):
+                        self.assertIn("        timeout-minutes: 2", step, name)
+                if suite in ("heal", "pool-expand", "performance"):
+                    install = next(step for name, step in steps.items() if name.startswith("Install RustFS package"))
+                    self.assertIn("        timeout-minutes: 5", install)
+                    self.assertIn("        timeout-minutes: 5", steps["Preflight checks"])
+
+    def test_performance_full_matrix_has_time_for_setup_and_cleanup(self):
+        from check_test_wiring import yaml_block
+        source = (candidate.ROOT / ".github/workflows/rustfs-performance-test.yml").read_text()
+        job = "\n".join(yaml_block(source.splitlines(), "performance-test", 2))
+        self.assertIn("RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '1m' }}", job)
+        self.assertIn("RUSTFS_WARP_SLEEP: '10'", job)
+        self.assertIn("RUSTFS_WARP_METHODS: ${{ inputs.test_method }}", job)
+        self.assertIn("RUSTFS_WARP_SIZES: ${{ inputs.object_size }}", job)
+        self.assertIn("default: '1m'", source)
+        # Keep all 3 methods x 10 sizes: 30m of measurement plus <=5m of pauses,
+        # leaving time inside the 45m step for warp preparation and teardown.
+        self.assertLess(3 * 10 * (60 + 10), 45 * 60)
+
+
 if __name__ == "__main__":
     unittest.main()

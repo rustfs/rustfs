@@ -852,16 +852,16 @@ emit_step_result() {
         wrapper.write_text(f"#!{sys.executable}\nimport json, os, sys\n" +
                            "print(json.dumps({'args': sys.argv[1:], 'env': {key: os.environ.get(key) for key in " +
                            "('RUSTFS_BENCH_SCRIPT', 'RUSTFS_WARP_METHODS', 'RUSTFS_WARP_SIZES', " +
-                           "'RUSTFS_WARP_DURATION', 'RUSTFS_WARP_CONCURRENCY', 'WARP_METHODS', " +
+                           "'RUSTFS_WARP_DURATION', 'RUSTFS_WARP_SLEEP', 'RUSTFS_WARP_CONCURRENCY', 'WARP_METHODS', " +
                            "'WARP_SIZES', 'WARP_DURATION', 'WARP_CONCURRENCY')}}))\n" +
                            "sys.exit(int(os.environ['FAKE_BENCH_EXIT']))\n")
         wrapper.chmod(0o755)
         runner.steps = named_steps(job)
         for methods, sizes, duration, concurrency in (
-            ("get", "1KiB", "1s", "7"), ("all", "all", "5m", "64"), ("", "", "5m", "64")
+            ("get", "1KiB", "1s", "7"), ("all", "all", "5m", "64"), ("", "", "1m", "64")
         ):
             runner.context = {"github.workspace": str(runner.directory), "inputs.test_method": methods,
-                              "inputs.object_size": sizes, "inputs.warp_duration || '5m'": duration,
+                              "inputs.object_size": sizes, "inputs.warp_duration || '1m'": duration,
                               "inputs.warp_concurrency || '64'": concurrency}
             runner.env = {**self.env, "RUSTFS_BENCH_SCRIPT": "/unverified/home-script.sh",
                           "RUSTFS_WARP_METHODS": "put", "RUSTFS_WARP_SIZES": "64MiB",
@@ -882,6 +882,7 @@ emit_step_result() {
                         self.assertEqual(invocation["env"]["RUSTFS_WARP_METHODS"], methods)
                         self.assertEqual(invocation["env"]["RUSTFS_WARP_SIZES"], sizes)
                         self.assertEqual(invocation["env"]["RUSTFS_WARP_DURATION"], duration)
+                        self.assertEqual(invocation["env"]["RUSTFS_WARP_SLEEP"], "10")
                         self.assertEqual(invocation["env"]["RUSTFS_WARP_CONCURRENCY"], concurrency)
                         if number == "6":
                             self.assertEqual(invocation["env"]["WARP_METHODS"], methods)

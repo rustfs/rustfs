@@ -85,7 +85,7 @@ env:
 jobs:
   upgrade-test:
     runs-on: smoke-testing
-    timeout-minutes: 420
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
@@ -133,6 +133,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
         run: |
           set -euo pipefail
@@ -152,6 +153,7 @@ jobs:
           done
 
       - name: Ensure docker (Vault container)
+        timeout-minutes: 5
         run: |
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update
@@ -162,6 +164,7 @@ jobs:
 
       - name: Run upgrade compatibility suite
         id: test
+        timeout-minutes: 45
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
@@ -221,6 +224,7 @@ jobs:
 
       - name: Generate report
         id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -279,6 +283,7 @@ jobs:
           [ "${RESULT}" = "success" ]
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -310,6 +315,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
+        timeout-minutes: 2
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
         continue-on-error: true
         env:
@@ -370,6 +376,7 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -383,6 +390,7 @@ jobs:
           retention-days: 3
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
         run: |
           set -euo pipefail
