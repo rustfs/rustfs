@@ -3927,7 +3927,7 @@ impl ECStore {
                 )
                 .await
             {
-                Ok(res) if !res.delete_marker => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
@@ -5423,7 +5423,7 @@ impl Sets {
                 )
                 .await
             {
-                Ok(res) if !res.delete_marker => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
@@ -6336,12 +6336,13 @@ impl SetDisks {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
+                Ok(_) => {}
                 Err(err) => {
                     if is_err_bucket_not_found(&err) {
                         return Err(err);
@@ -7209,6 +7210,7 @@ mod test {
         select_list_index_source_mode, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
         walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
     };
+    use crate::bucket::replication::ReplicationState;
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::{Result, StorageError};
@@ -7361,6 +7363,54 @@ mod test {
             cached: Some(meta),
             reusable: false,
         }
+    }
+
+    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+        let version_id = Uuid::from_u128(0x123456789abc_def0_123456789abc_def0);
+        let data_dir = Uuid::from_u128(0xabcdef123456_7890_abcdef123456_7890);
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut meta = FileMeta::new();
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(data_dir);
+        fi.volume = bucket.to_owned();
+        fi.name = name.to_owned();
+        fi.version_id = Some(version_id);
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), "pending-purge-etag".to_string());
+
+        meta.add_version(fi)
+            .expect("test metadata should accept pending-purge object version");
+        meta.delete_version(&FileInfo {
+            volume: bucket.to_owned(),
+            name: name.to_owned(),
+            version_id: Some(version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: crate::bucket::replication::version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        (
+            MetaCacheEntry {
+                name: name.to_owned(),
+                metadata,
+                cached: Some(meta),
+                reusable: false,
+            },
+            data_dir,
+        )
     }
 
     fn test_null_version_meta_entry(name: &str, mod_time: time::OffsetDateTime) -> MetaCacheEntry {
@@ -9382,6 +9432,70 @@ mod test {
                 "the empty listing should reclaim its committed delete residue"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn list_objects_hides_pending_version_purge_across_walk_and_exact_prefix() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "pending-purge-listing-bucket";
+        let object = "spilo/nested/_permtest";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+
+        let (entry, data_dir) = test_pending_version_purge_meta_entry(bucket, object);
+        for dir in &dirs {
+            let object_dir = dir.path().join(bucket).join(object);
+            tokio::fs::create_dir_all(object_dir.join(data_dir.to_string()))
+                .await
+                .expect("pending-purge object data directory should be created");
+            tokio::fs::write(object_dir.join(data_dir.to_string()).join("part.1"), b"x")
+                .await
+                .expect("pending-purge object part should be written");
+            tokio::fs::write(object_dir.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                .await
+                .expect("pending-purge metadata should be written");
+        }
+
+        let recursive = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive listing should succeed");
+        assert!(
+            recursive.objects.is_empty(),
+            "recursive ListObjectsV2 should hide pending version-purge entries"
+        );
+        assert!(
+            recursive.prefixes.is_empty(),
+            "recursive ListObjectsV2 should not synthesize prefixes from hidden entries"
+        );
+
+        let delimiter = store
+            .clone()
+            .list_objects_generic(bucket, "spilo/", None, Some("/".to_string()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(delimiter.objects.is_empty());
+        assert!(
+            delimiter.prefixes.is_empty(),
+            "delimiter ListObjectsV2 should not synthesize prefixes from hidden entries"
+        );
+
+        let exact = store
+            .list_objects_generic(bucket, object, None, None, 1, false)
+            .await
+            .expect("exact-prefix listing should succeed");
+        assert!(
+            exact.objects.is_empty(),
+            "exact-prefix max_keys=1 shortcut should hide pending version-purge entries"
+        );
+        assert!(exact.prefixes.is_empty());
     }
 
     #[tokio::test]
