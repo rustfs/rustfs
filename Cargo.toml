@@ -235,7 +235,7 @@ tokio-postgres-rustls = "0.14.0"
 # Utilities and Tools
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
-astral-tokio-tar = { package = "rustfs-tokio-tar", version = "0.7.1" }
+rustfs-tokio-tar = { version = "0.7.1" }
 # Candidate Snowball parser versions exercised by rustfs-zip compatibility fixtures.
 tar-codec = "0.0.14"
 tar-framing = "0.0.14"
