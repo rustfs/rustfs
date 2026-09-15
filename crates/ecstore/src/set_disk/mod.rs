@@ -160,7 +160,7 @@ use rustfs_utils::http::{
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, path_join_buf},
 };
 use sha2::Sha256;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -4416,8 +4416,11 @@ impl SetDisks {
         // This is only called after the lock-free LIST fast path observes an
         // unresolved metadata generation. Waiting on the ordinary object read
         // lock establishes a publication boundary with concurrent overwrites.
-        let _guard = self.acquire_read_lock_diag("list_object_reconcile", bucket, object).await?;
-        let (raw_entries, errors) = Self::read_all_raw_file_info(disks, bucket, object, false).await;
+        let stored_object = encode_dir_object_ref(object);
+        let _guard = self
+            .acquire_read_lock_diag("list_object_reconcile", bucket, stored_object.as_ref())
+            .await?;
+        let (raw_entries, errors) = Self::read_all_raw_file_info(disks, bucket, stored_object.as_ref(), false).await;
         let confirmed_absent = errors
             .iter()
             .flatten()
@@ -14582,19 +14585,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_metadata_reconcile_waits_for_namespace_writer() {
+    async fn listing_metadata_reconcile_encodes_directory_object_and_waits_for_writer() {
         let set_disks = make_local_bucket_test_set_disks().await;
         let bucket = "bucket-list-reconcile-lock";
-        let object = "object";
+        let object = "directory/";
+        let stored_object = encode_dir_object(object);
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"directory marker".to_vec());
+        set_disks
+            .put_object(bucket, &stored_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("directory object should be written under its encoded key");
+        let disks = set_disks.disks.read().await.clone();
         let namespace_lock = set_disks
-            .new_ns_lock(bucket, object)
+            .new_ns_lock(bucket, &stored_object)
             .await
             .expect("namespace lock should be created");
         let writer_guard = namespace_lock
             .get_write_lock(std::time::Duration::from_secs(30))
             .await
             .expect("writer lock should be acquired");
-        let read = set_disks.read_listing_metadata_after_namespace_barrier(&[], bucket, object);
+        let read = set_disks.read_listing_metadata_after_namespace_barrier(&disks, bucket, object);
         tokio::pin!(read);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut read)
@@ -14608,7 +14622,13 @@ mod tests {
             .await
             .expect("LIST reconciliation should resume after writer release")
             .expect("LIST reconciliation should read after the namespace barrier");
-        assert!(entries.0.is_empty());
+        assert_eq!(entries.0.len(), disks.len());
+        assert!(
+            entries.0.iter().all(|entry| entry
+                .as_ref()
+                .is_some_and(|entry| entry.name == object && !entry.metadata.is_empty())),
+            "LIST reconciliation must read encoded metadata and retain the logical key"
+        );
         assert_eq!(confirmed_absent, 0);
     }
 
