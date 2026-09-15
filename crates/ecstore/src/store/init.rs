@@ -2981,8 +2981,15 @@ mod tests {
                     assert!(backend.contains(&remote).await, "commit must not delete remote bytes before cleanup");
                     let removed_before = backend.remove_count().await;
 
-                    // Restart before queue delivery. The new runtime must
-                    // reconstruct ownership solely from the committed xl.meta.
+                    // Later matrix cases reuse this restarted store. If its
+                    // expiry worker has already dequeued this failed cleanup,
+                    // drain it before cancelling the context so the next
+                    // store cannot inherit object locks that block recovery.
+                    wait_for_expiry_workers_idle(&store).await;
+
+                    // Restart after the failed cleanup attempt. The new
+                    // runtime must reconstruct ownership from committed
+                    // xl.meta regardless of whether the old queue delivered it.
                     let tier_config = ctx
                         .tier_config_mgr()
                         .read()
