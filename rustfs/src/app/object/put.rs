@@ -1356,7 +1356,7 @@ impl DefaultObjectUsecase {
         };
         let committed = self.put_object_core(write, body, start_time).await?;
 
-        let raw_version = committed.obj_info.version_id.map(|v| v.to_string());
+        let raw_version = s3_response_version_id(committed.obj_info.version_id);
         let put_version = if committed.put_versioned { raw_version } else { None };
 
         let e_tag = committed.obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));

@@ -553,7 +553,7 @@ impl DefaultObjectUsecase {
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
-            version_id: read_response_version_id(info.version_id),
+            version_id: s3_response_version_id(info.version_id),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
