@@ -258,6 +258,7 @@ jobs:
           if [ -n "${PACKAGE_URL}" ]; then PACKAGE_SOURCE="${PACKAGE_URL}"; fi
           python3 auto-testing/scripts/issue_manager.py handle \
             --repo rustfs/backlog \
+            --outcome "${{ steps.test.outcome }}" \
             --suite table --category table --suite-label "S3 Tables" \
             --outcome '${{ steps.test.outcome }}' \
             --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md" \
