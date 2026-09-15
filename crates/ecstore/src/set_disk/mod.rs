@@ -4209,6 +4209,59 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn persist_delete_marker_purge(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> bool {
+        use rustfs_common::mrf_channel::{MrfDurableAdmissionError, MrfScope, persist_delete_marker_purge_intent};
+        let scope = (|| {
+            Ok::<_, MrfDurableAdmissionError>(MrfScope {
+                pool_index: u32::try_from(self.pool_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+                set_index: u32::try_from(self.set_index).map_err(|_| MrfDurableAdmissionError::InvalidIdentity)?,
+            })
+        })();
+        let result = match scope {
+            Ok(scope) => persist_delete_marker_purge_intent(bucket, object, version, scope, purge).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                tracing::trace!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "delete_marker_purge_durably_admitted",
+                    bucket,
+                    object,
+                    version_id = %version,
+                    pool_index = self.pool_index,
+                    set_index = self.set_index,
+                    "Delete-marker purge responsibility persisted"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "delete_marker_purge_admission_failed",
+                    bucket,
+                    object,
+                    version_id = %version,
+                    pool_index = self.pool_index,
+                    set_index = self.set_index,
+                    error = %error,
+                    "Delete-marker purge responsibility could not be persisted"
+                );
+                false
+            }
+        }
+    }
+
     pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
         use rustfs_common::mrf_channel::{
             MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,

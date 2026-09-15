@@ -26,8 +26,8 @@ use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
 use rustfs_common::mrf_channel::{
-    MRF_MAX_ATTEMPTS, MrfDurableAdmissionError, MrfDurableRepairAnchor, MrfDurableSubmission, MrfIngressResult, MrfIntent,
-    MrfKind,
+    MRF_MAX_ATTEMPTS, MRF_MAX_DELETE_MARKER_BYTES, MrfDeleteMarkerPurge, MrfDeleteMarkerPurgeIdentity, MrfDurableAdmissionError,
+    MrfDurableRepairAnchor, MrfDurableSubmission, MrfIngressResult, MrfIntent, MrfKind,
 };
 use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
@@ -48,7 +48,7 @@ pub mod snapshot;
 /// layout.
 pub(crate) const MRF_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal.bin";
 /// The scoped path is the authoritative snapshot for new readers and carries
-/// both v1 and v2 records. The legacy path is only a v1 compatibility mirror;
+/// v1, v2, and v3 records. The legacy path is only a v1 compatibility mirror;
 /// older readers ignore the authoritative path, while new readers never merge
 /// the two files. This prevents a partial two-file flush from fabricating a
 /// mixed epoch.
@@ -59,6 +59,7 @@ const MRF_JOURNAL_FORMAT: u8 = 1;
 /// Record layout version.
 const MRF_JOURNAL_VERSION: u8 = 1;
 const MRF_JOURNAL_VERSION_SCOPED: u8 = 2;
+const MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE: u8 = 3;
 
 /// Fixed header size: format, version, kind, attempts, enqueued_at_ms,
 /// has_version flag.
@@ -125,6 +126,7 @@ struct MrfQueueKey {
     object: Arc<str>,
     version_id: Option<[u8; 16]>,
     scope: Option<rustfs_common::mrf_channel::MrfScope>,
+    delete_marker_purge: Option<MrfDeleteMarkerPurgeIdentity>,
 }
 
 fn queue_key(intent: &MrfIntent) -> MrfQueueKey {
@@ -138,6 +140,7 @@ fn queue_key(intent: &MrfIntent) -> MrfQueueKey {
         object: intent.object.clone(),
         version_id,
         scope,
+        delete_marker_purge: intent.delete_marker_purge.as_ref().map(MrfDeleteMarkerPurge::identity),
     }
 }
 
@@ -234,9 +237,19 @@ pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
         .then_some(intent.scope)
         .flatten();
     let version_id = intent.version_id.filter(|bytes| *bytes != [0; 16]);
+    let purge = match intent.kind {
+        MrfKind::DeleteMarkerPurge => match intent.delete_marker_purge.as_ref().filter(|payload| payload.is_valid()) {
+            Some(payload) if version_id.is_some() && scope.is_some() => Some(payload),
+            _ => return false,
+        },
+        _ if intent.delete_marker_purge.is_none() => None,
+        _ => return false,
+    };
     let start = out.len();
     out.push(MRF_JOURNAL_FORMAT);
-    out.push(if scope.is_some() {
+    out.push(if purge.is_some() {
+        MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
+    } else if scope.is_some() {
         MRF_JOURNAL_VERSION_SCOPED
     } else {
         MRF_JOURNAL_VERSION
@@ -245,6 +258,7 @@ pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
         rustfs_common::mrf_channel::MrfKind::DecodeFailure => 1,
         rustfs_common::mrf_channel::MrfKind::MetadataCorruption => 2,
         rustfs_common::mrf_channel::MrfKind::PartialWrite => 3,
+        rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => 4,
     });
     out.push(intent.attempts);
     out.extend_from_slice(&intent.enqueued_at_ms.to_le_bytes());
@@ -263,6 +277,17 @@ pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
     out.extend_from_slice(&object_len.to_le_bytes());
     out.extend_from_slice(intent.bucket.as_bytes());
     out.extend_from_slice(intent.object.as_bytes());
+    if let Some(purge) = purge {
+        let Ok(marker_len) = u32::try_from(purge.marker.len()) else {
+            out.truncate(start);
+            return false;
+        };
+        out.extend_from_slice(purge.bucket_incarnation_id.as_bytes());
+        out.extend_from_slice(purge.marker_incarnation_id.as_bytes());
+        out.extend_from_slice(&purge.marker_identity);
+        out.extend_from_slice(&marker_len.to_le_bytes());
+        out.extend_from_slice(&purge.marker);
+    }
     let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
     hasher.update(&out[start..]);
     let Ok(checksum) = u32::try_from(hasher.finalize()) else {
@@ -277,15 +302,24 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
     if data.len() < MRF_RECORD_FIXED_HEAD + 8 {
         return None;
     }
-    if data[0] != MRF_JOURNAL_FORMAT || !matches!(data[1], MRF_JOURNAL_VERSION | MRF_JOURNAL_VERSION_SCOPED) {
+    if data[0] != MRF_JOURNAL_FORMAT
+        || !matches!(
+            data[1],
+            MRF_JOURNAL_VERSION | MRF_JOURNAL_VERSION_SCOPED | MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
+        )
+    {
         return None;
     }
     let kind = match data[2] {
         1 => rustfs_common::mrf_channel::MrfKind::DecodeFailure,
         2 => rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
         3 => rustfs_common::mrf_channel::MrfKind::PartialWrite,
+        4 => rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge,
         _ => return None,
     };
+    if (kind == MrfKind::DeleteMarkerPurge) != (data[1] == MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE) {
+        return None;
+    }
     let attempts = data[3];
     let enqueued_at_ms = u64::from_le_bytes(data[4..12].try_into().ok()?);
     let has_version = match data[12] {
@@ -304,7 +338,10 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
     } else {
         None
     };
-    let scope = if data[1] == MRF_JOURNAL_VERSION_SCOPED {
+    if kind == MrfKind::DeleteMarkerPurge && version_id.is_none_or(|bytes| bytes == [0; 16]) {
+        return None;
+    }
+    let scope = if matches!(data[1], MRF_JOURNAL_VERSION_SCOPED | MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE) {
         if data.len() < cursor + 8 {
             return None;
         }
@@ -324,7 +361,43 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
         return None;
     }
     cursor += 8;
-    let body_end = cursor.checked_add(bucket_len)?.checked_add(object_len)?;
+    let identity_end = cursor.checked_add(bucket_len)?.checked_add(object_len)?;
+    if data.len() < identity_end {
+        return None;
+    }
+    let bucket = std::sync::Arc::from(std::str::from_utf8(&data[cursor..cursor + bucket_len]).ok()?);
+    let object = std::sync::Arc::from(std::str::from_utf8(&data[cursor + bucket_len..identity_end]).ok()?);
+    let (delete_marker_purge, body_end) = if kind == MrfKind::DeleteMarkerPurge {
+        const PURGE_FIXED: usize = 16 + 16 + 32 + 4;
+        if data.len() < identity_end.checked_add(PURGE_FIXED)? {
+            return None;
+        }
+        let mut purge_cursor = identity_end;
+        let bucket_incarnation_id = Uuid::from_slice(&data[purge_cursor..purge_cursor + 16]).ok()?;
+        purge_cursor += 16;
+        let marker_incarnation_id = Uuid::from_slice(&data[purge_cursor..purge_cursor + 16]).ok()?;
+        purge_cursor += 16;
+        let marker_identity = data[purge_cursor..purge_cursor + 32].try_into().ok()?;
+        purge_cursor += 32;
+        let marker_len = usize::try_from(u32::from_le_bytes(data[purge_cursor..purge_cursor + 4].try_into().ok()?)).ok()?;
+        purge_cursor += 4;
+        if marker_len == 0 || marker_len > MRF_MAX_DELETE_MARKER_BYTES {
+            return None;
+        }
+        let body_end = purge_cursor.checked_add(marker_len)?;
+        if data.len() < body_end {
+            return None;
+        }
+        let payload = MrfDeleteMarkerPurge::new(
+            bucket_incarnation_id,
+            marker_incarnation_id,
+            marker_identity,
+            data[purge_cursor..body_end].to_vec(),
+        )?;
+        (Some(payload), body_end)
+    } else {
+        (None, identity_end)
+    };
     let record_end = body_end.checked_add(4)?;
     if data.len() < record_end {
         return None;
@@ -334,14 +407,13 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
     if u32::try_from(hasher.finalize()).ok()? != u32::from_le_bytes(data[body_end..record_end].try_into().ok()?) {
         return None;
     }
-    let bucket = std::sync::Arc::from(std::str::from_utf8(&data[cursor..cursor + bucket_len]).ok()?);
-    let object = std::sync::Arc::from(std::str::from_utf8(&data[cursor + bucket_len..body_end]).ok()?);
     Some((
         MrfIntent {
             bucket,
             object,
             version_id,
             kind,
+            delete_marker_purge,
             scope: if matches!(kind, rustfs_common::mrf_channel::MrfKind::MetadataCorruption) {
                 None
             } else {
@@ -482,6 +554,18 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
             },
             HealPriority::Normal,
         ),
+        rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => (
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id: version_id.expect("validated delete-marker purge requires a version"),
+                purge: intent
+                    .delete_marker_purge
+                    .clone()
+                    .expect("validated delete-marker purge requires a payload"),
+            },
+            HealPriority::Normal,
+        ),
     };
     let mut options = HealOptions::default();
     if matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::PartialWrite) {
@@ -510,6 +594,7 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
                 version_id: intent.version_id,
                 kind: intent.kind,
                 scope: intent.scope,
+                delete_marker_purge: intent.delete_marker_purge.as_ref().map(MrfDeleteMarkerPurge::identity),
                 lease: intent.lease,
             },
         )
@@ -536,7 +621,7 @@ struct MrfRuntime {
     /// True when replay observed a responsibility that cannot be discharged by
     /// a complete verified repair proof in this process.
     retain_replay_journal: bool,
-    /// Partial-write responsibilities accepted from replay and waiting for an
+    /// Durable responsibilities accepted from replay and waiting for an
     /// exact storage-owned proof before the startup journal can be deleted.
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
     /// Startup replay source to remove after the retained replay
@@ -568,7 +653,7 @@ impl MrfRuntime {
         // later write replaces this lease before its old proof arrives.
         let adopted_leases: HashSet<_> = self.partial_writes.intents().filter_map(|intent| intent.lease).collect();
         self.durable_replay_anchors
-            .retain(|anchor| anchor.kind != MrfKind::PartialWrite || !adopted_leases.contains(&anchor.lease));
+            .retain(|anchor| !anchor.kind.is_durable() || !adopted_leases.contains(&anchor.lease));
     }
 
     fn admit_partial_write(&mut self, intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
@@ -664,7 +749,7 @@ impl MrfRuntime {
             self.backoff_until = None;
         }
         while let Some(mut intent) = self.queue.pop_front() {
-            if intent.kind == MrfKind::PartialWrite {
+            if intent.kind.is_durable() {
                 if self.admit_partial_write(intent.clone()).is_err() {
                     self.queue.push_back(intent);
                     break;
@@ -780,9 +865,10 @@ impl MrfRuntime {
     }
 }
 
-/// Initialize the global MRF channel (honoring `RUSTFS_HEAL_MRF_ENABLE`) and
-/// spawn the consumer task. Called once from the heal runtime bootstrap right
-/// after the manager started; a disabled feature or a double call is a no-op.
+/// Initialize the global MRF channels and spawn the consumer task. The
+/// `RUSTFS_HEAL_MRF_ENABLE` switch only disables best-effort ingress; durable
+/// responsibility replay remains active so committed marker purges survive the
+/// ordinary MRF kill-switch.
 /// Public for integration tests that drive the real consumer loop.
 pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
     let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_MRF_ENABLE, rustfs_config::DEFAULT_HEAL_MRF_ENABLE);
@@ -790,9 +876,8 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
     if !enabled {
         tracing::info!(
             target: "rustfs::heal::mrf",
-            "MRF intent pipeline disabled by configuration; producers will not deliver"
+            "Best-effort MRF ingress disabled by configuration; durable responsibilities remain active"
         );
-        return;
     }
     let (receiver, durable_receiver) = match rustfs_common::mrf_channel::init_mrf_channel().and_then(|receiver| {
         rustfs_common::mrf_channel::init_durable_mrf_channel().map(|durable_receiver| (receiver, durable_receiver))
@@ -995,7 +1080,7 @@ async fn replay_into(
                 *backoff_until = Some(tokio::time::Instant::now());
                 break;
             }
-            if intent.kind == MrfKind::PartialWrite {
+            if intent.kind.is_durable() {
                 // Preserve the executable record as well as its proof anchor:
                 // a target that is still offline during replay needs live retries.
                 if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
@@ -1146,7 +1231,7 @@ async fn run_mrf_consumer(
                     return;
                 }
                 for intent in batch.drain(..) {
-                    if intent.kind == MrfKind::PartialWrite {
+                    if intent.kind.is_durable() {
                         if runtime.admit_partial_write(intent.clone()).is_err() {
                             rustfs_common::mrf_channel::release_mrf_intent(&intent);
                             counter!("rustfs_heal_mrf_dropped_total", "reason" => "queue_overflow").increment(1);
@@ -1273,11 +1358,44 @@ mod tests {
             object: StdArc::from(object),
             version_id: Some([7u8; 16]),
             kind: MrfKind::DecodeFailure,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 1_700_000_000_000,
             attempts,
         }
+    }
+
+    fn purge_intent(marker: Vec<u8>) -> MrfIntent {
+        let bucket_incarnation_id = Uuid::new_v4();
+        MrfIntent {
+            bucket: StdArc::from("purge-bucket"),
+            object: StdArc::from("markers/object.bin"),
+            version_id: Some(*Uuid::new_v4().as_bytes()),
+            kind: MrfKind::DeleteMarkerPurge,
+            delete_marker_purge: MrfDeleteMarkerPurge::new(bucket_incarnation_id, bucket_incarnation_id, [9; 32], marker),
+            scope: Some(rustfs_common::mrf_channel::MrfScope {
+                pool_index: 2,
+                set_index: 3,
+            }),
+            lease: None,
+            enqueued_at_ms: 1_700_000_000_001,
+            attempts: 2,
+        }
+    }
+
+    fn rewrite_record_crc(record: &mut [u8]) {
+        let crc_offset = record.len() - 4;
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(&record[..crc_offset]);
+        let checksum = u32::try_from(hasher.finalize()).expect("CRC32 fits");
+        record[crc_offset..].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn assert_journal_record_rejected(record: &[u8]) {
+        let (decoded, truncated) = decode_journal(record);
+        assert!(decoded.is_empty());
+        assert_eq!(truncated, record.len());
     }
 
     fn encoded_payload(intent: &MrfIntent) -> Vec<u8> {
@@ -1432,6 +1550,7 @@ mod tests {
             object: anchor.object.clone(),
             version_id: anchor.version_id,
             scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
             lease: Some(anchor.lease),
             bucket_incarnation_id: anchor.bucket_incarnation_id,
             disposition: MrfVerifiedRepairDisposition::Repaired,
@@ -2113,6 +2232,7 @@ mod tests {
             object: intent.object.clone(),
             version_id: intent.version_id,
             scope: intent.scope,
+            delete_marker_purge: intent.delete_marker_purge.as_ref().map(MrfDeleteMarkerPurge::identity),
             lease: intent.lease,
             bucket_incarnation_id,
             disposition: MrfVerifiedRepairDisposition::Repaired,
@@ -2368,6 +2488,7 @@ mod tests {
             object: anchor.object.clone(),
             version_id: anchor.version_id,
             scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
             lease: Some(anchor.lease),
             bucket_incarnation_id: anchor.bucket_incarnation_id,
             disposition: MrfVerifiedRepairDisposition::Repaired,
@@ -2629,6 +2750,7 @@ mod tests {
                 object: StdArc::from("object/c"),
                 version_id: None,
                 kind: MrfKind::MetadataCorruption,
+                delete_marker_purge: None,
                 scope: None,
                 lease: None,
                 enqueued_at_ms: 5,
@@ -2649,6 +2771,76 @@ mod tests {
             assert_eq!(left.kind, right.kind);
             assert_eq!(left.attempts, right.attempts);
         }
+    }
+
+    #[test]
+    fn journal_v3_roundtrip_preserves_delete_marker_purge_payload() {
+        let intent = purge_intent(vec![1, 2, 3, 4, 5]);
+        let mut buf = Vec::new();
+        assert!(encode_intent(&intent, &mut buf));
+        assert_eq!(buf[1], MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE);
+        assert_eq!(buf[2], 4);
+
+        let (decoded, truncated) = decode_journal(&buf);
+        assert_eq!(truncated, 0);
+        assert_eq!(decoded.len(), 1);
+        let decoded = &decoded[0];
+        assert_eq!(decoded.bucket, intent.bucket);
+        assert_eq!(decoded.object, intent.object);
+        assert_eq!(decoded.version_id, intent.version_id);
+        assert_eq!(decoded.kind, MrfKind::DeleteMarkerPurge);
+        assert_eq!(decoded.scope, intent.scope);
+        assert_eq!(decoded.delete_marker_purge, intent.delete_marker_purge);
+        assert_eq!(decoded.attempts, intent.attempts);
+    }
+
+    #[test]
+    fn journal_v3_rejects_nil_version_wrong_layout_corruption_and_truncation() {
+        let intent = purge_intent(vec![1, 2, 3, 4, 5]);
+        let mut encoded = Vec::new();
+        assert!(encode_intent(&intent, &mut encoded));
+
+        let mut nil_version = encoded.clone();
+        nil_version[13..29].fill(0);
+        rewrite_record_crc(&mut nil_version);
+        assert_journal_record_rejected(&nil_version);
+
+        let mut wrong_kind = encoded.clone();
+        wrong_kind[2] = 3;
+        rewrite_record_crc(&mut wrong_kind);
+        assert_journal_record_rejected(&wrong_kind);
+
+        let mut wrong_layout = encoded.clone();
+        wrong_layout[1] = MRF_JOURNAL_VERSION_SCOPED;
+        rewrite_record_crc(&mut wrong_layout);
+        assert_journal_record_rejected(&wrong_layout);
+
+        let marker_byte = encoded.len() - 5;
+        encoded[marker_byte] ^= 0xff;
+        assert_journal_record_rejected(&encoded);
+
+        let torn = &encoded[..encoded.len() - 1];
+        assert_journal_record_rejected(torn);
+    }
+
+    #[test]
+    fn journal_v3_rejects_missing_or_oversized_payload_without_mutating_output() {
+        let mut missing = purge_intent(vec![1]);
+        missing.delete_marker_purge = None;
+        let mut output = vec![7];
+        assert!(!encode_intent(&missing, &mut output));
+        assert_eq!(output, vec![7]);
+
+        let bucket_incarnation_id = Uuid::new_v4();
+        let mut oversized = purge_intent(vec![1]);
+        oversized.delete_marker_purge = Some(MrfDeleteMarkerPurge {
+            bucket_incarnation_id,
+            marker_incarnation_id: bucket_incarnation_id,
+            marker_identity: [3; 32],
+            marker: StdArc::from(vec![0; MRF_MAX_DELETE_MARKER_BYTES + 1]),
+        });
+        assert!(!encode_intent(&oversized, &mut output));
+        assert_eq!(output, vec![7]);
     }
 
     #[test]
@@ -2701,6 +2893,7 @@ mod tests {
             object: StdArc::from("o"),
             version_id: None,
             kind: MrfKind::MetadataCorruption,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 0,
@@ -2714,6 +2907,7 @@ mod tests {
             object: StdArc::from("o"),
             version_id: None,
             kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 0,

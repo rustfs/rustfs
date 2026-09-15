@@ -1226,6 +1226,7 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
             pool_index: 1,
             set_index: 2,
         }),
+        delete_marker_purge: None,
         lease: None,
     };
     let matching = HealObjectOutcome {
@@ -1352,6 +1353,7 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
             pool_index: 1,
             set_index: 2,
         }),
+        delete_marker_purge: None,
         lease: None,
     };
     let mismatch_target = MrfRepairNoticeTarget {

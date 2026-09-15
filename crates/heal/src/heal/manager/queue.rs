@@ -126,6 +126,17 @@ impl CompletedHealStatus {
                 add(object.capacity());
                 add(version_id.as_ref().map_or(0, String::capacity));
             }
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                purge,
+            } => {
+                add(bucket.capacity());
+                add(object.capacity());
+                add(version_id.capacity());
+                add(purge.marker.len());
+            }
             HealType::Prefix { bucket, prefix } => {
                 add(bucket.capacity());
                 add(prefix.capacity());
@@ -490,6 +501,17 @@ impl PriorityHealQueue {
             } => {
                 format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                purge,
+            } => format!(
+                "delete-marker-purge:{bucket}:{object}:{version_id}:{}:{}:{}",
+                purge.bucket_incarnation_id,
+                purge.marker_incarnation_id,
+                base64_simd::URL_SAFE_NO_PAD.encode_to_string(purge.marker_identity)
+            ),
         }
     }
 

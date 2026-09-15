@@ -24,7 +24,7 @@ struct Responsibility {
     next_attempt: Instant,
 }
 
-/// Partial writes have no rediscovery producer when scanning is disabled.
+/// Durable storage responsibilities have no guaranteed rediscovery producer.
 /// Admission, task failure and retry exhaustion cannot release their records.
 #[derive(Default)]
 pub(super) struct PartialWrites {
@@ -169,6 +169,7 @@ mod tests {
             object: Arc::from(object),
             version_id: None,
             kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
             scope: Some(MrfScope {
                 pool_index: 0,
                 set_index: 0,

@@ -632,19 +632,30 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, usize, Option<StorageError>) {
+        let (object_info, _, write_quorum, error) = self.get_object_info_fileinfo_and_quorum(bucket, object, opts).await;
+        (object_info, write_quorum, error)
+    }
+
+    pub(super) async fn get_object_info_fileinfo_and_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> (ObjectInfo, FileInfo, usize, Option<StorageError>) {
         let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
             Ok(snapshot) => snapshot,
-            Err(e) => return (ObjectInfo::default(), 0, Some(e)),
+            Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
-        let fi = snapshot.fi();
+        let fi = snapshot.fi().clone();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
                 oi,
+                fi,
                 write_quorum,
                 Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
             );
@@ -652,20 +663,26 @@ impl SetDisks {
 
         if fi.deleted {
             if opts.incl_free_versions && fi.tier_free_version() && opts.version_id.is_some() {
-                return (oi, write_quorum, None);
+                return (oi, fi, write_quorum, None);
             }
             return if opts.version_id.is_none() || opts.delete_marker {
-                (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
+                (
+                    oi,
+                    fi,
+                    write_quorum,
+                    Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])),
+                )
             } else {
                 (
                     oi,
+                    fi,
                     write_quorum,
                     Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
                 )
             };
         }
 
-        (oi, write_quorum, None)
+        (oi, fi, write_quorum, None)
     }
 
     #[allow(clippy::too_many_arguments)]

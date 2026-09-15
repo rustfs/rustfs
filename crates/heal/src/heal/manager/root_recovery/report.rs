@@ -203,7 +203,8 @@ mod tests {
     #[test]
     fn root_report_encoding_rejects_oversized_payload() {
         let task_id = Uuid::new_v4().to_string();
-        let terminal = RootHealTerminal::cancelled(&task_id, &HealType::Cluster, HealOptions::default());
+        let terminal = RootHealTerminal::cancelled(&task_id, &HealType::Cluster, HealOptions::default())
+            .expect("cluster is an administrator recovery type");
         let mut completed = terminal.clone().into_completed();
         completed.progress = Some(HealProgress {
             current_object: Some("x".repeat(MAX_ROOT_REPORT_BYTES)),

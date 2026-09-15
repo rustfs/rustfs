@@ -29,6 +29,7 @@ pub enum HealObjectKind {
     Object,
     Metadata,
     Decode,
+    DeleteMarkerPurge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

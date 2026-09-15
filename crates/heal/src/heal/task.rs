@@ -130,6 +130,13 @@ pub enum HealType {
         object: String,
         version_id: Option<String>,
     },
+    /// Complete an explicit delete-marker purge on its original erasure set.
+    DeleteMarkerPurge {
+        bucket: String,
+        object: String,
+        version_id: String,
+        purge: rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    },
 }
 
 impl HealType {
@@ -142,6 +149,7 @@ impl HealType {
             Self::ErasureSet { .. } => "erasure_set",
             Self::Metadata { .. } => "metadata",
             Self::ECDecode { .. } => "ec_decode",
+            Self::DeleteMarkerPurge { .. } => "delete_marker_purge",
         }
     }
 
@@ -152,7 +160,10 @@ impl HealType {
     /// cannot amplify into per-object `info!`/`warn!` lines; aggregate kinds
     /// (cluster/bucket/prefix/erasure-set) keep operator-visible levels.
     pub(crate) fn is_per_object(&self) -> bool {
-        matches!(self, Self::Object { .. } | Self::Metadata { .. } | Self::ECDecode { .. })
+        matches!(
+            self,
+            Self::Object { .. } | Self::Metadata { .. } | Self::ECDecode { .. } | Self::DeleteMarkerPurge { .. }
+        )
     }
 }
 
@@ -598,6 +609,7 @@ impl HealTask {
             kind: match self.heal_type {
                 HealType::Metadata { .. } => HealObjectKind::Metadata,
                 HealType::ECDecode { .. } => HealObjectKind::Decode,
+                HealType::DeleteMarkerPurge { .. } => HealObjectKind::DeleteMarkerPurge,
                 _ => HealObjectKind::Object,
             },
             bucket: bucket.to_owned(),
@@ -634,6 +646,12 @@ impl HealTask {
                 version_id,
             } => (bucket, object, version_id.as_deref()),
             HealType::Metadata { bucket, object } => (bucket, object, None),
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => (bucket, object, Some(version_id.as_str())),
             _ => return None,
         };
         Some(self.outcome_identity(bucket, object, version, self.options.pool_index, self.options.set_index))
@@ -752,6 +770,15 @@ impl HealTask {
                         None => event,
                     }
                 }
+                HealType::DeleteMarkerPurge {
+                    bucket,
+                    object,
+                    version_id,
+                    ..
+                } => event
+                    .with_bucket(bucket.as_str())
+                    .with_object(object.as_str())
+                    .with_attr("version_id", version_id.as_str()),
             };
 
             match error {
@@ -1091,6 +1118,12 @@ impl HealTask {
                     object,
                     version_id,
                 } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
+                HealType::DeleteMarkerPurge {
+                    bucket,
+                    object,
+                    version_id,
+                    purge,
+                } => self.heal_delete_marker_purge(bucket, object, version_id, purge).await,
                 HealType::ErasureSet { buckets, set_disk_id } => {
                     self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await
                 }

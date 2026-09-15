@@ -37,6 +37,7 @@ use rustfs_utils::http::{
     insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix, strip_internal_prefix_preserving_case,
     target_delete_marker_versions,
 };
+use sha2::{Digest as _, Sha256};
 
 const MSGPACK_EXT8: u8 = 0xc7;
 const MSGPACK_EXT16: u8 = 0xc8;
@@ -3010,6 +3011,40 @@ impl TryFrom<LegacyMetaV2DeleteMarker> for MetaDeleteMarker {
 }
 
 impl MetaDeleteMarker {
+    /// Return a deterministic identity for an exact delete-marker body.
+    /// MessagePack map order is intentionally excluded from the identity.
+    pub fn stable_identity(&self) -> [u8; 32] {
+        const DOMAIN: &[u8] = b"rustfs-delete-marker-identity-v1\0";
+
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        match self.version_id {
+            Some(version_id) => {
+                hasher.update([1]);
+                hasher.update(version_id.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        match self.mod_time {
+            Some(mod_time) => {
+                hasher.update([1]);
+                hasher.update(mod_time.unix_timestamp_nanos().to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+
+        let mut metadata = self.meta_sys.iter().collect::<Vec<_>>();
+        metadata.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        hasher.update(u64::try_from(metadata.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (key, value) in metadata {
+            hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value);
+        }
+        hasher.finalize().into()
+    }
+
     pub fn free_version(&self) -> bool {
         contains_key_bytes(&self.meta_sys, SUFFIX_FREE_VERSION)
     }
@@ -5623,6 +5658,40 @@ mod tests {
 
         // Same content is stable across recomputation.
         assert_eq!(base.get_signature(), base.get_signature());
+    }
+
+    #[test]
+    fn delete_marker_stable_identity_is_order_independent_and_exact() {
+        let version_id = sample_version_id();
+        let mod_time = sample_mod_time();
+        let mut first = MetaDeleteMarker {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            meta_sys: HashMap::new(),
+        };
+        first.meta_sys.insert("alpha".to_string(), vec![1, 2]);
+        first.meta_sys.insert("beta".to_string(), vec![3, 4]);
+
+        let mut reordered = MetaDeleteMarker {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            meta_sys: HashMap::new(),
+        };
+        reordered.meta_sys.insert("beta".to_string(), vec![3, 4]);
+        reordered.meta_sys.insert("alpha".to_string(), vec![1, 2]);
+        assert_eq!(first.stable_identity(), reordered.stable_identity());
+
+        let mut changed = first.clone();
+        changed.meta_sys.insert("beta".to_string(), vec![3, 5]);
+        assert_ne!(first.stable_identity(), changed.stable_identity());
+
+        changed = first.clone();
+        changed.version_id = Some(Uuid::new_v4());
+        assert_ne!(first.stable_identity(), changed.stable_identity());
+
+        changed = first.clone();
+        changed.mod_time = changed.mod_time.map(|value| value + time::Duration::NANOSECOND);
+        assert_ne!(first.stable_identity(), changed.stable_identity());
     }
 
     #[test]
