@@ -38,7 +38,7 @@ use super::{
     TOP_RPC_CAPABILITY, TOP_SCHEMA_VERSION, ThreadProfileScope, TopApiOperation, TopCaptureLimits, TopCaptureRequest,
     TopCaptureScope, TopOutcome, capture_cpu_profile, capture_thread_profile, capture_top_api, capture_top_locks,
     capture_top_rpc, encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases,
-    sign_drive_export, sign_network_export, sign_top_export, sign_top_export_with_nonce,
+    sign_drive_export, sign_network_export, sign_top_export_with_nonce,
 };
 use crate::connect::DeviceIdentity;
 
@@ -531,7 +531,7 @@ pub async fn execute_diagnostic_job(
             execute_performance_network_job(envelope, nonce, identity, provenance, cancel).await
         }
         DiagnosticJobKind::TopApi => execute_top_api_job(envelope, nonce, identity, provenance, cancel).await,
-        DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, identity, provenance, cancel).await,
+        DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopRpc => execute_top_rpc_job(envelope, nonce, identity, provenance, cancel).await,
     }
 }
@@ -919,6 +919,7 @@ async fn execute_top_api_job(
 
 async fn execute_top_locks_job(
     envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
     identity: &DeviceIdentity,
     provenance: ProfileProvenance,
     cancel: &CancellationToken,
@@ -966,7 +967,7 @@ async fn execute_top_locks_job(
             artifact_bytes: None,
         });
     }
-    let export = sign_top_export(&request, &result, identity, cancel).map_err(top_export_failure)?;
+    let export = sign_top_export_with_nonce(&request, &result, identity, cancel, nonce).map_err(top_export_failure)?;
     if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
         return Err(DiagnosticJobError::LimitExceeded);
     }
@@ -1535,6 +1536,39 @@ mod tests {
             signer.verify(&unbounded, &target(&unbounded), "2030-01-01T00:00:10Z".parse().expect("time")),
             Err(DiagnosticJobError::LimitExceeded)
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn top_locks_job_preserves_the_signed_job_nonce() {
+        rustfs_lock::get_global_lock_manager();
+        let now = Utc::now();
+        let mut top = envelope();
+        top.job_type = TOP_LOCKS_JOB_TYPE.to_owned();
+        top.required_capabilities = vec![TOP_LOCKS_CAPABILITY.to_owned()];
+        top.limits.max_cpu_millis = MAX_TOP_LOCKS_CPU_MILLIS;
+        top.parameters.duration_millis = 1;
+        top.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        top.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        top.parameters.consent_expires_at =
+            (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let nonce = [7_u8; 32];
+        let execution = execute_diagnostic_job(
+            VerifiedDiagnosticJob { envelope: top, nonce },
+            &DeviceIdentity::generate(),
+            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("top.locks job should execute");
+
+        let bytes = execution.artifact_bytes.expect("top.locks artifact");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("top.locks archive");
+        let mut envelope = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("envelope.json").expect("top.locks envelope"), &mut envelope)
+            .expect("read top.locks envelope");
+        let envelope: serde_json::Value = serde_json::from_str(&envelope).expect("valid top.locks envelope");
+        assert_eq!(envelope["nonce"], URL_SAFE_NO_PAD.encode_to_string(nonce));
     }
 
     #[test]
