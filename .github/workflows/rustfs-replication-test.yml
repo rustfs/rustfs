@@ -67,7 +67,7 @@ env:
 jobs:
   replication-test:
     runs-on: smoke-testing
-    timeout-minutes: 360
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
@@ -114,6 +114,7 @@ jobs:
           df -h /data | tail -1 || true
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -133,6 +134,7 @@ jobs:
 
       - name: Run replication suite
         id: test
+        timeout-minutes: 45
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-replication-test.sh
@@ -156,6 +158,7 @@ jobs:
 
       - name: Generate report
         id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -212,6 +215,7 @@ jobs:
           [ "${RESULT}" = "success" ]
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -243,6 +247,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
+        timeout-minutes: 2
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
         continue-on-error: true
         env:
@@ -303,6 +308,7 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -314,6 +320,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: always()
         run: |
           set -euo pipefail
