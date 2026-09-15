@@ -32,9 +32,10 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
-/// Encode the resolved local read identity. Storage distinguishes a null
-/// version from an unversioned object by returning a nil UUID instead of None.
-pub(crate) fn read_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+/// Encode a resolved object version identity for an S3 response. Storage
+/// distinguishes a null version from an unversioned object by returning a nil
+/// UUID instead of None.
+pub(crate) fn s3_response_version_id(version_id: Option<Uuid>) -> Option<String> {
     version_id.map(|id| {
         if id.is_nil() {
             NULL_VERSION_ID.to_owned()
@@ -1113,6 +1114,15 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
+        let version = Uuid::parse_str("9341ae04-d4ce-468c-a4e1-6501d58cd6b7").unwrap();
+
+        assert_eq!(s3_response_version_id(None), None);
+        assert_eq!(s3_response_version_id(Some(Uuid::nil())).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(s3_response_version_id(Some(version)), Some(version.to_string()));
+    }
 
     #[test]
     fn delete_marker_read_headers_round_trip_uuid_and_null_errors() {

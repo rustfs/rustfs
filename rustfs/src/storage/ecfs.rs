@@ -1233,7 +1233,7 @@ impl S3 for FS {
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
-            version_id: s3_api::read_response_version_id(info.version_id),
+            version_id: s3_api::s3_response_version_id(info.version_id),
         }))
     }
 
