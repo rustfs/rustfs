@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::root_recovery::RootHealRecovery;
+use super::super::root_recovery::{MAX_ROOT_RECOVERY_BYTES, RootHealRecovery};
 use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
 use std::collections::HashSet;
@@ -1400,7 +1400,7 @@ async fn root_recovery_terminal_gc_is_delete_budget_bounded() {
 }
 
 #[tokio::test]
-async fn root_recovery_corrupt_terminal_receipt_retains_pending_fail_closed() {
+async fn root_recovery_corrupt_terminal_receipt_is_quarantined_without_blocking_admission() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
     let request = admin_request(HealType::Bucket {
@@ -1445,7 +1445,28 @@ async fn root_recovery_corrupt_terminal_receipt_retains_pending_fail_closed() {
             .await
             .is_ok()
     );
-    assert!(manager.root_recovery.pending().await.is_err());
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("quarantine corrupt terminal")
+            .is_empty()
+    );
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("quarantined-root-heal-terminal-{}.json", request.id))
+            .await
+            .is_ok()
+    );
+    let mut replacement = admin_request(request.heal_type.clone());
+    replacement.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(replacement)
+            .await
+            .expect("admit independent replacement"),
+        HealAdmissionResult::Accepted
+    );
 }
 
 #[tokio::test]
@@ -1583,7 +1604,7 @@ async fn root_recovery_admin_overlap_same_id_does_not_overwrite_a_durable_only_b
 }
 
 #[tokio::test]
-async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_owner() {
+async fn root_recovery_admin_overlap_quarantines_corrupt_owner_before_replacement() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
     let owner = admin_prefix_request("bucket", "scope/child/");
@@ -1598,9 +1619,13 @@ async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_ow
         .expect("inject corrupt ownership record");
     let mut replacement = admin_prefix_request("bucket", "scope/");
     replacement.force_start = true;
-    assert!(
-        manager.submit_heal_request(replacement).await.is_err(),
-        "unknown ownership must fail before cancellation"
+    let replacement_id = replacement.id.clone();
+    assert_eq!(
+        manager
+            .submit_heal_request(replacement)
+            .await
+            .expect("admit replacement after quarantine"),
+        HealAdmissionResult::Accepted
     );
     assert_eq!(
         manager
@@ -1610,14 +1635,14 @@ async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_ow
             .requests()
             .map(|request| request.id.clone())
             .collect::<Vec<_>>(),
-        vec![owner.id.clone()]
+        vec![replacement_id]
     );
     assert_eq!(
         manager
             .get_task_status(&owner.id)
             .await
             .expect("original owner remains queryable"),
-        HealTaskStatus::Pending
+        HealTaskStatus::Cancelled
     );
     assert_eq!(
         disk.read_all(RUSTFS_META_BUCKET, &path)
@@ -1625,6 +1650,11 @@ async fn root_recovery_admin_overlap_corrupt_preflight_does_not_cancel_a_live_ow
             .expect("retain corrupt record")
             .as_ref(),
         b"{"
+    );
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("quarantined-root-heal-intent-{}.json", corrupt.id))
+            .await
+            .is_ok()
     );
 }
 
@@ -2012,8 +2042,8 @@ async fn root_recovery_force_start_replaces_fresh_queued_and_retrying_admin_root
 }
 
 #[tokio::test]
-async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
-    for kind in ["truncated", "schema", "identity", "option", "no_lock"] {
+async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay() {
+    for kind in ["truncated", "schema", "identity", "option", "no_lock", "oversized"] {
         let (_temp, disk) = recovery_disk().await;
         let manager = recovery_manager(vec![disk.clone()]);
         let valid = root_request();
@@ -2034,16 +2064,16 @@ async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
             "no_lock" => value["options"]["no_lock"] = true.into(),
             _ => {}
         }
-        let bytes = if kind == "truncated" {
-            b"{".to_vec()
-        } else {
-            serde_json::to_vec(&value).expect("modified record")
+        let bytes = match kind {
+            "truncated" => b"{".to_vec(),
+            "oversized" => vec![b' '; MAX_ROOT_RECOVERY_BYTES + 1],
+            _ => serde_json::to_vec(&value).expect("modified record"),
         };
         disk.write_all(RUSTFS_META_BUCKET, &path, bytes.clone().into())
             .await
             .expect("inject bad record");
-        assert!(manager.replay_root_heals().await.is_err(), "kind={kind}");
-        assert_eq!(manager.get_queue_length().await, 0, "no partial admission for {kind}");
+        manager.replay_root_heals().await.expect("quarantine invalid record");
+        assert_eq!(manager.get_queue_length().await, 1, "valid record replays for {kind}");
         assert_eq!(
             disk.read_all(RUSTFS_META_BUCKET, &path)
                 .await
@@ -2051,13 +2081,50 @@ async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
                 .as_ref(),
             bytes
         );
-        let mut forced = root_request();
-        forced.force_start = true;
+        let marker_path = format!("quarantined-root-heal-intent-{}.json", invalid.id);
+        let marker = disk
+            .read_all(RUSTFS_META_BUCKET, &marker_path)
+            .await
+            .expect("durable quarantine marker");
+        let marker: serde_json::Value = serde_json::from_slice(&marker).expect("quarantine marker JSON");
+        assert_eq!(marker["task_id"], invalid.id, "kind={kind}");
+        assert_eq!(marker["record_kind"], "intent", "kind={kind}");
+        assert_eq!(marker["source_prefix_len"], bytes.len().min(MAX_ROOT_RECOVERY_BYTES + 1), "kind={kind}");
+        assert_eq!(marker["source_oversized"], kind == "oversized", "kind={kind}");
+
+        let mut reused = invalid.clone();
+        reused.force_start = true;
         assert!(
-            manager.submit_heal_request(forced).await.is_err(),
-            "forceStart must not discard unknown state"
+            manager.submit_heal_request(reused).await.is_err(),
+            "quarantined task ID remains reserved for {kind}"
+        );
+        let mut replacement = root_request();
+        replacement.force_start = true;
+        assert_eq!(
+            manager
+                .submit_heal_request(replacement)
+                .await
+                .expect("admit independent compensation"),
+            HealAdmissionResult::Accepted,
+            "kind={kind}"
         );
     }
+}
+
+#[tokio::test]
+async fn root_recovery_quarantine_source_change_fails_closed() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let path = format!("root-heal-{}.json", request.id);
+    disk.write_all(RUSTFS_META_BUCKET, &path, b"{".to_vec().into())
+        .await
+        .expect("corrupt source");
+    manager.root_recovery.pending().await.expect("quarantine source");
+    disk.write_all(RUSTFS_META_BUCKET, &path, b"changed".to_vec().into())
+        .await
+        .expect("change retained source");
+    assert!(manager.root_recovery.pending().await.is_err(), "marker must fence a changed source");
 }
 
 #[tokio::test]
@@ -2517,7 +2584,7 @@ async fn root_recovery_legacy_empty_erasure_scope_does_not_block_other_owners() 
 }
 
 #[tokio::test]
-async fn root_recovery_erasure_bucket_scope_marker_rejects_conflicts() {
+async fn root_recovery_erasure_bucket_scope_marker_quarantines_conflicts() {
     for (buckets, marker, valid) in [
         (serde_json::json!([]), serde_json::json!(true), true),
         (serde_json::json!([]), serde_json::json!(false), false),
@@ -2538,8 +2605,15 @@ async fn root_recovery_erasure_bucket_scope_marker_rejects_conflicts() {
             .await
             .expect("scope marker record");
         let manager = recovery_manager(vec![disk.clone()]);
-        let result = manager.root_recovery.pending().await;
-        assert_eq!(result.is_ok(), valid, "{marker:?}, {buckets:?}");
+        let pending = manager.root_recovery.pending().await.expect("inventory scope marker");
+        assert_eq!(pending.len(), usize::from(valid), "{marker:?}, {buckets:?}");
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("quarantined-root-heal-intent-{}.json", request.id))
+                .await
+                .is_ok(),
+            !valid,
+            "{marker:?}, {buckets:?}"
+        );
         assert_eq!(
             disk.read_all(RUSTFS_META_BUCKET, &path)
                 .await

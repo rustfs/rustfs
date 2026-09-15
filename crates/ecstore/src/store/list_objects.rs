@@ -7366,8 +7366,8 @@ mod test {
     }
 
     fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
-        let version_id = Uuid::from_u128(0x123456789abc_def0_123456789abc_def0);
-        let data_dir = Uuid::from_u128(0xabcdef123456_7890_abcdef123456_7890);
+        let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let mut meta = FileMeta::new();
         let mut fi = FileInfo::new(name, 2, 2);

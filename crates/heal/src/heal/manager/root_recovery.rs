@@ -23,6 +23,8 @@ use crate::heal::resume::CheckpointManager;
 use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
 use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 mod report;
@@ -36,6 +38,10 @@ const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
 const SCOPED_ROOT_RECOVERY_SCHEMA: u32 = 2;
 const ROOT_RECOVERY_SCHEMA: u32 = 3;
 const ROOT_TERMINAL_SCHEMA: u32 = 1;
+const ROOT_QUARANTINE_INTENT_PREFIX: &str = "quarantined-root-heal-intent-";
+const ROOT_QUARANTINE_TERMINAL_PREFIX: &str = "quarantined-root-heal-terminal-";
+const ROOT_QUARANTINE_SCHEMA: u32 = 1;
+pub(super) const MAX_ROOT_RECOVERY_BYTES: usize = 64 * 1024;
 const ROOT_TERMINAL_GC_SCAN_BUDGET: usize = 1024;
 const ROOT_TERMINAL_GC_DELETE_BUDGET: usize = 64;
 
@@ -255,6 +261,38 @@ struct RootHealTerminal {
     completed_at: SystemTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RootHealRecordKind {
+    Intent,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootHealQuarantine {
+    schema: u32,
+    task_id: String,
+    record_kind: RootHealRecordKind,
+    source_prefix_len: usize,
+    source_prefix_sha256: Vec<u8>,
+    source_oversized: bool,
+    reason: String,
+    quarantined_at: SystemTime,
+}
+
+struct RootHealSource {
+    bytes: EcstoreDiskBytes,
+    source_prefix_sha256: Vec<u8>,
+    source_oversized: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RootHealInventory {
+    pub(super) requests: Vec<HealRequest>,
+    pub(super) quarantined_task_ids: HashSet<String>,
+}
+
 impl RootHealTerminal {
     fn validate(&self, task_id: &str) -> Result<()> {
         let _ = terminal_path(task_id)?;
@@ -411,8 +449,99 @@ fn terminal_path(task_id: &str) -> Result<String> {
     Ok(format!("{ROOT_TERMINAL_PREFIX}{task_id}.json"))
 }
 
+fn quarantine_path(record_kind: RootHealRecordKind, task_id: &str) -> Result<String> {
+    let _ = match record_kind {
+        RootHealRecordKind::Intent => intent_path(task_id)?,
+        RootHealRecordKind::Terminal => terminal_path(task_id)?,
+    };
+    let prefix = match record_kind {
+        RootHealRecordKind::Intent => ROOT_QUARANTINE_INTENT_PREFIX,
+        RootHealRecordKind::Terminal => ROOT_QUARANTINE_TERMINAL_PREFIX,
+    };
+    Ok(format!("{prefix}{task_id}.json"))
+}
+
+fn parse_quarantine_entry(entry: &str) -> Option<(RootHealRecordKind, &str)> {
+    let (record_kind, suffix) = if let Some(suffix) = entry
+        .strip_prefix(ROOT_QUARANTINE_INTENT_PREFIX)
+        .and_then(|entry| entry.strip_suffix(".json"))
+    {
+        (RootHealRecordKind::Intent, suffix)
+    } else {
+        let suffix = entry
+            .strip_prefix(ROOT_QUARANTINE_TERMINAL_PREFIX)
+            .and_then(|entry| entry.strip_suffix(".json"))?;
+        (RootHealRecordKind::Terminal, suffix)
+    };
+    Uuid::parse_str(suffix).ok().filter(|id| id.to_string() == suffix)?;
+    Some((record_kind, suffix))
+}
+
+async fn read_bounded(disk: &DiskStore, path: &str) -> Result<Option<EcstoreDiskBytes>> {
+    let reader = match EcstoreDiskAPI::read_file(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
+        Ok(reader) => reader,
+        Err(DiskError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(Error::Disk(error)),
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take(u64::try_from(MAX_ROOT_RECOVERY_BYTES + 1).map_err(Error::other)?)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(Some(bytes.into()))
+}
+
+async fn read_source(disk: &DiskStore, path: &str) -> Result<Option<RootHealSource>> {
+    let Some(bytes) = read_bounded(disk, path).await? else {
+        return Ok(None);
+    };
+    Ok(Some(RootHealSource {
+        source_prefix_sha256: Sha256::digest(&bytes).to_vec(),
+        source_oversized: bytes.len() > MAX_ROOT_RECOVERY_BYTES,
+        bytes,
+    }))
+}
+
+fn decode_quarantine(task_id: &str, record_kind: RootHealRecordKind, bytes: &[u8]) -> Result<RootHealQuarantine> {
+    let marker: RootHealQuarantine = serde_json::from_slice(bytes)
+        .map_err(|error| Error::Other(format!("Invalid root heal quarantine marker {task_id}: {error}")))?;
+    if marker.schema != ROOT_QUARANTINE_SCHEMA
+        || marker.task_id != task_id
+        || marker.record_kind != record_kind
+        || marker.source_prefix_sha256.len() != 32
+    {
+        return Err(Error::Other(format!("Unsupported or mismatched root heal quarantine marker {task_id}")));
+    }
+    let _ = quarantine_path(record_kind, task_id)?;
+    Ok(marker)
+}
+
+fn encode_quarantine(
+    task_id: &str,
+    record_kind: RootHealRecordKind,
+    source: &RootHealSource,
+    reason: &str,
+) -> Result<EcstoreDiskBytes> {
+    let marker = RootHealQuarantine {
+        schema: ROOT_QUARANTINE_SCHEMA,
+        task_id: task_id.to_owned(),
+        record_kind,
+        source_prefix_len: source.bytes.len(),
+        source_prefix_sha256: source.source_prefix_sha256.clone(),
+        source_oversized: source.source_oversized,
+        reason: reason.chars().take(256).collect(),
+        quarantined_at: SystemTime::now(),
+    };
+    serde_json::to_vec(&marker)
+        .map(EcstoreDiskBytes::from)
+        .map_err(|error| Error::Serialization(format!("Serialize root heal quarantine marker: {error}")))
+}
+
 fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     let _ = intent_path(task_id)?;
+    if bytes.len() > MAX_ROOT_RECOVERY_BYTES {
+        return Err(Error::Other(format!("Root heal recovery record exceeds its size limit {task_id}")));
+    }
     let mut intent: RootHealIntent = serde_json::from_slice(bytes)
         .map_err(|error| Error::Other(format!("Invalid root heal recovery record {task_id}: {error}")))?;
     if intent.task_id != task_id {
@@ -437,6 +566,9 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
 
 fn decode_terminal(task_id: &str, bytes: &[u8]) -> Result<RootHealTerminal> {
     let _ = terminal_path(task_id)?;
+    if bytes.len() > MAX_ROOT_RECOVERY_BYTES {
+        return Err(Error::Other(format!("Root heal terminal record exceeds its size limit {task_id}")));
+    }
     let terminal: RootHealTerminal = serde_json::from_slice(bytes)
         .map_err(|error| Error::Other(format!("Invalid root heal terminal record {task_id}: {error}")))?;
     terminal.validate(task_id)?;
@@ -513,16 +645,12 @@ impl RootHealRecovery {
             // read_all reports FileNotFound even when the whole metadata
             // volume is absent; that is an unknown owner, not empty state.
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
-            match EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, &path).await {
-                Ok(bytes) => {
-                    decode_intent(task_id, &bytes)?;
-                    if found.is_some() {
-                        return Err(Error::Other(format!("Multiple root heal recovery owners for {task_id}")));
-                    }
-                    found = Some((disk.clone(), bytes));
+            if let Some(bytes) = read_bounded(disk, &path).await? {
+                decode_intent(task_id, &bytes)?;
+                if found.is_some() {
+                    return Err(Error::Other(format!("Multiple root heal recovery owners for {task_id}")));
                 }
-                Err(DiskError::FileNotFound) => {}
-                Err(error) => return Err(Error::Disk(error)),
+                found = Some((disk.clone(), bytes));
             }
         }
         Ok(found)
@@ -533,16 +661,12 @@ impl RootHealRecovery {
         let mut found = None;
         for disk in disks {
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
-            match EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, &path).await {
-                Ok(bytes) => {
-                    decode_terminal(task_id, &bytes)?;
-                    if found.is_some() {
-                        return Err(Error::Other(format!("Multiple root heal terminal owners for {task_id}")));
-                    }
-                    found = Some((disk.clone(), bytes));
+            if let Some(bytes) = read_bounded(disk, &path).await? {
+                decode_terminal(task_id, &bytes)?;
+                if found.is_some() {
+                    return Err(Error::Other(format!("Multiple root heal terminal owners for {task_id}")));
                 }
-                Err(DiskError::FileNotFound) => {}
-                Err(error) => return Err(Error::Disk(error)),
+                found = Some((disk.clone(), bytes));
             }
         }
         Ok(found)
@@ -560,6 +684,187 @@ impl RootHealRecovery {
             return Ok(Some((disk, bytes)));
         }
         Ok(None)
+    }
+
+    async fn read_raw(disks: &[DiskStore], path: &str) -> Result<Vec<(DiskStore, RootHealSource)>> {
+        let mut found = Vec::new();
+        for disk in disks {
+            if let Some(source) = read_source(disk, path).await? {
+                found.push((disk.clone(), source));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn write_quarantine(
+        owner: &DiskStore,
+        task_id: &str,
+        record_kind: RootHealRecordKind,
+        source: &RootHealSource,
+        reason: &str,
+    ) -> Result<RootHealQuarantine> {
+        let marker = encode_quarantine(task_id, record_kind, source, reason)?;
+        let path = quarantine_path(record_kind, task_id)?;
+        let result =
+            EcstoreDiskAPI::compare_and_update_file(owner.as_ref(), RUSTFS_META_BUCKET, &path, None, Some(marker.clone()))
+                .await?;
+        let marker_bytes = match result {
+            EcstoreConditionalFileUpdate::Updated => marker,
+            EcstoreConditionalFileUpdate::Mismatch => read_bounded(owner, &path)
+                .await?
+                .ok_or_else(|| Error::other(format!("Root heal quarantine marker disappeared {task_id}")))?,
+            EcstoreConditionalFileUpdate::Missing => {
+                return Err(Error::other(format!("Root heal quarantine owner is unavailable {task_id}")));
+            }
+        };
+        let marker = decode_quarantine(task_id, record_kind, &marker_bytes)?;
+        if marker.source_prefix_len != source.bytes.len()
+            || marker.source_prefix_sha256 != source.source_prefix_sha256
+            || marker.source_oversized != source.source_oversized
+        {
+            return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+        }
+        Ok(marker)
+    }
+
+    async fn quarantine_marker_map(
+        disks: &[DiskStore],
+    ) -> Result<HashMap<(RootHealRecordKind, String), (DiskStore, RootHealQuarantine)>> {
+        let mut markers = HashMap::new();
+        for disk in disks {
+            let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, "", -1).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound) => continue,
+                Err(error) => return Err(Error::Disk(error)),
+            };
+            for entry in entries {
+                let Some((record_kind, task_id)) = parse_quarantine_entry(&entry) else {
+                    continue;
+                };
+                let Some(bytes) = read_bounded(disk, &entry).await? else {
+                    return Err(Error::other(format!("Root heal quarantine marker disappeared {task_id}")));
+                };
+                let marker = decode_quarantine(task_id, record_kind, &bytes)?;
+                let key = (record_kind, task_id.to_owned());
+                if markers.insert(key, (disk.clone(), marker)).is_some() {
+                    return Err(Error::other(format!("Multiple root heal quarantine owners for {task_id}")));
+                }
+            }
+        }
+        Ok(markers)
+    }
+
+    async fn inventory_locked(&self, disks: &[DiskStore]) -> Result<RootHealInventory> {
+        let mut intent_ids = HashSet::new();
+        let mut terminal_ids = HashSet::new();
+        for disk in disks {
+            let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, "", -1).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound) => continue,
+                Err(error) => return Err(Error::Disk(error)),
+            };
+            for entry in entries {
+                if let Some(task_id) = entry
+                    .strip_prefix(ROOT_RECOVERY_PREFIX)
+                    .and_then(|entry| entry.strip_suffix(".json"))
+                {
+                    let _ = intent_path(task_id)?;
+                    intent_ids.insert(task_id.to_owned());
+                } else if let Some(task_id) = entry
+                    .strip_prefix(ROOT_TERMINAL_PREFIX)
+                    .and_then(|entry| entry.strip_suffix(".json"))
+                {
+                    let _ = terminal_path(task_id)?;
+                    terminal_ids.insert(task_id.to_owned());
+                }
+            }
+        }
+
+        let markers = Self::quarantine_marker_map(disks).await?;
+        for (record_kind, task_id) in markers.keys() {
+            match record_kind {
+                RootHealRecordKind::Intent => {
+                    intent_ids.insert(task_id.clone());
+                }
+                RootHealRecordKind::Terminal => {
+                    terminal_ids.insert(task_id.clone());
+                }
+            }
+        }
+        let mut inventory = RootHealInventory {
+            requests: Vec::new(),
+            quarantined_task_ids: markers.keys().map(|(_, task_id)| task_id.clone()).collect(),
+        };
+        for task_id in intent_ids.union(&terminal_ids) {
+            let terminal_raw = Self::read_raw(disks, &terminal_path(task_id)?).await?;
+            if terminal_raw.len() > 1 {
+                return Err(Error::other(format!("Multiple root heal terminal owners for {task_id}")));
+            }
+            if let Some((owner, source)) = terminal_raw.into_iter().next() {
+                if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
+                    if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
+                        || marker.1.source_prefix_len != source.bytes.len()
+                        || marker.1.source_prefix_sha256 != source.source_prefix_sha256
+                        || marker.1.source_oversized != source.source_oversized
+                    {
+                        return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                    }
+                    inventory.quarantined_task_ids.insert(task_id.clone());
+                    continue;
+                }
+                match decode_terminal(task_id, &source.bytes) {
+                    Ok(_) => continue,
+                    Err(error) => {
+                        Self::write_quarantine(&owner, task_id, RootHealRecordKind::Terminal, &source, &error.to_string())
+                            .await?;
+                        inventory.quarantined_task_ids.insert(task_id.clone());
+                        continue;
+                    }
+                }
+            }
+            if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
+                return Err(Error::other(format!(
+                    "Root heal quarantine marker has no retained terminal source {} ({} bytes)",
+                    task_id, marker.1.source_prefix_len
+                )));
+            }
+
+            let intent_raw = Self::read_raw(disks, &intent_path(task_id)?).await?;
+            if intent_raw.len() > 1 {
+                return Err(Error::other(format!("Multiple root heal recovery owners for {task_id}")));
+            }
+            let Some((owner, source)) = intent_raw.into_iter().next() else {
+                if let Some(marker) = markers.get(&(RootHealRecordKind::Intent, task_id.clone())) {
+                    return Err(Error::other(format!(
+                        "Root heal quarantine marker has no retained intent source {} ({} bytes)",
+                        task_id, marker.1.source_prefix_len
+                    )));
+                }
+                continue;
+            };
+            if let Some(marker) = markers.get(&(RootHealRecordKind::Intent, task_id.clone())) {
+                if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
+                    || marker.1.source_prefix_len != source.bytes.len()
+                    || marker.1.source_prefix_sha256 != source.source_prefix_sha256
+                    || marker.1.source_oversized != source.source_oversized
+                {
+                    return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                }
+                inventory.quarantined_task_ids.insert(task_id.clone());
+                continue;
+            }
+            match decode_intent(task_id, &source.bytes) {
+                Ok(intent) => inventory.requests.push(intent.into_request()),
+                Err(error) => {
+                    Self::write_quarantine(&owner, task_id, RootHealRecordKind::Intent, &source, &error.to_string()).await?;
+                    inventory.quarantined_task_ids.insert(task_id.clone());
+                }
+            }
+        }
+        inventory
+            .requests
+            .sort_by(|left, right| left.created_at.cmp(&right.created_at).then_with(|| left.id.cmp(&right.id)));
+        Ok(inventory)
     }
 
     async fn persist_terminal_locked(
@@ -1034,43 +1339,21 @@ impl RootHealRecovery {
         Ok(report)
     }
 
-    pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
+    pub(super) async fn inventory(&self) -> Result<RootHealInventory> {
         #[cfg(any(test, feature = "test-util"))]
         if self.disabled_for_tests {
-            return Ok(Vec::new());
+            return Ok(RootHealInventory::default());
         }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
-        let mut ids = HashSet::new();
         for disk in &disks {
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
-            let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, "", -1).await {
-                Ok(entries) => entries,
-                Err(DiskError::FileNotFound) => continue,
-                Err(error) => return Err(Error::Disk(error)),
-            };
-            for entry in entries {
-                let Some(task_id) = entry
-                    .strip_prefix(ROOT_RECOVERY_PREFIX)
-                    .and_then(|entry| entry.strip_suffix(".json"))
-                else {
-                    continue;
-                };
-                let _ = intent_path(task_id)?;
-                ids.insert(task_id.to_string());
-            }
         }
-        let mut requests = Vec::new();
-        for task_id in ids {
-            if Self::find_terminal(&disks, &task_id).await?.is_some() {
-                continue;
-            }
-            if let Some((_, bytes)) = Self::find(&disks, &task_id).await? {
-                requests.push(decode_intent(&task_id, &bytes)?.into_request());
-            }
-        }
-        requests.sort_by(|left, right| left.created_at.cmp(&right.created_at).then_with(|| left.id.cmp(&right.id)));
-        Ok(requests)
+        self.inventory_locked(&disks).await
+    }
+
+    pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
+        Ok(self.inventory().await?.requests)
     }
 }
 
@@ -1079,7 +1362,7 @@ impl HealManager {
         // Decode every record before admitting anything. These are already
         // accepted responsibilities, so restore distinct IDs even when their
         // paths overlap or the configured admission capacity has changed.
-        let pending = self.root_recovery.pending().await?;
+        let pending = self.root_recovery.inventory().await?.requests;
         let mut requests = Vec::with_capacity(pending.len());
         for request in pending {
             if let HealType::Bucket { bucket } = &request.heal_type {

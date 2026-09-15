@@ -1571,20 +1571,25 @@ impl HealManager {
         );
 
         // Restore graceful-shutdown root responsibilities before automatic
-        // repair can admit overlapping work.
-        if let Err(error) = self.replay_root_heals().await {
-            // A missing owner or invalid root record must not block existing
-            // replacement recovery. Keep its file for a later restart after
-            // the owner is readable or the record has been repaired.
-            warn!(
-                target: "rustfs::heal::manager",
-                event = EVENT_HEAL_MANAGER_STATE,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_MANAGER,
-                state = "root_recovery_deferred",
-                error = %error,
-                "Root heal restart recovery deferred"
-            );
+        // repair can admit overlapping work. The same gate serializes admin
+        // admission with this reconciliation, so a fresh forceStart cannot
+        // race the durable-owner inventory.
+        {
+            let _admin_start_guard = self.admin_start_shutdown.lock().await;
+            if let Err(error) = self.replay_root_heals().await {
+                // A missing owner or invalid root record must not block existing
+                // replacement recovery. Keep its file for a later restart after
+                // the owner is readable or the record has been repaired.
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_MANAGER_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    state = "root_recovery_deferred",
+                    error = %error,
+                    "Root heal restart recovery deferred"
+                );
+            }
         }
 
         // start scheduler
@@ -1811,11 +1816,20 @@ impl HealManager {
         };
         // Decode all durable responsibilities before forceStart has side effects.
         // Do not hold runtime state locks while scanning recovery records.
+        let mut quarantined_task_ids = HashSet::new();
         let mut durable_owners = if source == HealRequestSource::Admin {
-            self.root_recovery.pending().await?
+            let inventory = self.root_recovery.inventory().await?;
+            quarantined_task_ids = inventory.quarantined_task_ids;
+            inventory.requests
         } else {
             Vec::new()
         };
+        if quarantined_task_ids.contains(&request.id) {
+            return Err(Error::Other(format!(
+                "Root heal recovery task {} is quarantined and requires operator repair",
+                request.id
+            )));
+        }
 
         if source == HealRequestSource::Admin
             && let HealType::Bucket { bucket } = &request.heal_type
