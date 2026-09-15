@@ -16,7 +16,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
+    use crate::chaos::{
+        VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post, start_root_heal_when_control_ready,
+    };
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
         init_logging, rustfs_binary_path,
@@ -960,19 +962,26 @@ mod tests {
 
         let online_key = "cluster/online-before-replacement.bin";
         let online_body = b"object written while all cluster nodes are online".to_vec();
-        clients[0]
-            .put_object()
-            .bucket(bucket)
-            .key(online_key)
-            .body(ByteStream::from(online_body.clone()))
-            .send()
-            .await?;
-
         let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
-        assert!(
-            object_metadata_exists_on_disk(&replaced_disk, bucket, online_key),
-            "node 1 should contain metadata before disk replacement"
-        );
+        // A quorum write need not include the disk this fixture will replace.
+        // Establish that disk's baseline before testing its reconstruction.
+        timeout(Duration::from_secs(30), async {
+            loop {
+                clients[0]
+                    .put_object()
+                    .bucket(bucket)
+                    .key(online_key)
+                    .body(ByteStream::from(online_body.clone()))
+                    .send()
+                    .await?;
+                if object_metadata_exists_on_disk(&replaced_disk, bucket, online_key) {
+                    return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "node 1 did not store the baseline object before disk replacement")??;
 
         cluster.stop_node(1)?;
         std::fs::remove_dir_all(&replaced_disk)?;
@@ -1017,7 +1026,7 @@ mod tests {
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
-        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+        start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key).await?;
 
         let expected_objects = [(online_key, online_body.as_slice()), (outage_key, outage_body.as_slice())];
         let mut remaining_rebuild_keys: HashSet<&str> = expected_objects.iter().map(|(key, _)| *key).collect();
@@ -1409,6 +1418,21 @@ mod tests {
             "replacement target must retain only its preformatted topology identity"
         );
 
+        // A multi-set pool can route a successful outage PUT away from the
+        // replacement drive. Identify its set through a witnessed baseline.
+        let target_set_peer_drives = cluster
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(node_index, _)| *node_index != 1)
+            .flat_map(|(_, node)| node.data_dirs.iter().map(PathBuf::from))
+            .filter(|drive| object_metadata_exists_on_disk(drive, bucket, &expected_manifests[0].key))
+            .collect::<Vec<_>>();
+        assert!(
+            !outage_target_manifest_required || !target_set_peer_drives.is_empty(),
+            "the replacement erasure set must retain an online baseline shard"
+        );
+
         let outage_payload_seed = 0xf1;
         let max_outage_write_attempts = topology.total_drives().max(1);
         let mut outage_key = None;
@@ -1429,6 +1453,18 @@ mod tests {
             .await;
             match put_result {
                 Ok(Ok(_)) => {
+                    if outage_target_manifest_required
+                        && !target_set_peer_drives
+                            .iter()
+                            .any(|drive| object_metadata_exists_on_disk(drive, bucket, &candidate_key))
+                    {
+                        timeout(
+                            Duration::from_secs(30),
+                            clients[2].delete_object().bucket(bucket).key(&candidate_key).send(),
+                        )
+                        .await??;
+                        continue;
+                    }
                     outage_key = Some(candidate_key);
                     break;
                 }
@@ -1455,6 +1491,14 @@ mod tests {
                 .into());
             }
         };
+
+        assert!(
+            !outage_target_manifest_required
+                || target_set_peer_drives
+                    .iter()
+                    .any(|drive| object_metadata_exists_on_disk(drive, bucket, &outage_key)),
+            "outage object {outage_key} belongs to a different erasure set than the replacement drive"
+        );
 
         let mut outage_peer_erasure_indices = HashSet::new();
         if !outage_write_deferred_until_rejoin {

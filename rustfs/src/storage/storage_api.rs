@@ -558,8 +558,9 @@ pub(crate) mod ecstore_rpc {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers,
-        set_tonic_canonical_body_digest, verify_put_file_capability, verify_tonic_rpc_response_proof,
+        ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers, gen_tonic_replay_scope_headers,
+        gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_put_file_capability,
+        verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
     };
 }
 
@@ -655,11 +656,11 @@ pub(crate) fn try_current_local_node_name() -> Option<String> {
 
 #[cfg(test)]
 pub(crate) use ecstore_rpc::gen_signature_headers;
-#[cfg(test)]
-pub(crate) use ecstore_rpc::gen_tonic_signature_headers;
 pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
 #[cfg(test)]
 pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
+#[cfg(test)]
+pub(crate) use ecstore_rpc::{gen_tonic_replay_scope_headers, gen_tonic_signature_headers, verify_tonic_boot_epoch_response};
 
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
 

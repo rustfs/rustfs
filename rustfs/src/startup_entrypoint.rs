@@ -308,7 +308,58 @@ async fn execute_connect_environment_inventory(options: ConnectEnvironmentInvent
             error => Error::other(error),
         })?,
     };
-    println!("{}", serde_json::to_string(&inventory).map_err(Error::other)?);
+    let Some(output) = options.output else {
+        println!("{}", serde_json::to_string(&inventory).map_err(Error::other)?);
+        return Ok(());
+    };
+    use crate::connect::{EnvironmentExportRequest, IdentityStore, save_signed_environment_export, sign_environment_inventory};
+    use rand::{TryRng as _, rngs::SysRng};
+    let required =
+        |value: Option<String>, name: &str| value.ok_or_else(|| Error::other(format!("--{name} is required with --output")));
+    let key = IdentityStore::new(options.state_dir.join("identity"))
+        .load()
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::other("connect environment export requires an enrolled device identity"))?;
+    let produced_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Error::other)
+        .and_then(|d| i64::try_from(d.as_secs()).map_err(Error::other))?;
+    let mut nonce = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+    let request = EnvironmentExportRequest {
+        confirmed: options.acknowledge_l1,
+        organization_name: required(options.organization, "organization")?,
+        cluster_name: required(options.cluster, "cluster")?,
+        device_name: required(options.device, "device")?,
+        run_uid: required(options.run_uid, "run-uid")?,
+        artifact_uid: required(options.artifact_uid, "artifact-uid")?,
+        consent_uid: required(options.consent_uid, "consent-uid")?,
+        policy_revision: options
+            .policy_revision
+            .ok_or_else(|| Error::other("--policy-revision is required with --output"))?,
+        produced_at_unix,
+        expires_at_unix: options
+            .expires_at_unix
+            .ok_or_else(|| Error::other("--expires-at is required with --output"))?,
+        nonce,
+        source_commit: crate::version::build::COMMIT_HASH.to_owned(),
+        executable_sha256: hash_current_executable()?,
+        rustfs_version: env!("CARGO_PKG_VERSION").to_owned(),
+        build_features: enabled_build_features(),
+    };
+    let export = sign_environment_inventory(&inventory, &request, &key, Duration::from_secs(options.timeout_seconds), &cancel)
+        .map_err(Error::other)?;
+    let writer_cancel = cancel.clone();
+    let receipt = tokio::task::spawn_blocking(move || save_signed_environment_export(&output, &export, &writer_cancel))
+        .await
+        .map_err(Error::other)?
+        .map_err(Error::other)?;
+    println!("tool=inventory.environment outcome=SUCCEEDED reason=COMPLETE");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
     Ok(())
 }
 

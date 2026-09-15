@@ -125,8 +125,9 @@ pub(crate) use diagnostics::{
     LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
 };
 pub use environment::{
-    ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError,
-    EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, collect_environment,
+    ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError, EnvironmentExportRequest,
+    EnvironmentFilesystemType, EnvironmentInventory, EnvironmentOsFamily, MAX_ENVIRONMENT_DURATION, SavedEnvironmentExport,
+    SignedEnvironmentExport, collect_environment, save_signed_environment_export, sign_environment_inventory,
 };
 pub use heartbeat::{CoarseNodeSummary, HeartbeatError, HeartbeatStatus};
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};

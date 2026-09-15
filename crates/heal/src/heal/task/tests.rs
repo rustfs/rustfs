@@ -1757,6 +1757,7 @@ enum MockHealObjectOutcome {
     DanglingGraceDeferred,
     UnavailableDrive(DriveState),
     RetryableReadQuorum,
+    InternodeHttp(http::StatusCode),
     RetryableSlowDown,
     PermanentOther(&'static str),
 }
@@ -1891,6 +1892,9 @@ impl HealStorageAPI for MockStorage {
                     ))),
                 )),
                 MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
+                MockHealObjectOutcome::InternodeHttp(status) => Err(Error::Storage(EcstoreError::from(DiskError::from(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)),
+                )))),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
@@ -1937,6 +1941,9 @@ impl HealStorageAPI for MockStorage {
                 MockHealObjectOutcome::ErrOther(message) | MockHealObjectOutcome::PermanentOther(message) => {
                     Err(Error::other(message))
                 }
+                MockHealObjectOutcome::InternodeHttp(status) => Err(Error::Storage(EcstoreError::from(DiskError::from(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)),
+                )))),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
@@ -2734,6 +2741,70 @@ async fn test_recursive_bucket_heal_retries_only_retryable_objects() {
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
     assert_eq!(progress.objects_failed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_retries_interrupted_internode_write() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-a".to_string(),
+        VecDeque::from([MockHealObjectOutcome::InternodeHttp(http::StatusCode::INTERNAL_SERVER_ERROR)]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    task.heal_bucket("bucket-a").await.expect("interrupted write must recover");
+    assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["object-a", "object-b", "object-a"]);
+    let progress = task.get_progress().await;
+    assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 2, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_bounds_internode_retries_and_keeps_auth_failures_terminal() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-a".to_string(),
+        (0..4)
+            .map(|_| MockHealObjectOutcome::InternodeHttp(http::StatusCode::INTERNAL_SERVER_ERROR))
+            .collect(),
+    );
+    storage.heal_object_outcomes.lock().unwrap().insert(
+        "object-b".to_string(),
+        VecDeque::from([MockHealObjectOutcome::InternodeHttp(http::StatusCode::FORBIDDEN)]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    task.heal_bucket("bucket-a")
+        .await
+        .expect_err("persistent and forbidden writes must fail");
+    let failure = task.take_batch_failure().await.expect("retain failure details");
+    assert_eq!((failure.failed, failure.retryable, failure.permanent), (2, 1, 1));
+    let calls = storage.heal_object_calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-a").count(), 4);
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
 }
 
 #[tokio::test(start_paused = true)]

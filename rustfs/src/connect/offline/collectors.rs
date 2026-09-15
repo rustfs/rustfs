@@ -165,9 +165,13 @@ impl From<EnvironmentError> for CollectorError {
             EnvironmentError::TimedOut => Self::TimedOut,
             EnvironmentError::TaskFailed => Self::TaskFailed,
             EnvironmentError::SourceUnavailable(_) => Self::SourceUnavailable,
-            EnvironmentError::UnsupportedVersion | EnvironmentError::UnsupportedCapability | EnvironmentError::InvalidTimeout => {
-                Self::TaskFailed
-            }
+            EnvironmentError::UnsupportedVersion
+            | EnvironmentError::UnsupportedCapability
+            | EnvironmentError::InvalidTimeout
+            | EnvironmentError::InvalidExport
+            | EnvironmentError::ExportEncoding
+            | EnvironmentError::ExportSigning
+            | EnvironmentError::ExportIo => Self::TaskFailed,
         }
     }
 }

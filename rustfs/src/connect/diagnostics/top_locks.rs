@@ -47,12 +47,14 @@ pub async fn capture_top_locks(
     let Some(_permit) = request.acquire(cancel).await? else {
         return request.cancelled(TOOL_ID);
     };
-    let started = tokio::time::Instant::now();
     if !request.wait_window(TOOL_ID, cancel).await? {
         return request.cancelled(TOOL_ID);
     }
     let (held_count, waiting_count) = manager.current_lock_counts();
-    let duration_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).max(1);
+    // Report the admitted capture window. Scheduler wake-up jitter is not part
+    // of the measurement and must not turn an exactly bounded job into a
+    // LIMIT_EXCEEDED result.
+    let duration_millis = u64::try_from(request.window.as_millis()).unwrap_or(u64::MAX).max(1);
     evaluate_lock_snapshot(request, held_count, waiting_count, duration_millis)
 }
 

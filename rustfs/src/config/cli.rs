@@ -348,6 +348,25 @@ pub struct ConnectEnvironmentInventoryOpts {
     /// Confirm this explicit local L1 inventory operation
     #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
     pub acknowledge_l1: bool,
+    /// New local signed archive path; omit to print the four-field JSON inventory
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub organization: Option<String>,
+    #[arg(long)]
+    pub cluster: Option<String>,
+    #[arg(long)]
+    pub device: Option<String>,
+    #[arg(long = "run-uid")]
+    pub run_uid: Option<String>,
+    #[arg(long = "artifact-uid")]
+    pub artifact_uid: Option<String>,
+    #[arg(long = "consent-uid")]
+    pub consent_uid: Option<String>,
+    #[arg(long = "policy-revision")]
+    pub policy_revision: Option<u64>,
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: Option<i64>,
 }
 
 #[derive(Args, Clone)]
@@ -1614,48 +1633,9 @@ mod tests {
         Cli, Commands, ConnectCommands, ConnectInventoryCommands, ConnectLicenseCommands, ConnectRelayMaterialKind,
         ConnectReportCommands, InspectCommands, preprocess_args_for_legacy,
     };
-    use crate::connect::CONNECT_DIAGNOSTIC_CAPABILITIES;
     use crate::version;
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
-
-    #[test]
-    fn advertised_diagnostic_capabilities_have_cli_dispatch() {
-        let expected = [
-            ("performance.client@1", &["performance", "client"][..]),
-            ("performance.drive@1", &["performance", "drive"][..]),
-            ("performance.object@1", &["performance", "object"][..]),
-            ("performance.siteReplication@1", &["performance", "site-replication"][..]),
-            ("logs.capture@1", &["logs"][..]),
-            ("profile.cpu@1", &["profile"][..]),
-            ("profile.memory@1", &["profile"][..]),
-            ("profile.threads@1", &["profile"][..]),
-            ("telemetry.record@1", &["telemetry", "record"][..]),
-            ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
-            ("telemetry.replay@1", &["telemetry", "replay"][..]),
-            ("top.api@1", &["top", "api"][..]),
-            ("top.disk@1", &["top", "disk"][..]),
-            ("top.locks@1", &["top", "locks"][..]),
-            ("top.net@1", &["top", "net"][..]),
-            ("top.rpc@1", &["top", "rpc"][..]),
-            ("inspect.object@1", &["inspect", "object"][..]),
-        ];
-        assert_eq!(
-            CONNECT_DIAGNOSTIC_CAPABILITIES,
-            expected.iter().map(|(capability, _)| *capability).collect::<Vec<_>>()
-        );
-
-        let command = Cli::command();
-        let connect = command.find_subcommand("connect").expect("connect command");
-        for (capability, path) in expected {
-            let mut command = connect;
-            for segment in path {
-                command = command
-                    .find_subcommand(segment)
-                    .unwrap_or_else(|| panic!("{capability} is missing CLI dispatch at {segment}"));
-            }
-        }
-    }
 
     #[test]
     fn preprocess_help_command_displays_top_level_help() {

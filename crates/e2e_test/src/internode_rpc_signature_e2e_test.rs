@@ -58,10 +58,11 @@
 //!
 //! Every covered handler checks the digest before touching storage, and
 //! `MakeVolume` resolves its disk *after* that check. Aiming at a disk that
-//! cannot exist gives three cleanly separable outcomes with zero side effects
+//! cannot exist gives four cleanly separable outcomes with zero side effects
 //! on the server's real data:
 //!
 //! - `Err(Unauthenticated)` — rejected by `check_auth` (signature layer).
+//! - `Err(Unavailable)` — a valid signature with a stale boot epoch, rejected before execution.
 //! - `Err(PermissionDenied)` — rejected by the handler's body-digest gate.
 //! - `Ok(success: false)` — **authentication passed**; the request reached
 //!   handler logic and only then failed on the bogus disk.
@@ -468,8 +469,8 @@ async fn replay_scope_rejects_replay_path_transplant_and_stale_epoch_e2e() -> Te
     rustfs_protos::evict_failed_connection(&url).await;
     assert_rejected(
         call_make_volume(&url, request.clone(), stale_epoch).await,
-        Code::Unauthenticated,
-        None,
+        Code::Unavailable,
+        Some("RPC boot epoch changed"),
         "a replay-scoped signature captured before the receiving process restart",
     );
 

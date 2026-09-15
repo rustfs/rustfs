@@ -57,7 +57,10 @@ use hyper_util::{
 use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
-use rustfs_common::GlobalReadiness;
+use rustfs_common::{
+    GlobalReadiness,
+    trace_bus::{TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit},
+};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
     INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
@@ -84,7 +87,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::service::Routes;
@@ -258,6 +261,93 @@ struct RpcRequestPathService<S> {
     inner: S,
 }
 
+struct RpcCompletionBody<B> {
+    inner: B,
+    started_at: Instant,
+    header_status: Option<TelemetryTraceStatus>,
+    complete: bool,
+}
+
+impl<B> RpcCompletionBody<B> {
+    fn new(inner: B, started_at: Instant, header_status: Option<TelemetryTraceStatus>) -> Self {
+        Self {
+            inner,
+            started_at,
+            header_status,
+            complete: false,
+        }
+    }
+
+    fn complete(&mut self, status: TelemetryTraceStatus) {
+        if self.complete {
+            return;
+        }
+        self.complete = true;
+        telemetry_trace_emit(|| {
+            TelemetryTraceEvent::new(TelemetryTraceOperation::InternalRpc, self.started_at.elapsed(), status)
+        });
+    }
+}
+
+impl<B> http_body::Body for RpcCompletionBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn is_end_stream(&self) -> bool {
+        self.complete || self.inner.is_end_stream()
+    }
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    let status = grpc_telemetry_status(trailers).unwrap_or(TelemetryTraceStatus::Error);
+                    self.complete(status);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.complete(TelemetryTraceStatus::Error);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                let status = self.header_status.unwrap_or(TelemetryTraceStatus::Error);
+                self.complete(status);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for RpcCompletionBody<B> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.complete(self.header_status.unwrap_or(TelemetryTraceStatus::Error));
+        }
+    }
+}
+
+fn grpc_telemetry_status(headers: &HeaderMap) -> Option<TelemetryTraceStatus> {
+    headers.get("grpc-status").map(|status| {
+        if status == "0" {
+            TelemetryTraceStatus::Ok
+        } else {
+            TelemetryTraceStatus::Error
+        }
+    })
+}
+
 impl<S> RpcRequestPathService<S> {
     fn new(inner: S) -> Self {
         Self { inner }
@@ -270,9 +360,9 @@ where
     S::Error: Send + 'static,
     S::Future: Send + 'static,
     B: Send + 'static,
-    ResBody: Send + 'static,
+    ResBody: http_body::Body<Data = Bytes> + Unpin + Send + 'static,
 {
-    type Response = Response<ResBody>;
+    type Response = Response<RpcCompletionBody<ResBody>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -281,6 +371,7 @@ where
     }
 
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let started_at = Instant::now();
         let target = RpcRequestTarget {
             uri: req.uri().clone(),
             method: req.method().clone(),
@@ -300,7 +391,10 @@ where
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
-            Ok(response)
+            let header_status = grpc_telemetry_status(response.headers());
+            let (parts, body) = response.into_parts();
+            let tracked = RpcCompletionBody::new(body, started_at, header_status);
+            Ok(Response::from_parts(parts, tracked))
         })
     }
 }
@@ -2352,7 +2446,13 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             error = %e,
             "RPC signature verification failed"
         );
-        Status::unauthenticated("No valid auth token")
+        if failure_reason == "stale_boot_epoch" {
+            // The signature is valid, but the peer restarted before this request. Reject it
+            // before execution and let the client retry after its authenticated epoch refresh.
+            Status::unavailable("RPC boot epoch changed")
+        } else {
+            Status::unauthenticated("No valid auth token")
+        }
     })?;
 
     let parent_context =
@@ -3436,6 +3536,49 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn rpc_completion_waits_for_the_grpc_stream_trailer() {
+        use http_body_util::StreamBody;
+        use rustfs_common::trace_bus::subscribe_telemetry_trace_events;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let mut subscription = subscribe_telemetry_trace_events();
+        let (tx, rx) = mpsc::channel::<std::result::Result<Frame<Bytes>, Infallible>>(2);
+        let mut body = RpcCompletionBody::new(StreamBody::new(ReceiverStream::new(rx)), Instant::now(), None);
+
+        tx.send(Ok(Frame::data(Bytes::from_static(b"rpc-data"))))
+            .await
+            .expect("response data frame should send");
+        let frame = body
+            .frame()
+            .await
+            .expect("response data frame")
+            .expect("response body should remain valid");
+        assert!(frame.is_data());
+        assert!(matches!(subscription.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        tx.send(Ok(Frame::trailers(trailers)))
+            .await
+            .expect("response trailer should send");
+        let frame = body
+            .frame()
+            .await
+            .expect("response trailer frame")
+            .expect("response body should remain valid");
+        assert!(frame.is_trailers());
+
+        let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("RPC completion event should arrive")
+            .expect("telemetry source should remain open");
+        assert_eq!(event.operation, TelemetryTraceOperation::InternalRpc);
+        assert_eq!(event.status, TelemetryTraceStatus::Ok);
+        assert!(event.duration > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn rpc_auth_binds_post_method_authority_and_exact_path() {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
@@ -3535,6 +3678,62 @@ mod tests {
         let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_stale_boot_epoch_is_retryable_after_signature_verification() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        let path = "/node_service.NodeService/ReadVersion";
+        rustfs_common::set_global_local_node_name(audience).await;
+        let challenge = uuid::Uuid::new_v4();
+        let proof = storage::tonic_boot_epoch_response_headers(audience, challenge).expect("signed epoch proof");
+        let epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, &proof).expect("authenticated epoch");
+        let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
+        let signed_headers = |audience: &str, epoch| {
+            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadVersion", None)
+                .expect("method-bound signature");
+            let replay = storage::gen_tonic_replay_scope_headers(
+                audience,
+                path,
+                headers["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                headers["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                epoch,
+            )
+            .expect("replay-scoped signature");
+            headers.extend(replay);
+            headers
+        };
+        let request = |headers: HeaderMap| {
+            let mut request = Request::new(());
+            request.metadata_mut().as_mut().extend(headers);
+            request.extensions_mut().insert(RpcRequestTarget {
+                uri: format!("http://{audience}{path}").parse().expect("RPC URI"),
+                method: Method::POST,
+            });
+            request
+        };
+
+        let stale = signed_headers(audience, stale_epoch);
+        let error = check_auth(request(stale.clone())).expect_err("a stale epoch must still reject the request");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "RPC boot epoch changed");
+
+        let mut forged = stale;
+        forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
+        let error = check_auth(request(forged)).expect_err("a forged stale-epoch signature must remain terminal");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch)))
+            .expect_err("a stale epoch must not hide an audience mismatch");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let current = signed_headers(audience, epoch);
+        assert!(check_auth(request(current.clone())).is_ok(), "a fresh authenticated scope must succeed");
+        let error = check_auth(request(current)).expect_err("a same-epoch nonce replay must remain terminal");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 

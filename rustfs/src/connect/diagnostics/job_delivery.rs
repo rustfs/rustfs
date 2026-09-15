@@ -38,7 +38,8 @@ use crate::connect::telemetry::{TelemetryDelivery, TelemetryTransport};
 
 const PROTOCOL_VERSION: &str = "v1";
 const MAX_EXECUTABLE_BYTES: u64 = 2_147_483_648;
-const DELIVERY_ATTEMPTS: u8 = 8;
+const INITIAL_DELIVERY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_DELIVERY_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 524_288;
 const MAX_STATE_FILES: usize = 65_536;
@@ -96,6 +97,13 @@ struct DiagnosticJobResultRequest<'a> {
     artifact_sha256: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryAttempt {
+    Accepted,
+    Retry,
+    Stop,
+}
+
 impl DiagnosticJobRuntime {
     pub(crate) fn from_config(config: &HeartbeatConfig) -> Option<Self> {
         let state_root = config.state_root()?.to_path_buf();
@@ -127,11 +135,12 @@ impl DiagnosticJobRuntime {
                 Some(JobState::Completed(result)) => Some(result.clone()),
                 Some(JobState::Uploaded(result)) => {
                     let result = result.clone();
+                    let expire_time = job.expire_time().to_owned();
                     drop(states);
                     let runtime = self.clone();
                     let cancel = shutdown.child_token();
                     tokio::spawn(async move {
-                        runtime.deliver_uploaded(result, &cancel).await;
+                        runtime.deliver_uploaded(result, &expire_time, &cancel).await;
                     });
                     return;
                 }
@@ -153,11 +162,12 @@ impl DiagnosticJobRuntime {
                             return;
                         }
                         states.insert(job_id.clone(), JobState::Uploaded(result.clone()));
+                        let expire_time = job.expire_time().to_owned();
                         drop(states);
                         let runtime = self.clone();
                         let cancel = shutdown.child_token();
                         tokio::spawn(async move {
-                            runtime.deliver_uploaded(result, &cancel).await;
+                            runtime.deliver_uploaded(result, &expire_time, &cancel).await;
                         });
                         return;
                     }
@@ -182,6 +192,7 @@ impl DiagnosticJobRuntime {
         };
         let runtime = self.clone();
         let cancel = shutdown.child_token();
+        let expire_time = job.expire_time().to_owned();
         tokio::spawn(async move {
             let result = match cached {
                 Some(result) => result,
@@ -202,17 +213,17 @@ impl DiagnosticJobRuntime {
                 }
             };
             if let Some(uploaded) = prepare_result(&runtime, result, &cancel).await {
-                runtime.deliver_uploaded(uploaded, &cancel).await;
+                runtime.deliver_uploaded(uploaded, &expire_time, &cancel).await;
             }
         });
     }
 
-    async fn deliver_uploaded(&self, result: UploadedDiagnosticJobResult, cancel: &CancellationToken) {
+    async fn deliver_uploaded(&self, result: UploadedDiagnosticJobResult, expire_time: &str, cancel: &CancellationToken) {
         let job_id = result.job_id.clone();
         let Some(_lease) = self.deliveries.acquire(&job_id) else {
             return;
         };
-        if deliver_result(&self.config, &result, cancel).await
+        if deliver_result(&self.config, &result, expire_time, cancel).await
             && self.store.save(&job_id, &JobState::Delivered).is_ok()
             && let Ok(mut states) = self.states.lock()
         {
@@ -519,7 +530,12 @@ async fn prepare_result(
     Some(uploaded)
 }
 
-async fn deliver_result(config: &HeartbeatConfig, result: &UploadedDiagnosticJobResult, cancel: &CancellationToken) -> bool {
+async fn deliver_result(
+    config: &HeartbeatConfig,
+    result: &UploadedDiagnosticJobResult,
+    expire_time: &str,
+    cancel: &CancellationToken,
+) -> bool {
     let Ok(transport) = TelemetryTransport::new(config.clone()) else {
         return false;
     };
@@ -533,24 +549,53 @@ async fn deliver_result(config: &HeartbeatConfig, result: &UploadedDiagnosticJob
         artifact_name: result.artifact_name.as_deref(),
         artifact_sha256: result.artifact_sha256.as_deref(),
     };
-    for attempt in 0..DELIVERY_ATTEMPTS {
-        if cancel.is_cancelled() {
+    let Some(deadline) = delivery_deadline(expire_time) else {
+        return false;
+    };
+    retry_delivery(deadline, cancel, || async {
+        match transport.post("diagnosticJobResults", &request).await {
+            Ok(delivery) => classify_delivery_attempt(delivery),
+            Err(_) => DeliveryAttempt::Retry,
+        }
+    })
+    .await
+}
+
+fn classify_delivery_attempt(delivery: TelemetryDelivery) -> DeliveryAttempt {
+    match delivery {
+        TelemetryDelivery::Accepted { .. } => DeliveryAttempt::Accepted,
+        TelemetryDelivery::Rejected { status: 409, .. } | TelemetryDelivery::Retry { .. } => DeliveryAttempt::Retry,
+        TelemetryDelivery::AuthenticationStopped { .. } | TelemetryDelivery::Rejected { .. } => DeliveryAttempt::Stop,
+    }
+}
+
+fn delivery_deadline(expire_time: &str) -> Option<tokio::time::Instant> {
+    let expire = chrono::DateTime::parse_from_rfc3339(expire_time).ok()?.with_timezone(&Utc);
+    let remaining = (expire - Utc::now()).to_std().ok()?;
+    Some(tokio::time::Instant::now() + remaining)
+}
+
+async fn retry_delivery<F, Fut>(deadline: tokio::time::Instant, cancel: &CancellationToken, mut deliver: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = DeliveryAttempt>,
+{
+    let mut backoff = INITIAL_DELIVERY_BACKOFF;
+    loop {
+        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
             return false;
         }
-        if matches!(
-            transport.post("diagnosticJobResults", &request).await,
-            Ok(TelemetryDelivery::Accepted { .. })
-        ) {
-            return true;
+        match deliver().await {
+            DeliveryAttempt::Accepted => return true,
+            DeliveryAttempt::Stop => return false,
+            DeliveryAttempt::Retry => {}
         }
-        if attempt + 1 < DELIVERY_ATTEMPTS {
-            tokio::select! {
-                () = cancel.cancelled() => return false,
-                () = tokio::time::sleep(Duration::from_secs(1_u64 << attempt)) => {}
-            }
+        tokio::select! {
+            () = cancel.cancelled() => return false,
+            () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + backoff)) => {}
         }
+        backoff = (backoff * 2).min(MAX_DELIVERY_BACKOFF);
     }
-    false
 }
 
 fn valid_uploaded_result(result: &UploadedDiagnosticJobResult, job_id: &str) -> bool {
@@ -648,6 +693,60 @@ mod tests {
         assert!(registry.acquire(&job_id).is_none());
         drop(first);
         assert!(registry.acquire(&job_id).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn result_delivery_retries_a_conflict_until_accepted() {
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut attempts = 0;
+        let delivered = retry_delivery(deadline, &cancel, || {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                classify_delivery_attempt(TelemetryDelivery::Rejected {
+                    status: 409,
+                    reason: Some("BUNDLE_NOT_READY".to_owned()),
+                })
+            } else {
+                DeliveryAttempt::Accepted
+            })
+        })
+        .await;
+        assert!(delivered);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn result_delivery_stops_at_job_expiry() {
+        let cancel = CancellationToken::new();
+        let mut attempts = 0;
+        let delivered = retry_delivery(tokio::time::Instant::now() + Duration::from_secs(2), &cancel, || {
+            attempts += 1;
+            std::future::ready(DeliveryAttempt::Retry)
+        })
+        .await;
+        assert!(!delivered);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn result_delivery_stops_on_shutdown() {
+        let cancel = CancellationToken::new();
+        let attempts = std::cell::Cell::new(0);
+        let delivery = retry_delivery(tokio::time::Instant::now() + Duration::from_secs(30), &cancel, || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(DeliveryAttempt::Retry)
+        });
+        tokio::pin!(delivery);
+        tokio::select! {
+            delivered = &mut delivery => panic!("delivery stopped before shutdown: {delivered}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(attempts.get(), 1);
+        cancel.cancel();
+        let delivered = delivery.await;
+        assert!(!delivered);
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
