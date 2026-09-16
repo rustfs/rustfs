@@ -65,6 +65,7 @@ members = [
     "crates/io-metrics", # I/O metrics collection for performance analysis
     "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
+    "vendor/rustfs-aes256-gcm-demo", # Demo cipher crate exercising the multi-cipher extension (native vendor)
 ]
 resolver = "3"
 
@@ -140,6 +141,7 @@ rustfs-test-utils = { path = "crates/test-utils", version = "1.0.0-rc.6" }
 rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-rc.6" }
 rustfs-utils = { path = "crates/utils", version = "1.0.0-rc.6" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.0-rc.6" }
+rustfs-aes256-gcm-demo = { path = "vendor/rustfs-aes256-gcm-demo", version = "0.1.0" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

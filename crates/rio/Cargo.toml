@@ -64,6 +64,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 rand = { workspace = true, features = ["serde"] }
 http.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
+rustfs-aes256-gcm-demo = { workspace = true }
 crc-fast = { workspace = true }
 pin-project-lite.workspace = true
 serde = { workspace = true, features = ["derive"] }
