@@ -520,6 +520,15 @@ fn warn_heal_writer_failures(
     );
 }
 
+/// Whether a heal version id denotes the null (unversioned) version.
+///
+/// The all-zero UUID is how an unversioned object's version id reaches the
+/// replacement path; the empty string is the disk layer's own "no version"
+/// spelling. Both mean "no concrete version to compare against".
+fn is_null_version_id(version_id: &str) -> bool {
+    version_id.is_empty() || Uuid::parse_str(version_id).is_ok_and(|parsed| parsed.is_nil())
+}
+
 impl SetDisks {
     pub(crate) async fn purge_delete_marker_exact(
         &self,
@@ -604,6 +613,17 @@ impl SetDisks {
         version_id: &str,
         targets: &[String],
     ) -> disk::error::Result<bool> {
+        // Automatic replacement is driven by the heal item's version id, and an
+        // unversioned (null version) object carries the all-zero UUID rather
+        // than an absent id. That marker is not a concrete version: the disk
+        // layer already treats a nil version as "no version"
+        // (`fi.version_id.is_none_or(|v| v.is_nil())`), and on-disk metadata for
+        // these objects has no version id to match. Reading or comparing the
+        // literal nil UUID therefore rejects every unversioned object, which
+        // turns a completed rebuild into a transient skip and eventually an
+        // unrecoverable replacement generation. Normalize it to the empty
+        // version id the disk layer uses for unversioned reads.
+        let version_id = if is_null_version_id(version_id) { "" } else { version_id };
         let disks = self.get_disks_internal().await;
 
         let mut target_disks = Vec::with_capacity(targets.len());
@@ -3292,6 +3312,17 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn null_version_ids_are_not_treated_as_concrete_versions() {
+        // An unversioned object reaches the replacement readback as the all-zero
+        // UUID; comparing that text against on-disk metadata rejected every
+        // unversioned object and reported a completed rebuild as a skip.
+        assert!(super::is_null_version_id("00000000-0000-0000-0000-000000000000"));
+        assert!(super::is_null_version_id(""));
+        assert!(!super::is_null_version_id("8cd6f2b4-1e8f-4a4e-9c0b-1f2d3e4a5b6c"));
+        assert!(!super::is_null_version_id("not-a-uuid"));
     }
 
     #[test]
