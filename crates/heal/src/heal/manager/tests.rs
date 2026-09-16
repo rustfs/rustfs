@@ -2500,6 +2500,12 @@ fn replacement_recovery_blocks_only_confirmed_conflicts() {
             message: "replacement recovery corruption: malformed legacy intent".to_string(),
         }
     ));
+    assert!(crate::heal::resume::replacement_recovery_error_requires_block(
+        &Error::ReplacementGenerationConflict {
+            task_id: "generation-a".to_string(),
+            reason: "divergent durable copies".to_string(),
+        }
+    ));
     assert!(!crate::heal::resume::replacement_recovery_error_requires_block(&Error::Disk(
         DiskError::Timeout
     )));

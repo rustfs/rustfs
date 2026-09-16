@@ -19,7 +19,7 @@ use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -31,7 +31,10 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
     ObjectIO as _, ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
+use super::{
+    DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError, local_disk_map_read,
+    resume::{ReplacementRecoveryCandidate, ReplacementTargetIdentity, merge_replacement_recovery_candidate},
+};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -159,6 +162,19 @@ const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
 pub enum ReplacementResumeDisk {
     Fresh,
     Existing(DiskStore),
+}
+
+fn replacement_resume_conflict_for_other_tasks(
+    requested_task_id: &str,
+    observed_other_tasks: &std::collections::HashSet<String>,
+    set_disk_id: &str,
+) -> Option<Error> {
+    let mut task_ids = observed_other_tasks.iter().collect::<Vec<_>>();
+    task_ids.sort_unstable();
+    task_ids.first().map(|other_task_id| Error::ReplacementGenerationConflict {
+        task_id: requested_task_id.to_string(),
+        reason: format!("durable generation {other_task_id} already owns set {set_disk_id}"),
+    })
 }
 
 pub(crate) fn next_heal_listing_token(
@@ -648,6 +664,20 @@ pub trait HealStorageAPI: Send + Sync {
     /// Capture the mounted replacement instance before it is formatted.
     async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
         Err(Error::other("replacement target identity collection is unsupported"))
+    }
+
+    /// Check whether a replacement generation may consume another retry.
+    /// Implementations must verify the mounted incarnation and that every
+    /// target is formatted in the expected erasure-set slot.  The default is
+    /// deliberately permissive for alternate/mock backends that do not expose
+    /// those disk-level probes.
+    async fn replacement_targets_ready_for_retry(
+        &self,
+        _set_disk_id: &str,
+        _targets: &[String],
+        _expected_identities: &[ReplacementTargetIdentity],
+    ) -> Result<bool> {
+        Ok(true)
     }
 
     async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
@@ -1849,39 +1879,106 @@ impl HealStorageAPI for ECStoreHealStorage {
         excluded_targets: &[String],
     ) -> Result<ReplacementResumeDisk> {
         let disks = self.resume_disk_inventory(set_disk_id).await?;
-        let mut existing = None;
-        for prefer_local in [true, false] {
-            for disk_store in &disks {
-                if disk_store.endpoint().is_local != prefer_local
-                    || excluded_targets.contains(&disk_store.endpoint().to_string())
-                    || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
-                {
+        let mut selected = None;
+        let mut observed_other_tasks = HashSet::new();
+        for disk_store in &disks {
+            if excluded_targets.contains(&disk_store.endpoint().to_string())
+                || !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil())
+            {
+                continue;
+            }
+            let mut replacement_tasks = super::resume::ResumeUtils::get_replacement_intent_tasks(disk_store).await?;
+            if !replacement_tasks.iter().any(|candidate| candidate == task_id)
+                && super::resume::ResumeManager::has_replacement_intent(disk_store, task_id).await
+            {
+                replacement_tasks.push(task_id.to_string());
+            }
+            if replacement_tasks.is_empty() {
+                continue;
+            }
+            for candidate_task_id in replacement_tasks {
+                // A request with a fresh UUID must not silently create a new
+                // generation while another durable intent already owns this
+                // set. Inspect one copy of each other task and let the
+                // caller reconcile it through the normal recovery scanner.
+                if candidate_task_id != task_id && !observed_other_tasks.insert(candidate_task_id.clone()) {
                     continue;
                 }
-                let replacement_tasks = super::resume::ResumeUtils::get_replacement_intent_tasks(disk_store).await?;
-                let has_intent = replacement_tasks.iter().any(|candidate| candidate == task_id)
-                    || (prefer_local && super::resume::ResumeManager::has_replacement_intent(disk_store, task_id).await);
-                if has_intent && existing.replace(disk_store.clone()).is_some() {
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
+                let manager =
+                    super::resume::ResumeManager::load_replacement_intent(disk_store.clone(), &candidate_task_id).await?;
+                let state = manager.get_state().await;
+                if state.set_disk_id != set_disk_id {
+                    return Err(Error::ReplacementGenerationConflict {
+                        task_id: candidate_task_id,
+                        reason: format!("replacement intent belongs to {}, not {set_disk_id}", state.set_disk_id),
                     });
                 }
-            }
-            // Existing releases only write replacement intents locally, and
-            // this release also prefers a local survivor. Keep that path free
-            // of remote availability and latency; remote discovery is needed
-            // only when no local survivor owns the task.
-            if existing.is_some() {
-                break;
+                if candidate_task_id != task_id {
+                    continue;
+                }
+                let candidate =
+                    ReplacementRecoveryCandidate::new(state, disk_store.endpoint().to_string(), disk_store.endpoint().is_local)?;
+                merge_replacement_recovery_candidate(&mut selected, candidate)?;
             }
         }
-        Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))
+
+        let Some(candidate) = selected else {
+            if let Some(error) = replacement_resume_conflict_for_other_tasks(task_id, &observed_other_tasks, set_disk_id) {
+                return Err(error);
+            }
+            return Ok(ReplacementResumeDisk::Fresh);
+        };
+        let disk = disks
+            .iter()
+            .find(|disk| disk.endpoint().to_string() == candidate.anchor)
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Selected replacement resume anchor disappeared for set_disk_id: {set_disk_id}"),
+            })?;
+        Ok(ReplacementResumeDisk::Existing(disk.clone()))
     }
 
     async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
         super::replacement_readiness::auto_replacement_target_identities(targets)
             .await
-            .ok_or_else(|| Error::other("replacement target is not a stable mounted disk"))
+            .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is not a stable mounted disk".to_string()))
+    }
+
+    async fn replacement_targets_ready_for_retry(
+        &self,
+        set_disk_id: &str,
+        targets: &[String],
+        expected_identities: &[ReplacementTargetIdentity],
+    ) -> Result<bool> {
+        let identities = match self.replacement_target_identities(targets).await {
+            Ok(identities) => identities,
+            Err(_) => return Ok(false),
+        };
+        if identities != expected_identities {
+            return Ok(false);
+        }
+
+        let local_disks = local_disk_map_read()
+            .await
+            .values()
+            .flatten()
+            .filter(|disk| disk.endpoint().is_local)
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in targets {
+            let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
+                return Ok(false);
+            };
+            let endpoint = disk.endpoint();
+            if crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx).as_deref()
+                != Some(set_disk_id)
+            {
+                return Ok(false);
+            }
+            if !matches!(disk.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
@@ -1894,8 +1991,9 @@ mod tests {
     use super::super::StorageError;
     use super::{
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
-        is_transient_object_exists_message, next_heal_listing_token,
+        is_transient_object_exists_message, next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn object_receipt_requires_integrity_and_resolved_version_evidence() {
@@ -2103,5 +2201,16 @@ mod tests {
             "bucket".to_string(),
             "object".to_string(),
         )));
+    }
+
+    #[test]
+    fn fresh_replacement_cannot_ignore_another_durable_generation() {
+        let other = "00000000-0000-4000-8000-000000000001".to_string();
+        let observed = HashSet::from([other]);
+        let error =
+            replacement_resume_conflict_for_other_tasks("00000000-0000-4000-8000-000000000002", &observed, "pool_0_set_0")
+                .expect("an unmatched durable owner must produce a conflict");
+        assert!(matches!(error, crate::Error::ReplacementGenerationConflict { .. }));
+        assert!(replacement_resume_conflict_for_other_tasks("task", &HashSet::new(), "pool_0_set_0").is_none());
     }
 }

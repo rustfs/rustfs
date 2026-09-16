@@ -37,7 +37,7 @@ impl ReplacementExecution {
     pub(crate) async fn acquire(targets: &[String]) -> Result<Arc<Self>> {
         let identities = auto_replacement_target_identities(targets)
             .await
-            .ok_or_else(|| Error::ReplacementOwnershipConflict("target mount admission failed".to_string()))?;
+            .ok_or_else(|| Error::ReplacementTargetNotReady("target mount admission failed".to_string()))?;
         let local_disks = ecstore_local_disk_map_read()
             .await
             .values()
@@ -51,12 +51,12 @@ impl ReplacementExecution {
         for identity in &identities {
             let disk = replacement_target_disk(&identity.endpoint, &local_disks)
                 .await
-                .ok_or_else(|| Error::ReplacementOwnershipConflict("replacement target is unavailable".to_string()))?;
+                .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is unavailable".to_string()))?;
             leases.push(disk.acquire_replacement_execution_lease().await?);
             disks.push(disk);
         }
         if auto_replacement_target_identities(targets).await.as_ref() != Some(&identities) {
-            return Err(Error::ReplacementOwnershipConflict(
+            return Err(Error::ReplacementTargetNotReady(
                 "target changed while acquiring execution leases".to_string(),
             ));
         }

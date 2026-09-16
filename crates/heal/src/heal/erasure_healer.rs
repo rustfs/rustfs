@@ -937,11 +937,28 @@ impl ErasureSetHealer {
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
-            if self.replacement_task_id.is_some() && resume_manager.schedule_retry().await? {
-                checkpoint_manager.reset_for_retry().await?;
-                return Err(Error::transient_skip(format!(
-                    "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
-                )));
+            if self.replacement_task_id.is_some() {
+                let state = resume_manager.get_state().await;
+                let targets_ready = self
+                    .storage
+                    .replacement_targets_ready_for_retry(
+                        set_disk_id,
+                        &state.replacement_targets,
+                        &state.replacement_target_identities,
+                    )
+                    .await?;
+                if !targets_ready {
+                    // The target may be between process restart, mount
+                    // admission, and format publication. Rewind only the
+                    // object checkpoint so the same generation can retry once
+                    // its identity is ready; do not spend a generation retry
+                    // or release its healing markers.
+                    checkpoint_manager.reset_for_retry().await?;
+                    resume_manager.defer_retry_until_target_ready().await?;
+                    return Err(Error::transient_skip(format!(
+                        "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; target readiness deferred retry"
+                    )));
+                }
             }
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
@@ -966,8 +983,13 @@ impl ErasureSetHealer {
                     state = "retry_scheduled",
                     "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
+                let prefix = if self.replacement_task_id.is_some() {
+                    "Replacement erasure set heal incomplete"
+                } else {
+                    "Erasure set heal incomplete"
+                };
                 return Err(Error::transient_skip(format!(
-                    "Erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
+                    "{prefix}: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
                 )));
             }
 

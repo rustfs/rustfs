@@ -47,6 +47,12 @@ impl HealManager {
 
         tokio::spawn(async move {
             let mut interval = interval(duration);
+            let block_recovery_set = |set_disk_id: &str| {
+                replacement_recovery_blocked_sets
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(set_disk_id.to_string());
+            };
 
             loop {
                 let mut candidate_count = 0usize;
@@ -72,7 +78,10 @@ impl HealManager {
                         // Build list of endpoints that need healing
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
                         let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>, String)>::new();
+                        let mut durable_recovery_candidates = HashMap::<String, ReplacementRecoveryCandidate>::new();
+                        let mut conflicted_recovery_tasks = HashSet::<String>::new();
                         let mut conflicted_recovery_sets = HashSet::<String>::new();
+                        let mut deferred_recovery_sets = HashSet::<String>::new();
                         let mut deferred_replacement_endpoints = HashSet::<String>::new();
                         let local_disks = {
                             let local_disk_map = local_disk_map_read().await;
@@ -317,69 +326,265 @@ impl HealManager {
                                     }
                                 };
                                 let state = resume_manager.get_state().await;
-                                let targets = state
-                                    .replacement_targets
-                                    .iter()
-                                    .filter_map(|target| {
-                                        local_endpoints
-                                            .iter()
-                                            .find(|endpoint| endpoint.to_string() == *target)
-                                            .cloned()
-                                    })
-                                    .collect::<Vec<_>>();
+                                if disk_set_disk_id.as_deref().is_some_and(|disk_set| disk_set != state.set_disk_id) {
+                                    let disk_set = disk_set_disk_id.as_deref().unwrap_or_default();
+                                    conflicted_recovery_tasks.insert(task_id.clone());
+                                    conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                    conflicted_recovery_sets.insert(disk_set.to_string());
+                                    block_recovery_set(&state.set_disk_id);
+                                    if !disk_set.is_empty() {
+                                        block_recovery_set(disk_set);
+                                    }
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                        endpoint = %endpoint,
+                                        task_id,
+                                        state_set_disk_id = %state.set_disk_id,
+                                        observed_set_disk_id = disk_set,
+                                        "Replacement recovery intent set binding is ambiguous"
+                                    );
+                                    continue;
+                                }
                                 // A remote survivor may own the durable intent, but only the
                                 // node mounting every replacement target may advance or replay it.
-                                if targets.len() != state.replacement_targets.len() {
+                                if state.replacement_targets.iter().any(|target| {
+                                    !local_endpoints.iter().any(|endpoint| endpoint.to_string() == *target)
+                                }) {
+                                    deferred_recovery_sets.insert(state.set_disk_id.clone());
                                     continue;
                                 }
-                                if !durable_replacement_recovery_is_due(&state, &task_id) {
-                                    if durable_replacement_reserves_targets(&state) {
-                                        conflicted_recovery_sets.insert(state.set_disk_id.clone());
-                                    }
+                                if conflicted_recovery_tasks.contains(&task_id) {
                                     continue;
                                 }
-                                let state = match resume_manager.resolve_replacement_recovery(storage.as_ref()).await {
-                                    Ok(state) => state,
-                                    Err(_) => {
+                                let mut selected = durable_recovery_candidates.remove(&task_id);
+                                let previous_set = selected.as_ref().map(|candidate| candidate.state.set_disk_id.clone());
+                                let candidate = match ReplacementRecoveryCandidate::new(
+                                    state.clone(),
+                                    disk.endpoint().to_string(),
+                                    disk.endpoint().is_local,
+                                ) {
+                                    Ok(candidate) => candidate,
+                                    Err(error) => {
+                                        conflicted_recovery_tasks.insert(task_id.clone());
                                         conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                        if let Some(previous_set) = &previous_set {
+                                            conflicted_recovery_sets.insert(previous_set.clone());
+                                        }
+                                        block_recovery_set(&state.set_disk_id);
+                                        if let Some(previous_set) = &previous_set {
+                                            block_recovery_set(previous_set);
+                                        }
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %endpoint,
+                                            task_id,
+                                            error = %error,
+                                            "Replacement recovery generation binding is ambiguous"
+                                        );
                                         continue;
                                     }
                                 };
-                                let task_id = state.task_id.clone();
-                                let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(
-                                    targets[0].pool_idx,
-                                    targets[0].set_idx,
-                                ) else {
-                                    continue;
-                                };
-                                if targets.iter().any(|target| {
-                                    crate::heal::utils::format_set_disk_id_from_i32(target.pool_idx, target.set_idx)
-                                        .as_deref()
-                                        != Some(set_disk_id.as_str())
-                                }) {
-                                    continue;
-                                }
-                                let resume_endpoint = disk.endpoint().to_string();
-                                match durable_recoveries.get(&set_disk_id) {
-                                    Some((existing_task_id, _, _, existing_anchor))
-                                        if existing_task_id != &task_id || existing_anchor != &resume_endpoint => {
-                                        replacement_recovery_blocked_sets
-                                            .lock()
-                                            .expect("replacement recovery blocked set lock poisoned")
-                                            .insert(set_disk_id.clone());
-                                        conflicted_recovery_sets.insert(set_disk_id);
+                                let task_set = candidate.state.set_disk_id.clone();
+                                if let Err(error) = merge_replacement_recovery_candidate(&mut selected, candidate) {
+                                    conflicted_recovery_tasks.insert(task_id.clone());
+                                    conflicted_recovery_sets.insert(task_set.clone());
+                                    if let Some(previous_set) = &previous_set {
+                                        conflicted_recovery_sets.insert(previous_set.clone());
                                     }
-                                    Some(_) => {}
-                                    None => {
-                                        durable_recoveries.insert(
-                                            set_disk_id,
-                                            (task_id, targets, state.replacement_buckets, resume_endpoint),
-                                        );
+                                    block_recovery_set(&task_set);
+                                    if let Some(previous_set) = &previous_set {
+                                        block_recovery_set(previous_set);
                                     }
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                        endpoint = %endpoint,
+                                        task_id,
+                                        error = %error,
+                                        "Replacement recovery generation merge failed"
+                                    );
+                                } else if let Some(selected) = selected {
+                                    durable_recovery_candidates.insert(task_id, selected);
                                 }
                             }
                         }
 
+                        // Resolve only the canonical copy.  Resolving every
+                        // replica independently can advance separate revisions
+                        // and recreates the duplicate-generation race this scan
+                        // is meant to recover from.
+                        for (task_id, candidate) in durable_recovery_candidates {
+                            // Discovery can observe a remote survivor before it
+                            // confirms that every replacement target is mounted
+                            // locally.  Do not resolve (and therefore mutate)
+                            // that generation in the same pass; the next scan
+                            // must make the readiness decision again.
+                            if deferred_recovery_sets.contains(&candidate.state.set_disk_id)
+                                || conflicted_recovery_sets.contains(&candidate.state.set_disk_id)
+                            {
+                                continue;
+                            }
+                            let Some(anchor_disk) = local_disks
+                                .iter()
+                                .chain(recovery_disks.iter())
+                                .find(|disk| disk.endpoint().to_string() == candidate.anchor)
+                                .cloned()
+                            else {
+                                deferred_recovery_sets.insert(candidate.state.set_disk_id.clone());
+                                continue;
+                            };
+                            let resume_manager = match ResumeManager::load_replacement_intent(anchor_disk, &task_id).await {
+                                Ok(resume_manager) => resume_manager,
+                                Err(error) => {
+                                    conflicted_recovery_sets.insert(candidate.state.set_disk_id.clone());
+                                    block_recovery_set(&candidate.state.set_disk_id);
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                        task_id,
+                                        error = %error,
+                                        "Canonical replacement recovery intent load failed"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let mut state = resume_manager.get_state().await;
+                            if replacement_retry_is_exhausted_active(&state) {
+                                match resume_manager
+                                    .rearm_replacement_recovery_if_needed(storage.as_ref())
+                                    .await
+                                {
+                                    Ok(true) => state = resume_manager.get_state().await,
+                                    Ok(false) => {
+                                        // A ready generation without the
+                                        // compatibility transient-skip marker
+                                        // remains bounded; do not turn it into
+                                        // a fresh retry.
+                                        if durable_replacement_reserves_targets(&state) {
+                                            conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                            block_recovery_set(&state.set_disk_id);
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                        block_recovery_set(&state.set_disk_id);
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            task_id,
+                                            error = %error,
+                                            "Replacement recovery readiness probe failed"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            if !durable_replacement_recovery_is_due(&state, &task_id) {
+                                if durable_replacement_reserves_targets(&state) {
+                                    conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                    block_recovery_set(&state.set_disk_id);
+                                }
+                                continue;
+                            }
+                            let state = match resume_manager.resolve_replacement_recovery(storage.as_ref()).await {
+                                Ok(state) => state,
+                                Err(Error::ReplacementTargetNotReady(_)) => {
+                                    deferred_recovery_sets.insert(state.set_disk_id.clone());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                    block_recovery_set(&state.set_disk_id);
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                        task_id,
+                                        error = %error,
+                                        "Canonical replacement recovery resolution failed"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let targets = state
+                                .replacement_targets
+                                .iter()
+                                .filter_map(|target| {
+                                    local_endpoints
+                                        .iter()
+                                        .find(|endpoint| endpoint.to_string() == *target)
+                                        .cloned()
+                                })
+                                .collect::<Vec<_>>();
+                            if targets.len() != state.replacement_targets.len() {
+                                deferred_recovery_sets.insert(state.set_disk_id.clone());
+                                continue;
+                            }
+                            let Some(first_target) = targets.first() else {
+                                conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                block_recovery_set(&state.set_disk_id);
+                                continue;
+                            };
+                            // A pending handoff may resolve the predecessor to
+                            // its durable successor.  Queue the resolved owner,
+                            // not the stale filename that initiated replay.
+                            let resolved_task_id = state.task_id.clone();
+                            let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(
+                                first_target.pool_idx,
+                                first_target.set_idx,
+                            ) else {
+                                conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                block_recovery_set(&state.set_disk_id);
+                                continue;
+                            };
+                            if state.set_disk_id != set_disk_id
+                                || targets.iter().any(|target| {
+                                    crate::heal::utils::format_set_disk_id_from_i32(target.pool_idx, target.set_idx)
+                                        .as_deref()
+                                        != Some(set_disk_id.as_str())
+                                })
+                            {
+                                block_recovery_set(&set_disk_id);
+                                conflicted_recovery_sets.insert(set_disk_id);
+                                continue;
+                            }
+                            let resume_endpoint = candidate.anchor;
+                            match durable_recoveries.get(&set_disk_id) {
+                                Some((existing_task_id, existing_targets, existing_buckets, _))
+                                    if existing_task_id != &resolved_task_id
+                                        || existing_targets != &targets
+                                        || existing_buckets != &state.replacement_buckets => {
+                                    block_recovery_set(&set_disk_id);
+                                    conflicted_recovery_sets.insert(set_disk_id);
+                                }
+                                Some(_) => {}
+                                None => {
+                                    durable_recoveries.insert(
+                                        set_disk_id,
+                                        (resolved_task_id, targets, state.replacement_buckets, resume_endpoint),
+                                    );
+                                }
+                            }
+                        }
+
+                        for set_disk_id in &deferred_recovery_sets {
+                            durable_recoveries.remove(set_disk_id);
+                            endpoints.remove(set_disk_id);
+                        }
                         for set_disk_id in &conflicted_recovery_sets {
                             durable_recoveries.remove(set_disk_id);
                             endpoints.remove(set_disk_id);
