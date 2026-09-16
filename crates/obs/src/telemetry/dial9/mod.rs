@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tokio runtime-level telemetry via `dial9-tokio-telemetry`.
+//! Tokio runtime-level telemetry via `dial9`.
 //!
 //! This is an on-demand profiler for executor-level faults — long polls that
 //! stall a worker, park/unpark storms, tasks that never yield — which are

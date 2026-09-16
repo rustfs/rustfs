@@ -14,7 +14,7 @@
 
 //! Enforces that the `dial9` feature is paired with `--cfg tokio_unstable`.
 //!
-//! `dial9-tokio-telemetry` hooks Tokio's unstable runtime instrumentation. The
+//! `dial9` hooks Tokio's unstable runtime instrumentation. The
 //! flag lives in `RUSTFLAGS`, which a caller can silently clobber by exporting
 //! their own value — that used to turn telemetry off with no diagnostic. Fail
 //! the build instead.

@@ -20,7 +20,7 @@
 
 use crate::TelemetryError;
 
-/// Placeholder for `dial9_tokio_telemetry::telemetry::TelemetryGuard`.
+/// Placeholder for `dial9::TelemetryGuard`.
 ///
 /// Never constructed: [`build_traced_runtime`] always fails without the
 /// `dial9` feature.

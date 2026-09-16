@@ -3791,6 +3791,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dial9"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49b11bce55173f77d9003cce8f129b4af889a4639005c53c3498cef933bc895c"
+dependencies = [
+ "bon",
+ "dial9-core",
+ "dial9-macro",
+ "dial9-metrique",
+ "dial9-perf-self-profile",
+ "dial9-tokio-telemetry",
+ "dial9-trace-format",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dial9-core"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3813,6 +3830,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "dial9-macro"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4177b8f8bf95d8e3769c1aad596f5d6fb231953a45c4c3d2a5946fe8e4ec327b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "dial9-metrique"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d42fe0e3e14e8780c4ecf9ee14c183dbcb9b1ae3612cc9a689e7dc83b13adef1"
+dependencies = [
+ "dial9-core",
+ "dial9-trace-format",
+ "metrique",
+ "metrique-writer",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dial9-perf-self-profile"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3827,6 +3869,7 @@ dependencies = [
  "libc",
  "perf-event-data",
  "perf-event-open-sys2",
+ "tokio",
  "tracing",
 ]
 
@@ -10345,7 +10388,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-utils",
- "dial9-tokio-telemetry",
+ "dial9",
  "flate2",
  "futures-util",
  "glob",
