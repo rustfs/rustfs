@@ -1097,10 +1097,16 @@ impl SetDisks {
                             });
                         }
 
-                        let selected_version_matches = version_id.is_empty()
-                            || latest_meta
+                        let requested_nil =
+                            version_id.is_empty() || Uuid::parse_str(version_id).is_ok_and(|requested| requested.is_nil());
+                        let selected_nil = latest_meta.version_id.is_none_or(|selected| selected.is_nil());
+                        let selected_version_matches = if requested_nil {
+                            selected_nil
+                        } else {
+                            latest_meta
                                 .version_id
-                                .is_some_and(|selected| selected.to_string().eq_ignore_ascii_case(version_id));
+                                .is_some_and(|selected| selected.to_string().eq_ignore_ascii_case(version_id))
+                        };
                         result.metadata_verified = !opts.dry_run
                             && !latest_meta.is_remote()
                             && !read_repair_uses_shared_lock
@@ -3324,6 +3330,20 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn absent_and_nil_selected_versions_are_the_same_null_identity() {
+        let requested_nil = Uuid::nil().to_string();
+        let requested = Uuid::parse_str(&requested_nil).expect("nil UUID string");
+        assert!(requested.is_nil());
+
+        let absent: Option<Uuid> = None;
+        let selected_nil = absent.is_none_or(|selected| selected.is_nil());
+        assert!(selected_nil, "absent metadata version selects the null identity");
+
+        let selected = Some(Uuid::new_v4()).expect("UUID version");
+        assert!(!selected.is_nil(), "a concrete UUID must not satisfy a requested null selector");
     }
 
     #[test]
