@@ -200,7 +200,12 @@ async fn receipt_requires_independent_deep_verification() {
             )
             .await
             .expect("normal presence scan");
-        assert!(normal.receipt.is_none(), "a presence scan cannot certify payload integrity");
+        let normal_receipt = normal.receipt.expect("a normal presence scan should certify metadata health");
+        assert_eq!(
+            normal_receipt.disposition,
+            HealObjectDisposition::MetadataHealthy,
+            "a presence scan must not be promoted to payload VerifiedHealthy"
+        );
         let result = storage
             .heal_object_with_receipt(
                 bucket,

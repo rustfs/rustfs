@@ -65,9 +65,12 @@ queue does not imply that these persistent obligations have been cleared.
 Partial-write MRF replay uses Deep verification so a protected object's repair
 can discharge its obligation after verifying the payload. This adds full-object
 read work to those background attempts, including healthy replay targets.
-Normal presence scans likewise cannot certify protected payloads. Local Heal
-of transitioned objects checks metadata without reading the tier payload, so it
-does not issue a payload-integrity receipt even if a descriptor remains. An
+Normal presence scans likewise cannot certify protected payloads; an exact,
+all-healthy protected version or delete marker may receive `MetadataHealthy`,
+which proves authoritative metadata rather than payload integrity. Legacy
+objects receive no positive receipt. Local Heal of transitioned objects
+checks metadata without reading the tier payload, so it does not issue a
+payload-integrity receipt even if a descriptor remains. An
 authoritative historical-version cleanup or absence proof has its own identity
 and commit checks and does not depend on a live payload digest.
 
