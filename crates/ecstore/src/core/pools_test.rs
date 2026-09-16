@@ -481,6 +481,9 @@ mod decommission_lock_order_tests {
         if let Some(deployment_id) = other_store.ctx.deployment_id() {
             ctx.set_deployment_id(deployment_id);
         }
+        for pool in &mut pools {
+            Arc::make_mut(pool).set_instance_ctx_for_test(Arc::clone(&ctx));
+        }
         let store = Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: other_store.disk_map.clone(),
@@ -6645,7 +6648,19 @@ mod decommission_lock_order_tests {
 
         let restore_get_barrier = if matches!(mutation, ExternalObjectMutation::Restore) {
             let tier_name = format!("ORDERRESTORE{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
-            let backend = register_mock_tier(&store.pools[2].instance_ctx().tier_config_mgr(), &tier_name).await;
+            let source_tiers = store.tier_config_mgr();
+            let restore_tiers = other_store.tier_config_mgr();
+            let backend = register_mock_tier(&source_tiers, &tier_name).await;
+            // Both peers must resolve the same persisted backend identity, including its prefix.
+            let tier_config = source_tiers.read().await.tiers[&tier_name].clone();
+            restore_tiers.write().await.tiers.insert(tier_name.clone(), tier_config);
+            crate::services::tier::tier::TierConfigMgr::install_test_driver_in(
+                &restore_tiers,
+                &tier_name,
+                Box::new(backend.clone()),
+            )
+            .await
+            .expect("install the same mock tier on the restoring peer");
             store.pools[2]
                 .transition_object(
                     &bucket,
@@ -6919,7 +6934,10 @@ mod decommission_lock_order_tests {
             }
         });
         if let Some(get_barrier) = restore_get_barrier.as_ref() {
-            get_barrier.wait_until_paused().await;
+            tokio::select! {
+                () = get_barrier.wait_until_paused() => {}
+                result = &mut ordinary_mutation => panic!("restore finished before the tier GET barrier: {result:?}"),
+            }
             let read_opts = ObjectOptions {
                 skip_decommissioned: true,
                 ..Default::default()

@@ -132,6 +132,12 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
+# The real object probe includes bucket creation and cleanup in its short
+# measurement budget. Keep competing storage fixtures outside that budget.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+threads-required = "num-test-threads"
+
 # Serialize the durable manual-transition checkpoint test across nextest's
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
 [[profile.default.overrides]]
@@ -326,6 +332,10 @@ test-group = 'ecstore-serial-flaky'
 [[profile.ci.overrides]]
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test under the ci profile
 # too. No retries: failures stay visible.

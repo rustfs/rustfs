@@ -324,6 +324,15 @@ impl Sets {
         &self.ctx
     }
 
+    /// Keep simulated peers' metadata ownership separate while sharing disks and lock clients.
+    #[cfg(test)]
+    pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
+        for set in &mut self.disk_set {
+            Arc::make_mut(set).set_instance_ctx_for_test(Arc::clone(&ctx));
+        }
+        self.ctx = ctx;
+    }
+
     async fn monitor_and_connect_endpoints_task(sets: Weak<Sets>, mut rx: Receiver<()>) {
         let startup_delay = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(startup_delay);

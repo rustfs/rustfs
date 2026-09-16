@@ -3757,11 +3757,8 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(api) = runtime_sources::object_store_handle() else {
-        return;
-    };
-    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
             observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
@@ -12703,7 +12700,8 @@ mod tests {
                 .push((event, state, reason));
         });
 
-        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &object_info, LcEventSrc::S3PutObject, &ObjectOptions::default())
+            .await;
 
         assert!(
             observed.lock().expect("observed events should not poison").contains(&(

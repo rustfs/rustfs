@@ -6,6 +6,17 @@ pub(crate) use rustfs_ecstore::api::erasure::Erasure;
 pub(crate) use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 pub(crate) use rustfs_ecstore::api::{error::Error, set_disk::SetDisks, storage::ECStore};
 use rustfs_storage_api as storage_contracts;
+#[cfg(feature = "test-util")]
+pub(crate) mod metadata_lock {
+    pub(crate) use super::storage_contracts::{
+        BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
+    };
+    pub(crate) use super::{Error, ObjectOptions, PutObjReader};
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+        init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks,
+    };
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{PutObjectCommitBarrier, PutObjectCommitPause};
+}
 
 pub(crate) mod contract_compat {
     pub(crate) use super::storage_contracts::{
