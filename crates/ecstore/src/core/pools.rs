@@ -12432,10 +12432,14 @@ impl ECStore {
             .get(idx)
             .and_then(|pool| pool.decommission.as_ref())
             .and_then(|info| info.capacity_reservation.as_ref())
-            .filter(|reservation| reservation.lease_active_at(OffsetDateTime::now_utc()))
         else {
             return Ok(None);
         };
+        if !reservation.lease_active_at(OffsetDateTime::now_utc()) {
+            return Err(decommission_capacity_blocked_error(
+                "decommission capacity reservation lease is not active",
+            ));
+        }
         Ok(Some(DecommissionCapacityOwner {
             source_pool_index: idx,
             operation_id: reservation.operation_id,
@@ -20024,6 +20028,45 @@ mod tests {
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err)),
             "the reserved first pool must not receive the multipart mutation"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn expired_decommission_capacity_lease_requires_recovery_before_entry() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1, 1),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 2, 2, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 2, 2, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the expired lease reservation");
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("read the active decommission generation");
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("the expired lease reservation should exist");
+            reservation.expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        }
+
+        let err = store
+            .decommission_capacity_owner_for_worker(0, generation)
+            .await
+            .expect_err("an expired capacity lease must not fall back to ownerless migration");
+        assert!(is_decommission_capacity_blocked_error(&err));
     }
 
     #[tokio::test]
