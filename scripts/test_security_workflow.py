@@ -867,6 +867,84 @@ emit_step_result() {
                 if "later step failure" in failed_log:
                     self.assertIn("| 3 | later step failure | FAIL |", (self.artifacts / "steps.md").read_text())
 
+    def test_tier_gate_rejects_failed_suites_and_invalid_structured_results(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.context["env.TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        gate_file = self.artifacts / "rustfs-tier-gate.rc"
+        for evidence_outcome, test_outcome, gate_result, success in (
+            ("success", "success", "0\n", True),
+            ("success", "failure", "0\n", False),
+            ("success", "cancelled", "0\n", False),
+            ("success", "skipped", "0\n", False),
+            ("failure", "success", "0\n", False),
+            ("success", "success", None, False),
+            ("success", "success", "", False),
+            ("success", "success", "1\n", False),
+            ("success", "success", "invalid\n", False),
+        ):
+            with self.subTest(evidence=evidence_outcome, suite=test_outcome, structured=gate_result):
+                self.context["steps.evidence.outcome"] = evidence_outcome
+                self.context["steps.test.outcome"] = test_outcome
+                gate_file.unlink(missing_ok=True)
+                if gate_result is not None:
+                    gate_file.write_text(gate_result)
+                result = self.run_step("Enforce tier suite result")
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_tier_backlog_manager_never_closes_issues_after_evidence_or_gate_failure(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.env["TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        capture = self.directory / "manager-args.json"
+        self.env["CAPTURE_MANAGER"] = str(capture)
+        manager = self.directory / "auto-testing/scripts/issue_manager.py"
+        manager.parent.mkdir(parents=True)
+        manager.write_text("import json, os, sys\nfrom pathlib import Path\n"
+                           "Path(os.environ['CAPTURE_MANAGER']).write_text(json.dumps(sys.argv[1:]))\n")
+        for test, verify, gate, expected in (
+            ("success", "success", "success", "success"),
+            ("failure", "success", "success", "failure"),
+            ("success", "failure", "success", "failure"),
+            ("success", "success", "failure", "failure"),
+            ("cancelled", "failure", "failure", "cancelled"),
+        ):
+            with self.subTest(suite=test, evidence=verify, gate=gate):
+                self.context.update({"steps.test.outcome": test, "steps.evidence_verify.outcome": verify,
+                                     "steps.gate.outcome": gate})
+                result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(capture.read_text())
+                self.assertEqual(args[args.index("--outcome") + 1], expected)
+        capture.unlink()
+        self.artifacts.rmdir()
+        self.artifacts.symlink_to(self.directory, target_is_directory=True)
+        result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(capture.exists())
+
+    def test_tier_failure_issue_never_reads_rejected_or_symlinked_evidence(self):
+        for rejected in (True, False):
+            with self.subTest(rejected=rejected):
+                self.prepare("tier")
+                evidence = self.directory / "untrusted-evidence"
+                evidence.mkdir()
+                (evidence / "rustfs-tier-report.md").write_text("UNTRUSTED EVIDENCE MUST NOT BE READ")
+                if rejected:
+                    self.artifacts = evidence
+                else:
+                    self.artifacts.symlink_to(evidence, target_is_directory=True)
+                self.context.update({
+                    "env.TIER_ARTIFACTS_DIR": str(self.artifacts),
+                    "steps.evidence.outcome": "failure" if rejected else "success",
+                    "steps.evidence_verify.outcome": "failure", "steps.gate.outcome": "failure",
+                })
+                result = self.run_step("File failure issue in rustfs/backlog")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                body = Path(self.env["CAPTURE_BODY"]).read_text()
+                self.assertNotIn("UNTRUSTED EVIDENCE MUST NOT BE READ", body)
+                self.assertIn("its contents were not read", body)
+
     def test_performance_results_version_and_report_are_bound_to_the_run(self):
         self.prepare("performance")
         initialized = self.run_step("Initialize functional evidence")
