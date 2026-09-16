@@ -4564,6 +4564,7 @@ impl ECStore {
                     namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
                     bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
                     object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
+                    quota_admission: dst_opts.quota_admission,
                     ..Default::default()
                 };
                 if !self.single_pool() {
@@ -4606,6 +4607,7 @@ impl ECStore {
                         namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
                         bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
                         object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
+                        quota_admission: dst_opts.quota_admission,
                         ..Default::default()
                     };
                     if !self.single_pool() {
@@ -4658,6 +4660,7 @@ impl ECStore {
             namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
             bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
             object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
+            quota_admission: dst_opts.quota_admission,
             ..Default::default()
         };
         if !self.single_pool() {
