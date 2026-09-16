@@ -3494,17 +3494,36 @@ fn dangling_delete_grace() -> time::Duration {
 /// Result of scanning one disk's copy of a directory prefix while deciding
 /// whether an orphan (metadata-less) directory tree can be safely purged.
 enum OrphanDirScan {
-    /// The subtree holds object metadata or uncommitted data, so it must not be
-    /// purged.
-    HasData,
-    /// The prefix contains only empty directories and/or UUID data directories
-    /// carrying a committed delete marker.
-    Purgeable {
-        empty_dirs: Vec<String>,
+    /// The prefix exists on this disk. `blocked` holds every directory that is
+    /// itself, or an ancestor of, object metadata or uncommitted data (closed
+    /// under taking parents, root included when anything under it is blocked);
+    /// `dirs` is the pre-order list of every directory reached that is not
+    /// blocked, and `committed_files` the erasure data and committed delete
+    /// markers found in the unblocked UUID data dirs among them.
+    Scanned {
+        blocked: HashSet<String>,
+        dirs: Vec<String>,
         committed_files: Vec<String>,
     },
+    /// A directory read failed for a reason other than absence, so nothing
+    /// under the prefix can be classified on this disk.
+    Unreadable,
     /// The prefix does not exist on this disk.
     Missing,
+}
+
+/// Mark `dir` and every ancestor up to and including `root` as blocked.
+fn block_orphan_dir_chain(blocked: &mut HashSet<String>, root: &str, dir: &str) {
+    let mut current = dir;
+    loop {
+        if !blocked.insert(current.to_owned()) || current == root {
+            return;
+        }
+        let Some((parent, _)) = current.rsplit_once(SLASH_SEPARATOR) else {
+            return;
+        };
+        current = parent;
+    }
 }
 
 fn is_safe_orphan_dir_entry(entry: &str) -> bool {
@@ -6311,9 +6330,12 @@ impl SetDisks {
         .await
     }
 
-    /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
-    /// directory subtree. Only empty directories and UUID data directories with
-    /// valid committed delete markers are purgeable; every child is still scanned.
+    /// Scan a single disk's copy of `prefix` and classify every directory
+    /// under it. Only empty directories and UUID data directories with valid
+    /// committed delete markers are purgeable; anything else blocks its whole
+    /// ancestor chain while sibling subtrees stay purgeable, so committed
+    /// residue is still reclaimed when it shares an ancestor with residue from
+    /// an older build that never wrote markers (#6898).
     async fn scan_orphan_dir(disk: &DiskStore, bucket: &str, prefix: &str) -> OrphanDirScan {
         let root = prefix.trim_end_matches(SLASH_SEPARATOR).to_string();
         let mut stack = vec![root.clone()];
@@ -6321,6 +6343,7 @@ impl SetDisks {
         // so reversing it yields a safe children-first removal order.
         let mut dirs: Vec<String> = Vec::new();
         let mut committed_files: Vec<String> = Vec::new();
+        let mut blocked: HashSet<String> = HashSet::new();
         let mut existed = false;
 
         while let Some(dir) = stack.pop() {
@@ -6335,16 +6358,18 @@ impl SetDisks {
                 }
                 // Classification must fail closed: committed residue is safe to
                 // remove only after every reachable child was inspected.
-                Err(_) => return OrphanDirScan::HasData,
+                Err(_) => return OrphanDirScan::Unreadable,
             };
 
             existed = true;
             let mut child_dirs = Vec::new();
             let mut files = Vec::new();
 
+            let mut has_data = false;
             for entry in entries {
                 if !is_safe_orphan_dir_entry(&entry) {
-                    return OrphanDirScan::HasData;
+                    has_data = true;
+                    break;
                 }
                 match entry.strip_suffix(SLASH_SEPARATOR) {
                     Some(child) => child_dirs.push(format!("{dir}{SLASH_SEPARATOR}{child}")),
@@ -6352,28 +6377,29 @@ impl SetDisks {
                 }
             }
 
-            if !files.is_empty() {
+            if !has_data && !files.is_empty() {
                 let data_dir_name = dir.rsplit(SLASH_SEPARATOR).next().unwrap_or_default();
                 let is_uuid_data_dir = Uuid::parse_str(data_dir_name).is_ok_and(|uuid| !uuid.is_nil());
                 let has_committed_delete = files.iter().any(|entry| is_committed_delete_marker(entry));
+                has_data = !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE);
+            }
 
-                if !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE) {
-                    return OrphanDirScan::HasData;
-                }
-
-                committed_files.extend(files.into_iter().map(|entry| path_join_buf(&[&dir, &entry])));
-                dirs.push(dir);
-                stack.extend(child_dirs);
+            if has_data {
+                // Nothing below a blocked directory is ever removed, so its
+                // children need no classification.
+                block_orphan_dir_chain(&mut blocked, &root, &dir);
                 continue;
             }
 
+            committed_files.extend(files.into_iter().map(|entry| path_join_buf(&[&dir, &entry])));
             dirs.push(dir);
             stack.extend(child_dirs);
         }
 
         if existed {
-            OrphanDirScan::Purgeable {
-                empty_dirs: dirs,
+            OrphanDirScan::Scanned {
+                blocked,
+                dirs,
                 committed_files,
             }
         } else {
@@ -6470,41 +6496,53 @@ impl SetDisks {
     pub(crate) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> disk::error::Result<bool> {
         let disks = self.get_disks_internal().await;
 
-        // Phase 1: classify every online disk. Refuse to purge if ANY disk holds
-        // object data under the prefix, so a degraded/healable object is never
-        // destroyed.
-        let mut per_disk_dirs: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
-        let mut existed = false;
+        // Phase 1: classify every online disk. A directory that holds object
+        // data or uncommitted residue on ANY disk blocks itself and its
+        // ancestors on every disk, so a degraded/healable object is never
+        // destroyed; purgeable subtrees beside it are still reclaimed.
+        let mut per_disk: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
+        let mut blocked: HashSet<String> = HashSet::new();
         for (i, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else { continue };
             match Self::scan_orphan_dir(disk, bucket, object).await {
-                OrphanDirScan::HasData => return Ok(false),
-                OrphanDirScan::Purgeable {
-                    empty_dirs,
+                OrphanDirScan::Unreadable => return Ok(false),
+                OrphanDirScan::Scanned {
+                    blocked: disk_blocked,
+                    dirs,
                     committed_files,
                 } => {
-                    existed = true;
-                    per_disk_dirs.push((i, empty_dirs, committed_files));
+                    blocked.extend(disk_blocked);
+                    per_disk.push((i, dirs, committed_files));
                 }
                 OrphanDirScan::Missing => {}
             }
         }
 
-        if !existed {
-            return Ok(false);
-        }
-
-        // Phase 2: remove only the files classified as committed residue, then
-        // remove directories children-first. Every directory delete is
-        // non-recursive, so a directory that concurrently gained an object fails
-        // with DirectoryNotEmpty and is skipped — a racing PutObject is never
+        // Phase 2: remove only the files classified as committed residue in
+        // unblocked data dirs, then remove unblocked directories
+        // children-first. Every directory delete is non-recursive, so a
+        // directory that concurrently gained an object fails with
+        // DirectoryNotEmpty and is skipped — a racing PutObject is never
         // clobbered.
-        for (i, empty_dirs, committed_files) in per_disk_dirs {
+        let mut purged = false;
+        for (i, dirs, committed_files) in per_disk {
             let Some(disk) = disks[i].as_ref() else { continue };
-            Self::delete_purgeable_orphan_entries(disk, bucket, object, empty_dirs, committed_files).await;
+            let dirs = dirs.into_iter().filter(|dir| !blocked.contains(dir)).collect::<Vec<_>>();
+            let committed_files = committed_files
+                .into_iter()
+                .filter(|file| {
+                    file.rsplit_once(SLASH_SEPARATOR)
+                        .is_some_and(|(data_dir, _)| !blocked.contains(data_dir))
+                })
+                .collect::<Vec<_>>();
+            if dirs.is_empty() && committed_files.is_empty() {
+                continue;
+            }
+            purged = true;
+            Self::delete_purgeable_orphan_entries(disk, bucket, object, dirs, committed_files).await;
         }
 
-        Ok(true)
+        Ok(purged)
     }
 
     /// Reclaim orphaned physical data directories under `bucket/object` that no
@@ -7621,13 +7659,15 @@ mod tests {
             .await
             .expect("committed delete marker should be written");
 
-        let OrphanDirScan::Purgeable {
-            empty_dirs,
+        let OrphanDirScan::Scanned {
+            blocked,
+            dirs: empty_dirs,
             committed_files,
         } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
         else {
             panic!("committed residue should be classified as purgeable");
         };
+        assert!(blocked.is_empty(), "committed residue alone blocks nothing");
 
         let nested_object = residue.join("nested");
         tokio::fs::create_dir_all(&nested_object)
@@ -7669,13 +7709,15 @@ mod tests {
             .await
             .expect("committed delete marker should be written");
 
-        let OrphanDirScan::Purgeable {
-            empty_dirs,
+        let OrphanDirScan::Scanned {
+            blocked,
+            dirs: empty_dirs,
             committed_files,
         } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
         else {
             panic!("committed residue should be classified as purgeable");
         };
+        assert!(blocked.is_empty(), "committed residue alone blocks nothing");
         tokio::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o555))
             .await
             .expect("residue directory should become read-only");

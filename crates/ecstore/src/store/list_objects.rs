@@ -9730,6 +9730,79 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn empty_delimiter_listing_of_mixed_residue_ancestor_reclaims_only_committed_subtree() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-mixed-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let committed_dir = uuid::Uuid::new_v4();
+        let unmarked_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let committed = dir
+                .path()
+                .join(bucket)
+                .join("metrics/cpu/2026/08/28/22/a.parquet")
+                .join(committed_dir.to_string());
+            tokio::fs::create_dir_all(&committed)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(committed.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                committed.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+
+            // Residue left by a build that never wrote delete markers, or a
+            // PUT still streaming its parts: indistinguishable, so never purged.
+            let unmarked = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(unmarked_dir.to_string());
+            tokio::fs::create_dir_all(&unmarked)
+                .await
+                .expect("unmarked residue should be created");
+            tokio::fs::write(unmarked.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty(), "neither residue subtree may surface as a prefix");
+        for dir in &dirs {
+            let metrics = dir.path().join(bucket).join("metrics");
+            assert!(
+                !metrics.join("cpu").exists(),
+                "the committed subtree must be reclaimed even though a sibling subtree is blocked"
+            );
+            assert!(
+                metrics
+                    .join("kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                    .join(unmarked_dir.to_string())
+                    .join("part.1")
+                    .exists(),
+                "residue without a committed marker must survive the purge"
+            );
+        }
+    }
+
     #[test]
     fn list_objects_index_provider_state_uses_lifecycle_active_generation() {
         let provider = ListObjectsIndexProviderState::walker_key_only();
