@@ -9623,6 +9623,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-aes256-gcm-demo"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+]
+
+[[package]]
 name = "rustfs-audit"
 version = "1.0.0-rc.6"
 dependencies = [
@@ -10563,6 +10570,7 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "reqwest",
+ "rustfs-aes256-gcm-demo",
  "rustfs-config",
  "rustfs-io-metrics",
  "rustfs-tls-runtime",

@@ -16,7 +16,10 @@
 .devcontainer
 rustfs/static/*
 !rustfs/static/.gitkeep
-vendor
+# Vendored third-party crates (cargo vendor output) are ignored; the in-repo
+# demo cipher crate is tracked so path dependencies resolve on any checkout.
+vendor/*
+!vendor/rustfs-aes256-gcm-demo/
 cli/rustfs-gui/embedded-rustfs/rustfs
 *.log
 deploy/certs/*
