@@ -116,6 +116,20 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Create independent shard commitments for new writes after the fleet is upgraded.
+/// Existing protected objects and multipart uploads retain their protection.
+pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
+pub const DEFAULT_SHARD_INTEGRITY_WRITE: bool = false;
+
+/// Operator confirmation that every reader, writer and background coordinator
+/// understands independent shard commitments. This is not capability discovery
+/// or a fence against an old binary rejoining the fleet.
+pub const ENV_SHARD_INTEGRITY_FLEET_CONFIRMED: &str = "RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED";
+pub const DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_WRITE);
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED);
+
 /// How object writes treat a bucket whose stored versioning configuration
 /// cannot be parsed: `permissive` writes as if unversioned (the historical
 /// behavior, recorded by metrics and an error log) and `strict` refuses the

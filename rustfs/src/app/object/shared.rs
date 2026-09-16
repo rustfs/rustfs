@@ -32,6 +32,19 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
+/// Encode a resolved object version identity for an S3 response. Storage
+/// distinguishes a null version from an unversioned object by returning a nil
+/// UUID instead of None.
+pub(crate) fn s3_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+    version_id.map(|id| {
+        if id.is_nil() {
+            NULL_VERSION_ID.to_owned()
+        } else {
+            id.to_string()
+        }
+    })
+}
+
 fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
     let code = if version_id.is_some() {
         S3ErrorCode::MethodNotAllowed
@@ -466,7 +479,7 @@ mod bucket_default_sse_lookup_tests {
         let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
             .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
     }
 
     #[test]
@@ -1101,6 +1114,15 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
+        let version = Uuid::parse_str("9341ae04-d4ce-468c-a4e1-6501d58cd6b7").unwrap();
+
+        assert_eq!(s3_response_version_id(None), None);
+        assert_eq!(s3_response_version_id(Some(Uuid::nil())).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(s3_response_version_id(Some(version)), Some(version.to_string()));
+    }
 
     #[test]
     fn delete_marker_read_headers_round_trip_uuid_and_null_errors() {

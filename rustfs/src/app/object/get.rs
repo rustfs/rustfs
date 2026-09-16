@@ -2148,7 +2148,7 @@ impl DefaultObjectUsecase {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_reader_blob<R>(
+    async fn build_reader_blob<R>(
         reader: R,
         response_content_length: i64,
         request_id: &str,
@@ -2159,10 +2159,12 @@ impl DefaultObjectUsecase {
         key: &str,
         lifecycle: GetObjectBodyLifecycle,
         resume: Option<GetObjectResumeControl<R>>,
-    ) -> StreamingBlob
+    ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        use tokio::io::AsyncReadExt as _;
+
         let streaming_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let tuned_stream_buffer_size =
@@ -2178,7 +2180,7 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        let reader = GetObjectStreamingReader::new(
+        let mut reader = GetObjectStreamingReader::new(
             reader,
             bucket,
             key,
@@ -2189,6 +2191,17 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
+        let mut prefix = [0_u8; 1];
+        let prefix_len = if expected == 0 {
+            0
+        } else {
+            reader
+                .read_exact(&mut prefix)
+                .await
+                .map_err(|error| map_get_object_reader_error(StorageError::from(error)))?;
+            1
+        };
+        let reader = std::io::Cursor::new(prefix).take(prefix_len).chain(reader);
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
             .with_diagnostics(bucket, key, request_id);
         let blob = StreamingBlob::new(stream);
@@ -2202,7 +2215,7 @@ impl DefaultObjectUsecase {
             );
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAMING_BLOB, streaming_blob_start);
-        blob
+        Ok(blob)
     }
 
     fn init_get_object_bootstrap(&self, bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -3176,7 +3189,7 @@ impl DefaultObjectUsecase {
             let (stream_buffer_size, stream_strategy) =
                 Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
             record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
-            return Ok(Self::build_reader_blob(
+            return Self::build_reader_blob(
                 final_stream,
                 response_content_length,
                 request_id,
@@ -3187,7 +3200,8 @@ impl DefaultObjectUsecase {
                 key,
                 lifecycle,
                 resume(info),
-            ));
+            )
+            .await;
         }
 
         if let Some(buffered_body) = buffered_body {
@@ -3254,7 +3268,7 @@ impl DefaultObjectUsecase {
         let (stream_buffer_size, stream_strategy) =
             Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
-        Ok(Self::build_reader_blob(
+        Self::build_reader_blob(
             final_stream,
             response_content_length,
             request_id,
@@ -3265,7 +3279,8 @@ impl DefaultObjectUsecase {
             key,
             lifecycle,
             resume(info),
-        ))
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3620,7 +3635,6 @@ impl DefaultObjectUsecase {
         queue_status: &concurrency::IoQueueStatus,
         concurrent_requests: usize,
         part_number: Option<usize>,
-        versioned: bool,
         lifecycle: GetObjectBodyLifecycle,
         resume: F,
     ) -> S3Result<GetObjectOutputContext>
@@ -3678,17 +3692,7 @@ impl DefaultObjectUsecase {
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
-        let output_version_id = if versioned {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let output_version_id = s3_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
         let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
@@ -3714,6 +3718,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            content_language: info.user_defined.get("content-language").cloned(),
             cache_control,
             content_disposition,
             content_range,
@@ -4181,7 +4186,6 @@ impl DefaultObjectUsecase {
                 &queue_status,
                 concurrent_requests,
                 part_number,
-                opts.versioned,
                 lifecycle,
                 |info| {
                     Some(get_object_resume_control(GetObjectResumeContext::new(
@@ -4426,17 +4430,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let version_id = s3_response_version_id(info.version_id);
 
         let output = GetObjectAttributesOutput {
             checksum,
@@ -5862,8 +5856,11 @@ mod tests {
     }
 
     impl AsyncRead for ReadProbeReader {
-        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            if buf.remaining() > 0 {
+                buf.put_slice(b"x");
+            }
             Poll::Ready(Ok(()))
         }
     }
@@ -6463,12 +6460,11 @@ mod tests {
         )
         .await
         .expect("reservation bypass must construct the normal streaming fallback");
-        let chunk = fallback_body
-            .next()
-            .await
-            .expect("fallback stream must yield a body chunk")
-            .expect("fallback stream must not fail");
-        assert_eq!(chunk, Bytes::from_static(b"body"));
+        let mut received = Vec::new();
+        while let Some(chunk) = fallback_body.next().await {
+            received.extend_from_slice(&chunk.expect("fallback stream must not fail"));
+        }
+        assert_eq!(received, b"body");
         assert!(fallback_reads.load(AtomicOrdering::Relaxed) > 0);
         assert_eq!(readers.load(AtomicOrdering::Relaxed), 0, "cold-fill materialization must remain unopened");
         assert_eq!(coordinator.active_session_count_for_test(), 0);
@@ -7786,6 +7782,151 @@ mod tests {
                 0,
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_rejects_quorum_failure_before_handoff() {
+        let result = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(
+                b"",
+                Some(std::io::Error::other(StorageError::InsufficientReadQuorum(
+                    "test-bucket".to_string(),
+                    "unavailable-object".to_string(),
+                ))),
+            ),
+            5,
+            "req-preheader-quorum",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "unavailable-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await;
+
+        let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
+        assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+        assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(error.message(), Some("Resource requested is unreadable, please reduce your request rate"));
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_preserves_primed_byte_for_full_and_range() {
+        for (request_id, content_range) in [("req-preheader-full", None), ("req-preheader-range", Some("bytes 10-14/100"))] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let mut body = DefaultObjectUsecase::build_reader_blob(
+                DataProbeReader {
+                    reads: Arc::clone(&reads),
+                    data: std::io::Cursor::new(b"hello".to_vec()),
+                },
+                5,
+                request_id,
+                content_range,
+                64,
+                GetObjectStreamStrategy::Standard,
+                "test-bucket",
+                "test-object",
+                GetObjectBodyLifecycle::disabled(),
+                None,
+            )
+            .await
+            .expect("the first byte should be available before response handoff");
+
+            assert_eq!(reads.load(AtomicOrdering::Relaxed), 1, "response construction must prime one byte");
+            let mut received = Vec::new();
+            while let Some(chunk) = body.next().await {
+                received.extend_from_slice(&chunk.expect("the primed body should remain readable"));
+            }
+            assert_eq!(received, b"hello", "the primed byte must be delivered exactly once");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_does_not_poll_empty_object() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            ReadProbeReader {
+                reads: Arc::clone(&reads),
+            },
+            0,
+            "req-empty-object",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "empty-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await
+        .expect("an empty response should not require a storage read");
+
+        assert_eq!(reads.load(AtomicOrdering::Relaxed), 0);
+        assert!(body.next().await.is_none());
+        assert_eq!(reads.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_leaves_later_failure_in_body_stream() {
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(b"h", Some(std::io::Error::other("failure after handoff"))),
+            5,
+            "req-postheader-failure",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "later-failure-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await
+        .expect("the available first byte should allow response handoff");
+
+        let first = body
+            .next()
+            .await
+            .expect("the primed byte must be present")
+            .expect("the primed byte must be successful");
+        assert_eq!(first, Bytes::from_static(b"h"));
+        let error = body
+            .next()
+            .await
+            .expect("the later read must produce a body result")
+            .expect_err("a failure after the first byte must stay in the body stream");
+        assert!(error.to_string().contains("failure after handoff"));
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_resume_offset_includes_primed_byte() {
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
+            assert_eq!(emitted, 1, "resume must start after the byte consumed before response handoff");
+            Ok(FailAtEndReader::new(b"ello", None))
+        });
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(b"h", Some(relocation_read_error())),
+            5,
+            "req-preheader-resume-offset",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "relocated-object",
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        )
+        .await
+        .expect("the first byte should permit response handoff before relocation");
+
+        let mut received = Vec::new();
+        while let Some(chunk) = body.next().await {
+            received.extend_from_slice(&chunk.expect("resume should complete the body"));
+        }
+        assert_eq!(received, b"hello");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -9108,7 +9249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
+    async fn build_get_object_body_primes_large_stream_before_handoff() {
         let reads = Arc::new(AtomicUsize::new(0));
         let reader = ReadProbeReader {
             reads: Arc::clone(&reads),
@@ -9141,13 +9282,13 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "large-object response construction should not pre-read object data"
+            1,
+            "large-object response construction should prime exactly one byte"
         );
     }
 
     #[tokio::test]
-    async fn build_get_object_body_keeps_large_encrypted_objects_on_streaming_path_without_preread() {
+    async fn build_get_object_body_primes_large_encrypted_stream_before_handoff() {
         let reads = Arc::new(AtomicUsize::new(0));
         let reader = ReadProbeReader {
             reads: Arc::clone(&reads),
@@ -9180,8 +9321,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "large encrypted object response construction should not pre-read object data"
+            1,
+            "large encrypted object response construction should prime exactly one byte"
         );
     }
 
@@ -9351,8 +9492,8 @@ mod tests {
         assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::SkippedSizeMismatch);
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "size-mismatched rejected fill should construct the fallback stream without pre-reading"
+            1,
+            "size-mismatched rejected fill should prime the fallback stream before handoff"
         );
         assert!(
             matches!(lookup_after_mismatch, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
@@ -10060,8 +10201,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "too-large materialize-fill candidate must not pre-read the fallback reader"
+            1,
+            "too-large materialize-fill candidate must prime the streaming fallback"
         );
     }
 
@@ -10099,8 +10240,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "default GetObject response construction should not pre-read small plain object data"
+            1,
+            "default GetObject response construction should prime exactly one byte"
         );
     }
 
@@ -10495,78 +10636,101 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        let mut metadata = HashMap::new();
-        metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
-        metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+        for (content_language, user_language) in [
+            (Some("zh-CN"), None),
+            (None, None),
+            (Some(""), None),
+            (Some("zh-CN"), Some("fr-FR")),
+            (None, Some("fr-FR")),
+        ] {
+            let mut metadata = HashMap::new();
+            metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
+            metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+            if let Some(language) = content_language {
+                metadata.insert("content-language".to_string(), language.to_string());
+            }
+            if let Some(language) = user_language {
+                metadata.insert("x-amz-meta-content-language".to_string(), language.to_string());
+            }
 
-        let info = ObjectInfo {
-            bucket: "test-bucket".to_string(),
-            name: "path/raw".to_string(),
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
+            let info = ObjectInfo {
+                bucket: "test-bucket".to_string(),
+                name: "path/raw".to_string(),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
 
-        let input = GetObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("path/raw".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultObjectUsecase::without_context();
-        let queue_status = concurrency::IoQueueStatus::default();
+            let input = GetObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("path/raw".to_string())
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::GET);
+            let usecase = DefaultObjectUsecase::without_context();
+            let queue_status = concurrency::IoQueueStatus::default();
 
-        let context = usecase
-            .build_get_object_output_context(
-                &req,
-                get_concurrency_manager(),
-                "test-bucket",
-                "path/raw",
-                info.clone(),
-                Some(info),
-                wrap_reader(tokio::io::empty()),
-                Some(Bytes::new()),
-                false,
-                false,
-                true,
-                None,
-                None,
-                None,
-                0,
-                None,
-                "req-output-content-disposition",
-                None,
-                None,
-                None,
-                None,
-                false,
-                Duration::ZERO,
-                0.0,
-                &queue_status,
-                1,
-                None,
-                false,
-                GetObjectBodyLifecycle::disabled(),
-                |_| panic!("a buffered output must not initialize streaming resume state"),
-            )
-            .await
-            .expect("get object output context");
+            let context = usecase
+                .build_get_object_output_context(
+                    &req,
+                    get_concurrency_manager(),
+                    "test-bucket",
+                    "path/raw",
+                    info.clone(),
+                    Some(info),
+                    wrap_reader(tokio::io::empty()),
+                    Some(Bytes::new()),
+                    false,
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    "req-output-content-disposition",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Duration::ZERO,
+                    0.0,
+                    &queue_status,
+                    1,
+                    None,
+                    GetObjectBodyLifecycle::disabled(),
+                    |_| panic!("a buffered output must not initialize streaming resume state"),
+                )
+                .await
+                .expect("get object output context");
 
-        assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
-        assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("cache-control"))
-        );
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("content-disposition"))
-        );
+            assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
+            assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+            assert_eq!(context.output.content_language.as_deref(), content_language);
+            assert_eq!(
+                context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("content-language"))
+                    .map(String::as_str),
+                user_language,
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("cache-control"))
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("content-disposition"))
+            );
+        }
     }
 
     #[tokio::test]

@@ -134,6 +134,10 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
         self.pace_mainline().await?;
+        if self.source == HealRequestSource::Admin && matches!(self.heal_type, HealType::Bucket { .. }) {
+            self.await_with_control(self.storage.validate_bucket_incarnation(bucket, self.bucket_incarnation_id))
+                .await?;
+        }
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_BUCKET_STAGE,
@@ -216,7 +220,13 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        let heal_result = self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await;
+        let heal_result = match self.bucket_incarnation_id {
+            Some(expected) => {
+                self.await_with_control(self.storage.heal_bucket_at_incarnation(bucket, expected, &heal_opts))
+                    .await
+            }
+            None => self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await,
+        };
 
         match heal_result {
             Ok(result) => {
@@ -247,6 +257,7 @@ impl HealTask {
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(error @ Error::StaleBucketIncarnation { .. }) => Err(error),
             Err(e) => {
                 error!(
                     target: "rustfs::heal::task",
@@ -307,7 +318,7 @@ impl HealTask {
                         if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
                             retry_attempt = retry_attempt.saturating_add(1);
                             self.await_with_control(async {
-                                tokio::time::sleep(self.bucket_object_retry_delay(retry_attempt)).await;
+                                tokio::time::sleep(Self::bucket_object_retry_delay(&self.id, retry_attempt)).await;
                                 Ok(())
                             })
                             .await?;
@@ -481,8 +492,26 @@ impl HealTask {
                 .collect(),
         };
 
+        // Cluster and prefix requests have no bucket identity at admission.
+        // Pin it before enumeration and retain it across sets and object retries:
+        // a deleted candidate must never be repaired or certified in a successor bucket.
+        let traversal_incarnation_id = match self.bucket_incarnation_id {
+            Some(expected) => Some(expected),
+            None if self.source == HealRequestSource::Admin && !heal_opts.dry_run => {
+                Some(self.await_with_control(self.storage.admit_bucket_incarnation(bucket)).await?)
+            }
+            None => None,
+        };
+
         for (set_disk_id, heal_opts) in listing_scopes {
-            let bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, heal_opts.dry_run).await?;
+            let bucket_incarnation_id = match traversal_incarnation_id {
+                Some(expected) => {
+                    self.await_with_control(self.storage.validate_bucket_incarnation(bucket, Some(expected)))
+                        .await?;
+                    Some(expected)
+                }
+                None => self.outcome_bucket_incarnation_id(bucket, heal_opts.dry_run).await?,
+            };
             let mut continuation_token: Option<String> = None;
             let mut deferred = DeferredWindow::default();
             let mut inline_retry: Option<DeferredObject> = None;
@@ -549,8 +578,8 @@ impl HealTask {
                                     self.outcome.write().await.attempt_failed();
                                     if error.is_recoverable_heal() && listing_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
                                         listing_attempt += 1;
-                                        listing_due =
-                                            tokio::time::Instant::now() + self.bucket_object_retry_delay(listing_attempt);
+                                        listing_due = tokio::time::Instant::now()
+                                            + Self::bucket_object_retry_delay(&self.id, listing_attempt);
                                         continue;
                                     }
                                     self.outcome.write().await.mark_untraversable();
@@ -602,12 +631,26 @@ impl HealTask {
                         Some(Error::other("heal object retry age exhausted"))
                     } else {
                         match self
-                            .await_with_control(self.storage.heal_object_with_receipt(
-                                bucket,
-                                object,
-                                item.version_id.as_deref(),
-                                &heal_opts,
-                            ))
+                            .await_with_control(async {
+                                match traversal_incarnation_id {
+                                    Some(expected) => {
+                                        self.storage
+                                            .heal_object_at_incarnation(
+                                                bucket,
+                                                object,
+                                                item.version_id.as_deref(),
+                                                expected,
+                                                &heal_opts,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        self.storage
+                                            .heal_object_with_receipt(bucket, object, item.version_id.as_deref(), &heal_opts)
+                                            .await
+                                    }
+                                }
+                            })
                             .await
                         {
                             Ok(storage_result) if storage_result.error.is_none() => {
@@ -654,6 +697,7 @@ impl HealTask {
 
                     if let Some(err) = error {
                         match err {
+                            Error::StaleBucketIncarnation { .. } => return Err(err),
                             Error::TaskCancelled | Error::TaskTimeout => {
                                 let disposition = if matches!(err, Error::TaskCancelled) {
                                     HealObjectDisposition::Cancelled
@@ -676,10 +720,16 @@ impl HealTask {
                             _ => {}
                         }
                         detail = Some(err.to_string());
-                        if Self::is_dangling_delete_grace_error(&err) {
+                        if matches!(&err, Error::Storage(source) if source.is_retired_marker_deferred()) {
+                            disposition = HealObjectDisposition::Deferred {
+                                reason: HealDeferredReason::RetiredMarkerProof,
+                                retry_not_before: None,
+                            };
+                            telemetry_unknown |= !increment_counter(&mut skipped);
+                        } else if Self::is_dangling_delete_grace_error(&err) {
                             disposition = HealObjectDisposition::Deferred {
                                 reason: HealDeferredReason::DanglingDeleteGrace,
-                                retry_not_before: None,
+                                retry_not_before: err.dangling_delete_retry_not_before(),
                             };
                             telemetry_unknown |= !increment_counter(&mut skipped);
                             warn!(
@@ -727,7 +777,7 @@ impl HealTask {
                                 result = "object_retry_scheduled",
                                 "Heal bucket object retry scheduled"
                             );
-                            item.defer(self.bucket_object_retry_delay(retry_attempt + 1));
+                            item.defer(Self::bucket_object_retry_delay(&self.id, retry_attempt + 1));
                             if let Err(item) = deferred.push(item) {
                                 inline_retry = Some(item);
                             }

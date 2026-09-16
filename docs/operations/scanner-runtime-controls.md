@@ -178,12 +178,27 @@ The reset does not delete metadata files by hand and does not publish an authori
 |---|---|
 | data movement | wait for decommission or rebalance to leave the scanner metadata path, then retry |
 | invalid scanner cycle state | run `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}` first |
+| scanner leader lock is busy | retry with an async recovery intent or wait for the current leader to restart/release the lock |
+
+When a running scanner leader already holds `leader.lock`, submit a durable async recovery intent instead of repeatedly calling the synchronous reset:
+
+```json
+{
+  "mode": "full-rebuild",
+  "async": true,
+  "idempotency_key": "<stable-operator-request-id>"
+}
+```
+
+The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
+
+A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must run as a full scan until an authoritative usage snapshot replaces the marker.
 
 ## Cleanup With The Scanner Disabled
 
 With `RUSTFS_SCANNER_ENABLED=false`, startup makes one controlled attempt to finish a previously persisted cycle reset whose validated recovery marker is already `cleanup-pending`. This is metadata cleanup only: it does not start the ordinary scanner loop, scan namespaces, accept a new reset request, or automatically perform a usage-state `full-rebuild`. Missing, merely `blocked`, unknown-version, unknown-phase, or corrupt markers do not authorize an automatic reset.
 
-The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. The v3 reset routes remain synchronous and return their existing successful HTTP 200 responses; no asynchronous HTTP 202 acceptance is introduced.
+The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. Cycle-state reset remains a synchronous HTTP 200 operation; usage-state reset also supports the async recovery-intent form described above.
 
 The startup probe is cancellation-aware and uses the existing cache persistence I/O timeout. Shutdown waits only for the existing server shutdown timeout. If the cleanup task cannot join in that window, the `scanner_cleanup_not_joined` warning means completion is unconfirmed, not drained. The task is not force-aborted or force-unlocked while its runtime remains alive; it retains its existing namespace/admission guards, and durable marker/fence state remains authoritative. Inspect status before retrying. This does not establish a hard deadline for an unresponsive storage operation or prove that I/O has drained when the process or runtime subsequently exits. Task-ownership timeout tests are not storage fsync, commit-tail, or process-crash durability evidence.
 
@@ -292,7 +307,7 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running admin waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
-| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` dedups an admin heal start that overlaps a running or queued heal; `minio_error` returns a typed already-running / overlapping-paths rejection like madmin. |
+| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` reuses the token of an equivalent active, queued, or retrying admin heal; incompatible same-target starts and intersecting admin scopes return `already_running` / `overlapping_paths`. Durable-only owners reject until recovered or replaced with `forceStart`. `minio_error` also rejects equivalent starts and preserves overlap rejection against background tasks. |
 | `RUSTFS_HEAL_MRF_ENABLE` | `true` (`DEFAULT_HEAL_MRF_ENABLE`) | MRF intent pipeline: error paths deliver repair intents to the heal runtime and unconsumed intents replay from the durable journal after restart. |
 | `RUSTFS_HEAL_MRF_QUEUE_SIZE` | `100000` (`DEFAULT_HEAL_MRF_QUEUE_SIZE`) | MRF in-memory queue capacity. |
 | `RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES` | `8388608` (`DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES`, 8 MiB) | MRF journal size at which compaction runs. |
@@ -341,7 +356,11 @@ Rediscovery and admission observations update the recorded result but do not pos
 |---|---|---|
 | Scanner corrupt metadata | Metadata kind with no invented version/set; an existing pending-cache hint remains available for bounded retries. | Cache publication is separate from MRF ingress. Its age/count limits mean it is not an irrevocable repair-obligation ledger. |
 | Read decode failure | Decode kind, available version and erasure-set scope; a later failing read can rediscover the repair. | Nonblocking ingress and in-memory read-repair admission do not acknowledge durable acceptance. |
-| Partial write | Partial-write kind, available version and erasure-set scope; an in-memory heal request is the fast path. | The caller's documented restart-survival requirement is not fulfilled by ignoring the ingress result or by removing the unaccepted journal record at manager admission. Verified durable ownership remains pending. |
+| Partial write | Partial-write kind, version and erasure-set scope; each committed write receives a fresh responsibility lease. PUT rename convergence, partial delete-marker creation, and explicit partial-write producers use the durable MRF channel. | A successful durable-admission receipt follows committed checkpoint publication. The record remains after manager admission and retries until an exact verified storage receipt discharges it. Restart re-arms retained records even when the target is still offline. |
+
+With MRF enabled, a partial commit waits up to ten seconds for its checkpoint receipt. Fully converged writes do not enter this path or add MRF journal writes. The consumer batches available submissions and uses the existing count/byte budgets; an offline member or exhausted hint retry count does not evict an admitted partial-write obligation. New responsibility for the same unversioned object invalidates the previous lease, and a task that already started cannot accept that new responsibility as a merged proof target.
+
+Disabled/unavailable delivery, full queues, invalid identities, persistence failures and receipt timeouts are not durable admission. An already committed object is not rolled back: the producer falls back to the existing in-memory Heal channel. When MRF is enabled, a failed admission attempt also records `mrf_durable_admission_failed`. An admission timeout does not cancel a record already retained by the consumer. These failure cases therefore do not promise that every successful S3 response has a durable repair obligation. Early-ACK PUTs can also return before their rename tail settles; the tail submits responsibility when its final outcome requires repair. The MRF switch is independent of automatic disk scanning, so returning members can be repaired with scanner and auto-heal disabled.
 
 Legacy notices carry only bucket/object/version, not a verified storage disposition, incarnation, scope, or durable responsibility generation. They are drained without clearing hints. Terminal callbacks release only their exact node-local ingress lease so rediscovery remains possible; lease generations are not durable successor receipts. Pending migration staging is not activated, and this change does not enable durable tombstones or garbage collection. Positive cleanup requires a storage-owner receipt with the complete responsibility identity and validated commit/fence evidence; neither task status nor the bounded diagnostic outcome window supplies it.
 

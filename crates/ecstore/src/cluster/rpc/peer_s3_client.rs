@@ -741,7 +741,10 @@ impl LocalPeerS3Client {
         movement_guard_held: bool,
     ) -> Result<HealResultItem> {
         let disks = self.local_disks_for_pools().await.into_iter().map(Some).collect();
-        let store = runtime_sources::object_store_handle().filter(|store| Arc::ptr_eq(&store.ctx, &self.instance_ctx));
+        let store = crate::store::bucket_heal_scope(bucket)
+            .map(|scope| scope.store.clone())
+            .or_else(runtime_sources::object_store_handle)
+            .filter(|store| Arc::ptr_eq(&store.ctx, &self.instance_ctx));
         #[cfg(not(test))]
         if store.is_none() {
             return Err(Error::other("bucket heal refused: pool metadata is unavailable for this instance"));
@@ -1266,11 +1269,19 @@ impl PeerS3Client for RemotePeerS3Client {
                 let options = encode_heal_bucket_rpc_options(*opts, fenced_pools)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(HealBucketRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(bucket)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     bucket: bucket.to_string(),
                     options,
                 });
                 set_tonic_mutation_body_digest(&mut request)?;
-                let response = client.heal_bucket(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    client.heal_bucket(request).await?
+                } else {
+                    client.heal_bucket_at_incarnation(request).await?
+                }
+                .into_inner();
                 if !response.success {
                     return if let Some(err) = response.error {
                         Err(err.into())
@@ -1520,6 +1531,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
     pool_meta: Option<&RwLock<PoolMeta>>,
     dispatch_fenced_pools: &[usize],
 ) -> Result<HealResultItem> {
+    if let Some(scope) = crate::store::bucket_heal_scope(bucket) {
+        scope.check()?;
+    }
     let (fenced_disks, mut fenced_pool_idxs) = snapshot_heal_bucket_fence(&disks, pool_meta, dispatch_fenced_pools).await?;
     let fenced_disks = Arc::new(fenced_disks);
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
@@ -1633,6 +1647,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
                     if let Some(err) = injected_heal_bucket_operation_error(&bucket, index, HealBucketOperation::Delete) {
                         return Err(err);
                     }
+                    if let Some(scope) = crate::store::bucket_heal_scope(&bucket) {
+                        scope.check()?;
+                    }
                     mutation_disk.delete_volume(&bucket, false).await
                 })
                 .await;
@@ -1686,6 +1703,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
                     let result = run_heal_bucket_volume_mutation(&disk, pool_meta, || async move {
                         if let Some(err) = injected_heal_bucket_operation_error(&bucket, idx, HealBucketOperation::Make) {
                             return Err(err);
+                        }
+                        if let Some(scope) = crate::store::bucket_heal_scope(&bucket) {
+                            scope.check()?;
                         }
                         match mutation_disk.make_volume(&bucket).await {
                             Ok(()) | Err(Error::VolumeExists) => Ok(()),

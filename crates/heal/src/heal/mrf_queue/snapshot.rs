@@ -701,6 +701,7 @@ mod tests {
             object: Arc::from(object),
             version_id: None,
             kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 1234,
@@ -719,6 +720,7 @@ mod tests {
                 object: Arc::from(format!("o-{index:06}")),
                 version_id: None,
                 kind: MrfKind::PartialWrite,
+                delete_marker_purge: None,
                 scope: None,
                 lease: None,
                 enqueued_at_ms: 1234,
@@ -1699,6 +1701,7 @@ mod tests {
                 object: Arc::from("a"),
                 version_id: None,
                 kind: MrfKind::PartialWrite,
+                delete_marker_purge: None,
                 scope: Some(MrfScope {
                     pool_index: 0,
                     set_index,

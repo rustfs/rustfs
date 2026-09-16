@@ -17,6 +17,7 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
+pub(crate) use crate::app::object::s3_response_version_id;
 use crate::app::{
     bucket_usecase::DefaultBucketUsecase, multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase,
 };

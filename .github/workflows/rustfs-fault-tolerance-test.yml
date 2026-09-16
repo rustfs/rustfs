@@ -73,7 +73,7 @@ env:
 jobs:
   fault-tolerance-test:
     runs-on: smoke-testing
-    timeout-minutes: 480
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
@@ -105,6 +105,7 @@ jobs:
         run: python3 scripts/functional_chain_evidence.py consume
 
       - name: Checkout auto-testing scripts
+        timeout-minutes: 5
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: rustfs/auto-testing
@@ -121,6 +122,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
           ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}"
@@ -133,9 +135,11 @@ jobs:
         run: python3 scripts/prepare_functional_package.py prepare
 
       - name: Run fault-tolerance scenarios (A, B, C, C2)
+        timeout-minutes: 45
         id: test
         # Standalone case failures are reported by the backlog manager.
         # Chain evidence separately requires complete passing cases.
+        continue-on-error: true
         run: |
           ARGS=(--all -y --package-url "${{ steps.chain_package.outputs.package_url || inputs.package_url || env.RUSTFS_NIGHTLY_PACKAGE_URL }}" --log-file "${LOG_FILE}")
           if [ "${{ inputs.strict }}" = "true" ]; then
@@ -144,6 +148,7 @@ jobs:
           ./auto-testing/rustfs-fault-tolerance-test.sh "${ARGS[@]}"
 
       - name: Generate report
+        timeout-minutes: 2
         id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
@@ -184,6 +189,7 @@ jobs:
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
         # Signal-based lifecycle: dedups against open issues by label
         # (fault-tolerance + FT case), labels new issues (functional-test,
         # category, case IDs, env), and closes fixed issues after a fully
@@ -229,6 +235,7 @@ jobs:
             --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload test logs & evidence
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -240,6 +247,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
           ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}" || true

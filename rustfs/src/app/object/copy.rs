@@ -826,7 +826,7 @@ impl DefaultObjectUsecase {
             S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
         })??;
 
-        let raw_dest_version = oi.version_id.map(|v| v.to_string());
+        let raw_dest_version = s3_response_version_id(oi.version_id);
         let dest_version = if dest_versioned { raw_dest_version } else { None };
 
         // Echo the source version that was copied via x-amz-copy-source-version-id (issue #4976).
@@ -1325,6 +1325,78 @@ mod tests {
             )
             .await
             .expect("expected-current copy test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_renders_null_directory_destination_version() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("directory copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-null-dir-version-{}", Uuid::new_v4());
+        let source = "source.bin";
+        let destination = "directory/";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned directory copy test bucket should be created");
+
+        let mut source_reader = PutObjReader::from_vec(b"copy source".to_vec());
+        store
+            .put_object(
+                &bucket,
+                source,
+                &mut source_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("copy source should be written");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: source.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(destination.to_string())
+            .build()
+            .expect("directory copy input should build");
+        let response = DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect("copying to a directory marker should succeed");
+
+        assert_eq!(
+            response.output.version_id.as_deref(),
+            Some(NULL_VERSION_ID),
+            "CopyObject must expose the null destination version without leaking the internal nil UUID"
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("directory copy test bucket should be removed");
     }
 
     #[tokio::test]
