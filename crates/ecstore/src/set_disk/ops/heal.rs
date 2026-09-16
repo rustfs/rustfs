@@ -3342,7 +3342,7 @@ mod heal_result_report_tests {
         let selected_nil = absent.is_none_or(|selected| selected.is_nil());
         assert!(selected_nil, "absent metadata version selects the null identity");
 
-        let selected = Some(Uuid::new_v4()).expect("UUID version");
+        let selected = Uuid::new_v4();
         assert!(!selected.is_nil(), "a concrete UUID must not satisfy a requested null selector");
     }
 
