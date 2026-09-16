@@ -14,13 +14,14 @@
 
 #![cfg(feature = "test-util")]
 
-use rustfs_ecstore::api::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
-use rustfs_ecstore::api::error::Error;
-use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
-use rustfs_ecstore::api::set_disk::test_util::{PutObjectCommitBarrier, PutObjectCommitPause};
-use rustfs_storage_api::{BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO};
+mod storage_api;
+
 use std::sync::Arc;
 use std::time::Duration;
+use storage_api::metadata_lock::{
+    BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOptions,
+    PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys, isolated_store_over_temp_disks,
+};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use uuid::Uuid;
