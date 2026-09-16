@@ -629,6 +629,7 @@ impl From<StorageError> for ApiError {
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
+            | StorageError::DiskFull
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureReadQuorum
             | StorageError::InsufficientReadQuorum(_, _)
