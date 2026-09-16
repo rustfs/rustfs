@@ -168,6 +168,133 @@ pub(super) fn replacement_targets_match_identities(targets: &[String], identitie
         && identities.iter().map(|identity| &identity.endpoint).eq(targets.iter())
 }
 
+/// A durable intent can be visible through more than one survivor after a
+/// restart.  The endpoint that exposes the record is a replica location, not
+/// a generation identity, so discovery must merge those observations before it
+/// decides whether a set is conflicted.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplacementRecoveryCandidate {
+    pub(crate) state: ResumeState,
+    pub(crate) anchor: String,
+    pub(crate) anchor_is_local: bool,
+}
+
+/// An exhausted replacement data pass is eligible for a readiness probe.
+/// Handoff-pending generations stay on their durable handoff protocol; an
+/// ordinary rebuild may re-arm only for a currently unavailable target or the
+/// one-shot legacy transient-skip compatibility marker.
+pub(crate) fn replacement_retry_is_exhausted_active(state: &ResumeState) -> bool {
+    !state.completed
+        && state.retry_count >= state.max_retries
+        && replacement_targets_match_identities(&state.replacement_targets, &state.replacement_target_identities)
+        && matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent | ReplacementPhase::OwnershipPending | ReplacementPhase::Rebuilding
+        )
+}
+
+/// Releases before readiness-aware retry persistence encoded a target restart
+/// as an ordinary transient-skip retry.  Such a state is recoverable once
+/// after the same generation is rediscovered, but must not reopen an already
+/// bounded generation on every scanner tick.
+pub(crate) fn replacement_retry_is_legacy_transient_skip(state: &ResumeState) -> bool {
+    !state.replacement_legacy_retry_compatibility_done
+        && state.error_message.as_deref().is_some_and(|message| {
+            message.starts_with("Transient heal skip:")
+                && message.contains("Replacement erasure set heal incomplete")
+                && message.contains("retry scheduled")
+                && !message.contains("target readiness deferred retry")
+        })
+}
+
+impl ReplacementRecoveryCandidate {
+    pub(crate) fn new(state: ResumeState, anchor: impl Into<String>, anchor_is_local: bool) -> Result<Self> {
+        let candidate = Self {
+            state,
+            anchor: anchor.into(),
+            anchor_is_local,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !is_replacement_intent(&self.state)
+            || self.state.replacement_generation.as_deref() != Some(self.state.task_id.as_str())
+            || crate::heal::utils::parse_set_disk_id(&self.state.set_disk_id).is_err()
+            || !replacement_targets_match_identities(&self.state.replacement_targets, &self.state.replacement_target_identities)
+        {
+            return Err(Error::ReplacementGenerationConflict {
+                task_id: self.state.task_id.clone(),
+                reason: "durable intent does not bind one generation to its target identities".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Merge one durable observation into the generation selected for a set.
+///
+/// `replacement_revision` is a per-generation CAS fence.  A higher revision
+/// wins; equal revisions must describe the exact same state, otherwise the
+/// on-disk copies cannot be ordered safely and the caller must surface a typed
+/// conflict.  Local anchors are preferred only when the durable revisions and
+/// state are identical, followed by endpoint order for deterministic replay.
+pub(crate) fn merge_replacement_recovery_candidate(
+    selected: &mut Option<ReplacementRecoveryCandidate>,
+    candidate: ReplacementRecoveryCandidate,
+) -> Result<()> {
+    candidate.validate()?;
+    let Some(current) = selected.as_ref() else {
+        *selected = Some(candidate);
+        return Ok(());
+    };
+
+    if !same_replacement_generation_binding(&current.state, &candidate.state) {
+        return Err(Error::ReplacementGenerationConflict {
+            task_id: candidate.state.task_id,
+            reason: "durable copies disagree on set, target slot, target incarnation, or lineage".to_string(),
+        });
+    }
+
+    let candidate_revision = candidate.state.replacement_revision;
+    let current_revision = current.state.replacement_revision;
+    if candidate_revision == current_revision && candidate.state != current.state {
+        return Err(Error::ReplacementGenerationConflict {
+            task_id: candidate.state.task_id,
+            reason: format!("durable copies diverge at replacement revision {candidate_revision}"),
+        });
+    }
+
+    let candidate_wins = candidate_revision > current_revision
+        || (candidate_revision == current_revision
+            && (candidate.anchor_is_local, std::cmp::Reverse(candidate.anchor.as_str()))
+                > (current.anchor_is_local, std::cmp::Reverse(current.anchor.as_str())));
+    if candidate_wins {
+        *selected = Some(candidate);
+    }
+    Ok(())
+}
+
+/// Fields that identify a generation independently of its mutable progress.
+/// Handoff phase and counters intentionally remain mutable and are ordered by
+/// the revision fence above.
+fn same_replacement_generation_binding(left: &ResumeState, right: &ResumeState) -> bool {
+    left.task_id == right.task_id
+        && left.task_type == right.task_type
+        && left.schema_version == right.schema_version
+        && left.set_disk_id == right.set_disk_id
+        && left.replacement_targets == right.replacement_targets
+        && left.replacement_target_identities == right.replacement_target_identities
+        && left.replacement_buckets == right.replacement_buckets
+        && left.replacement_generation == right.replacement_generation
+        && left.replacement_execution_protocol == right.replacement_execution_protocol
+        && left.replacement_predecessor == right.replacement_predecessor
+        && left.replacement_lineage == right.replacement_lineage
+        && left.replacement_legacy_import == right.replacement_legacy_import
+        && left.max_retries == right.max_retries
+}
+
 /// Stable evidence for the mounted replacement instance that owns a repair
 /// generation. Endpoint text alone is not sufficient because a later disk can
 /// be mounted at the same configured path.
@@ -367,6 +494,8 @@ impl ResumeManager {
         }
         state.replacement_phase = ReplacementPhase::Rebuilding;
         state.error_message = None;
+        state.replacement_legacy_retry_compatibility_done = true;
+        state.replacement_retry_waiting_for_target = false;
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         drop(state);
         self.save_state_strict().await
@@ -377,9 +506,27 @@ impl ResumeManager {
         if state.replacement_generation.as_deref() != Some(state.task_id.as_str()) {
             return Err(replacement_recovery_conflict("replacement failure has no matching generation"));
         }
+        let readiness_deferred = matches!(error, Error::ReplacementTargetNotReady(_))
+            || (state.replacement_retry_waiting_for_target
+                && matches!(error, Error::TransientSkip { message } if message.contains("target readiness deferred retry")));
+        if readiness_deferred {
+            if state.retry_count >= state.max_retries && state.max_retries > 0 {
+                state.retry_count = state.max_retries.saturating_sub(1);
+            }
+            state.replacement_retry_waiting_for_target = true;
+            state.error_message = Some(super::REPLACEMENT_TARGET_READINESS_DEFERRED.to_string());
+            state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            drop(state);
+            return self.save_state_strict().await;
+        }
         state.error_message = Some(error.to_string());
         state.retry_count = state.retry_count.max(retry_attempts);
-        if matches!(error, Error::ReplacementRetryBudgetExhausted | Error::ReplacementOwnershipConflict(_)) {
+        if matches!(
+            error,
+            Error::ReplacementRetryBudgetExhausted
+                | Error::ReplacementOwnershipConflict(_)
+                | Error::ReplacementGenerationConflict { .. }
+        ) {
             state.retry_count = state.max_retries;
         }
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();

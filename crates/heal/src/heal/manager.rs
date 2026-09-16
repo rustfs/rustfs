@@ -15,7 +15,10 @@
 use crate::heal::{
     outcome::HealTaskOutcome,
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeGc, ResumeManager, ResumeState, ResumeUtils},
+    resume::{
+        ReplacementPhase, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState, ResumeUtils,
+        merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+    },
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
