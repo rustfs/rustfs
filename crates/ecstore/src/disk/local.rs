@@ -105,6 +105,12 @@ pub(crate) const RESERVED_DELETE_DATA_DIR_MARKER_PREFIX: &str = "reserve-delete-
 /// under-filled batch settles the common case without materializing large
 /// child sets; a full batch cannot prove no listable child hides behind it.
 const DELETE_RESIDUE_PROBE_LIMIT: i32 = 8;
+/// Most directory reads one delete-residue probe spends walking down through
+/// the ancestors of a deleted key before it gives up and lets the prefix
+/// surface. A genuine prefix settles within its depth (the first object's
+/// `xl.meta` ends the walk), so the budget only caps the cost of hiding a
+/// large residue tree, which then hides one level at a time instead.
+const DELETE_RESIDUE_PROBE_READ_BUDGET: usize = 32;
 
 /// A `part.N` file with a positive part number, the shape erasure data takes
 /// inside a version data dir.
@@ -8047,15 +8053,20 @@ impl LocalDisk {
         Ok(false)
     }
 
-    /// Whether the metadata-less directory `dir_name` holds nothing but the
-    /// data dirs of deleted versions: it is itself a non-nil UUID directory of
-    /// `part.N` files and delete-transaction markers, or every child is one.
-    /// That is what an interrupted or deferred version delete leaves behind
-    /// once the `xl.meta` is gone, and it must not surface as a prefix. Real
-    /// object children are directories carrying their own `xl.meta`, so the
-    /// first non-UUID child, stray file, or subdirectory inside a UUID child
-    /// proves the directory is a genuine prefix. Reads are bounded: a
-    /// directory that vanishes mid-probe holds nothing listable.
+    /// Whether the metadata-less directory `dir_name` holds nothing that a
+    /// listing could show: every leaf under it is the data dir of a deleted
+    /// version (a non-nil UUID directory of `part.N` files and
+    /// delete-transaction markers) or an empty directory. That is what an
+    /// interrupted or deferred version delete leaves behind once the `xl.meta`
+    /// is gone, and neither the object directory nor the date-style ancestors
+    /// above it may surface as prefixes (#6898). Real objects are directories
+    /// carrying their own `xl.meta`, so the first file met outside a UUID data
+    /// dir, or any stray entry inside one, proves a genuine prefix and ends the
+    /// walk at the depth of the first object. Reads are bounded per directory
+    /// and by a total budget: a residue tree larger than the budget surfaces
+    /// and is hidden one level down instead, so the cost on a genuine prefix
+    /// never exceeds a handful of small directory reads. A directory that
+    /// vanishes mid-probe holds nothing listable.
     async fn directory_is_delete_residue(&self, bucket: &str, dir_name: &str, stall: Option<Duration>) -> Result<bool> {
         let dir_name = dir_name.trim_end_matches(SLASH_SEPARATOR);
         let Some(entries) = self.read_dir_for_residue_probe(bucket, dir_name, stall).await? else {
@@ -8065,32 +8076,49 @@ impl LocalDisk {
             return Ok(false);
         }
 
-        let is_data_dir = dir_name
-            .rsplit(SLASH_SEPARATOR)
-            .next()
-            .is_some_and(|name| Uuid::parse_str(name).is_ok_and(|uuid| !uuid.is_nil()));
-        if is_data_dir && entries.iter().all(|entry| is_metadata_less_data_dir_entry(entry)) {
-            return Ok(true);
-        }
-
-        for entry in entries {
-            let Some(child) = entry.strip_suffix(SLASH_SEPARATOR) else {
-                return Ok(false);
-            };
-            if !Uuid::parse_str(child).is_ok_and(|uuid| !uuid.is_nil()) {
-                return Ok(false);
+        // Depth-first: a genuine prefix is settled by the first object found
+        // under its first child, so siblings are only read once that child
+        // turned out to hold nothing listable.
+        let mut reads = 1usize;
+        let mut pending: Vec<String> = Vec::new();
+        let mut dir = dir_name.to_owned();
+        let mut entries = entries;
+        loop {
+            let is_data_dir = dir
+                .rsplit(SLASH_SEPARATOR)
+                .next()
+                .is_some_and(|name| Uuid::parse_str(name).is_ok_and(|uuid| !uuid.is_nil()));
+            if !(is_data_dir && entries.iter().all(|entry| is_metadata_less_data_dir_entry(entry))) {
+                for entry in entries {
+                    let Some(child) = entry.strip_suffix(SLASH_SEPARATOR) else {
+                        // A file outside a plain data dir: `xl.meta` or something
+                        // this probe does not understand. Either way, not residue.
+                        return Ok(false);
+                    };
+                    pending.push(path_join_buf(&[&dir, child]));
+                }
             }
 
-            let child_path = path_join_buf(&[dir_name, child]);
-            let Some(child_entries) = self.read_dir_for_residue_probe(bucket, &child_path, stall).await? else {
-                continue;
-            };
-            if !child_entries.iter().all(|entry| is_metadata_less_data_dir_entry(entry)) {
-                return Ok(false);
+            loop {
+                let Some(next) = pending.pop() else {
+                    return Ok(true);
+                };
+                if reads >= DELETE_RESIDUE_PROBE_READ_BUDGET {
+                    return Ok(false);
+                }
+                reads += 1;
+                match self.read_dir_for_residue_probe(bucket, &next, stall).await? {
+                    // Vanished mid-probe or empty: nothing listable there.
+                    None => continue,
+                    Some(next_entries) if next_entries.is_empty() => continue,
+                    Some(next_entries) => {
+                        dir = next;
+                        entries = next_entries;
+                        break;
+                    }
+                }
             }
         }
-
-        Ok(true)
     }
 
     /// Read `dir` with a bounded batch first and a complete read only when the
@@ -18719,9 +18747,9 @@ mod test {
         let (fast_path_names, fast_path_probes) = scan_prefixes(&disk, bucket, true).await;
 
         assert_eq!(conservative_names, expected_names);
-        let mut expected_fast_path_names = expected_names.clone();
-        expected_fast_path_names.push("stale/".to_owned());
-        assert_eq!(fast_path_names, expected_fast_path_names);
+        // The fast path hides the empty `stale/` chain too, at the cost of a
+        // few bounded directory reads rather than the metadata probes.
+        assert_eq!(fast_path_names, expected_names);
         let expected_probes = PREFIX_COUNT * 3 + 3;
         assert_eq!(conservative_probes, expected_probes);
         assert_eq!(fast_path_probes, 0);
@@ -18832,9 +18860,9 @@ mod test {
         }
 
         // Directories whose only content is a deleted version's data dir are
-        // not prefixes; their ancestors stay ordinary directories until an
-        // empty listing reclaims them.
+        // not prefixes, and neither are their ancestors.
         assert_eq!(scan_names(&disk, bucket, "residue/2026/").await, Vec::<String>::new());
+        assert_eq!(scan_names(&disk, bucket, "residue/").await, Vec::<String>::new());
         assert_eq!(scan_names(&disk, bucket, "committed/").await, Vec::<String>::new());
 
         // UUID-named directories holding real objects, an object keyed by a
@@ -18844,14 +18872,127 @@ mod test {
         assert_eq!(scan_names(&disk, bucket, "mixed/").await, vec!["mixed/child".to_owned()]);
         assert_eq!(
             scan_names(&disk, bucket, "").await,
-            vec![
-                "committed/".to_owned(),
-                "mixed/".to_owned(),
-                "named/".to_owned(),
-                "residue/".to_owned(),
-                "uploads/".to_owned(),
-            ]
+            vec!["mixed/".to_owned(), "named/".to_owned(), "uploads/".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_fast_path_hides_delete_residue_ancestors() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        async fn write_object(object_dir: &Path, object_name: &str) {
+            fs::create_dir_all(object_dir)
+                .await
+                .expect("object directory should be created");
+            let mut metadata = FileMeta::default();
+            let mut file_info = FileInfo::new(object_name, 1, 1);
+            file_info.mod_time = Some(OffsetDateTime::now_utc());
+            metadata.add_version(file_info).expect("metadata should be valid");
+            fs::write(
+                object_dir.join(STORAGE_FORMAT_FILE),
+                metadata.marshal_msg().expect("metadata should encode"),
+            )
+            .await
+            .expect("object metadata should be written");
+        }
+
+        async fn write_residue(object_dir: &Path, committed: bool) {
+            let residue = object_dir.join(Uuid::new_v4().to_string());
+            fs::create_dir_all(&residue).await.expect("residue should be created");
+            fs::write(residue.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            if committed {
+                fs::write(residue.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4())), [])
+                    .await
+                    .expect("delete marker should be written");
+            }
+        }
+
+        // The reported shape: a date-partitioned key deleted on an older build,
+        // whose data dir survived without a delete-transaction marker. Every
+        // ancestor up to `metrics/` holds nothing else.
+        write_residue(&bucket_dir.join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet"), false).await;
+        // Several committed residues under one hour plus an empty sibling hour.
+        write_residue(&bucket_dir.join("metrics/cpu/2026/08/28/22/a.parquet"), true).await;
+        write_residue(&bucket_dir.join("metrics/cpu/2026/08/28/22/b.parquet"), true).await;
+        fs::create_dir_all(bucket_dir.join("metrics/cpu/2026/08/28/21"))
+            .await
+            .expect("empty hour directory should be created");
+
+        // A live object deep under an otherwise identical tree keeps every
+        // ancestor visible, even beside residue.
+        write_residue(&bucket_dir.join("logs/default/2026/08/28/23/old.parquet"), false).await;
+        write_object(
+            &bucket_dir.join("logs/default/2026/08/28/23/live.parquet"),
+            "logs/default/2026/08/28/23/live.parquet",
+        )
+        .await;
+
+        // A prefix with more residue directories than the probe budget stays
+        // visible rather than costing an unbounded walk.
+        for hour in 0..(DELETE_RESIDUE_PROBE_READ_BUDGET + 1) {
+            write_residue(&bucket_dir.join(format!("bulk/2026/08/28/{hour:02}/a.parquet")), false).await;
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be UTF-8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, current: &str) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+            let mut output = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: current.to_string(),
+                skip_hidden_prefix_check: true,
+                ..Default::default()
+            };
+            let mut objects_returned = 0;
+            disk.scan_dir(
+                current.to_string(),
+                "".to_string(),
+                &opts,
+                &mut output,
+                &mut objects_returned,
+                false,
+                None,
+            )
+            .await
+            .expect("scan_dir should succeed");
+            output.close().await.expect("metacache writer should close");
+            drop(output);
+            drop(writer);
+
+            let mut names = MetacacheReader::new(reader)
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        // Every level of a tree whose only leaves are deleted data dirs is
+        // hidden, not just the object directory itself.
+        assert_eq!(scan_names(&disk, bucket, "metrics/kubelet/2026/08/28/").await, Vec::<String>::new());
+        assert_eq!(scan_names(&disk, bucket, "metrics/kubelet/").await, Vec::<String>::new());
+        assert_eq!(scan_names(&disk, bucket, "metrics/cpu/2026/08/28/").await, Vec::<String>::new());
+        assert_eq!(scan_names(&disk, bucket, "metrics/").await, Vec::<String>::new());
+        assert_eq!(
+            scan_names(&disk, bucket, "logs/default/2026/08/28/").await,
+            vec!["logs/default/2026/08/28/23/".to_owned()]
+        );
+        assert_eq!(scan_names(&disk, bucket, "logs/").await, vec!["logs/default/".to_owned()]);
+        assert_eq!(scan_names(&disk, bucket, "bulk/2026/08/").await, vec!["bulk/2026/08/28/".to_owned()]);
+        assert_eq!(scan_names(&disk, bucket, "").await, vec!["bulk/".to_owned(), "logs/".to_owned()]);
     }
 
     #[tokio::test]

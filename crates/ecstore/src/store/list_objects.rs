@@ -9678,6 +9678,58 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_purges_whole_tree() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-ancestor-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let data_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(data_dir.to_string());
+            tokio::fs::create_dir_all(&residue)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(residue.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+        }
+
+        // Browsing an ancestor of the deleted key must not show the empty
+        // date folders, and the empty result reclaims the whole residue tree
+        // in one pass instead of one level per listing.
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty(), "ancestors of delete residue must not surface as prefixes");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("metrics").exists(),
+                "the empty delimiter listing should reclaim the committed delete residue tree under it"
+            );
+        }
+    }
+
     #[test]
     fn list_objects_index_provider_state_uses_lifecycle_active_generation() {
         let provider = ListObjectsIndexProviderState::walker_key_only();
