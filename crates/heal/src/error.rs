@@ -66,6 +66,12 @@ pub enum Error {
     #[error("Replacement ownership conflict: {0}")]
     ReplacementOwnershipConflict(String),
 
+    #[error("Replacement generation conflict for task {task_id}: {reason}")]
+    ReplacementGenerationConflict { task_id: String, reason: String },
+
+    #[error("Replacement target is not ready: {0}")]
+    ReplacementTargetNotReady(String),
+
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
 
@@ -117,6 +123,7 @@ impl Error {
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
             Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
+            Error::ReplacementTargetNotReady(_) => true,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
@@ -346,6 +353,11 @@ mod tests {
     #[test]
     fn task_timeout_is_terminal() {
         assert!(!Error::TaskTimeout.is_recoverable_heal());
+    }
+
+    #[test]
+    fn replacement_target_restart_is_recoverable() {
+        assert!(Error::ReplacementTargetNotReady("mount is restarting".to_string()).is_recoverable_heal());
     }
 
     #[test]

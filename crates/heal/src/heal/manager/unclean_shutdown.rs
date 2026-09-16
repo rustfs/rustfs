@@ -83,6 +83,8 @@ impl HealManager {
         let mut set_disk_ids = HashSet::new();
         let mut reserved_replacement_sets = HashSet::new();
         let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>, String)>::new();
+        let mut replacement_recovery_candidates = HashMap::<String, ReplacementRecoveryCandidate>::new();
+        let mut conflicted_replacement_tasks = HashSet::new();
         let mut conflicted_replacement_sets = HashSet::new();
 
         {
@@ -233,6 +235,31 @@ impl HealManager {
                         }
                     };
                     let state = manager.get_state().await;
+                    if disk_set_disk_id
+                        .as_deref()
+                        .is_some_and(|disk_set| disk_set != state.set_disk_id)
+                    {
+                        let disk_set = disk_set_disk_id.as_deref().unwrap_or_default();
+                        conflicted_replacement_tasks.insert(task_id.clone());
+                        conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                        conflicted_replacement_sets.insert(disk_set.to_string());
+                        self.block_replacement_recovery_set(&state.set_disk_id);
+                        if !disk_set.is_empty() {
+                            self.block_replacement_recovery_set(disk_set);
+                        }
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            endpoint = %endpoint,
+                            task_id,
+                            state_set_disk_id = %state.set_disk_id,
+                            observed_set_disk_id = disk_set,
+                            "Replacement recovery intent set binding is ambiguous"
+                        );
+                        continue;
+                    }
                     if durable_replacement_reserves_targets(&state) {
                         reserved_replacement_sets.insert(state.set_disk_id.clone());
                     }
@@ -247,7 +274,7 @@ impl HealManager {
                                 | ReplacementPhase::HandoffPending
                                 | ReplacementPhase::Rebuilding
                         )
-                        && state.retry_count < state.max_retries;
+                        && (state.retry_count < state.max_retries || replacement_retry_is_exhausted_active(&state));
                     let verified_replacement = state.completed
                         && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
                     if !active_replacement && !verified_replacement && durable_replacement_reserves_targets(&state) {
@@ -257,34 +284,150 @@ impl HealManager {
                         && state.replacement_generation.as_deref() == Some(task_id.as_str())
                         && !state.replacement_targets.is_empty()
                     {
-                        let state = match manager.resolve_replacement_recovery(self.storage.as_ref()).await {
-                            Ok(state) => state,
-                            Err(_) => {
-                                conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                                continue;
-                            }
-                        };
-                        let resume_endpoint = endpoint.to_string();
-                        match replacement_intents.entry(state.task_id.clone()) {
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert((
-                                    state.set_disk_id,
-                                    state.replacement_targets,
-                                    state.replacement_buckets,
-                                    resume_endpoint,
-                                ));
-                            }
-                            std::collections::hash_map::Entry::Occupied(entry) => {
-                                let (existing_set, existing_targets, existing_buckets, existing_anchor) = entry.get();
-                                if existing_set != &state.set_disk_id
-                                    || existing_targets != &state.replacement_targets
-                                    || existing_buckets != &state.replacement_buckets
-                                    || existing_anchor != &resume_endpoint
-                                {
+                        if conflicted_replacement_tasks.contains(&task_id) {
+                            continue;
+                        }
+                        let mut selected = replacement_recovery_candidates.remove(&task_id);
+                        let previous_set = selected.as_ref().map(|candidate| candidate.state.set_disk_id.clone());
+                        let candidate =
+                            match ReplacementRecoveryCandidate::new(state.clone(), endpoint.to_string(), endpoint.is_local) {
+                                Ok(candidate) => candidate,
+                                Err(error) => {
+                                    conflicted_replacement_tasks.insert(task_id.clone());
                                     conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                                    if let Some(previous_set) = &previous_set {
+                                        conflicted_replacement_sets.insert(previous_set.clone());
+                                    }
                                     self.block_replacement_recovery_set(&state.set_disk_id);
+                                    if let Some(previous_set) = &previous_set {
+                                        self.block_replacement_recovery_set(previous_set);
+                                    }
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        endpoint = %endpoint,
+                                        task_id,
+                                        error = %error,
+                                        "Replacement recovery generation binding is ambiguous"
+                                    );
+                                    continue;
                                 }
+                            };
+                        let task_set = candidate.state.set_disk_id.clone();
+                        if let Err(error) = merge_replacement_recovery_candidate(&mut selected, candidate) {
+                            conflicted_replacement_tasks.insert(task_id.clone());
+                            conflicted_replacement_sets.insert(task_set.clone());
+                            self.block_replacement_recovery_set(&task_set);
+                            if let Some(previous_set) = &previous_set {
+                                conflicted_replacement_sets.insert(previous_set.clone());
+                                self.block_replacement_recovery_set(previous_set);
                             }
+                            warn!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                endpoint = %endpoint,
+                                task_id,
+                                error = %error,
+                                "Replacement recovery generation merge failed"
+                            );
+                        } else if let Some(selected) = selected {
+                            replacement_recovery_candidates.insert(task_id, selected);
+                        }
+                    }
+                }
+            }
+
+            // Replay only the canonical durable copy.  Replica locations are
+            // observations of one generation and must never each advance it.
+            for (task_id, candidate) in replacement_recovery_candidates {
+                let Some(anchor_disk) = recovery_disks
+                    .iter()
+                    .find(|disk| disk.endpoint().to_string() == candidate.anchor)
+                    .cloned()
+                else {
+                    conflicted_replacement_sets.insert(candidate.state.set_disk_id.clone());
+                    self.block_replacement_recovery_set(&candidate.state.set_disk_id);
+                    continue;
+                };
+                let manager = match ResumeManager::load_replacement_intent(anchor_disk, &task_id).await {
+                    Ok(manager) => manager,
+                    Err(error) => {
+                        conflicted_replacement_sets.insert(candidate.state.set_disk_id.clone());
+                        self.block_replacement_recovery_set(&candidate.state.set_disk_id);
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            error = %error,
+                            "Canonical replacement recovery intent load failed"
+                        );
+                        continue;
+                    }
+                };
+                let mut state = manager.get_state().await;
+                if replacement_retry_is_exhausted_active(&state) {
+                    match manager.rearm_replacement_recovery_if_needed(self.storage.as_ref()).await {
+                        Ok(true) => state = manager.get_state().await,
+                        Ok(false) => {
+                            // A ready target with an exhausted all-skip pass
+                            // is terminal for this generation; preserve its
+                            // reservation and do not enqueue a fresh task.
+                            conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                            self.block_replacement_recovery_set(&state.set_disk_id);
+                            continue;
+                        }
+                        Err(error) => {
+                            conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                            self.block_replacement_recovery_set(&state.set_disk_id);
+                            warn!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                error = %error,
+                                "Replacement recovery readiness probe failed"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let state = match manager.resolve_replacement_recovery(self.storage.as_ref()).await {
+                    Ok(state) => state,
+                    Err(Error::ReplacementTargetNotReady(_)) => continue,
+                    Err(error) => {
+                        conflicted_replacement_sets.insert(state.set_disk_id.clone());
+                        self.block_replacement_recovery_set(&state.set_disk_id);
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            error = %error,
+                            "Canonical replacement recovery resolution failed"
+                        );
+                        continue;
+                    }
+                };
+                let resolved = (state.set_disk_id, state.replacement_targets, state.replacement_buckets, candidate.anchor);
+                match replacement_intents.entry(state.task_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(resolved);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        let existing = entry.get();
+                        if existing.0 != resolved.0 || existing.1 != resolved.1 || existing.2 != resolved.2 {
+                            conflicted_replacement_sets.insert(existing.0.clone());
+                            conflicted_replacement_sets.insert(resolved.0.clone());
+                            self.block_replacement_recovery_set(&resolved.0);
+                            self.block_replacement_recovery_set(&existing.0);
                         }
                     }
                 }

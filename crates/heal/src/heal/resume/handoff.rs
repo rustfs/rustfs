@@ -104,6 +104,10 @@ impl ResumeManager {
             Err(error) if matches!(&error, Error::Disk(DiskError::Io(io)) if io.kind() == std::io::ErrorKind::WouldBlock) => {
                 Err(error)
             }
+            // A target can be temporarily absent while its process or mount
+            // restarts.  This is a readiness observation, not a failed
+            // generation attempt, so do not consume the durable retry budget.
+            Err(error @ Error::ReplacementTargetNotReady(_)) => Err(error),
             Err(failure) => match self.record_replacement_failure(&failure, attempt).await {
                 Ok(()) => Err(failure),
                 Err(persistence) => Err(Error::ReplacementFailurePersistence {

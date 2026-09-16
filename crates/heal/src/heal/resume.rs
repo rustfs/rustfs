@@ -44,10 +44,15 @@ use replacement::replacement_targets_match_identities;
 pub use replacement::{
     ReplacementPhase, ReplacementRecoveryRecord, ReplacementRecoveryState, ReplacementTargetIdentity, compose_key,
 };
+pub(crate) use replacement::{
+    ReplacementRecoveryCandidate, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+    replacement_retry_is_legacy_transient_skip,
+};
 pub use utils::ResumeUtils;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";
+pub(crate) const REPLACEMENT_TARGET_READINESS_DEFERRED: &str = "Replacement target readiness deferred; retry pending";
 const EVENT_HEAL_RESUME_STATE: &str = "heal_resume_state";
 
 /// resume state file constants
@@ -128,7 +133,7 @@ pub(crate) fn replacement_recovery_error_requires_block(error: &Error) -> bool {
         Error::TaskExecutionFailed { message }
             if message.starts_with(REPLACEMENT_RECOVERY_CONFLICT_PREFIX)
                 || message.starts_with(REPLACEMENT_RECOVERY_CORRUPTION_PREFIX)
-    )
+    ) || matches!(error, Error::ReplacementGenerationConflict { .. })
 }
 
 fn replacement_recovery_corruption_for_state_load(message: impl std::fmt::Display, error: Error) -> Error {
@@ -345,6 +350,17 @@ pub struct ResumeState {
     pub replacement_legacy_import: Option<LegacyReplacementApproval>,
     #[serde(default)]
     pub replacement_legacy_successor: Option<String>,
+    /// Whether the legacy transient-skip compatibility path is no longer
+    /// applicable to this generation (or has already been consumed). New
+    /// generations set this true; older schema-seven snapshots default false
+    /// and may receive one bounded compatibility re-arm.
+    #[serde(default)]
+    pub replacement_legacy_retry_compatibility_done: bool,
+    /// The current pass was rewound because the replacement mount was not
+    /// ready.  Task-level error persistence must not turn this readiness wait
+    /// back into a consumed retry attempt.
+    #[serde(default)]
+    pub replacement_retry_waiting_for_target: bool,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -421,6 +437,8 @@ impl ResumeState {
             replacement_lineage: Vec::new(),
             replacement_legacy_import: None,
             replacement_legacy_successor: None,
+            replacement_legacy_retry_compatibility_done: false,
+            replacement_retry_waiting_for_target: false,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -461,6 +479,9 @@ impl ResumeState {
         state.replacement_generation = Some(task_id);
         state.replacement_phase = ReplacementPhase::Intent;
         state.replacement_execution_protocol = 1;
+        // New generations already use readiness-aware persistence and must
+        // never enter the one-shot compatibility path for legacy snapshots.
+        state.replacement_legacy_retry_compatibility_done = true;
         state
     }
 
@@ -1127,10 +1148,78 @@ impl ResumeManager {
         if !state.can_retry() {
             return Ok(false);
         }
+        state.replacement_retry_waiting_for_target = false;
         state.increment_retry();
         state.reset_for_retry();
         drop(state);
         self.save_state().await?;
+        Ok(true)
+    }
+
+    /// Rewind one replacement pass while its target is not ready, without
+    /// consuming the generation retry budget. The caller resets the companion
+    /// checkpoint first; this method rewinds the resume ledger and keeps the
+    /// durable generation in `Rebuilding` so the existing markers remain owned
+    /// until the target can be admitted again.
+    pub(crate) async fn defer_retry_until_target_ready(&self) -> Result<()> {
+        self.defer_retry_until_target_ready_with_rearm(false).await
+    }
+
+    async fn defer_retry_until_target_ready_with_rearm(&self, legacy_rearm: bool) -> Result<()> {
+        let mut state = self.state.write().await;
+        // Readiness deferral is not a heal attempt. Preserve an in-budget
+        // counter, but reserve one bounded pass when compatibility recovery
+        // has to re-arm an exhausted legacy generation.
+        if state.retry_count >= state.max_retries {
+            state.retry_count = state.max_retries.saturating_sub(1);
+        }
+        if legacy_rearm {
+            state.replacement_legacy_retry_compatibility_done = true;
+        }
+        state.replacement_retry_waiting_for_target = true;
+        state.reset_for_retry();
+        state.error_message = Some(REPLACEMENT_TARGET_READINESS_DEFERRED.to_string());
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    /// Re-arm an exhausted generation when its target is unavailable, or when
+    /// a pre-readiness-aware release left the durable transient-skip marker at
+    /// the retry ceiling.  The compatibility path is one-shot; an exhausted
+    /// ready generation with no such marker remains terminal.
+    pub(crate) async fn rearm_replacement_recovery_if_needed(
+        &self,
+        storage: &dyn crate::heal::storage::HealStorageAPI,
+    ) -> Result<bool> {
+        let state = self.get_state().await;
+        if !replacement_retry_is_exhausted_active(&state) {
+            return Ok(false);
+        }
+        if state.max_retries == 0 {
+            return Ok(false);
+        }
+        let legacy_rearm = replacement_retry_is_legacy_transient_skip(&state);
+        let ready = storage
+            .replacement_targets_ready_for_retry(
+                &state.set_disk_id,
+                &state.replacement_targets,
+                &state.replacement_target_identities,
+            )
+            .await?;
+        if ready && !legacy_rearm {
+            return Ok(false);
+        }
+        // Legacy exhausted passes may already have a checkpoint containing
+        // the skipped object ledger.  Rewinding only the resume summary would
+        // make the next executor suppress those objects again, so clear the
+        // companion checkpoint before publishing the re-armed state.
+        if CheckpointManager::has_checkpoint(&self.disk, &state.task_id).await {
+            CheckpointManager::load_from_disk(self.disk.clone(), &state.task_id)
+                .await?
+                .reset_for_retry()
+                .await?;
+        }
+        self.defer_retry_until_target_ready_with_rearm(legacy_rearm).await?;
         Ok(true)
     }
 
