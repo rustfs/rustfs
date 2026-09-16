@@ -9826,14 +9826,7 @@ mod tests {
             .await
             .expect("manual task receipt path should resolve");
         let target_task_set = store.pools[1].get_disks_by_key(&manual_task_receipt_path);
-        let original_target_task_disks = {
-            let mut disks = target_task_set.disks.write().await;
-            let original = disks.clone();
-            for disk in disks.iter_mut().take(2) {
-                *disk = None;
-            }
-            original
-        };
+        let offline_target_task_disks = force_set_disk_range_offline_for_test(&target_task_set, 0..2).await;
         let receipt_quorum_error = store
             .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
                 0,
@@ -9842,7 +9835,7 @@ mod tests {
             )
             .await
             .expect_err("target read quorum without receipt write quorum must retain the source");
-        *target_task_set.disks.write().await = original_target_task_disks;
+        drop(offline_target_task_disks);
         let receipt_quorum_error = receipt_quorum_error.to_string();
         assert!(receipt_quorum_error.contains("receipt"));
         assert!(receipt_quorum_error.contains(&manual_task_path));

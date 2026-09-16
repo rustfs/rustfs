@@ -245,6 +245,26 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
+    /// Checks whether an active table already owns any part of the candidate warehouse location.
+    ///
+    /// This is a preflight for clients that write data before catalog registration. Registration
+    /// remains the authoritative atomic check for concurrent creators.
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        let candidate_prefix = table_warehouse_object_prefix(candidate)?;
+        for existing in self.list_all_tables(&candidate.table_bucket).await? {
+            if existing.state != TableCatalogEntryState::Active || existing.table_id == candidate.table_id {
+                continue;
+            }
+            let existing_prefix = table_warehouse_object_prefix(&existing)?;
+            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -1239,6 +1259,13 @@ where
         match self {
             Self::ObjectBacked(store) => store.list_all_tables(table_bucket).await,
             Self::DurableStrong(store) => store.list_all_tables(table_bucket).await,
+        }
+    }
+
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.ensure_table_warehouse_location_available(candidate).await,
+            Self::DurableStrong(store) => store.ensure_table_warehouse_location_available(candidate).await,
         }
     }
 

@@ -5168,6 +5168,10 @@ where
         Ok(entries)
     }
 
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        self.ensure_table_warehouse_prefix_available(candidate).await
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,

@@ -2776,7 +2776,16 @@ mod tests {
 
         let mut active_reader = PutObjReader::from_vec(b"active owner".to_vec());
         store.pools[0]
-            .put_object(&bucket, active_object, &mut active_reader, &ObjectOptions::default())
+            .put_object(
+                &bucket,
+                active_object,
+                &mut active_reader,
+                &ObjectOptions {
+                    // Drain the rename tail before removing a physical shard.
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("active owner object should be written");
         let active_disks = store.pools[0].disk_set[0].disks.read().await.clone();
@@ -2812,6 +2821,7 @@ mod tests {
                     &mut duplicate_reader,
                     &ObjectOptions {
                         mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(mod_time)),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
                         ..Default::default()
                     },
                 )
