@@ -239,7 +239,11 @@ class EnvelopeTests(unittest.TestCase):
         for suite in evidence.SUITES:
             job = "\n".join(yaml_block(lines, suite, 2))
             self.assertIn("needs: [prepare" + (", " + previous if previous else "") + "]", job)
-            self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
+            if suite == "performance":
+                # gated on the preflight probe: runs only when its fleet is online
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}", job)
+            else:
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
             self.assertIn("chain_manifest: ${{ needs.prepare.outputs.manifest }}", job)
             previous = suite
         complete = "\n".join(yaml_block(lines, "complete-chain", 2))
@@ -248,6 +252,12 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn("functional_chain_evidence.py summarize", complete)
         self.assertIn("functional-chain-report-", complete)
         self.assertIn("needs.prepare.result != 'skipped'", complete)
+        prepare = "\n".join(yaml_block(lines, "prepare", 2))
+        self.assertIn("Check shared functional fleet runner before scheduling suites", prepare)
+        self.assertIn("check_functional_runners.py smoke-testing", prepare)
+        self.assertIn("Probe performance fleet runner", prepare)
+        self.assertIn("check_functional_runners.py pf-testing", prepare)
+        self.assertIn("performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}", prepare)
 
     def test_every_lane_retains_failed_evidence_and_deduplicates_its_own_attempt(self):
         paths = list((candidate.ROOT / ".github/workflows").glob("rustfs-*-test.yml"))
