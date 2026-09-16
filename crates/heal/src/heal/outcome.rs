@@ -105,13 +105,17 @@ pub struct HealObjectReceipt {
 
 impl HealObjectReceipt {
     pub(crate) fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
-        matches!(
-            self.disposition,
+        let disposition_verifies = match self.disposition {
             HealObjectDisposition::Repaired
-                | HealObjectDisposition::VerifiedHealthy
-                | HealObjectDisposition::MetadataHealthy
-                | HealObjectDisposition::AuthoritativelyAbsent
-        ) && self.identity.kind == expected.kind
+            | HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => true,
+            // A metadata/presence proof never certifies payload bytes, so it
+            // cannot discharge a request that exists to decode the payload.
+            HealObjectDisposition::MetadataHealthy => expected.kind != HealObjectKind::Decode,
+            _ => false,
+        };
+        disposition_verifies
+            && self.identity.kind == expected.kind
             && self.identity.bucket == expected.bucket
             && self.identity.object == expected.object
             && self.identity.version_id == expected.version_id
@@ -528,6 +532,32 @@ mod canonical_outcome_tests {
         assert_eq!(restored.retained_object_bytes, MAX_OUTCOME_BYTES);
         value["objects"][0]["identity"]["object"] = serde_json::json!("x".repeat(MAX_OUTCOME_BYTES - fixed_bytes + 1));
         assert!(serde_json::from_value::<HealTaskOutcome>(value).is_err());
+    }
+
+    #[test]
+    fn metadata_health_receipt_never_discharges_a_payload_decode_request() {
+        let incarnation = Uuid::new_v4();
+        let mut expected = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..item(HealObjectDisposition::Unknown).identity
+        };
+        let mut receipt = HealObjectReceipt {
+            identity: expected.clone(),
+            disposition: HealObjectDisposition::MetadataHealthy,
+        };
+        assert!(
+            receipt.verified_for(&expected),
+            "a presence proof still settles a metadata-level object request"
+        );
+
+        expected.kind = HealObjectKind::Decode;
+        receipt.identity.kind = HealObjectKind::Decode;
+        assert!(
+            !receipt.verified_for(&expected),
+            "a presence-only proof must not clear a payload decode responsibility"
+        );
+        receipt.disposition = HealObjectDisposition::VerifiedHealthy;
+        assert!(receipt.verified_for(&expected));
     }
 
     #[test]

@@ -3636,13 +3636,22 @@ impl SetDisks {
             // Transformed streams (unknown stored size) are admitted by their
             // plaintext size and then take the streaming encode with inline
             // buffer writers, since the single-block fast path needs a known length.
-            // Protected inline writes retain the single-block bound on proof metadata.
+            // Every inline candidate keeps the single-block bound on its admission
+            // size: the inline buffer writer grows without a cap, so an explicit
+            // INLINE_BLOCK budget above `block_size` must not admit multi-block
+            // payloads into memory and xl.meta. Protected inline writes also need
+            // a known stored length for their proof metadata, so they never fall
+            // back to the plaintext size.
+            let inline_admission_size = if put_object_size >= 0 || protect_write {
+                put_object_size
+            } else {
+                data.actual_size()
+            };
             let is_inline_buffer = storage_class_config.should_inline(
                 inline_admission_shard_size(&erasure, put_object_size, data.actual_size()),
                 erasure.data_shards,
                 opts.versioned,
-            ) && (!protect_write
-                || usize::try_from(put_object_size).is_ok_and(|size| size <= erasure.block_size));
+            ) && usize::try_from(inline_admission_size).is_ok_and(|size| size <= erasure.block_size);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -11791,6 +11800,54 @@ mod inline_put_commit_path_tests {
                 assert!(!file_info.inline_data(), "unknown or multi-block protected shards must remain external");
                 assert!(file_info.parts[0].integrity.is_some(), "protected PUT must retain its integrity proof");
             }
+            assert_eq!(read_back(&set_disks, bucket, object).await, plaintext);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unprotected_puts_keep_multi_block_inline_candidates_external() {
+        for transformed in [true, false] {
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let storage_class =
+                temp_env::with_var(INLINE_BLOCK_ENV, Some("16MiB"), || lookup_config_for_pools(&KVS::new(), &[4]))
+                    .expect("large inline budget should resolve");
+            set_disks.set_test_storage_class_config(storage_class);
+            let bucket = "unprotected-inline-candidates";
+            let object = "object.bin";
+            make_bucket(&disk_stores, bucket).await;
+            // Above the single erasure block: an explicit INLINE_BLOCK budget must
+            // not pull a multi-block payload into the unbounded inline buffer.
+            let plaintext = compressible_payload(1024 * 1024 + 17);
+            let (mut reader, opts) = if transformed {
+                transformed_put(plaintext.clone())
+            } else {
+                (PutObjReader::from_vec(plaintext.clone()), ObjectOptions::default())
+            };
+            temp_env::async_with_vars(
+                [(
+                    crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                    Some("false"),
+                )],
+                set_disks.put_object(bucket, object, &mut reader, &opts),
+            )
+            .await
+            .expect("multi-block PUT should commit with part files");
+
+            for (disk_index, disk) in disk_stores.iter().enumerate() {
+                let file_info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {disk_index} should persist metadata: {err}"));
+                assert!(
+                    !file_info.inline_data(),
+                    "disk {disk_index}: a payload above block_size must stay external (transformed={transformed})"
+                );
+            }
+            assert!(
+                count_part_files(&temp_dirs) > 0,
+                "a multi-block object must keep part files (transformed={transformed})"
+            );
             assert_eq!(read_back(&set_disks, bucket, object).await, plaintext);
         }
     }
