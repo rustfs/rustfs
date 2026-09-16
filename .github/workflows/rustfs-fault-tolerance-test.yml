@@ -235,6 +235,7 @@ jobs:
             --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
