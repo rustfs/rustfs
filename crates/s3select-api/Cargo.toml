@@ -74,6 +74,7 @@ futures = { workspace = true }
 futures-core = { workspace = true }
 flate2.workspace = true
 http.workspace = true
+memchr.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }

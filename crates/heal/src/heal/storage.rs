@@ -109,7 +109,9 @@ fn verified_object_receipt(
     item: &HealResultItem,
     bucket_incarnation_id: Uuid,
 ) -> Option<HealObjectReceipt> {
-    if opts.dry_run || (!item.integrity_verified && !item.repair_verified) {
+    if opts.dry_run
+        || (!item.integrity_verified && !item.repair_verified && !item.metadata_verified && !item.metadata_repair_verified)
+    {
         return None;
     }
     let resolved_version = Uuid::from_bytes(item.resolved_version_id?);
@@ -120,7 +122,7 @@ fn verified_object_receipt(
     }
     item.drives_reported()?;
     let drives_healed = item.drives_healed()?;
-    if item.repair_verified && drives_healed == 0 {
+    if (item.repair_verified || item.metadata_repair_verified) && drives_healed == 0 {
         return None;
     }
     let ok_drive_state = DriveState::Ok.to_string();
@@ -142,10 +144,12 @@ fn verified_object_receipt(
             pool_index: opts.pool,
             set_index: opts.set,
         },
-        disposition: if drives_healed > 0 {
+        disposition: if drives_healed > 0 && (item.integrity_verified || item.repair_verified || item.metadata_repair_verified) {
             HealObjectDisposition::Repaired
-        } else if item.integrity_verified {
+        } else if drives_healed == 0 && item.integrity_verified {
             HealObjectDisposition::VerifiedHealthy
+        } else if drives_healed == 0 && item.metadata_verified {
+            HealObjectDisposition::MetadataHealthy
         } else {
             return None;
         },
@@ -752,7 +756,10 @@ impl ECStoreHealStorage {
             } else {
                 None
             }
-        } else if error.is_none() && !opts.dry_run && (item.integrity_verified || item.repair_verified) {
+        } else if error.is_none()
+            && !opts.dry_run
+            && (item.integrity_verified || item.repair_verified || item.metadata_verified || item.metadata_repair_verified)
+        {
             let bucket_incarnation_id = match expected {
                 Some(expected) => Some(expected),
                 None => self.ecstore.bucket_incarnation_id(bucket).await.ok(),
@@ -2080,6 +2087,51 @@ mod tests {
             "legacy results cannot prove the selected version"
         );
         assert!(verified_object_receipt("bucket", "object", None, &options, &item, incarnation).is_none());
+    }
+
+    #[test]
+    fn metadata_health_and_marker_repair_have_distinct_receipts() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let incarnation = Uuid::new_v4();
+        let version = Uuid::new_v4().to_string();
+        let options = HealOpts::default();
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        let mut item = HealResultItem {
+            metadata_verified: true,
+            version_id: version.clone(),
+            resolved_version_id: Some(*Uuid::parse_str(&version).expect("version UUID").as_bytes()),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("metadata quorum should certify metadata health");
+        assert_eq!(receipt.disposition, HealObjectDisposition::MetadataHealthy);
+
+        item.integrity_verified = true;
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("stronger integrity proof should remain available");
+        assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+
+        item.integrity_verified = false;
+        item.metadata_verified = false;
+        item.metadata_repair_verified = true;
+        item.before.drives[0].state = "missing".to_string();
+        let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
+            .expect("a committed metadata repair should certify the marker/version");
+        assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+
+        item.before.drives[0].state = "ok".to_string();
+        assert!(
+            verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation).is_none(),
+            "repair proof without a repaired drive must fail closed"
+        );
     }
 
     #[test]

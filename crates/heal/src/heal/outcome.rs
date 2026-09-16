@@ -76,6 +76,9 @@ pub enum HealObjectDisposition {
     Unknown,
     Repaired,
     VerifiedHealthy,
+    /// Authoritative metadata/presence proof only. This does not certify
+    /// payload integrity.
+    MetadataHealthy,
     AuthoritativelyAbsent,
     Deferred {
         reason: HealDeferredReason,
@@ -106,6 +109,7 @@ impl HealObjectReceipt {
             self.disposition,
             HealObjectDisposition::Repaired
                 | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::MetadataHealthy
                 | HealObjectDisposition::AuthoritativelyAbsent
         ) && self.identity.kind == expected.kind
             && self.identity.bucket == expected.bucket
@@ -367,7 +371,9 @@ impl HealTaskOutcome {
         counters.overflowed |= !increment_counter(&mut counters.processed);
         let counter = match item.disposition {
             HealObjectDisposition::Repaired => &mut counters.healed,
-            HealObjectDisposition::VerifiedHealthy | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
+            HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::MetadataHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
             HealObjectDisposition::Failed(_) => &mut counters.failed,
             HealObjectDisposition::Unknown => {
                 counters.overflowed |= !increment_counter(&mut counters.unknown);
@@ -531,6 +537,7 @@ mod canonical_outcome_tests {
             HealObjectDisposition::Unknown,
             HealObjectDisposition::Repaired,
             HealObjectDisposition::VerifiedHealthy,
+            HealObjectDisposition::MetadataHealthy,
             HealObjectDisposition::AuthoritativelyAbsent,
             HealObjectDisposition::Deferred {
                 reason: HealDeferredReason::DanglingDeleteGrace,
@@ -543,7 +550,7 @@ mod canonical_outcome_tests {
             outcome.record(item(disposition));
         }
         let c = &outcome.counters;
-        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (8, 1, 2, 4, 1, 1));
+        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (9, 1, 3, 4, 1, 1));
         assert_eq!(c.processed, c.healed + c.unchanged + c.skipped + c.failed);
     }
 

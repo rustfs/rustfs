@@ -59,7 +59,7 @@ def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
     expected.update({job: "success" if mode == "full" else "skipped" for job in CODE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in ("refs/heads/main", "refs/heads/release")))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
     expected["e2e-full"] = "success" if full else "skipped"
     return expected
 
@@ -222,7 +222,7 @@ class SelfTests(unittest.TestCase):
     def test_full_e2e_gate_preserves_workflow_branch_and_event_scope(self):
         for event, ref, required in (
             ("push", "refs/heads/main", "success"),
-            ("push", "refs/heads/release", "success"),
+            ("push", "refs/heads/release", "skipped"),
             ("push", "refs/heads/feature", "skipped"),
             ("push", "refs/heads/release-candidate", "skipped"),
             ("push", "refs/tags/release", "skipped"),
