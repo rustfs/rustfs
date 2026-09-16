@@ -152,9 +152,29 @@ async fn test_compression_roundtrip() -> Result<(), Box<dyn std::error::Error + 
     let content_length = head_response.content_length().unwrap_or(0);
     assert_eq!(content_length as usize, original_size, "Content-Length should be original size");
 
+    // A 5 KiB compressed object sits inside the inline budget, so its shard is
+    // embedded in xl.meta rather than written as a part file; the stored size
+    // recorded in the metadata is the compressed length.
     let part_files = find_part_files(&env.temp_dir, COMPRESSION_TEST_BUCKET, object_key)?;
-    assert!(!part_files.is_empty(), "expected on-disk part files for the compressed object");
-    let total_physical_size = part_files_total_size(&part_files)?;
+    assert!(
+        part_files.is_empty(),
+        "small compressed object must be stored inline, found part files {part_files:?}"
+    );
+    let xl_meta_path = PathBuf::from(&env.temp_dir)
+        .join(COMPRESSION_TEST_BUCKET)
+        .join(object_key)
+        .join("xl.meta");
+    let file_info = rustfs_filemeta::FileMeta::load(&fs::read(&xl_meta_path)?)?.into_fileinfo(
+        COMPRESSION_TEST_BUCKET,
+        object_key,
+        "",
+        true,
+        false,
+        true,
+    )?;
+    assert!(file_info.inline_data(), "xl.meta must carry the inline marker for the compressed object");
+    assert!(file_info.is_compressed(), "xl.meta must carry the compression marker");
+    let total_physical_size = u64::try_from(file_info.size)?;
 
     assert!(
         total_physical_size < original_size as u64,
