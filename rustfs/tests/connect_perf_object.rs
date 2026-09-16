@@ -397,6 +397,61 @@ async fn oversized_response_is_rejected_without_buffering_it() {
 }
 
 #[tokio::test]
+async fn cleanup_uses_a_budget_independent_of_the_measurement_window() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let _guard = TEST_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("response listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        for (index, response) in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xa5\xa5\xa5\xa5".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut socket, _) = listener.accept().await.expect("object connection");
+            let mut request = vec![0_u8; 16 * 1024];
+            let _ = socket.read(&mut request).await.expect("request headers");
+            if index >= 3 {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            socket.write_all(response).await.expect("response");
+        }
+    });
+    let probe = S3ObjectProbe::new(
+        &format!("http://{address}"),
+        None,
+        None,
+        Zeroizing::new("access".to_owned()),
+        Zeroizing::new("secret".to_owned()),
+        Zeroizing::new(String::new()),
+        Duration::from_secs(1),
+    )
+    .expect("object probe");
+    let mut request = request(ObjectOperation::GetObject);
+    request.traffic_bytes = 4;
+
+    let measurement = measure_object(&request, &probe, &CancellationToken::new())
+        .await
+        .expect("object measurement");
+    assert_eq!(
+        measurement.result.outcome(),
+        ObjectOutcome::Succeeded,
+        "target result: {:?}",
+        measurement.target
+    );
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("cleanup requests should complete")
+        .expect("response server");
+}
+
+#[tokio::test]
 async fn signed_result_is_saved_without_overwrite() {
     let _guard = TEST_LOCK.lock().await;
     let request = request(ObjectOperation::PutObject);
@@ -463,6 +518,7 @@ fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put() {
 }
 
 async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_body() {
+    let _guard = TEST_LOCK.lock().await;
     let port = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
