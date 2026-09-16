@@ -9,7 +9,7 @@ use rustfs_storage_api as storage_contracts;
 #[cfg(feature = "test-util")]
 pub(crate) mod metadata_lock {
     pub(crate) use super::storage_contracts::{
-        BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO,
+        BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
     };
     pub(crate) use super::{Error, ObjectOptions, PutObjReader};
     pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{

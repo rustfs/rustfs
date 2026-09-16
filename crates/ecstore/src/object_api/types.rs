@@ -41,7 +41,7 @@ impl Debug for NamespaceLockFence {
 }
 
 impl NamespaceLockFence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
@@ -170,6 +170,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_store_bucket(
         store_id: Uuid,
         bucket: &str,
@@ -221,7 +222,7 @@ impl ObjectLockConfigSnapshot {
         config_revision: OffsetDateTime,
         state: crate::bucket::metadata_sys::ObjectLockConfigState,
         lifecycle_fence: NamespaceLockFence,
-        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     ) -> Self {
         Self {
             store_id: Some(store_id),
@@ -231,7 +232,7 @@ impl ObjectLockConfigSnapshot {
             state,
             lifecycle_fence,
             _lifecycle_guard: None,
-            metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
+            metadata_transaction_guard: Some(metadata_transaction_guard),
         }
     }
 

@@ -1047,6 +1047,7 @@ impl ECStore {
         opts: &ObjectOptions,
         publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<ObjectInfo> {
+        let request_opts = opts;
         let (target_pool_idx, mutation_fence) = target;
         check_complete_multipart_args(bucket, object, upload_id)?;
         if !opts.data_movement {
@@ -1132,7 +1133,8 @@ impl ECStore {
             )
             .await;
         drop(publication_guard);
-        let result = enqueue_transition_after_write(result, LcEventSrc::S3CompleteMultipartUpload).await;
+        let result =
+            enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, request_opts).await;
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
         }

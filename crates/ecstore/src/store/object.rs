@@ -2837,7 +2837,7 @@ impl ECStore {
             config_revision,
             state,
             lifecycle_fence.clone(),
-            metadata_guard,
+            Arc::new(metadata_guard),
         )))
     }
 
@@ -4296,6 +4296,7 @@ impl ECStore {
         if !opts.data_movement {
             return Err(Error::other("data movement PUT requires data_movement options"));
         }
+        let request_opts = opts;
         let (object, mut opts) = self.prepare_put_object(bucket, object, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, &object, &mut opts);
         let idx = self
@@ -4338,7 +4339,7 @@ impl ECStore {
                 },
             )
             .await;
-        let result = enqueue_transition_after_write(result, LcEventSrc::S3PutObject).await;
+        let result = enqueue_transition_after_write(self, result, LcEventSrc::S3PutObject, request_opts).await;
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self, bucket).await;
         }
@@ -4823,22 +4824,26 @@ impl ECStore {
             get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await?;
         }
         let _object_lock_metadata_guard = if !is_meta_bucketname(bucket) {
-            Some(acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?)
+            Some(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?))
         } else {
             None
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
             opts.add_namespace_lock_guard(guard);
         }
-        let current_bucket_incarnation_id = if _object_lock_metadata_guard.is_some() {
+        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
                 get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
-            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
                 incarnation_id,
                 config_revision,
                 state,
+                opts.bucket_lifecycle_lock_fence
+                    .clone()
+                    .unwrap_or_else(NamespaceLockFence::new),
+                Arc::clone(metadata_guard),
             )));
             Some(incarnation_id)
         } else {
@@ -5257,26 +5262,32 @@ impl ECStore {
         let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
             None
         } else {
-            Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
-                Ok(guard) => guard,
-                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
-            })
+            Some(Arc::new(
+                match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
+                    Ok(guard) => guard,
+                    Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
+                },
+            ))
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
             opts.add_namespace_lock_guard(guard);
         }
-        let current_bucket_incarnation_id = if _object_lock_metadata_guard.is_some() {
+        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
                 match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };
-            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
                 incarnation_id,
                 config_revision,
                 state,
+                opts.bucket_lifecycle_lock_fence
+                    .clone()
+                    .unwrap_or_else(NamespaceLockFence::new),
+                Arc::clone(metadata_guard),
             )));
             Some(incarnation_id)
         } else {

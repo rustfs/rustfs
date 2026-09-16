@@ -19,8 +19,9 @@ mod storage_api;
 use std::sync::Arc;
 use std::time::Duration;
 use storage_api::metadata_lock::{
-    BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOptions,
-    PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys, isolated_store_over_temp_disks,
+    BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
+    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys,
+    isolated_store_over_temp_disks,
 };
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -44,6 +45,14 @@ async fn replica_write_with_waiting_metadata_writer(multipart: bool) {
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("create bucket");
+    store
+        .update_bucket_metadata_config(
+            bucket,
+            "lifecycle.xml",
+            br#"<LifecycleConfiguration><Rule><ID>expire-old-versions</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#.to_vec(),
+        )
+        .await
+        .expect("configure post-write lifecycle evaluation");
     let opts = ObjectOptions {
         versioned: true,
         version_id: Some(Uuid::new_v4().to_string()),
@@ -244,4 +253,36 @@ async fn multipart_rejects_metadata_snapshots_from_another_scope() {
             .expect_err("foreign snapshot must be rejected");
         assert!(error.to_string().contains("valid metadata transaction fence"), "{error:?}");
     }
+}
+
+#[tokio::test]
+async fn delete_prefix_reuses_its_metadata_snapshot_for_generation_validation() {
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "metadata-read-reuse-delete";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    let mut data = PutObjReader::from_vec(b"remove prefix".to_vec());
+    store
+        .put_object(bucket, "prefix/object", &mut data, &ObjectOptions::default())
+        .await
+        .expect("seed object");
+    store
+        .delete_object(
+            bucket,
+            "prefix/",
+            ObjectOptions {
+                delete_prefix: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delete prefix with an internally captured metadata snapshot");
+    let error = store
+        .get_object_info(bucket, "prefix/object", &ObjectOptions::default())
+        .await
+        .expect_err("prefix object must be deleted");
+    assert!(matches!(error, Error::ObjectNotFound(..)), "{error:?}");
 }
