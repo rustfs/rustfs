@@ -994,6 +994,15 @@ impl FileMeta {
                 Uuid::nil()
             }
         };
+        // A nil selector denotes the null version slot, which legacy metadata
+        // may encode as either an absent UUID or an explicit nil UUID.
+        let matches_version = |actual: Option<Uuid>| {
+            if vid.is_nil() {
+                actual.is_none_or(|version_id| version_id.is_nil())
+            } else {
+                actual == Some(vid)
+            }
+        };
 
         let mut is_latest = true;
         let mut succ_mod_time = None;
@@ -1031,7 +1040,7 @@ impl FileMeta {
                     }
                 }
 
-                if header.version_id != Some(vid) {
+                if !matches_version(header.version_id) {
                     continue;
                 }
             }
@@ -1040,7 +1049,7 @@ impl FileMeta {
                 continue;
             }
 
-            if !version_id.is_empty() && header.version_id != Some(vid) {
+            if !version_id.is_empty() && !matches_version(header.version_id) {
                 is_latest = false;
                 succ_mod_time = header.mod_time;
                 continue;
@@ -2685,6 +2694,48 @@ mod test {
         );
         assert!(fi.uses_legacy_checksum);
         assert!(fi.is_latest);
+
+        let selected = fm
+            .into_fileinfo(".rustfs.sys", "pool.bin", &Uuid::nil().to_string(), true, false, true)
+            .expect("nil selector should match the legacy null version");
+        assert_eq!(selected.version_id, None);
+    }
+
+    #[test]
+    fn nil_version_selector_matches_only_the_null_slot() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid test timestamp");
+        let version_id = Uuid::new_v4();
+        let versioned = version_for_ordering(VersionType::Object, version_id, mod_time + time::Duration::seconds(1), 2);
+        let mut null = version_for_ordering(VersionType::Object, Uuid::nil(), mod_time, 1);
+        null.object
+            .as_mut()
+            .expect("ordering helper should construct an object")
+            .version_id = None;
+
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(versioned.clone()).expect("add versioned object");
+        fm.add_version_filemata(null).expect("add legacy null object");
+
+        let selected_null = fm
+            .into_fileinfo("bucket", "object", &Uuid::nil().to_string(), false, false, true)
+            .expect("nil selector should match only the legacy null slot");
+        assert_eq!(selected_null.version_id, None);
+
+        let selected_versioned = fm
+            .into_fileinfo("bucket", "object", &version_id.to_string(), false, false, true)
+            .expect("non-nil selector should still match its exact version");
+        assert_eq!(selected_versioned.version_id, Some(version_id));
+
+        let mut versioned_only = FileMeta::new();
+        versioned_only
+            .add_version_filemata(versioned)
+            .expect("add versioned object without a null slot");
+        assert!(
+            versioned_only
+                .into_fileinfo("bucket", "object", &Uuid::nil().to_string(), false, false, true)
+                .is_err(),
+            "nil selector must not fall back to a non-nil latest version"
+        );
     }
 
     #[test]
