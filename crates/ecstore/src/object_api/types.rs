@@ -41,7 +41,7 @@ impl Debug for NamespaceLockFence {
 }
 
 impl NamespaceLockFence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
@@ -153,7 +153,7 @@ pub struct ObjectLockConfigSnapshot {
     state: crate::bucket::metadata_sys::ObjectLockConfigState,
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
-    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -170,6 +170,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_store_bucket(
         store_id: Uuid,
         bucket: &str,
@@ -210,7 +211,7 @@ impl ObjectLockConfigSnapshot {
             state,
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
-            metadata_transaction_guard: Some(metadata_transaction_guard),
+            metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
         }
     }
 
@@ -221,7 +222,7 @@ impl ObjectLockConfigSnapshot {
         config_revision: OffsetDateTime,
         state: crate::bucket::metadata_sys::ObjectLockConfigState,
         lifecycle_fence: NamespaceLockFence,
-        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     ) -> Self {
         Self {
             store_id: Some(store_id),
@@ -263,6 +264,23 @@ impl ObjectLockConfigSnapshot {
                 .metadata_transaction_guard
                 .as_ref()
                 .is_some_and(|guard| !guard.is_lock_lost())
+    }
+
+    /// Share the held transaction lock without queuing another reader behind
+    /// a metadata writer that is itself waiting for this snapshot to drop.
+    pub(crate) fn metadata_transaction_guard_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let bucket_incarnation_id = self.bucket_incarnation_id?;
+        if expected_incarnation_id.is_some_and(|expected| expected != bucket_incarnation_id)
+            || !self.is_valid_for_destructive_put(store_id, bucket, bucket_incarnation_id)
+        {
+            return None;
+        }
+        self.metadata_transaction_guard.clone()
     }
 
     pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
@@ -882,6 +900,15 @@ pub enum WriteCompletion {
     TailDrained,
 }
 
+/// Storage-owned write mode inherited by physical rewrites. This selects the
+/// destination format; the source reader must still validate every source byte.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardIntegrityWriteMode {
+    Legacy,
+    Protected,
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -942,6 +969,10 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Internal, in-memory protection context. Never populated from S3 metadata.
+    /// None selects the rollout default only for a new write, not for a rewrite.
+    #[doc(hidden)]
+    pub shard_integrity_write_mode: Option<ShardIntegrityWriteMode>,
     /// Durable reservation identity carried only by decommission writes. Other
     /// data-movement users, including rebalance, leave it unset. Keep this
     /// context boxed because `ObjectOptions` is passed by value through deep
@@ -1043,6 +1074,25 @@ pub enum ReplicationStatusWritebackMode {
 }
 
 impl ObjectOptions {
+    pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
+        match self.shard_integrity_write_mode {
+            Some(ShardIntegrityWriteMode::Protected) => true,
+            Some(ShardIntegrityWriteMode::Legacy) => false,
+            None if self.data_movement => false,
+            None => {
+                rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+                    && rustfs_utils::get_env_bool(
+                        rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                        rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    )
+            }
+        }
+    }
+
+    pub(crate) fn inherit_shard_integrity(&mut self, source: &ObjectInfo) {
+        self.shard_integrity_write_mode = Some(source.shard_integrity_write_mode());
+    }
+
     pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
         Self {
             decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
@@ -1438,6 +1488,23 @@ impl Clone for ObjectInfo {
 }
 
 impl ObjectInfo {
+    pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
+        // Any declaration requires protection. Malformed declarations remain
+        // errors in the source reader and must never select the legacy path.
+        if self.parts.iter().any(|part| part.integrity.is_some())
+            || [
+                rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+            ]
+            .iter()
+            .any(|suffix| rustfs_utils::http::contains_key_str(&self.user_defined, suffix))
+        {
+            ShardIntegrityWriteMode::Protected
+        } else {
+            ShardIntegrityWriteMode::Legacy
+        }
+    }
+
     /// Capture the source mutation snapshot used by replication workers when
     /// publishing terminal status. The semantic fingerprint is recomputed at
     /// the storage CAS boundary, so an older writer that preserves an unknown
@@ -1839,6 +1906,7 @@ impl ObjectInfo {
                 checksums: part.checksums.clone(),
                 number: part.number,
                 error: part.error.clone(),
+                integrity: part.integrity.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -2054,6 +2122,18 @@ impl ObjectInfo {
         let mut prev_prefix = "";
         for entry in entries.entries() {
             if entry.is_object() {
+                let fi = match entry.to_fileinfo(bucket) {
+                    Ok(res) => Some(res),
+                    Err(err) => {
+                        warn!("file_info_versions err {:?}", err);
+                        None
+                    }
+                };
+
+                if fi.as_ref().is_some_and(|fi| !fi.version_purge_status().is_empty()) {
+                    continue;
+                }
+
                 if let Some(delimiter) = &delimiter {
                     let remaining = if entry.name.starts_with(prefix) {
                         &entry.name[prefix.len()..]
@@ -2080,15 +2160,10 @@ impl ObjectInfo {
                     }
                 }
 
-                let fi = match entry.to_fileinfo(bucket) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        warn!("file_info_versions err {:?}", err);
-                        continue;
-                    }
+                let Some(fi) = fi else {
+                    continue;
                 };
 
-                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 
@@ -2619,6 +2694,66 @@ mod tests {
                 .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
         );
         assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_hides_objects_pending_version_purge() {
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+        let object = "folder/object";
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: object.to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let list_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", None).await;
+        let delimiter_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        let public_versions = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_versions =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert!(
+            list_objects.is_empty(),
+            "ListObjectsV2 must not publish a key hidden from public versions"
+        );
+        assert!(
+            delimiter_objects.is_empty(),
+            "delimiter ListObjectsV2 must not synthesize a prefix from a hidden key"
+        );
+        assert!(
+            public_versions.is_empty(),
+            "public ListObjectVersions hides pending version-purge records"
+        );
+        assert_eq!(lifecycle_versions.len(), 1, "lifecycle cleanup still needs the pending purge record");
+        assert_eq!(lifecycle_versions[0].version_purge_status, VersionPurgeStatusType::Pending);
     }
 
     #[test]

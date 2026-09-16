@@ -17,7 +17,9 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::{FS, propagate_object_lock_peer_reload, validate_object_lock_configuration_input};
+    use crate::storage::ecfs::{
+        FS, parse_object_version_id, propagate_object_lock_peer_reload, validate_object_lock_configuration_input,
+    };
     use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
@@ -639,6 +641,36 @@ mod tests {
         assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
         assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP));
         assert_eq!(metadata.get("content-type"), Some(&"application/octet-stream".to_string()));
+    }
+
+    #[test]
+    fn test_tagging_version_id_preserves_explicit_null_and_latest_selection() {
+        assert_eq!(parse_object_version_id(None).expect("latest version selector"), None);
+        assert_eq!(
+            parse_object_version_id(Some("null".to_owned())).expect("explicit null version selector"),
+            Some(uuid::Uuid::nil())
+        );
+        for version in [uuid::Uuid::nil(), uuid::Uuid::new_v4()] {
+            assert_eq!(
+                parse_object_version_id(Some(version.to_string())).expect("UUID version selector"),
+                Some(version)
+            );
+        }
+    }
+
+    #[test]
+    fn test_tagging_version_id_rejects_invalid_values_instead_of_selecting_latest() {
+        for version in [
+            "",
+            "NULL",
+            " null ",
+            "not-a-version",
+            "null/other",
+            "00000000-0000-0000-0000-00000000000g",
+        ] {
+            let err = parse_object_version_id(Some(version.to_owned())).expect_err("invalid version must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "version: {version:?}");
+        }
     }
 
     #[tokio::test]

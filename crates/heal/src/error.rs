@@ -56,6 +56,28 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]
+    ReplacementFailurePersistence {
+        #[source]
+        failure: Box<Error>,
+        persistence: Box<Error>,
+    },
+
+    #[error("Replacement ownership conflict: {0}")]
+    ReplacementOwnershipConflict(String),
+
+    #[error("Replacement generation conflict for task {task_id}: {reason}")]
+    ReplacementGenerationConflict { task_id: String, reason: String },
+
+    #[error("Replacement target is not ready: {0}")]
+    ReplacementTargetNotReady(String),
+
+    #[error("replacement recovery retry budget exhausted")]
+    ReplacementRetryBudgetExhausted,
+
+    #[error("stale_bucket_incarnation: bucket {bucket} no longer belongs to this heal admission ({expected:?})")]
+    StaleBucketIncarnation { bucket: String, expected: Option<uuid::Uuid> },
+
     /// The current page already exhausted its local retry budget. Retrying
     /// the enclosing bucket would replay pages whose results were counted.
     #[error("Heal listing failed for bucket {bucket}: {source}")]
@@ -100,7 +122,8 @@ impl Error {
     /// catches errors whose typed identity was destroyed upstream.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
-            Error::TaskCancelled | Error::TaskTimeout => false,
+            Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
+            Error::ReplacementTargetNotReady(_) => true,
             Error::TransientSkip { .. } => true,
             // Lock failures classify by LockError's own taxonomy: only the
             // fatal variants (ResourceNotFound / PermissionDenied /
@@ -147,6 +170,16 @@ impl Error {
             Error::Io(err) => is_recoverable_internode_error(err) || is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
+    }
+
+    pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
+        let after = match self {
+            Self::Storage(error) => error.dangling_delete_retry_after(),
+            Self::Disk(error) => error.dangling_delete_retry_after(),
+            Self::Io(error) => DiskError::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }?;
+        std::time::SystemTime::now().checked_add(after)
     }
 
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
@@ -320,6 +353,11 @@ mod tests {
     #[test]
     fn task_timeout_is_terminal() {
         assert!(!Error::TaskTimeout.is_recoverable_heal());
+    }
+
+    #[test]
+    fn replacement_target_restart_is_recoverable() {
+        assert!(Error::ReplacementTargetNotReady("mount is restarting".to_string()).is_recoverable_heal());
     }
 
     #[test]

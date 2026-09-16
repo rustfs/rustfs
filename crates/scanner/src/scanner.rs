@@ -333,6 +333,7 @@ pub struct ScannerCycleScheduleStatus {
     execution_role: &'static str,
     effective_interval_available: bool,
     effective_interval_seconds: u64,
+    usage_bootstrap_rebuild_pending: bool,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
     superseded_retry_backoff_enabled: bool,
@@ -345,6 +346,7 @@ impl Default for ScannerCycleScheduleStatus {
             execution_role: "unknown",
             effective_interval_available: false,
             effective_interval_seconds: 0,
+            usage_bootstrap_rebuild_pending: false,
             clean_idle_backoff_enabled: false,
             clean_idle_backoff_multiplier: 1,
             superseded_retry_backoff_enabled: false,
@@ -368,6 +370,7 @@ pub fn scanner_cycle_schedule_status() -> ScannerCycleScheduleStatus {
 
 fn record_scanner_cycle_schedule(
     effective_interval: Duration,
+    usage_bootstrap_rebuild_pending: bool,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
     superseded_retry_backoff_enabled: bool,
@@ -383,6 +386,7 @@ fn record_scanner_cycle_schedule(
         execution_role: "leader",
         effective_interval_available: true,
         effective_interval_seconds,
+        usage_bootstrap_rebuild_pending,
         clean_idle_backoff_enabled,
         clean_idle_backoff_multiplier: clean_idle_backoff_multiplier.max(1),
         superseded_retry_backoff_enabled,
@@ -1157,6 +1161,56 @@ impl ScannerMaintenanceFeatures {
         self.needs_regular_cycle()
             || observed_generation != Some(current_generation)
             || !matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerUsageBootstrapRebuild {
+    pending: bool,
+}
+
+impl ScannerUsageBootstrapRebuild {
+    fn from_startup(startup: PersistedUsageFloorStartup) -> Self {
+        Self {
+            pending: startup != PersistedUsageFloorStartup::Authoritative,
+        }
+    }
+
+    fn pending(self) -> bool {
+        self.pending
+    }
+
+    fn wait_plan(self, mut plan: ScannerCycleWaitPlan, convergence_retry_interval: Option<Duration>) -> ScannerCycleWaitPlan {
+        if self.pending && convergence_retry_interval.is_none() {
+            plan.delay = Duration::ZERO;
+        }
+        plan
+    }
+
+    fn clean_idle_backoff_enabled(self, enabled: bool) -> bool {
+        enabled && !self.pending
+    }
+
+    fn requires_full_scan(
+        self,
+        maintenance_features: ScannerMaintenanceFeatures,
+        observed_generation: Option<u64>,
+        current_generation: u64,
+        wake: ScannerCycleWakeReason,
+    ) -> bool {
+        self.pending || maintenance_features.requires_full_scan(observed_generation, current_generation, wake)
+    }
+
+    fn record_cycle(&mut self, outcome: ScannerCycleOutcome) -> bool {
+        if matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ) {
+            let was_pending = self.pending;
+            self.pending = false;
+            return was_pending;
+        }
+        false
     }
 }
 
@@ -2770,6 +2824,7 @@ where
     };
     let (allow_usage_floor_bootstrap_pending, usage_floor_cycle_reset_policy) =
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
+    let mut usage_bootstrap_rebuild = ScannerUsageBootstrapRebuild::from_startup(usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
     match usage_floor_startup {
         PersistedUsageFloorStartup::Authoritative
@@ -2888,7 +2943,13 @@ where
         return Ok(());
     }
 
-    let initial_pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+    let initial_pause_backlog_attempt = if usage_bootstrap_rebuild.pending() {
+        pause_backlog
+            .begin_usage_bootstrap_rebuild_attempt(scanner_pause_backlog_now())
+            .await
+    } else {
+        pause_backlog.begin_attempt(scanner_pause_backlog_now()).await
+    };
     if !ctx.is_cancelled()
         && matches!(
             initial_pause_backlog_attempt,
@@ -2896,6 +2957,7 @@ where
         )
     {
         // Preserve previous behavior: run one cycle immediately after lock acquisition.
+        let usage_bootstrap_pending_before_cycle = usage_bootstrap_rebuild.pending();
         let dirty_generation_before_cycle = dirty_usage_generation();
         let dirty_usage_pending_before_cycle = dirty_usage_buckets_pending();
         let maintenance_generation_before_cycle = scanner_maintenance_generation();
@@ -2958,6 +3020,9 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, initial_pause_backlog_attempt, initial_outcome).await;
+        if usage_bootstrap_rebuild.record_cycle(initial_outcome) {
+            clean_idle_backoff.reset();
+        }
         superseded_backoff.record_retryable_cycle(initial_outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(initial_outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -2983,12 +3048,12 @@ where
             scanner_activity_backoff_blocked = true;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -2999,7 +3064,8 @@ where
                 dirty_usage_pending_before_cycle,
                 dirty_generation_before_cycle,
                 dirty_usage_generation(),
-            ) || maintenance_generation_before_cycle != scanner_maintenance_generation()
+            ) || usage_bootstrap_pending_before_cycle
+                || maintenance_generation_before_cycle != scanner_maintenance_generation()
                 || scanner_activity_observed_work(scanner_activity_observation),
         );
         runtime_config_generation_seen = scanner_runtime_config_generation();
@@ -3040,12 +3106,12 @@ where
             scanner_activity_seen = None;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
         let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
@@ -3055,16 +3121,20 @@ where
             wait_plan.effective_interval = retry_interval;
             wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
         }
-        if let Some(pause_backlog_delay) = pause_backlog.scheduling_delay(scanner_pause_backlog_now()) {
+        if let Some(pause_backlog_delay) =
+            pause_backlog.scheduling_delay(scanner_pause_backlog_now(), usage_bootstrap_rebuild.pending())
+        {
             wait_plan.effective_interval = pause_backlog_delay.max(Duration::from_secs(1));
             wait_plan.delay = pause_backlog_delay;
             convergence_retry_interval = Some(pause_backlog_delay.max(Duration::from_secs(1)));
         }
+        wait_plan = usage_bootstrap_rebuild.wait_plan(wait_plan, convergence_retry_interval);
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
         let maintenance_generation_before_wait = scanner_maintenance_generation();
         record_scanner_cycle_schedule(
             wait_plan.effective_interval,
+            usage_bootstrap_rebuild.pending(),
             backoff_enabled,
             u64::from(clean_idle_backoff.interval_multiplier),
             superseded_retry_interval.is_some(),
@@ -3079,6 +3149,7 @@ where
             effective_interval = ?wait_plan.effective_interval,
             clean_idle_max_interval = ?wait_plan.clean_idle_max_interval,
             scheduled_delay = ?wait_plan.delay,
+            usage_bootstrap_rebuild_pending = usage_bootstrap_rebuild.pending(),
             interval_multiplier = clean_idle_backoff.interval_multiplier,
             clean_idle_backoff_enabled = backoff_enabled,
             superseded_retry_backoff_enabled = superseded_retry_interval.is_some(),
@@ -3101,6 +3172,7 @@ where
             movement_changed,
             current_movement_generation: move || movement_store.scanner_data_movement_generation(),
             is_lock_lost: || guard.is_lock_lost(),
+            recovery_wake: Some(&SCANNER_CYCLE_RECOVERY_WAKE),
         };
         let wake_reason = wait_for_next_scanner_cycle_with_activity_and_movement(
             &ctx,
@@ -3149,7 +3221,8 @@ where
             ScannerCycleWakeReason::Timer
             | ScannerCycleWakeReason::DirtyUsage
             | ScannerCycleWakeReason::ClusterActivity
-            | ScannerCycleWakeReason::ClusterActivityUnavailable => {}
+            | ScannerCycleWakeReason::ClusterActivityUnavailable
+            | ScannerCycleWakeReason::Recovery => {}
         }
 
         if wake_reason == ScannerCycleWakeReason::DirtyUsage {
@@ -3191,13 +3264,20 @@ where
         if pause_backlog_observation.paused {
             continue;
         }
-        let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+        let pause_backlog_attempt = if usage_bootstrap_rebuild.pending() {
+            pause_backlog
+                .begin_usage_bootstrap_rebuild_attempt(scanner_pause_backlog_now())
+                .await
+        } else {
+            pause_backlog.begin_attempt(scanner_pause_backlog_now()).await
+        };
         if matches!(
             pause_backlog_attempt,
             ScannerPauseBacklogAttemptDecision::RateLimited | ScannerPauseBacklogAttemptDecision::PersistenceUnavailable
         ) {
             continue;
         }
+        let usage_bootstrap_pending_before_cycle = usage_bootstrap_rebuild.pending();
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
@@ -3212,7 +3292,8 @@ where
                 leader_epoch,
                 cycle_budget.clone(),
                 ScannerCycleScheduling {
-                    requires_full_scan: maintenance_features.requires_full_scan(
+                    requires_full_scan: usage_bootstrap_rebuild.requires_full_scan(
+                        maintenance_features,
                         maintenance_generation_seen,
                         scanner_maintenance_generation(),
                         wake_reason,
@@ -3256,6 +3337,9 @@ where
             }
         };
         finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, pause_backlog_attempt, outcome).await;
+        if usage_bootstrap_rebuild.record_cycle(outcome) {
+            clean_idle_backoff.reset();
+        }
         superseded_backoff.record_retryable_cycle(outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -3314,12 +3398,12 @@ where
             scanner_activity_backoff_blocked = true;
         }
         let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+        let backoff_enabled = usage_bootstrap_rebuild.clean_idle_backoff_enabled(scanner_clean_idle_backoff_enabled(
             clean_idle_topology_supported,
             scanner_activity_ready,
             maintenance_features,
             &runtime_config,
-        );
+        ));
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -3330,7 +3414,8 @@ where
                 dirty_usage_pending_before_wait,
                 dirty_generation_before_wait,
                 dirty_usage_generation(),
-            ) || scanner_activity_observed_work(scanner_activity_observation),
+            ) || usage_bootstrap_pending_before_cycle
+                || scanner_activity_observed_work(scanner_activity_observation),
         );
     }
 

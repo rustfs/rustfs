@@ -590,7 +590,12 @@ pub(crate) struct ParallelReader<R> {
     // Demand-bound hedges use a fresh deferred reader so cancelling a hedge
     // never consumes the unopened reader reserved for a later stripe.
     deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+    // A latency hedge cancels a stream without proving that its disk failed.
+    // Keep those slots available for a stripe-aligned reopen if a later stripe
+    // loses another disk and needs the original erasure redundancy.
+    hedged_readers: ActiveReaders,
     stripe_index: usize,
+    integrity: Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
 }
 }
 
@@ -781,7 +786,9 @@ where
         let engaged: SmallVec<_> = (0..readers.len())
             .map(|index| !demand_bound_lockstep || index < e.data_shards)
             .collect();
+        let hedged_readers = smallvec![false; readers.len()];
         ParallelReader {
+            integrity: readers.iter().flatten().find_map(BitrotReader::integrity_proof),
             readers,
             offset,
             shard_size,
@@ -799,6 +806,7 @@ where
             engaged,
             deferred_handles: Vec::new(),
             deferred_reopeners: Vec::new(),
+            hedged_readers,
             stripe_index: 0,
         }
     }
@@ -815,10 +823,11 @@ where
         self
     }
 
-    /// Attach factories for unopened parity readers. A factory must return a
+    /// Attach factories for fresh readers. A factory must return a
     /// reader already aligned to the requested stripe. Keeping the original
-    /// deferred reader in `self.readers` lets a cancelled hedge be discarded
-    /// without poisoning the next-stripe reserve.
+    /// deferred reader in `self.readers` lets a cancelled parity hedge be
+    /// discarded without poisoning the next-stripe reserve. Other slots can
+    /// use the factory to recover from a latency hedge on an earlier stripe.
     pub(crate) fn with_deferred_parity_reopeners(mut self, mut reopeners: Vec<Option<DeferredReaderReopener<R>>>) -> Self {
         reopeners.resize_with(self.readers.len(), || None);
         reopeners.truncate(self.readers.len());
@@ -1468,8 +1477,12 @@ where
                 if self.engaged[i] && self.readers[i].is_some() && shards[i].is_none() && errs[i].is_none() {
                     errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read hedged after a slow shard")));
                     retire_readers.push(i);
+                    self.hedged_readers[i] = self.deferred_reopeners.get(i).is_some_and(Option::is_some);
                 }
             }
+        }
+        for i in retire_readers.drain(..) {
+            self.readers[i] = None;
         }
 
         // A data shard may have died or been hedged this stripe. The unengaged
@@ -1488,10 +1501,20 @@ where
             if !data_shard_missing || success_now > data_shards {
                 break;
             }
-            let Some(idx) = (data_shards..num_readers).find(|&i| self.readers[i].is_some() && !self.engaged[i]) else {
+            let deferred_parity = (data_shards..num_readers).find(|&i| self.readers[i].is_some() && !self.engaged[i]);
+            let Some(idx) = deferred_parity.or_else(|| self.hedged_readers.iter().position(|hedged| *hedged)) else {
                 break;
             };
-            if !self.try_engage_parity(idx, stripe_index) {
+            if self.hedged_readers[idx] {
+                // Never resume the canceled stream: its last read may have
+                // consumed a partial block. A fresh reader starts at this
+                // stripe, and an actual read error retires it permanently.
+                self.hedged_readers[idx] = false;
+                self.readers[idx] = self.deferred_reopeners[idx].as_ref().and_then(|reopen| reopen(stripe_index));
+                if self.readers[idx].is_none() {
+                    continue;
+                }
+            } else if !self.try_engage_parity(idx, stripe_index) {
                 continue;
             }
             let read_cost = self.read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
@@ -1998,11 +2021,28 @@ where
     R: crate::erasure::coding::ShardSource,
 {
     async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
+        let stripe = self.offset.checked_div(self.shard_size);
         let mut state = self
             .stripe_state
             .take()
             .unwrap_or_else(|| Box::new(StripeReadState::with_slot_count(self.readers.len(), self.data_shards)));
         self.read_into_state(&mut state).await;
+        if state.can_decode()
+            && let Some(proof) = &self.integrity
+        {
+            let result = match stripe {
+                Some(stripe) => proof.reconstruction_proof(stripe, state.shards_mut()).await,
+                None => Err(io::Error::new(ErrorKind::InvalidData, "invalid integrity stripe offset")),
+            };
+            match result {
+                Ok(proof) => state.integrity = proof,
+                Err(_) => {
+                    let (shards, errors) = state.parts_mut();
+                    shards.iter_mut().for_each(|shard| *shard = None);
+                    errors.fill(Some(Error::FileCorrupt));
+                }
+            }
+        }
         state
     }
 
@@ -2336,6 +2376,8 @@ impl Erasure {
         ret_err: &mut Option<std::io::Error>,
         stage_metrics_enabled: bool,
         require_surplus_source: bool,
+        integrity: Option<&std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
+        request_offset: usize,
     ) -> StripeFlow
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -2373,6 +2415,20 @@ impl Erasure {
         // missing data shard and an extra source shard was available, verify
         // the reconstructed data against that source before streaming bytes.
         let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let proof = if let Some(integrity) = integrity {
+            match integrity
+                .reconstruction_proof((request_offset + *written) / self.block_size, shards)
+                .await
+            {
+                Ok(proof) => proof,
+                Err(error) => {
+                    *ret_err = Some(error);
+                    return StripeFlow::Stop;
+                }
+            }
+        } else {
+            None
+        };
         let decode_result = if require_surplus_source {
             self.decode_data_with_reconstruction_verification_for_lockstep(shards)
         } else {
@@ -2397,6 +2453,12 @@ impl Erasure {
         }
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
+        if let Some(proof) = proof
+            && let Err(error) = proof.verify(shards)
+        {
+            *ret_err = Some(error);
+            return StripeFlow::Stop;
+        }
         let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let n = match write_data_blocks(writer, shards, self.data_shards, block_offset, block_length).await {
             Ok(n) => {
@@ -2510,6 +2572,8 @@ impl Erasure {
         .with_deferred_parity_handles(deferred_handles)
         .with_deferred_parity_reopeners(deferred_reopeners);
 
+        let integrity = reader.integrity.clone();
+
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
 
@@ -2615,6 +2679,8 @@ impl Erasure {
                                 &mut ret_err,
                                 stage_metrics_enabled,
                                 require_surplus_source,
+                                integrity.as_ref(),
+                                offset,
                             );
                             tokio::pin!(read_fut);
                             tokio::pin!(emit_fut);
@@ -2663,6 +2729,8 @@ impl Erasure {
                                 &mut ret_err,
                                 stage_metrics_enabled,
                                 reader.demand_bound_lockstep,
+                                integrity.as_ref(),
+                                offset,
                             )
                             .await
                         {
@@ -2704,6 +2772,8 @@ impl Erasure {
                         &mut ret_err,
                         stage_metrics_enabled,
                         reader.demand_bound_lockstep,
+                        integrity.as_ref(),
+                        offset,
                     )
                     .await
                 {
@@ -5000,6 +5070,101 @@ mod tests {
         assert!(bufs[2].is_some());
         assert!(bufs[3].is_some());
         assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lockstep_reopens_hedged_shard_after_later_peer_loss() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let data: Vec<u8> = (0..192).collect();
+        let mut shard_bytes = vec![Vec::new(); DATA_SHARDS + PARITY_SHARDS];
+        for block in data.chunks(BLOCK_SIZE) {
+            for (bytes, encoded) in shard_bytes
+                .iter_mut()
+                .zip(erasure.encode_data(block).expect("encode test stripe"))
+            {
+                bytes.extend_from_slice(&encoded);
+            }
+        }
+        let mut readers: Vec<_> = shard_bytes
+            .iter()
+            .map(|bytes| {
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(bytes.clone())),
+                    SHARD_SIZE,
+                    HashAlgorithm::None,
+                    false,
+                ))
+            })
+            .collect();
+        readers[0] = Some(BitrotReader::new(TestShardReader::Parked, SHARD_SIZE, HashAlgorithm::None, false));
+        let reopen_calls = Arc::new(AtomicUsize::new(0));
+        let mut reopeners: Vec<Option<DeferredReaderReopener<TestShardReader>>> = vec![None; readers.len()];
+        let reopened_bytes = shard_bytes[0].clone();
+        let calls = Arc::clone(&reopen_calls);
+        reopeners[0] = Some(Arc::new(move |stripe| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = reopened_bytes.get(stripe * SHARD_SIZE..)?.to_vec();
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(remaining)),
+                SHARD_SIZE,
+                HashAlgorithm::None,
+                false,
+            ))
+        }));
+        for slot in &mut reopeners[1..3] {
+            *slot = Some(Arc::new(|_| panic!("a real peer read error must not be retried")));
+        }
+        let mut reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            data.len(),
+            None,
+            vec![ShardReadCost::Unknown; 4],
+            Duration::from_secs(60),
+            true,
+        )
+        .with_deferred_parity_reopeners(reopeners);
+
+        let (first, errors) = reader.read().await;
+        assert_eq!(first.iter().flatten().count(), DATA_SHARDS + 1);
+        assert!(matches!(&errors[0], Some(DiskError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+        assert_eq!(reopen_calls.load(Ordering::SeqCst), 0, "a healthy stripe must keep its latency hedge");
+        for slot in &mut reader.readers[1..3] {
+            *slot = Some(BitrotReader::new(
+                TestShardReader::TerminalFileNotFound,
+                SHARD_SIZE,
+                HashAlgorithm::None,
+                false,
+            ));
+        }
+
+        for stripe in 1..3 {
+            let (mut shards, _) = reader.read().await;
+            assert_eq!(
+                shards.iter().flatten().count(),
+                DATA_SHARDS,
+                "surviving physical shards must remain usable"
+            );
+            assert_eq!(
+                shards[0].as_deref(),
+                Some(&shard_bytes[0][stripe * SHARD_SIZE..(stripe + 1) * SHARD_SIZE])
+            );
+            erasure
+                .decode_data_with_reconstruction_verification(&mut shards)
+                .expect("recover the stripe after peer loss");
+            let actual: Vec<u8> = shards[..DATA_SHARDS].iter().flatten().flatten().copied().collect();
+            assert_eq!(actual, data[stripe * BLOCK_SIZE..(stripe + 1) * BLOCK_SIZE]);
+        }
+        assert_eq!(
+            reopen_calls.load(Ordering::SeqCst),
+            1,
+            "a reopened healthy reader must stay aligned across stripes"
+        );
     }
 
     /// Demand-bound lockstep regression: a slow data shard must be hedged as

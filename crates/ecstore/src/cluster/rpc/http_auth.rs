@@ -39,11 +39,12 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK,
-    INTERNODE_OPERATION_GRPC_LOCK_BATCH, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
-    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH,
-    INTERNODE_OPERATION_GRPC_UNLOCK, INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
+    INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK, INTERNODE_OPERATION_GRPC_LOCK_BATCH,
+    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH, INTERNODE_OPERATION_GRPC_UNLOCK,
+    INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
 use rustfs_utils::get_env_bool;
@@ -1077,6 +1078,7 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
         Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
         Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
         Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("CompareAndUpdateFile") => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
         Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
         Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
         Some("LockBatch") => INTERNODE_OPERATION_GRPC_LOCK_BATCH,
@@ -2714,6 +2716,10 @@ mod tests {
             INTERNODE_OPERATION_GRPC_WRITE_ALL
         );
         assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/CompareAndUpdateFile"),
+            INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE
+        );
+        assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/Lock"),
             INTERNODE_OPERATION_GRPC_LOCK
         );
@@ -3012,6 +3018,7 @@ mod tests {
     fn rename_data_mutation_contract_binds_method_nonce_and_body() {
         ensure_test_rpc_secret();
         let message = rustfs_protos::proto_gen::node_service::RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "http://node-a:9000/data/rustfs0".to_string(),
             src_volume: ".rustfs.sys/multipart".to_string(),
             src_path: "uploads/object".to_string(),

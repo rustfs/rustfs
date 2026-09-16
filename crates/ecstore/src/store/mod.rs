@@ -395,12 +395,19 @@ async fn scan_metadata_less_residue_with_budget(
     Ok(scan)
 }
 
-async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEventSrc) -> Result<ObjectInfo> {
+async fn enqueue_transition_after_write(
+    store: &ECStore,
+    result: Result<ObjectInfo>,
+    src: LcEventSrc,
+    opts: &ObjectOptions,
+) -> Result<ObjectInfo> {
     match result {
         Ok(oi) => {
             if should_enqueue_transition_immediately(&oi) {
                 enqueue_transition_immediate(&oi, src.clone()).await;
-                enqueue_immediate_expiry(&oi, src).await;
+                if let Ok(api) = metadata_sys::object_store_in(&store.ctx).await {
+                    enqueue_immediate_expiry(api, &oi, src, opts).await;
+                }
             }
             Ok(oi)
         }
@@ -419,6 +426,8 @@ mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
 mod heal;
+pub(crate) use heal::bucket_heal_scope;
+pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
 mod init;
@@ -1279,9 +1288,11 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
         let result = match self.handle_put_object(bucket, object, data, opts).await {
-            Ok((object_info, old_current_size)) => enqueue_transition_after_write(Ok(object_info), LcEventSrc::S3PutObject)
-                .await
-                .map(|object_info| (object_info, old_current_size)),
+            Ok((object_info, old_current_size)) => {
+                enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts)
+                    .await
+                    .map(|object_info| (object_info, old_current_size))
+            }
             Err(err) => Err(err),
         };
         if result.is_ok() {
@@ -1354,9 +1365,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         let result = enqueue_transition_after_write(
+            self,
             self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
                 .await,
             LcEventSrc::S3CopyObject,
+            dst_opts,
         )
         .await;
         if result.is_ok() {
@@ -1623,10 +1636,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         let result = enqueue_transition_after_write(
+            self.as_ref(),
             self.clone()
                 .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await,
             LcEventSrc::S3CompleteMultipartUpload,
+            opts,
         )
         .await;
         if result.is_ok() {

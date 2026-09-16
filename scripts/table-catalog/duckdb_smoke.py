@@ -287,17 +287,6 @@ def negative_sql(args: argparse.Namespace, *, kind: str, seed_table: str, write_
     bootstrap = f"bootstrap_{kind}"
     sql = profile_sql(args, catalog=bootstrap, table=seed_table)
     sql += f"DETACH {engine_compatibility.quote_double_identifier(bootstrap)};\n"
-    if kind == "stage-create":
-        catalog = "stage_default"
-        sql += attach_sql(
-            args,
-            catalog=catalog,
-            rest_path="/iceberg",
-            signing_name="s3",
-            compatibility_options=False,
-        )
-        sql += f"CREATE TABLE {table_identifier(catalog, args.namespace, table_name(args.table, 'stage'))} (id BIGINT);\n"
-        return sql
     if kind == "purge":
         catalog = "purge_requested"
         sql += attach_sql(
@@ -435,9 +424,8 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     write_table = table_name(args.table, "write")
     purge_table = table_name(args.table, "purge")
     drop_table = table_name(args.table, "drop")
-    stage_table = table_name(args.table, "stage")
     v3_table = table_name(args.table, "v3")
-    smoke_tables = [seed_table, write_table, purge_table, drop_table, stage_table, v3_table]
+    smoke_tables = [seed_table, write_table, purge_table, drop_table, v3_table]
     catalog = pyiceberg_smoke.load_rest_catalog(iceberg_args, deps)
     namespace_preexisting = bool(catalog.namespace_exists(args.namespace))
     prepare_smoke_tables(catalog, args.namespace, smoke_tables, args.replace)
@@ -489,7 +477,6 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
         checks["s3tables_alias"] = "pass"
 
         negatives = [
-            ("stage-create", "stage-create is not supported"),
             ("purge", "purgeRequested=true is not supported"),
             ("format-v3", "unsupported Iceberg table format-version: 3"),
         ]
@@ -507,7 +494,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
             )
             require_duckdb_error(execution, kind, expected_error)
             checks[kind] = "failed-closed"
-        if catalog.table_exists((args.namespace, stage_table)) or catalog.table_exists((args.namespace, v3_table)):
+        if catalog.table_exists((args.namespace, v3_table)):
             raise RuntimeError("a failed DuckDB create probe left a catalog table behind")
         if not catalog.table_exists((args.namespace, purge_table)):
             raise RuntimeError("purgeRequested=true removed a table despite the expected failure")

@@ -76,6 +76,12 @@ setup = 'ecstore-base-stack'
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
 
+# The pool metadata placement regression composes the full erasure-heal
+# startup future and overflows the default Linux test-thread stack.
+[[profile.default.scripts]]
+filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+setup = 'ecstore-large-stack'
+
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
@@ -126,6 +132,12 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
+# The real object probe includes bucket creation and cleanup in its short
+# measurement budget. Keep competing storage fixtures outside that budget.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+threads-required = "num-test-threads"
+
 # Serialize the durable manual-transition checkpoint test across nextest's
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
 [[profile.default.overrides]]
@@ -152,8 +164,17 @@ test-group = 'ecstore-serial-flaky'
 # deterministic commit barriers. Keep the whole init decommission family in one
 # nextest group; serial_test alone cannot isolate separate test processes.
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_.*|suspended_.*decommission.*)$/)'
 test-group = 'ecstore-serial-flaky'
+
+# The tier overwrite cleanup-owner matrix restarts a real 4-disk store and
+# drives free-version recovery through lifecycle expiry workers. Reserve the
+# full test budget so competing real-store fixtures cannot starve the walk's
+# filesystem progress deadlines. Keep the production deadlines and no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners)'
+test-group = 'ecstore-serial-flaky'
+threads-required = "num-test-threads"
 
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
 # init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
@@ -229,6 +250,12 @@ setup = 'ecstore-base-stack'
 [[profile.ci.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
 setup = 'lifecycle-large-stack'
+
+# The pool metadata placement regression composes the full erasure-heal
+# startup future and overflows the default Linux test-thread stack.
+[[profile.ci.scripts]]
+filter = 'package(rustfs-heal) & test(=replacement_pool_metadata_follows_real_two_set_placement)'
+setup = 'ecstore-large-stack'
 
 # ===========================================================================
 # QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.
@@ -306,6 +333,10 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+threads-required = "num-test-threads"
+
 # Serialize the durable manual-transition checkpoint test under the ci profile
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
@@ -323,8 +354,13 @@ filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_reg
 test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_.*|suspended_.*decommission.*)$/)'
 test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(tier_overwrite_put_and_self_copy_recover_persisted_cleanup_owners)'
+test-group = 'ecstore-serial-flaky'
+threads-required = "num-test-threads"
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
 # too (see the matching default-profile override near the top). No retries.
@@ -538,6 +574,13 @@ path = "junit.xml"
 [[profile.e2e-nightly.overrides]]
 filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'
+
+# The EC8+4 multi-set heal proof deliberately uploads a larger workload so the
+# background root-heal pass can be interrupted after targeting the replacement
+# drive's erasure slots. Keep the extended budget scoped to this proof case.
+[[profile.e2e-nightly.overrides]]
+filter = 'package(e2e_test) & test(=heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart)'
+slow-timeout = { period = "120s", terminate-after = 12, grace-period = "10s" }
 
 # ---------------------------------------------------------------------------
 # e2e-distributed profile — 4-node 4-disk Actions suite

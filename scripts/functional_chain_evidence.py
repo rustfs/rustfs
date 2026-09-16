@@ -15,7 +15,7 @@ import subprocess
 
 from resolve_functional_candidate import ROOT, positive, require, sha, validate_manifest
 
-SUITES = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication", "performance")
+SUITES = ("upgrade", "s3", "kms", "tier", "storage", "heal", "pool", "security", "replication", "fault-tolerance", "table", "performance")
 MAX_REPORT = 8 * 1024 * 1024
 
 
@@ -85,6 +85,29 @@ def report_counts(text, performance=False):
     return counts
 
 
+def fault_tolerance_counts(text):
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "UNSUPPORTED": 0, "RUNNING": 0}
+    statuses = {"pass": "PASS", "known-divergence": "UNSUPPORTED", "UNEXPECTED": "FAIL"}
+    cases = set()
+    summary = None
+    for line in text.splitlines():
+        if line.startswith("FT-CASE:"):
+            match = re.fullmatch(r"FT-CASE:\s+(\S+)\s+verdict=(\S+)\s+.*", line)
+            require(match is not None and summary is None, "invalid or late fault-tolerance case")
+            case, status = match.groups()
+            require(case not in cases and status in statuses, "duplicate or unknown fault-tolerance case result")
+            cases.add(case)
+            counts[statuses[status]] += 1
+        elif line.startswith("FT-SUMMARY:"):
+            match = re.fullmatch(r"FT-SUMMARY: unexpected=(\d+) known-divergence=(\d+) strict=([01])", line)
+            require(match is not None and summary is None, "invalid or duplicate fault-tolerance summary")
+            summary = tuple(map(int, match.groups()))
+    require(cases and summary is not None, "missing completed fault-tolerance evidence")
+    require(summary[:2] == (counts["FAIL"], counts["UNSUPPORTED"]), "fault-tolerance summary disagrees with cases")
+    require(not summary[2] or not counts["UNSUPPORTED"], "strict fault-tolerance run has known divergence")
+    return counts
+
+
 def record(chain, suite, report, output):
     require(suite in SUITES, "unknown suite")
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
@@ -95,7 +118,8 @@ def record(chain, suite, report, output):
         require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
         data = report.read_bytes()
         result["report_sha256"] = hashlib.sha256(data).hexdigest()
-        result["counts"] = report_counts(data.decode("utf-8"), suite == "performance")
+        text = data.decode("utf-8")
+        result["counts"] = fault_tolerance_counts(text) if suite == "fault-tolerance" else report_counts(text, suite == "performance")
         require(result["counts"]["PASS"] > 0 and not result["counts"]["FAIL"] and not result["counts"]["RUNNING"], "no passing executions or incomplete/failed cases")
         require(all(os.environ[key] == "success" for key in ("CHAIN_JOB_STATUS", "CHAIN_TEST_OUTCOME", "CHAIN_REPORT_OUTCOME")), "suite, report or job did not succeed")
         result["valid"] = True
@@ -162,18 +186,24 @@ def render_summary(result):
     return "\n".join(lines) + "\n"
 
 
-def aggregate(chain, directory, needs):
+def aggregate(chain, directory, needs, allow_skipped=()):
+    allowed = {name for name in allow_skipped if name}
+    require(allowed <= set(SUITES), "aggregate allow-list names an unknown lane")
     require(set(needs) == set(SUITES), "aggregate is missing a required lane")
-    require(all(value.get("result") == "success" for value in needs.values()), "a required suite did not succeed")
-    require({path.name for path in directory.iterdir()} == {suite + ".json" for suite in SUITES}, "missing or unexpected suite evidence")
-    records = [json.loads((directory / (suite + ".json")).read_text()) for suite in SUITES]
-    validate_records(chain, records)
-    return {"schema": 1, "chain": chain, "suites": records, "complete": True, "completed_at": datetime.now(timezone.utc).isoformat()}
+    skipped = {name for name, value in needs.items() if value.get("result") == "skipped"}
+    require(skipped <= allowed, "a lane was skipped without preflight permission: " + ", ".join(sorted(skipped - allowed)))
+    require(all(value.get("result") == "success" for name, value in needs.items() if name not in skipped), "a required suite did not succeed")
+    expected = [suite for suite in SUITES if suite not in skipped]
+    require({path.name for path in directory.iterdir()} == {suite + ".json" for suite in expected}, "missing or unexpected suite evidence")
+    records = [json.loads((directory / (suite + ".json")).read_text()) for suite in expected]
+    validate_records(chain, records, expected)
+    return {"schema": 1, "chain": chain, "suites": records, "complete": True,
+            "skipped_lanes": sorted(skipped), "completed_at": datetime.now(timezone.utc).isoformat()}
 
 
-def validate_records(chain, records):
-    require(isinstance(records, list) and len(records) == len(SUITES), "missing suite evidence")
-    require([record.get("suite") for record in records] == list(SUITES), "missing, duplicate or reordered suite evidence")
+def validate_records(chain, records, expected_suites=SUITES):
+    require(isinstance(records, list) and len(records) == len(expected_suites), "missing suite evidence")
+    require([record.get("suite") for record in records] == list(expected_suites), "missing, duplicate or reordered suite evidence")
     for suite, result in zip(SUITES, records):
         require(type(result.get("schema")) is int and result["schema"] == 1 and result.get("suite") == suite and result.get("chain") == chain, "suite evidence identity mismatch")
         require(result.get("valid") is True and sha(result.get("report_sha256"), 64), "suite evidence is invalid")
@@ -189,6 +219,8 @@ def main():
     parser.add_argument("--report", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--directory", type=Path)
+    parser.add_argument("--allow-skipped", default="",
+                        help="comma-separated lanes the preflight deliberately skipped (e.g. performance)")
     args = parser.parse_args()
     if args.mode == "summarize":
         chain = current_chain() if os.environ.get("CHAIN_MANIFEST") else None
@@ -207,7 +239,7 @@ def main():
     else:
         needs = json.loads(os.environ["CHAIN_NEEDS"])
         needs.pop("prepare", None)
-        result = aggregate(chain, args.directory, needs)
+        result = aggregate(chain, args.directory, needs, args.allow_skipped.split(","))
         args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
 
 

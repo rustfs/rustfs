@@ -924,7 +924,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
     responses: &[Option<Vec<ObjectPartInfo>>],
     read_quorum: usize,
 ) -> disk::error::Result<ObjectPartInfo> {
-    let mut part_quorum: HashMap<(&str, usize, usize, i64), (usize, &ObjectPartInfo)> = HashMap::new();
+    let mut part_quorum = HashMap::new();
     let mut present_count = 0usize;
     let mut missing_count = 0usize;
     let mut transient_error_count = 0usize;
@@ -943,7 +943,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         if !parts[part_idx].etag.is_empty() {
             present_count += 1;
             let part = &parts[part_idx];
-            let key = (part.etag.as_str(), part.number, part.size, part.actual_size);
+            let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
             let (count, _) = part_quorum.entry(key).or_insert((0, part));
             *count += 1;
             continue;
@@ -1323,9 +1323,9 @@ pub(in crate::set_disk) struct BitrotReaderSetup {
     /// readers. The lockstep GET decode uses them to open a parity shard
     /// aligned to the stripe where a data shard failed (backlog#923).
     pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
-    /// Factories for a fresh, stripe-aligned parity reader. CopySource hedges
-    /// use these disposable readers so an abandoned hedge leaves the original
-    /// deferred reserve untouched.
+    /// Factories for fresh, stripe-aligned readers. CopySource uses disposable
+    /// parity readers; multi-stripe GETs can recover a previously hedged slot
+    /// when another disk subsequently fails.
     pub(in crate::set_disk) deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
@@ -1420,6 +1420,40 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 }
 
 impl BitrotReaderSetup {
+    pub(in crate::set_disk) fn bind_integrity(
+        &mut self,
+        expected: Option<&rustfs_filemeta::shard_integrity::PartIntegrity>,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        first_stripe: usize,
+    ) -> std::io::Result<()> {
+        use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+        let Some(expected) = expected else { return Ok(()) };
+        let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+        for (index, reader) in self.readers.iter_mut().enumerate() {
+            if let Some(reader) = reader {
+                let advanced = self.deferred_stripe_handles[index]
+                    .as_ref()
+                    .map(DeferredReaderStripeHandle::integrity_position);
+                reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first_stripe, advanced)?)?;
+            }
+            if let Some(reopen) = self.deferred_reopeners[index].take() {
+                let proof = Arc::clone(&proof);
+                self.deferred_reopeners[index] = Some(Arc::new(move |stripe| {
+                    let mut reader = reopen(stripe)?;
+                    let first = first_stripe.checked_add(stripe)?;
+                    reader
+                        .set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first, None).ok()?)
+                        .ok()?;
+                    Some(reader)
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
@@ -1680,9 +1714,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // reopener. Otherwise a recovered slow data read can cancel and consume
     // the only parity reserve needed by a later degraded stripe.
     let demand_bound_lockstep = crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
+    let preserve_hedged_readers = !demand_bound_lockstep && read_length > shard_size;
 
     for idx in 0..disks.len() {
-        if setup.attempted[idx] {
+        if setup.attempted[idx] && (!preserve_hedged_readers || setup.readers[idx].is_none()) {
             continue;
         }
 
@@ -1694,7 +1729,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = demand_bound_lockstep.then(|| {
+        let reopener = (demand_bound_lockstep || preserve_hedged_readers).then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -1708,6 +1743,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 use_mmap_read,
             )
         });
+        setup.deferred_reopeners[idx] = reopener;
+        if setup.attempted[idx] {
+            continue;
+        }
         let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
@@ -1721,7 +1760,6 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             use_mmap_read,
         );
         setup.retain_deferred_reader(idx, reader, stripe_handle);
-        setup.deferred_reopeners[idx] = reopener;
     }
 
     // With the data-shards-only lockstep gate on (backlog#923), the GET decode
@@ -3077,6 +3115,23 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, false).await
+    }
+
+    pub(crate) async fn load_file_info_versions_for_tier_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, true).await
+    }
+
+    async fn load_file_info_versions_for_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+        retain_unconfirmed_tier_references: bool,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
         let disk_object = rustfs_utils::path::encode_dir_object(object);
         let disks = self.get_disks_internal().await;
         if disks.is_empty() {
@@ -3152,12 +3207,24 @@ impl SetDisks {
             )));
         }
 
-        let file_info_versions = FileMeta {
+        let mut file_info_versions = FileMeta {
             versions,
             ..Default::default()
         }
         .get_all_file_info_versions(bucket, object, true)
         .map_err(decode_error)?;
+        if retain_unconfirmed_tier_references {
+            // A failed overwrite may leave its live source on a minority
+            // of disks. Preserve that reference even if quorum merging
+            // selects only the replacement and its cleanup owner.
+            file_info_versions.versions.extend(
+                transition_copies
+                    .into_values()
+                    .flatten()
+                    .map(|(version, _)| version)
+                    .filter(|version| !version.tier_free_version()),
+            );
+        }
 
         for file_info in file_info_versions
             .versions
@@ -5669,6 +5736,8 @@ impl SetDisks {
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         self.recover_part_transaction(dst_object, write_quorum).await?;
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        let integrity = part.integrity.map(Arc::new);
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5682,12 +5751,39 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
             let dst_object = dst_object.clone();
             let meta = meta.clone();
+            let integrity = integrity.clone();
             async move {
                 let disk = disk?;
-                Some(
-                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
-                        .await,
-                )
+                let prepared = disk
+                    .prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                    .await;
+                if let Err(error) = prepared {
+                    return Some(Err(error));
+                }
+                if let Some(integrity) = integrity {
+                    let Some((directory, _)) = dst_object.rsplit_once('/') else {
+                        return Some(Err(DiskError::FileCorrupt));
+                    };
+                    let path = format!("{directory}/{}", integrity.file_name());
+                    // Older peers may return Ok from PreparePart without moving
+                    // the index. They must not enter the protected write quorum.
+                    let result = async {
+                        let mut reader = disk
+                            .read_file_stream(&dst_bucket, &path, 0, rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE)
+                            .await?;
+                        let mut header = [0; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header)
+                            .await
+                            .map_err(DiskError::from)?;
+                        if header != integrity.index_header() {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    return Some(result);
+                }
+                Some(Ok(()))
             }
         });
         let prepare_results = join_all(prepare_tasks).await;
@@ -5950,6 +6046,20 @@ impl SetDisks {
         data_errs_by_part: &HashMap<usize, Vec<usize>>,
         opts: ObjectOptions,
     ) -> disk::error::Result<FileInfo> {
+        self.delete_if_dangling_with_proof(bucket, object, meta_arr, errs, data_errs_by_part, opts)
+            .await
+            .map(|(metadata, _)| metadata)
+    }
+
+    pub(in crate::set_disk) async fn delete_if_dangling_with_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        meta_arr: &[FileInfo],
+        errs: &[Option<DiskError>],
+        data_errs_by_part: &HashMap<usize, Vec<usize>>,
+        opts: ObjectOptions,
+    ) -> disk::error::Result<(FileInfo, bool)> {
         let (m, can_heal) = is_object_dangling(meta_arr, errs, data_errs_by_part);
 
         if !can_heal {
@@ -6036,11 +6146,17 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut futures = Vec::with_capacity(disks.len());
-        for disk_op in disks.iter() {
+        for (disk_index, disk_op) in disks.iter().enumerate() {
+            #[cfg(not(test))]
+            let _ = disk_index;
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
             futures.push(async move {
+                #[cfg(test)]
+                if let Some(error) = crate::set_disk::ops::heal::injected_dangling_delete_error(&bucket, &object, disk_index) {
+                    return Err(error);
+                }
                 if let Some(disk) = disk_op {
                     disk.delete_version(&bucket, &object, fi, false, DeleteOptions::default())
                         .await
@@ -6051,6 +6167,7 @@ impl SetDisks {
         }
 
         let results = join_all(futures).await;
+        let mut all_deleted = !results.is_empty();
         let mut delete_errs = Vec::with_capacity(results.len());
         for (index, result) in results.into_iter().enumerate() {
             let key = format!("ddisk-{index}");
@@ -6064,6 +6181,7 @@ impl SetDisks {
                     delete_errs.push(None);
                 }
                 Err(e) => {
+                    all_deleted &= matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound);
                     tags.insert(key, e.to_string());
                     if already_absent || matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound) {
                         delete_errs.push(None);
@@ -6083,7 +6201,30 @@ impl SetDisks {
             return Err(err);
         }
 
-        Ok(m)
+        // Quorum success alone may leave the only stale replica behind. The
+        // proof uses the same disk snapshot as deletion and exact-version reads.
+        let absent = if all_deleted {
+            match Self::read_all_fileinfo(
+                &disks,
+                "",
+                bucket,
+                object,
+                opts.version_id.as_deref().unwrap_or(""),
+                false,
+                false,
+                false,
+            )
+            .await
+            {
+                Ok((_, after)) => after
+                    .iter()
+                    .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound))),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        Ok((m, absent))
     }
 
     fn reduce_delete_prefix_results(results: Vec<disk::error::Result<()>>, write_quorum: usize) -> disk::error::Result<()> {
@@ -12212,6 +12353,64 @@ mod tests {
         let result = set.update_object_meta("bucket", "object", with_metadata, &[None, None]).await;
 
         assert!(result.is_err(), "missing disks must prevent metadata write quorum");
+    }
+
+    #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_unreadable_disk_despite_metadata_quorum() {
+        let bucket = "tier-unreadable-disk";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        for index in 1..=3 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            fi.erasure.index = index;
+            disk.write_metadata(bucket, bucket, object, fi.clone())
+                .await
+                .expect("seed metadata quorum");
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        disks.push(None);
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's unreadable-replica fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "unreadable replica may still reference the old remote object"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_minority_metadata_in_an_absent_set() {
+        let bucket = "tier-minority-metadata";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        for index in 1..=4 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            if index == 1 {
+                let mut fi = metadata_test_fileinfo(object);
+                fi.mod_time = Some(OffsetDateTime::now_utc());
+                disk.write_metadata(bucket, bucket, object, fi)
+                    .await
+                    .expect("seed minority metadata");
+            }
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's minority-ownership fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "absence on a majority cannot prove this physical set has no remote reference"
+        );
     }
 
     #[tokio::test]

@@ -1,14 +1,13 @@
 %global _enable_debug_packages 0
 %global _empty_manifest_terminate_build 0
-%global prerelease rc.6
 Name:           rustfs
-Version:        1.0.0
-Release:        rc.6
+Version:        1.0.1
+Release:        1
 Summary:       High-performance distributed object storage for MinIO alternative
 
 License:        Apache-2.0
 URL:            https://github.com/rustfs/rustfs
-Source0:        https://github.com/rustfs/rustfs/archive/refs/tags/%{version}-%{prerelease}.tar.gz
+Source0:        https://github.com/rustfs/rustfs/archive/refs/tags/%{version}.tar.gz
 
 BuildRequires: cargo
 BuildRequires: rust
@@ -27,7 +26,7 @@ BuildRequires: clang-devel
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
 
 %prep 
-%autosetup -n %{name}-%{version}-%{prerelease}
+%autosetup -n %{name}-%{version}
 
 %build
 # Set the target directory according to the schema
@@ -50,7 +49,7 @@ CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-l
 
 %install
 mkdir -p %buildroot/usr/bin/
-install %_builddir/%{name}-%{version}-%{prerelease}/target/%_arch/%_arch-unknown-linux-gnu/release/rustfs %buildroot/usr/bin/
+install %_builddir/%{name}-%{version}/target/%_arch/%_arch-unknown-linux-gnu/release/rustfs %buildroot/usr/bin/
 
 %files
 %license LICENSE
@@ -58,8 +57,14 @@ install %_builddir/%{name}-%{version}-%{prerelease}/target/%_arch/%_arch-unknown
 %_bindir/rustfs
 
 %changelog
-* Thu Sep 10 2026 overtrue <anzhengchao@gmail.com>
-- Update RPM package to RustFS 1.0.0-rc.6
+* Wed Sep 16 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.1
+
+* Wed Sep 16 2026 overtrue <anzhengchao@gmail.com>
+- Record the RustFS 1.0.0 stable release
+
+* Mon Sep 14 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0
 
 * Mon Aug 31 2026 overtrue <anzhengchao@gmail.com>
 - Update RPM package to RustFS 1.0.0-rc.5

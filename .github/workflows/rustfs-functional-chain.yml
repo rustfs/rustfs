@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Reusable workflows run from this driver's commit in one Actions run. Each
-# suite still runs after an earlier suite fails; the final job requires all ten.
+# suite still runs after an earlier suite fails; the final job requires all twelve.
 name: RustFS Functional Chain
 
 on:
@@ -46,6 +46,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       manifest: ${{ steps.candidate.outputs.manifest }}
+      performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -65,10 +66,25 @@ jobs:
           path: ${{ runner.temp }}/chain-candidate.json
           if-no-files-found: error
 
-      - name: Check shared functional runners before scheduling suites
+      - name: Check shared functional fleet runner before scheduling suites
+        # The eleven functional suites run on the smoke-testing fleet; a hard
+        # requirement. The performance lane runs on pf-testing, which is a
+        # separate fleet - probe it without failing the whole chain so an
+        # offline performance runner skips only the performance lane.
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: python3 scripts/check_functional_runners.py smoke-testing pf-testing
+        run: python3 scripts/check_functional_runners.py smoke-testing
+
+      - name: Probe performance fleet runner
+        id: perf_probe
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          if python3 scripts/check_functional_runners.py pf-testing; then
+            echo "performance_ready=online" >> "$GITHUB_OUTPUT"
+          else
+            echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
+          fi
 
   upgrade:
     needs: [prepare]
@@ -142,16 +158,32 @@ jobs:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
     secrets: inherit
 
-  performance:
+  fault-tolerance:
     needs: [prepare, replication]
     if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-fault-tolerance-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  table:
+    needs: [prepare, fault-tolerance]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-table-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  performance:
+    needs: [prepare, table]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}
     uses: ./.github/workflows/rustfs-performance-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
     secrets: inherit
 
   complete-chain:
-    needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, performance]
+    needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, fault-tolerance, table, performance]
     if: ${{ always() && needs.prepare.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -192,6 +224,7 @@ jobs:
           CHAIN_NEEDS: ${{ toJSON(needs) }}
         run: >-
           python3 scripts/functional_chain_evidence.py aggregate
+          --allow-skipped "${{ needs.prepare.outputs.performance_ready == 'online' && '' || 'performance' }}"
           --directory "${RUNNER_TEMP}/chain-evidence"
           --output "${RUNNER_TEMP}/chain-complete.json"
       - name: Upload complete-chain evidence

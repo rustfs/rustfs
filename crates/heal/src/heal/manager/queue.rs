@@ -81,6 +81,8 @@ pub(super) enum QueuePushOutcome {
 #[derive(Debug, Clone)]
 pub(super) struct CompletedHealStatus {
     pub(super) heal_type: HealType,
+    /// Options used to execute the task, retained for token-scoped status.
+    pub(super) options: HealOptions,
     pub(super) status: HealTaskStatus,
     pub(super) progress: Option<HealProgress>,
     pub(super) outcome: Option<Arc<HealTaskOutcome>>,
@@ -123,6 +125,17 @@ impl CompletedHealStatus {
                 add(bucket.capacity());
                 add(object.capacity());
                 add(version_id.as_ref().map_or(0, String::capacity));
+            }
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                purge,
+            } => {
+                add(bucket.capacity());
+                add(object.capacity());
+                add(version_id.capacity());
+                add(purge.marker.len());
             }
             HealType::Prefix { bucket, prefix } => {
                 add(bucket.capacity());
@@ -205,13 +218,22 @@ impl CompletedHealStatus {
     }
 
     pub(super) async fn snapshot(task: &HealTask, status: HealTaskStatus) -> Self {
-        let seqed_items = task.get_seqed_result_items().await;
-        let (next_seq, min_seq) = task.result_seq_cursors();
+        let (seqed_items, (next_seq, min_seq)) = {
+            // Freeze the window and its cursors together while a cancelled
+            // worker may still append its last result.
+            let items = task.result_items.read().await;
+            (items.iter().cloned().collect(), task.result_seq_cursors())
+        };
+        let mut outcome = task.get_outcome().await;
+        if status == HealTaskStatus::Cancelled {
+            outcome.finish(Some(crate::heal::outcome::HealAbortReason::Cancelled));
+        }
         let mut snapshot = Self {
             heal_type: task.heal_type.clone(),
+            options: task.options.clone(),
             status,
             progress: Some(task.get_progress().await),
-            outcome: Some(Arc::new(task.get_outcome().await)),
+            outcome: Some(Arc::new(outcome)),
             retained_bytes: std::sync::OnceLock::new(),
             result_items_truncated: task.result_items_truncated(),
             completed_at: SystemTime::now(),
@@ -432,10 +454,21 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     pub(super) fn make_dedup_key(request: &HealRequest) -> String {
-        let base = Self::make_dedup_key_for_type(&request.heal_type);
-        match (&request.heal_type, request.options.set_key()) {
-            (HealType::Object { .. } | HealType::ECDecode { .. }, Some(scope)) => format!("{base}:scope:{scope}"),
-            _ => base,
+        Self::make_dedup_key_for_scope(&request.heal_type, &request.options)
+    }
+
+    pub(super) fn make_dedup_key_for_scope(heal_type: &HealType, options: &HealOptions) -> String {
+        let base = Self::make_dedup_key_for_type(heal_type);
+        // Erasure-set keys already encode pool/set and are also queried by
+        // automatic replacement admission through contains_erasure_set.
+        if matches!(heal_type, HealType::ErasureSet { .. }) {
+            return base;
+        }
+        match heal_scope_indices(heal_type, options) {
+            (None, None) => base,
+            // A distinct leading tag cannot alias an unscoped S3 key that
+            // happens to contain the scope suffix as literal object bytes.
+            (pool, set) => format!("scope:{pool:?}:{set:?}:{base}"),
         }
     }
 
@@ -468,6 +501,17 @@ impl PriorityHealQueue {
             } => {
                 format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                purge,
+            } => format!(
+                "delete-marker-purge:{bucket}:{object}:{version_id}:{}:{}:{}",
+                purge.bucket_incarnation_id,
+                purge.marker_incarnation_id,
+                base64_simd::URL_SAFE_NO_PAD.encode_to_string(purge.marker_identity)
+            ),
         }
     }
 
@@ -491,14 +535,15 @@ impl PriorityHealQueue {
         self.heap.iter().map(|item| &item.request)
     }
 
+    #[cfg(test)]
     pub(super) fn contains_request_id(&self, request_id: &str) -> bool {
         self.heap.iter().any(|item| item.request.id == request_id)
     }
 
-    pub(super) fn contains_request_id_matching_path(&self, request_id: &str, heal_path: &str) -> bool {
-        self.heap
-            .iter()
-            .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
+    pub(super) fn request_matching_id_and_path(&self, request_id: &str, heal_path: Option<&str>) -> Option<&HealRequest> {
+        self.heap.iter().map(|item| &item.request).find(|request| {
+            request.id == request_id && heal_path.is_none_or(|path| heal_type_matches_path(&request.heal_type, path))
+        })
     }
 
     pub(super) fn queued_request_id_for_dedup_key(&self, key: &str) -> Option<&str> {

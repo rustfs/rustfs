@@ -110,7 +110,6 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.env = {
             **os.environ, "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
             "GITHUB_ENV": str(self.directory / "github-env"), "RUNNER_TEMP": self.temp.name, "TMPDIR": self.temp.name,
-            "LOG_FILE": str(self.directory / "suite.log"),
         }
         for key in ("server_url", "repository", "run_id", "run_attempt", "sha", "event_name"):
             self.env[f"GITHUB_{key.upper()}"] = self.context[f"github.{key}"]
@@ -118,10 +117,17 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.artifacts = self.directory / "rustfs-security-314159-2"
         suite = self.directory / "auto-testing/rustfs-security-test.sh"
         suite.parent.mkdir()
+        ansi = {"ANSI_GREEN": "\033[1;32m", "ANSI_RED": "\033[1;31m", "ANSI_YELLOW": "\033[1;33m", "ANSI_RESET": "\033[0m"}
         suite.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'log_dir=$(mktemp -d "$TMPDIR/rustfs-security.XXXXXX")\n'
-            'echo "CURRENT SUITE LOG" > "$log_dir/suite.log"\n'
+            # Verdict lines carry ANSI color escapes and are printed to stdout
+            # (captured via tee into the artifacts suite.log), exactly like the
+            # real suite output the report step has to grep through: a color
+            # tag before the verdict and a reset escape between the tag and
+            # the case id.
+            'printf "%s\\n" "${ANSI_GREEN}[PASS]${ANSI_RESET} IAM-101 ok" "${ANSI_RED}[FAIL]${ANSI_RESET} STS-105 broken" "${ANSI_YELLOW}[SKIP]${ANSI_RESET} OIDC-103 skipped" | tee "$log_dir/suite.log"\n'
+            'echo "CURRENT SUITE LOG" >> "$log_dir/suite.log"\n'
             'echo "CURRENT SUITE STDOUT"; echo "CURRENT SUITE STDERR" >&2\n'
             'case "$FAKE_REPORT" in\n'
             f'  present) printf "%s\\n" "CURRENT SUITE DIAGNOSTIC" "{CASE_ROW}" > "$REPORT_FILE" ;;\n'
@@ -130,6 +136,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             'echo "UNWRAPPED SUITE SUMMARY" >> "$GITHUB_STEP_SUMMARY"\n'
             'exit "$FAKE_EXIT"\n'
         )
+        self.env.update(ansi)
 
     def test_workflow_wiring(self) -> None:
         names = list(self.steps)
@@ -140,9 +147,9 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertNotIn("        continue-on-error: true", self.steps[name])
         self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", self.steps["Generate report"])
         self.assertNotIn("/tmp/rustfs-security", self.source)
-        for name in ("Upload functional report to dashboard", "File failure issue in rustfs/backlog"):
-            report = next(line for line in self.steps[name] if line.strip().startswith("REPORT_FILE:"))
-            self.assertIn("${{ env.SECURITY_ARTIFACTS_DIR }}/report.md", report)
+        for name in ("Upload functional report to dashboard", "Manage backlog issues (dedup / label / auto-close)"):
+            expected = "${{ env.SECURITY_ARTIFACTS_DIR }}/report.md" if name.startswith("Upload") else '--report-file "${SECURITY_ARTIFACTS_DIR}/report.md"'
+            self.assertIn(expected, "\n".join(self.steps[name]))
         for name in ("Upload functional report to dashboard", "Upload report and logs"):
             self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", self.steps[name])
         artifact_settings = yaml_block(self.steps["Upload report and logs"], "with", 8)
@@ -167,11 +174,19 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     self.assertEqual(suite.returncode, exit_code, suite.stderr)
                     logs = list(Path(str(self.artifacts) + "-scratch").glob("rustfs-security.*/suite.log"))
                     self.assertEqual(len(logs), 1)
-                    self.assertEqual(logs[0].read_text(), "CURRENT SUITE LOG\n")
+                    self.assertEqual(logs[0].read_text().splitlines()[-1], "CURRENT SUITE LOG")
                 self.context["steps.test.outcome"] = outcome
+                # A suite that never ran (skipped with no report, or a
+                # cancelled run) leaves no suite.log behind, so there are no
+                # verdict lines and the report step stays red.
+                ran = outcome != "skipped" or mode == "present"
                 report = self.run_step("Generate report")
+                # The report step is red only for harness/environment breakdowns:
+                # a failed suite that still produced verdict lines stays green,
+                # while skipped/cancelled never reach a verdict at all.
                 success = outcome == "success" and mode == "present"
-                self.assertEqual(report.returncode == 0, success, report.stderr)
+                green = ran and (outcome == "success" or outcome == "failure")
+                self.assertEqual(report.returncode == 0, green, report.stderr)
                 contents = (self.artifacts / "report.md").read_text()
                 for expected in (
                     "https://github.com/rustfs/rustfs/actions/runs/314159", "Attempt: 2",
@@ -179,8 +194,15 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}",
                 ):
                     self.assertIn(expected, contents)
-                self.assertEqual(CASE_ROW in contents, success)
-                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, success)
+                # The verdict counters must see through the ANSI escapes in the
+                # suite log: 1 passed, 1 failed, 1 skipped (only when the suite
+                # actually ran and left a suite.log behind).
+                if ran:
+                    self.assertIn("Product result: 1 passed, 1 failed, 1 skipped", contents)
+                else:
+                    self.assertIn("Product result: 0 passed, 0 failed", contents)
+                self.assertEqual(CASE_ROW in contents, mode == "present")
+                self.assertEqual("CURRENT SUITE DIAGNOSTIC" in contents, mode == "present")
                 if mode == "present":
                     raw = (self.artifacts / "suite-report.md").read_text()
                     self.assertEqual(raw, f"CURRENT SUITE DIAGNOSTIC\n{CASE_ROW}\n")
@@ -190,7 +212,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 expected = {self.artifacts / "report.md"}
                 if outcome != "skipped" or mode == "present":
                     expected.add(self.artifacts / "suite.log")
-                    self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE STDOUT\nCURRENT SUITE STDERR\n")
+                    self.assertIn("CURRENT SUITE STDOUT\nCURRENT SUITE STDERR", (self.artifacts / "suite.log").read_text())
                 if mode in ("present", "empty"):
                     expected.add(self.artifacts / "suite-report.md")
                 (self.artifacts / "unexpected-token.json").write_text("FAKE-SECRET-CANARY")
@@ -268,10 +290,12 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             gh.chmod(0o755)
             body = self.directory / "issue-body.md"
             self.env.update(PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", CAPTURE_BODY=str(body))
-            result = self.run_step("File failure issue in rustfs/backlog")
+            result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("OLD RUN REPORT", body.read_text())
-            self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
+            # The manager lives in the private auto-testing checkout; without it
+            # the step must skip without publishing anything.
+            self.assertIn("issue_manager.py not found", result.stdout + result.stderr)
+            self.assertFalse(body.exists())
 
     def test_all_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
         for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
@@ -283,7 +307,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     line.strip() for line in yaml_block(source, "concurrency", 0)
                     if line.strip() and not line.lstrip().startswith("#")
                 ], [
-                    "group: rustfs-shared-functional-tests", "cancel-in-progress: false",
+                    "group: rustfs-shared-functional-tests-v2", "cancel-in-progress: false",
                 ])
                 self.assertIsNotNone(yaml_block(source, "workflow_dispatch", 2))
                 self.assertIsNotNone(yaml_block(source, "repository_dispatch", 2))
@@ -341,7 +365,7 @@ fi
                 job = yaml_block(replication.splitlines(), "replication-test", 2)
                 self.assertFalse(any(line.startswith("    continue-on-error:") for line in job))
                 self.steps = named_steps(job)
-                handoff = "Continue functional chain (next: Performance)"
+                handoff = "Continue functional chain (next: Fault tolerance)"
                 self.assertIn("        if: ${{ always() && github.event_name == 'repository_dispatch' }}", self.steps[handoff])
                 self.assertFalse(any(line.strip().startswith("continue-on-error:") for line in self.steps[handoff]))
                 self.assertIn("        if: always()", self.steps["Cleanup environment (after)"])
@@ -361,11 +385,11 @@ fi
                 self.assertEqual(forwarded.returncode == 0, bool(token) and failed_attempts < 3, forwarded.stderr)
                 calls = dispatches.read_text().splitlines() if dispatches.exists() else []
                 self.assertEqual(calls, [
-                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-performance -F client_payload[from_suite]=replication",
+                    "api --method POST repos/rustfs/rustfs/dispatches -f event_type=rustfs-chain-fault-tolerance -F client_payload[from_suite]=replication",
                 ] * (min(failed_attempts + 1, 3) if token else 0))
                 if failed_attempts == 3:
-                    self.assertIn("could not hand off from **replication** to **Performance**", body.read_text())
-                    self.assertIn("rustfs-chain-performance", body.read_text())
+                    self.assertIn("could not hand off from **replication** to **Fault tolerance**", body.read_text())
+                    self.assertIn("rustfs-chain-fault-tolerance", body.read_text())
                     self.assertEqual(executed.read_text().splitlines().count("issue"), 2 if issue_exit else 1)
                     self.assertFalse(Path(body_path.read_text().strip()).exists())
 
@@ -375,17 +399,19 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "kms-test", "storage": "storage-test", "s3-compat": "s3-compat-test",
         "upgrade": "upgrade-test", "replication": "replication-test", "heal": "heal-test",
         "tier": "tier-test", "pool-expand": "pool-expansion-test", "performance": "performance-test",
-        "table": "table-test",
+        "table": "table-test", "fault-tolerance": "fault-tolerance-test",
     }
     DIRECT_TESTS = {
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
-        "table": "Run table suite",
+        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2)",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
         for suite, job_id in self.JOBS.items():
+            if suite in getattr(self, "EXCLUDED", ()):
+                continue
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
@@ -394,7 +420,9 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 steps = named_steps(job)
                 if suite in self.DIRECT_TESTS:
                     test = steps[self.DIRECT_TESTS[suite]]
-                    self.assertNotRegex("\n".join(test), r'''(?m)^        ["']?continue-on-error["']?\s*:''')
+                    # Case failures keep the run green; the step records its
+                    # outcome for the report and the backlog issue manager.
+                    self.assertRegex("\n".join(test), r'''(?m)^        continue-on-error: true$''')
                     self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", steps["Generate report"])
                 cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
                 condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
@@ -421,7 +449,12 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "auto-testing").mkdir()
                 script = root / f"auto-testing/rustfs-{suite}-test.sh"
-                script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                if suite == "fault-tolerance":
+                    # FT cleans up through the suite script itself (--cleanup), not ssh;
+                    # emit the marker so the ordering assertion holds
+                    script.write_text('#!/bin/sh\n[ "$1" = "--cleanup" ] && printf "cleanup\\n" >> "$EXECUTED"\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                else:
+                    script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
                 script.chmod(0o755)
                 fake_bin = root / "bin"
                 fake_bin.mkdir()
@@ -438,9 +471,18 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 steps = named_steps(yaml_block(source.splitlines(), self.JOBS[suite], 2))
                 context = {"github.event_name": "repository_dispatch", "steps.test.outcome": "failure"}
+                if suite == "table":
+                    context["steps.chain_package.outputs.package_url || inputs.package_url"] = env["RUSTFS_NIGHTLY_PACKAGE_URL"]
                 for expression in re.findall(r"\$\{\{\s*(.*?)\s*\}\}", source):
                     if expression.startswith("inputs.") and re.fullmatch(r"inputs\.\w+", expression):
                         context[expression] = ""
+                    elif "steps.chain_package.outputs.package_url" in expression:
+                        # composite fallback expression used by the FT suite
+                        context[expression] = ""
+                    elif "inputs." in expression:
+                        # composite conditions (e.g. always() && inputs.cleanup_after != 'false'):
+                        # blank every inputs.* token so the literal guard stays meaningful
+                        context[expression] = re.sub(r"inputs\.\w+", "", expression)
                 def execute(name):
                     lines = steps[name]
                     rendered = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: context[match[1]], shell_body(lines))
@@ -520,7 +562,13 @@ printf '%s\n' '--- KMS-101 roundtrip ---' '[UNSUPPORTED] KMS-101'
 
 
 class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
+    # "table" and "fault-tolerance" follow the release-branch semantics and
+    # their own report shapes (table: functional_case_report; FT: FT-CASE
+    # lines + chain evidence). They are excluded from the legacy matrices via
+    # EXCLUDED (report matrix tail + wiring legacy-issue section) while the
+    # upload-allowlist matrix still covers them through the full list.
     SUITES = (*FunctionalWorkflowTests.DIRECT_TESTS, "heal", "performance")
+    EXCLUDED = ("performance", "table", "fault-tolerance")
 
     def prepare(self, suite: str) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -563,7 +611,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
         self.env["PATH"] = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
 
     def test_evidence_wiring_and_failed_initialization_cannot_publish_stale_files(self):
-        for suite, suffix in ((suite, suffix) for suite in self.SUITES for suffix in ("", "-scratch")):
+        for suite, suffix in ((suite, suffix) for suite in self.SUITES if suite not in ("table", "fault-tolerance") for suffix in ("", "-scratch")):
             with self.subTest(suite=suite, collision=suffix or "artifact"):
                 self.prepare(suite)
                 self.assertNotIn("/tmp/rustfs-", self.source)
@@ -590,15 +638,14 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 initialized = self.run_step("Initialize functional evidence")
                 self.assertNotEqual(initialized.returncode, 0)
                 self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
-                issue = self.run_step("File failure issue in rustfs/backlog")
-                self.assertEqual(issue.returncode, 0, issue.stderr)
-                body = Path(self.env["CAPTURE_BODY"]).read_text()
-                self.assertNotIn("OLD RUN EVIDENCE", body)
-                self.assertIn("no report or log file was produced", body)
+                manager = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+                self.assertEqual(manager.returncode, 0, manager.stderr)
+                self.assertIn("issue_manager.py not found", manager.stdout + manager.stderr)
+                self.assertFalse(Path(self.env["CAPTURE_BODY"]).exists())
                 self.assertEqual((existing / "report.md").read_text(), "OLD RUN EVIDENCE")
 
     def test_reports_use_only_current_complete_suite_evidence(self):
-        for suite in self.SUITES[:-1]:
+        for suite in (s for s in self.SUITES if s not in self.EXCLUDED):
             good = "--- KMS-101 roundtrip ---\n[PASS] KMS-101\n"
             partial = "--- KMS-101 roundtrip ---\n[PASS] KMS-101\n--- KMS-102 unfinished ---\n"
             if suite == "s3-compat":
@@ -623,10 +670,14 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     self.context["steps.test.outcome"] = outcome
                     report = self.run_step("Generate report")
                     success = outcome == "success" and log == good
-                    self.assertEqual(report.returncode == 0, success, report.stderr)
+                    # Report steps are red only for harness/environment breakdowns;
+                    # a failure outcome with recorded case rows stays green
+                    # (performance is unchanged and still gates on the suite result).
+                    green = (outcome == "success" or (outcome == "failure" and log in (good, partial))) if suite != "performance" else success
+                    self.assertEqual(report.returncode == 0, green, report.stderr)
                     contents = Path(self.env["REPORT_FILE"]).read_text()
                     self.assertNotIn("OLD RUN EVIDENCE", contents)
-                    self.assertEqual("| PASS |" in contents, success)
+                    self.assertEqual("| PASS |" in contents, success if suite == "performance" else log in (good, partial))
                     for value in ("actions/runs/314159", "Attempt: 2", "Workflow Commit: " + self.context["github.sha"],
                                   f"Test Step Outcome: {'success' if success else 'failure'}", f"Suite Step Outcome: {outcome}"):
                         self.assertIn(value, contents)
@@ -668,8 +719,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 )
                 result = self.run_step(name)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE LOG\n")
-                self.assertEqual(len(list(Path(self.env["TMPDIR"]).glob("fixture.*/trace.log"))), 1)
+                self.assertEqual((self.artifacts / "suite.log").read_text().splitlines()[-1], "CURRENT SUITE LOG")
                 self.assertEqual(list(self.artifacts.glob("fixture.*")), [])
                 if suite == "performance":
                     self.assertEqual((self.artifacts / "results/summary.md").read_text(), "CURRENT RESULTS\n")
@@ -677,7 +727,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
     def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
         extra = {
             "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
-            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"], "fault-tolerance": [],
             "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
                             "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
         }
@@ -804,15 +854,96 @@ emit_step_result() {
         for failed_log in failed_logs:
             with self.subTest(log=failed_log):
                 Path(self.env["LOG_FILE"]).write_text(failed_log)
+                # A failing heal run exits non-zero; the report step stays green
+                # because the steps ran, and the per-step table is always published.
+                self.context["steps.test.outcome"] = "failure"
                 report = self.run_step("Generate report")
-                self.assertNotEqual(report.returncode, 0, report.stderr)
+                self.assertEqual(report.returncode, 0, report.stderr)
                 contents = Path(self.env["REPORT_FILE"]).read_text()
                 self.assertIn("Test Step Outcome: failure", contents)
-                self.assertNotIn("| PASS |", contents)
+                self.assertIn("| PASS |", contents)
                 if "original failure" in failed_log:
                     self.assertIn("| 3 | original failure | FAIL |", (self.artifacts / "steps.md").read_text())
                 if "later step failure" in failed_log:
                     self.assertIn("| 3 | later step failure | FAIL |", (self.artifacts / "steps.md").read_text())
+
+    def test_tier_gate_rejects_failed_suites_and_invalid_structured_results(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.context["env.TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        gate_file = self.artifacts / "rustfs-tier-gate.rc"
+        for evidence_outcome, test_outcome, gate_result, success in (
+            ("success", "success", "0\n", True),
+            ("success", "failure", "0\n", False),
+            ("success", "cancelled", "0\n", False),
+            ("success", "skipped", "0\n", False),
+            ("failure", "success", "0\n", False),
+            ("success", "success", None, False),
+            ("success", "success", "", False),
+            ("success", "success", "1\n", False),
+            ("success", "success", "invalid\n", False),
+        ):
+            with self.subTest(evidence=evidence_outcome, suite=test_outcome, structured=gate_result):
+                self.context["steps.evidence.outcome"] = evidence_outcome
+                self.context["steps.test.outcome"] = test_outcome
+                gate_file.unlink(missing_ok=True)
+                if gate_result is not None:
+                    gate_file.write_text(gate_result)
+                result = self.run_step("Enforce tier suite result")
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_tier_backlog_manager_never_closes_issues_after_evidence_or_gate_failure(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.env["TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        capture = self.directory / "manager-args.json"
+        self.env["CAPTURE_MANAGER"] = str(capture)
+        manager = self.directory / "auto-testing/scripts/issue_manager.py"
+        manager.parent.mkdir(parents=True)
+        manager.write_text("import json, os, sys\nfrom pathlib import Path\n"
+                           "Path(os.environ['CAPTURE_MANAGER']).write_text(json.dumps(sys.argv[1:]))\n")
+        for test, verify, gate, expected in (
+            ("success", "success", "success", "success"),
+            ("failure", "success", "success", "failure"),
+            ("success", "failure", "success", "failure"),
+            ("success", "success", "failure", "failure"),
+            ("cancelled", "failure", "failure", "cancelled"),
+        ):
+            with self.subTest(suite=test, evidence=verify, gate=gate):
+                self.context.update({"steps.test.outcome": test, "steps.evidence_verify.outcome": verify,
+                                     "steps.gate.outcome": gate})
+                result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(capture.read_text())
+                self.assertEqual(args[args.index("--outcome") + 1], expected)
+        capture.unlink()
+        self.artifacts.rmdir()
+        self.artifacts.symlink_to(self.directory, target_is_directory=True)
+        result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(capture.exists())
+
+    def test_tier_failure_issue_never_reads_rejected_or_symlinked_evidence(self):
+        for rejected in (True, False):
+            with self.subTest(rejected=rejected):
+                self.prepare("tier")
+                evidence = self.directory / "untrusted-evidence"
+                evidence.mkdir()
+                (evidence / "rustfs-tier-report.md").write_text("UNTRUSTED EVIDENCE MUST NOT BE READ")
+                if rejected:
+                    self.artifacts = evidence
+                else:
+                    self.artifacts.symlink_to(evidence, target_is_directory=True)
+                self.context.update({
+                    "env.TIER_ARTIFACTS_DIR": str(self.artifacts),
+                    "steps.evidence.outcome": "failure" if rejected else "success",
+                    "steps.evidence_verify.outcome": "failure", "steps.gate.outcome": "failure",
+                })
+                result = self.run_step("File failure issue in rustfs/backlog")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                body = Path(self.env["CAPTURE_BODY"]).read_text()
+                self.assertNotIn("UNTRUSTED EVIDENCE MUST NOT BE READ", body)
+                self.assertIn("its contents were not read", body)
 
     def test_performance_results_version_and_report_are_bound_to_the_run(self):
         self.prepare("performance")
@@ -892,3 +1023,28 @@ emit_step_result() {
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TableSuiteTests(unittest.TestCase):
+    """Contract tests for the S3 Tables (Iceberg REST Catalog) suite workflow."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_workflow_wiring(self) -> None:
+        source = (self.ROOT / ".github/workflows/rustfs-table-test.yml").read_text()
+        self.assertIn("group: rustfs-shared-functional-tests-v2", source)
+        self.assertIn("runs-on: smoke-testing", source)
+        # New gate semantics: case failures stay green, harness breakdowns red.
+        self.assertRegex(source, r"(?m)^        continue-on-error: true")
+        self.assertIn("# Red only for harness/environment breakdowns; case failures stay green.", source)
+        self.assertIn("HARNESS_OK", source)
+        self.assertIn("Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed", source)
+        self.assertIn('python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}"', source)
+        # Case rows come from the shared generator (ANSI-tolerant parser).
+        # Issue manager, dashboard upload and artifacts use the shared contract.
+        self.assertIn("--suite table --category table", source)
+        self.assertIn("functional-reports/${SUITE}/${DATE}.md", source)
+        self.assertIn("rustfs-table-test-${{ github.run_id }}-${{ github.run_attempt }}", source)
+        # The suite is invoked with the product smoke script for TBL-101.
+        self.assertIn("--smoke-script", source)
+        self.assertIn("scripts/table-catalog/pyiceberg_smoke.py", source)

@@ -16,7 +16,7 @@ use super::checkpoint::CURRENT_CHECKPOINT_SCHEMA;
 use super::replacement::ReplacementCompletionProof;
 use super::*;
 
-async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
+pub(super) async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
     use super::super::{DiskOption, Endpoint, new_disk};
 
     let temp_dir = tempfile::TempDir::new().expect("create schema test directory");
@@ -83,6 +83,137 @@ fn replacement_intent_binds_a_generation_before_format() {
         ["bucket-a"],
         "recovery must retain the original positional bucket plan"
     );
+}
+
+fn replacement_candidate_state(task_id: &str) -> ResumeState {
+    ResumeState::replacement_intent(
+        task_id.to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+}
+
+#[test]
+fn replacement_recovery_merges_same_generation_replicas() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut stale = replacement_candidate_state(&task_id);
+    stale.replacement_revision = 4;
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(stale, "http://survivor-a/recovery", false).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+
+    let mut latest = replacement_candidate_state(&task_id);
+    latest.replacement_revision = 5;
+    latest.processed_objects = 7;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(latest, "http://survivor-b/recovery", true).expect("valid candidate"),
+    )
+    .expect("same generation replica should be merged");
+
+    let selected = current.expect("a canonical candidate should remain");
+    assert_eq!(selected.state.replacement_revision, 5);
+    assert_eq!(selected.state.processed_objects, 7);
+    assert_eq!(selected.anchor, "http://survivor-b/recovery");
+}
+
+#[test]
+fn replacement_recovery_rejects_ambiguous_equal_revision_copies() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut left = replacement_candidate_state(&task_id);
+    left.replacement_revision = 2;
+    let mut right = left.clone();
+    right.processed_objects = 1;
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(left, "survivor-a", false).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+    let error = merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(right, "survivor-b", false).expect("valid candidate"),
+    )
+    .expect_err("equal revisions with divergent progress must remain a typed conflict");
+    assert!(matches!(error, Error::ReplacementGenerationConflict { .. }));
+}
+
+#[test]
+fn replacement_recovery_rejects_different_generation_binding() {
+    let task_id = Uuid::new_v4().to_string();
+    let first = replacement_candidate_state(&task_id);
+    let mut second = first.clone();
+    second.replacement_targets = vec!["replacement-b".to_string()];
+    second.replacement_target_identities[0].endpoint = "replacement-b".to_string();
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(first, "survivor-a", true).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+    let error = merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(second, "survivor-b", true).expect("candidate shape is still valid"),
+    )
+    .expect_err("different target slots must not be merged");
+    assert!(matches!(error, Error::ReplacementGenerationConflict { .. }));
+}
+
+#[test]
+fn exhausted_replacement_is_probeable_without_losing_failed_progress() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut state = replacement_candidate_state(&task_id);
+    state.replacement_phase = ReplacementPhase::Rebuilding;
+    state.retry_count = state.max_retries;
+    state.skipped_objects = 24;
+    assert!(replacement_retry_is_exhausted_active(&state));
+
+    state.failed_objects = 1;
+    assert!(replacement_retry_is_exhausted_active(&state));
+}
+
+#[test]
+fn exhausted_legacy_transient_skip_is_rearmed_only_once() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut state = replacement_candidate_state(&task_id);
+    state.replacement_phase = ReplacementPhase::Rebuilding;
+    state.retry_count = state.max_retries;
+    state.error_message = Some(
+        "Transient heal skip: Replacement erasure set heal incomplete: 0 bucket(s) failed, 0 object(s) failed, 24 object(s) skipped; retry scheduled"
+            .to_string(),
+    );
+    state.replacement_legacy_retry_compatibility_done = false;
+    assert!(replacement_retry_is_legacy_transient_skip(&state));
+
+    state.replacement_legacy_retry_compatibility_done = true;
+    assert!(!replacement_retry_is_legacy_transient_skip(&state));
+}
+
+#[test]
+fn readiness_aware_retry_marker_defaults_old_schema_seven_intents_to_legacy() {
+    let task_id = Uuid::new_v4().to_string();
+    let current = replacement_candidate_state(&task_id);
+    assert!(current.replacement_legacy_retry_compatibility_done);
+
+    let mut encoded = serde_json::to_value(current).expect("serialize current replacement intent");
+    encoded
+        .as_object_mut()
+        .expect("replacement intent is a JSON object")
+        .remove("replacement_legacy_retry_compatibility_done");
+    let legacy: ResumeState = serde_json::from_value(encoded).expect("deserialize prior schema-seven replacement intent");
+
+    assert!(!legacy.replacement_legacy_retry_compatibility_done);
 }
 
 #[tokio::test]
@@ -394,6 +525,7 @@ async fn torn_intent_recovery_cas_preserves_a_concurrent_valid_binding() {
             }],
         ))),
         throttle: Mutex::new(PersistThrottle::new()),
+        persistence_lock: tokio::sync::Mutex::new(()),
         state_file: ResumeStateFile::ReplacementIntent,
     };
     let error = match loser.publish_new_replacement_intent(Some(expected)).await {
@@ -1415,6 +1547,142 @@ fn reset_for_retry_clears_progress_but_keeps_retry_budget() {
     assert_eq!(state.retry_count, 1, "retry budget must be preserved");
 }
 
+#[tokio::test]
+async fn replacement_readiness_deferral_rewinds_progress_without_spending_budget() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.processed_objects = 9;
+        state.skipped_objects = 4;
+        state.retry_count = 2;
+    }
+    manager
+        .save_state_strict()
+        .await
+        .expect("progress should persist before deferral");
+
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("readiness deferral should persist without incrementing retry count");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 2, "readiness deferral must not spend the in-budget counter");
+    assert_eq!(state.processed_objects, 0);
+    assert_eq!(state.skipped_objects, 0);
+    assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    assert!(!state.completed);
+    assert!(state.replacement_retry_waiting_for_target);
+    assert_eq!(state.error_message.as_deref(), Some(REPLACEMENT_TARGET_READINESS_DEFERRED));
+}
+
+#[tokio::test]
+async fn exhausted_replacement_deferral_reserves_one_bounded_retry() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.retry_count = state.max_retries;
+    }
+    manager.save_state_strict().await.expect("exhausted state should persist");
+
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("compatibility deferral should persist");
+    manager
+        .record_replacement_failure(
+            &Error::transient_skip("Replacement erasure set heal incomplete: target readiness deferred retry"),
+            99,
+        )
+        .await
+        .expect("task-level persistence must preserve a readiness deferral");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, state.max_retries.saturating_sub(1));
+    assert!(state.replacement_legacy_retry_compatibility_done);
+    assert!(state.replacement_retry_waiting_for_target);
+}
+
+#[tokio::test]
+async fn replacement_target_not_ready_failure_does_not_consume_budget() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.retry_count = 1;
+    }
+    manager.save_state_strict().await.expect("active state should persist");
+
+    manager
+        .record_replacement_failure(&Error::ReplacementTargetNotReady("target is restarting".to_string()), 99)
+        .await
+        .expect("target readiness should be persisted as a deferral");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 1);
+    assert!(state.replacement_retry_waiting_for_target);
+    assert_eq!(state.error_message.as_deref(), Some(REPLACEMENT_TARGET_READINESS_DEFERRED));
+}
+
 #[test]
 fn can_retry_is_bounded_by_max_retries() {
     let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), vec![]);
@@ -1600,6 +1868,152 @@ async fn test_resumestate_schema_v0_discarded_on_load() {
     assert_eq!(state.failed_objects, 0);
     assert!(!state.completed);
     temp_dir.close().expect("remove schema test directory");
+}
+
+#[tokio::test]
+async fn historical_null_progress_is_replayed_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut state = ResumeState::new(
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["pending-bucket".to_string()],
+    );
+    state.schema_version = 5;
+    state.resume_cursor = Some("dw1:old-page".to_string());
+    state.completed_buckets = vec!["completed-bucket".to_string()];
+    state.processed_objects = 5;
+    state.successful_objects = 5;
+    state.completed = true;
+    let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize schema 5").into(),
+    )
+    .await
+    .expect("persist old resume state");
+
+    let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
+    checkpoint.schema_version = 6;
+    checkpoint.current_bucket_index = 1;
+    checkpoint.current_object_index = 5;
+    checkpoint.processed_objects.insert(compose_key("versions/object.bin", None));
+    checkpoint.successful_objects = 5;
+    // Schema 6 used a digest over the canonical JSON with a null digest field.
+    let mut wire = serde_json::to_value(&checkpoint).expect("serialize schema 6");
+    let unsigned = serde_json::to_vec(&wire).expect("serialize unsigned schema 6");
+    wire["integrity_digest"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)));
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &checkpoint_path,
+        serde_json::to_vec(&wire).expect("serialize signed schema 6").into(),
+    )
+    .await
+    .expect("persist old checkpoint");
+
+    let restored = ResumeManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("load old resume state")
+        .get_state()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_RESUME_SCHEMA);
+    assert_eq!(restored.resume_cursor, None);
+    assert_eq!(restored.processed_objects, 0);
+    assert_eq!(restored.successful_objects, 0);
+    assert!(!restored.completed);
+    assert!(restored.completed_buckets.is_empty());
+    assert_eq!(
+        restored.pending_buckets,
+        ["completed-bucket", "pending-bucket"],
+        "formerly completed buckets must be rescanned too"
+    );
+    let restored = CheckpointManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("load old signed checkpoint")
+        .get_checkpoint()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+    assert!(
+        restored.processed_objects.is_empty(),
+        "ambiguous null coverage cannot survive the upgrade"
+    );
+    assert_eq!(restored.current_bucket_index, 0);
+    assert_eq!(restored.current_object_index, 0);
+    assert_eq!(restored.successful_objects, 0);
+    temp_dir.close().expect("remove upgrade fixture");
+}
+
+#[tokio::test]
+async fn legacy_replacement_null_coverage_cannot_reuse_a_completion_proof() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("persist replacement intent");
+    manager
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("persist the old completion proof");
+    let proof_path = replacement_completion_proof_path(&task_id);
+    let proof_path = proof_path.to_str().expect("proof path must be UTF-8");
+    let proof_before = disk
+        .read_all(RUSTFS_META_BUCKET, proof_path)
+        .await
+        .expect("read completion proof");
+    let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+    let intent_path = intent_path.to_str().expect("intent path must be UTF-8");
+    for phase in [
+        ReplacementPhase::Intent,
+        ReplacementPhase::Rebuilding,
+        ReplacementPhase::Verified,
+        ReplacementPhase::CleanupPending,
+    ] {
+        let mut legacy = manager.get_state().await;
+        legacy.schema_version = 5;
+        legacy.replacement_phase = phase;
+        legacy.completed = matches!(phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
+        let bytes = serde_json::to_vec(&legacy).expect("serialize old replacement state");
+        disk.write_all(RUSTFS_META_BUCKET, intent_path, bytes.clone().into())
+            .await
+            .expect("write old replacement state");
+        let error = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .err()
+            .expect("legacy replacement coverage must require explicit recovery");
+        assert!(
+            error.to_string().contains("legacy version coverage"),
+            "unexpected recovery error: {error}"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, intent_path)
+                .await
+                .expect("retained intent")
+                .as_ref(),
+            bytes
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, proof_path).await.expect("retained proof"),
+            proof_before,
+            "an upgrade must not discard the ownership/completion fence"
+        );
+    }
+    temp_dir.close().expect("remove replacement upgrade fixture");
 }
 
 #[tokio::test]

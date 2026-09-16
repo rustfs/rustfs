@@ -23,16 +23,17 @@ const MAX_OUTCOME_ITEMS: usize = 128;
 const MAX_OUTCOME_BYTES: usize = 64 * 1024;
 const MAX_OUTCOME_DETAIL_BYTES: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealObjectKind {
     Object,
     Metadata,
     Decode,
+    DeleteMarkerPurge,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HealObjectIdentity {
     pub kind: HealObjectKind,
     pub bucket: String,
@@ -44,16 +45,17 @@ pub struct HealObjectIdentity {
     pub set_index: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealDeferredReason {
     DanglingDeleteGrace,
+    RetiredMarkerProof,
     TransientUsageCache,
     TransientExistenceCheck,
     Deadline,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealFailureClass {
     Recoverable,
@@ -61,18 +63,22 @@ pub enum HealFailureClass {
     Permanent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
     content = "details",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum HealObjectDisposition {
     /// The legacy storage response does not prove the requested check or commit.
     Unknown,
     Repaired,
     VerifiedHealthy,
+    /// Authoritative metadata/presence proof only. This does not certify
+    /// payload integrity.
+    MetadataHealthy,
     AuthoritativelyAbsent,
     Deferred {
         reason: HealDeferredReason,
@@ -83,8 +89,8 @@ pub enum HealObjectDisposition {
     DryRunObserved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HealObjectOutcome {
     pub identity: HealObjectIdentity,
     pub disposition: HealObjectDisposition,
@@ -103,6 +109,7 @@ impl HealObjectReceipt {
             self.disposition,
             HealObjectDisposition::Repaired
                 | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::MetadataHealthy
                 | HealObjectDisposition::AuthoritativelyAbsent
         ) && self.identity.kind == expected.kind
             && self.identity.bucket == expected.bucket
@@ -125,7 +132,7 @@ impl HealObjectOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealTraversalCoverage {
     #[default]
@@ -180,6 +187,61 @@ pub struct HealTaskOutcome {
     retained_object_bytes: usize,
     #[serde(skip)]
     untraversable: bool,
+}
+
+impl<'de> Deserialize<'de> for HealTaskOutcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Snapshot {
+            execution: HealExecutionOutcome,
+            coverage: HealTraversalCoverage,
+            counters: HealOutcomeCounters,
+            objects: VecDeque<HealObjectOutcome>,
+            objects_truncated: bool,
+        }
+
+        let mut snapshot = Snapshot::deserialize(deserializer)?;
+        if snapshot.objects.len() > MAX_OUTCOME_ITEMS {
+            return Err(serde::de::Error::custom("heal outcome object window exceeds its limit"));
+        }
+        let mut retained_object_bytes = 0usize;
+        for object in &mut snapshot.objects {
+            object.identity.bucket.shrink_to_fit();
+            object.identity.object.shrink_to_fit();
+            if let Some(version) = &mut object.identity.version_id {
+                version.shrink_to_fit();
+            }
+            if let Some(detail) = &mut object.detail {
+                if detail.len() > MAX_OUTCOME_DETAIL_BYTES {
+                    return Err(serde::de::Error::custom("heal outcome detail exceeds its limit"));
+                }
+                detail.shrink_to_fit();
+            }
+            retained_object_bytes = retained_object_bytes.saturating_add(object.retained_bytes());
+        }
+        if retained_object_bytes > MAX_OUTCOME_BYTES {
+            return Err(serde::de::Error::custom("heal outcome bytes exceed their limit"));
+        }
+        let counters = &snapshot.counters;
+        let total = counters
+            .healed
+            .checked_add(counters.unchanged)
+            .and_then(|total| total.checked_add(counters.skipped))
+            .and_then(|total| total.checked_add(counters.failed));
+        if !counters.overflowed && (total != Some(counters.processed) || counters.unknown > counters.skipped) {
+            return Err(serde::de::Error::custom("heal outcome counters are inconsistent"));
+        }
+        Ok(Self {
+            execution: snapshot.execution,
+            coverage: snapshot.coverage,
+            counters: snapshot.counters,
+            objects: snapshot.objects,
+            objects_truncated: snapshot.objects_truncated,
+            retained_object_bytes,
+            untraversable: snapshot.execution == HealExecutionOutcome::Aborted(HealAbortReason::Untraversable),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -309,7 +371,9 @@ impl HealTaskOutcome {
         counters.overflowed |= !increment_counter(&mut counters.processed);
         let counter = match item.disposition {
             HealObjectDisposition::Repaired => &mut counters.healed,
-            HealObjectDisposition::VerifiedHealthy | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
+            HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::MetadataHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
             HealObjectDisposition::Failed(_) => &mut counters.failed,
             HealObjectDisposition::Unknown => {
                 counters.overflowed |= !increment_counter(&mut counters.unknown);
@@ -435,12 +499,45 @@ mod canonical_outcome_tests {
     }
 
     #[test]
+    fn persisted_outcome_rebuilds_accounting_and_enforces_window_boundaries() {
+        let mut outcome = HealTaskOutcome::default();
+        for _ in 0..MAX_OUTCOME_ITEMS {
+            outcome.record(item(HealObjectDisposition::Repaired));
+        }
+        outcome.finish(None);
+        let value = serde_json::to_value(&outcome).expect("bounded outcome");
+        let mut restored: HealTaskOutcome = serde_json::from_value(value.clone()).expect("restore bounded window");
+        assert_eq!(restored.retained_object_bytes, outcome.retained_object_bytes);
+        restored.record(item(HealObjectDisposition::Repaired));
+        assert_eq!(restored.objects.len(), MAX_OUTCOME_ITEMS);
+        assert!(restored.objects_truncated);
+        let mut oversized = value;
+        let extra = oversized["objects"][0].clone();
+        oversized["objects"].as_array_mut().expect("objects").push(extra);
+        assert!(serde_json::from_value::<HealTaskOutcome>(oversized).is_err());
+
+        let mut object = item(HealObjectDisposition::Repaired);
+        let fixed_bytes = object.retained_bytes() - object.identity.object.capacity();
+        object.identity.object = "x".repeat(MAX_OUTCOME_BYTES - fixed_bytes);
+        let mut outcome = HealTaskOutcome::default();
+        outcome.record(object);
+        outcome.finish(None);
+        assert_eq!(outcome.retained_object_bytes, MAX_OUTCOME_BYTES);
+        let mut value = serde_json::to_value(outcome).expect("exact byte boundary");
+        let restored: HealTaskOutcome = serde_json::from_value(value.clone()).expect("exact bound remains readable");
+        assert_eq!(restored.retained_object_bytes, MAX_OUTCOME_BYTES);
+        value["objects"][0]["identity"]["object"] = serde_json::json!("x".repeat(MAX_OUTCOME_BYTES - fixed_bytes + 1));
+        assert!(serde_json::from_value::<HealTaskOutcome>(value).is_err());
+    }
+
+    #[test]
     fn canonical_outcome_categories_have_one_terminal_count() {
         let mut outcome = HealTaskOutcome::default();
         for disposition in [
             HealObjectDisposition::Unknown,
             HealObjectDisposition::Repaired,
             HealObjectDisposition::VerifiedHealthy,
+            HealObjectDisposition::MetadataHealthy,
             HealObjectDisposition::AuthoritativelyAbsent,
             HealObjectDisposition::Deferred {
                 reason: HealDeferredReason::DanglingDeleteGrace,
@@ -453,7 +550,7 @@ mod canonical_outcome_tests {
             outcome.record(item(disposition));
         }
         let c = &outcome.counters;
-        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (8, 1, 2, 4, 1, 1));
+        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (9, 1, 3, 4, 1, 1));
         assert_eq!(c.processed, c.healed + c.unchanged + c.skipped + c.failed);
     }
 

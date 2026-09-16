@@ -38,6 +38,7 @@ const MAX_ORPHANS_REAPED_PER_WRITE: usize = 64;
 const MAX_ORPHAN_PROBES_PER_WRITE: usize = 128;
 const ORPHAN_PROBE_CONCURRENCY: usize = 32;
 const EVENT_QUOTA_LEDGER_SETTLEMENT: &str = "quota_ledger_settlement";
+const EVENT_QUOTA_ADMISSION: &str = "quota_admission";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
 
@@ -46,6 +47,8 @@ static FAIL_NEXT_LEDGER_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic:
 
 // Lock order: caller-held destination object/upload, bucket metadata
 // transaction (read), operation reservation, then quota ledger.
+// When Object Lock already holds the metadata transaction read lock, reuse
+// that guard: reacquiring it behind a waiting metadata writer would deadlock.
 
 #[cfg(not(any(test, feature = "test-util")))]
 const ORPHAN_MIN_AGE_SECONDS: i64 = 30;
@@ -210,7 +213,7 @@ pub(crate) struct QuotaContext {
     capability_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     snapshot_admission: Option<QuotaAdmission>,
     legacy_data_movement: bool,
-    metadata_guard: Option<NamespaceLockGuard>,
+    metadata_guard: Option<Arc<NamespaceLockGuard>>,
     pool_index: Option<usize>,
     set_index: Option<usize>,
 }
@@ -295,7 +298,7 @@ impl QuotaContext {
                     limit: quota_limit,
                 });
             }
-            if operation_guard.is_lock_lost() || metadata_guard.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost) {
+            if operation_guard.is_lock_lost() || metadata_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(StorageError::NamespaceLockQuorumUnavailable {
                     mode: "quota_reservation",
                     bucket: ledger_data.bucket.clone(),
@@ -332,7 +335,7 @@ struct LedgerReservationData {
 pub(crate) struct QuotaReservation {
     ledger: Option<LedgerReservationData>,
     operation_guard: Option<NamespaceLockGuard>,
-    metadata_guard: Option<NamespaceLockGuard>,
+    metadata_guard: Option<Arc<NamespaceLockGuard>>,
     capability_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     state: ReservationState,
 }
@@ -346,7 +349,7 @@ enum ReservationState {
 }
 
 impl QuotaReservation {
-    fn unlimited(metadata_guard: Option<NamespaceLockGuard>) -> Self {
+    fn unlimited(metadata_guard: Option<Arc<NamespaceLockGuard>>) -> Self {
         Self {
             ledger: None,
             operation_guard: None,
@@ -358,7 +361,7 @@ impl QuotaReservation {
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.operation_guard.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
-            || self.metadata_guard.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
+            || self.metadata_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
     }
 
     pub(crate) fn capability_proof_matches(&self) -> bool {
@@ -438,11 +441,12 @@ pub(crate) async fn begin(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     object: &str,
-    snapshot_admission: Option<QuotaAdmission>,
-    data_movement: bool,
+    opts: &ObjectOptions,
     pool_index: usize,
     set_index: usize,
 ) -> Result<QuotaContext> {
+    let snapshot_admission = opts.quota_admission;
+    let data_movement = opts.data_movement;
     if crate::bucket::utils::is_meta_bucketname(bucket) {
         return Ok(QuotaContext {
             store: None,
@@ -497,7 +501,7 @@ pub(crate) async fn begin(
         });
     }
 
-    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_in(ctx, bucket).await?;
+    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
     let (quota, bucket_incarnation, quota_revision) =
         metadata_sys::get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await?;
     if metadata_guard.is_lock_lost() {
@@ -513,6 +517,7 @@ pub(crate) async fn begin(
         .as_ref()
         .is_some_and(|quota| quota.has_unsupported_reservation_protocol())
     {
+        log_admission_rejected(bucket, object, "unsupported_reservation_protocol");
         return Err(StorageError::PartMissingOrCorrupt);
     }
     let durable_quota = quota.as_ref().filter(|quota| quota.uses_durable_reservations());
@@ -529,7 +534,16 @@ pub(crate) async fn begin(
         Some(quota) => match (quota.quota, snapshot_admission) {
             (Some(limit), Some(admission)) if admission.quota_limit() == limit => Some(admission),
             (Some(_), None) if data_movement => None,
-            (Some(_), _) => return Err(StorageError::PartMissingOrCorrupt),
+            (Some(_), _) => {
+                // A snapshot-protocol quota requires the request handler's
+                // admission on every write. Missing or mismatched admission
+                // means a caller rebuilt `ObjectOptions` without carrying it
+                // over (rustfs/rustfs#7674 lost it on CopyObject); fail closed
+                // but leave a diagnosable trace, because the storage error is
+                // the generic `PartMissingOrCorrupt`.
+                log_admission_rejected(bucket, object, "snapshot_quota_admission_missing");
+                return Err(StorageError::PartMissingOrCorrupt);
+            }
             (None, _) => None,
         },
         None => None,
@@ -902,6 +916,18 @@ async fn save_ledger_locked(
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn fail_next_quota_ledger_save_for_test() {
     FAIL_NEXT_LEDGER_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn log_admission_rejected(bucket: &str, object: &str, state: &'static str) {
+    warn!(
+        event = EVENT_QUOTA_ADMISSION,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_QUOTA,
+        state,
+        bucket = %bucket,
+        object = %object,
+        "quota admission rejected the write before commit"
+    );
 }
 
 fn log_deferred_settlement(data: &LedgerReservationData, state: &'static str, err: &StorageError) {
