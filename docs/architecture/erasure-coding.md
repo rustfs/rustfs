@@ -216,10 +216,13 @@ Legacy objects retain their existing GET and traditional Heal behavior and
 therefore their residual complete-donor substitution risk. Ordinary shard repair
 and the existing explicit-version metadata recovery path remain available, but
 do not create commitments or certify object identity. Actual drive repairs are
-reported separately from strong integrity receipts. Normal
-presence scans do not issue strong integrity receipts even for protected
-objects. Only a completed exclusive Deep scan/repair with authenticated sources
-can do so. See the [upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
+reported separately from strong integrity receipts. Normal presence scans do
+not issue strong integrity receipts even for protected objects; an all-healthy
+protected version or delete marker may instead carry `MetadataHealthy`, which
+proves metadata quorum only. Legacy objects receive no positive receipt. Only a
+completed exclusive Deep scan/repair with authenticated sources
+can produce `VerifiedHealthy` or a payload-backed repair receipt. See the
+[upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
 for mixed-version and migration constraints and the
 [rollout runbook](../operations/shard-integrity-rollout.md) for activation and rollback.
 

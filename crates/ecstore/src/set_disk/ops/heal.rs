@@ -1105,6 +1105,28 @@ impl SetDisks {
                             });
                         }
 
+                        let requested_nil =
+                            version_id.is_empty() || Uuid::parse_str(version_id).is_ok_and(|requested| requested.is_nil());
+                        let selected_nil = latest_meta.version_id.is_none_or(|selected| selected.is_nil());
+                        let selected_version_matches = if requested_nil {
+                            selected_nil
+                        } else {
+                            latest_meta
+                                .version_id
+                                .is_some_and(|selected| selected.to_string().eq_ignore_ascii_case(version_id))
+                        };
+                        result.metadata_verified = !opts.dry_run
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && selected_version_matches
+                            && (protected || latest_meta.deleted)
+                            && !result.after.drives.is_empty()
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
                             result.detail =
                                 "Legacy object uses standard repair; independent object identity remains unverified".to_owned();
@@ -1828,6 +1850,16 @@ impl SetDisks {
 
                         result.repair_verified = protected
                             && !latest_meta.deleted
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && result.drives_healed().is_some_and(|healed| healed > 0)
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+                        result.metadata_repair_verified = latest_meta.deleted
+                            && !opts.dry_run
                             && !latest_meta.is_remote()
                             && !read_repair_uses_shared_lock
                             && result.drives_healed().is_some_and(|healed| healed > 0)
@@ -2800,6 +2832,8 @@ fn finalize_object_heal_result(
     if lock_lost {
         result.integrity_verified = false;
         result.repair_verified = false;
+        result.metadata_verified = false;
+        result.metadata_repair_verified = false;
         *absence = None;
         error = Some(Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -3282,6 +3316,8 @@ mod heal_result_report_tests {
         let result = rustfs_madmin::heal_commands::HealResultItem {
             integrity_verified: true,
             repair_verified: true,
+            metadata_verified: true,
+            metadata_repair_verified: true,
             ..Default::default()
         };
 
@@ -3289,6 +3325,8 @@ mod heal_result_report_tests {
 
         assert!(!result.integrity_verified);
         assert!(!result.repair_verified);
+        assert!(!result.metadata_verified);
+        assert!(!result.metadata_repair_verified);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -3300,6 +3338,20 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn absent_and_nil_selected_versions_are_the_same_null_identity() {
+        let requested_nil = Uuid::nil().to_string();
+        let requested = Uuid::parse_str(&requested_nil).expect("nil UUID string");
+        assert!(requested.is_nil());
+
+        let absent: Option<Uuid> = None;
+        let selected_nil = absent.is_none_or(|selected| selected.is_nil());
+        assert!(selected_nil, "absent metadata version selects the null identity");
+
+        let selected = Uuid::new_v4();
+        assert!(!selected.is_nil(), "a concrete UUID must not satisfy a requested null selector");
     }
 
     #[test]
