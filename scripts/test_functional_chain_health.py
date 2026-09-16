@@ -85,6 +85,15 @@ class HealthTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "changed during inspection"):
                 health.collect()
 
+    def test_health_follows_configured_build_source_not_workflow_main(self):
+        run = {**self.run, "status": "completed", "conclusion": "success"}
+        complete = self.validate()
+        for expected, healthy in (("release", True), ("refs/heads/release", True), ("main", False)):
+            responses = [{"state": "active"}, {"workflow_runs": [run]}, run, {"workflow_runs": [run]}]
+            with mock.patch.object(health, "api", side_effect=responses), mock.patch.object(health, "complete_success", return_value=complete):
+                result = health.collect(source_ref=expected)
+            self.assertEqual(result["healthy"], healthy)
+
     def test_publication_uses_the_read_blob_sha(self):
         current = {"schema": 1, "observed_at": self.now, "last_complete_success": {}, "healthy": False}
         existing = {"sha": "reviewed-blob", "content": base64.b64encode(json.dumps(current).encode()).decode()}

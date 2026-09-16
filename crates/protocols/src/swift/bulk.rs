@@ -633,7 +633,7 @@ mod tests {
     /// Tests for the `extract_tar_entries` async function.
     ///
     /// Conditionally compiled with the `swift` feature, which gates the
-    /// `tokio_tar` (astral-tokio-tar) and `async_compression` dependencies.
+    /// `tokio_tar` (rustfs-tokio-tar) and `async_compression` dependencies.
     #[cfg(feature = "swift")]
     mod tar_extraction {
         use super::*;

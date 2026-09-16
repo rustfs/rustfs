@@ -329,7 +329,7 @@ jiff = { workspace = true, features = ["serde"] }
 time = { workspace = true, features = ["parsing", "formatting", "serde", "macros"] }
 
 # Utilities and Tools
-astral-tokio-tar = { workspace = true }
+rustfs-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }

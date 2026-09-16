@@ -48,16 +48,16 @@ use super::super::{
     disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
     get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
     get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
-    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
-    is_explicit_null_version, is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled,
-    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
-    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
-    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
-    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
-    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
+    inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled,
+    is_err_object_not_found, is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
+    is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
+    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
+    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
+    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
+    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
+    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
@@ -3591,7 +3591,14 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
+            // Transformed streams (unknown stored size) are admitted by their
+            // plaintext size and then take the streaming encode with inline
+            // buffer writers, since the single-block fast path needs a known length.
+            let is_inline_buffer = storage_class_config.should_inline(
+                inline_admission_shard_size(&erasure, put_object_size, data.actual_size()),
+                erasure.data_shards,
+                opts.versioned,
+            );
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -7798,12 +7805,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             rollback_futures.push(async move {
                 if should_rollback {
+                    // The dedicated undo path never forwards the marker-only creation flag.
                     if let Err(err) = disk
-                        .delete_version_with_namespace_owner(
+                        .undo_write_with_namespace_owner(
                             &bucket,
                             &object,
                             fi,
-                            force_del_marker,
                             DeleteOptions {
                                 undo_write: true,
                                 undo_delete: true,
@@ -11450,6 +11457,152 @@ mod inline_put_commit_path_tests {
             .await
             .expect("inline object should stream");
         assert_eq!(restored, payload);
+    }
+
+    /// Counts `part.*` files under every hermetic disk root.
+    fn count_part_files(temp_dirs: &[tempfile::TempDir]) -> usize {
+        fn walk(dir: &std::path::Path, hits: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, hits);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("part."))
+                {
+                    *hits += 1;
+                }
+            }
+        }
+
+        let mut hits = 0;
+        for dir in temp_dirs {
+            walk(dir.path(), &mut hits);
+        }
+        hits
+    }
+
+    /// The reader shape the app layer hands to `put_object` for a compressed
+    /// single PUT: the stored size is unknown (`SIZE_PRESERVE_LAYER`), the
+    /// plaintext size is known, and the metadata marks the object compressed so
+    /// GET decompresses it. Encrypted PUTs present the same shape.
+    fn transformed_put(plaintext: Vec<u8>) -> (PutObjReader, ObjectOptions) {
+        let actual_size = plaintext.len() as i64;
+        let plain = HashReader::from_stream(Cursor::new(plaintext), actual_size, actual_size, None, None, false)
+            .expect("hash reader over plaintext");
+        let compressed = crate::io_support::rio::compression_reader(plain, rustfs_utils::CompressionAlgorithm::default(), false);
+        let stream = HashReader::from_reader(compressed, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+            .expect("hash reader over transformed stream");
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(rustfs_utils::CompressionAlgorithm::default()),
+        );
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
+        let opts = ObjectOptions {
+            no_lock: true,
+            user_defined,
+            ..Default::default()
+        };
+        (PutObjReader::new(stream), opts)
+    }
+
+    fn compressible_payload(size: usize) -> Vec<u8> {
+        b"inline transformed stream payload. "
+            .iter()
+            .copied()
+            .cycle()
+            .take(size)
+            .collect()
+    }
+
+    async fn read_back(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) -> Vec<u8> {
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("object should stream");
+        restored
+    }
+
+    #[tokio::test]
+    async fn transformed_small_put_is_stored_inline_and_round_trips() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-transformed-small";
+        let object = "object.txt";
+        // 16 KiB plaintext over EC 2+2 is 8 KiB per data shard, inside the
+        // default 128 KiB inline budget; the stored size is unknown up front.
+        let plaintext = compressible_payload(16 * 1024);
+        make_bucket(&disk_stores, bucket).await;
+
+        let (mut reader, opts) = transformed_put(plaintext.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("transformed PUT should commit");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist metadata: {err}"));
+            assert!(file_info.inline_data(), "disk {disk_index} must mark the transformed shard inline");
+            assert!(
+                file_info.data.as_ref().is_some_and(|data| !data.is_empty()),
+                "disk {disk_index} must embed the shard in xl.meta"
+            );
+            assert!(file_info.is_compressed(), "disk {disk_index} must keep the compression marker");
+        }
+        assert_eq!(count_part_files(&temp_dirs), 0, "an inline transformed object must not leave part files");
+
+        assert_eq!(read_back(&set_disks, bucket, object).await, plaintext);
+    }
+
+    #[tokio::test]
+    async fn transformed_put_above_inline_budget_keeps_part_files() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-transformed-large";
+        let object = "object.txt";
+        // 512 KiB plaintext is 256 KiB per data shard, above the 128 KiB budget,
+        // even though the compressed bytes would fit: the plaintext size is the
+        // admission input, exactly like a known-size PUT of the same object.
+        let plaintext = compressible_payload(512 * 1024);
+        make_bucket(&disk_stores, bucket).await;
+
+        let (mut reader, opts) = transformed_put(plaintext.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("transformed PUT should commit");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist metadata: {err}"));
+            assert!(!file_info.inline_data(), "disk {disk_index} must keep the shard outside xl.meta");
+        }
+        assert_eq!(count_part_files(&temp_dirs), disk_stores.len(), "every disk must hold one part file");
+
+        assert_eq!(read_back(&set_disks, bucket, object).await, plaintext);
     }
 
     #[tokio::test]

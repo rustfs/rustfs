@@ -63,13 +63,15 @@ def complete_success(run):
     return result
 
 
-def collect(limit=20):
+def collect(limit=20, source_ref="main"):
+    source_ref = source_ref.removeprefix("refs/heads/")
+    require(bool(source_ref), "expected nightly source ref is empty")
     observed = datetime.now(timezone.utc)
     workflow = api(f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW}")
     runs = api(f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW}/runs?branch=main&per_page={limit}")["workflow_runs"]
     runs.sort(key=lambda run: timestamp(run["run_started_at"]), reverse=True)
     result = {"schema": 1, "observed_at": observed.isoformat(), "workflow_state": workflow["state"],
-              "owner": "@overtrue", "scan_limit": limit, "inspection_complete": True,
+              "owner": "@overtrue", "scan_limit": limit, "inspection_complete": True, "expected_source_ref": source_ref,
               "latest_attempt": None, "last_complete_success": {}, "healthy": False}
     for index, listed in enumerate(runs):
         run = api(f"repos/{REPOSITORY}/actions/runs/{listed['id']}/attempts/{listed['run_attempt']}")
@@ -104,7 +106,7 @@ def collect(limit=20):
         complete["fresh"] = observed <= timestamp(complete["expires_at"])
     latest = result["latest_attempt"] or {}
     result["healthy"] = (result["workflow_state"] == "active" and latest.get("verification") == "complete"
-                         and latest.get("source_ref") == "main" and result["last_complete_success"].get("main", {}).get("fresh") is True)
+                         and latest.get("source_ref") == source_ref and result["last_complete_success"].get(source_ref, {}).get("fresh") is True)
     return result
 
 
@@ -134,8 +136,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--source-ref", default="main", help="Expected nightly build source, not the workflow branch")
     args = parser.parse_args()
-    result = collect()
+    result = collect(source_ref=args.source_ref)
     if args.publish:
         publish(result)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

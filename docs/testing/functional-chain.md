@@ -16,6 +16,18 @@ Every suite records its chain run/attempt, workflow SHA, private pin, candidate 
 
 The final job checks all ten expected suite results and all ten proof files against the same envelope. It emits `functional-chain-complete-<run>-<attempt>` only after those checks pass. Failed partial reruns cannot combine an old successful lane's proof with a new attempt. Use **Re-run all jobs** for a new complete acceptance attempt.
 
+## Stalled suites and time limits
+
+The nine non-performance reusable suite jobs, and the standalone table suite, have a **60-minute job limit**. The primary test step has a **45-minute limit** so a stalled test can fail before the hard job cancellation. Cleanup steps are limited to five minutes; report generation, dashboard/backlog operations and ordinary artifact uploads are limited to two minutes each. Separate installer and preflight steps are limited to five minutes. Performance is explicitly excluded from these limits.
+
+The limits use GitHub Actions native timeouts. They are wall-clock limits, not log-idle detection: a process printing progress forever is still stopped. A step timeout is not a passing result. Existing `always()` finalizers attempt reporting and cleanup, and the chain driver's `always()` plus successful-prepare condition allows the next suite after a failed or cancelled suite. Missing or partial evidence still fails the complete-success gate; it cannot authorize closing historical issues.
+
+The 15-minute difference between test and job limits is **headroom, not a reserved cleanup window**: checkout and setup also consume the 60-minute job budget, and several failing finalizers may exhaust it. Reaching the hard limit, losing a runner, or terminating an SSH connection does not guarantee remote processes have stopped or cleanup has completed. The next suite must retain its pre-test cleanup. Inspect the runner and remote VMs after a hard timeout before trusting subsequent results; do not interpret contaminated-environment failures as independent product regressions.
+
+The performance workflow remains unchanged: its job limit is 900 minutes, the default duration is five minutes per round, and the external script retains its default sixty-second pauses. Its methods, sizes, manual overrides and step limits are not modified by the functional timeout policy. A long performance run can therefore still occupy the final lane and delay chain completion; it is not covered by the one-hour guarantee for non-performance suites.
+
+Job timeouts start when execution starts; they do **not** bound runner or concurrency queue time. Runner preflight checks detect an already-offline runner but are not reservations. The reusable chain continues after a job timeout without cancelling the whole Actions run. The legacy `repository_dispatch` path relies on an in-job handoff and cannot guarantee continuation after hard cancellation; use the reusable driver for bounded nightly chains. A queue watchdog would need an external dispatcher and environment recovery, not cancellation of the whole parent run (which would also cancel the remaining suites).
+
 ## Health publication
 
 `functional-chain-health.yml` inspects recent main-branch chain runs hourly. It validates complete evidence against the exact producer artifact again and checks the private pin from the chain's workflow commit. Its JSON separates the latest attempt from the last complete success for each source. A later failure preserves historical success without turning the new failure green.

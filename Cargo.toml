@@ -145,7 +145,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-rc.6" }
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
-async-compression = { version = "0.4.46" }
+async-compression = { version = "0.4.47" }
 async-recursion = "1.1.1"
 async-trait = "0.1.92"
 async-nats = { version = "0.50.0", default-features = false }
@@ -235,8 +235,7 @@ tokio-postgres-rustls = "0.14.0"
 # Utilities and Tools
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
-# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): keep the fork pin while Snowball and Swift still depend on it. Remove after Snowball uses a released tar-codec/tar-framing API that exposes precedence-resolved MinIO vendor records, RustFS preserves cancellation-safe ownership of large streamed members, footerless minio-go input is accepted only at an authenticated complete request boundary, the existing resource-limit, cancellation, and error-fuse regressions pass, and Swift no longer needs this fork.
-astral-tokio-tar = { git = "https://github.com/cxymds/tokio-tar.git", rev = "603756478b7668436e464519c77ccac22a99ba96" }
+rustfs-tokio-tar = { version = "0.7.1" }
 # Candidate Snowball parser versions exercised by rustfs-zip compatibility fixtures.
 tar-codec = "0.0.14"
 tar-framing = "0.0.14"
@@ -253,7 +252,7 @@ aws-smithy-runtime-api = { version = "1.16.0" }
 aws-smithy-types = { version = "1.6.3" }
 base64-simd = "0.8.0"
 brotli = "9.0.0"
-clap = { version = "4.6.6" }
+clap = { version = "4.6.7" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
 criterion = { version = "0.8" }
