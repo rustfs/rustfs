@@ -75,8 +75,8 @@ EncryptReader（AsyncRead）被下游 HashReader/写盘逐块拉取
 | SSE 类型 | key_bytes 来源 | 代码位置 |
 |---|---|---|
 | SSE-C（客户自带 key） | 客户 key Base64 解码，校验必须恰好 32B | `validate_ssec_params` sse.rs:4156；直接 `validated.key_bytes` sse.rs:2564 |
-| SSE-S3 / SSE-KMS（托管） | `derive_object_key`：`HMAC-SHA256(external_key, OBJECT_KEY_DERIVATION_CONTEXT ‖ random32)` | sse.rs:1655-1667 |
-| rio-v2 object-key 模式 | 同上派生（封在 sealed key 里） | sse.rs:1655 |
+| SSE-S3 / SSE-KMS（托管，默认构建） | KMS DEK：`provider.generate_sse_dek(...)` → `data_key.plaintext_key`（key 与 nonce 一并由 provider 生成） | sse.rs:2789（DEK 生成）、:2799-2801（`Direct` 组装） |
+| rio-v2 object-key 模式 | `derive_object_key`：`HMAC-SHA256(external_key, OBJECT_KEY_DERIVATION_CONTEXT ‖ random32)`，`#[cfg(feature = "rio-v2")]` 门控（sse.rs:1654），默认构建不编译 → 封进 sealed key | sse.rs:1655-1667、:2794 |
 
 ### 2.3 base_nonce（12B）的生成与持久化
 
@@ -254,7 +254,7 @@ uvarint：明文长度（≤10B）
 | 加密输出 | :166-172 / :299-304 | `Vec<u8>` = 8B 帧头 + uvarint 明文长 + **密文（明文 + 16B tag）** |
 | AAD 生成 | :51-56 | 帧头 8B ‖ block_index u64 小端 → 16B |
 | nonce 派生 | :861-885 | `base[8..12]` BE u32 + block_index；multipart 先 `base[4..8]` + part |
-| key/nonce 来源 | sse.rs:796 / :1655 / :2562 | `key_bytes [u8;32]`（客户 key 或 HMAC 派生）+ 随机 `base_nonce [u8;12]` |
+| key/nonce 来源 | sse.rs:796 / :2789 / :2562 | `key_bytes [u8;32]`（客户 key、KMS DEK 或 rio-v2 构建的 HMAC 派生）+ 随机 `base_nonce [u8;12]` |
 | 写端接线 | io_support/rio.rs:445-494 | `WriteEncryption.mode` → 选 `new` / `new_v2` / `new_multipart*` |
 
 ## 8. 与 multi-cipher 方案（09 号文档）的对应

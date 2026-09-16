@@ -28,7 +28,7 @@ members = [
 ]
 ```
 
-**改动点 0.5-B：`[workspace.dependencies]`**（Cargo.toml:91 起，依赖表追加——仿 :96 等内部 crate 的 path 写法）：
+**改动点 0.5-B：`[workspace.dependencies]`**（Cargo.toml:92 起，依赖表追加——仿 :96 等内部 crate 的 path 写法）：
 
 ```toml
 [workspace.dependencies]
@@ -44,7 +44,7 @@ aes-gcm = { workspace = true, features = ["rand_core"] }
 rustfs-aes256-gcm-demo = { workspace = true }
 ```
 
-**改动点 0.5-D：`vendor/` 目录的 git 跟踪约定（已定案：D1）**。`.gitignore:19` 是裸 `vendor`，整个目录被 git 忽略——vendor crate 默认**不会被提交**。这是 MinIO/rustfs 系仓库的第三方依赖 vendor 惯例（CI 侧用 `cargo vendor` 重新生成），但自制 crate 若只存在本地，换机器/CI 构建时 path 依赖会失配。**定案 D1（提交自制 crate）**：`.gitignore:19` 由裸 `vendor` 改为限定通配：
+**改动点 0.5-D：`vendor/` 目录的 git 跟踪约定（已定案：D1）**。改动前的 `.gitignore:19` 是裸 `vendor`，整个目录被 git 忽略（改动后当前文件的 :21-22 已是 D1 通配）——vendor crate 默认**不会被提交**。这是 MinIO/rustfs 系仓库的第三方依赖 vendor 惯例（CI 侧用 `cargo vendor` 重新生成），但自制 crate 若只存在本地，换机器/CI 构建时 path 依赖会失配。**定案 D1（提交自制 crate）**：将原 `:19` 的裸 `vendor` 改为限定通配：
 
 ```gitignore
 # vendor/ 整体忽略，仅自制 crate 可跟踪（D1）
@@ -490,7 +490,7 @@ Aes256GcmDemo 按 0.5-E 契约实现 `aead::Aead`，decrypt 调用与 Aes256Gcm 
 
 Aes256GcmDemo 是插桩示例，验证了整套扩展骨架。后续加一个真实 Rust AEAD 算法（如 `chacha20-poly1305`、`aes-256-gcm-siv`），固定六步：
 
-1. **依赖**：两种引入方式，按算法来源二选一——(a) 自制/内购或需 vendor 的算法：仿第 0.5 节 Aes256GcmDemo 的 vendor 模式，三处配置（workspace members + `[workspace.dependencies]` path 依赖 + `crates/rio/Cargo.toml` 一行）；(b) crates.io 公开算法：workspace 根 `[workspace.dependencies]` 加算法 crate（`chacha20poly1305 = 0.11.0` 已在 workspace，见 Cargo.toml:206），`crates/rio/Cargo.toml` 加一行 `chacha20poly1305 = { workspace = true }`
+1. **依赖**：两种引入方式，按算法来源二选一——(a) 自制/内购或需 vendor 的算法：仿第 0.5 节 Aes256GcmDemo 的 vendor 模式，三处配置（workspace members + `[workspace.dependencies]` path 依赖 + `crates/rio/Cargo.toml` 一行）；(b) crates.io 公开算法：workspace 根 `[workspace.dependencies]` 加算法 crate（`chacha20poly1305 = 0.11.0` 已在 workspace，见 Cargo.toml:208），`crates/rio/Cargo.toml` 加一行 `chacha20poly1305 = { workspace = true }`
 2. **帧类型**：encrypt_reader.rs:44-47 常量区加 `FRAME_TYPE_X_V2` / `FRAME_TYPE_X_V2_FINAL`（legacy 帧类型值域 0x00-0xFF 不受限）
 3. **写端**：`EncryptCipher` enum 加变体（如 `ChaCha20Poly1305(ChaCha20Poly1305)`）+ `build_frame` 加密分支 + poll_read :220 的 type-byte 路由；新增 `new_v2_with_chacha20_poly1305` / `new_multipart_v2_with_chacha20_poly1305` 构造器赋值 `frame_v2 = true`
 4. **读端**：`cipher_for_type` 加两行 match；混合算法检查的 cipher token 加一个值
@@ -516,7 +516,7 @@ Aes256GcmDemo 是插桩示例，验证了整套扩展骨架。后续加一个真
 
 ## 6. 后续可扩展方向（本期不做）
 
-**bucket 级算法**：`BucketMetadata` 手写 msgpack 序列化（metadata.rs `decode_from` :667 / `encode_to` :747），可加 `cipher: Option<EncryptionCipher>` 字段（缺省 None）；但写路径取 cipher 需把值从 sse.rs 的 `EncryptionMaterial` 一路传到 `WriteEncryption`（约 6 处调用点），且 bucket SSE XML DTO 是严格 round-trip 类型不能污染 → 改动用例更多。若未来需要，建议作为独立版本演进，勿与全局 env 混用优先级。
+**bucket 级算法**：`BucketMetadata` 手写 msgpack 序列化（metadata.rs `decode_from` :525 / `encode_to` :605），可加 `cipher: Option<EncryptionCipher>` 字段（缺省 None）；但写路径取 cipher 需把值从 sse.rs 的 `EncryptionMaterial` 一路传到 `WriteEncryption`（约 6 处调用点），且 bucket SSE XML DTO 是严格 round-trip 类型不能污染 → 改动用例更多。若未来需要，建议作为独立版本演进，勿与全局 env 混用优先级。
 
 ---
 
@@ -528,7 +528,7 @@ Aes256GcmDemo 是插桩示例，验证了整套扩展骨架。后续加一个真
   - `decrypt_accepts_aes256_gcm_demo_v2`：手工构造 0x03/0x04 帧流 → `DecryptReader` 成功解密（仿 rio-v2:786-819 已有测试）
   - `segment_mixing_aes_and_demo_fails`：同一段混 0x01 与 0x03 → 报 "mixes cipher algorithms"
   - `v1_aes_still_reads`：既有 v1 帧流回归（确保 `cipher` 类型化未破坏旧路径）
-- crates/ecstore：`temp_env::async_with_vars` 设 `RUSTFS_ENCRYPTION_CIPHER=aes256-gcm-demo` 后 `WritePlan.apply`（io_support/rio.rs tests 模块，仿 rustfs/src/app/object/put.rs:2347 既有模式）→ 产物帧类型断言 + 解密 roundtrip；读端不读 env 的回归：demo env 下读 AES 对象仍成功
+- crates/ecstore：`temp_env::async_with_vars` 设 `RUSTFS_ENCRYPTION_CIPHER=aes256-gcm-demo` 后 `WritePlan.apply`（io_support/rio.rs tests 模块，仿 rustfs/src/app/object/put.rs:2325 既有模式）→ 产物帧类型断言 + 解密 roundtrip；读端不读 env 的回归：demo env 下读 AES 对象仍成功
 
 ---
 
