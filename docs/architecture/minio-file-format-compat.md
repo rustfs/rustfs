@@ -183,7 +183,10 @@ through upgraded coordinators. Recomputing a hash from existing suspect shards,
 or agreeing RS parity alone, does not establish their original identity.
 
 Normal scans, tier metadata scans and unproven legacy scans cannot produce `VerifiedHealthy` or
-`Repaired` integrity receipts. Legacy repair still runs and reports actual
+`Repaired` integrity receipts. A protected object or delete marker may produce
+`MetadataHealthy` only when its exact version was selected from authoritative
+metadata quorum; that disposition proves metadata/presence health and never
+payload integrity. Legacy objects remain without a positive receipt. Legacy repair still runs and reports actual
 before/after drive changes; an unknown strong result does not mean the repair
 was never attempted. Authoritative historical-version absence/cleanup proofs
 remain separate from live payload verification. Retain trusted backups for

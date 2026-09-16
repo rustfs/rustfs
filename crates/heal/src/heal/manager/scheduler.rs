@@ -811,6 +811,9 @@ pub(super) fn mrf_verified_repair_event_for_target(
     let disposition = match outcome.disposition {
         HealObjectDisposition::Repaired => MrfVerifiedRepairDisposition::Repaired,
         HealObjectDisposition::VerifiedHealthy => MrfVerifiedRepairDisposition::VerifiedHealthy,
+        HealObjectDisposition::MetadataHealthy if target.kind == MrfKind::MetadataCorruption => {
+            MrfVerifiedRepairDisposition::VerifiedHealthy
+        }
         HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
         _ => return None,
     };
