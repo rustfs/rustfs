@@ -640,9 +640,17 @@ impl SetDisks {
                 if !file_info_is_valid_for_metadata(&file_info) {
                     return Ok(false);
                 }
-                if !version_id.is_empty() && file_info.version_id.as_ref().map(ToString::to_string).as_deref() != Some(version_id)
-                {
-                    return Ok(false);
+                if !version_id.is_empty() {
+                    let Ok(requested_version) = Uuid::parse_str(version_id) else {
+                        return Ok(false);
+                    };
+                    // Treat absent and nil UUID metadata as the same null slot.
+                    let actual_version = file_info.version_id.filter(|version_id| !version_id.is_nil());
+                    if (requested_version.is_nil() && actual_version.is_some())
+                        || (!requested_version.is_nil() && actual_version != Some(requested_version))
+                    {
+                        return Ok(false);
+                    }
                 }
                 if file_info.is_canonical_delete_marker() || file_info.is_remote() {
                     return Ok(true);
@@ -3914,10 +3922,22 @@ mod heal_result_report_tests {
         let data_dir = source.data_dir.expect("non-inline source should have a data directory");
         let targets = vec![set.set_endpoints[0].to_string(), set.set_endpoints[1].to_string()];
 
-        assert!(
-            set.replacement_targets_have_version(bucket, object, "", &targets)
+        for disk in disks.iter().take(targets.len()) {
+            let mut metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
                 .await
-                .expect("healthy target shards should be readable")
+                .expect("target metadata should be readable");
+            metadata.version_id = None;
+            disk.write_metadata("", bucket, object, metadata)
+                .await
+                .expect("target metadata should be rewritten as a legacy null version");
+        }
+        let null_version = Uuid::nil().to_string();
+
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &null_version, &targets)
+                .await
+                .expect("nil selector should confirm healthy legacy null-version target shards")
         );
 
         tokio::fs::remove_file(
@@ -3932,7 +3952,7 @@ mod heal_result_report_tests {
         .expect("target shard should be removed after the initial commit");
 
         assert!(
-            !set.replacement_targets_have_version(bucket, object, "", &targets)
+            !set.replacement_targets_have_version(bucket, object, &null_version, &targets)
                 .await
                 .expect("missing target shard should be observable")
         );
