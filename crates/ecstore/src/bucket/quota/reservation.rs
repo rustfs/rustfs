@@ -38,6 +38,7 @@ const MAX_ORPHANS_REAPED_PER_WRITE: usize = 64;
 const MAX_ORPHAN_PROBES_PER_WRITE: usize = 128;
 const ORPHAN_PROBE_CONCURRENCY: usize = 32;
 const EVENT_QUOTA_LEDGER_SETTLEMENT: &str = "quota_ledger_settlement";
+const EVENT_QUOTA_ADMISSION: &str = "quota_admission";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
 
@@ -513,6 +514,7 @@ pub(crate) async fn begin(
         .as_ref()
         .is_some_and(|quota| quota.has_unsupported_reservation_protocol())
     {
+        log_admission_rejected(bucket, object, "unsupported_reservation_protocol");
         return Err(StorageError::PartMissingOrCorrupt);
     }
     let durable_quota = quota.as_ref().filter(|quota| quota.uses_durable_reservations());
@@ -529,7 +531,16 @@ pub(crate) async fn begin(
         Some(quota) => match (quota.quota, snapshot_admission) {
             (Some(limit), Some(admission)) if admission.quota_limit() == limit => Some(admission),
             (Some(_), None) if data_movement => None,
-            (Some(_), _) => return Err(StorageError::PartMissingOrCorrupt),
+            (Some(_), _) => {
+                // A snapshot-protocol quota requires the request handler's
+                // admission on every write. Missing or mismatched admission
+                // means a caller rebuilt `ObjectOptions` without carrying it
+                // over (rustfs/rustfs#7674 lost it on CopyObject); fail closed
+                // but leave a diagnosable trace, because the storage error is
+                // the generic `PartMissingOrCorrupt`.
+                log_admission_rejected(bucket, object, "snapshot_quota_admission_missing");
+                return Err(StorageError::PartMissingOrCorrupt);
+            }
             (None, _) => None,
         },
         None => None,
@@ -902,6 +913,18 @@ async fn save_ledger_locked(
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn fail_next_quota_ledger_save_for_test() {
     FAIL_NEXT_LEDGER_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn log_admission_rejected(bucket: &str, object: &str, state: &'static str) {
+    warn!(
+        event = EVENT_QUOTA_ADMISSION,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_QUOTA,
+        state,
+        bucket = %bucket,
+        object = %object,
+        "quota admission rejected the write before commit"
+    );
 }
 
 fn log_deferred_settlement(data: &LedgerReservationData, state: &'static str, err: &StorageError) {

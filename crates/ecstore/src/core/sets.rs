@@ -790,6 +790,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
+            quota_admission: dst_opts.quota_admission,
             ..Default::default()
         };
 
