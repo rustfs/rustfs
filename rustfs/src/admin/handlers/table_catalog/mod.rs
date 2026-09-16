@@ -3525,7 +3525,9 @@ fn validate_create_table_commit_requirements(requirements: &[serde_json::Value])
             .iter()
             .any(|requirement| requirement.get("type").and_then(serde_json::Value::as_str) != Some("assert-create"))
     {
-        return Err(s3_error!(InvalidRequest, "create table commit requires only assert-create requirements"));
+        return Err(S3Error::from(ApiError::invalid_request(
+            "create table commit requires only assert-create requirements",
+        )));
     }
     Ok(())
 }
@@ -5247,7 +5249,8 @@ fn next_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: 
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(Vec::is_empty) =>
         {
-            initial_id.ok_or_else(|| s3_error!(InvalidRequest, "metadata field {array_key} has no {id_key}"))
+            initial_id
+                .ok_or_else(|| S3Error::from(ApiError::invalid_request(format!("metadata field {array_key} has no {id_key}"))))
         }
         Err(err) => Err(err),
     }
@@ -5587,7 +5590,7 @@ where
     let (entry, metadata) = table_entry_from_create_table_request(bucket, namespace, request)?;
     if staged {
         if !table_bucket_enabled {
-            return Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"));
+            return Err(S3Error::from(ApiError::invalid_request(format!("bucket {bucket} is not table-enabled"))));
         }
         get_namespace_response(store, bucket, namespace).await?;
         if store
@@ -6400,7 +6403,7 @@ where
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
 
     let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid table name: {err}"))))?;
     let (commit_id, _) = standard_commit_ids(request.commit_id.or(request.idempotency_key));
     let table_id = Uuid::new_v4().to_string();
     let metadata_location =
@@ -6411,7 +6414,7 @@ where
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
     )
-    .map_err(|_| s3_error!(InvalidRequest, "table property values must be strings"))?;
+    .map_err(|_| S3Error::from(ApiError::invalid_request("table property values must be strings")))?;
     let mut entry = crate::table_catalog::TableEntry {
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
@@ -6442,8 +6445,9 @@ where
         )));
     }
     let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(metadata_backend);
-    let metadata_data = serde_json::to_vec(&metadata)
-        .map_err(|err| s3_error!(InternalError, "failed to serialize initial table metadata: {}", err))?;
+    let metadata_data = serde_json::to_vec(&metadata).map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize initial table metadata: {err}"))
+    })?;
     metadata_backend
         .put_object(
             bucket,
