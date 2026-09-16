@@ -8499,24 +8499,24 @@ dependencies = [
 
 [[package]]
 name = "qrcode-core"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5c0d85fe467f79319e9f0d0ffe43f8c32defae67263f78d57e33d8b4a638bf"
+checksum = "26252cf2e15d05b24b4a2cb9335952d697e54f07949f79ee721951d563b19a71"
 
 [[package]]
 name = "qrcode-decode"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04cf729caefa8fd0919f8d111a4e6531942ac48742e7649ed4c9c159b41a6fda"
+checksum = "3054ba7f6b1906502789970337da290b1da2069d7225c9ec1c3f8351de807f78"
 dependencies = [
  "qrcode-core",
 ]
 
 [[package]]
 name = "qrcode-eps"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d289a6212464685d1e598c3692e02189a096b2f4abe1acdb1f4fba6a932809d2"
+checksum = "c7a9f889b4a03011b029f20ad6b68450eac25c1be04d13ee22f7682496c1f069"
 dependencies = [
  "qrcode-core",
  "qrcode-render",
@@ -8524,9 +8524,9 @@ dependencies = [
 
 [[package]]
 name = "qrcode-html"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a14b98d4aa6278f7e7218ad901837a85cef040a262127d0c4b6f8d3bd51d46e"
+checksum = "454af1fc1b8b56b2e38913f0aeba20241e0790dd031d3595ae1a098174944478"
 dependencies = [
  "qrcode-core",
  "qrcode-render",
@@ -8534,9 +8534,9 @@ dependencies = [
 
 [[package]]
 name = "qrcode-image"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7923bee1dc13ef96b9778e9299d803ae9f5de38971cb8e55c141022cc296618"
+checksum = "9336db7ceee96a7909ebf412c9734fbfe498825ab29246d4dee27c9398baa9f9"
 dependencies = [
  "qrcode-core",
  "qrcode-render",
@@ -8544,15 +8544,15 @@ dependencies = [
 
 [[package]]
 name = "qrcode-parse"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0726e7e2acd6335b63936ba1d784361765313f53274942efb0636407e882fdc9"
+checksum = "1ae80b5d21e40035a88f449e2031985522de0d6a2c16bbfacc75b983698bf731"
 
 [[package]]
 name = "qrcode-pdf"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41ed9a51cab153e441963f8ec64ffc980d7a40bfd7fa8f6e0edd290424cda206"
+checksum = "123246123420fdc135533e47f47b00636c4138bf71adf141c5de846f94f811ad"
 dependencies = [
  "qrcode-core",
  "qrcode-render",
@@ -8560,9 +8560,9 @@ dependencies = [
 
 [[package]]
 name = "qrcode-pic"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038be675ee01aeae82f20eea4b043054f8232e14d3ccc7836803510ad3ff6524"
+checksum = "18cbc03b812474442622453c1b9f925a4025cc00d9100255ecb1accef7953411"
 dependencies = [
  "qrcode-core",
  "qrcode-render",
@@ -8570,18 +8570,18 @@ dependencies = [
 
 [[package]]
 name = "qrcode-render"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7af1ddfd0f2496c28276913e26289e8fb245cab16ece7efcf9df46e2027dd3c8"
+checksum = "74445b565ffecbed5c6ad34096df2a81f487c4befd6b91b75d11bdbe61d73094"
 dependencies = [
  "qrcode-core",
 ]
 
 [[package]]
 name = "qrcode-rs"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "246e31e4a82d59d4714c589e4912f27bc67f5fa205cc4e3bdf916ccc640af010"
+checksum = "320f7c1c48a10a0850746b87d5adf95f1db5209320c7f1853556c0bb774fc0f6"
 dependencies = [
  "qrcode-core",
  "qrcode-decode",
@@ -8597,9 +8597,9 @@ dependencies = [
 
 [[package]]
 name = "qrcode-svg"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f641cac9a021d31948437c740baec47243c03586c3230c839b76df9e4df084"
+checksum = "daea027c13f12e97bc32aeefda12c4ce0298307e9094fe45731a731f544dabd0"
 dependencies = [
  "qrcode-core",
  "qrcode-render",

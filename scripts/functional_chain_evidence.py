@@ -186,18 +186,24 @@ def render_summary(result):
     return "\n".join(lines) + "\n"
 
 
-def aggregate(chain, directory, needs):
+def aggregate(chain, directory, needs, allow_skipped=()):
+    allowed = {name for name in allow_skipped if name}
+    require(allowed <= set(SUITES), "aggregate allow-list names an unknown lane")
     require(set(needs) == set(SUITES), "aggregate is missing a required lane")
-    require(all(value.get("result") == "success" for value in needs.values()), "a required suite did not succeed")
-    require({path.name for path in directory.iterdir()} == {suite + ".json" for suite in SUITES}, "missing or unexpected suite evidence")
-    records = [json.loads((directory / (suite + ".json")).read_text()) for suite in SUITES]
-    validate_records(chain, records)
-    return {"schema": 1, "chain": chain, "suites": records, "complete": True, "completed_at": datetime.now(timezone.utc).isoformat()}
+    skipped = {name for name, value in needs.items() if value.get("result") == "skipped"}
+    require(skipped <= allowed, "a lane was skipped without preflight permission: " + ", ".join(sorted(skipped - allowed)))
+    require(all(value.get("result") == "success" for name, value in needs.items() if name not in skipped), "a required suite did not succeed")
+    expected = [suite for suite in SUITES if suite not in skipped]
+    require({path.name for path in directory.iterdir()} == {suite + ".json" for suite in expected}, "missing or unexpected suite evidence")
+    records = [json.loads((directory / (suite + ".json")).read_text()) for suite in expected]
+    validate_records(chain, records, expected)
+    return {"schema": 1, "chain": chain, "suites": records, "complete": True,
+            "skipped_lanes": sorted(skipped), "completed_at": datetime.now(timezone.utc).isoformat()}
 
 
-def validate_records(chain, records):
-    require(isinstance(records, list) and len(records) == len(SUITES), "missing suite evidence")
-    require([record.get("suite") for record in records] == list(SUITES), "missing, duplicate or reordered suite evidence")
+def validate_records(chain, records, expected_suites=SUITES):
+    require(isinstance(records, list) and len(records) == len(expected_suites), "missing suite evidence")
+    require([record.get("suite") for record in records] == list(expected_suites), "missing, duplicate or reordered suite evidence")
     for suite, result in zip(SUITES, records):
         require(type(result.get("schema")) is int and result["schema"] == 1 and result.get("suite") == suite and result.get("chain") == chain, "suite evidence identity mismatch")
         require(result.get("valid") is True and sha(result.get("report_sha256"), 64), "suite evidence is invalid")
@@ -213,6 +219,8 @@ def main():
     parser.add_argument("--report", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--directory", type=Path)
+    parser.add_argument("--allow-skipped", default="",
+                        help="comma-separated lanes the preflight deliberately skipped (e.g. performance)")
     args = parser.parse_args()
     if args.mode == "summarize":
         chain = current_chain() if os.environ.get("CHAIN_MANIFEST") else None
@@ -231,7 +239,7 @@ def main():
     else:
         needs = json.loads(os.environ["CHAIN_NEEDS"])
         needs.pop("prepare", None)
-        result = aggregate(chain, args.directory, needs)
+        result = aggregate(chain, args.directory, needs, args.allow_skipped.split(","))
         args.output.write_text(json.dumps(result, sort_keys=True) + "\n")
 
 
