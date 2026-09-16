@@ -58,7 +58,7 @@ permissions:
 # environment (vm000/vm001/vm002), so concurrent runs must not clobber each
 # other.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
@@ -252,6 +252,9 @@ jobs:
       - name: Run pool expansion & decommission test
         id: pool_test
         timeout-minutes: 45
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
+        continue-on-error: true
         run: |
           set -o pipefail
           STEPS="4,5,6"
@@ -500,7 +503,11 @@ jobs:
           }
 
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-test.log"
-          require_nonempty "${POOL_ARTIFACT_DIR}/warp.log"
+          # warp is stopped early (SIGINT/SIGTERM) once the storage threshold
+          # is reached, and it only writes its final report on a clean exit —
+          # an empty warp.log is the expected shape of a healthy run, so only
+          # require that the redirect target exists.
+          require_available "${POOL_ARTIFACT_DIR}/warp.log"
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-report.md"
           require_nonempty "${POOL_ARTIFACT_DIR}/pool-baseline.log"
           require_nonempty "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"
@@ -551,6 +558,16 @@ jobs:
             echo "dedicated proxy error log contains an upstream timeout or connection failure" >&2
             failed=1
           fi
+          # A mid-script abort is a product/harness signal: the run step's
+          # continue-on-error would otherwise keep the workflow green, so the
+          # validator must turn it red. Aborts go through die(), which prints
+          # an [ERROR] line; a step that dies never emits its [POOL-STEP]
+          # verdict, so "any FAIL verdict" cannot be the trigger.
+          if grep -q '^\[POOL-STEP\] .* FAIL' "${POOL_ARTIFACT_DIR}/pool-test.log" 2>/dev/null \
+            || grep -q '\[ERROR\]' "${POOL_ARTIFACT_DIR}/pool-test.log" 2>/dev/null; then
+            echo "pool test script reported a failure (step FAIL verdict or die() abort)" >&2
+            failed=1
+          fi
           [ "${failed}" -eq 0 ] || exit 1
 
       - name: Upload functional report to dashboard
@@ -586,65 +603,55 @@ jobs:
           fi
           rm -f "${B64_FILE}"
 
-      - name: File failure issue in rustfs/backlog
+      - name: Manage backlog issues (dedup / label / auto-close)
         timeout-minutes: 2
-        if: ${{ always() && (failure() || steps.pool_test.outcome == 'failure' || steps.pool_test.outcome == 'cancelled') }}
+        # Replaces the old per-run failure filing. One entry point that:
+        # - dedups by signal: failing cases are matched against open backlog
+        #   issues by label (category + case ID); covered cases become a
+        #   comment on the existing issue, only uncovered cases file a new one
+        # - labels new issues (functional-test, category, case IDs, env)
+        # - closes fixed issues after a fully green run
+        # - never files or closes on cancelled runs
+        if: ${{ always() }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           SUITE: 'pool'
           SUITE_LABEL: 'Pool expansion'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '${{ env.POOL_ARTIFACT_DIR }}/pool-report.md'
-          LOG_FILE: '${{ env.POOL_ARTIFACT_DIR }}/pool-test.log'
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
-          EXISTING="$(gh issue list -R rustfs/backlog --state all \
-            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
-          if [ -n "${EXISTING}" ]; then
-            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found in auto-testing checkout; skipping"
             exit 0
           fi
-          redact() {
-            sed -E \
-              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
-              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
-          }
-          BODY_FILE="$(mktemp)"
-          {
-            echo "The **${SUITE_LABEL}** functional suite failed."
-            echo ""
-            echo "- Suite: \`${SUITE}\`"
-            echo "- Run: ${RUN_URL}"
-            echo "- Trigger: ${GITHUB_EVENT_NAME}"
-            echo "- Date: $(date -u +%Y-%m-%d)"
-            echo ""
-            echo "## Report (errors and symptoms)"
-            echo ""
-            if [ -s "${REPORT_FILE}" ]; then
-              redact < "${REPORT_FILE}"
-            elif [ -s "${LOG_FILE:-}" ]; then
-              echo "(report file missing; log tail below)"
-              echo ""
-              tail -n 200 "${LOG_FILE}" | redact
-            else
-              echo "(no report or log file was produced)"
-            fi
-          } | head -c 55000 > "${BODY_FILE}"
-          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
-          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test; then
-            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          PACKAGE_SOURCE=""
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          echo "filed backlog issue for suite ${SUITE}"
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
+            --outcome "${{ steps.pool_test.outcome }}" \
+            --report-file "${POOL_ARTIFACT_DIR}/pool-report.md" \
+            --log "${POOL_ARTIFACT_DIR}/pool-test.log" \
+            --run-url "${RUN_URL}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${{ github.event_name }}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload test logs
         timeout-minutes: 2

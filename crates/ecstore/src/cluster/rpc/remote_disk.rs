@@ -22,9 +22,10 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -54,13 +55,14 @@ use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
-    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
-    DeleteVersionRequest, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest,
-    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
-    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-    WriteMetadataRequest, node_service_client::NodeServiceClient,
+    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
+    CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+    DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
+    MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
+    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -148,6 +150,18 @@ fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result
         return Err(Error::other("remote snapshot lease protocol is incompatible"));
     }
     SnapshotLeaseToken::from_slice(&response.token)
+}
+
+fn conditional_file_update_from_wire(outcome: i32) -> Result<ConditionalFileUpdate> {
+    match CompareAndUpdateFileOutcome::try_from(outcome) {
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated) => Ok(ConditionalFileUpdate::Updated),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing) => Ok(ConditionalFileUpdate::Missing),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch) => Ok(ConditionalFileUpdate::Mismatch),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified) => {
+            Err(Error::other("unspecified compare-and-update-file outcome"))
+        }
+        Err(_) => Err(Error::other("invalid compare-and-update-file outcome")),
+    }
 }
 
 /// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
@@ -844,6 +858,44 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn rename_file_with_durability(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        durable: bool,
+    ) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(RenameFileRequest {
+                    durable,
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+
+                let response = client.rename_file(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                if durable && !response.durability_applied {
+                    return Err(DiskError::MethodNotAllowed);
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
@@ -1798,7 +1850,7 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
-    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
+    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion).
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
@@ -2084,6 +2136,9 @@ impl RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(dst_volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2096,7 +2151,8 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2104,7 +2160,13 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
                 }
 
-                let response = client.rename_data(request).await?.into_inner();
+                let response = if incarnation_bound {
+                    // Older peers return Unimplemented before mutation; never downgrade.
+                    client.rename_data_at_incarnation(request).await?
+                } else {
+                    client.rename_data(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2154,6 +2216,9 @@ impl RemoteDisk {
                 let options = serde_json::to_string(&opt)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2163,7 +2228,7 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                if scanner_publication_lease_token.is_some() || !request.get_ref().bucket_incarnation_id.is_empty() {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("delete request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2171,7 +2236,12 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
                 }
 
-                let response = client.delete(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    client.delete(request).await?
+                } else {
+                    client.delete_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2466,11 +2536,15 @@ impl DiskAPI for RemoteDisk {
                 // JSON + msgpack until its fallback counter has read zero across a release window.
                 let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let opts_bin = encode_msgpack(&opts)?;
+                let conditional_marker = opts.expected_delete_marker.is_some();
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteVersionRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2481,9 +2555,24 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if incarnation_bound {
+                    let body = canonical_body.map_err(|_| Error::other("delete-version body length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                }
 
-                let response = client.delete_version(request).await?.into_inner();
+                // The marker-specific method rejects older peers; its body digest
+                // also binds any incarnation, so neither precondition can be lost.
+                let response = if conditional_marker {
+                    client.delete_retired_marker(request).await?
+                } else if incarnation_bound {
+                    client.delete_version_at_incarnation(request).await?
+                } else {
+                    client.delete_version(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2751,6 +2840,9 @@ impl DiskAPI for RemoteDisk {
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(WriteMetadataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2758,9 +2850,15 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
-
-                let response = client.write_metadata(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
+                    client.write_metadata(request).await?
+                } else {
+                    let body = canonical_body.map_err(|_| Error::other("write metadata request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                    client.write_metadata_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -3401,30 +3499,13 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(RenameFileRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                });
-                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, false)
+            .await
+    }
 
-                let response = client.rename_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, true)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -3749,6 +3830,58 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        self.execute_with_timeout(
+            || async {
+                let data_len = expected
+                    .as_ref()
+                    .map_or(0, Bytes::len)
+                    .saturating_add(replacement.as_ref().map_or(0, Bytes::len));
+                let disk = self.disk_ref().await;
+                let mut client = self.get_bulk_client().await.inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })?;
+                let mut request = Request::new(CompareAndUpdateFileRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    expected,
+                    replacement,
+                });
+                let canonical_body = rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "compare_and_update_file")?;
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_request();
+                let response = match client.compare_and_update_file(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                        return Err(err.into());
+                    }
+                };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_sent_bytes(data_len);
+
+                if !response.success {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                conditional_file_update_from_wire(response.outcome).inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         trace!(
@@ -3867,6 +4000,17 @@ mod tests {
     static INIT: Once = Once::new();
 
     #[test]
+    fn compare_and_update_wire_outcome_fails_closed() {
+        assert_eq!(
+            conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32)
+                .expect("updated outcome"),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32).is_err());
+        assert!(conditional_file_update_from_wire(i32::MAX).is_err());
+    }
+
+    #[test]
     fn request_compat_send_sites_keep_manifest_json_encoders() {
         // Rolling-upgrade contract (rustfs-protos compat manifest): every
         // dual-write request field must keep producing its JSON side with the
@@ -3885,6 +4029,49 @@ mod tests {
                 send_site.json_encoder
             );
         }
+    }
+
+    #[test]
+    fn retired_marker_options_preserve_legacy_positional_wire_shape() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct LegacyDeleteOptions {
+            recursive: bool,
+            immediate: bool,
+            undo_write: bool,
+            undo_delete: bool,
+            old_data_dir: Option<Uuid>,
+        }
+        let legacy = LegacyDeleteOptions {
+            recursive: false,
+            immediate: false,
+            undo_write: false,
+            undo_delete: false,
+            old_data_dir: None,
+        };
+        let original = encode_msgpack(&legacy).unwrap();
+        let current = encode_msgpack(&DeleteOptions::default()).unwrap();
+        assert_eq!(current, original, "ordinary deletes must retain the older peer's positional payload");
+        assert_eq!(rmp_serde::from_slice::<LegacyDeleteOptions>(&current).unwrap(), legacy);
+        assert!(
+            rmp_serde::from_slice::<DeleteOptions>(&original)
+                .unwrap()
+                .expected_delete_marker
+                .is_none()
+        );
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(::time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        let marker = rustfs_filemeta::MetaDeleteMarker::from(marker);
+        let options = DeleteOptions {
+            expected_delete_marker: Some(marker.clone()),
+            ..Default::default()
+        };
+        let decoded: DeleteOptions = rmp_serde::from_slice(&encode_msgpack(&options).unwrap()).unwrap();
+        assert_eq!(decoded.expected_delete_marker, Some(marker));
     }
 
     #[test]

@@ -540,7 +540,7 @@ impl SetDisks {
 
         let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object, &vid]))
         {
             Ok(v) => v,
             Err(e) => {
@@ -564,7 +564,7 @@ impl SetDisks {
                 GET_STAGE_METADATA_RESOLVE,
                 metadata_resolve_stage_start,
             );
-            return Err(to_object_err(err.into(), vec![bucket, object]));
+            return Err(to_object_err(err.into(), vec![bucket, object, &vid]));
         }
 
         let (op_online_disks, mut fi, fileinfo_selection_quorum) =
@@ -626,25 +626,26 @@ impl SetDisks {
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
-    pub(super) async fn get_object_info_and_quorum(
+    pub(super) async fn get_object_info_fileinfo_and_quorum(
         &self,
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> (ObjectInfo, usize, Option<StorageError>) {
+    ) -> (ObjectInfo, FileInfo, usize, Option<StorageError>) {
         let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
             Ok(snapshot) => snapshot,
-            Err(e) => return (ObjectInfo::default(), 0, Some(e)),
+            Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
-        let fi = snapshot.fi();
+        let fi = snapshot.fi().clone();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
                 oi,
+                fi,
                 write_quorum,
                 Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
             );
@@ -652,20 +653,26 @@ impl SetDisks {
 
         if fi.deleted {
             if opts.incl_free_versions && fi.tier_free_version() && opts.version_id.is_some() {
-                return (oi, write_quorum, None);
+                return (oi, fi, write_quorum, None);
             }
             return if opts.version_id.is_none() || opts.delete_marker {
-                (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
+                (
+                    oi,
+                    fi,
+                    write_quorum,
+                    Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])),
+                )
             } else {
                 (
                     oi,
+                    fi,
                     write_quorum,
                     Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
                 )
             };
         }
 
-        (oi, write_quorum, None)
+        (oi, fi, write_quorum, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -725,6 +732,15 @@ impl SetDisks {
                 skip_verify_bitrot,
             )
             .await?;
+            if let Some(expected) = part.integrity.as_ref() {
+                use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+                let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+                for (index, reader) in readers.iter_mut().enumerate() {
+                    if let Some(reader) = reader {
+                        reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, 0, None)?)?;
+                    }
+                }
+            }
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -777,6 +793,7 @@ impl SetDisks {
             erasure.data_shards,
         )
         .await;
+        reader_setup.bind_integrity(part.integrity.as_ref(), &files, &disks, bucket, object, 0)?;
         let reader_setup_elapsed = reader_setup_stage_start.elapsed();
         rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -978,6 +995,7 @@ impl SetDisks {
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
             let sync_spec = PartReaderSetupSpec {
+                integrity: fi.parts[current_part].integrity.clone(),
                 part_number,
                 read_offset,
                 read_length,
@@ -1032,6 +1050,7 @@ impl SetDisks {
                 let next_size = fi.parts[next_part].size;
                 let next_length = next_size.min(remaining_after_current);
                 let spec = PartReaderSetupSpec {
+                    integrity: fi.parts[next_part].integrity.clone(),
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
@@ -1657,7 +1676,7 @@ impl SetDisks {
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
-        let reader_setup = create_bitrot_readers_until_quorum_with_preference(
+        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference(
             files,
             disks,
             bucket,
@@ -1681,6 +1700,12 @@ impl SetDisks {
             }),
         )
         .await;
+        let expected = fi
+            .parts
+            .iter()
+            .find(|part| part.number == part_number)
+            .and_then(|part| part.integrity.as_ref());
+        reader_setup.bind_integrity(expected, files, disks, bucket, object, part_offset / erasure.block_size)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
@@ -1773,6 +1798,7 @@ impl SetDisks {
 
 /// Per-part parameters for a multipart bitrot reader setup.
 struct PartReaderSetupSpec {
+    integrity: Option<rustfs_filemeta::shard_integrity::PartIntegrity>,
     part_number: usize,
     read_offset: usize,
     read_length: usize,
@@ -1914,7 +1940,7 @@ async fn setup_multipart_part_readers(
     metrics_size_bucket: &'static str,
 ) -> (BitrotReaderSetup, Duration) {
     let started = Instant::now();
-    let setup = create_bitrot_readers_until_quorum_with_preference(
+    let mut setup = create_bitrot_readers_until_quorum_with_preference(
         files,
         disks,
         bucket,
@@ -1938,6 +1964,13 @@ async fn setup_multipart_part_readers(
         }),
     )
     .await;
+    if setup
+        .bind_integrity(spec.integrity.as_ref(), files, disks, bucket, object, spec.read_offset / shard_size)
+        .is_err()
+    {
+        setup = BitrotReaderSetup::new(disks.len());
+        setup.errors.fill(Some(DiskError::FileCorrupt));
+    }
     (setup, started.elapsed())
 }
 
@@ -2776,7 +2809,7 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    async fn get_object_info_and_quorum_maps_delete_marker_and_purge_states() {
+    async fn get_object_info_fileinfo_and_quorum_maps_delete_marker_and_purge_states() {
         let bucket = "get-object-info-marker-bucket";
         let (_dir, disk) = new_read_version_test_disk(bucket).await;
         let set = SetDisks::new(
@@ -2803,8 +2836,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "latest-delete-marker", latest_marker)
             .await
             .expect("latest marker metadata should be written");
-        let (_, _, latest_err) = set
-            .get_object_info_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
+        let (_, _, _, latest_err) = set
+            .get_object_info_fileinfo_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
             .await;
         assert!(
             matches!(latest_err, Some(StorageError::ObjectNotFound(_, _))),
@@ -2823,8 +2856,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "version-delete-marker", version_marker)
             .await
             .expect("version marker metadata should be written");
-        let (_, _, version_err) = set
-            .get_object_info_and_quorum(
+        let (_, _, _, version_err) = set
+            .get_object_info_fileinfo_and_quorum(
                 bucket,
                 "version-delete-marker",
                 &ObjectOptions {
@@ -5761,6 +5794,47 @@ mod tests {
                 assert_eq!(&out[..n], b"cccc");
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bitrot_reader_setup_preserves_multistripe_hedge_reopeners() {
+        temp_env::async_with_vars([("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("false"))], async {
+            let files = vec![inline_reader_setup_fileinfo(Some(b"abcdefgh")); 4];
+            let disks = vec![None; files.len()];
+            let setup = create_bitrot_readers_until_quorum_with_preference(
+                &files,
+                &disks,
+                "bucket",
+                "object",
+                1,
+                0,
+                8,
+                4,
+                HashAlgorithm::None,
+                false,
+                false,
+                2,
+                2,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+            for (index, reopen) in setup.deferred_reopeners.iter().enumerate() {
+                let reopen = reopen
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("healthy shard {index} needs a reopener for a later stripe"));
+                let mut reader = reopen(1).expect("reopen the second stripe");
+                let mut bytes = [0; 4];
+                assert_eq!(reader.read(&mut bytes).await.expect("read reopened shard"), bytes.len());
+                assert_eq!(&bytes, b"efgh", "reopened shard must not return the previous stripe");
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

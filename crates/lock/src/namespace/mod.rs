@@ -57,6 +57,11 @@ impl NamespaceLockWrapper {
         &self.owner
     }
 
+    /// Logical namespace label for diagnostics; local namespaces may share a manager.
+    pub fn namespace(&self) -> &str {
+        self.lock.namespace()
+    }
+
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {

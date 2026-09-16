@@ -22,7 +22,7 @@ use crate::services::tier::warm_backend_gcs::WarmBackendGCS;
 use crate::services::tier::{
     tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
-    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
+    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
     warm_backend_huaweicloud::WarmBackendHuaweicloud,
@@ -40,7 +40,7 @@ use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
 use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
-    api_error_response::to_error_response,
+    api_error_response::{ErrorResponse, to_error_response},
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -669,6 +669,17 @@ fn probe_cleanup_incomplete_error() -> AdminError {
     err
 }
 
+fn is_remote_tier_auth_rejection(err: &std::io::Error) -> bool {
+    let Some(response) = err.get_ref().and_then(|err| err.downcast_ref::<ErrorResponse>()) else {
+        return false;
+    };
+    matches!(response.status_code, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        || matches!(
+            response.code,
+            S3ErrorCode::AccessDenied | S3ErrorCode::InvalidAccessKeyId | S3ErrorCode::SignatureDoesNotMatch
+        )
+}
+
 async fn check_warm_backend_with_deadlines(
     w: Option<&WarmBackendImpl>,
     deadline: tokio::time::Instant,
@@ -689,6 +700,9 @@ async fn check_warm_backend_with_deadlines(
         tokio::time::timeout_at(deadline, w.put(&probe_object, ReaderImpl::Body(Bytes::from_static(b"RustFS")), 6)).await;
     let remote_version_id = match put_result {
         Ok(Ok(remote_version_id)) => remote_version_id,
+        Ok(Err(err)) if is_remote_tier_auth_rejection(&err) => {
+            return Err(ERR_TIER_INVALID_CREDENTIALS.clone());
+        }
         Ok(Err(_)) => {
             return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
                 Ok(()) => ERR_TIER_PERM_ERR.clone(),
@@ -1285,6 +1299,13 @@ mod tests {
         removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
+    struct AuthRejectingProbePutBackend {
+        status_code: StatusCode,
+        code: S3ErrorCode,
+        probes: Arc<AtomicUsize>,
+        removes: Arc<AtomicUsize>,
+    }
+
     #[derive(Clone, Copy)]
     enum ProbeBody {
         Exact,
@@ -1520,6 +1541,46 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl WarmBackend for AuthRejectingProbePutBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Err(std::io::Error::other(rustfs_s3_client::api_error_response::ErrorResponse {
+                status_code: self.status_code,
+                code: self.code.clone(),
+                message: "remote credentials rejected".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("GET must not run after an auth-rejected probe PUT"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            self.removes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("remove must not run after a deterministic auth rejection"))
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("probe must not run after a deterministic auth rejection"))
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
     #[tokio::test]
     async fn check_warm_backend_validates_before_probe_io() {
         let validations = Arc::new(AtomicUsize::new(0));
@@ -1698,6 +1759,34 @@ mod tests {
         assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
         assert!(err.message.contains("cleanup is incomplete"));
         assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_reports_auth_rejected_probe_put_as_invalid_credentials() {
+        for (status_code, code) in [
+            (StatusCode::FORBIDDEN, S3ErrorCode::AccessDenied),
+            (StatusCode::UNAUTHORIZED, S3ErrorCode::Custom("".into())),
+            (StatusCode::OK, S3ErrorCode::InvalidAccessKeyId),
+            (StatusCode::OK, S3ErrorCode::SignatureDoesNotMatch),
+        ] {
+            let probes = Arc::new(AtomicUsize::new(0));
+            let removes = Arc::new(AtomicUsize::new(0));
+            let backend: WarmBackendImpl = Box::new(AuthRejectingProbePutBackend {
+                status_code,
+                code,
+                probes: probes.clone(),
+                removes: removes.clone(),
+            });
+
+            let err = check_warm_backend(Some(&backend))
+                .await
+                .expect_err("a deterministic remote-auth rejection should not become an uncertain probe error");
+
+            assert_eq!(err.code, ERR_TIER_INVALID_CREDENTIALS.code);
+            assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+            assert_eq!(probes.load(Ordering::SeqCst), 0);
+            assert_eq!(removes.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]

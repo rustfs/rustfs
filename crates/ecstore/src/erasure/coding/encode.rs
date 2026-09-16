@@ -19,6 +19,7 @@ use crate::disk::error_reduce::{
 use crate::erasure::coding::BitrotWriterWrapper;
 use crate::erasure::coding::Erasure;
 use crate::erasure::coding::erasure::EncodedBlock;
+use crate::io_support::shard_integrity::{IntegrityBuilder, PreparedIntegrity};
 use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
@@ -42,6 +43,13 @@ const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: usize = 4;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
+
+pub(crate) enum IntegrityEncodeMode {
+    Inline(usize),
+    SingleBlock(usize),
+    Streaming,
+    Batched,
+}
 
 /// Cached value of `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` env var.
 /// Read once at first use via `OnceLock` to avoid per-encode syscall.
@@ -319,6 +327,7 @@ impl Default for WriteProgressPolicy {
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
+    integrity: Option<&'a mut IntegrityBuilder>,
     write_quorum: usize,
     errs: Vec<Option<Error>>,
     policy: WriteProgressPolicy,
@@ -336,6 +345,7 @@ impl<'a> MultiWriter<'a> {
         let length = writers.len();
         MultiWriter {
             writers,
+            integrity: None,
             write_quorum,
             errs: vec![None; length],
             policy,
@@ -397,6 +407,10 @@ impl<'a> MultiWriter<'a> {
     }
 
     async fn write_block(&mut self, block: &EncodedBlock) -> std::io::Result<()> {
+        if let Some(integrity) = &mut self.integrity {
+            // Commit every coding index, including disks absent from the write.
+            integrity.push(block.shards()).await?;
+        }
         self.write_shards(block.shards()).await
     }
 
@@ -530,6 +544,63 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
+    pub(crate) async fn encode_with_shard_integrity<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        part_number: usize,
+        mode: IntegrityEncodeMode,
+        protected: bool,
+    ) -> std::io::Result<(R, usize, Option<Vec<Bytes>>, Option<PreparedIntegrity>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let mut integrity = if protected {
+            let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(
+                self.data_shards,
+                self.parity_shards,
+                self.block_size,
+                self.uses_legacy_codec(),
+            )
+            .map_err(std::io::Error::other)?;
+            Some(IntegrityBuilder::new(layout, part_number)?)
+        } else {
+            None
+        };
+        let (reader, size, inline) = match mode {
+            IntegrityEncodeMode::Inline(hint) => {
+                let (reader, size, shards) = self
+                    .encode_inline_shards_with_integrity(reader, hint, integrity.as_mut())
+                    .await?;
+                (reader, size, Some(shards))
+            }
+            IntegrityEncodeMode::SingleBlock(hint) => {
+                let (reader, size) = self
+                    .encode_small_direct(reader, writers, quorum, true, hint, integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+            IntegrityEncodeMode::Streaming => {
+                let (reader, size) = self
+                    .encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest(), integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+            IntegrityEncodeMode::Batched => {
+                let (reader, size) = self
+                    .encode_batched_with_integrity(reader, writers, quorum, integrity.as_mut())
+                    .await?;
+                (reader, size, None)
+            }
+        };
+        let integrity = match integrity {
+            Some(integrity) => Some(integrity.finish(size).await?),
+            None => None,
+        };
+        Ok((reader, size, inline, integrity))
+    }
+
     async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(EncodedBlock, Vec<u8>)> {
         let encode_stage_start = stage_timer_if_enabled();
         let encode_once = move || {
@@ -586,6 +657,7 @@ impl Erasure {
         quorum: usize,
         require_single_block: bool,
         size_hint: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
@@ -618,6 +690,7 @@ impl Erasure {
 
         let block = self.encode_data_owned_block(buf)?;
         let mut mw = MultiWriter::new(writers, quorum);
+        mw.integrity = integrity;
         mw.write_block(&block).await?;
         mw.shutdown().await?;
         Ok((reader, total))
@@ -627,10 +700,23 @@ impl Erasure {
     /// The returned bytes are the same `[hash][shard]` representation produced
     /// by `BitrotWriter`, ready to be embedded in each disk's staged `xl.meta`.
     #[hotpath::measure(impl_type = "Erasure")]
+    #[cfg(test)]
     pub(crate) async fn encode_inline_shards_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize, Vec<Bytes>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_inline_shards_with_integrity(reader, size_hint, None).await
+    }
+
+    async fn encode_inline_shards_with_integrity<R>(
         self: Arc<Self>,
         mut reader: R,
         size_hint: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize, Vec<Bytes>)>
     where
         R: AsyncRead + Send + Sync + Unpin,
@@ -644,6 +730,9 @@ impl Erasure {
         }
 
         let block = self.encode_data_owned_block(buf)?;
+        if let Some(integrity) = integrity {
+            integrity.push(block.shards()).await?;
+        }
         let mut inline_shards = Vec::with_capacity(block.shards().len());
         for shard in block.shards() {
             let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
@@ -667,7 +756,7 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         let use_bytesmut_ingest = use_bytesmut_ingest();
-        self.encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest)
+        self.encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest, None)
             .await
     }
 
@@ -681,6 +770,7 @@ impl Erasure {
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
         use_bytesmut_ingest: bool,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -788,6 +878,7 @@ impl Erasure {
         }));
 
         let mut writers = MultiWriter::new(writers, quorum);
+        writers.integrity = integrity;
 
         let mut write_err = None;
 
@@ -835,9 +926,22 @@ impl Erasure {
     #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode_batched<R>(
         self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        self.encode_batched_with_integrity(reader, writers, quorum, None).await
+    }
+
+    async fn encode_batched_with_integrity<R>(
+        self: Arc<Self>,
         mut reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
+        integrity: Option<&mut IntegrityBuilder>,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -918,6 +1022,7 @@ impl Erasure {
         }));
 
         let mut writers = MultiWriter::new(writers, quorum);
+        writers.integrity = integrity;
         let mut write_err = None;
 
         loop {
@@ -976,7 +1081,8 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin,
     {
         let size_hint = self.block_size;
-        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, false, size_hint, None)
+            .await
     }
 
     /// Size-aware inline fast path. `size_hint` only controls the bounded initial
@@ -992,7 +1098,8 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, false, size_hint, None)
+            .await
     }
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
@@ -1008,7 +1115,7 @@ impl Erasure {
         R: AsyncRead + Send + Sync + Unpin,
     {
         let size_hint = self.block_size;
-        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, true, size_hint, None).await
     }
 
     /// Size-aware single-block fast path. `size_hint` only controls the bounded
@@ -1024,7 +1131,7 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+        self.encode_small_direct(reader, writers, quorum, true, size_hint, None).await
     }
 }
 
@@ -1478,10 +1585,10 @@ mod tests {
 
         let encode = match pipeline {
             EncodePipeline::Vec => {
-                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await })
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await })
             }
             EncodePipeline::BytesMut => {
-                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await })
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await })
             }
             EncodePipeline::Batched => tokio::spawn(async move { erasure.encode_batched(reader, &mut writers, 1).await }),
         };
@@ -1540,8 +1647,8 @@ mod tests {
         ))];
 
         let result = match pipeline {
-            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await,
-            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await,
+            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await,
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await,
             EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, 1).await,
         };
 
@@ -1614,8 +1721,8 @@ mod tests {
         let mut writers = vec![Some(bitrot_writer(FailAfterReaderErrorWriter { reader_failed }, BLOCK_SIZE))];
 
         let result = match pipeline {
-            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await,
-            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await,
+            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false, None).await,
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await,
             EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, 1).await,
         };
 
@@ -1650,7 +1757,11 @@ mod tests {
             BLOCK_SIZE,
         ))];
         let erasure_for_task = erasure.clone();
-        let encode = tokio::spawn(async move { erasure_for_task.encode_with_ingest_mode(reader, &mut writers, 1, false).await });
+        let encode = tokio::spawn(async move {
+            erasure_for_task
+                .encode_with_ingest_mode(reader, &mut writers, 1, false, None)
+                .await
+        });
 
         tokio::time::timeout(Duration::from_secs(1), writer_entered)
             .await
@@ -1817,8 +1928,8 @@ mod tests {
             let erasure = Arc::new(Erasure::new(2, 2, 64));
             let result = match path {
                 "direct" => erasure.encode_single_block_non_inline(reader, &mut writers, 2).await,
-                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false).await,
-                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true).await,
+                "vec" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, false, None).await,
+                "bytesmut" => erasure.encode_with_ingest_mode(reader, &mut writers, 2, true, None).await,
                 "batched" => erasure.encode_batched(reader, &mut writers, 2).await,
                 _ => unreachable!(),
             };
@@ -2290,7 +2401,7 @@ mod tests {
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
         let (_reader, written) = erasure
-            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true)
+            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true, None)
             .await
             .expect("BytesMut ingest path should encode the streaming payload");
 
@@ -2319,7 +2430,7 @@ mod tests {
         let reader = tokio::io::BufReader::new(Cursor::new(vec![0x5a; block_size * 2]));
 
         rustfs_io_metrics::set_put_stage_metrics_enabled(true);
-        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await;
+        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true, None).await;
         rustfs_io_metrics::set_put_stage_metrics_enabled(false);
 
         let (_reader, written) = result.expect("bytesmut streaming encode should complete");
@@ -2937,10 +3048,14 @@ mod tests {
         let (_reader, total) = match pipeline {
             EncodePipeline::Vec => {
                 erasure
-                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, false)
+                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, false, None)
                     .await
             }
-            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true).await,
+            EncodePipeline::BytesMut => {
+                erasure
+                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true, None)
+                    .await
+            }
             EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, DATA_SHARDS).await,
         }
         .expect("encode should succeed");
