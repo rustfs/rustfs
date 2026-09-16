@@ -3029,6 +3029,7 @@ mod tests {
                     backend.set_remove_failure(false);
                     // This fixture starts expiry workers without the runtime's
                     // recovery loop, so drive its durable rescan explicitly.
+                    eprintln!("Recovering overwrite cleanup: state={state:?}, suspended={suspended}, copy={self_copy}");
                     wait_for_tier_free_version_recovery(Arc::clone(&store), &backend, removed_before + 1).await;
                     let versions = set
                         .load_file_info_versions_exact(&bucket, object)
@@ -12600,19 +12601,33 @@ mod tests {
         expected_removes: usize,
     ) {
         ExpiryState::resize_workers(1, store.clone()).await;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let mut last_progress = None;
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let stats = recover_tier_free_versions(store.clone(), 100, None, None)
                     .await
                     .expect("tier free-version recovery scan should succeed");
-                if backend.remove_versions().await.len() >= expected_removes && stats.enqueued == 0 && stats.failed == 0 {
+                let removes = backend.remove_versions().await.len();
+                let recovered = removes >= expected_removes && stats.enqueued == 0 && stats.failed == 0;
+                last_progress = Some((removes, stats));
+                if recovered {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
-        .await
-        .expect("tier free-version recovery should complete");
+        .await;
+        if result.is_err() {
+            let expiry_state = store.ctx.expiry_state();
+            let workers = expiry_state
+                .try_read()
+                .ok()
+                .map(|state| (state.pending_tasks(), state.active_tasks()));
+            panic!(
+                "tier free-version recovery should complete: expected_removes={expected_removes}, \
+                 last_progress={last_progress:?}, workers(pending, active)={workers:?}"
+            );
+        }
         wait_for_expiry_workers_idle(&store).await;
     }
 
