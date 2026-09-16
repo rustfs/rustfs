@@ -3691,7 +3691,7 @@ async fn concurrent_staged_create_commits_publish_exactly_one_table() {
             .await
         });
         tokio::time::timeout(StdDuration::from_secs(2), async {
-            while metadata_backend.state.lock().await.objects.len() < 1 {
+            while metadata_backend.state.lock().await.objects.is_empty() {
                 tokio::task::yield_now().await;
             }
         })
