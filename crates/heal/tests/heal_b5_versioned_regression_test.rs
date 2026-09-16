@@ -441,7 +441,7 @@ mod serial_tests {
             let mut latest_data = versioned_test_data(6);
             latest_data.extend_from_slice(b"new-uuid");
             let latest = put_versioned(&ecstore, &bucket, object, &latest_data).await;
-            versions.push((latest, latest_data.clone()));
+            versions.push((latest.clone(), latest_data.clone()));
 
             let target = disk_paths
                 .iter()
@@ -525,7 +525,16 @@ mod serial_tests {
                 .expect("an omitted selector must still heal latest");
             assert!(latest_result.error.is_none());
             assert_eq!(latest_result.item.object_size, latest_data.len());
-            let latest_receipt = latest_result.receipt.expect("a normal scan should certify metadata health");
+            assert!(
+                latest_result.receipt.is_none(),
+                "an omitted selector certifies metadata health only for the null identity"
+            );
+            let latest_receipt = storage
+                .heal_object_with_receipt(&bucket, object, Some(latest.as_str()), &HealOpts::default())
+                .await
+                .expect("a normal scan of the exact latest version")
+                .receipt
+                .expect("a normal scan should certify metadata health");
             assert_eq!(latest_receipt.disposition, HealObjectDisposition::MetadataHealthy);
             let verified_latest = storage
                 .heal_object_with_receipt(
