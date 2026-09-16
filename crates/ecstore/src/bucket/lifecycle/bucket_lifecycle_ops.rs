@@ -7603,7 +7603,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_version_enqueue_counts_pending_before_publishing_and_rolls_back_when_full() {
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
         let state = ExpiryState::new_with_unconsumed_worker_channel(1);
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
@@ -7621,8 +7624,7 @@ mod tests {
         assert!(state.read().await.enqueue_free_version(oi.clone()));
         assert_eq!(state.read().await.stats.pending_tasks(), 1);
 
-        // The single-slot queue is full: the recovered path must not leave
-        // its speculative increment behind for a task that was never queued.
+        // The single-slot queue is full for both enqueue paths.
         assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
         assert_eq!(state.read().await.stats.pending_tasks(), 1);
         assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
