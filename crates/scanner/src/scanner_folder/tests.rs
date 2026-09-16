@@ -1073,6 +1073,41 @@ async fn test_prune_failed_objects_max_zero_keeps_fresh() {
 }
 
 #[test]
+fn scanner_heal_request_builders_assign_distinct_identities() {
+    let requests = [
+        build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "first".to_string(),
+            None,
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_object_heal_request(
+            "bucket".to_string(),
+            "second".to_string(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+        build_non_destructive_object_heal_request(
+            "bucket".to_string(),
+            "third".to_string(),
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        ),
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for request in requests {
+        let id = uuid::Uuid::parse_str(&request.id).expect("scanner must assign an ID before publishing its request");
+        assert!(!id.is_nil());
+        assert!(ids.insert(id), "independent scanner requests must not share an identity");
+        assert_eq!(request.clone().id, request.id, "replaying a captured request must preserve its identity");
+        assert_eq!(request.source, HealRequestSource::Scanner);
+    }
+}
+
+#[test]
 fn test_build_object_heal_request_omits_nil_version_id() {
     let request = build_object_heal_request(
         "bucket".to_string(),

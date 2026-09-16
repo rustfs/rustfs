@@ -8442,13 +8442,14 @@ fn scanner_cycle_wait_plan_drives_growth_resets_and_bitrot_cap() {
 #[test]
 #[serial]
 fn scanner_cycle_schedule_status_reports_effective_backoff() {
-    record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, 2_048, true, 7);
+    record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, true, 2_048, true, 7);
 
     let status = scanner_cycle_schedule_status();
 
     assert_eq!(status.execution_role, "leader");
     assert!(status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 86_401);
+    assert!(status.usage_bootstrap_rebuild_pending);
     assert!(status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 2_048);
     assert!(status.superseded_retry_backoff_enabled);
@@ -8459,12 +8460,14 @@ fn scanner_cycle_schedule_status_reports_effective_backoff() {
     assert_eq!(status.execution_role, "follower");
     assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
+    assert!(!status.usage_bootstrap_rebuild_pending);
 
     reset_scanner_cycle_schedule();
     let status = scanner_cycle_schedule_status();
     assert_eq!(status.execution_role, "unknown");
     assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
+    assert!(!status.usage_bootstrap_rebuild_pending);
     assert!(!status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 1);
     assert!(!status.superseded_retry_backoff_enabled);
@@ -8710,6 +8713,57 @@ fn clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
     ] {
         assert!(!scanner_clean_idle_backoff_enabled(true, true, features, &default_config));
     }
+}
+
+#[test]
+fn usage_bootstrap_rebuild_bypasses_clean_idle_until_authoritative_cycle() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let features = ScannerMaintenanceFeatures::default();
+    let generation = Some(scanner_maintenance_generation());
+    let mut clean_idle_backoff = ScannerCleanIdleBackoff { interval_multiplier: 8 };
+    let mut rebuild = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
+
+    assert!(!rebuild.clean_idle_backoff_enabled(true));
+    assert!(rebuild.requires_full_scan(
+        features,
+        generation,
+        scanner_maintenance_generation(),
+        ScannerCycleWakeReason::DirtyUsage,
+    ));
+
+    let plan = rebuild.wait_plan(scanner_cycle_wait_plan(&config, clean_idle_backoff, true, std::convert::identity), None);
+    assert_eq!(plan.delay, Duration::ZERO);
+
+    assert!(!rebuild.record_cycle(ScannerCycleOutcome::Partial));
+    assert!(rebuild.pending());
+    assert!(rebuild.record_cycle(ScannerCycleOutcome::CompletedWithPendingMaintenance));
+    assert!(!rebuild.pending());
+
+    let mut rebuild = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
+    assert!(rebuild.record_cycle(ScannerCycleOutcome::Completed));
+    assert!(!rebuild.pending());
+    assert!(rebuild.clean_idle_backoff_enabled(true));
+
+    clean_idle_backoff.reset();
+    record_scanner_cycle_result(
+        &mut clean_idle_backoff,
+        &config,
+        rebuild.clean_idle_backoff_enabled(true),
+        ScannerCycleWakeReason::Timer,
+        ScannerCycleOutcome::Completed,
+        true,
+    );
+    assert_eq!(
+        clean_idle_backoff.effective_interval(
+            config.cycle_interval,
+            scanner_clean_idle_max_interval(config.cycle_interval, &config),
+            true,
+        ),
+        Duration::from_secs(60)
+    );
 }
 
 #[tokio::test]
@@ -9188,6 +9242,7 @@ async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
         movement_changed,
         current_movement_generation: move || movement_generation.load(Ordering::Acquire),
         is_lock_lost: || false,
+        recovery_wake: None,
     };
     let reason = wait_for_next_scanner_cycle_with_movement(
         &ctx,
@@ -9203,6 +9258,39 @@ async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
     .await;
 
     assert_eq!(reason, ScannerCycleWakeReason::MovementGeneration);
+}
+
+#[tokio::test]
+async fn recovery_wake_interrupts_normal_cycle_wait() {
+    let ctx = CancellationToken::new();
+    let recovery_wake = Notify::new();
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost: || false,
+        recovery_wake: Some(&recovery_wake),
+    };
+
+    let mut wait = Box::pin(wait_for_next_scanner_cycle_with_movement(
+        &ctx,
+        Duration::from_secs(60),
+        ScannerCycleObservedGenerations {
+            dirty_usage: None,
+            runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+            maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            defer_cluster_activity: false,
+        },
+        &movement,
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+
+    recovery_wake.notify_one();
+    let reason = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("recovery wake should interrupt the scanner cycle wait");
+
+    assert_eq!(reason, ScannerCycleWakeReason::Recovery);
 }
 
 fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {

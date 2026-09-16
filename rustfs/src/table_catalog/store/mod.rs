@@ -21,6 +21,8 @@ mod strong;
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
+pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
+#[cfg(test)]
 pub(super) use strong::{
     STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
     StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,
@@ -280,6 +282,24 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         object: &str,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         scan_table_data_plane_resource_for_object(self, table_bucket, object).await
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+        let Some(table_bucket_entry) = self.get_table_bucket(table_bucket).await? else {
+            return Ok(None);
+        };
+        if table_bucket_entry.state != TableCatalogEntryState::Active {
+            return Ok(None);
+        }
+        let entries = self.list_all_tables(table_bucket).await?;
+        table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)
     }
 
     /// Atomically advances a validated table metadata pointer.
@@ -1272,6 +1292,17 @@ where
         match self {
             Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
             Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
+        }
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self {
+            Self::ObjectBacked(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
+            Self::DurableStrong(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
         }
     }
 

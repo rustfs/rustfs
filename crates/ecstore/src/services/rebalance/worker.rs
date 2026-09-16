@@ -21,6 +21,11 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_METADATA_RETRY_PROBE: Arc<tokio::sync::Notify>;
+}
+
 /// Background walks skip the total timeout, so the per-read stall budget is what
 /// catches a drive that stops answering. Keep it generous: rebalance is not
 /// latency-sensitive, and one slow read is not a dead drive.
@@ -116,11 +121,14 @@ pub(super) fn rebalance_meta_lock_error(err: rustfs_lock::LockError, mode: &'sta
             required,
             achieved,
         },
-        other => Error::other(format!(
-            "failed to acquire rebalance metadata {mode} lock on {}/{}: {other}",
-            crate::disk::RUSTFS_META_BUCKET,
-            REBAL_META_NAME
-        )),
+        other => crate::data_movement::data_movement_context_error(
+            format!(
+                "failed to acquire rebalance metadata {mode} lock on {}/{}: {other}",
+                crate::disk::RUSTFS_META_BUCKET,
+                REBAL_META_NAME
+            ),
+            Error::Lock(other),
+        ),
     }
 }
 
@@ -311,6 +319,49 @@ pub(super) fn parse_rebalance_max_attempts(value: Option<&str>) -> usize {
 
 pub(super) fn rebalance_max_attempts() -> usize {
     parse_rebalance_max_attempts(std::env::var(REBALANCE_MAX_ATTEMPTS_ENV).ok().as_deref())
+}
+
+/// Retry lock admission or read-only metadata access, never a data mutation.
+/// Each failed attempt must release its guards before the backoff so queued
+/// writers and stop/replacement activation can make progress.
+pub(super) async fn retry_rebalance_metadata_access<T, Access, AccessFuture>(
+    cancel: Option<&CancellationToken>,
+    max_attempts: usize,
+    mut access: Access,
+) -> Result<T>
+where
+    Access: FnMut() -> AccessFuture,
+    AccessFuture: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        let result = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::OperationCanceled),
+                result = access() => result,
+            },
+            None => access().await,
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt.saturating_add(1) >= max_attempts.max(1)
+                    || !matches!(rebalance_error_source(&err), Error::Lock(lock_err) if is_rebalance_transient_lock_error(lock_err))
+                {
+                    return Err(err);
+                }
+                #[cfg(test)]
+                let _ = REBALANCE_METADATA_RETRY_PROBE.try_with(|probe| probe.notify_one());
+                let delay = rebalance_migration_retry_delay(attempt, &err);
+                match cancel {
+                    Some(cancel) => wait_rebalance_listing_retry(cancel, delay).await?,
+                    None => tokio::time::sleep(delay).await,
+                }
+                attempt += 1;
+            }
+        }
+    }
 }
 
 pub(super) fn rebalance_listing_retry_delay(attempt: usize) -> Duration {
@@ -600,6 +651,122 @@ impl SetDisks {
 #[cfg(test)]
 mod error_source_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rebalance_metadata_retry_is_bounded_and_retains_the_timeout() {
+        for max_attempts in [0, 1, 3] {
+            let mut attempts = 0;
+            let result = retry_rebalance_metadata_access(None, max_attempts, || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(rebalance_meta_lock_error(
+                    rustfs_lock::LockError::timeout(".rustfs.sys/rebalance.bin@latest", Duration::from_secs(5)),
+                    "read",
+                )))
+            })
+            .await;
+            let err = result.expect_err("persistent lock contention must not become success");
+            assert_eq!(attempts, max_attempts.max(1));
+            assert!(matches!(
+                rebalance_error_source(&err),
+                Error::Lock(rustfs_lock::LockError::Timeout { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_metadata_retry_does_not_retry_permanent_or_untyped_errors() {
+        for err in [
+            Error::FileAccessDenied,
+            Error::DiskFull,
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "read",
+                bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                object: REBAL_META_NAME.to_string(),
+                required: 3,
+                achieved: 2,
+            },
+            Error::other("stale rebalance run rejected: lock acquisition timed out"),
+            Error::other("rebalance distributed run fence lost"),
+            Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ] {
+            let expected = err.to_string();
+            let mut error = Some(crate::data_movement::data_movement_context_error(expected.clone(), err));
+            let mut attempts = 0;
+            let result = retry_rebalance_metadata_access(None, 3, || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(error.take().expect("permanent metadata failures must not be retried")))
+            })
+            .await;
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                rebalance_error_source(&result.expect_err("failure must remain visible")).to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_metadata_retry_cancels_a_pending_attempt() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancel = CancellationToken::new();
+        let started = tokio::sync::Notify::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let access = retry_rebalance_metadata_access(Some(&cancel), 3, || async {
+            let _probe = DropProbe(Arc::clone(&dropped));
+            started.notify_one();
+            std::future::pending::<Result<()>>().await
+        });
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(access, async {
+                started.notified().await;
+                cancel.cancel();
+            })
+        })
+        .await
+        .expect("cancellation must interrupt a pending lock attempt");
+        assert!(matches!(result, Err(Error::OperationCanceled)));
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rebalance_metadata_retry_cancels_before_another_attempt() {
+        let cancel = CancellationToken::new();
+        let mut attempts = 0;
+        let result = retry_rebalance_metadata_access(Some(&cancel), 3, || {
+            attempts += 1;
+            let cancel = &cancel;
+            async move {
+                cancel.cancel();
+                Err::<(), _>(Error::Lock(rustfs_lock::LockError::timeout(REBAL_META_NAME, Duration::from_secs(5))))
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::OperationCanceled)));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn rebalance_metadata_lock_timeout_preserves_retryable_source() {
+        let resource = ".rustfs.sys/rebalance.bin@latest";
+        for mode in ["read", "write"] {
+            let error = rebalance_meta_lock_error(rustfs_lock::LockError::timeout(resource, Duration::from_secs(5)), mode);
+            assert!(
+                is_transient_rebalance_error(&error),
+                "metadata lock contention must remain retryable: {error}"
+            );
+            assert!(is_rebalance_lock_or_rpc_timeout(&error));
+            assert!(matches!(
+                rebalance_error_source(&error),
+                Error::Lock(rustfs_lock::LockError::Timeout { resource: actual, .. }) if actual == resource
+            ));
+            assert!(error.to_string().contains(&format!("rebalance metadata {mode} lock")));
+        }
+    }
 
     #[test]
     fn stage_wrapped_errors_select_the_source_backoff_policy() {

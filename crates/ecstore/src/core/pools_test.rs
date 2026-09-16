@@ -3820,7 +3820,8 @@ mod decommission_lock_order_tests {
             .await
             .expect_err("lost data-movement PUT capacity lease must not publish the object");
         assert!(
-            crate::error::is_err_object_not_found(&object_err),
+            matches!(&object_err, crate::error::Error::VersionNotFound(b, o, v)
+                if b == RUSTFS_META_BUCKET && o == object && v == &version_id),
             "data-movement PUT lease loss should leave the target object absent: {object_err}"
         );
 
@@ -3932,13 +3933,17 @@ mod decommission_lock_order_tests {
                 next_object,
                 &ObjectOptions {
                     versioned: true,
-                    version_id: Some(next_version_id),
+                    version_id: Some(next_version_id.clone()),
                     ..Default::default()
                 },
             )
             .await
             .expect_err("the next mutation must remain unpublished after A recovery");
-        assert!(crate::error::is_err_object_not_found(&next_target_err));
+        assert!(
+            matches!(&next_target_err, crate::error::Error::VersionNotFound(b, o, v)
+                if b == RUSTFS_META_BUCKET && o == next_object && v == &next_version_id),
+            "the next mutation must leave its exact target version absent: {next_target_err}"
+        );
     }
 
     #[tokio::test]

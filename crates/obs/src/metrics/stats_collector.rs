@@ -351,6 +351,16 @@ fn scanner_scan_mode_code(scan_mode: &str) -> u64 {
     }
 }
 
+fn scanner_usage_publication_result_code(state: &str) -> u64 {
+    match state {
+        "success" => 1,
+        "deferred" => 2,
+        "failed" => 3,
+        "no_update" => 4,
+        _ => 0,
+    }
+}
+
 fn scanner_work_rate_per_second(count: u64, seconds: f64) -> f64 {
     if seconds > 0.0 && seconds.is_finite() {
         count as f64 / seconds
@@ -1628,6 +1638,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
+    let usage_freshness = &metrics.usage_freshness;
 
     Some(ScannerRuntimeStats {
         server: current_local_node_identity(),
@@ -1725,6 +1736,19 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
             partial_cycles_runtime: metrics.partial_cycles_runtime,
             partial_cycles_objects: metrics.partial_cycles_objects,
             partial_cycles_directories: metrics.partial_cycles_directories,
+            dirty_usage_pending_buckets: usage_freshness.dirty_pending_buckets,
+            dirty_usage_last_mark_unix_seconds: usage_freshness.last_dirty_mark_unix_secs,
+            dirty_usage_last_clear_unix_seconds: usage_freshness.last_dirty_clear_unix_secs,
+            dirty_usage_last_cycle_buckets: usage_freshness.last_cycle_dirty_buckets,
+            dirty_usage_last_cycle_cleared_buckets: usage_freshness.last_cycle_cleared_dirty_buckets,
+            usage_last_save_unix_seconds: usage_freshness.last_usage_save_unix_secs,
+            usage_last_save_result: usage_freshness.last_usage_save_result_code,
+            usage_last_durable_success_unix_seconds: usage_freshness.last_durable_success_unix_secs,
+            usage_last_publication_unix_seconds: usage_freshness.last_publication_unix_secs,
+            usage_last_publication_result: scanner_usage_publication_result_code(&usage_freshness.last_publication_state),
+            usage_deferred_pending: usage_freshness.deferred_pending,
+            usage_deferred_total: usage_freshness.deferred_total,
+            usage_last_deferred_unix_seconds: usage_freshness.last_deferred_unix_secs,
         },
     })
 }
@@ -2175,6 +2199,15 @@ mod tests {
     #[test]
     fn scanner_scan_mode_code_maps_unknown_mode() {
         assert_eq!(scanner_scan_mode_code(""), HealScanMode::Unknown as u8 as u64);
+    }
+
+    #[test]
+    fn scanner_usage_publication_result_code_maps_known_states() {
+        assert_eq!(scanner_usage_publication_result_code("success"), 1);
+        assert_eq!(scanner_usage_publication_result_code("deferred"), 2);
+        assert_eq!(scanner_usage_publication_result_code("failed"), 3);
+        assert_eq!(scanner_usage_publication_result_code("no_update"), 4);
+        assert_eq!(scanner_usage_publication_result_code("future"), 0);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Reusable workflows run from this driver's commit in one Actions run. Each
-# suite still runs after an earlier suite fails; the final job requires all ten.
+# suite still runs after an earlier suite fails; the final job requires all twelve.
 name: RustFS Functional Chain
 
 on:
@@ -67,7 +67,7 @@ jobs:
           if-no-files-found: error
 
       - name: Check shared functional fleet runner before scheduling suites
-        # The nine functional suites run on the smoke-testing fleet; a hard
+        # The eleven functional suites run on the smoke-testing fleet; a hard
         # requirement. The performance lane runs on pf-testing, which is a
         # separate fleet - probe it without failing the whole chain so an
         # offline performance runner skips only the performance lane.
@@ -158,8 +158,24 @@ jobs:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
     secrets: inherit
 
-  performance:
+  fault-tolerance:
     needs: [prepare, replication]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-fault-tolerance-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  table:
+    needs: [prepare, fault-tolerance]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    uses: ./.github/workflows/rustfs-table-test.yml
+    with:
+      chain_manifest: ${{ needs.prepare.outputs.manifest }}
+    secrets: inherit
+
+  performance:
+    needs: [prepare, table]
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}
     uses: ./.github/workflows/rustfs-performance-test.yml
     with:
@@ -167,7 +183,7 @@ jobs:
     secrets: inherit
 
   complete-chain:
-    needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, performance]
+    needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, fault-tolerance, table, performance]
     if: ${{ always() && needs.prepare.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10

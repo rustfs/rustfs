@@ -584,6 +584,7 @@ mod tests {
                 object: Arc::from(object),
                 version_id: None,
                 kind,
+                delete_marker_purge: None,
                 scope,
                 lease: None,
                 enqueued_at_ms: 1,

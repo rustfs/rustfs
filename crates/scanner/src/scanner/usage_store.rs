@@ -76,6 +76,24 @@ impl DataUsagePublicationResult {
     }
 }
 
+fn root_write_publication_proof(
+    outcome: DataUsagePersistOutcome,
+    write_confirmed: bool,
+    written_etag: Option<&str>,
+    expected: &crate::scanner_io::ScannerPublicationExpectation,
+    data_digest: &[u8; 32],
+) -> Option<RootPublicationProof> {
+    if outcome != DataUsagePersistOutcome::Saved || !write_confirmed || !expected.matches_encoded_candidate(data_digest) {
+        return None;
+    }
+
+    let etag = written_etag.filter(|etag| !etag.is_empty())?;
+    Some(RootPublicationProof {
+        candidate: expected.clone(),
+        root_version: (etag.to_string(), *data_digest),
+    })
+}
+
 fn root_ack_write_is_confirmed<T, E>(
     result: &std::result::Result<T, E>,
     state: Option<ScannerPublicationCommitState>,
@@ -123,6 +141,52 @@ mod root_publication_confirmation_tests {
             .map(|(result, state, etag)| root_ack_write_is_confirmed(result, *state, *etag))
             .collect::<Vec<_>>();
         assert_eq!(confirmations, [false, false, false, true]);
+    }
+}
+
+#[cfg(test)]
+mod root_write_publication_proof_tests {
+    use super::*;
+
+    fn expectation_for(info: &DataUsageInfo) -> crate::scanner_io::ScannerPublicationExpectation {
+        let data = serde_json::to_vec(info).expect("usage info should encode");
+        crate::scanner_io::ScannerPublicationExpectation::for_tests(
+            Sha256::digest(data).into(),
+            crate::data_usage_define::DataUsageScanPlanDigest([7; 32]),
+        )
+    }
+
+    #[test]
+    fn root_write_publication_proof_requires_committed_root_write_identity() {
+        let info = DataUsageInfo {
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(7),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let expected = expectation_for(&info);
+        let data = serde_json::to_vec(&info).expect("usage info should encode");
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let stale_digest = Sha256::digest(b"stale").into();
+
+        assert!(
+            root_write_publication_proof(DataUsagePersistOutcome::AlreadyDurable, true, Some("etag"), &expected, &digest)
+                .is_none()
+        );
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, false, Some("etag"), &expected, &digest).is_none());
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, true, None, &expected, &digest).is_none());
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some(""), &expected, &digest).is_none());
+        assert!(
+            root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some("etag"), &expected, &stale_digest).is_none()
+        );
+
+        let proof = root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some("etag"), &expected, &digest)
+            .expect("a confirmed root CAS write should prove its own candidate");
+        let (etag, raw_digest) = proof
+            .verified_version_for(&expected)
+            .expect("proof should bind the expected candidate");
+        assert_eq!(etag, "etag");
+        assert_eq!(*raw_digest, digest);
     }
 }
 
@@ -1085,6 +1149,9 @@ where
                 written_etag.as_deref(),
             )
             .await;
+            if proof.is_none() {
+                proof = root_write_publication_proof(outcome, write_confirmed, written_etag.as_deref(), expected, &data_digest);
+            }
         }
     }
 

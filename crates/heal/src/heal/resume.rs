@@ -29,20 +29,30 @@ use super::{
 
 mod checkpoint;
 mod gc;
+mod handoff;
+mod legacy_handoff;
 mod replacement;
 mod utils;
 
+pub(crate) use checkpoint::AdminErasureCheckpoint;
 pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ResumeCheckpoint};
 pub(crate) use gc::ResumeGc;
+pub use handoff::{ReplacementHandoff, ReplacementHandoffLink, ReplacementHandoffPhase};
+pub use legacy_handoff::{LegacyReplacementApproval, LegacyReplacementSource};
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
     ReplacementPhase, ReplacementRecoveryRecord, ReplacementRecoveryState, ReplacementTargetIdentity, compose_key,
 };
+pub(crate) use replacement::{
+    ReplacementRecoveryCandidate, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+    replacement_retry_is_legacy_transient_skip,
+};
 pub use utils::ResumeUtils;
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";
+pub(crate) const REPLACEMENT_TARGET_READINESS_DEFERRED: &str = "Replacement target readiness deferred; retry pending";
 const EVENT_HEAL_RESUME_STATE: &str = "heal_resume_state";
 
 /// resume state file constants
@@ -62,10 +72,9 @@ const REPLACEMENT_RECOVERY_CONFLICT_PREFIX: &str = "replacement recovery conflic
 const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corruption:";
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
-/// older schema (which tracked latest-only object names and a positional
-/// cursor) are incompatible with the per-version resume cursor, so they are
-/// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 5;
+/// older schema could mark historical null versions covered after reading
+/// latest. Discard their cursor and progress and scan from the beginning.
+const CURRENT_RESUME_SCHEMA: u32 = 7;
 
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
@@ -124,7 +133,7 @@ pub(crate) fn replacement_recovery_error_requires_block(error: &Error) -> bool {
         Error::TaskExecutionFailed { message }
             if message.starts_with(REPLACEMENT_RECOVERY_CONFLICT_PREFIX)
                 || message.starts_with(REPLACEMENT_RECOVERY_CORRUPTION_PREFIX)
-    )
+    ) || matches!(error, Error::ReplacementGenerationConflict { .. })
 }
 
 fn replacement_recovery_corruption_for_state_load(message: impl std::fmt::Display, error: Error) -> Error {
@@ -327,6 +336,31 @@ pub struct ResumeState {
     pub replacement_generation: Option<String>,
     #[serde(default)]
     pub replacement_phase: ReplacementPhase,
+    #[serde(default)]
+    pub replacement_execution_protocol: u8,
+    #[serde(default)]
+    pub replacement_revision: u64,
+    #[serde(default)]
+    pub replacement_predecessor: Option<String>,
+    #[serde(default)]
+    pub replacement_handoff: Option<ReplacementHandoff>,
+    #[serde(default)]
+    pub replacement_lineage: Vec<ReplacementHandoffLink>,
+    #[serde(default)]
+    pub replacement_legacy_import: Option<LegacyReplacementApproval>,
+    #[serde(default)]
+    pub replacement_legacy_successor: Option<String>,
+    /// Whether the legacy transient-skip compatibility path is no longer
+    /// applicable to this generation (or has already been consumed). New
+    /// generations set this true; older schema-seven snapshots default false
+    /// and may receive one bounded compatibility re-arm.
+    #[serde(default)]
+    pub replacement_legacy_retry_compatibility_done: bool,
+    /// The current pass was rewound because the replacement mount was not
+    /// ready.  Task-level error persistence must not turn this readiness wait
+    /// back into a consumed retry attempt.
+    #[serde(default)]
+    pub replacement_retry_waiting_for_target: bool,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -396,6 +430,15 @@ impl ResumeState {
             replacement_buckets: Vec::new(),
             replacement_generation: None,
             replacement_phase: ReplacementPhase::None,
+            replacement_execution_protocol: 0,
+            replacement_revision: 0,
+            replacement_predecessor: None,
+            replacement_handoff: None,
+            replacement_lineage: Vec::new(),
+            replacement_legacy_import: None,
+            replacement_legacy_successor: None,
+            replacement_legacy_retry_compatibility_done: false,
+            replacement_retry_waiting_for_target: false,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -435,6 +478,10 @@ impl ResumeState {
         state.replacement_buckets = state.pending_buckets.clone();
         state.replacement_generation = Some(task_id);
         state.replacement_phase = ReplacementPhase::Intent;
+        state.replacement_execution_protocol = 1;
+        // New generations already use readiness-aware persistence and must
+        // never enter the one-shot compatibility path for legacy snapshots.
+        state.replacement_legacy_retry_compatibility_done = true;
         state
     }
 
@@ -582,6 +629,7 @@ pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
     throttle: Mutex<PersistThrottle>,
+    persistence_lock: tokio::sync::Mutex<()>,
     state_file: ResumeStateFile,
 }
 
@@ -609,6 +657,8 @@ fn is_replacement_intent(state: &ResumeState) -> bool {
         && matches!(
             state.replacement_phase,
             ReplacementPhase::Intent
+                | ReplacementPhase::OwnershipPending
+                | ReplacementPhase::HandoffPending
                 | ReplacementPhase::Rebuilding
                 | ReplacementPhase::Verified
                 | ReplacementPhase::CleanupPending
@@ -631,6 +681,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::Ordinary,
         };
 
@@ -670,6 +721,9 @@ impl ResumeManager {
             match Self::load_replacement_intent(disk.clone(), &task_id).await {
                 Ok(manager) => {
                     let state = manager.get_state().await;
+                    if !state.completed && state.retry_count >= state.max_retries {
+                        return Err(Error::ReplacementRetryBudgetExhausted);
+                    }
                     if state.set_disk_id != set_disk_id
                         || state.replacement_targets != replacement_targets
                         || state.replacement_target_identities != replacement_target_identities
@@ -677,6 +731,7 @@ impl ResumeManager {
                         || !matches!(
                             state.replacement_phase,
                             ReplacementPhase::Intent
+                                | ReplacementPhase::OwnershipPending
                                 | ReplacementPhase::Rebuilding
                                 | ReplacementPhase::Verified
                                 | ReplacementPhase::CleanupPending
@@ -722,6 +777,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::ReplacementIntent,
         };
         manager.publish_new_replacement_intent(recovery_expected).await?;
@@ -790,9 +846,10 @@ impl ResumeManager {
             disk,
             state: legacy.state.clone(),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file: ResumeStateFile::ReplacementIntent,
         };
-        migrated.save_state_strict().await?;
+        migrated.publish_new_replacement_intent(None).await?;
         migrated.ensure_replacement_intent_seal().await?;
         legacy.cleanup().await?;
         delete_resume_file(&migrated.disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
@@ -812,9 +869,7 @@ impl ResumeManager {
             });
         }
 
-        // A snapshot written by an older schema tracked a latest-only positional
-        // cursor that is meaningless under per-version resume. Discard the stale
-        // progress so the scan restarts cleanly, then stamp the current schema.
+        // Older progress cannot prove that the exact null slot was inspected.
         if state.schema_version > CURRENT_RESUME_SCHEMA {
             return Err(Error::TaskExecutionFailed {
                 message: format!(
@@ -823,7 +878,20 @@ impl ResumeManager {
                 ),
             });
         }
+        if state.schema_version == 6 && state.replacement_generation.is_none() && state.replacement_targets.is_empty() {
+            // Schema 7 adds replacement ownership only. Ordinary schema-6
+            // cursors already contain the exact historical-null identity.
+            state.schema_version = CURRENT_RESUME_SCHEMA;
+        }
         if state.schema_version < CURRENT_RESUME_SCHEMA {
+            // Replacement intents may already have a separate completion proof.
+            // Resetting only their cursor could revive that stale proof or reopen
+            // a target for formatting. Preserve ownership for explicit recovery.
+            if state.replacement_generation.is_some() || !state.replacement_targets.is_empty() {
+                return Err(replacement_recovery_conflict(format!(
+                    "Replacement intent {task_id} has legacy version coverage; explicit recovery is required before resuming"
+                )));
+            }
             warn!(
                 target: "rustfs::heal::resume",
                 event = EVENT_HEAL_RESUME_STATE,
@@ -849,14 +917,47 @@ impl ResumeManager {
             state.baseline_known = false;
             state.counter_unknown = false;
             state.completed = false;
-            state.completed_buckets.clear();
+            state.pending_buckets.append(&mut state.completed_buckets);
+            state.pending_buckets.sort();
+            state.pending_buckets.dedup();
+            state.current_bucket = None;
+            state.current_object = None;
             state.schema_version = CURRENT_RESUME_SCHEMA;
         }
 
+        if state.replacement_generation.is_some() {
+            handoff::validate_lineage(&state.task_id, &state.set_disk_id, &state.replacement_lineage)?;
+            if let Some(handoff) = &state.replacement_handoff {
+                Self::validate_handoff(handoff, &state)?;
+            }
+            if state
+                .replacement_lineage
+                .last()
+                .is_some_and(|link| link.targets != state.replacement_target_identities)
+            {
+                return Err(replacement_recovery_conflict("replacement lineage has a different target binding"));
+            }
+            if let Some(approval) = &state.replacement_legacy_import {
+                approval.validate_state(&state)?;
+            }
+            if let Some(successor) = &state.replacement_legacy_successor {
+                validate_resume_task_id(successor)?;
+                if successor == &state.task_id || state.replacement_phase != ReplacementPhase::Abandoned {
+                    return Err(replacement_recovery_conflict("invalid retired legacy generation"));
+                }
+            }
+            if state.replacement_execution_protocol != 1
+                || state.replacement_predecessor.as_deref()
+                    != state.replacement_lineage.last().map(|link| link.predecessor.as_str())
+            {
+                return Err(replacement_recovery_conflict("replacement execution protocol or predecessor is invalid"));
+            }
+        }
         Ok(Self {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            persistence_lock: tokio::sync::Mutex::new(()),
             state_file,
         })
     }
@@ -1047,10 +1148,78 @@ impl ResumeManager {
         if !state.can_retry() {
             return Ok(false);
         }
+        state.replacement_retry_waiting_for_target = false;
         state.increment_retry();
         state.reset_for_retry();
         drop(state);
         self.save_state().await?;
+        Ok(true)
+    }
+
+    /// Rewind one replacement pass while its target is not ready, without
+    /// consuming the generation retry budget. The caller resets the companion
+    /// checkpoint first; this method rewinds the resume ledger and keeps the
+    /// durable generation in `Rebuilding` so the existing markers remain owned
+    /// until the target can be admitted again.
+    pub(crate) async fn defer_retry_until_target_ready(&self) -> Result<()> {
+        self.defer_retry_until_target_ready_with_rearm(false).await
+    }
+
+    async fn defer_retry_until_target_ready_with_rearm(&self, legacy_rearm: bool) -> Result<()> {
+        let mut state = self.state.write().await;
+        // Readiness deferral is not a heal attempt. Preserve an in-budget
+        // counter, but reserve one bounded pass when compatibility recovery
+        // has to re-arm an exhausted legacy generation.
+        if state.retry_count >= state.max_retries {
+            state.retry_count = state.max_retries.saturating_sub(1);
+        }
+        if legacy_rearm {
+            state.replacement_legacy_retry_compatibility_done = true;
+        }
+        state.replacement_retry_waiting_for_target = true;
+        state.reset_for_retry();
+        state.error_message = Some(REPLACEMENT_TARGET_READINESS_DEFERRED.to_string());
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    /// Re-arm an exhausted generation when its target is unavailable, or when
+    /// a pre-readiness-aware release left the durable transient-skip marker at
+    /// the retry ceiling.  The compatibility path is one-shot; an exhausted
+    /// ready generation with no such marker remains terminal.
+    pub(crate) async fn rearm_replacement_recovery_if_needed(
+        &self,
+        storage: &dyn crate::heal::storage::HealStorageAPI,
+    ) -> Result<bool> {
+        let state = self.get_state().await;
+        if !replacement_retry_is_exhausted_active(&state) {
+            return Ok(false);
+        }
+        if state.max_retries == 0 {
+            return Ok(false);
+        }
+        let legacy_rearm = replacement_retry_is_legacy_transient_skip(&state);
+        let ready = storage
+            .replacement_targets_ready_for_retry(
+                &state.set_disk_id,
+                &state.replacement_targets,
+                &state.replacement_target_identities,
+            )
+            .await?;
+        if ready && !legacy_rearm {
+            return Ok(false);
+        }
+        // Legacy exhausted passes may already have a checkpoint containing
+        // the skipped object ledger.  Rewinding only the resume summary would
+        // make the next executor suppress those objects again, so clear the
+        // companion checkpoint before publishing the re-armed state.
+        if CheckpointManager::has_checkpoint(&self.disk, &state.task_id).await {
+            CheckpointManager::load_from_disk(self.disk.clone(), &state.task_id)
+                .await?
+                .reset_for_retry()
+                .await?;
+        }
+        self.defer_retry_until_target_ready_with_rearm(legacy_rearm).await?;
         Ok(true)
     }
 
@@ -1092,6 +1261,7 @@ impl ResumeManager {
     }
 
     async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
+        let _persistence = self.persistence_lock.lock().await;
         let state = self.state.read().await.clone();
         validate_resume_task_id(&state.task_id)?;
         let state_data = EcstoreDiskBytes::from(serde_json::to_vec(&state).map_err(|e| Error::TaskExecutionFailed {

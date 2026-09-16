@@ -15,6 +15,47 @@
 use super::*;
 
 impl HealTask {
+    pub(super) async fn heal_delete_marker_purge(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> Result<()> {
+        self.check_control_flags().await?;
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: true,
+            recreate: false,
+            scan_mode: HealScanMode::Deep,
+            update_parity: false,
+            no_lock: self.options.no_lock,
+            read_repair: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let mut expected =
+            self.outcome_identity(bucket, object, Some(version_id), self.options.pool_index, self.options.set_index);
+        expected.bucket_incarnation_id = Some(purge.bucket_incarnation_id);
+        let storage_result = self
+            .await_with_control(
+                self.storage
+                    .purge_delete_marker(bucket, object, version_id, purge, &heal_opts),
+            )
+            .await?;
+        if let Some(error) = storage_result.error {
+            return Err(error);
+        }
+        if !self.record_verified_storage_receipt(expected, storage_result.receipt).await {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("delete-marker purge returned no exact storage proof for {bucket}/{object}/{version_id}"),
+            });
+        }
+        self.progress.write().await.update_object_progress(1, 1, 0, 0, 0);
+        Ok(())
+    }
+
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     #[hotpath::measure]
@@ -180,10 +221,17 @@ impl HealTask {
 
         match heal_result {
             Ok(storage_result) => {
+                if let Some(resolved_version_id) = storage_result.item.resolved_version_id {
+                    let resolved_version = Uuid::from_bytes(resolved_version_id);
+                    if !resolved_version.is_nil() {
+                        expected_identity.version_id = Some(resolved_version.to_string());
+                    }
+                }
                 let result = storage_result.item;
                 let error = storage_result.error;
                 if let Some(e) = error {
-                    if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                    if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await
+                    {
                         return Ok(());
                     }
 
@@ -277,7 +325,7 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await {
                     return Ok(());
                 }
 

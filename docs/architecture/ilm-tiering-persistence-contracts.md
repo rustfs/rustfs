@@ -30,10 +30,22 @@ These are approved-target invariants. A protocol's explicitly labeled current ex
 | Remote PUT is in flight or its response is unknown | Transition transaction | Only cleanup of its own canonical candidate, subject to the transaction recovery predicate | Durable transaction identity plus a known remote-version state; the approved target also requires expiry and durable takeover of the creator fence |
 | Local transition commit is complete | Exact transitioned version in `xl.meta` | No | Recovery finds the transaction's logical bucket/object/version and requires the complete recorded source identity (version ID, data directory, modification time, size, and ETag), `TRANSITION_COMPLETE`, and the same remote object, tier, and remote version before removing only the transaction record |
 | An ordinary delete removes that transitioned version | Hidden `xl.meta` free-version | Yes | Metadata quorum atomically removes the visible version and preserves its exact tier tuple in the free-version |
+| PUT or materialized self-copy replaces a transitioned null version | Hidden `xl.meta` free-version | Yes, after replacement commit and complete physical reference checks | The coordinator supplies one cleanup UUID to every disk; replacement metadata and the old remote tuple are written in the same `xl.meta` commit |
 | A recursive prefix/delete-all operation cannot preserve per-object markers | v6 journal bound to an immutable single dispatch manifest or a chunk-parent-bound child manifest | Yes, but only after child/manifest completion and all-pool absence proof | `DispatchAuthorized`, exact local destructive mutation, every journal `Committed`, then child/manifest `Completed`; a chunk parent advances only after that child completion |
 | Tier configuration mutation, manual job, or decommission receipt | Intent/admission/copy proof only | No | These records gate configuration, scheduling, or migration; they never become remote-object cleanup owners |
 
 An old journal and a free-version can coexist during compatibility recovery. That coexistence is evidence of multiple possible owners, not permission to choose one: the journal path must retain its record until the version-specific recovery rule proves which owner is authoritative.
+
+Null-version replacement uses the existing free-version format and recovery
+worker. Failed metadata preparation preserves both the old version and its
+inline bytes; rename rollback restores the complete previous metadata. Recovery
+must retain cleanup while any physical replica still references the remote tuple,
+including a minority version omitted by quorum merging, or any disk cannot be
+checked. A successful replacement needs no in-memory queue receipt to survive
+restart: the normal free-version sweep discovers its committed owner. Restores
+that retain the same remote tuple and ordinary versioned writes retain their
+existing ownership. Older binaries can read this format, but all writers and
+cleanup workers need the overwrite fix before these guarantees cover the fleet.
 
 ## Persisted record inventory
 

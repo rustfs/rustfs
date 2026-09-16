@@ -537,7 +537,21 @@ pub(crate) struct HostEnvironment {
 impl HostEnvironment {
     fn collect() -> Result<Self, EnvironmentError> {
         #[cfg(test)]
-        let _scan = test_support::ScanGuard::start();
+        let scan = test_support::ScanGuard::start();
+        #[cfg(test)]
+        if scan.controlled() {
+            return Ok(Self {
+                os_summary: "test-os".to_owned(),
+                kernel_summary: "test-kernel".to_owned(),
+                architecture: std::env::consts::ARCH,
+                cores: 1,
+                total_memory_bytes: 1,
+                under_memory_pressure: false,
+                filesystem_types: vec![EnvironmentFilesystemType::Other],
+                interface_count: 1,
+                bond_count: 0,
+            });
+        }
 
         // Processes, names, addresses, paths, mount options and device labels are outside this schema.
         let system = System::new_with_specifics(RefreshKind::everything().without_processes());
@@ -624,30 +638,123 @@ pub(crate) async fn collect_host_environment(
 
 #[cfg(test)]
 mod test_support {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
 
-    pub(super) static DELAY_MILLIS: AtomicU64 = AtomicU64::new(0);
+    use tokio::sync::Semaphore;
+
     pub(super) static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     pub(super) static MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static CONTROLLED_SCAN: Mutex<Option<Arc<ScanBarrier>>> = Mutex::new(None);
 
-    pub(super) struct ScanGuard;
+    struct ScanBarrier {
+        reached: Semaphore,
+        completed: Semaphore,
+        released: Mutex<bool>,
+        release: Condvar,
+    }
+
+    impl ScanBarrier {
+        fn new() -> Self {
+            Self {
+                reached: Semaphore::new(0),
+                completed: Semaphore::new(0),
+                released: Mutex::new(false),
+                release: Condvar::new(),
+            }
+        }
+
+        fn wait(&self) {
+            self.reached.add_permits(1);
+            let mut released = self.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = self.release.wait(released).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            self.release.notify_all();
+        }
+    }
+
+    pub(super) struct ControlledScan {
+        barrier: Arc<ScanBarrier>,
+    }
+
+    impl ControlledScan {
+        pub(super) async fn wait_until_reached(&self) {
+            let permit = self
+                .barrier
+                .reached
+                .acquire()
+                .await
+                .expect("controlled scan barrier should stay open");
+            permit.forget();
+        }
+
+        pub(super) fn release(&self) {
+            self.barrier.release();
+        }
+
+        pub(super) async fn wait_until_completed(&self) {
+            let permit = self
+                .barrier
+                .completed
+                .acquire()
+                .await
+                .expect("controlled scan completion should stay open");
+            permit.forget();
+        }
+    }
+
+    impl Drop for ControlledScan {
+        fn drop(&mut self) {
+            self.barrier.release();
+            let mut controlled = CONTROLLED_SCAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if controlled.as_ref().is_some_and(|barrier| Arc::ptr_eq(barrier, &self.barrier)) {
+                controlled.take();
+            }
+        }
+    }
+
+    pub(super) fn control_next_scan() -> ControlledScan {
+        let barrier = Arc::new(ScanBarrier::new());
+        let mut controlled = CONTROLLED_SCAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(controlled.is_none(), "only one controlled system scan may be installed");
+        *controlled = Some(Arc::clone(&barrier));
+        ControlledScan { barrier }
+    }
+
+    pub(super) struct ScanGuard {
+        barrier: Option<Arc<ScanBarrier>>,
+    }
 
     impl ScanGuard {
         pub(super) fn start() -> Self {
             let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
             MAX_ACTIVE.fetch_max(active, Ordering::SeqCst);
-            let delay = DELAY_MILLIS.load(Ordering::SeqCst);
-            if delay != 0 {
-                std::thread::sleep(Duration::from_millis(delay));
+            let barrier = CONTROLLED_SCAN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(barrier) = &barrier {
+                barrier.wait();
             }
-            Self
+            Self { barrier }
+        }
+
+        pub(super) fn controlled(&self) -> bool {
+            self.barrier.is_some()
         }
     }
 
     impl Drop for ScanGuard {
         fn drop(&mut self) {
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                barrier.completed.add_permits(1);
+            }
         }
     }
 }
@@ -659,39 +766,31 @@ mod tests {
 
     use super::*;
 
-    async fn wait_for_active(expected: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while test_support::ACTIVE.load(Ordering::SeqCst) != expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("system scan reaches expected state");
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_and_cancelled_scans_remain_single_flight() {
         test_support::MAX_ACTIVE.store(0, Ordering::SeqCst);
-        test_support::DELAY_MILLIS.store(150, Ordering::SeqCst);
+        let controlled = test_support::control_next_scan();
 
-        let cancel = CancellationToken::new();
-        assert_eq!(
-            collect_host_environment(Duration::from_millis(20), &cancel).await,
-            Err(EnvironmentError::TimedOut)
-        );
+        let first = tokio::spawn(async {
+            let cancel = CancellationToken::new();
+            collect_host_environment(Duration::from_millis(20), &cancel).await
+        });
+        controlled.wait_until_reached().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        assert_eq!(first.await.expect("first scan"), Err(EnvironmentError::TimedOut));
         assert_eq!(test_support::ACTIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(SYSTEM_SCAN_PERMIT.available_permits(), 0);
 
         let second_cancel = CancellationToken::new();
-        let second = tokio::spawn({
-            let second_cancel = second_cancel.clone();
-            async move { collect_host_environment(Duration::from_secs(1), &second_cancel).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = collect_host_environment(Duration::from_secs(1), &second_cancel);
+        tokio::pin!(second);
+        assert!(futures::poll!(second.as_mut()).is_pending());
         assert_eq!(test_support::MAX_ACTIVE.load(Ordering::SeqCst), 1);
         second_cancel.cancel();
-        assert_eq!(second.await.expect("second scan"), Err(EnvironmentError::Cancelled));
-        wait_for_active(0).await;
-        test_support::DELAY_MILLIS.store(0, Ordering::SeqCst);
+        assert_eq!(second.await, Err(EnvironmentError::Cancelled));
+        controlled.release();
+        controlled.wait_until_completed().await;
+        assert_eq!(test_support::ACTIVE.load(Ordering::SeqCst), 0);
     }
 
     #[test]

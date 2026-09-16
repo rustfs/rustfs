@@ -219,6 +219,7 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
 struct NoticeStorage {
     calls: std::sync::Mutex<HashMap<String, u32>>,
     retry_started: tokio::sync::Notify,
+    bucket_incarnation_id: Uuid,
 }
 
 #[async_trait::async_trait]
@@ -235,6 +236,9 @@ impl HealStorageAPI for NoticeStorage {
             ..Default::default()
         }))
     }
+    async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
+        Ok(Some(self.bucket_incarnation_id))
+    }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }
@@ -248,14 +252,16 @@ impl HealStorageAPI for NoticeStorage {
         _: Option<&str>,
         _: &HealOpts,
     ) -> rustfs_heal::Result<(HealItem, Option<rustfs_heal::Error>)> {
-        let retry = {
+        let call = {
             let mut calls = self.calls.lock().expect("fixture calls");
             let count = calls.entry(object.to_string()).or_default();
             *count += 1;
-            *count > 1
+            *count
         };
-        if retry {
-            self.retry_started.notify_one();
+        if call > 1 {
+            if call == 2 {
+                self.retry_started.notify_one();
+            }
             std::future::pending::<()>().await;
         }
         match object {
@@ -315,25 +321,41 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
     }
     // The production ingress channel is a process singleton; isolation keeps
     // its receiver and lease generations independent from other scanner tests.
+    // Partial writes require a committed journal and a complete bucket identity
+    // before the real consumer may dispatch them.
+    let journal_root = tempfile::tempdir().expect("MRF journal fixture");
+    let _journal_env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(journal_root.path())
+        .build()
+        .await;
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     let bucket = format!("mrf-ownership-{}", Uuid::new_v4());
     scanner.new_cache.info.name = bucket.clone();
     scanner.update_cache.info.name = bucket.clone();
     scanner.heal_object_select = 1;
-    let storage = Arc::new(NoticeStorage::default());
+    let storage = Arc::new(NoticeStorage {
+        bucket_incarnation_id: Uuid::new_v4(),
+        ..Default::default()
+    });
+    const OBJECTS: [&str; 4] = ["grace", "unknown", "failed", "cancelled"];
     let manager = Arc::new(HealManager::new(
         storage.clone(),
         Some(HealConfig {
             enable_auto_heal: false,
             mainline_throttle_enable: false,
             heal_interval: Duration::from_millis(10),
+            // Unproved partial writes remain durable after cancellation and
+            // may replay while later cases run. Give every retained case a
+            // slot so an earlier blocked retry cannot starve the next case.
+            max_concurrent_heals: OBJECTS.len(),
+            max_concurrent_per_set: OBJECTS.len(),
             ..Default::default()
         }),
     ));
     manager.start().await.expect("production manager starts");
     spawn_mrf_consumer(manager.clone());
-    for (index, object) in ["grace", "unknown", "failed", "cancelled"].iter().enumerate() {
+    for (index, object) in OBJECTS.iter().enumerate() {
         let version = Uuid::new_v4();
         scanner.new_cache.info.pending_heals.push(pending_heal(
             PendingScannerHealKind::Object,
