@@ -260,3 +260,293 @@ uvarint：明文长度（≤10B）
 ## 8. 与 multi-cipher 方案（09 号文档）的对应
 
 本走读标出的两个加密调用点（v2 的 :151-164、v1 的 :273-276）正是 09 号方案改动点 C 的改造位置：把 `cipher: &Aes256Gcm` 参数化为 `&EncryptCipher` 枚举后，`:151-164` 的 match 按算法路由到 `Aes256Gcm` / `Aes256GcmDemo` 两种原语的 `encrypt`，帧类型字节 0x03/0x04 与 `build_frame` 的 `type_byte` 选择（改动点 D）在 :220 接入。
+
+## 9. 详细代码流程（真实代码逐段全标注）
+
+> 以下全部为 `crates/rio/src/encrypt_reader.rs` 的真实代码，注释为逐个参数/逐行含义标注。行号 = 当前 checkout（1.0.0-rc.6_caohui）实际行号。
+
+### 9.1 帧类型常量与 AAD 函数（:44-56）
+
+```rust
+// —— 帧类型字节（8B 帧头的 [0] 字节）——
+const FRAME_TYPE_V1: u8 = 0x00;        // AES v1 帧：无 AEAD 认证头，密文不绑帧头/序号
+const FRAME_TYPE_V2: u8 = 0x01;        // AES v2 非末帧：帧头+序号进 AAD，定长 8KB
+const FRAME_TYPE_V2_FINAL: u8 = 0x02;  // AES v2 末帧：类型字节本身也被 AAD 认证，防截断
+const FRAME_TYPE_END: u8 = 0xFF;       // 段结束标记：不进 AEAD，仅作分段符
+
+/// AEAD associated data of a v2 frame: the 8-byte header followed by the
+/// frame index within its segment, little-endian.
+/// 输入参数：
+///   header: &[u8; 8]  —— 即将写入的 8B 帧头（type + len + crc32）
+///   block_index       —— 本块在段内的绝对序号（从 0 起）
+/// 返回：16B AAD = 帧头 8B ‖ 序号 u64 小端 8B
+fn v2_frame_aad(header: &[u8; 8], block_index: usize) -> [u8; 16] {
+    let mut aad = [0u8; 16];
+    aad[..8].copy_from_slice(header);                     // [0..8)  = 帧头副本
+    aad[8..].copy_from_slice(&(block_index as u64).to_le_bytes()); // [8..16) = 块序号小端
+    aad
+}
+```
+
+### 9.2 构造器：key / nonce 参数注入点（:82-96，:107-111）
+
+```rust
+/// 参数：
+///   inner: R          —— 上游明文 AsyncRead（请求体/解压流等）
+///   key:   [u8; 32]   —— AES-256 密钥（来自 sse.rs 的 EncryptionMaterial.key_bytes）
+///   nonce: [u8; 12]   —— 96-bit 基础 nonce（来自 sse.rs 的 EncryptionMaterial.base_nonce）
+pub fn new(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
+    Self {
+        inner,
+        cipher: Aes256Gcm::new_from_slice(&key).expect("key"), // ★ 算法对象在此构造
+        base_nonce: nonce,          // 存 12B 基础 nonce，后续逐块派生
+        buffer: Vec::new(),         // 输出帧缓冲（攒好一帧后由 poll_read 逐段拷贝出去）
+        buffer_pos: 0,              // 输出帧缓冲中的消费位置
+        read_buffer: vec![0u8; ENCRYPTION_BLOCK_SIZE], // 明文块缓冲（8KB）
+        block_index: 0,             // 块序号：nonce 派生 + v2 AAD 都用它
+        finished: false,            // 是否已写完（含段结束帧）
+        frame_v2: false,            // false = v1 布局（每次读到多少加密多少）
+        pending: 0,                 // (v2) 已累积进 read_buffer 的明文字节数
+        input_done: false,          // (v2) 上游是否已 EOF
+    }
+}
+
+pub fn new_v2(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
+    let mut reader = Self::new(inner, key, nonce); // 复用 new：key/nonce 语义完全一致
+    reader.frame_v2 = true;                        // 只切布局开关 → v2 定长认证帧
+    reader
+}
+```
+
+### 9.3 build_frame：v2 帧加密核心（:123-173）—— ★ 真算法调用处
+
+```rust
+/// 输入参数（参数即契约）：
+///   cipher:      &Aes256Gcm    —— :85 构造的算法对象
+///   nonce_bytes: &[u8; 12]     —— 本块 GCM nonce（poll_read 里 derive_block_nonce 派生）
+///   type_byte:   u8            —— 0x01 非末帧 / 0x02 末帧（:220 决定）
+///   block_index: usize         —— 本块绝对序号（AAD + nonce 共用）
+///   plaintext:   &[u8]         —— 明文块（非末帧恒 8KB；末帧 ≤8KB，可为 0）
+/// 返回：一帧完整字节 = 8B 帧头 + uvarint 明文长 + 密文（明文+16B tag）
+fn build_frame(
+    cipher: &Aes256Gcm,
+    nonce_bytes: &[u8; 12],
+    type_byte: u8,
+    block_index: usize,
+    plaintext: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+    let nonce = &nonce;                    // [u8;12] → aead::Nonce<Aes256Gcm>（12B 类型级固定）
+
+    // 明文 CRC-32（CRC32/Iso-Hdlc）：放进帧头 [4..8)，v2 时随帧头一起被 AAD 认证
+    let crc = {
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(plaintext);
+        hasher.finalize() as u32
+    };
+
+    let int_len = put_uvarint_len(plaintext.len() as u64); // 明文长度 uvarint 的字节数（≤10）
+    // 帧头 len 字段（24-bit）提前算好：int_len + 明文 + 16B tag + 4
+    // → 加密前帧头就已固定，所以它能作为 AAD 参与认证
+    let clen = int_len + plaintext.len() + 16 + 4;
+    let mut header = [0u8; 8];
+    header[0] = type_byte;                 // [0]    = 帧类型（0x01/0x02）
+    header[1] = (clen & 0xFF) as u8;       // [1..4) = clen 24-bit 小端
+    header[2] = ((clen >> 8) & 0xFF) as u8;
+    header[3] = ((clen >> 16) & 0xFF) as u8;
+    header[4] = (crc & 0xFF) as u8;        // [4..8) = 明文 CRC-32 小端
+    header[5] = ((crc >> 8) & 0xFF) as u8;
+    header[6] = ((crc >> 16) & 0xFF) as u8;
+    header[7] = ((crc >> 24) & 0xFF) as u8;
+
+    // ★★★★★ 真正调用 Aes256Gcm 算法的地方 ★★★★★
+    // cipher.encrypt 是 aead::Aead::encrypt trait 方法，返回 Result<Vec<u8>>：
+    //   成功 = 密文 Vec<u8>（明文 + 16B GCM tag）
+    //   失败 = aead::Error（如 key/nonce 非法、内部错误），映射为 io::Error
+    let ciphertext = match type_byte {
+        FRAME_TYPE_V1 => cipher.encrypt(nonce, plaintext),   // v1：只加密明文，无 AAD
+        _ => {                                                // v2（0x01/0x02）：
+            let aad = v2_frame_aad(&header, block_index);    //   AAD = 帧头 + 序号
+            cipher.encrypt(
+                nonce,
+                Payload {       // aead::Payload：msg=明文，aad=认证数据（不进密文但参与加密）
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+        }
+    }
+    .map_err(|e| Error::other(format!("encrypt error: {e}")))?; // aead 错误 → io 错误
+
+    // —— 输出：拼一帧落盘 ——
+    let mut out = Vec::with_capacity(8 + int_len + ciphertext.len()); // 8B 头 + uvarint + 密文
+    out.extend_from_slice(&header);                              // ① 8B 帧头
+    let mut plaintext_len_buf = [0u8; 10];
+    let encoded_len = put_uvarint(&mut plaintext_len_buf, plaintext.len() as u64);
+    out.extend_from_slice(&plaintext_len_buf[..encoded_len]);    // ② 明文长度 uvarint
+    out.extend_from_slice(&ciphertext);                          // ③ 密文（明文+16B tag）
+    Ok(out)
+}
+```
+
+### 9.4 poll_read v2 路径（:196-243）—— 读明文 → 派生 nonce → 交给 build_frame
+
+```rust
+if *this.frame_v2 {
+    // ① 输入侧：循环拉上游明文，累积满 8KB 才加密。
+    //    目的：每个非末帧定长（ENCRYPTION_BLOCK_SIZE），range read/seek 才有闭式偏移映射。
+    while !*this.input_done && *this.pending < ENCRYPTION_BLOCK_SIZE {
+        let mut temp_buf = ReadBuf::new(&mut this.read_buffer[*this.pending..ENCRYPTION_BLOCK_SIZE]);
+        match this.inner.as_mut().poll_read(cx, &mut temp_buf) { // inner = 上游明文 reader
+            Poll::Pending => return Poll::Pending,               // 上游没数据：等下次 poll
+            Poll::Ready(Ok(())) => {
+                let n = temp_buf.filled().len();
+                if n == 0 { *this.input_done = true; }           // 读到 0 字节 = EOF
+                else      { *this.pending += n; }                // 累计明文长度
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        }
+    }
+
+    // ② 是否末帧：EOF 切不足一块 → 末帧（短块只可能是流尾；恰好 8KB 边界则整块非末帧 + 空末帧）
+    let is_final = *this.input_done && *this.pending < ENCRYPTION_BLOCK_SIZE;
+    let type_byte = if is_final { FRAME_TYPE_V2_FINAL } else { FRAME_TYPE_V2 }; // 0x02 / 0x01
+
+    // ③ 本块 GCM nonce：base_nonce 的 [8..12) 字节（BE u32）+ 块序号
+    let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
+
+    // ④ ★ 调 build_frame → 内部走 :151-164 的 Aes256Gcm::encrypt（见 9.3）
+    let mut out = build_frame(
+        this.cipher,                                   // 算法对象 &Aes256Gcm
+        &block_nonce,                                  // 本块 nonce [u8;12]
+        type_byte,                                     // 0x01 / 0x02
+        *this.block_index,                             // 块序号（AAD 用）
+        &this.read_buffer[..*this.pending],            // 明文块（非末帧 8KB / 末帧 ≤8KB）
+    )?;
+
+    if is_final {
+        // 末帧后追加 8B 结束帧（0xFF）作为段分隔符
+        let mut end_header = [0u8; 8];
+        end_header[0] = FRAME_TYPE_END;
+        out.extend_from_slice(&end_header);
+        *this.finished = true;
+    }
+    *this.pending = 0;          // 清累积计数
+    *this.block_index += 1;     // 块序号 +1（影响下帧 nonce + AAD）
+    *this.buffer = out;         // ⑤ 输出侧：整帧入缓冲，下面按调用方容量逐段拷贝出去
+    *this.buffer_pos = 0;
+    let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+    buf.put_slice(&this.buffer[..to_copy]);   // 把帧内容拷贝进调用方的 ReadBuf
+    *this.buffer_pos += to_copy;
+    return Poll::Ready(Ok(()));
+}
+```
+
+### 9.5 poll_read v1 路径（:245-316）—— 默认布局的内联加密：★ 真算法调用处（无 AAD）
+
+```rust
+// ① 输入侧：每次只读一块（最多 8KB），读到多少加密多少 → v1 帧长度可变
+let mut temp_buf = ReadBuf::new(&mut this.read_buffer[..]);
+match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
+    Poll::Pending => Poll::Pending,
+    Poll::Ready(Ok(())) => {
+        let n = temp_buf.filled().len();     // 本次实际读到的明文长度
+        if n == 0 {
+            // EOF：写 8B 结束帧（0xFF）后结束
+            let mut header = [0u8; 8];
+            header[0] = 0xFF;                // type: end
+            *this.buffer = header.to_vec();
+            *this.buffer_pos = 0;
+            *this.finished = true;
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos += to_copy;
+            Poll::Ready(Ok(()))
+        } else {
+            // ② 派生本块 nonce（与 v2 同一函数）
+            let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
+            let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+            let plaintext = &this.read_buffer[..n];   // 明文切片 = 本次读到的 n 字节
+            let plaintext_len = plaintext.len();
+            // ③ 明文 CRC-32（帧头 [4..8)，v1 无 AAD 认证，仅校验用途）
+            let crc = {
+                let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                hasher.update(plaintext);
+                hasher.finalize() as u32
+            };
+            // ★★★★★ v1 的 Aes256Gcm 调用点（:273-276）★★★★★
+            // 参数：nonce（12B 派生值） + 明文 whole slice，无 AAD；返回 明文+16B tag
+            let ciphertext = this
+                .cipher                       // &Aes256Gcm 算法对象
+                .encrypt(&nonce, plaintext)   // aead::Aead::encrypt
+                .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
+            let int_len = put_uvarint_len(plaintext_len as u64); // 明文长 uvarint 字节数
+            // v1 帧头 len 字段 = int_len + 密文长 + 4（密文已含 16B tag）
+            let clen = int_len + ciphertext.len() + 4;
+            let mut header = [0u8; 8];
+            header[0] = 0x00;                        // 0 = encrypted（v1 类型恒定 0x00）
+            header[1] = (clen & 0xFF) as u8;         // [1..4) len 24-bit 小端
+            header[2] = ((clen >> 8) & 0xFF) as u8;
+            header[3] = ((clen >> 16) & 0xFF) as u8;
+            header[4] = (crc & 0xFF) as u8;          // [4..8) 明文 CRC-32 小端
+            header[5] = ((crc >> 8) & 0xFF) as u8;
+            header[6] = ((crc >> 16) & 0xFF) as u8;
+            header[7] = ((crc >> 24) & 0xFF) as u8;
+            // ④ 输出侧：拼帧 = 8B 头 + uvarint 明文长 + 密文
+            let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
+            out.extend_from_slice(&header);
+            let mut plaintext_len_buf = [0u8; 10];
+            let encoded_len = put_uvarint(&mut plaintext_len_buf, plaintext_len as u64);
+            out.extend_from_slice(&plaintext_len_buf[..encoded_len]);
+            out.extend_from_slice(&ciphertext);
+            *this.buffer = out;                      // 整帧进缓冲，供上层逐段拷贝
+            *this.buffer_pos = 0;
+            *this.block_index += 1;                  // 块序号 +1
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos += to_copy;
+            Poll::Ready(Ok(()))
+        }
+    }
+    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+}
+```
+
+### 9.6 nonce 派生族（:861-885）—— 参数含义逐行
+
+```rust
+/// 块 nonce：在 base_nonce 的第 [8..12) 字节处叠 block_index
+fn derive_block_nonce(base: &[u8; 12], block_index: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, block_index)   // start=8 → 修改 base[8..12)
+}
+
+/// multipart part 的 nonce 基：与块 nonce 用不同的字节窗口（[4..8)），互不重叠
+pub fn multipart_part_nonce(base_nonce: [u8; 12], part_number: usize) -> [u8; 12] {
+    derive_part_nonce(&base_nonce, part_number)
+}
+
+fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 4, part_number)   // start=4 → 修改 base[4..8)
+}
+
+/// 读端 v1 历史布局之一（旧版 part nonce 窗口在 [8..12)，与块 nonce 同窗）
+fn derive_legacy_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, part_number)
+}
+
+/// 统一实现：
+///   参数 base: &[u8; 12] —— 基础 nonce（对象级 base_nonce，或 part nonce 基）
+///   参数 start: usize    —— 叠加窗口起点：8 = 块窗口（[8..12)），4 = part 窗口（[4..8)）
+///   参数 offset: usize   —— 要叠加的序号：block_index 或 part_number
+///   做法：把窗口内 4B 当大端 u32，wrapping_add(offset) 后写回；窗口外字节原样保留
+///   成因：GCM 要求同一 key 下 nonce 不重用 → 每个 (对象,part,块) nonce 唯一
+fn derive_nonce_offset(base: &[u8; 12], start: usize, offset: usize) -> [u8; 12] {
+    let mut nonce = *base;
+    let mut suffix = [0u8; 4];
+    suffix.copy_from_slice(&nonce[start..start + 4]);   // 取窗口 4B
+    let current = u32::from_be_bytes(suffix);           // 大端读成 u32
+    let next = current.wrapping_add(offset as u32);     // 加序号（wrapping：溢出回绕不 panic）
+    nonce[start..start + 4].copy_from_slice(&next.to_be_bytes()); // 大端写回
+    nonce
+}
+```
