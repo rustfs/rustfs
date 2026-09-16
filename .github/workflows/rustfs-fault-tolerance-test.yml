@@ -234,6 +234,35 @@ jobs:
             --package-source "${PACKAGE_SOURCE}" \
             --date "$(date -u +%Y-%m-%d)"
 
+      - name: Upload functional report to dashboard
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: ${{ env.REPORT_FILE }}
+          SUITE: fault-tolerance
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+          echo "dashboard updated: ${REPORT_PATH}"
+
       - name: Upload test logs & evidence
         timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
