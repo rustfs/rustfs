@@ -530,7 +530,11 @@ impl ECStore {
             return Ok((result, 0, opts.expected_bucket_incarnation_id));
         }
 
-        if opts.data_movement && opts.version_id.is_some() {
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
+        if opts.data_movement && (opts.version_id.is_some() || capacity_owner.is_some()) {
+            // Capacity-owned decommission writes must remain on the target
+            // selected by the durable reservation, including unversioned
+            // objects whose ObjectOptions carry no version ID.
             let idx = self.select_data_movement_pool_idx(bucket, object, -1, &opts, false).await?;
             if idx == opts.src_pool_idx {
                 return Err(StorageError::DataMovementOverwriteErr(
@@ -542,12 +546,9 @@ impl ECStore {
             self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
                 .await;
             let res = self
-                .run_decommission_capacity_temporary_mutation(
-                    idx,
-                    DecommissionCapacityOwner::from_options(&opts),
-                    None,
-                    || async { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
-                )
+                .run_decommission_capacity_temporary_mutation(idx, capacity_owner, None, || async {
+                    self.pools[idx].new_multipart_upload(bucket, object, &opts).await
+                })
                 .await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }

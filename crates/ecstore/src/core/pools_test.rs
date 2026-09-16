@@ -2885,6 +2885,89 @@ mod decommission_lock_order_tests {
 
     #[test]
     #[serial_test::serial]
+    fn unversioned_decommission_multipart_uses_reserved_target() {
+        run_large_stack_current_thread_async_test(
+            "unversioned-decommission-multipart-target",
+            unversioned_decommission_multipart_uses_reserved_target_case,
+        );
+    }
+
+    async fn unversioned_decommission_multipart_uses_reserved_target_case() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("unversioned-decommission-multipart-target");
+        let object = "unversioned-existing-unreserved-target.bin";
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_snapshot = || {
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1, 1),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 2, 2, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 100, 100, 0),
+            ]
+        };
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the unversioned multipart target bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the unversioned multipart target incarnation");
+
+        // Force the ordinary pool selector to choose pool 2. A capacity-owned
+        // upload must ignore this unreserved existing object and use pool 1.
+        let mut existing = PutObjReader::from_vec(b"existing unreserved target".to_vec());
+        store.pools[2]
+            .put_object(
+                &bucket,
+                object,
+                &mut existing,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed the unreserved target object");
+
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity_snapshot()]);
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the unversioned multipart reservation");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let targets = &pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the unversioned multipart reservation should exist")
+                .targets;
+            assert_eq!(targets.len(), 1, "only pool 1 should be reserved");
+            assert_eq!(targets[0].pool_index, 1);
+        }
+
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
+        let mut upload_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            versioned: false,
+            version_id: None,
+            mod_time: Some(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(97)),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        owner.apply_to(&mut upload_opts);
+
+        let (_, target_pool_idx, _) = store
+            .handle_new_multipart_upload_with_pool_idx(&bucket, object, &upload_opts, None)
+            .await
+            .expect("unversioned decommission multipart must use the reserved target");
+        assert_eq!(target_pool_idx, 1, "the reservation target must override the existing unreserved object");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn data_movement_multipart_abort_restart_reconciles_inflight_after_release_save_loss() {
         run_large_stack_current_thread_async_test(
             "multipart-abort-restart",
