@@ -355,7 +355,7 @@ impl ECStore {
         if let Some(guard) = guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
         }
-        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
         if opts.expected_bucket_incarnation_id != Some(current) {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }

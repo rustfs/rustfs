@@ -29,8 +29,8 @@ use crate::bucket::lifecycle::{
     },
 };
 use crate::bucket::metadata_sys::{
-    acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_in, get_cached_bucket_incarnation_id_in,
-    get_object_lock_config_and_incarnation_from_disk_in,
+    acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_for_options_in,
+    get_cached_bucket_incarnation_id_in, get_object_lock_config_and_incarnation_from_disk_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
@@ -4445,7 +4445,7 @@ impl ECStore {
         };
         let current_bucket_incarnation_id = if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
             dst_opts.add_bucket_lifecycle_lock_guard(guard);
-            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, dst_bucket).await?;
+            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, dst_bucket, &dst_opts).await?;
             if dst_opts
                 .expected_bucket_incarnation_id
                 .is_some_and(|expected| expected != current_incarnation_id)
@@ -5617,7 +5617,7 @@ impl ECStore {
             opts.add_bucket_lifecycle_lock_guard(guard);
         }
         if !is_meta_bucketname(bucket) {
-            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
             if opts.expected_bucket_incarnation_id != Some(current_incarnation_id) {
                 return Err(StorageError::BucketNotFound(bucket.to_string()));
             }
@@ -5690,7 +5690,7 @@ impl ECStore {
             None
         } else {
             let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+            let current_incarnation_id = get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
             if opts
                 .expected_bucket_incarnation_id
                 .is_some_and(|expected| expected != current_incarnation_id)

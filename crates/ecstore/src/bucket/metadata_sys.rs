@@ -24,6 +24,7 @@ use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_p
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
+use crate::object_api::ObjectOptions;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -488,6 +489,18 @@ pub(crate) async fn get_bucket_incarnation_id_in(ctx: &crate::runtime::instance:
     let sys = bucket_metadata_sys_of(ctx)?;
     let sys = sys.read().await.clone();
     sys.get_bucket_incarnation_id_from_disk(bucket).await
+}
+
+/// Validate against disk while retaining an already-held Object Lock fence.
+pub(crate) async fn get_bucket_incarnation_id_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> Result<Uuid> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    let guard = acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    sys.get_bucket_incarnation_id_under_transaction_lock(bucket, &guard).await
 }
 
 pub(crate) async fn get_cached_bucket_incarnation_id_in(
@@ -1053,6 +1066,24 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in(
         .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
         .await?;
     Ok(lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
+}
+
+/// Readers already holding an Object Lock snapshot must share its guard:
+/// a fresh read acquisition can queue behind a writer waiting for that snapshot.
+pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
+    if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
+        let store = object_store_in(ctx).await?;
+        return snapshot
+            .metadata_transaction_guard_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+            .ok_or_else(|| {
+                Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
+            });
+    }
+    Ok(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(ctx, bucket).await?))
 }
 
 async fn acquire_transaction_lock_with_sys(
@@ -2357,8 +2388,17 @@ impl BucketMetadataSys {
         let _transaction_guard = transaction_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
+        self.get_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
+            .await
+    }
+
+    async fn get_bucket_incarnation_id_under_transaction_lock(
+        &self,
+        bucket: &str,
+        transaction_guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<Uuid> {
         let incarnation_id = load_bucket_incarnation(self.object_store(), bucket).await?;
-        if _transaction_guard.is_lock_lost() {
+        if transaction_guard.is_lock_lost() {
             return Err(Error::other(format!("bucket incarnation metadata transaction lock was lost: {bucket}")));
         }
         match incarnation_id {

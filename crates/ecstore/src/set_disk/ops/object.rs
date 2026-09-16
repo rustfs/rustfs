@@ -3427,8 +3427,8 @@ impl SetDisks {
         Ok(removed)
     }
 
-    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid) -> Result<()> {
-        let current = metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid, opts: &ObjectOptions) -> Result<()> {
+        let current = metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, opts).await?;
         if current != expected {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
@@ -4234,16 +4234,7 @@ impl SetDisks {
                 None
             };
 
-            let quota_context = reservation::begin(
-                &self.ctx,
-                bucket,
-                object,
-                opts.quota_admission,
-                opts.data_movement,
-                self.pool_index,
-                self.set_index,
-            )
-            .await?;
+            let quota_context = reservation::begin(&self.ctx, bucket, object, opts, self.pool_index, self.set_index).await?;
             let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
             let mut replication_quota_size = None;
 
@@ -8869,7 +8860,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Ok(ObjectInfo::default());
             }
             if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
-                self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+                self.validate_bucket_incarnation(bucket, expected_incarnation_id, &opts)
+                    .await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
@@ -9283,7 +9275,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
 
         if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
-            self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+            self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
+                .await?;
         }
         if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || opts
@@ -9863,7 +9856,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .await?
                 .acquire_bucket_lifecycle_read_lock(bucket)
                 .await?;
-            self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+            self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
+                .await?;
             Some(guard)
         } else {
             None
