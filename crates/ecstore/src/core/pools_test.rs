@@ -481,6 +481,9 @@ mod decommission_lock_order_tests {
         if let Some(deployment_id) = other_store.ctx.deployment_id() {
             ctx.set_deployment_id(deployment_id);
         }
+        for pool in &mut pools {
+            Arc::make_mut(pool).set_instance_ctx_for_test(Arc::clone(&ctx));
+        }
         let store = Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: other_store.disk_map.clone(),

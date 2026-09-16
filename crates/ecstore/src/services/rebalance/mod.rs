@@ -222,10 +222,14 @@ async fn test_pool_stores_with_contexts(
         std::sync::Arc::clone(&ctx)
     };
     let make_store = |store_ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>| {
+        let mut store_pools = pools.clone();
+        for pool in &mut store_pools {
+            std::sync::Arc::make_mut(pool).set_instance_ctx_for_test(std::sync::Arc::clone(&store_ctx));
+        }
         std::sync::Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: std::collections::HashMap::new(),
-            pools: pools.clone(),
+            pools: store_pools,
             peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, std::sync::Arc::clone(&store_ctx)),
             pool_meta: tokio::sync::RwLock::new(pool_meta.clone()),
             rebalance_meta: tokio::sync::RwLock::new(rebalance_meta.clone()),
