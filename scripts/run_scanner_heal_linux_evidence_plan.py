@@ -467,7 +467,7 @@ def build_plan(registry: dict[str, Any], revision: str, phases: set[str]) -> dic
         "registry": str(REGISTRY.relative_to(ROOT)),
         "run_root_env": "RUN_ROOT",
         "requirements": {
-            "base_branch": "release",
+            "base_branch": "main",
             "platform": "Linux",
             "tracked_source_clean": True,
             "measured_evidence_required": True,
