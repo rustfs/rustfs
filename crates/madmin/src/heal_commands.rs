@@ -45,6 +45,15 @@ pub struct HealResultItem {
     /// healthy or unchanged object.
     #[serde(skip)]
     pub repair_verified: bool,
+    /// Storage-owner proof that the selected version/marker has authoritative
+    /// metadata from read quorum. This is weaker than payload integrity proof
+    /// and is intentionally in-process only.
+    #[serde(skip)]
+    pub metadata_verified: bool,
+    /// Storage-owner proof that metadata or a delete marker was committed by
+    /// this heal. This is intentionally in-process only.
+    #[serde(skip)]
+    pub metadata_repair_verified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]
@@ -120,6 +129,10 @@ mod tests {
         assert!(wire.get("resolvedVersionId").is_none());
         assert!(wire.get("repair_verified").is_none());
         assert!(wire.get("repairVerified").is_none());
+        assert!(wire.get("metadata_verified").is_none());
+        assert!(wire.get("metadataVerified").is_none());
+        assert!(wire.get("metadata_repair_verified").is_none());
+        assert!(wire.get("metadataRepairVerified").is_none());
         wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
         let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
         assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");

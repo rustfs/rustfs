@@ -28,6 +28,7 @@ use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
+    outcome::HealObjectDisposition,
     storage::{
         ECStoreHealStorage, HealListItem, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI,
     },
@@ -365,7 +366,12 @@ mod serial_tests {
                 assert!(healed.error.is_none(), "exact version repair failed: {:?}", healed.error);
                 if item.is_delete_marker {
                     assert!(!healed.item.integrity_verified);
-                    assert!(healed.receipt.is_none(), "delete markers carry no shard-integrity proof");
+                    let receipt = healed.receipt.expect("delete markers require an exact metadata receipt");
+                    assert_eq!(receipt.identity.version_id, item.version_id);
+                    assert!(matches!(
+                        receipt.disposition,
+                        HealObjectDisposition::Repaired | HealObjectDisposition::MetadataHealthy
+                    ));
                 } else {
                     assert!(healed.item.integrity_verified);
                     let receipt = healed
@@ -435,7 +441,7 @@ mod serial_tests {
             let mut latest_data = versioned_test_data(6);
             latest_data.extend_from_slice(b"new-uuid");
             let latest = put_versioned(&ecstore, &bucket, object, &latest_data).await;
-            versions.push((latest, latest_data.clone()));
+            versions.push((latest.clone(), latest_data.clone()));
 
             let target = disk_paths
                 .iter()
@@ -519,7 +525,17 @@ mod serial_tests {
                 .expect("an omitted selector must still heal latest");
             assert!(latest_result.error.is_none());
             assert_eq!(latest_result.item.object_size, latest_data.len());
-            assert!(latest_result.receipt.is_none(), "a normal scan cannot certify payload integrity");
+            assert!(
+                latest_result.receipt.is_none(),
+                "an omitted selector certifies metadata health only for the null identity"
+            );
+            let latest_receipt = storage
+                .heal_object_with_receipt(&bucket, object, Some(latest.as_str()), &HealOpts::default())
+                .await
+                .expect("a normal scan of the exact latest version")
+                .receipt
+                .expect("a normal scan should certify metadata health");
+            assert_eq!(latest_receipt.disposition, HealObjectDisposition::MetadataHealthy);
             let verified_latest = storage
                 .heal_object_with_receipt(
                     &bucket,
@@ -704,6 +720,46 @@ mod serial_tests {
             matches!(&latest_after, Ok(info) if info.delete_marker) || latest_after.is_err(),
             "latest must remain a delete marker after heal"
         );
+    }
+
+    /// A missing xl.meta must produce an exact marker repair receipt, while a
+    /// healthy replay must prove metadata health without claiming payload integrity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_delete_marker_receipt_repair_then_metadata_healthy() {
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+        let bucket = "b5-dm-receipt";
+        let object = "marker.bin";
+        create_versioned_bucket(&ecstore, bucket).await;
+
+        let _data = put_versioned(&ecstore, bucket, object, &versioned_test_data(41)).await;
+        let marker = put_delete_marker(&ecstore, bucket, object).await;
+        let obj_dir = object_dir(&disk_paths[0], bucket, object);
+        tokio::fs::remove_file(xl_meta_path(&obj_dir))
+            .await
+            .expect("remove one xl.meta replica");
+
+        let repaired = heal_storage
+            .heal_object_with_receipt(bucket, object, Some(&marker), &recreate_heal_opts())
+            .await
+            .expect("marker repair request");
+        assert!(repaired.error.is_none(), "{:?}", repaired.error);
+        assert!(repaired.item.metadata_repair_verified);
+        let receipt = repaired.receipt.expect("committed marker repair receipt");
+        assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(marker.as_str()));
+
+        let healthy = heal_storage
+            .heal_object_with_receipt(bucket, object, Some(&marker), &recreate_heal_opts())
+            .await
+            .expect("healthy marker replay");
+        assert!(healthy.error.is_none(), "{:?}", healthy.error);
+        assert_eq!(healthy.item.drives_healed(), Some(0));
+        assert!(healthy.item.metadata_verified);
+        assert!(!healthy.item.integrity_verified);
+        let receipt = healthy.receipt.expect("metadata health receipt");
+        assert_eq!(receipt.disposition, HealObjectDisposition::MetadataHealthy);
+        assert_eq!(receipt.identity.version_id.as_deref(), Some(marker.as_str()));
     }
 
     /// Enumerated unversioned objects select the exact null slot once each.

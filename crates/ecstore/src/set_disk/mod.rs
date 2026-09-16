@@ -4703,6 +4703,12 @@ impl SetDisks {
         &self.ctx
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
+        self.local_lock_manager = ctx.lock_manager();
+        self.ctx = ctx;
+    }
+
     /// Read the persisted bucket identity through this set's metadata owner.
     /// Missing or non-authoritative legacy identities remain errors.
     pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {

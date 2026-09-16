@@ -3159,6 +3159,120 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// rustfs/rustfs#7674: a bucket carrying a legacy snapshot-protocol quota
+    /// (written before durable reservations existed, so `quota.json` has no
+    /// `reservation_protocol`) must accept a cross-key CopyObject whose
+    /// destination options carry the handler's quota admission. The storage
+    /// layer fails closed with `PartMissingOrCorrupt` when a quota-enforced
+    /// bucket sees a write without admission, so dropping the admission while
+    /// rebuilding the destination options turns every copy into a
+    /// deterministic "part missing or corrupt" failure even though the source
+    /// object is perfectly readable.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn copy_object_forwards_quota_admission_on_legacy_snapshot_quota_bucket() {
+        let temp_dir = tempfile::tempdir().expect("create legacy quota copy store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-quota-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("legacy-quota-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let target_object = "docker/registry/v2/blobs/sha256/a5/digest/data";
+        let payload = vec![0x5A; 8178];
+        let quota_limit = 1u64 << 30;
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for legacy quota copy");
+        // Legacy quota shape: no `reservation_protocol`, so the storage layer
+        // requires the handler-supplied snapshot admission on every write.
+        let legacy_quota = format!(r#"{{"quota":{quota_limit},"quota_type":"Hard"}}"#);
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_QUOTA_CONFIG_FILE,
+            legacy_quota.into_bytes(),
+        )
+        .await
+        .expect("persist legacy snapshot quota");
+        let (quota, _, _) = crate::bucket::metadata_sys::get_quota_config_and_incarnation_from_disk_in(&ctx, &bucket)
+            .await
+            .expect("legacy quota should load");
+        let quota = quota.expect("legacy quota must be persisted");
+        assert_eq!(quota.quota, Some(quota_limit));
+        assert!(!quota.uses_durable_reservations(), "fixture must stay on the snapshot protocol");
+
+        let mut write_opts = ObjectOptions::default();
+        assert!(write_opts.set_quota_admission(0, quota_limit));
+
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &write_opts)
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &write_opts)
+            .await
+            .expect("stage multipart source part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                source_object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &write_opts,
+            )
+            .await
+            .expect("complete the multipart source under the legacy quota");
+
+        let source_reader = store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed multipart source should be readable");
+        let mut copy_info = source_reader.object_info.clone();
+        let actual_size = copy_info.get_actual_size().expect("copy source logical size should resolve");
+        assert_eq!(actual_size, payload.len() as i64);
+        let copy_reader = rustfs_rio::HashReader::from_stream(source_reader.stream, actual_size, actual_size, None, None, false)
+            .expect("copy source hash reader should build");
+        copy_info.put_object_reader = Some(PutObjReader::new(copy_reader));
+
+        let mut dst_opts = ObjectOptions::default();
+        assert!(dst_opts.set_quota_admission(payload.len() as u64, quota_limit));
+        store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                target_object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &dst_opts,
+            )
+            .await
+            .expect("CopyObject must forward the handler quota admission to the destination write");
+
+        let mut target_reader = store
+            .get_object_reader(&bucket, target_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("copied target should be readable");
+        let mut target_body = Vec::new();
+        target_reader
+            .stream
+            .read_to_end(&mut target_body)
+            .await
+            .expect("target body should stream");
+        assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
@@ -9722,14 +9836,7 @@ mod tests {
             .await
             .expect("manual task receipt path should resolve");
         let target_task_set = store.pools[1].get_disks_by_key(&manual_task_receipt_path);
-        let original_target_task_disks = {
-            let mut disks = target_task_set.disks.write().await;
-            let original = disks.clone();
-            for disk in disks.iter_mut().take(2) {
-                *disk = None;
-            }
-            original
-        };
+        let offline_target_task_disks = force_set_disk_range_offline_for_test(&target_task_set, 0..2).await;
         let receipt_quorum_error = store
             .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
                 0,
@@ -9738,7 +9845,7 @@ mod tests {
             )
             .await
             .expect_err("target read quorum without receipt write quorum must retain the source");
-        *target_task_set.disks.write().await = original_target_task_disks;
+        drop(offline_target_task_disks);
         let receipt_quorum_error = receipt_quorum_error.to_string();
         assert!(receipt_quorum_error.contains("receipt"));
         assert!(receipt_quorum_error.contains(&manual_task_path));

@@ -1,7 +1,7 @@
 %global _enable_debug_packages 0
 %global _empty_manifest_terminate_build 0
 Name:           rustfs
-Version:        1.0.0
+Version:        1.0.1
 Release:        1
 Summary:       High-performance distributed object storage for MinIO alternative
 
@@ -57,6 +57,9 @@ install %_builddir/%{name}-%{version}/target/%_arch/%_arch-unknown-linux-gnu/rel
 %_bindir/rustfs
 
 %changelog
+* Wed Sep 16 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.1
+
 * Wed Sep 16 2026 overtrue <anzhengchao@gmail.com>
 - Record the RustFS 1.0.0 stable release
 

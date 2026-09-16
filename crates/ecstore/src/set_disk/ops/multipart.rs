@@ -2613,16 +2613,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
-        let quota_context = reservation::begin(
-            &self.ctx,
-            bucket,
-            object,
-            opts.quota_admission,
-            opts.data_movement,
-            self.pool_index,
-            self.set_index,
-        )
-        .await?;
+        let quota_context = reservation::begin(&self.ctx, bucket, object, opts, self.pool_index, self.set_index).await?;
         let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
         let preserve_replication_ciphertext = opts.replication_request
             && contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
