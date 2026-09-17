@@ -36,6 +36,9 @@ pub mod io;
 #[cfg(feature = "hash")]
 pub mod hash;
 
+#[cfg(feature = "hash")]
+pub mod hash_stream;
+
 #[cfg(feature = "os")]
 pub mod os;
 
@@ -58,6 +61,9 @@ pub mod dirs;
 
 #[cfg(feature = "hash")]
 pub use hash::*;
+
+#[cfg(feature = "hash")]
+pub use hash_stream::Md5Stream;
 
 #[cfg(feature = "io")]
 pub use io::*;

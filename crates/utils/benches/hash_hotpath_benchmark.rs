@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{HashAlgorithm, Md5Stream};
 use std::hint::black_box;
 
 fn generate_payload(size: usize) -> Vec<u8> {
@@ -47,6 +47,21 @@ fn bench_hash_hotpaths(c: &mut Criterion) {
                 });
             });
         }
+        // The ETag path never sees the object in one piece: EtagReader is fed
+        // whatever the body stream yields. Model that with 256 KiB updates.
+        group.bench_with_input(
+            BenchmarkId::new("md5_stream_256KiB_chunks", payload_name),
+            payload.as_slice(),
+            |b, payload| {
+                b.iter(|| {
+                    let mut hasher = Md5Stream::new();
+                    for chunk in black_box(payload).chunks(256 * 1024) {
+                        hasher.update(chunk);
+                    }
+                    black_box(hasher.finalize()[0]);
+                });
+            },
+        );
     }
     group.finish();
 }

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use crate::hash_stream::Md5Stream;
 use blake2::Blake2b512;
 use highway::{HighwayHash, HighwayHasher, Key};
-use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -113,7 +113,7 @@ impl HashAlgorithm {
     #[inline]
     pub fn hash_encode(&self, data: &[u8]) -> impl AsRef<[u8]> {
         match self {
-            HashAlgorithm::Md5 => HashEncoded::Md5(Md5::digest(data).into()),
+            HashAlgorithm::Md5 => HashEncoded::Md5(Md5Stream::digest(data)),
             HashAlgorithm::HighwayHash256 => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
@@ -148,11 +148,11 @@ impl HashAlgorithm {
     {
         match self {
             HashAlgorithm::Md5 => {
-                let mut hasher = Md5::new();
+                let mut hasher = Md5Stream::new();
                 for slice in slices {
                     hasher.update(slice);
                 }
-                HashEncoded::Md5(hasher.finalize().into())
+                HashEncoded::Md5(hasher.finalize())
             }
             HashAlgorithm::HighwayHash256 => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
@@ -302,14 +302,39 @@ mod tests {
 
     #[test]
     fn test_hash_encode_md5() {
+        // Same input and digest that crates/checksums and crates/rio pin, so a
+        // backend change on any side fails loudly here too.
         let data = b"test data";
         let hash = HashAlgorithm::Md5.hash_encode(data);
         let hash = hash.as_ref();
         assert_eq!(hash.len(), 16);
+        assert_eq!(
+            hex_simd::encode_to_string(hash, hex_simd::AsciiCase::Lower),
+            "eb733a00c0c9d336e65691a37ab54293"
+        );
         // MD5 should be deterministic
         let hash2 = HashAlgorithm::Md5.hash_encode(data);
         let hash2 = hash2.as_ref();
         assert_eq!(hash, hash2);
+    }
+
+    /// RFC 1321 vectors through the one-shot interface: `HashAlgorithm::Md5`
+    /// and `Md5Stream` must be the same MD5 whatever backend is compiled in.
+    #[test]
+    fn test_hash_encode_md5_rfc1321_vectors() {
+        for (input, want) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (&b"abc"[..], "900150983cd24fb0d6963f7d28e17f72"),
+            (&b"message digest"[..], "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                &b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"[..],
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ] {
+            let got = HashAlgorithm::Md5.hash_encode(input);
+            assert_eq!(hex_simd::encode_to_string(got.as_ref(), hex_simd::AsciiCase::Lower), want);
+            assert_eq!(got.as_ref(), Md5Stream::digest(input));
+        }
     }
 
     #[test]
