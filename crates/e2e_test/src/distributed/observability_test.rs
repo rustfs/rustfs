@@ -400,12 +400,20 @@ async fn verify_write_observations_during_peer_failure(dist: &DistCluster, bucke
             let observations = storage["info"]["observations"]
                 .as_array()
                 .ok_or("recovery omitted observations")?;
+            let disks = storage["info"]["disks"].as_array().ok_or("recovery omitted disks")?;
             Ok(observations.len() == 4
                 && observations
                     .iter()
-                    .all(|item| item["status"] == "succeeded" && item["cached"] == false))
+                    .all(|item| item["status"] == "succeeded" && item["cached"] == false)
+                && disks.len() == 16
+                && disks.iter().all(|disk| {
+                    disk["state"].as_str().is_some_and(|state| state.eq_ignore_ascii_case("ok"))
+                        && disk["runtimeState"]
+                            .as_str()
+                            .is_some_and(|state| state.eq_ignore_ascii_case("online"))
+                }))
         },
-        "peer probes recover to fresh successful observations",
+        "peer probes and remote disks recover to fresh successful observations",
     )
     .await?;
     wait_for_ready(&dist.cluster).await?;
