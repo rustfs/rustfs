@@ -2391,6 +2391,51 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn node_pool_metadata_timeout_fails_closed_with_empty_cache() {
+        reset_node_pool_metadata_readiness_cache();
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
+            let timed_out = apply_node_pool_metadata_timeout_policy(
+                StorageWriteReadinessStatus {
+                    ready: false,
+                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
+                },
+                Instant::now(),
+            );
+
+            assert!(!timed_out.ready);
+            assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
+        })
+        .await;
+        reset_node_pool_metadata_readiness_cache();
+    }
+
+    #[test]
+    fn node_pool_metadata_timeout_fails_closed_after_cache_ttl() {
+        let mut cache = NodePoolMetadataReadinessCache::default();
+        let observed_at = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let writable = StorageWriteReadinessStatus {
+            ready: true,
+            pool_metadata_reason: None,
+        };
+        assert_eq!(cache.observe(writable, observed_at, observed_at, ttl), writable);
+
+        let timed_out = cache.observe(
+            StorageWriteReadinessStatus {
+                ready: false,
+                pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
+            },
+            observed_at + Duration::from_secs(61),
+            observed_at + Duration::from_secs(61),
+            ttl,
+        );
+
+        assert!(!timed_out.ready);
+        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn node_pool_metadata_timeout_never_hides_confirmed_block() {
         reset_node_pool_metadata_readiness_cache();
         async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
