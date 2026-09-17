@@ -4090,7 +4090,7 @@ mod tests {
             .collect::<Vec<_>>();
         for disk in &disks {
             disk.close().await.expect("fault injection should stop per-disk monitoring");
-            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.force_offline_for_test();
         }
 
         // Sets has an independent endpoint monitor that renews missing slots.
@@ -4127,7 +4127,7 @@ mod tests {
             .collect::<Vec<_>>();
         for disk in &disks {
             disk.close().await.expect("fault injection should stop per-disk monitoring");
-            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.force_offline_for_test();
         }
         set.connect_disks().await;
         for disk in &disks {
