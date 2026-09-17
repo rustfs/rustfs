@@ -1080,8 +1080,11 @@ impl ChecksumHasher for Sha512Hasher {
 
 /// MD5 hasher for the ADDITIONAL checksum (x-amz-checksum-md5). Separate from the
 /// legacy Content-MD5 / ETag machinery — this only serves the flexible-checksum path.
+/// MD5 hasher for the `x-amz-checksum-*` path. Backed by the shared
+/// `rustfs_utils::hash::Md5Stream`, so the ETag path and this path can never
+/// disagree about which MD5 implementation is in use.
 pub struct Md5Hasher {
-    hasher: md5::Md5,
+    hasher: rustfs_utils::hash::Md5Stream,
 }
 
 impl Default for Md5Hasher {
@@ -1092,14 +1095,14 @@ impl Default for Md5Hasher {
 
 impl Md5Hasher {
     pub fn new() -> Self {
-        use md5::Digest as _;
-        Self { hasher: md5::Md5::new() }
+        Self {
+            hasher: rustfs_utils::hash::Md5Stream::new(),
+        }
     }
 }
 
 impl Write for Md5Hasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use md5::Digest as _;
         self.hasher.update(buf);
         Ok(buf.len())
     }
@@ -1110,14 +1113,17 @@ impl Write for Md5Hasher {
 }
 
 impl ChecksumHasher for Md5Hasher {
+    /// Returns the digest of everything written so far and restarts the
+    /// hasher, i.e. `finalize` followed by `reset`. `HashReader` calls this
+    /// exactly once at EOF, so the implicit reset is unobservable there; a
+    /// caller that keeps writing afterwards gets a digest of the new bytes
+    /// only, which is the same contract `reset` documents.
     fn finalize(&mut self) -> Vec<u8> {
-        use md5::Digest as _;
-        self.hasher.clone().finalize().to_vec()
+        self.hasher.finalize_reset().to_vec()
     }
 
     fn reset(&mut self) {
-        use md5::Digest as _;
-        self.hasher = md5::Md5::new();
+        self.hasher = rustfs_utils::hash::Md5Stream::new();
     }
 }
 
@@ -1660,6 +1666,38 @@ mod tests {
         }
     }
 
+    /// `Md5Hasher` is the `x-amz-checksum-md5` shell over `Md5Stream`; pin the
+    /// `finalize`-restarts contract that `HashReader` relies on at EOF.
+    #[test]
+    fn md5_hasher_finalize_restarts_and_reset_clears() {
+        use super::ChecksumHasher as _;
+        use std::io::Write as _;
+        fn reference(data: &[u8]) -> Vec<u8> {
+            <md5::Md5 as md5::Digest>::digest(data).to_vec()
+        }
+        let body: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let want = reference(&body);
+
+        let mut hasher = super::Md5Hasher::default();
+        for chunk in body.chunks(1234) {
+            hasher.write_all(chunk).expect("in-memory write");
+        }
+        hasher.flush().expect("flush is a no-op");
+        assert_eq!(hasher.finalize(), want);
+        // finalize restarted the hasher: a second call is the digest of nothing.
+        assert_eq!(hasher.finalize(), reference(b""));
+
+        hasher.write_all(b"partial").expect("in-memory write");
+        hasher.reset();
+        hasher.write_all(&body).expect("in-memory write");
+        assert_eq!(hasher.finalize(), want);
+
+        // The trait-object path used by HashReader resolves to the same shell.
+        let mut boxed = ChecksumType::MD5.hasher().expect("MD5 has a hasher");
+        boxed.write_all(&body).expect("in-memory write");
+        assert_eq!(boxed.finalize(), want);
+    }
+
     // Drift lock for the backlog#1844 PR3 verdict: rio keeps its own hasher
     // shells instead of delegating to rustfs-checksums, so both sides pin the
     // SAME input and official digests (crates/checksums/src/lib.rs pins these
@@ -1673,6 +1711,9 @@ mod tests {
             (ChecksumType::CRC64_NVME, "aecaf3af9c98a855"),
             (ChecksumType::SHA1, "f48dd853820860816c75d54d0f584dc863327a7c"),
             (ChecksumType::SHA256, "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"),
+            // Content-MD5 shares this vector with crates/checksums (`test_md5_checksum`)
+            // and crates/utils (`test_hash_encode_md5`).
+            (ChecksumType::MD5, "eb733a00c0c9d336e65691a37ab54293"),
         ] {
             assert_eq!(raw_hex(t, b"test data"), want_hex, "{t:?} digest drifted from the shared vector");
         }

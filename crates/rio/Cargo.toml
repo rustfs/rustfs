@@ -78,7 +78,6 @@ rustfs-io-metrics.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-md-5 = { workspace = true }
 minlz.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
@@ -89,6 +88,8 @@ xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+# Independent MD5 reference for etag/checksum tests; production code goes through rustfs-utils.
+md-5 = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }

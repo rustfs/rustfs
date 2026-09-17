@@ -14,8 +14,8 @@
 
 use crate::compress_index::{Index, TryGetIndex};
 use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
-use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
+use rustfs_utils::hash::Md5Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -25,7 +25,9 @@ pin_project! {
     pub struct  EtagReader<R> {
         #[pin]
         pub inner: R,
-        pub md5: Md5,
+        // `Some` until EOF; taken (consumed) exactly once when the stream ends.
+        // `Md5Stream` has no snapshot/clone: the digest exists only after EOF.
+        md5: Option<Md5Stream>,
         pub finished: bool,
         pub checksum: Option<String>,
         resolved_etag: Option<String>,
@@ -36,23 +38,30 @@ impl<R> EtagReader<R> {
     pub fn new(inner: R, checksum: Option<String>) -> Self {
         Self {
             inner,
-            md5: Md5::new(),
+            md5: Some(Md5Stream::new()),
             finished: false,
             checksum,
             resolved_etag: None,
         }
     }
 
-    /// Get the final md5 value (etag) as a hex string, only compute once.
-    /// Can be called multiple times, always returns the same result after finished.
-    pub fn get_etag(&mut self) -> String {
-        if let Some(etag) = &self.resolved_etag {
-            return etag.clone();
-        }
+    /// The final md5 value (etag) as a hex string.
+    ///
+    /// `None` until the inner stream has reached EOF: the hasher is consumed
+    /// exactly once at that point, so there is no partial digest to hand out
+    /// earlier. After EOF this returns the same cached value every time.
+    pub fn get_etag(&self) -> Option<String> {
+        self.resolved_etag.clone()
+    }
 
-        let etag = self.md5.clone().finalize().to_vec();
-        let etag = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
-        self.resolved_etag = Some(etag.clone());
+    /// Runs exactly once, on the poll that observes EOF: `finished` is set on
+    /// that same poll and every later poll returns early, so `md5` is always
+    /// `Some` here. Hashing nothing on the impossible `None` beats panicking
+    /// inside the data path.
+    fn resolve_at_eof(md5: &mut Option<Md5Stream>, resolved_etag: &mut Option<String>) -> String {
+        let digest = md5.take().unwrap_or_default().finalize();
+        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+        *resolved_etag = Some(etag.clone());
         etag
     }
 }
@@ -72,18 +81,13 @@ where
         if let Poll::Ready(Ok(())) = &poll {
             let filled = &buf.filled()[orig_filled..];
             if !filled.is_empty() {
-                this.md5.update(filled);
+                if let Some(md5) = this.md5.as_mut() {
+                    md5.update(filled);
+                }
             } else {
                 // EOF
                 *this.finished = true;
-                let etag = if let Some(etag) = this.resolved_etag.as_ref() {
-                    etag.clone()
-                } else {
-                    let etag = this.md5.clone().finalize().to_vec();
-                    let etag = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
-                    *this.resolved_etag = Some(etag.clone());
-                    etag
-                };
+                let etag = Self::resolve_at_eof(this.md5, this.resolved_etag);
 
                 if let Some(checksum) = this.checksum
                     && *checksum != etag
@@ -112,7 +116,7 @@ impl<R> EtagResolvable for EtagReader<R> {
         if let Some(checksum) = &self.checksum {
             Some(checksum.clone())
         } else if self.finished {
-            Some(self.get_etag())
+            self.get_etag()
         } else {
             None
         }
@@ -144,6 +148,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    // RustCrypto md-5 stays a dev-dependency: the expected values must come
+    // from an implementation independent of the one under test.
+    use md5::{Digest, Md5};
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -216,6 +223,54 @@ mod tests {
         let mut buf = [0u8; 2];
         let _ = etag_reader.read(&mut buf).await.unwrap();
         assert_eq!(etag_reader.try_resolve_etag(), None);
+        assert_eq!(etag_reader.get_etag(), None, "no partial digest before EOF");
+
+        // Reading the rest resolves it, and the value is stable afterwards.
+        let mut rest = Vec::new();
+        etag_reader.read_to_end(&mut rest).await.unwrap();
+        let expected = faster_hex::hex_string(Md5::digest(data).as_slice());
+        assert_eq!(etag_reader.get_etag(), Some(expected.clone()));
+        assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
+    }
+
+    /// The body stream never hands EtagReader the object in one piece; the
+    /// digest must not depend on how the inner reader splits its reads.
+    #[tokio::test]
+    async fn test_etag_reader_small_inner_reads_match_one_shot() {
+        let size = 3 * 64 * 1024 + 77;
+        let mut data = vec![0u8; size];
+        rand::rng().fill(&mut data[..]);
+        let expected = faster_hex::hex_string(Md5::digest(&data).as_slice());
+
+        // BufReader with a tiny capacity forces many short poll_read fills.
+        let inner = BufReader::with_capacity(61, Cursor::new(data.clone()));
+        let mut etag_reader = EtagReader::new(inner, None);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 61];
+        loop {
+            let n = etag_reader.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(out, data);
+        assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
+    }
+
+    /// Reads after EOF are a no-op and never disturb the resolved etag.
+    #[tokio::test]
+    async fn test_etag_reader_reads_after_eof_are_stable() {
+        let data = b"stable after eof";
+        let expected = faster_hex::hex_string(Md5::digest(data).as_slice());
+        let mut etag_reader = EtagReader::new(BufReader::new(&data[..]), None);
+        let mut buf = Vec::new();
+        etag_reader.read_to_end(&mut buf).await.unwrap();
+        for _ in 0..3 {
+            let mut extra = [0u8; 8];
+            assert_eq!(etag_reader.read(&mut extra).await.unwrap(), 0);
+            assert_eq!(etag_reader.get_etag(), Some(expected.clone()));
+        }
     }
 
     #[tokio::test]
@@ -274,6 +329,87 @@ mod tests {
             .and_then(|source| source.downcast_ref::<BadDigest>())
             .expect("checksum mismatch should preserve the BadDigest type");
         assert_eq!(digest.expected_md5, wrong_checksum);
-        assert_eq!(digest.calculated_md5, calculated_md5);
+        assert_eq!(digest.calculated_md5, calculated_md5.clone());
+        // The digest was resolved before the comparison, so it stays observable
+        // after the error and the reader stays at EOF.
+        assert_eq!(etag_reader.get_etag(), Some(calculated_md5));
+        assert!(etag_reader.finished);
+    }
+
+    /// An inner reader that yields part of the body, then one `Err`, then the
+    /// rest. EtagReader must surface the error, must not treat it as EOF, and
+    /// must keep hashing correctly once the inner reader recovers.
+    struct FlakyInner {
+        data: Vec<u8>,
+        pos: usize,
+        fail_at: usize,
+        failed: bool,
+    }
+
+    impl AsyncRead for FlakyInner {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.pos >= self.fail_at && !self.failed {
+                self.failed = true;
+                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "transient")));
+            }
+            let end = (self.pos + buf.remaining().min(7)).min(self.data.len());
+            buf.put_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_etag_reader_inner_error_is_not_eof_and_state_survives() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let expected = faster_hex::hex_string(Md5::digest(&data).as_slice());
+        let mut etag_reader = EtagReader::new(
+            FlakyInner {
+                data: data.clone(),
+                pos: 0,
+                fail_at: 300,
+                failed: false,
+            },
+            None,
+        );
+
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 64];
+        let mut saw_error = false;
+        loop {
+            match etag_reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(err) => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+                    assert!(!etag_reader.finished, "an inner error must not finish the reader");
+                    assert_eq!(etag_reader.get_etag(), None);
+                    saw_error = true;
+                }
+            }
+        }
+        assert!(saw_error, "the inner reader must have failed once");
+        assert_eq!(out, data);
+        assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
+    }
+
+    /// Interleaved `Pending` from the inner reader (a slow network body) must
+    /// neither be treated as data nor as EOF.
+    #[tokio::test]
+    async fn test_etag_reader_survives_pending_between_chunks() {
+        let data = b"pending between chunks keeps the digest intact";
+        let expected = faster_hex::hex_string(Md5::digest(data).as_slice());
+        let inner = tokio_test::io::Builder::new()
+            .read(&data[..10])
+            .wait(std::time::Duration::from_millis(5))
+            .read(&data[10..20])
+            .wait(std::time::Duration::from_millis(5))
+            .read(&data[20..])
+            .build();
+        let mut etag_reader = EtagReader::new(inner, None);
+        let mut out = Vec::new();
+        etag_reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
+        assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
     }
 }

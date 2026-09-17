@@ -778,6 +778,52 @@ mod tests {
         assert_eq!(buf, data);
     }
 
+    /// Content-MD5 through the full HashReader stack: a matching value is
+    /// accepted and the resolved etag is the independent MD5 of the body.
+    #[tokio::test]
+    async fn content_md5_match_through_hash_reader_resolves_etag() {
+        use md5::Digest as _;
+        let data: Vec<u8> = (0..(256 * 1024 + 9)).map(|i| (i * 13 % 251) as u8).collect();
+        let expected_md5 = faster_hex::hex_string(md5::Md5::digest(&data).as_slice());
+        let reader = BufReader::with_capacity(4096, Cursor::new(data.clone()));
+        let mut hash_reader =
+            HashReader::from_stream(reader, data.len() as i64, data.len() as i64, Some(expected_md5.clone()), None, false)
+                .expect("operation should succeed");
+        let mut buf = Vec::new();
+        hash_reader
+            .read_to_end(&mut buf)
+            .await
+            .expect("matching Content-MD5 must be accepted");
+        assert_eq!(buf, data);
+        assert_eq!(hash_reader.try_resolve_etag(), Some(expected_md5));
+    }
+
+    /// Content-MD5 mismatch must surface as the typed `BadDigest` that the API
+    /// layer maps to the S3 `BadDigest` error, not as an opaque io::Error.
+    #[tokio::test]
+    async fn content_md5_mismatch_through_hash_reader_retains_bad_digest() {
+        use md5::Digest as _;
+        let data = b"tampered content-md5 payload";
+        let wrong_md5 = "0".repeat(32);
+        let calculated = faster_hex::hex_string(md5::Md5::digest(data).as_slice());
+        let reader = BufReader::new(Cursor::new(&data[..]));
+        let mut hash_reader =
+            HashReader::from_stream(reader, data.len() as i64, data.len() as i64, Some(wrong_md5.clone()), None, false)
+                .expect("operation should succeed");
+
+        let error = hash_reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("Content-MD5 mismatch should fail");
+        let digest = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::BadDigest>())
+            .expect("Content-MD5 mismatch should remain typed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(digest.expected_md5, wrong_md5);
+        assert_eq!(digest.calculated_md5, calculated);
+    }
+
     #[tokio::test]
     async fn sha256_mismatch_retains_typed_io_error_source() {
         let data = b"tampered payload";
