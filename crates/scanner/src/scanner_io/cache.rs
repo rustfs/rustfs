@@ -13,6 +13,7 @@
 // limitations under the License.
 /// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
 pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
     let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
@@ -21,6 +22,69 @@ pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCac
 
 pub(crate) fn scanner_cache_lock_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
+#[derive(Debug)]
+pub(crate) enum ScannerCheckpointPersistResult {
+    Saved,
+    FenceChanged,
+    Failed(StorageError),
+}
+
+/// Persist one bounded checkpoint and refresh its CAS revisions.
+///
+/// Local and remote workers share the same publication/leader fencing and
+/// revision-refresh contract; only their lock/cancellation handling remains
+/// at the caller because those guards have different concrete types.
+pub(crate) async fn persist_scanner_checkpoint<S>(
+    store: Arc<S>,
+    cache_name: &str,
+    checkpoint: &DataUsageCache,
+    revisions: &mut DataUsageCacheRevisions,
+    expected_publication_epoch: u64,
+    cycle: u64,
+    leader_epoch: u64,
+) -> ScannerCheckpointPersistResult
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, store.clone())
+        .await
+        .is_err()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+    if scanner_publication_admission_for_epoch(store.clone(), expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    if let Err(error) = checkpoint
+        .save_with_revisions_for_epoch(store.clone(), cache_name, revisions, expected_publication_epoch)
+        .await
+    {
+        return ScannerCheckpointPersistResult::Failed(error);
+    }
+
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, store.clone())
+        .await
+        .is_err()
+        || scanner_publication_admission_for_epoch(store.clone(), expected_publication_epoch)
+            .await
+            .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    match DataUsageCache::read_revisions(store, cache_name).await {
+        Ok(next_revisions) => {
+            *revisions = next_revisions;
+            ScannerCheckpointPersistResult::Saved
+        }
+        Err(error) => ScannerCheckpointPersistResult::Failed(error),
+    }
 }
 
 #[derive(Debug)]

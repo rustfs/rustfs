@@ -2034,6 +2034,59 @@ fn data_usage_cache_prepare_for_scan_fences_leader_epochs() {
 }
 
 #[test]
+fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(identity.tier_registry_generation),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_resume_after: Some("bucket/a".to_string()),
+            scan_checkpoint: Some(DataUsageScanCheckpoint::new(
+                "bucket/a".to_string(),
+                DataUsageScanCheckpointReason::Objects,
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let legacy_digest = cache
+        .legacy_coverage_prefix_digest("bucket/a")
+        .expect("legacy receipt digest");
+    cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+        through: "bucket/a".to_string(),
+        digest: legacy_digest,
+    });
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 8, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.leader_epoch, 2);
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+    assert_ne!(cache.info.scan_coverage_receipt.expect("migrated receipt").digest, legacy_digest);
+}
+
+#[test]
 fn test_data_usage_cache_mutations_update_in_place() {
     let mut cache = DataUsageCache {
         info: DataUsageCacheInfo {

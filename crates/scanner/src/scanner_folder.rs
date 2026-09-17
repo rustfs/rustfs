@@ -91,6 +91,9 @@ const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const SCANNER_LIST_PATH_RAW_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_ENTRY_PROGRESS_BATCH: u64 = 32;
 const SCANNER_ENTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const SCANNER_CHECKPOINT_OBJECT_INTERVAL: u64 = 1024;
+const SCANNER_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const SCANNER_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT: usize = 128;
 const SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET: usize = 1;
 // Erasure data directories contain direct part.N files; keep namespace probes bounded.
@@ -723,7 +726,11 @@ pub struct FolderScanner {
     disks_quorum: usize,
 
     updates: Option<mpsc::Sender<DataUsageEntry>>,
+    checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
     last_update: SystemTime,
+    checkpoint_objects: u64,
+    last_checkpoint_objects: u64,
+    last_checkpoint_at: Instant,
 
     update_current_path: UpdateCurrentPathFn,
 
@@ -1204,6 +1211,58 @@ impl FolderScanner {
         (progress.cursor(), progress.page_index())
     }
 
+    fn peek_raw_enumeration_resume_state(&self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
+        self.raw_enumeration_progress
+            .iter()
+            .max_by_key(|progress| progress.checkpointable_entry_count())
+            .map_or((None, None), |progress| (progress.cursor(), progress.page_index()))
+    }
+
+    fn maybe_send_checkpoint(&mut self) {
+        let Some(checkpoint_tx) = self.checkpoint_tx.as_ref() else { return };
+        let elapsed = self.last_checkpoint_at.elapsed();
+        if self.new_cache.info.scan_progress.is_none()
+            || elapsed < SCANNER_CHECKPOINT_MIN_INTERVAL
+            || (self.checkpoint_objects.saturating_sub(self.last_checkpoint_objects) < SCANNER_CHECKPOINT_OBJECT_INTERVAL
+                && elapsed < SCANNER_CHECKPOINT_INTERVAL)
+        {
+            return;
+        }
+        if self.new_cache.root().is_none() && self.raw_enumeration_progress.is_empty() {
+            return;
+        }
+
+        let mut snapshot = self.new_cache.clone();
+        snapshot.info.last_update = Some(SystemTime::now());
+        snapshot.info.snapshot_complete = false;
+        let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
+        if cursor.is_some() || page_index.is_some() {
+            snapshot.info.scan_raw_enumeration_cursor = cursor;
+            snapshot.info.scan_raw_enumeration_page_index = page_index;
+            snapshot.info.scan_resume_after = None;
+            snapshot.info.scan_checkpoint = None;
+            snapshot.info.scan_coverage_receipt = None;
+        } else if snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).is_err() {
+            return;
+        }
+        if snapshot.root().is_none()
+            && snapshot.info.scan_raw_enumeration_cursor.is_none()
+            && snapshot.info.scan_raw_enumeration_page_index.is_none()
+        {
+            return;
+        }
+        if snapshot.info.scan_raw_enumeration_cursor.is_none()
+            && snapshot.info.scan_raw_enumeration_page_index.is_none()
+            && snapshot.validated_scan_frontier().is_none()
+        {
+            return;
+        }
+        if checkpoint_tx.try_send(snapshot).is_ok() {
+            self.last_checkpoint_objects = self.checkpoint_objects;
+            self.last_checkpoint_at = Instant::now();
+        }
+    }
+
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
         if entry.compacted {
             // Compacted entries store child totals directly; child links would be flattened twice.
@@ -1592,6 +1651,7 @@ impl FolderScanner {
                     }
                 }
                 self.record_raw_enumeration_entry(&folder.name, &file_name);
+                self.maybe_send_checkpoint();
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
 
                 let file_path = entry.path().to_string_lossy().to_string();
@@ -1887,6 +1947,8 @@ impl FolderScanner {
                 into.objects += 1;
                 object_count += 1;
                 self.budget.record_object_scanned();
+                self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
+                self.maybe_send_checkpoint();
 
                 timer.sleep().await;
 
@@ -2180,6 +2242,7 @@ impl FolderScanner {
 
                     into.add_child(&h);
                     self.record_completed_child(&folder_item.name, dst.failed_objects == 0);
+                    self.maybe_send_checkpoint();
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
@@ -2578,6 +2641,7 @@ impl FolderScanner {
                         self.update_cache.delete_recursive(&h);
                         self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
                         self.send_update().await;
+                        self.maybe_send_checkpoint();
                     }
                 }
             }
@@ -2668,7 +2732,7 @@ pub async fn scan_data_folder(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
-    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None).await
+    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,6 +2746,7 @@ pub(crate) async fn scan_data_folder_scoped(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
     prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+    checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
@@ -2740,7 +2805,11 @@ pub(crate) async fn scan_data_folder_scoped(
         disks,
         disks_quorum,
         updates,
+        checkpoint_tx,
         last_update: SystemTime::UNIX_EPOCH,
+        checkpoint_objects: 0,
+        last_checkpoint_objects: 0,
+        last_checkpoint_at: Instant::now(),
         update_current_path,
         budget: budget.clone(),
         skip_heal,

@@ -1293,6 +1293,7 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
 pub struct ScannerDiskScanOptions {
     pub scan_mode: HealScanMode,
     pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+    pub checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
 }
 
 #[async_trait::async_trait]
@@ -1608,8 +1609,8 @@ use dirty_usage::*;
 use guards::*;
 
 pub(crate) use cache::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, acquire_scanner_cache_locks,
-    current_cache_root_or_prepare_with_generation,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistResult, acquire_scanner_cache_locks,
+    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,

@@ -339,7 +339,11 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         disks: Vec::new(),
         disks_quorum: 0,
         updates: None,
+        checkpoint_tx: None,
         last_update: SystemTime::UNIX_EPOCH,
+        checkpoint_objects: 0,
+        last_checkpoint_objects: 0,
+        last_checkpoint_at: Instant::now(),
         update_current_path,
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
@@ -364,6 +368,55 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
     };
 
     (scanner, temp_dir)
+}
+
+#[tokio::test]
+async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(checkpoint_tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+        requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+    });
+    scanner.new_cache.info.source = Some(crate::DataUsageCacheSource::new(0, 0));
+    scanner.new_cache.info.scan_identity = Some(crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(1),
+        set_layout: crate::DataUsageScanPlanDigest([2; 32]),
+        publication_epoch: 1,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    });
+    scanner.new_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.new_cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    scanner.coverage_frontier = Some("bucket/a".to_string());
+    scanner.new_cache.info.scan_checkpoint = Some(crate::DataUsageScanCheckpoint::new(
+        "bucket/a".to_string(),
+        crate::DataUsageScanCheckpointReason::Objects,
+    ));
+    scanner.new_cache.info.scan_resume_after = Some("bucket/a".to_string());
+    scanner
+        .new_cache
+        .seal_scan_frontier(Some("bucket/a"))
+        .expect("fixture frontier");
+    assert_eq!(scanner.new_cache.validated_scan_frontier(), Some("bucket/a"));
+
+    scanner.maybe_send_checkpoint();
+
+    let checkpoint = checkpoint_rx.try_recv().expect("object threshold emits a bounded checkpoint");
+    assert_eq!(checkpoint.info.name, "bucket");
+    assert!(!checkpoint.info.snapshot_complete);
+    assert_eq!(scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL);
+    assert!(checkpoint_rx.try_recv().is_err(), "checkpoint queue remains bounded");
+    tokio::fs::remove_dir_all(temp_dir)
+        .await
+        .expect("remove test scanner directory");
 }
 
 struct TestGuard {
