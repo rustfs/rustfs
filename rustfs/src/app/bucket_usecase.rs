@@ -514,11 +514,13 @@ fn parse_notification_target_id(arn_str: &str) -> Result<TargetID, TargetIDError
         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
 }
 
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
+
 /// Builds the notify runtime rules for a bucket notification configuration
 /// without touching the store or the runtime rule state.
 fn build_notification_event_rules(
     notification_configuration: &NotificationConfiguration,
-) -> S3Result<Vec<(Vec<EventName>, String, String, Vec<TargetID>)>> {
+) -> S3Result<Vec<NotificationEventRule>> {
     let mut event_rules = Vec::new();
     let invalid_arn = |e: TargetIDError| {
         S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid ARN in notification configuration: {e}"))
