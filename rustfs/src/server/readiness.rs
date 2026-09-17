@@ -810,6 +810,9 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
         && report.readiness.peer_health_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
+        if ready && *reason == ReadinessDegradedReason::PoolMetadataCheckTimeout {
+            continue;
+        }
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
     }
 }
@@ -1259,11 +1262,13 @@ mod tests {
 
     use super::*;
     use crate::storage_api::server::readiness::{DiskOption, new_disk};
+    use metrics_util::MetricKind;
     use rustfs_madmin::{BackendInfo, Disk};
     use serial_test::serial;
     use std::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     #[derive(Debug, Default)]
     struct RuntimeInventory {
@@ -2361,6 +2366,66 @@ mod tests {
         assert!(!report.readiness.storage_ready, "inspection timeout must remain fail-closed");
         assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::PoolMetadataCheckTimeout]);
         assert_eq!(report.degraded_reasons[0].as_str(), "pool_metadata_check_timeout");
+    }
+
+    #[test]
+    #[serial]
+    fn sticky_pool_metadata_timeout_uses_dedicated_metric_without_degraded_count() {
+        reset_node_pool_metadata_readiness_cache();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            with_var(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"), || {
+                let writable = StorageWriteReadinessStatus {
+                    ready: true,
+                    pool_metadata_reason: None,
+                };
+                assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
+                let sticky = apply_node_pool_metadata_timeout_policy(
+                    StorageWriteReadinessStatus {
+                        ready: false,
+                        pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
+                    },
+                    Instant::now(),
+                );
+                assert!(sticky.ready);
+                record_readiness_report(&DependencyReadinessReport {
+                    readiness: DependencyReadiness {
+                        storage_ready: true,
+                        iam_ready: true,
+                        lock_quorum_ready: true,
+                        peer_health_ready: true,
+                    },
+                    degraded_reasons: vec![ReadinessDegradedReason::PoolMetadataCheckTimeout],
+                    storage_details: None,
+                });
+            });
+        });
+        reset_node_pool_metadata_readiness_cache();
+
+        let entries = snapshotter.snapshot().into_vec();
+        let ready = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
+        });
+        assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0));
+
+        let degraded = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Counter
+                && composite.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                && composite
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "pool_metadata_check_timeout"))
+            .then_some(value)
+        });
+        assert!(degraded.is_none());
+
+        let timeout = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL)
+                .then_some(value)
+        });
+        assert!(matches!(timeout, Some(DebugValue::Counter(1))));
     }
 
     #[tokio::test]
