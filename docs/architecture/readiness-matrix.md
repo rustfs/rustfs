@@ -43,6 +43,9 @@ an unknown or unsupported peer-health snapshot degrades readiness with
 - A blocked pool metadata writer degrades node and cluster-write readiness with
   `pool_meta_write_blocked`. Metadata save-gate inspection is bounded to 100 ms;
   contention reports `pool_metadata_check_timeout` without installing a block.
+  Node readiness keeps the last confirmed writable observation for the normal
+  readiness-cache TTL during a transient inspection timeout, while preserving a
+  confirmed block and failing closed when no fresh observation exists.
 - The authenticated cluster snapshot extends its existing node-local metadata
   gate inspection with safe reason, failure phase, and original block time. It
   distinguishes timeout from a block and changes no admission or recovery
@@ -76,7 +79,7 @@ For a healthy IAM and metadata writer in a four-node, one-drive-per-node EC 2+2 
 | 1 | false | false | true | 503 / false |
 | All restored | true | true | true | 200 / true |
 
-The node path reads local disk-handle health and reuses the same reachable-host observation as its lock dependency, including the existing `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS` cache. Only `Online` drives count; a reachable host with a `Returning` drive does not yet prove data I/O has recovered. It does not call cluster `storage_info`, local `disk_info`, or add disk-info RPCs. The entire storage inventory snapshot has a separate 100 ms wait budget; expiry reports `storage_readiness_check_timeout` and fails closed. Pool metadata inspection retains its own 100 ms budget. These observations are not an atomic cluster snapshot and do not bypass the existing lock-probe timing or cache policy.
+The node path reads local disk-handle health and reuses the same reachable-host observation as its lock dependency, including the existing `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS` cache. Only `Online` drives count; a reachable host with a `Returning` drive does not yet prove data I/O has recovered. It does not call cluster `storage_info`, local `disk_info`, or add disk-info RPCs. The entire storage inventory snapshot has a separate 100 ms wait budget; expiry reports `storage_readiness_check_timeout` and fails closed. Pool metadata inspection retains its own 100 ms budget; a timeout is counted by `rustfs_pool_metadata_check_timeouts_total` and uses the last confirmed node-local gate state only within the same cache TTL. These observations are not an atomic cluster snapshot and do not bypass the existing lock-probe timing or cache policy.
 
 The new fields are additive. Their absence in an older response is not evidence of storage quorum. Minimal responses still contain only the existing top-level fields, liveness remains dependency-independent, and HEAD responses remain bodyless.
 
