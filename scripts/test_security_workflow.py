@@ -302,7 +302,8 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
                 # Workflow-level concurrency covers every job, including cleanup,
-                # regardless of trigger or the runner hosting the job.
+                # regardless of trigger or the runner hosting the job. The
+                # performance suite intentionally uses its isolated fleet lock.
                 expected_group = "rustfs-performance-suite" if suite == "performance" else "rustfs-shared-functional-tests-v2"
                 self.assertEqual([
                     line.strip() for line in yaml_block(source, "concurrency", 0)
