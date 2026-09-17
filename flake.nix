@@ -73,7 +73,7 @@
             rustc = rustToolchain;
           };
 
-          clientVersion = "0.1.32";
+          clientVersion = "0.1.36";
 
           rustfs = rustPlatform.buildRustPackage {
             pname = "rustfs";
