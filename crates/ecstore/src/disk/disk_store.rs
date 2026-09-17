@@ -30,6 +30,8 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::{info_commands::DiskMetrics, metrics::TimedAction};
 #[cfg(not(test))]
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -628,6 +630,8 @@ pub struct DiskHealthTracker {
     /// Authoritative atomically published runtime/status pair.
     state_snapshot: AtomicU64,
     transition_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    test_forced_offline: AtomicBool,
 }
 
 fn pack_health_state(runtime_state: RuntimeDriveHealthState, status: u32) -> u64 {
@@ -975,6 +979,8 @@ impl DiskHealthTracker {
             last_capacity_probe_unix_secs: AtomicI64::new(0),
             state_snapshot: AtomicU64::new(pack_health_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK)),
             transition_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_forced_offline: AtomicBool::new(false),
         }
     }
 
@@ -1043,6 +1049,13 @@ impl DiskHealthTracker {
             DISK_HEALTH_OK
         };
         self.publish_state(state, status);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.test_forced_offline.store(true, Ordering::Release);
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_state(RuntimeDriveHealthState::Offline, DISK_HEALTH_FAULTY);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
@@ -1123,6 +1136,8 @@ impl DiskHealthTracker {
     /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
     /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
     pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        #[cfg(test)]
+        self.test_forced_offline.store(false, Ordering::Release);
         self.reset_for_store_init_retry_at(endpoint, current_unix_time());
     }
 
@@ -1142,6 +1157,10 @@ impl DiskHealthTracker {
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        #[cfg(test)]
+        if self.test_forced_offline.load(Ordering::Acquire) {
+            return false;
+        }
         let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         let next = match current {
@@ -1438,6 +1457,11 @@ impl LocalDiskWrapper {
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.health.force_offline_for_test();
     }
 
     /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
