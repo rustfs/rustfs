@@ -7571,7 +7571,11 @@ impl SetDisks {
         let fi = &transported;
         let disks = self.disk_inventory().await;
         let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
-        let write_quorum = disks.len() / 2 + 1;
+        // Quorum is a property of the configured set, not of the current
+        // online snapshot. A decommission/offline refresh may temporarily
+        // shorten the snapshot; deriving quorum from it would turn a
+        // quorum-minus-one delete into an apparent success.
+        let write_quorum = self.set_drive_count / 2 + 1;
         let rollback_dir = Uuid::new_v4();
 
         let mut futures = Vec::with_capacity(disks.len());
