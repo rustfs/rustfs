@@ -147,6 +147,11 @@ const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const DECOMMISSION_ENTRY_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS: usize = 12;
+// A scanner pause backlog handoff conflict is a transient membership
+// transition: the native authority is expected to converge once surviving
+// replicas advance their durable commit. Bound the wait so a genuinely
+// divergent authority still reaches a terminal, attributable failure.
+const DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -994,6 +999,30 @@ fn decommission_capacity_retry_kind(err: &Error, intent_conflict_attempt: usize)
     (intent_conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
         && is_decommission_capacity_intent_conflict(err))
     .then_some(DecommissionCapacityRetryKind::IntentConflict)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionScannerBacklogRetryKind {
+    HandoffConflict,
+}
+
+fn is_decommission_scanner_backlog_handoff_conflict(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<data_movement::scanner_backlog::ScannerPauseBacklogRetirementError>(err)
+        .is_some_and(data_movement::scanner_backlog::ScannerPauseBacklogRetirementError::is_retryable_handoff_conflict)
+}
+
+/// Classify a retryable scanner pause backlog handoff conflict.
+///
+/// The typed planner error is the only signal consulted: string matching would
+/// turn unrelated retirement failures into retries. `handoff_conflict_attempt`
+/// is the number of retries already consumed by this entry.
+fn decommission_scanner_backlog_retry_kind(
+    err: &Error,
+    handoff_conflict_attempt: usize,
+) -> Option<DecommissionScannerBacklogRetryKind> {
+    (handoff_conflict_attempt < DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS
+        && is_decommission_scanner_backlog_handoff_conflict(err))
+    .then_some(DecommissionScannerBacklogRetryKind::HandoffConflict)
 }
 
 fn ensure_decommission_capacity_target_fence(
@@ -14058,6 +14087,7 @@ impl ECStore {
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
             let attempt_result = {
                 let mut conflict_attempt = 0;
+                let mut scanner_backlog_handoff_attempt = 0;
                 loop {
                     let result = self
                         .decommission_entry_attempt(
@@ -14072,6 +14102,7 @@ impl ECStore {
                             replication_config.clone(),
                             expected_bucket_incarnation_id,
                             entry_attempt,
+                            scanner_backlog_handoff_attempt,
                             source_changed_exhaustions.as_ref(),
                             &mut counted_versions,
                         )
@@ -14080,17 +14111,48 @@ impl ECStore {
                         .as_ref()
                         .err()
                         .and_then(|err| decommission_capacity_retry_kind(err, conflict_attempt));
-                    let retry_attempt = match retry {
-                        Some(DecommissionCapacityRetryKind::IntentConflict) => {
-                            conflict_attempt += 1;
-                            conflict_attempt
+                    if let Some(DecommissionCapacityRetryKind::IntentConflict) = retry {
+                        conflict_attempt += 1;
+                        let retry_delay =
+                            decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, conflict_attempt);
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
                         }
-                        None => break result,
-                    };
-                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, retry_attempt);
-                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
-                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                        continue;
                     }
+                    // Scanner pause backlog handoff conflicts resolve when the
+                    // surviving membership converges. Retry on a bounded
+                    // backoff that never writes failure state, clears
+                    // `start_time`, or releases the capacity reservation.
+                    let scanner_retry = result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| decommission_scanner_backlog_retry_kind(err, scanner_backlog_handoff_attempt));
+                    if let Some(DecommissionScannerBacklogRetryKind::HandoffConflict) = scanner_retry {
+                        scanner_backlog_handoff_attempt += 1;
+                        let retry_delay = decommission_retry_backoff_delay(
+                            DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY,
+                            scanner_backlog_handoff_attempt,
+                        );
+                        info!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "scanner_backlog_handoff_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            attempt = scanner_backlog_handoff_attempt,
+                            max_attempts = DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            "Decommission scanner pause backlog handoff conflict; retrying entry"
+                        );
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
+                        continue;
+                    }
+                    break result;
                 }
             };
             match attempt_result {
@@ -14138,6 +14200,7 @@ impl ECStore {
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         entry_attempt: usize,
+        scanner_backlog_handoff_attempt: usize,
         source_changed_exhaustions: &AtomicUsize,
         counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
     ) -> Result<DecommissionEntryAttemptOutcome> {
@@ -14197,27 +14260,56 @@ impl ECStore {
         if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
             let outcome = self
                 .retire_scanner_pause_backlog_entry(rx, idx, generation, Arc::clone(&set), fivs.clone(), capacity_owner)
-                .await?;
-            if matches!(outcome, DecommissionEntryAttemptOutcome::Complete) {
-                let mut pool_meta = self.pool_meta.write().await;
-                ensure_decommission_generation(&pool_meta, idx, generation)?;
-                if let Some(version) = fivs.versions.first()
-                    && counted_versions.insert((version.version_id, false))
-                {
-                    count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), false)?;
+                .await;
+            return match outcome {
+                Ok(DecommissionEntryAttemptOutcome::Complete) => {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    ensure_decommission_generation(&pool_meta, idx, generation)?;
+                    if let Some(version) = fivs.versions.first()
+                        && counted_versions.insert((version.version_id, false))
+                    {
+                        count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), false)?;
+                    }
+                    track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
+                    drop(pool_meta);
+                    self.track_decommission_entry_progress_stage(
+                        idx,
+                        generation,
+                        &bucket,
+                        &entry.name,
+                        DECOMMISSION_STAGE_ENTRY_FINISHED,
+                    )
+                    .await?;
+                    Ok(DecommissionEntryAttemptOutcome::Complete)
                 }
-                track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
-                drop(pool_meta);
-                self.track_decommission_entry_progress_stage(
-                    idx,
-                    generation,
-                    &bucket,
-                    &entry.name,
-                    DECOMMISSION_STAGE_ENTRY_FINISHED,
-                )
-                .await?;
-            }
-            return Ok(outcome);
+                Ok(outcome) => Ok(outcome),
+                Err(err) => {
+                    // The retry loop owns the handoff-conflict budget, so a
+                    // retryable conflict must not be attributed here. Once that
+                    // budget is exhausted the failure is terminal and belongs to
+                    // this entry rather than to whichever object was processed
+                    // last.
+                    let retryable_handoff = data_movement::data_movement_stage_source_as::<
+                        data_movement::scanner_backlog::ScannerPauseBacklogRetirementError,
+                    >(&err)
+                    .is_some_and(
+                        data_movement::scanner_backlog::ScannerPauseBacklogRetirementError::is_retryable_handoff_conflict,
+                    );
+                    let terminal = !retryable_handoff
+                        || scanner_backlog_handoff_attempt >= DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS;
+                    if terminal {
+                        let mut pool_meta = self.pool_meta.write().await;
+                        ensure_decommission_generation(&pool_meta, idx, generation)?;
+                        if let Some(version) = fivs.versions.first()
+                            && counted_versions.insert((version.version_id, true))
+                        {
+                            count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), true)?;
+                        }
+                        track_decommission_current_object(&mut pool_meta, idx, &bucket, &entry.name)?;
+                    }
+                    Err(err)
+                }
+            };
         }
 
         let pending_mutations = if let Some(owner) = capacity_owner {
@@ -21685,6 +21777,45 @@ mod tests {
     #[test]
     fn decommission_target_capacity_error_rejects_unrelated_errors() {
         assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
+    }
+
+    #[test]
+    fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
+        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+
+        let handoff = data_movement::data_movement_context_error(
+            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
+            ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            },
+        );
+        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
+        assert_eq!(
+            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
+        );
+        assert_eq!(
+            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+            None,
+            "a divergent handoff must not retry forever"
+        );
+
+        for non_retryable in [
+            ScannerPauseBacklogRetirementError::AuthorityConflict {
+                reason: "larger source authority".to_string(),
+            },
+            ScannerPauseBacklogRetirementError::InvalidRecord {
+                reason: "unread member".to_string(),
+            },
+        ] {
+            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
+            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&err, 0),
+                None,
+                "only a handoff conflict may be retried"
+            );
+        }
     }
 
     #[test]
