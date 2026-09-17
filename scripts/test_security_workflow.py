@@ -405,7 +405,7 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
-        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2)",
+        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2, D)",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
@@ -502,6 +502,130 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 self.assertEqual(handoff.returncode, 0, handoff.stderr)
                 markers = (root / "executed").read_text().splitlines()
                 self.assertEqual(markers, ["cleanup", "dispatch"])
+
+
+class FaultToleranceWorkflowContractTests(unittest.TestCase):
+    TESTING_SHA = "a" * 40
+
+    def setUp(self) -> None:
+        source = (ROOT / ".github/workflows/rustfs-fault-tolerance-test.yml").read_text()
+        job = yaml_block(source.splitlines(), "fault-tolerance-test", 2)
+        self.assertIsNotNone(job)
+        self.steps = named_steps(job)
+        self.report_body = shell_body(self.steps["Generate report"])
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.artifacts = self.directory / "artifacts"
+        (self.artifacts / "evidence").mkdir(parents=True)
+        self.log = self.artifacts / "suite.log"
+        self.log.write_text("FT-REPORT: fixture\n")
+        self.results = self.artifacts / "results.json"
+        self.output = self.directory / "github-output"
+        self.env = {
+            **os.environ,
+            "AUTO_TESTING_SHA": self.TESTING_SHA,
+            "FUNCTIONAL_ARTIFACTS_DIR": str(self.artifacts),
+            "LOG_FILE": str(self.log),
+            "REPORT_FILE": str(self.artifacts / "report.md"),
+            "RESULTS_FILE": str(self.results),
+            "GITHUB_OUTPUT": str(self.output),
+            "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REPOSITORY": "rustfs/rustfs",
+            "GITHUB_RUN_ID": "314159",
+        }
+
+    def write_result(self, *, seen: int = 38, complete: bool = True,
+                     duplicate: bool = False, testing_sha: str | None = None) -> None:
+        expected = [f"CASE-{index:02d}" for index in range(38)]
+        seen_cases = expected[:seen]
+        case_ids = list(seen_cases)
+        if duplicate:
+            case_ids[-1] = case_ids[0]
+        payload = {
+            "schema_version": 1,
+            "auto_testing_sha": testing_sha or self.TESTING_SHA,
+            "selected_scenarios": ["A", "B", "C", "C2", "D"],
+            "complete": complete,
+            "expected_cases": expected,
+            "seen_cases": seen_cases,
+            "missing_cases": expected[seen:],
+            "harness_errors": [],
+            "counts": {
+                "expected": 38,
+                "seen": seen,
+                "unexpected": 1,
+                "known_divergence": 0,
+                "harness_errors": 0,
+            },
+            "cases": [
+                {"case_id": case_id, "verdict": "UNEXPECTED" if index == 0 else "pass", "detail": "fixture"}
+                for index, case_id in enumerate(case_ids)
+            ],
+        }
+        self.results.write_text(json.dumps(payload))
+
+    def run_report(self) -> subprocess.CompletedProcess[str]:
+        replacements = {
+            "inputs.package_url || 'nightly (R2 latest)'": "fixture-package",
+            "inputs.strict || 'false'": "false",
+        }
+        rendered = re.sub(
+            r"\$\{\{\s*(.*?)\s*\}\}",
+            lambda match: replacements[match[1]],
+            self.report_body,
+        )
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", rendered],
+            cwd=self.directory,
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_complete_product_failure_is_valid_harness_evidence(self) -> None:
+        self.write_result()
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text().splitlines()[-1], "complete=true")
+
+    def test_partial_or_missing_results_fail_the_harness_gate(self) -> None:
+        self.write_result(seen=17, complete=False)
+        partial = self.run_report()
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertEqual(self.output.read_text().splitlines()[-1], "complete=false")
+
+        self.results.unlink()
+        self.output.unlink()
+        missing = self.run_report()
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(self.output.read_text().splitlines()[-1], "complete=false")
+
+    def test_duplicate_cases_or_revision_mismatch_fail_the_harness_gate(self) -> None:
+        self.write_result(duplicate=True)
+        self.assertNotEqual(self.run_report().returncode, 0)
+
+        self.output.unlink()
+        self.write_result(testing_sha="b" * 40)
+        self.assertNotEqual(self.run_report().returncode, 0)
+
+    def test_backlog_manager_only_runs_after_complete_report(self) -> None:
+        condition = next(
+            line.strip() for line in self.steps["Manage backlog issues (dedup / label / auto-close)"]
+            if line.startswith("        if:")
+        )
+        self.assertEqual(
+            condition,
+            "if: ${{ always() && steps.evidence.outcome == 'success' && steps.chain_report.outputs.complete == 'true' }}",
+        )
+
+    def test_auto_testing_ref_is_resolved_once_and_recorded(self) -> None:
+        checkout = "\n".join(self.steps["Checkout auto-testing scripts"])
+        record = "\n".join(self.steps["Record auto-testing revision"])
+        self.assertIn("steps.chain.outputs.testing_sha || inputs.auto_testing_ref || 'main'", checkout)
+        self.assertIn("git -C auto-testing rev-parse HEAD", record)
+        self.assertIn("AUTO_TESTING_SHA", record)
 
 
 class FunctionalCaseReportTests(unittest.TestCase):
@@ -727,7 +851,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
     def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
         extra = {
             "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
-            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"], "fault-tolerance": [],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"], "fault-tolerance": ["results.json"],
             "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
                             "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
         }
