@@ -24,7 +24,9 @@ use serial_test::serial;
 use tokio::io::AsyncReadExt as _;
 
 mod storage_api;
-use storage_api::integration::{DiskAPI, ObjectIO, ObjectOptions, PutObjReader, ReadOptions, ShardIntegrityWriteMode};
+use storage_api::integration::{
+    DiskAPI, ObjectIO, ObjectOptions, PutObjReader, ReadOptions, ShardIntegrityWriteMode, WriteCompletion,
+};
 
 #[tokio::test]
 #[serial]
@@ -46,6 +48,8 @@ async fn legacy_repair_reports_execution_without_strong_receipt() {
             &mut PutObjReader::from_vec(expected.clone()),
             &ObjectOptions {
                 shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                // Disk inspection and fault injection require every shard rename to finish.
+                write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
@@ -196,7 +200,12 @@ async fn receipt_requires_independent_deep_verification() {
             )
             .await
             .expect("normal presence scan");
-        assert!(normal.receipt.is_none(), "a presence scan cannot certify payload integrity");
+        let normal_receipt = normal.receipt.expect("a normal presence scan should certify metadata health");
+        assert_eq!(
+            normal_receipt.disposition,
+            HealObjectDisposition::MetadataHealthy,
+            "a presence scan must not be promoted to payload VerifiedHealthy"
+        );
         let result = storage
             .heal_object_with_receipt(
                 bucket,

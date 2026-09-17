@@ -43,7 +43,7 @@ env:
 jobs:
   s3-compat-test:
     runs-on: smoke-testing
-    timeout-minutes: 360
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
@@ -89,6 +89,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -108,6 +109,7 @@ jobs:
 
       - name: Run S3 compatibility suite
         id: test
+        timeout-minutes: 45
         # Case failures keep the run green: the report and the backlog
         # issue manager carry the product signal.
         continue-on-error: true
@@ -128,6 +130,7 @@ jobs:
 
       - name: Generate report
         id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -204,6 +207,7 @@ jobs:
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -235,6 +239,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
         # Replaces the old per-run failure filing. One entry point that:
         # - dedups by signal: failing cases are matched against open backlog
         #   issues by label (category + case ID); covered cases become a
@@ -285,6 +290,7 @@ jobs:
             --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -296,6 +302,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: always()
         run: |
           set -euo pipefail

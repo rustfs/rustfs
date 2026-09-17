@@ -55,7 +55,15 @@ pub(crate) async fn lifecycle_expiry_allowed(
 }
 
 pub(crate) async fn get_expiry_configs(api: &crate::store::ECStore, bucket: &str) -> Result<LifecycleExpiryConfigs> {
-    let bucket_incarnation_id = api.bucket_incarnation_id_from_disk(bucket).await?;
+    get_expiry_configs_for_options(api, bucket, &crate::object_api::ObjectOptions::default()).await
+}
+
+pub(crate) async fn get_expiry_configs_for_options(
+    api: &crate::store::ECStore,
+    bucket: &str,
+    opts: &crate::object_api::ObjectOptions,
+) -> Result<LifecycleExpiryConfigs> {
+    let bucket_incarnation_id = metadata_sys::get_bucket_incarnation_id_for_options_in(&api.ctx, bucket, opts).await?;
     let metadata = get_authoritative_metadata(api, bucket, bucket_incarnation_id).await?;
     let table_bucket_enabled = metadata.table_bucket_enabled();
 

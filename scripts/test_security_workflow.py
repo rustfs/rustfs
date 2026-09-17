@@ -399,17 +399,19 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "kms-test", "storage": "storage-test", "s3-compat": "s3-compat-test",
         "upgrade": "upgrade-test", "replication": "replication-test", "heal": "heal-test",
         "tier": "tier-test", "pool-expand": "pool-expansion-test", "performance": "performance-test",
-        "table": "table-test",
+        "table": "table-test", "fault-tolerance": "fault-tolerance-test",
     }
     DIRECT_TESTS = {
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
-        "table": "Run table suite",
+        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2)",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
         for suite, job_id in self.JOBS.items():
+            if suite in getattr(self, "EXCLUDED", ()):
+                continue
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
@@ -447,7 +449,12 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "auto-testing").mkdir()
                 script = root / f"auto-testing/rustfs-{suite}-test.sh"
-                script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                if suite == "fault-tolerance":
+                    # FT cleans up through the suite script itself (--cleanup), not ssh;
+                    # emit the marker so the ordering assertion holds
+                    script.write_text('#!/bin/sh\n[ "$1" = "--cleanup" ] && printf "cleanup\\n" >> "$EXECUTED"\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                else:
+                    script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
                 script.chmod(0o755)
                 fake_bin = root / "bin"
                 fake_bin.mkdir()
@@ -469,6 +476,13 @@ class FunctionalWorkflowTests(unittest.TestCase):
                 for expression in re.findall(r"\$\{\{\s*(.*?)\s*\}\}", source):
                     if expression.startswith("inputs.") and re.fullmatch(r"inputs\.\w+", expression):
                         context[expression] = ""
+                    elif "steps.chain_package.outputs.package_url" in expression:
+                        # composite fallback expression used by the FT suite
+                        context[expression] = ""
+                    elif "inputs." in expression:
+                        # composite conditions (e.g. always() && inputs.cleanup_after != 'false'):
+                        # blank every inputs.* token so the literal guard stays meaningful
+                        context[expression] = re.sub(r"inputs\.\w+", "", expression)
                 def execute(name):
                     lines = steps[name]
                     rendered = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: context[match[1]], shell_body(lines))
@@ -548,10 +562,13 @@ printf '%s\n' '--- KMS-101 roundtrip ---' '[UNSUPPORTED] KMS-101'
 
 
 class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
-    SUITES = tuple(suite for suite in FunctionalWorkflowTests.DIRECT_TESTS if suite != "table") + (
-        "heal",
-        "performance",
-    )
+    # "table" and "fault-tolerance" follow the release-branch semantics and
+    # their own report shapes (table: functional_case_report; FT: FT-CASE
+    # lines + chain evidence). They are excluded from the legacy matrices via
+    # EXCLUDED (report matrix tail + wiring legacy-issue section) while the
+    # upload-allowlist matrix still covers them through the full list.
+    SUITES = (*FunctionalWorkflowTests.DIRECT_TESTS, "heal", "performance")
+    EXCLUDED = ("performance", "table", "fault-tolerance")
 
     def prepare(self, suite: str) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -594,7 +611,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
         self.env["PATH"] = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
 
     def test_evidence_wiring_and_failed_initialization_cannot_publish_stale_files(self):
-        for suite, suffix in ((suite, suffix) for suite in self.SUITES for suffix in ("", "-scratch")):
+        for suite, suffix in ((suite, suffix) for suite in self.SUITES if suite not in ("table", "fault-tolerance") for suffix in ("", "-scratch")):
             with self.subTest(suite=suite, collision=suffix or "artifact"):
                 self.prepare(suite)
                 self.assertNotIn("/tmp/rustfs-", self.source)
@@ -628,7 +645,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 self.assertEqual((existing / "report.md").read_text(), "OLD RUN EVIDENCE")
 
     def test_reports_use_only_current_complete_suite_evidence(self):
-        for suite in self.SUITES[:-1]:
+        for suite in (s for s in self.SUITES if s not in self.EXCLUDED):
             good = "--- KMS-101 roundtrip ---\n[PASS] KMS-101\n"
             partial = "--- KMS-101 roundtrip ---\n[PASS] KMS-101\n--- KMS-102 unfinished ---\n"
             if suite == "s3-compat":
@@ -710,7 +727,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
     def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
         extra = {
             "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
-            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"], "table": ["cases.md"], "fault-tolerance": [],
             "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
                             "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
         }
@@ -849,6 +866,84 @@ emit_step_result() {
                     self.assertIn("| 3 | original failure | FAIL |", (self.artifacts / "steps.md").read_text())
                 if "later step failure" in failed_log:
                     self.assertIn("| 3 | later step failure | FAIL |", (self.artifacts / "steps.md").read_text())
+
+    def test_tier_gate_rejects_failed_suites_and_invalid_structured_results(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.context["env.TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        gate_file = self.artifacts / "rustfs-tier-gate.rc"
+        for evidence_outcome, test_outcome, gate_result, success in (
+            ("success", "success", "0\n", True),
+            ("success", "failure", "0\n", False),
+            ("success", "cancelled", "0\n", False),
+            ("success", "skipped", "0\n", False),
+            ("failure", "success", "0\n", False),
+            ("success", "success", None, False),
+            ("success", "success", "", False),
+            ("success", "success", "1\n", False),
+            ("success", "success", "invalid\n", False),
+        ):
+            with self.subTest(evidence=evidence_outcome, suite=test_outcome, structured=gate_result):
+                self.context["steps.evidence.outcome"] = evidence_outcome
+                self.context["steps.test.outcome"] = test_outcome
+                gate_file.unlink(missing_ok=True)
+                if gate_result is not None:
+                    gate_file.write_text(gate_result)
+                result = self.run_step("Enforce tier suite result")
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_tier_backlog_manager_never_closes_issues_after_evidence_or_gate_failure(self):
+        self.prepare("tier")
+        self.artifacts.mkdir()
+        self.env["TIER_ARTIFACTS_DIR"] = str(self.artifacts)
+        capture = self.directory / "manager-args.json"
+        self.env["CAPTURE_MANAGER"] = str(capture)
+        manager = self.directory / "auto-testing/scripts/issue_manager.py"
+        manager.parent.mkdir(parents=True)
+        manager.write_text("import json, os, sys\nfrom pathlib import Path\n"
+                           "Path(os.environ['CAPTURE_MANAGER']).write_text(json.dumps(sys.argv[1:]))\n")
+        for test, verify, gate, expected in (
+            ("success", "success", "success", "success"),
+            ("failure", "success", "success", "failure"),
+            ("success", "failure", "success", "failure"),
+            ("success", "success", "failure", "failure"),
+            ("cancelled", "failure", "failure", "cancelled"),
+        ):
+            with self.subTest(suite=test, evidence=verify, gate=gate):
+                self.context.update({"steps.test.outcome": test, "steps.evidence_verify.outcome": verify,
+                                     "steps.gate.outcome": gate})
+                result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(capture.read_text())
+                self.assertEqual(args[args.index("--outcome") + 1], expected)
+        capture.unlink()
+        self.artifacts.rmdir()
+        self.artifacts.symlink_to(self.directory, target_is_directory=True)
+        result = self.run_step("Manage backlog issues (dedup / label / auto-close)")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(capture.exists())
+
+    def test_tier_failure_issue_never_reads_rejected_or_symlinked_evidence(self):
+        for rejected in (True, False):
+            with self.subTest(rejected=rejected):
+                self.prepare("tier")
+                evidence = self.directory / "untrusted-evidence"
+                evidence.mkdir()
+                (evidence / "rustfs-tier-report.md").write_text("UNTRUSTED EVIDENCE MUST NOT BE READ")
+                if rejected:
+                    self.artifacts = evidence
+                else:
+                    self.artifacts.symlink_to(evidence, target_is_directory=True)
+                self.context.update({
+                    "env.TIER_ARTIFACTS_DIR": str(self.artifacts),
+                    "steps.evidence.outcome": "failure" if rejected else "success",
+                    "steps.evidence_verify.outcome": "failure", "steps.gate.outcome": "failure",
+                })
+                result = self.run_step("File failure issue in rustfs/backlog")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                body = Path(self.env["CAPTURE_BODY"]).read_text()
+                self.assertNotIn("UNTRUSTED EVIDENCE MUST NOT BE READ", body)
+                self.assertIn("its contents were not read", body)
 
     def test_performance_results_version_and_report_are_bound_to_the_run(self):
         self.prepare("performance")

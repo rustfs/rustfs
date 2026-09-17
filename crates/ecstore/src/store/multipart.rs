@@ -355,7 +355,7 @@ impl ECStore {
         if let Some(guard) = guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
         }
-        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
         if opts.expected_bucket_incarnation_id != Some(current) {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
@@ -530,7 +530,11 @@ impl ECStore {
             return Ok((result, 0, opts.expected_bucket_incarnation_id));
         }
 
-        if opts.data_movement && opts.version_id.is_some() {
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
+        if opts.data_movement && (opts.version_id.is_some() || capacity_owner.is_some()) {
+            // Capacity-owned decommission writes must remain on the target
+            // selected by the durable reservation, including unversioned
+            // objects whose ObjectOptions carry no version ID.
             let idx = self.select_data_movement_pool_idx(bucket, object, -1, &opts, false).await?;
             if idx == opts.src_pool_idx {
                 return Err(StorageError::DataMovementOverwriteErr(
@@ -542,12 +546,9 @@ impl ECStore {
             self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
                 .await;
             let res = self
-                .run_decommission_capacity_temporary_mutation(
-                    idx,
-                    DecommissionCapacityOwner::from_options(&opts),
-                    None,
-                    || async { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
-                )
+                .run_decommission_capacity_temporary_mutation(idx, capacity_owner, None, || async {
+                    self.pools[idx].new_multipart_upload(bucket, object, &opts).await
+                })
                 .await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
@@ -1046,6 +1047,7 @@ impl ECStore {
         opts: &ObjectOptions,
         publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<ObjectInfo> {
+        let request_opts = opts;
         let (target_pool_idx, mutation_fence) = target;
         check_complete_multipart_args(bucket, object, upload_id)?;
         if !opts.data_movement {
@@ -1131,7 +1133,8 @@ impl ECStore {
             )
             .await;
         drop(publication_guard);
-        let result = enqueue_transition_after_write(result, LcEventSrc::S3CompleteMultipartUpload).await;
+        let result =
+            enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, request_opts).await;
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
         }

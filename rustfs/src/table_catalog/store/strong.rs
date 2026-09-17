@@ -2270,6 +2270,16 @@ where
             .collect())
     }
 
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        validate_table_entry_version_and_id(candidate)?;
+        let namespace = parse_namespace_for_store(&candidate.namespace)?;
+        let table = parse_table_for_store(&candidate.table)?;
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        let key = Self::table_key(&candidate.table_bucket, &namespace, &table);
+        Self::ensure_table_warehouse_prefix_available_locked(&state, candidate, &key)
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,

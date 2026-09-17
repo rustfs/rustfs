@@ -3900,6 +3900,12 @@ pub struct SetDisks {
     /// writes skip the global registry mutex (backlog#1315). `Arc` so clones of
     /// a set share one generation marker.
     capacity_dirty_generation: Arc<AtomicU64>,
+    /// Orphan prefixes whose last purge scan met data that can never be
+    /// purged by listing (residue without a committed marker, an in-flight
+    /// write), keyed by `bucket/prefix` with the time of that scan. Empty
+    /// listings of such a prefix are frequent and the scan reads the whole
+    /// subtree, so it is not repeated within `ORPHAN_PURGE_BACKOFF` (#6898).
+    orphan_purge_backoff: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
@@ -4690,6 +4696,7 @@ impl SetDisks {
             ctx,
             capacity_scope_cache: Arc::new(std::sync::RwLock::new(CapacityScopeCache::default())),
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
@@ -4701,6 +4708,12 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
+        self.local_lock_manager = ctx.lock_manager();
+        self.ctx = ctx;
     }
 
     /// Read the persisted bucket identity through this set's metadata owner.
@@ -5218,6 +5231,24 @@ fn known_put_object_storage_size(data_size: i64) -> i64 {
     } else {
         HashReader::SIZE_PRESERVE_LAYER
     }
+}
+
+/// Shard size the inline admission check evaluates for a single PUT.
+///
+/// A compressed or encrypted stream reports `SIZE_PRESERVE_LAYER` as its
+/// stored size because the transformed length is only known after the write.
+/// MinIO's `putObject` sizes such objects for inline admission by their
+/// plaintext `ActualSize`; without that fallback every transformed object,
+/// however small, lands in `part.1` files. A stream with neither size known
+/// yields a negative shard size, which `should_inline` rejects.
+fn inline_admission_shard_size(erasure: &coding::Erasure, stored_size: i64, actual_size: i64) -> i64 {
+    if stored_size >= 0 {
+        return erasure.shard_file_size(stored_size);
+    }
+    if actual_size > 0 {
+        return erasure.shard_file_size(actual_size);
+    }
+    HashReader::SIZE_PRESERVE_LAYER
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9311,6 +9342,175 @@ mod tests {
             dir0.path().join("bucket").join("pfx").join("a").exists(),
             "empty tree must be left untouched when the purge is aborted"
         );
+    }
+
+    async fn write_committed_residue(object_dir: &std::path::Path) -> std::path::PathBuf {
+        let residue = object_dir.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("committed data directory should be created");
+        fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, Uuid::new_v4())),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+        residue
+    }
+
+    // #6898: residue from a build that never wrote delete markers blocks only
+    // its own ancestor chain; a committed sibling subtree is still reclaimed
+    // and the call reports the partial purge.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_reclaims_committed_subtree_beside_blocked_subtree() {
+        let (dir0, disk0) = make_single_local_disk().await;
+        let (dir1, disk1) = make_single_local_disk().await;
+
+        let committed = write_committed_residue(&dir0.path().join("bucket/pfx/a/obj")).await;
+        let unmarked = dir1.path().join("bucket/pfx/b/obj").join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&unmarked)
+            .await
+            .expect("unmarked residue should be created");
+        fs::write(unmarked.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::create_dir_all(dir0.path().join("bucket/pfx/b/obj"))
+            .await
+            .expect("disk0 copy of the blocked chain should be created");
+
+        let set = make_set_disks_with(vec![Some(disk0), Some(disk1)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(purged, "the committed subtree must be reported as purged");
+        assert!(!committed.exists(), "committed residue beside a blocked subtree must be reclaimed");
+        assert!(!dir0.path().join("bucket/pfx/a").exists(), "the reclaimed subtree's directories must go");
+        assert!(unmarked.join("part.1").exists(), "unmarked residue must survive");
+        assert!(
+            dir0.path().join("bucket/pfx/b/obj").exists(),
+            "a directory blocked on another disk must be left alone on this one"
+        );
+        assert!(dir0.path().join("bucket/pfx").exists() && dir1.path().join("bucket/pfx").exists());
+    }
+
+    // A data dir that is committed residue on one disk but still holds an
+    // object below it on another disk is blocked on every disk.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_blocks_committed_files_by_other_disks_data() {
+        let (dir0, disk0) = make_single_local_disk().await;
+        let (dir1, disk1) = make_single_local_disk().await;
+
+        let data_dir = Uuid::new_v4();
+        let committed = dir0.path().join("bucket/pfx/x").join(data_dir.to_string());
+        fs::create_dir_all(&committed)
+            .await
+            .expect("committed data directory should be created");
+        fs::write(committed.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            committed.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, Uuid::new_v4())),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+        let nested = dir1.path().join("bucket/pfx/x").join(data_dir.to_string()).join("nested");
+        fs::create_dir_all(&nested)
+            .await
+            .expect("nested object dir should be created");
+        fs::write(nested.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("nested object metadata should be written");
+
+        let set = make_set_disks_with(vec![Some(disk0), Some(disk1)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged);
+        assert!(
+            committed.join("part.1").exists(),
+            "committed files under a dir blocked elsewhere must remain"
+        );
+        assert!(nested.join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    // An unreadable directory anywhere under the prefix aborts the purge on
+    // every disk before anything is deleted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn purge_orphan_dir_object_aborts_when_a_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, disk) = make_single_local_disk().await;
+        let committed = write_committed_residue(&dir.path().join("bucket/pfx/b/obj")).await;
+        let sealed = dir.path().join("bucket/pfx/a");
+        fs::create_dir_all(&sealed).await.expect("sealed directory should be created");
+        fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
+            .await
+            .expect("sealed directory should become unreadable");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set.purge_orphan_dir_object("bucket", "pfx/").await;
+        fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("sealed directory should be restored");
+
+        assert!(matches!(purged, Ok(false)), "an unreadable directory must abort the purge");
+        assert!(committed.join("part.1").exists(), "nothing may be deleted once classification failed");
+    }
+
+    // After a scan met unpurgeable data the prefix is not rescanned for a
+    // while, even when new committed residue appears under it.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_backs_off_after_blocked_scan() {
+        let (dir, disk) = make_single_local_disk().await;
+        let unmarked = dir.path().join("bucket/pfx/b/obj").join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&unmarked)
+            .await
+            .expect("unmarked residue should be created");
+        fs::write(unmarked.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert!(
+            !set.purge_orphan_dir_object("bucket", "pfx/")
+                .await
+                .expect("scan should succeed")
+        );
+
+        let committed = write_committed_residue(&dir.path().join("bucket/pfx/a/obj")).await;
+        assert!(
+            !set.purge_orphan_dir_object("bucket", "pfx/")
+                .await
+                .expect("scan should succeed"),
+            "a prefix in backoff is not rescanned"
+        );
+        assert!(committed.exists());
+        assert!(
+            set.purge_orphan_dir_object("bucket", "pfx/a/")
+                .await
+                .expect("scan should succeed"),
+            "backoff is per prefix, a narrower prefix still purges"
+        );
+        assert!(!committed.exists());
+
+        let committed = write_committed_residue(&dir.path().join("bucket/pfx/a/obj")).await;
+        set.clear_orphan_purge_backoff();
+        assert!(
+            set.purge_orphan_dir_object("bucket", "pfx/")
+                .await
+                .expect("scan should succeed")
+        );
+        assert!(!committed.exists());
+        assert!(unmarked.join("part.1").exists());
     }
 
     // Build an `xl.meta` under `object_dir` whose versions reference `data_dirs`
@@ -13583,6 +13783,29 @@ mod tests {
             classify_put_write_path(false, known_put_object_storage_size(1024 * 1024), 1024 * 1024),
             SmallWritePath::SingleBlockNonInline
         ));
+    }
+
+    #[test]
+    fn inline_admission_falls_back_to_actual_size_for_transformed_streams() {
+        let erasure = coding::Erasure::new(2, 2, 1024 * 1024);
+        let unknown = HashReader::SIZE_PRESERVE_LAYER;
+
+        // A known stored size is authoritative, whatever the plaintext size says.
+        assert_eq!(
+            inline_admission_shard_size(&erasure, 16 * 1024, 4 * 1024 * 1024),
+            erasure.shard_file_size(16 * 1024)
+        );
+        assert_eq!(inline_admission_shard_size(&erasure, 0, 4 * 1024), 0);
+
+        // A transformed stream is sized by its plaintext length (MinIO parity).
+        assert_eq!(
+            inline_admission_shard_size(&erasure, unknown, 16 * 1024),
+            erasure.shard_file_size(16 * 1024)
+        );
+
+        // Neither size known, or an empty transformed stream, cannot be admitted.
+        assert!(inline_admission_shard_size(&erasure, unknown, 0) < 0);
+        assert!(inline_admission_shard_size(&erasure, unknown, unknown) < 0);
     }
 
     #[test]

@@ -43,7 +43,7 @@ jobs:
   table-test:
     name: table-test
     runs-on: smoke-testing
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Checkout repository (for report parser)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -72,6 +72,7 @@ jobs:
         run: python3 scripts/functional_chain_evidence.py consume
 
       - name: Checkout auto-testing scripts
+        timeout-minutes: 5
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: rustfs/auto-testing
@@ -89,6 +90,7 @@ jobs:
           python3 --version
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         continue-on-error: true
         run: |
           set -uo pipefail
@@ -114,6 +116,7 @@ jobs:
 
       - name: Run table suite
         id: test
+        timeout-minutes: 45
         # Standalone case failures are reported by the backlog manager.
         # Chain evidence separately requires complete passing cases.
         continue-on-error: true
@@ -137,6 +140,7 @@ jobs:
           ./auto-testing/rustfs-table-test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Generate report
+        timeout-minutes: 2
         id: chain_report
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
@@ -203,6 +207,7 @@ jobs:
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -232,6 +237,7 @@ jobs:
           echo "dashboard updated: ${REPORT_PATH}"
 
       - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
         # Replaces the old per-run failure filing. One entry point that:
         # - dedups by signal: failing cases are matched against open backlog
         #   issues by label (category + case ID); covered cases become a
@@ -273,6 +279,7 @@ jobs:
             --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -285,6 +292,7 @@ jobs:
           retention-days: 30
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: always()
         continue-on-error: true
         run: |

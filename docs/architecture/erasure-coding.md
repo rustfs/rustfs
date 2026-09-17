@@ -216,10 +216,13 @@ Legacy objects retain their existing GET and traditional Heal behavior and
 therefore their residual complete-donor substitution risk. Ordinary shard repair
 and the existing explicit-version metadata recovery path remain available, but
 do not create commitments or certify object identity. Actual drive repairs are
-reported separately from strong integrity receipts. Normal
-presence scans do not issue strong integrity receipts even for protected
-objects. Only a completed exclusive Deep scan/repair with authenticated sources
-can do so. See the [upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
+reported separately from strong integrity receipts. Normal presence scans do
+not issue strong integrity receipts even for protected objects; an all-healthy
+protected version or delete marker may instead carry `MetadataHealthy`, which
+proves metadata quorum only. Legacy objects receive no positive receipt. Only a
+completed exclusive Deep scan/repair with authenticated sources
+can produce `VerifiedHealthy` or a payload-backed repair receipt. See the
+[upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
 for mixed-version and migration constraints and the
 [rollout runbook](../operations/shard-integrity-rollout.md) for activation and rollback.
 
@@ -288,7 +291,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 
 ### 6.6 Inline data
 
-Small objects store their payload inline after the container CRC ([filemeta_inline.rs](../../crates/filemeta/src/filemeta_inline.rs)): 1 version byte (`INLINE_DATA_VER = 1`) then a msgpack map of `version-key → bin`. **INVARIANT — the map key** is the version-id string, `"null"` (`NULL_VERSION_ID`, [fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)) for the null/None version, else the lowercase hyphenated UUID. Presence is determined **on read** solely by the `meta_sys[inline-data]` body marker (`FileInfo::inline_data`); the read path gates inline extraction on that marker alone. The header `InlineData` flag is **written** (mirrored from the body on marshal) but is **not** consulted on read, and a disagreement is tolerated — MinIO may leave the header flag unset while inline data is present, so a reader must **not** require the flag and the marker to agree. The inline threshold is `should_inline` ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)): inline if `shard_size ≤ inline_block/8` for versioned buckets, else `≤ inline_block`; `DEFAULT_INLINE_BLOCK = 128 KiB`.
+Small objects store their payload inline after the container CRC ([filemeta_inline.rs](../../crates/filemeta/src/filemeta_inline.rs)): 1 version byte (`INLINE_DATA_VER = 1`) then a msgpack map of `version-key → bin`. **INVARIANT — the map key** is the version-id string, `"null"` (`NULL_VERSION_ID`, [fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)) for the null/None version, else the lowercase hyphenated UUID. Presence is determined **on read** solely by the `meta_sys[inline-data]` body marker (`FileInfo::inline_data`); the read path gates inline extraction on that marker alone. The header `InlineData` flag is **written** (mirrored from the body on marshal) but is **not** consulted on read, and a disagreement is tolerated — MinIO may leave the header flag unset while inline data is present, so a reader must **not** require the flag and the marker to agree. The inline threshold is `should_inline` ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)): inline if `shard_size ≤ inline_block/8` for versioned buckets, else `≤ inline_block`; `DEFAULT_INLINE_BLOCK = 128 KiB`. A compressed or encrypted single PUT has no known stored size up front, so its shard size is derived from the plaintext `actual_size` (`inline_admission_shard_size`, MinIO `putObject` parity); such objects are inlined through the streaming encoder with in-memory bitrot writers rather than the single-block fast path. When shard-integrity protected writes are enabled, inline placement additionally requires a known stored length no greater than one erasure block; unknown transformed streams retain external shards and proof indexes.
 
 ---
 

@@ -979,6 +979,14 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
         }
     }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_offline_for_test(),
+            Disk::Remote(remote_disk) => remote_disk.force_offline_for_test(),
+        }
+    }
 }
 
 #[derive(Debug)]

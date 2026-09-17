@@ -67,7 +67,7 @@ env:
 jobs:
   tier-test:
     runs-on: smoke-testing
-    timeout-minutes: 420
+    timeout-minutes: 60
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout chain tooling
@@ -104,6 +104,7 @@ jobs:
           persist-credentials: false
 
       - name: Prepare pinned RustFS CLI
+        timeout-minutes: 5
         id: rc
         run: |
           set -euo pipefail
@@ -216,6 +217,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
@@ -236,6 +238,7 @@ jobs:
           done
 
       - name: Ensure MQTT broker + clients
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           if ! command -v mosquitto_sub >/dev/null 2>&1; then
@@ -265,6 +268,7 @@ jobs:
 
       - name: Run tier suite
         id: test
+        timeout-minutes: 45
         # Case failures keep the run green: the report and the backlog
         # issue manager carry the product signal.
         continue-on-error: true
@@ -309,6 +313,7 @@ jobs:
 
       - name: Generate report
         id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
@@ -389,6 +394,7 @@ jobs:
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -421,6 +427,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: Verify required tier evidence
+        timeout-minutes: 2
         id: evidence_verify
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
@@ -451,6 +458,7 @@ jobs:
           [ "${failed}" -eq 0 ]
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -459,6 +467,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: always()
         run: |
           set -euo pipefail
@@ -480,6 +489,7 @@ jobs:
           done
 
       - name: Cleanup pinned RustFS CLI
+        timeout-minutes: 2
         if: always()
         run: |
           set -euo pipefail
@@ -498,23 +508,103 @@ jobs:
           GATE_RC_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-gate.rc
         run: |
           set -euo pipefail
-          # Product gate: failing cases keep the run green (the structured gate
-          # rc and the report carry the per-case signal, and the backlog issue
-          # manager tracks failures). Only harness/environment breakdowns —
-          # evidence initialization or a missing structured gate result — turn
-          # the workflow red.
           failed=0
           if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
             echo "tier evidence directory initialization is ${EVIDENCE_OUTCOME}, expected success" >&2
             failed=1
+          fi
+          if [ "${TEST_OUTCOME}" != "success" ]; then
+            echo "tier suite step outcome is ${TEST_OUTCOME}, expected success" >&2
+            failed=1
+          fi
+          if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
+            echo "structured gate result is unavailable because evidence initialization failed" >&2
           elif [ ! -s "${GATE_RC_FILE}" ]; then
             echo "structured gate result is missing" >&2
             failed=1
+          else
+            GATE_RC="$(tr -d '[:space:]' < "${GATE_RC_FILE}")"
+            if ! [[ "${GATE_RC}" =~ ^[0-9]+$ ]] || [ "${GATE_RC}" -ne 0 ]; then
+              echo "structured 56-case gate failed with exit ${GATE_RC:-invalid}" >&2
+              failed=1
+            fi
           fi
           [ "${failed}" -eq 0 ]
 
+      - name: File failure issue in rustfs/backlog
+        timeout-minutes: 2
+        if: ${{ always() && (steps.evidence.outcome != 'success' || steps.test.outcome == 'cancelled' || steps.evidence_verify.outcome == 'failure' || steps.evidence_verify.outcome == 'cancelled' || (steps.gate.outcome == 'failure' && steps.test.outcome != 'failure') || steps.gate.outcome == 'cancelled') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          SUITE: 'tier'
+          SUITE_LABEL: 'Tier'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVIDENCE_DIR: ${{ env.TIER_ARTIFACTS_DIR }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          VERIFY_OUTCOME: ${{ steps.evidence_verify.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          REPORT_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-report.md
+          LOG_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier.log
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            exit 0
+          fi
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
+          EXISTING="$(gh issue list -R rustfs/backlog --state all \
+            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
+            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
+          if [ -n "${EXISTING}" ]; then
+            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+            exit 0
+          fi
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+          BODY_FILE="$(mktemp)"
+          {
+            echo "The **${SUITE_LABEL}** functional suite failed."
+            echo ""
+            echo "- Suite: \`${SUITE}\`"
+            echo "- Run: ${RUN_URL}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Date: $(date -u +%Y-%m-%d)"
+            echo "- Evidence initialization: ${EVIDENCE_OUTCOME}"
+            echo "- Evidence verification: ${VERIFY_OUTCOME}"
+            echo "- Final gate: ${GATE_OUTCOME}"
+            echo ""
+            echo "## Report (errors and symptoms)"
+            echo ""
+            if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
+              echo "(the run evidence directory was rejected; its contents were not read)"
+            elif [ ! -d "${EVIDENCE_DIR}" ] || [ -L "${EVIDENCE_DIR}" ]; then
+              echo "(the run evidence directory is missing or unsafe; its contents were not read)"
+            elif [ -s "${REPORT_FILE}" ]; then
+              redact < "${REPORT_FILE}"
+            elif [ -s "${LOG_FILE:-}" ]; then
+              echo "(report file missing; log tail below)"
+              echo ""
+              tail -n 200 "${LOG_FILE}" | redact
+            else
+              echo "(no report or log file was produced)"
+            fi
+          } | head -c 55000 > "${BODY_FILE}"
+          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
+          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test; then
+            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          fi
+          echo "filed backlog issue for suite ${SUITE}"
+
       - name: Manage backlog issues (dedup / label / auto-close)
-        # Replaces the old per-run failure filing. One entry point that:
+        timeout-minutes: 2
+        # Case-level issue management complements the infrastructure failure report:
         # - dedups by signal: failing cases are matched against open backlog
         #   issues by label (category + case ID); covered cases become a
         #   comment on the existing issue, only uncovered cases file a new one
@@ -525,6 +615,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          VERIFY_OUTCOME: ${{ steps.evidence_verify.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
           SUITE: 'tier'
           SUITE_LABEL: 'Tier'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -537,6 +630,14 @@ jobs:
           if [ ! -f auto-testing/scripts/issue_manager.py ]; then
             echo "issue_manager.py not found in auto-testing checkout; skipping"
             exit 0
+          fi
+          if [ ! -d "${TIER_ARTIFACTS_DIR}" ] || [ -L "${TIER_ARTIFACTS_DIR}" ]; then
+            echo "tier evidence directory is missing or unsafe; skipping backlog issue management" >&2
+            exit 1
+          fi
+          OUTCOME="${TEST_OUTCOME}"
+          if [ "${OUTCOME}" != "cancelled" ] && { [ "${VERIFY_OUTCOME}" != "success" ] || [ "${GATE_OUTCOME}" != "success" ]; }; then
+            OUTCOME=failure
           fi
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
@@ -551,7 +652,7 @@ jobs:
           python3 auto-testing/scripts/issue_manager.py handle \
             --repo rustfs/backlog \
             --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
-            --outcome "${{ steps.test.outcome }}" \
+            --outcome "${OUTCOME}" \
             --report "${TIER_ARTIFACTS_DIR}/rustfs-tier-cases.md" \
             --report-file "${TIER_ARTIFACTS_DIR}/rustfs-tier-report.md" \
             --log "${TIER_ARTIFACTS_DIR}/rustfs-tier.log" \

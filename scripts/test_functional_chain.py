@@ -289,7 +289,11 @@ class EnvelopeTests(unittest.TestCase):
         for suite in evidence.SUITES:
             job = "\n".join(yaml_block(lines, suite, 2))
             self.assertIn("needs: [prepare" + (", " + previous if previous else "") + "]", job)
-            self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
+            if suite == "performance":
+                # gated on the preflight probe: runs only when its fleet is online
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}", job)
+            else:
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
             self.assertIn("chain_manifest: ${{ needs.prepare.outputs.manifest }}", job)
             previous = suite
         complete = "\n".join(yaml_block(lines, "complete-chain", 2))
@@ -298,6 +302,12 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn("functional_chain_evidence.py summarize", complete)
         self.assertIn("functional-chain-report-", complete)
         self.assertIn("needs.prepare.result != 'skipped'", complete)
+        prepare = "\n".join(yaml_block(lines, "prepare", 2))
+        self.assertIn("Check shared functional fleet runner before scheduling suites", prepare)
+        self.assertIn("check_functional_runners.py smoke-testing", prepare)
+        self.assertIn("Probe performance fleet runner", prepare)
+        self.assertIn("check_functional_runners.py pf-testing", prepare)
+        self.assertIn("performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}", prepare)
 
     def test_every_lane_retains_failed_evidence_and_identifies_its_own_attempt(self):
         paths = list((candidate.ROOT / ".github/workflows").glob("rustfs-*-test.yml"))
@@ -361,6 +371,49 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn('--report "${FUNCTIONAL_ARTIFACTS_DIR}/' + report + '"', workflow)
                 self.assertIn("CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}", workflow)
                 self.assertIn("CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}", workflow)
+
+
+class WorkflowTimeoutTests(unittest.TestCase):
+    def test_non_performance_suites_have_hard_and_step_deadlines(self):
+        from check_test_wiring import yaml_block
+        from test_security_workflow import FunctionalWorkflowTests, named_steps
+        jobs = {**FunctionalWorkflowTests.JOBS, "security": "security-test"}
+        jobs.pop("performance")
+        self.assertEqual(len(jobs), 11)
+        for suite, job_id in jobs.items():
+            with self.subTest(suite=suite):
+                source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
+                job = yaml_block(source.splitlines(), job_id, 2)
+                self.assertIn("    timeout-minutes: 60", job)
+                steps = named_steps(job)
+                primary = [step for step in steps.values() if any(
+                    line in ("        id: test", "        id: pool_test") for line in step)]
+                self.assertEqual(len(primary), 1)
+                self.assertIn("        timeout-minutes: 45", primary[0])
+                cleanup = "Cleanup environment"
+                for phase in ("before", "after"):
+                    self.assertIn("        timeout-minutes: 5", steps[f"{cleanup} ({phase})"])
+                self.assertTrue(any("always()" in line for line in steps[f"{cleanup} (after)"]))
+                for name, step in steps.items():
+                    if name.startswith(("Generate report", "Upload functional report", "File failure issue",
+                                        "Upload report", "Upload test logs", "Manage backlog issues")):
+                        self.assertIn("        timeout-minutes: 2", step, name)
+                if suite in ("heal", "pool-expand"):
+                    install = next(step for name, step in steps.items() if name.startswith("Install RustFS package"))
+                    self.assertIn("        timeout-minutes: 5", install)
+                    self.assertIn("        timeout-minutes: 5", steps["Preflight checks"])
+
+    def test_performance_is_exempt_from_functional_timeouts(self):
+        from check_test_wiring import yaml_block
+        source = (candidate.ROOT / ".github/workflows/rustfs-performance-test.yml").read_text()
+        job = "\n".join(yaml_block(source.splitlines(), "performance-test", 2))
+        self.assertIn("    timeout-minutes: 900", job)
+        self.assertNotIn("        timeout-minutes:", job)
+        self.assertIn("RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '5m' }}", job)
+        self.assertNotIn("RUSTFS_WARP_SLEEP:", job)
+        self.assertIn("RUSTFS_WARP_METHODS: ${{ inputs.test_method }}", job)
+        self.assertIn("RUSTFS_WARP_SIZES: ${{ inputs.object_size }}", job)
+        self.assertIn("default: '5m'", source)
 
 
 if __name__ == "__main__":

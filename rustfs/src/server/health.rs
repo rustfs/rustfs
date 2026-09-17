@@ -531,6 +531,22 @@ mod tests {
         });
     }
 
+    #[test]
+    #[serial]
+    fn writable_node_readiness_keeps_200_for_transient_pool_metadata_timeout() {
+        let mut report = ready_report();
+        report.degraded_reasons = vec![ReadinessDegradedReason::PoolMetadataCheckTimeout];
+
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
+            let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs", None, None);
+
+            assert_eq!(parts.status_code, StatusCode::OK);
+            let payload = parts.payload.expect("GET readiness body");
+            assert_eq!(payload["ready"], true);
+            assert_eq!(payload["degradedReasons"], json!(["pool_metadata_check_timeout"]));
+        });
+    }
+
     #[tokio::test]
     async fn readiness_collects_object_stalls_and_recovers_on_completion() {
         let object_traffic_health = ObjectTrafficHealth::enabled_for_test(Duration::ZERO);

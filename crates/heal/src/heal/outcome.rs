@@ -76,6 +76,9 @@ pub enum HealObjectDisposition {
     Unknown,
     Repaired,
     VerifiedHealthy,
+    /// Authoritative metadata/presence proof only. This does not certify
+    /// payload integrity.
+    MetadataHealthy,
     AuthoritativelyAbsent,
     Deferred {
         reason: HealDeferredReason,
@@ -102,12 +105,17 @@ pub struct HealObjectReceipt {
 
 impl HealObjectReceipt {
     pub(crate) fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
-        matches!(
-            self.disposition,
+        let disposition_verifies = match self.disposition {
             HealObjectDisposition::Repaired
-                | HealObjectDisposition::VerifiedHealthy
-                | HealObjectDisposition::AuthoritativelyAbsent
-        ) && self.identity.kind == expected.kind
+            | HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => true,
+            // A metadata/presence proof never certifies payload bytes, so it
+            // cannot discharge a request that exists to decode the payload.
+            HealObjectDisposition::MetadataHealthy => expected.kind != HealObjectKind::Decode,
+            _ => false,
+        };
+        disposition_verifies
+            && self.identity.kind == expected.kind
             && self.identity.bucket == expected.bucket
             && self.identity.object == expected.object
             && self.identity.version_id == expected.version_id
@@ -367,7 +375,9 @@ impl HealTaskOutcome {
         counters.overflowed |= !increment_counter(&mut counters.processed);
         let counter = match item.disposition {
             HealObjectDisposition::Repaired => &mut counters.healed,
-            HealObjectDisposition::VerifiedHealthy | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
+            HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::MetadataHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
             HealObjectDisposition::Failed(_) => &mut counters.failed,
             HealObjectDisposition::Unknown => {
                 counters.overflowed |= !increment_counter(&mut counters.unknown);
@@ -525,12 +535,39 @@ mod canonical_outcome_tests {
     }
 
     #[test]
+    fn metadata_health_receipt_never_discharges_a_payload_decode_request() {
+        let incarnation = Uuid::new_v4();
+        let mut expected = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..item(HealObjectDisposition::Unknown).identity
+        };
+        let mut receipt = HealObjectReceipt {
+            identity: expected.clone(),
+            disposition: HealObjectDisposition::MetadataHealthy,
+        };
+        assert!(
+            receipt.verified_for(&expected),
+            "a presence proof still settles a metadata-level object request"
+        );
+
+        expected.kind = HealObjectKind::Decode;
+        receipt.identity.kind = HealObjectKind::Decode;
+        assert!(
+            !receipt.verified_for(&expected),
+            "a presence-only proof must not clear a payload decode responsibility"
+        );
+        receipt.disposition = HealObjectDisposition::VerifiedHealthy;
+        assert!(receipt.verified_for(&expected));
+    }
+
+    #[test]
     fn canonical_outcome_categories_have_one_terminal_count() {
         let mut outcome = HealTaskOutcome::default();
         for disposition in [
             HealObjectDisposition::Unknown,
             HealObjectDisposition::Repaired,
             HealObjectDisposition::VerifiedHealthy,
+            HealObjectDisposition::MetadataHealthy,
             HealObjectDisposition::AuthoritativelyAbsent,
             HealObjectDisposition::Deferred {
                 reason: HealDeferredReason::DanglingDeleteGrace,
@@ -543,7 +580,7 @@ mod canonical_outcome_tests {
             outcome.record(item(disposition));
         }
         let c = &outcome.counters;
-        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (8, 1, 2, 4, 1, 1));
+        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (9, 1, 3, 4, 1, 1));
         assert_eq!(c.processed, c.healed + c.unchanged + c.skipped + c.failed);
     }
 

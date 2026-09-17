@@ -41,7 +41,7 @@ impl Debug for NamespaceLockFence {
 }
 
 impl NamespaceLockFence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
@@ -153,7 +153,7 @@ pub struct ObjectLockConfigSnapshot {
     state: crate::bucket::metadata_sys::ObjectLockConfigState,
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
-    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -170,6 +170,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_store_bucket(
         store_id: Uuid,
         bucket: &str,
@@ -210,7 +211,7 @@ impl ObjectLockConfigSnapshot {
             state,
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
-            metadata_transaction_guard: Some(metadata_transaction_guard),
+            metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
         }
     }
 
@@ -221,7 +222,7 @@ impl ObjectLockConfigSnapshot {
         config_revision: OffsetDateTime,
         state: crate::bucket::metadata_sys::ObjectLockConfigState,
         lifecycle_fence: NamespaceLockFence,
-        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     ) -> Self {
         Self {
             store_id: Some(store_id),
@@ -263,6 +264,23 @@ impl ObjectLockConfigSnapshot {
                 .metadata_transaction_guard
                 .as_ref()
                 .is_some_and(|guard| !guard.is_lock_lost())
+    }
+
+    /// Share the held transaction lock without queuing another reader behind
+    /// a metadata writer that is itself waiting for this snapshot to drop.
+    pub(crate) fn metadata_transaction_guard_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let bucket_incarnation_id = self.bucket_incarnation_id?;
+        if expected_incarnation_id.is_some_and(|expected| expected != bucket_incarnation_id)
+            || !self.is_valid_for_destructive_put(store_id, bucket, bucket_incarnation_id)
+        {
+            return None;
+        }
+        self.metadata_transaction_guard.clone()
     }
 
     pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {

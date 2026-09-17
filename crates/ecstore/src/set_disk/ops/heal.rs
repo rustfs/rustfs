@@ -640,9 +640,17 @@ impl SetDisks {
                 if !file_info_is_valid_for_metadata(&file_info) {
                     return Ok(false);
                 }
-                if !version_id.is_empty() && file_info.version_id.as_ref().map(ToString::to_string).as_deref() != Some(version_id)
-                {
-                    return Ok(false);
+                if !version_id.is_empty() {
+                    let Ok(requested_version) = Uuid::parse_str(version_id) else {
+                        return Ok(false);
+                    };
+                    // Treat absent and nil UUID metadata as the same null slot.
+                    let actual_version = file_info.version_id.filter(|version_id| !version_id.is_nil());
+                    if (requested_version.is_nil() && actual_version.is_some())
+                        || (!requested_version.is_nil() && actual_version != Some(requested_version))
+                    {
+                        return Ok(false);
+                    }
                 }
                 if file_info.is_canonical_delete_marker() || file_info.is_remote() {
                     return Ok(true);
@@ -1096,6 +1104,28 @@ impl SetDisks {
                                 state: drive_state.to_string(),
                             });
                         }
+
+                        let requested_nil =
+                            version_id.is_empty() || Uuid::parse_str(version_id).is_ok_and(|requested| requested.is_nil());
+                        let selected_nil = latest_meta.version_id.is_none_or(|selected| selected.is_nil());
+                        let selected_version_matches = if requested_nil {
+                            selected_nil
+                        } else {
+                            latest_meta
+                                .version_id
+                                .is_some_and(|selected| selected.to_string().eq_ignore_ascii_case(version_id))
+                        };
+                        result.metadata_verified = !opts.dry_run
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && selected_version_matches
+                            && (protected || latest_meta.deleted)
+                            && !result.after.drives.is_empty()
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
 
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
                             result.detail =
@@ -1820,6 +1850,16 @@ impl SetDisks {
 
                         result.repair_verified = protected
                             && !latest_meta.deleted
+                            && !latest_meta.is_remote()
+                            && !read_repair_uses_shared_lock
+                            && result.drives_healed().is_some_and(|healed| healed > 0)
+                            && result
+                                .after
+                                .drives
+                                .iter()
+                                .all(|drive| drive.state == DriveState::Ok.to_string());
+                        result.metadata_repair_verified = latest_meta.deleted
+                            && !opts.dry_run
                             && !latest_meta.is_remote()
                             && !read_repair_uses_shared_lock
                             && result.drives_healed().is_some_and(|healed| healed > 0)
@@ -2792,6 +2832,8 @@ fn finalize_object_heal_result(
     if lock_lost {
         result.integrity_verified = false;
         result.repair_verified = false;
+        result.metadata_verified = false;
+        result.metadata_repair_verified = false;
         *absence = None;
         error = Some(Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -3274,6 +3316,8 @@ mod heal_result_report_tests {
         let result = rustfs_madmin::heal_commands::HealResultItem {
             integrity_verified: true,
             repair_verified: true,
+            metadata_verified: true,
+            metadata_repair_verified: true,
             ..Default::default()
         };
 
@@ -3281,6 +3325,8 @@ mod heal_result_report_tests {
 
         assert!(!result.integrity_verified);
         assert!(!result.repair_verified);
+        assert!(!result.metadata_verified);
+        assert!(!result.metadata_repair_verified);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -3292,6 +3338,20 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn absent_and_nil_selected_versions_are_the_same_null_identity() {
+        let requested_nil = Uuid::nil().to_string();
+        let requested = Uuid::parse_str(&requested_nil).expect("nil UUID string");
+        assert!(requested.is_nil());
+
+        let absent: Option<Uuid> = None;
+        let selected_nil = absent.is_none_or(|selected| selected.is_nil());
+        assert!(selected_nil, "absent metadata version selects the null identity");
+
+        let selected = Uuid::new_v4();
+        assert!(!selected.is_nil(), "a concrete UUID must not satisfy a requested null selector");
     }
 
     #[test]
@@ -3914,10 +3974,22 @@ mod heal_result_report_tests {
         let data_dir = source.data_dir.expect("non-inline source should have a data directory");
         let targets = vec![set.set_endpoints[0].to_string(), set.set_endpoints[1].to_string()];
 
-        assert!(
-            set.replacement_targets_have_version(bucket, object, "", &targets)
+        for disk in disks.iter().take(targets.len()) {
+            let mut metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
                 .await
-                .expect("healthy target shards should be readable")
+                .expect("target metadata should be readable");
+            metadata.version_id = None;
+            disk.write_metadata("", bucket, object, metadata)
+                .await
+                .expect("target metadata should be rewritten as a legacy null version");
+        }
+        let null_version = Uuid::nil().to_string();
+
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &null_version, &targets)
+                .await
+                .expect("nil selector should confirm healthy legacy null-version target shards")
         );
 
         tokio::fs::remove_file(
@@ -3932,7 +4004,7 @@ mod heal_result_report_tests {
         .expect("target shard should be removed after the initial commit");
 
         assert!(
-            !set.replacement_targets_have_version(bucket, object, "", &targets)
+            !set.replacement_targets_have_version(bucket, object, &null_version, &targets)
                 .await
                 .expect("missing target shard should be observable")
         );
