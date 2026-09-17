@@ -297,12 +297,13 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             self.assertIn("issue_manager.py not found", result.stdout + result.stderr)
             self.assertFalse(body.exists())
 
-    def test_all_suites_hold_the_shared_lock_for_manual_and_chain_runs(self) -> None:
+    def test_all_suites_hold_the_expected_lock_for_manual_and_chain_runs(self) -> None:
         for suite in ("upgrade", "s3-compat", "kms", "tier", "storage", "heal", "pool-expand", "security", "replication", "performance"):
             with self.subTest(suite=suite):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
                 # Workflow-level concurrency covers every job, including cleanup,
-                # regardless of trigger or the runner hosting the job.
+                # regardless of trigger or the runner hosting the job. Performance
+                # uses a separate fleet and therefore has a dedicated group.
                 expected_group = "rustfs-performance-suite" if suite == "performance" else "rustfs-shared-functional-tests-v2"
                 self.assertEqual([
                     line.strip() for line in yaml_block(source, "concurrency", 0)
