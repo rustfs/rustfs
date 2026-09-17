@@ -6586,7 +6586,10 @@ mod tests {
         );
         assert!(!remote_object_dir.join(rollback_dir.to_string()).exists());
 
-        *set.disks.write().await = vec![Some(remote.clone()), Some(local_disks[1].clone()), None, None];
+        // Model a transient membership snapshot that contains only two
+        // attached disks. The write quorum must still come from the configured
+        // four-drive set, otherwise this quorum-minus-one delete is accepted.
+        *set.disks.write().await = vec![Some(remote.clone()), Some(local_disks[1].clone())];
         for _ in 0..3 {
             let marker = rustfs_filemeta::FileInfo {
                 name: object.to_string(),
