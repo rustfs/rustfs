@@ -292,13 +292,13 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 |---|---|---|
 | `RUSTFS_HEAL_ENABLED` (deprecated alias `RUSTFS_ENABLE_HEAL`) | `true` (`heal_enabled_from_env`, `rustfs/src/module_switches.rs`) | Master switch for the background heal manager. |
 | `RUSTFS_HEAL_AUTO_HEAL_ENABLE` | `true` (`DEFAULT_HEAL_AUTO_HEAL_ENABLE`) | Enables automatic healing of detected issues; `false` leaves healing to manual admin requests. |
-| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. |
+| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. The manager reserves at least one slot per Scanner/ReadRepair/AutoHeal source, or 10% for larger queues, so sustained normal-priority MRF or internal background work cannot consume every slot. |
 | `RUSTFS_HEAL_INTERVAL_SECS` | `10` (`DEFAULT_HEAL_INTERVAL_SECS`) | Heal manager polling interval. |
 | `RUSTFS_HEAL_TASK_TIMEOUT_SECS` | `300` (`DEFAULT_HEAL_TASK_TIMEOUT_SECS`) | Per-task timeout. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_HEALS` | `4` (`DEFAULT_HEAL_MAX_CONCURRENT_HEALS`) | Global concurrent heal task limit. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_PER_SET` | `1` (`DEFAULT_HEAL_MAX_CONCURRENT_PER_SET`) | Per-erasure-set limit; effective value is `min(global, per_set)`, each floored at `1`. |
 | `RUSTFS_HEAL_LOW_PRIORITY_MERGE_ENABLE` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE`) | Merge duplicate low-priority requests with the same dedup key. |
-| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests when the queue is full. |
+| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests only after the reserved best-effort capacity is occupied and the queue is actually full. |
 | `RUSTFS_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE` | `true` (`DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE`) | Notify-driven scheduler wakeups. |
 | `RUSTFS_HEAL_SET_BULKHEAD_ENABLE` | `true` (`DEFAULT_HEAL_SET_BULKHEAD_ENABLE`) | Per-set bulkhead scheduling. |
 | `RUSTFS_HEAL_PAGE_PARALLEL_ENABLE` | `true` (`DEFAULT_HEAL_PAGE_PARALLEL_ENABLE`) | Page-level parallel object healing during erasure-set repair. |
@@ -313,6 +313,18 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES` | `8388608` (`DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES`, 8 MiB) | MRF journal size at which compaction runs. |
 | `RUSTFS_HEAL_MRF_REPLAY_BATCH` | `256` (`DEFAULT_HEAL_MRF_REPLAY_BATCH`) | Intents per replay push round. |
 | `RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS` | `3600` (`DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS`, `crates/ecstore/src/set_disk/core/io_primitives.rs`) | A recently modified object is never deleted as dangling inside this window; `0` disables the grace window. |
+
+The heal scheduler preserves priority ordering for urgent, high, and ordinary
+work, but applies a bounded fairness quantum to a continuously refilled MRF
+normal backlog: after four MRF/normal dispatches, a runnable Scanner,
+ReadRepair, or AutoHeal request gets a service opportunity. This protects
+integrity progress without weakening durable MRF admission or receipt
+requirements. Queue capacities from 4 through 9 reserve three slots, one per
+best-effort source, while still leaving one slot for MRF; capacities below 4
+cannot isolate all work classes and
+should only be used for diagnostic tests. Normal-priority non-best-effort submissions are deferred at the
+reserve boundary; high and urgent requests, including admin or MRF recovery,
+retain their priority and may use that space.
 
 ### Admin heal start, retries, and budgets
 
