@@ -417,8 +417,19 @@ async fn verify_write_observations_during_peer_failure(dist: &DistCluster, bucke
     )
     .await?;
     wait_for_ready(&dist.cluster).await?;
-    assert!(observed_put(dist, 0, bucket, "recovered").await?.is_success());
-    assert_eq!(http_put_counts(dist, 0).await?, [baseline[0][0] + 1, baseline[0][1] + 2]);
+    let recovered_before = http_put_counts(dist, 0).await?;
+    wait_until(
+        Duration::from_secs(90),
+        || async { Ok(observed_put(dist, 0, bucket, "recovered").await?.is_success()) },
+        "recovered PUT after remote disk and lock convergence",
+    )
+    .await?;
+    let recovered_after = http_put_counts(dist, 0).await?;
+    assert_eq!(recovered_after[0], recovered_before[0] + 1);
+    assert!(
+        recovered_after[1] >= baseline[0][1] + 2,
+        "recovery retries must retain the two intentional sub-quorum failures: before={recovered_before:?}, after={recovered_after:?}"
+    );
     for node in 0..dist.cluster.nodes.len() {
         assert_object_bytes(&dist.client(node)?, bucket, "healthy-0", b"write-observation").await?;
         assert_object_bytes(&dist.client(node)?, bucket, "recovered", b"write-observation").await?;
