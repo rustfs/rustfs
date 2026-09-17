@@ -1263,12 +1263,12 @@ mod tests {
     use super::*;
     use crate::storage_api::server::readiness::{DiskOption, new_disk};
     use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_madmin::{BackendInfo, Disk};
     use serial_test::serial;
     use std::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     #[derive(Debug, Default)]
     struct RuntimeInventory {
