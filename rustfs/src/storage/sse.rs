@@ -90,7 +90,6 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderName, HeaderValue};
-use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
@@ -148,9 +147,7 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
 fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
-    let mut hasher = Md5::new();
-    hasher.update(input.as_ref());
-    hasher.finalize().into()
+    rustfs_utils::hash_stream::Md5Stream::digest(input.as_ref())
 }
 
 fn md5_base64(input: impl AsRef<[u8]>) -> String {

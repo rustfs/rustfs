@@ -21,6 +21,7 @@ use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
 use crate::app::trailer_adapter::trailer_source;
 use futures::stream::FuturesUnordered;
+use rustfs_utils::hash_stream::Md5Stream;
 use std::collections::HashSet;
 
 // One logical member can be preceded by local PAX, GNU long-name, and GNU
@@ -54,7 +55,8 @@ pin_project! {
     struct ExtractArchiveEtagReader<R> {
         #[pin]
         inner: R,
-        md5: Md5,
+        // `Some` until the EOF probe consumes it; `finished` guards every later poll.
+        md5: Option<Md5Stream>,
         expected_length: u64,
         bytes_read: u64,
         pending_final_byte: Option<u8>,
@@ -98,7 +100,7 @@ impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, expected_length: u64, state: Arc<Mutex<ExtractArchiveUploadState>>) -> Self {
         Self {
             inner,
-            md5: Md5::new(),
+            md5: Some(Md5Stream::new()),
             expected_length,
             bytes_read: 0,
             pending_final_byte: None,
@@ -155,8 +157,8 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         if let Ok(mut state) = this.state.lock()
                             && !state.body_complete
                         {
-                            state.etag =
-                                Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
+                            let digest = this.md5.take().unwrap_or_default().finalize();
+                            state.etag = Some(hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower));
                             state.body_complete = true;
                         }
                         *this.validating_eof = false;
@@ -180,7 +182,9 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         return Poll::Ready(Err(extract_archive_incomplete_body(*this.expected_length - *this.bytes_read)));
                     }
                     Poll::Ready(Ok(())) => {
-                        this.md5.update(final_buf.filled());
+                        if let Some(md5) = this.md5.as_mut() {
+                            md5.update(final_buf.filled());
+                        }
                         *this.bytes_read = match this.bytes_read.checked_add(1) {
                             Some(bytes_read) => bytes_read,
                             None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
@@ -203,7 +207,9 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         return Poll::Ready(Err(extract_archive_incomplete_body(*this.expected_length - *this.bytes_read)));
                     }
                     Poll::Ready(Ok(())) => {
-                        this.md5.update(limited_buf.filled());
+                        if let Some(md5) = this.md5.as_mut() {
+                            md5.update(limited_buf.filled());
+                        }
                         limited_buf.filled().len()
                     }
                 }
@@ -2732,7 +2738,9 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Independent MD5 reference: expectations must not come from the implementation under test.
     use http::{HeaderMap, HeaderName, HeaderValue};
+    use md5::{Digest as _, Md5};
     use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};

@@ -297,6 +297,7 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Independent MD5 reference: expectations must not come from the implementation under test.
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
     use crate::app::storage_api::s3::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
@@ -308,6 +309,7 @@ mod tests {
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use crate::on_demand_migration::{PullFailureReason, SourceSse};
     use http::Method;
+    use md5::Md5; // `sha2::Digest` below is the same trait and already in scope
     use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, contains_key_str, get_str};
     use sha2::{Digest as Sha256Digest, Sha256};
     use std::time::SystemTime;

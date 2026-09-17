@@ -747,12 +747,14 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Independent MD5 reference: expectations must not come from the implementation under test.
     use crate::app::storage_api::s3::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
         ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
     };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+    use md5::{Digest as _, Md5};
     use rustfs_utils::http::{
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_ODM_PULLED_AT, SUFFIX_ODM_SOURCE, SUFFIX_ODM_SOURCE_ETAG,
         SUFFIX_ODM_SOURCE_LAST_MODIFIED, SUFFIX_ODM_SOURCE_VERSION_ID, contains_key_str, get_consistent_str, get_str,

@@ -64,9 +64,8 @@ tempfile = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 
 # Additional dependencies
-md-5 = { workspace = true }
 arc-swap = { workspace = true }
-rustfs-utils = { workspace = true, features = ["http"] }
+rustfs-utils = { workspace = true, features = ["http", "hash"] }
 rustfs-security-governance = { workspace = true }
 # `EventName` for KMS audit records. A leaf crate with no rustfs dependencies,
 # so the audit sink can live outside this crate without a second, drifting
@@ -95,6 +94,8 @@ aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 aws-smithy-types = { workspace = true }
 
 [dev-dependencies]
+# Independent MD5 reference for behaviour tests; production code goes through rustfs-utils.
+md-5 = { workspace = true }
 anyhow = { workspace = true }
 # Debugging recorder for asserting emitted metrics in tests.
 metrics-util = { workspace = true, features = ["debugging"] }

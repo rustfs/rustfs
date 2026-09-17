@@ -46,7 +46,6 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 lazy_static.workspace = true
-md-5.workspace = true
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 rand = { workspace = true, features = ["serde"] }
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }

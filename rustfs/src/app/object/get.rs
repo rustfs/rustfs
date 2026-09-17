@@ -4828,6 +4828,7 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
 #[cfg(test)]
 mod on_demand_migration_tests {
     use super::*;
+    // Independent MD5 reference: expectations must not come from the implementation under test.
     use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
@@ -4837,6 +4838,7 @@ mod on_demand_migration_tests {
     };
     use async_trait::async_trait;
     use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
+    use md5::{Digest as _, Md5};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
     use std::time::SystemTime;

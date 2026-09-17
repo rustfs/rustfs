@@ -344,7 +344,6 @@ const-str = { workspace = true, features = ["std", "proc"] }
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true
 matchit = { workspace = true }
-md-5 = { workspace = true }
 mime_guess = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
@@ -382,6 +381,8 @@ libsystemd.workspace = true
 pyroscope = { workspace = true, optional = true, features = ["backend-pprof-rs"] }
 
 [dev-dependencies]
+# Independent MD5 reference for tests; production code goes through rustfs-utils.
+md-5 = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

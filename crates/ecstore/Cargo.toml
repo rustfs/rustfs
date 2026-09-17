@@ -196,7 +196,6 @@ async-channel.workspace = true
 num_cpus = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 pin-project-lite.workspace = true
-md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
 # "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
@@ -246,6 +245,8 @@ windows-sys = { workspace = true, features = [
 windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
+# Independent MD5 reference for tests; production code goes through rustfs-utils.
+md-5.workspace = true
 aws-smithy-async.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }

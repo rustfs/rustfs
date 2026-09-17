@@ -24,8 +24,8 @@ use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
 use jiff::Zoned;
-use md5::{Digest as Md5Digest, Md5};
 use rand::random;
+use rustfs_utils::hash_stream::Md5Stream;
 use rustfs_utils::http::object_encryption_keys::{
     INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_CONTEXT_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
     INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_TAG_HEADER,
@@ -37,9 +37,7 @@ use tracing::debug;
 use zeroize::Zeroize;
 
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(input.as_ref());
-    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
+    hex_simd::encode_to_string(Md5Stream::digest(input.as_ref()), hex_simd::AsciiCase::Lower)
 }
 
 /// Data key for object encryption

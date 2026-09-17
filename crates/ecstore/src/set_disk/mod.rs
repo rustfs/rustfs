@@ -119,7 +119,6 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use futures::future::join_all;
 use http::HeaderMap;
-use md5::{Digest as Md5Digest, Md5};
 use regex::Regex;
 use rustfs_config::MI_B;
 use rustfs_filemeta::metadata_keys;
@@ -6980,11 +6979,8 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
         }
     }
 
-    let mut hasher = Md5::new();
-    hasher.update(&buf);
-
-    let digest = hasher.finalize();
-    let etag_hex = faster_hex::hex_string(digest.as_slice());
+    let digest = rustfs_utils::hash_stream::Md5Stream::digest(&buf);
+    let etag_hex = faster_hex::hex_string(&digest);
     format!("{}-{}", etag_hex, parts.len())
 }
 

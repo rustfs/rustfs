@@ -21,8 +21,8 @@
 use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
-use md5::{Digest as Md5Digest, Md5};
 use rustfs_credentials::Credentials;
+use rustfs_utils::hash_stream::Md5Stream;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,11 +82,9 @@ impl SLOManifest {
             etag_concat.push_str(etag);
         }
 
-        let mut hasher = Md5::new();
-        hasher.update(etag_concat.as_bytes());
         format!(
             "\"{}-{}\"",
-            hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower),
+            hex_simd::encode_to_string(Md5Stream::digest(etag_concat.as_bytes()), hex_simd::AsciiCase::Lower),
             self.segments.len()
         )
     }
