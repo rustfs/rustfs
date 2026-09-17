@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_movement::data_movement_context_error;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::ObjectOptions;
@@ -26,6 +27,28 @@ use tokio::io::AsyncReadExt;
 
 pub const MAX_SCANNER_PAUSE_BACKLOG_BYTES: u64 = 64 * 1024;
 pub(crate) const SCANNER_PAUSE_BACKLOG_PATH: &str = "buckets/.scanner-pause-backlog.json";
+
+/// Typed failure from the scanner-owned native retirement planner.
+///
+/// Decommission must preserve the source when the native authority cannot be
+/// proven. The handoff variant is deliberately narrower than other authority
+/// failures so the worker can retry without converting a transient membership
+/// transition into a terminal pool failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ScannerPauseBacklogRetirementError {
+    #[error("scanner pause backlog retirement has a retryable handoff conflict: {reason}")]
+    HandoffConflict { reason: String },
+    #[error("scanner pause backlog retirement has an unsafe authority conflict: {reason}")]
+    AuthorityConflict { reason: String },
+    #[error("scanner pause backlog retirement found an invalid native record: {reason}")]
+    InvalidRecord { reason: String },
+}
+
+impl ScannerPauseBacklogRetirementError {
+    pub fn is_retryable_handoff_conflict(&self) -> bool {
+        matches!(self, Self::HandoffConflict { .. })
+    }
+}
 
 /// A bounded, storage-fenced native replica. Only a confirmed missing object
 /// has no payload; read failures never enter the Scanner verifier.
@@ -44,7 +67,10 @@ pub struct ScannerPauseBacklogRetirementPlan {
 }
 
 pub type ScannerPauseBacklogRetirementPlanner =
-    fn(usize, &[ScannerPauseBacklogRetirementReplica]) -> std::result::Result<Option<ScannerPauseBacklogRetirementPlan>, String>;
+    fn(
+        usize,
+        &[ScannerPauseBacklogRetirementReplica],
+    ) -> std::result::Result<Option<ScannerPauseBacklogRetirementPlan>, ScannerPauseBacklogRetirementError>;
 
 static RETIREMENT_PLANNER: OnceLock<ScannerPauseBacklogRetirementPlanner> = OnceLock::new();
 
@@ -161,7 +187,8 @@ pub(crate) fn plan_scanner_pause_backlog_retirement(
             data: read.replica.data.clone(),
         })
         .collect::<Vec<_>>();
-    planner(source_pool_index, &snapshots).map_err(Error::other)
+    planner(source_pool_index, &snapshots)
+        .map_err(|err| data_movement_context_error(format!("scanner pause backlog retirement planner failed: {err}"), err))
 }
 
 /// The native writer and retirement handoff use the same conditional, full-tail
