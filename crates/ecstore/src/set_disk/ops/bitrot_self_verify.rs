@@ -141,7 +141,7 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
 mod tests {
     use super::super::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
     use super::*;
-    use rustfs_storage_api::ObjectIO;
+    use crate::storage_api_contracts::object::ObjectIO as _;
 
     async fn encode_streaming_shard(data: &[u8], shard_size: usize) -> Bytes {
         let mut writer = coding::BitrotWriter::new(Cursor::new(Vec::new()), shard_size, HashAlgorithm::HighwayHash256S);
