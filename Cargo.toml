@@ -287,6 +287,9 @@ memmap2 = "0.9.11"
 lz4 = "1.28.1"
 matchit = "0.9.2"
 md-5 = "0.11.0"
+# MD5 backend selectable with the `hash-md5-fast-md5` feature (crates/utils/src/hash_stream.rs).
+# Pinned exactly: single-maintainer crate with hand-written assembly; bump deliberately.
+fast-md5 = "=1.0.0"
 mime_guess = "2.0.5"
 moka = { version = "0.12.16" }
 netif = "0.1.6"

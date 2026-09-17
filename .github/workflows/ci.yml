@@ -514,9 +514,18 @@ jobs:
       matrix:
         features:
           - name: swift
+            packages: "-p rustfs -p rustfs-protocols"
             flags: "--features swift"
           - name: sftp
+            packages: "-p rustfs -p rustfs-protocols"
             flags: "--features sftp"
+          # Alternate MD5 backend behind rustfs_utils::hash::Md5Stream. Not a
+          # protocol, but the same shape: a build feature that must keep the
+          # crates it touches green. utils carries the backend and its
+          # differential oracle, rio carries the ETag / Content-MD5 consumers.
+          - name: hash-md5-fast-md5
+            packages: "-p rustfs-utils -p rustfs-rio"
+            flags: "--features rustfs-utils/hash-md5-fast-md5,rustfs-rio/hash-md5-fast-md5"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -538,7 +547,7 @@ jobs:
 
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
-          cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
+          cargo clippy ${{ matrix.features.packages }} --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
         env:
@@ -549,7 +558,7 @@ jobs:
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+          cargo nextest run --profile ci ${{ matrix.features.packages }} ${{ matrix.features.flags }}
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary

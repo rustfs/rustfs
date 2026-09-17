@@ -74,6 +74,8 @@ connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# Alternate MD5 backend for ETag / Content-MD5 (crates/utils/src/hash_stream.rs). Not in `default` or `full`.
+hash-md5-fast-md5 = ["rustfs-utils/hash-md5-fast-md5", "rustfs-rio/hash-md5-fast-md5"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]

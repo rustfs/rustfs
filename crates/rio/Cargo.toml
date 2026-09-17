@@ -30,6 +30,8 @@ workspace = true
 
 [features]
 default = []
+# Forwarded so `-p rustfs-rio --features hash-md5-fast-md5` tests rio on the alternate MD5 backend.
+hash-md5-fast-md5 = ["rustfs-utils/hash-md5-fast-md5"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

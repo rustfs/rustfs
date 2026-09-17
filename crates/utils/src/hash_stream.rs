@@ -21,9 +21,17 @@
 //! `HashAlgorithm::Md5`, never through the backing crate directly.
 //!
 //! Backend selection lives in the private [`backend`] module. Exactly one
-//! backend is compiled in; today that is RustCrypto `md-5`. Adding another
-//! backend means adding one `Md5Inner` behind a cargo feature there and
-//! nothing else in the tree changes.
+//! backend is compiled in:
+//!
+//! | cargo feature (on `rustfs-utils`) | backend |
+//! |---|---|
+//! | `hash` (default for consumers)    | RustCrypto `md-5`, portable Rust |
+//! | `hash-md5-fast-md5`               | `fast-md5`, hand-written x86_64 / aarch64 kernels |
+//!
+//! `rustfs-rio` and the `rustfs` binary forward `hash-md5-fast-md5`, so
+//! `cargo build --features hash-md5-fast-md5` switches the whole tree. Adding
+//! another backend means adding one `Md5Inner` behind a cargo feature in
+//! [`backend`] and nothing else in the tree changes.
 //!
 //! # Why `finalize` consumes `self` and there is no `Clone`
 //!
@@ -49,6 +57,10 @@ pub struct Md5Stream(backend::Md5Inner);
 impl Md5Stream {
     /// Digest length in bytes.
     pub const OUTPUT_SIZE: usize = 16;
+
+    /// Name of the backend compiled into this build. Diagnostic only
+    /// (startup logs, tests); never part of any on-wire or on-disk format.
+    pub const ACTIVE_BACKEND: &'static str = backend::NAME;
 
     /// Create an empty hasher.
     #[inline]
@@ -119,9 +131,16 @@ impl io::Write for Md5Stream {
 /// that shape only, so a backend does not need `Clone`, `Default`, or any
 /// trait from the backing crate.
 mod backend {
+    #[cfg(not(feature = "hash-md5-fast-md5"))]
+    pub(super) const NAME: &str = "md-5";
+    #[cfg(feature = "hash-md5-fast-md5")]
+    pub(super) const NAME: &str = "fast-md5";
+
     /// RustCrypto `md-5`: the default backend.
+    #[cfg(not(feature = "hash-md5-fast-md5"))]
     pub(super) struct Md5Inner(md5::Md5);
 
+    #[cfg(not(feature = "hash-md5-fast-md5"))]
     impl Md5Inner {
         #[inline]
         pub(super) fn new() -> Self {
@@ -139,6 +158,31 @@ mod backend {
         pub(super) fn finalize(self) -> [u8; 16] {
             use md5::Digest as _;
             self.0.finalize().into()
+        }
+    }
+
+    /// `fast-md5`: hand-written assembly compression on x86_64 and aarch64,
+    /// portable Rust elsewhere. Selected at compile time (no runtime CPU
+    /// detection); the x86_64 kernel uses baseline integer instructions only,
+    /// so it runs on any x86_64 CPU.
+    #[cfg(feature = "hash-md5-fast-md5")]
+    pub(super) struct Md5Inner(fast_md5::Md5);
+
+    #[cfg(feature = "hash-md5-fast-md5")]
+    impl Md5Inner {
+        #[inline]
+        pub(super) fn new() -> Self {
+            Self(fast_md5::Md5::new())
+        }
+
+        #[inline]
+        pub(super) fn update(&mut self, data: &[u8]) {
+            self.0.update(data);
+        }
+
+        #[inline]
+        pub(super) fn finalize(self) -> [u8; 16] {
+            self.0.finalize()
         }
     }
 }
@@ -256,6 +300,21 @@ mod tests {
         let mut hasher = Md5Stream::new();
         hasher.update(b"secret payload");
         assert_eq!(format!("{hasher:?}"), "Md5Stream");
+    }
+
+    /// Pins which backend this build compiled in, so the `hash-md5-fast-md5`
+    /// CI leg proves the feature actually took effect rather than silently
+    /// testing the default backend twice.
+    #[test]
+    fn active_backend_matches_cargo_feature() {
+        assert_eq!(
+            Md5Stream::ACTIVE_BACKEND,
+            if cfg!(feature = "hash-md5-fast-md5") {
+                "fast-md5"
+            } else {
+                "md-5"
+            }
+        );
     }
 
     #[test]
