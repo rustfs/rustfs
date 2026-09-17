@@ -36,3 +36,7 @@ drive ownership, snapshot freshness, counter queries, and rolling upgrades.
 
 For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
 activation, legacy repair results, multipart mode changes, and rollback limits.
+
+For crates.io publication of workspace crates, see
+[Workspace Cargo Publish](operations/cargo-publish-workspace.md): dependency
+ordering, dry-run, publish, and failure handling.

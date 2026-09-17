@@ -29,7 +29,7 @@ const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
 pub(crate) const REBAL_META_NAME: &str = "rebalance.bin";
 const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
-pub(crate) const REBALANCE_SOURCE_CLEANUP_MAX_DEFERS: usize = 3;
+pub(crate) const REBALANCE_SOURCE_CLEANUP_MAX_DEFERS: usize = 8;
 const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
 const REBALANCE_STOP_PROPAGATION_ERROR_PREFIX: &str = "rebalance stop propagation incomplete: ";
 const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -55,7 +55,7 @@ pub use types::{
     DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
     RebalanceStats, RebalanceStopPropagationRecord,
 };
-use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome};
+use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceDeferKind, RebalanceEntryOutcome};
 
 #[cfg(any(test, feature = "test-util"))]
 pub async fn test_store_with_persisted_rebalance_meta(

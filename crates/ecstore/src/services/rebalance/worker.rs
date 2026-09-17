@@ -1,9 +1,9 @@
 use super::migration::MigrationVersionResult;
 use super::{
     DEFAULT_REBALANCE_MAX_ATTEMPTS, EVENT_REBALANCE_LISTING, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
-    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_MAX_ATTEMPTS_ENV, REBALANCE_MIGRATION_LOCK_RETRY_CAP,
-    REBALANCE_MIGRATION_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalanceBucketConfigs,
-    RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
+    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_MAX_ATTEMPTS_ENV,
+    REBALANCE_MIGRATION_LOCK_RETRY_CAP, REBALANCE_MIGRATION_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX,
+    RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceDeferKind, RebalanceEntryOutcome, Result,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::core::pools::ListCallback;
@@ -177,7 +177,7 @@ pub(super) fn resolve_rebalance_entry_cleanup_delete_result(
 ) -> RebalanceEntryCleanupResult {
     match result {
         Ok(_) => RebalanceEntryCleanupResult::Completed { warning: None },
-        Err(SourceCleanupError::Storage(err)) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+        Err(SourceCleanupError::Storage(err)) if is_source_cleanup_not_found(&err) => {
             RebalanceEntryCleanupResult::Completed { warning: None }
         }
         Err(SourceCleanupError::SourceChanged) => RebalanceEntryCleanupResult::Deferred {
@@ -185,10 +185,23 @@ pub(super) fn resolve_rebalance_entry_cleanup_delete_result(
                 "{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} source changed during cleanup preflight for {bucket}/{object_name}"
             ),
         },
+        // A transient cleanup failure is not evidence that the source replica is gone, so the
+        // entry stays incomplete and the bucket is retried instead of recording a permanent
+        // cleanup warning that would block pool completion.
+        Err(SourceCleanupError::Storage(err)) if is_transient_rebalance_error(&err) => RebalanceEntryCleanupResult::Deferred {
+            last_error: format!(
+                "{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} transient source cleanup failure for {bucket}/{object_name} will be retried: {err}"
+            ),
+        },
         Err(SourceCleanupError::Storage(err)) => RebalanceEntryCleanupResult::Completed {
             warning: Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}")),
         },
     }
+}
+
+fn is_source_cleanup_not_found(err: &Error) -> bool {
+    let err = rebalance_error_source(err);
+    is_err_object_not_found(err) || is_err_version_not_found(err)
 }
 
 pub(super) fn resolve_rebalance_migrate_result_error(
@@ -208,6 +221,23 @@ pub(super) fn resolve_rebalance_migrate_result_error(
 
 pub(super) fn should_defer_rebalance_entry_failure(err: &Error) -> bool {
     is_transient_rebalance_error(err)
+}
+
+pub(super) fn resolve_rebalance_deferred_last_error(
+    kind: RebalanceDeferKind,
+    pending_entry_defer: Option<&str>,
+    last_error: &str,
+) -> Option<String> {
+    match kind {
+        RebalanceDeferKind::Entry => Some(last_error.to_string()),
+        // A retryable cleanup conflict is progress, not a pool failure, so it must not surface as
+        // `lastError`. It also must not erase an unresolved migration deferral: that marker is the
+        // only signal keeping the pool from completing at the free-space goal while an entry is
+        // still retried, and the two deferrals can be reported by different buckets of one pool.
+        RebalanceDeferKind::SourceCleanup => pending_entry_defer
+            .filter(|pending| pending.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX))
+            .map(str::to_string),
+    }
 }
 
 pub(super) fn resolve_load_rebalance_stats_update_result(result: Result<()>) -> Result<()> {
@@ -299,7 +329,10 @@ fn is_rebalance_transient_io_error(err: &std::io::Error) -> bool {
 
 fn is_rebalance_transient_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("lock acquisition timed out")
+    // `LockError::Timeout` renders "Lock acquisition timeout for resource ...", while the
+    // namespace-lock layer renders "lock acquisition timed out on ..."; both are retryable.
+    message.contains("lock acquisition timeout")
+        || message.contains("lock acquisition timed out")
         || message.contains("remote lock rpc timed out")
         || message.contains("keepalivetimedout")
         || message.contains("i/o timeout")
@@ -380,7 +413,8 @@ fn is_rebalance_lock_or_rpc_timeout(err: &Error) -> bool {
 
 fn is_rebalance_lock_or_rpc_timeout_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("lock acquisition timed out")
+    message.contains("lock acquisition timeout")
+        || message.contains("lock acquisition timed out")
         || message.contains("remote lock rpc timed out")
         || message.contains("keepalivetimedout")
 }
@@ -805,6 +839,46 @@ mod error_source_tests {
                     error,
                 );
             }
+        }
+    }
+    #[test]
+    fn rendered_lock_timeout_text_selects_the_lock_backoff() {
+        // The lock backend renders a timeout as "Lock acquisition timeout for resource ...",
+        // so the message matcher must recognize that text when the error arrives re-rendered
+        // instead of as a typed `Error::Lock`.
+        let rendered = rustfs_lock::LockError::timeout("bucket/object@latest", Duration::from_secs(5)).to_string();
+        assert!(
+            rendered.contains("Lock acquisition timeout for resource"),
+            "unexpected lock timeout text: {rendered}"
+        );
+
+        // The lock policy jitters the delay inside its own cap, so a far-out attempt identifies
+        // the selected policy: the linear fallback would return `base * (attempt + 1)`.
+        let far_attempt = 100;
+        assert!(REBALANCE_MIGRATION_RETRY_BASE_DELAY * 101 > REBALANCE_MIGRATION_LOCK_RETRY_CAP);
+
+        let mut error = Error::other(format!("Lock error: {rendered}"));
+        for depth in 0..=3 {
+            assert!(
+                is_transient_rebalance_error(&error),
+                "rendered lock timeout lost retryability at depth {depth}: {error:?}"
+            );
+            assert!(
+                is_rebalance_lock_or_rpc_timeout(&error),
+                "rendered lock timeout lost the lock backoff at depth {depth}: {error:?}"
+            );
+            let delay = rebalance_migration_retry_delay(far_attempt, &error);
+            assert!(
+                delay <= REBALANCE_MIGRATION_LOCK_RETRY_CAP && delay >= Duration::from_millis(1),
+                "rendered lock timeout must stay inside the lock backoff cap at depth {depth}: {delay:?}"
+            );
+            error = crate::data_movement::data_movement_stage_error_for_test(
+                "rebalance_object",
+                "put_object",
+                "bucket",
+                "baseline/00042.bin",
+                error,
+            );
         }
     }
 }

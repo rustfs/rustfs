@@ -13,7 +13,9 @@ Every remote lock call (`lock`, `lock_batch`, `release`, `refresh`, `force_relea
 | Any failure while the last eviction is younger than the cooldown | `cooling_down` | Channel kept so the fresh dial can prove itself; no re-dial burst. |
 | Transport failure (refused, reset, `GOAWAY`) outside the cooldown | `evict` | Cached channel evicted once. |
 
-A timed-out request is no longer cancelled. Cancelling sends `RST_STREAM`, and enough resets against a server that is slow to accept streams make it answer `GOAWAY too_many_resets`, which kills every stream on the connection and restarts the loop. Instead the stream is detached: it keeps running in the background (bounded by the internode RPC timeout), the caller still gets its timeout error, and if the peer grants a lock after the caller gave up the client releases it immediately instead of leaving an orphan for the lease to expire.
+A timed-out request is no longer cancelled. Cancelling sends `RST_STREAM`, and enough resets against a server that is slow to accept streams make it answer `GOAWAY too_many_resets`, which kills every stream on the connection and restarts the loop. Instead the stream is detached: it keeps running in the background (bounded by the internode RPC timeout), the caller still gets its timeout error, and if the peer grants a lock after the caller gave up the client performs bounded release retries. A per-peer cleanup budget prevents late-release retries from becoming a second request storm; entries beyond that budget remain protected by the server lease.
+
+Three consecutive lock-acquisition timeouts open a request-level per-peer breaker. While open, new `lock` and `lock_batch` calls fail fast as retryable contention; after the backoff window one half-open probe is admitted. The breaker does not block release or refresh traffic, and it is separate from channel eviction. A per-peer in-flight admission limit also bounds requests that were already admitted before the breaker opened.
 
 Unlocks that fail three quick retries no longer stop there. The background task continues with a deferred schedule (1s, 2s, 4s, 8s, 16s) before it gives up and leaves the entry to the server-side lease.
 
@@ -24,6 +26,7 @@ Unlocks that fail three quick retries no longer stop there. The background task 
 | `RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS` | `3000` | Per-request deadline for remote lock RPCs. |
 | `RUSTFS_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS` | `5000` | Minimum interval between channel evictions per peer. `0` restores eviction on every qualifying failure. |
 | `RUSTFS_OBJECT_LOCK_RPC_DETACHED_LIMIT` | `256` | How many timed-out lock RPCs per peer may keep running in the background. Beyond the budget a timed-out stream is cancelled as before. |
+| `RUSTFS_OBJECT_LOCK_RPC_REQUEST_LIMIT` | `128` | Maximum in-flight lock acquisition RPCs admitted to a peer while its request breaker is degraded. Excess calls fail fast as retryable contention; healthy peers are not capped by this guard. |
 
 ## Metrics
 
@@ -35,6 +38,7 @@ Unlocks that fail three quick retries no longer stop there. The background task 
 | `rustfs_remote_lock_rpc_detached_total` | `op`, `outcome` | Timed-out RPCs left running (`detached`) or cancelled for budget (`aborted`). |
 | `rustfs_remote_lock_rpc_late_completions_total` | `op`, `outcome` | How detached RPCs ended (`success`, `error`, `join_error`). |
 | `rustfs_remote_lock_late_releases_total` | `outcome` | Releases of locks granted after their caller timed out (`released`, `partial`, `failed`). |
+| `rustfs_remote_lock_request_suppressed_total` | `peer`, `op`, `reason` | Lock acquisitions rejected before dialing because the peer breaker is open or its degraded in-flight limit is reached. |
 
 ## Reading an incident
 
