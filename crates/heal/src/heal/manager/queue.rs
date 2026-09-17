@@ -34,6 +34,33 @@ pub(super) struct PriorityHealQueue {
     pub(super) sequence: u64,
     /// Deduplication index for queued requests
     pub(super) dedup_keys: HashMap<String, DedupKeyEntry>,
+    pub(super) best_effort_queued: usize,
+    pub(super) best_effort_queued_by_source: [usize; 3],
+    /// Number of MRF/Normal tasks dispatched since a best-effort task ran.
+    /// This is kept with the queue so event-driven scheduler wakeups cannot
+    /// reset the fairness budget between cycles.
+    pub(super) mrf_normal_dispatches_since_best_effort: usize,
+    pub(super) last_best_effort_source: Option<HealRequestSource>,
+}
+
+const MRF_NORMAL_DISPATCH_QUANTUM: usize = 4;
+
+fn best_effort_source_index(source: HealRequestSource) -> Option<usize> {
+    match source {
+        HealRequestSource::Scanner => Some(0),
+        HealRequestSource::ReadRepair => Some(1),
+        HealRequestSource::AutoHeal => Some(2),
+        _ => None,
+    }
+}
+
+fn best_effort_source_order(last: Option<HealRequestSource>) -> [usize; 3] {
+    match last {
+        Some(HealRequestSource::Scanner) => [1, 2, 0],
+        Some(HealRequestSource::ReadRepair) => [2, 0, 1],
+        Some(HealRequestSource::AutoHeal) => [0, 1, 2],
+        _ => [0, 1, 2],
+    }
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -264,6 +291,10 @@ impl PriorityHealQueue {
             heap: BinaryHeap::new(),
             sequence: 0,
             dedup_keys: HashMap::new(),
+            best_effort_queued: 0,
+            best_effort_queued_by_source: [0; 3],
+            mrf_normal_dispatches_since_best_effort: 0,
+            last_best_effort_source: None,
         }
     }
 
@@ -271,9 +302,11 @@ impl PriorityHealQueue {
         self.heap.len()
     }
 
+    #[cfg(test)]
     pub(super) fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            self.remove_best_effort_count(item.request.source);
             item.request
         })
     }
@@ -301,12 +334,19 @@ impl PriorityHealQueue {
             })
             .refcount += 1;
         self.sequence += 1;
+        let source = request.source;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
             sequence: self.sequence,
             dedup_key: key,
             request,
         });
+        if is_best_effort_source(source) {
+            self.best_effort_queued += 1;
+            if let Some(index) = best_effort_source_index(source) {
+                self.best_effort_queued_by_source[index] += 1;
+            }
+        }
         QueuePushOutcome::Accepted
     }
 
@@ -356,6 +396,7 @@ impl PriorityHealQueue {
 
         let displaced = displaced.map(|item| {
             Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            self.remove_best_effort_count(item.request.source);
             self.refresh_dedup_representative(&item.dedup_key);
             item.request
         });
@@ -400,6 +441,7 @@ impl PriorityHealQueue {
     pub(super) fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            self.remove_best_effort_count(item.request.source);
             item.request
         })
     }
@@ -429,10 +471,113 @@ impl PriorityHealQueue {
         (
             selected.map(|item| {
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                self.remove_best_effort_count(item.request.source);
                 item.request
             }),
             skipped,
         )
+    }
+
+    pub(super) fn pop_runnable_with_fairness<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
+    where
+        F: Fn(&HealRequest) -> bool,
+        G: Fn(&HealRequest) -> Option<String>,
+    {
+        if self.mrf_normal_dispatches_since_best_effort < MRF_NORMAL_DISPATCH_QUANTUM {
+            let (chosen, skipped) = self.pop_runnable_with_skips(can_run, skip_label);
+            if let Some(request) = chosen.as_ref() {
+                self.record_dispatch(request);
+            }
+            return (chosen, skipped);
+        }
+
+        if self.best_effort_queued == 0 {
+            self.mrf_normal_dispatches_since_best_effort = 0;
+            let (chosen, skipped) = self.pop_runnable_with_skips(can_run, skip_label);
+            if let Some(request) = chosen.as_ref() {
+                self.record_dispatch(request);
+            }
+            return (chosen, skipped);
+        }
+
+        let mut items = std::mem::take(&mut self.heap).into_vec();
+        let mut skipped = Vec::new();
+        let mut first_runnable: Option<usize> = None;
+        let mut best_effort_candidates: [Option<usize>; 3] = [None; 3];
+        for (index, item) in items.iter().enumerate() {
+            if !can_run(&item.request) {
+                if let Some(label) = skip_label(&item.request) {
+                    skipped.push(label);
+                }
+                continue;
+            }
+            if first_runnable.is_none_or(|current| item.cmp(&items[current]).is_gt()) {
+                first_runnable = Some(index);
+            }
+            let Some(source_index) = best_effort_source_index(item.request.source) else {
+                continue;
+            };
+            if best_effort_candidates[source_index].is_none_or(|current| {
+                item.priority > items[current].priority
+                    || (item.priority == items[current].priority && item.sequence < items[current].sequence)
+            }) {
+                best_effort_candidates[source_index] = Some(index);
+            }
+        }
+
+        let chosen_index = first_runnable.filter(|index| {
+            let item = &items[*index];
+            item.priority == HealPriority::Normal
+                && matches!(item.request.source, HealRequestSource::Mrf | HealRequestSource::Internal)
+        });
+        let best_effort_priority = best_effort_candidates
+            .into_iter()
+            .flatten()
+            .map(|index| items[index].priority)
+            .max();
+        let chosen_index = chosen_index
+            .and_then(|_| {
+                let priority = best_effort_priority?;
+                best_effort_source_order(self.last_best_effort_source)
+                    .into_iter()
+                    .find_map(|source| best_effort_candidates[source].filter(|index| items[*index].priority == priority))
+            })
+            .or(first_runnable);
+        let chosen = chosen_index.map(|index| items.swap_remove(index));
+        self.heap = BinaryHeap::from(items);
+
+        let chosen = chosen.map(|item| {
+            let request = item.request;
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            self.remove_best_effort_count(request.source);
+            self.record_dispatch(&request);
+            request
+        });
+        (chosen, skipped)
+    }
+
+    fn record_dispatch(&mut self, request: &HealRequest) {
+        if is_best_effort_source(request.source) {
+            self.mrf_normal_dispatches_since_best_effort = 0;
+            self.last_best_effort_source = Some(request.source);
+        } else if matches!(request.source, HealRequestSource::Mrf | HealRequestSource::Internal)
+            && request.priority == HealPriority::Normal
+        {
+            self.mrf_normal_dispatches_since_best_effort = self.mrf_normal_dispatches_since_best_effort.saturating_add(1);
+        }
+    }
+
+    fn remove_best_effort_count(&mut self, source: HealRequestSource) {
+        if is_best_effort_source(source) {
+            self.best_effort_queued = self.best_effort_queued.saturating_sub(1);
+            if let Some(index) = best_effort_source_index(source) {
+                self.best_effort_queued_by_source[index] = self.best_effort_queued_by_source[index].saturating_sub(1);
+            }
+        }
+    }
+
+    pub(super) fn best_effort_source_count(&self, source: HealRequestSource) -> usize {
+        best_effort_source_index(source).map_or(0, |index| self.best_effort_queued_by_source[index])
     }
 
     fn restore_deferred_items(&mut self, deferred: Vec<PriorityQueueItem>) {
@@ -590,6 +735,7 @@ impl PriorityHealQueue {
             if removed.is_none() && item.request.id == request_id {
                 let key = item.dedup_key.clone();
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                self.remove_best_effort_count(item.request.source);
                 affected_key = Some(key);
                 removed = Some(item.request);
             } else {
@@ -615,6 +761,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                self.remove_best_effort_count(item.request.source);
                 affected_keys.push(item.dedup_key);
                 removed.push(item.request);
             } else {

@@ -150,7 +150,7 @@ impl HealManager {
         for _ in 0..available_slots {
             let selected_request = if config.set_bulkhead_enable || mainline_pressure.is_some() {
                 let max_concurrent_per_set = config.max_concurrent_per_set;
-                let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
+                let (selected_request, skipped_sets) = queue.pop_runnable_with_fairness(
                     |request| {
                         let set_allowed = !config.set_bulkhead_enable
                             || can_schedule_request(request, &running_per_set, max_concurrent_per_set);
@@ -164,7 +164,7 @@ impl HealManager {
                 }
                 selected_request
             } else {
-                queue.pop_next()
+                queue.pop_runnable_with_fairness(|_| true, |_| None).0
             };
 
             if let Some(mut request) = selected_request {
