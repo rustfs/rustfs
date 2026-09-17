@@ -90,36 +90,42 @@ struct SignedRequest {
 /// Constructs a real SigV4 fixture using the production crypto primitives.
 /// S3S verifies both the request authorization and every signed chunk.
 fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
-    use rustfs_utils::{hex_sha256, hmac_sha256};
-
     const DATE: &str = "20130524T000000Z";
     const SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
+    const REGION: &str = "us-east-1";
+    const SERVICE: &str = "s3";
+    const SECRET_KEY: &str = "test-secret";
     let mode = if unsigned_trailer {
         "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
     } else {
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
     };
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length";
-    let headers = format!(
-        "host:s3.amazonaws.com\nx-amz-content-sha256:{mode}\nx-amz-date:{DATE}\nx-amz-decoded-content-length:{}\n",
-        payload.len()
-    );
-    let canonical = format!("PUT\n/test-bucket/test-key\npartNumber=1&uploadId=test-upload\n{headers}\n{signed_headers}\n{mode}");
-    let key = hmac_sha256("AWS4test-secret", "20130524");
-    let key = hmac_sha256(key, "us-east-1");
-    let key = hmac_sha256(key, "s3");
-    let key = hmac_sha256(key, "aws4_request");
-    let digest = |data: &[u8]| hex_sha256(data, str::to_owned);
-    let encode = |data: [u8; 32]| hex_simd::encode_to_string(data, hex_simd::AsciiCase::Lower);
-    let seed = encode(hmac_sha256(
-        key,
-        format!("AWS4-HMAC-SHA256\n{DATE}\n{SCOPE}\n{}", digest(canonical.as_bytes())),
-    ));
+    let decoded_length = payload.len().to_string();
+    let mut signed_headers = vec![
+        ("content-encoding", "aws-chunked"),
+        ("host", "s3.amazonaws.com"),
+        ("x-amz-content-sha256", mode),
+        ("x-amz-date", DATE),
+        ("x-amz-decoded-content-length", decoded_length.as_str()),
+    ];
+    if unsigned_trailer {
+        signed_headers.push(("x-amz-trailer", "x-amz-checksum-crc32"));
+    }
+    signed_headers.sort_unstable_by(|lhs, rhs| lhs.0.cmp(rhs.0));
+    let signed_header_names = signed_headers.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(";");
+    let query = [("partNumber", "1"), ("uploadId", "test-upload")];
+    let payload_mode = if unsigned_trailer {
+        s3s_sigv4::Payload::UnsignedMultipleChunksWithTrailer
+    } else {
+        s3s_sigv4::Payload::MultipleChunks
+    };
+    let date = s3s_sigv4::AmzDate::parse(DATE).expect("fixture date");
+    let canonical = s3s_sigv4::create_canonical_request("PUT", "/test-bucket/test-key", &query, &signed_headers, payload_mode);
+    let string_to_sign = s3s_sigv4::create_string_to_sign(&canonical, &date, REGION, SERVICE);
+    let seed = s3s_sigv4::calculate_signature(&string_to_sign, SECRET_KEY, &date, REGION, SERVICE);
     let chunk_signature = |previous: &str, data: &[u8]| {
-        encode(hmac_sha256(
-            key,
-            format!("AWS4-HMAC-SHA256-PAYLOAD\n{DATE}\n{SCOPE}\n{previous}\n{}\n{}", digest(b""), digest(data)),
-        ))
+        let string_to_sign = s3s_sigv4::create_chunk_string_to_sign(&date, REGION, SERVICE, previous, &[data]);
+        s3s_sigv4::calculate_signature(&string_to_sign, SECRET_KEY, &date, REGION, SERVICE)
     };
     let (prefix, suffix) = if unsigned_trailer {
         (
@@ -147,7 +153,7 @@ fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
         .header("x-amz-decoded-content-length", payload.len())
         .header(
             "authorization",
-            format!("AWS4-HMAC-SHA256 Credential=test-access/{SCOPE}, SignedHeaders={signed_headers}, Signature={seed}"),
+            format!("AWS4-HMAC-SHA256 Credential=test-access/{SCOPE}, SignedHeaders={signed_header_names}, Signature={seed}"),
         );
     if unsigned_trailer {
         builder = builder.header("x-amz-trailer", "x-amz-checksum-crc32");
