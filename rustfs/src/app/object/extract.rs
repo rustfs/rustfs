@@ -2747,6 +2747,15 @@ mod tests {
             let _ = self.events.send(args.version_id);
         }
 
+        async fn validate_event_specific_rules(
+            &self,
+            _bucket_name: &str,
+            _region: &str,
+            _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
+        ) -> Result<(), rustfs_notify::NotificationError> {
+            Ok(())
+        }
+
         async fn add_event_specific_rules(
             &self,
             _bucket_name: &str,

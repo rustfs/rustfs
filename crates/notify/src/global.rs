@@ -239,6 +239,42 @@ pub mod notifier_global {
             .await
     }
 
+    fn bucket_notification_config_for_rules(
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> BucketNotificationConfig {
+        let mut bucket_config = BucketNotificationConfig::new(region);
+
+        for (event_names, prefix, suffix, target_ids) in event_rules {
+            // Use `new_pattern` to construct a matching pattern
+            let pattern = crate::rules::pattern::new_pattern(Some(prefix.as_str()), Some(suffix.as_str()));
+
+            for target_id in target_ids {
+                bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
+            }
+        }
+
+        bucket_config
+    }
+
+    /// Checks that the runtime can accept `event_rules` for `region` without
+    /// publishing them. Callers use this to fail before persisting a bucket
+    /// notification configuration the notify subsystem would reject.
+    pub async fn validate_event_specific_rules(
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError> {
+        let bucket_config = bucket_notification_config_for_rules(region, event_rules);
+
+        // Get global NotificationSystem instance
+        let notification_sys = notification_system().ok_or(NotificationError::Lifecycle(LifecycleError::NotInitialized))?;
+
+        notification_sys
+            .validate_bucket_notification_config(bucket_name, &bucket_config)
+            .await
+    }
+
     /// Dynamically add notification rules according to different event types.
     ///
     /// # Parameter
@@ -256,16 +292,7 @@ pub mod notifier_global {
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError> {
-        let mut bucket_config = BucketNotificationConfig::new(region);
-
-        for (event_names, prefix, suffix, target_ids) in event_rules {
-            // Use `new_pattern` to construct a matching pattern
-            let pattern = crate::rules::pattern::new_pattern(Some(prefix.as_str()), Some(suffix.as_str()));
-
-            for target_id in target_ids {
-                bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
-            }
-        }
+        let bucket_config = bucket_notification_config_for_rules(region, event_rules);
 
         // Get global NotificationSystem instance
         let notification_sys = notification_system().ok_or(NotificationError::Lifecycle(LifecycleError::NotInitialized))?;
