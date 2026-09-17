@@ -3512,6 +3512,12 @@ enum OrphanDirScan {
     Missing,
 }
 
+/// How long an orphan prefix whose purge scan met unpurgeable data is left
+/// alone before an empty listing scans it again.
+const ORPHAN_PURGE_BACKOFF: Duration = Duration::from_secs(60);
+/// Upper bound on remembered backoff entries; the oldest is dropped first.
+const ORPHAN_PURGE_BACKOFF_MAX_ENTRIES: usize = 4096;
+
 /// Mark `dir` and every ancestor up to and including `root` as blocked.
 fn block_orphan_dir_chain(blocked: &mut HashSet<String>, root: &str, dir: &str) {
     let mut current = dir;
@@ -6391,7 +6397,7 @@ impl SetDisks {
                 continue;
             }
 
-            committed_files.extend(files.into_iter().map(|entry| path_join_buf(&[&dir, &entry])));
+            committed_files.extend(files.into_iter().map(|entry| format!("{dir}{SLASH_SEPARATOR}{entry}")));
             dirs.push(dir);
             stack.extend(child_dirs);
         }
@@ -6494,6 +6500,11 @@ impl SetDisks {
     /// of this set (the caller should surface the original NotFound), and `Err` on
     /// a hard disk failure.
     pub(crate) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> disk::error::Result<bool> {
+        let backoff_key = format!("{bucket}{SLASH_SEPARATOR}{object}");
+        if self.orphan_purge_in_backoff(&backoff_key) {
+            return Ok(false);
+        }
+
         let disks = self.get_disks_internal().await;
 
         // Phase 1: classify every online disk. A directory that holds object
@@ -6516,6 +6527,11 @@ impl SetDisks {
                 }
                 OrphanDirScan::Missing => {}
             }
+        }
+        if !blocked.is_empty() {
+            // Whatever is purgeable goes now; what blocks the rest will still
+            // block it on the next empty listing, so do not rescan for a while.
+            self.record_orphan_purge_backoff(backoff_key);
         }
 
         // Phase 2: remove only the files classified as committed residue in
@@ -6543,6 +6559,42 @@ impl SetDisks {
         }
 
         Ok(purged)
+    }
+
+    fn orphan_purge_in_backoff(&self, key: &str) -> bool {
+        let backoff = self
+            .orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        backoff
+            .get(key)
+            .is_some_and(|scanned_at| scanned_at.elapsed() < ORPHAN_PURGE_BACKOFF)
+    }
+
+    fn record_orphan_purge_backoff(&self, key: String) {
+        let mut backoff = self
+            .orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        backoff.retain(|_, scanned_at| now.duration_since(*scanned_at) < ORPHAN_PURGE_BACKOFF);
+        if backoff.len() >= ORPHAN_PURGE_BACKOFF_MAX_ENTRIES
+            && let Some(oldest) = backoff
+                .iter()
+                .min_by_key(|(_, scanned_at)| **scanned_at)
+                .map(|(key, _)| key.clone())
+        {
+            backoff.remove(&oldest);
+        }
+        backoff.insert(key, now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_orphan_purge_backoff(&self) {
+        self.orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Reclaim orphaned physical data directories under `bucket/object` that no
