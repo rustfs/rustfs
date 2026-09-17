@@ -515,20 +515,26 @@ impl ExpiryStats {
         Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
     }
 
+    // The pending and active gauges are balanced by design: every increment
+    // has exactly one matching decrement. They must not saturate at zero on
+    // update, because a worker can dequeue (and decrement) before the
+    // enqueuing side has recorded its increment. Clamping that transient -1
+    // to 0 turns the later +1 into a phantom task that never drains
+    // (rustfs#7921). Readers clamp negative snapshots instead.
     fn increment_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, 1);
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, -1);
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, 1);
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, -1);
+        self.active_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_workers(&self) {
@@ -1074,9 +1080,13 @@ impl ExpiryState {
     }
 
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        // Account for the task before a worker can observe it. The worker
+        // decrements on dequeue, so incrementing after `try_send` would let a
+        // fast dequeue run the gauge through zero first.
+        self.stats.increment_pending_tasks();
         let queued = wrkr.try_send(Some(task)).is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
+        if !queued {
+            self.stats.decrement_pending_tasks();
         }
         queued
     }
@@ -1444,11 +1454,14 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
         return false;
     };
 
+    // Same ordering rule as `ExpiryState::send_expiry_task`: count first, so
+    // a worker that dequeues immediately cannot decrement before this
+    // increment lands.
+    stats.increment_pending_tasks();
     let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
     if !queued {
+        stats.decrement_pending_tasks();
         stats.increment_missed_freevers_tasks();
-    } else {
-        stats.increment_pending_tasks();
     }
     stats.record_scanner_expiry_state();
     queued
@@ -7567,6 +7580,65 @@ mod tests {
         assert!(!queued);
         assert_eq!(state.stats.missed_free_vers_tasks(), 1);
         assert!(recovery_notify.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn expiry_pending_gauge_survives_dequeue_landing_before_enqueue_accounting() {
+        // A worker may dequeue and decrement before the enqueuing side records
+        // its increment. The gauge must return to zero afterwards instead of
+        // clamping the transient -1 away and reporting a phantom pending task
+        // that no idle check can ever drain (rustfs#7921).
+        let state = ExpiryState::new();
+        let stats = Arc::clone(&state.read().await.stats);
+
+        stats.decrement_pending_tasks();
+        stats.increment_pending_tasks();
+        assert_eq!(stats.pending_tasks(), 0);
+        assert_eq!(state.read().await.pending_tasks(), 0);
+
+        stats.decrement_active_tasks();
+        stats.increment_active_tasks();
+        assert_eq!(stats.active_tasks(), 0);
+        assert_eq!(state.read().await.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(state.read().await.enqueue_free_version(oi.clone()));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+
+        // The single-slot queue is full for both enqueue paths.
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
+
+        assert!(!state.read().await.enqueue_free_version(oi));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 2);
+
+        // Draining the one real task returns the gauge to zero.
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver.lock().await.recv().await.expect("queued task");
+        assert!(task.is_some());
+        state.read().await.stats.decrement_pending_tasks();
+        assert_eq!(state.read().await.pending_tasks(), 0);
     }
 
     #[tokio::test]

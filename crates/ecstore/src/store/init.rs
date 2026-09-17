@@ -2905,8 +2905,17 @@ mod tests {
                     if !version.is_empty() {
                         insert_str(&mut metadata, SUFFIX_TRANSITIONED_VERSION_ID, version.to_string());
                     }
+                    // The commit path acknowledges at write quorum and drains
+                    // the remaining rename fan-out in the background. This
+                    // fixture "crashes" the store right after the overwrite,
+                    // so it must wait for that tail: a disk left with the old
+                    // live transitioned source makes exact cleanup fail closed
+                    // (a minority live owner still references the remote
+                    // tuple) until heal repairs it, which this fixture never
+                    // runs (rustfs#7921).
                     let options = ObjectOptions {
                         version_suspended: suspended,
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
                         ..Default::default()
                     };
                     store
@@ -2978,6 +2987,7 @@ mod tests {
                     assert_eq!(free.len(), 1, "{state:?}, suspended={suspended}, copy={self_copy}");
                     assert_eq!(free[0].transitioned_objname, remote);
                     assert_eq!(free[0].transition_version_state, state);
+                    assert_every_disk_holds_only_the_cleanup_owner(&set, &bucket, object, &remote).await;
                     assert!(backend.contains(&remote).await, "commit must not delete remote bytes before cleanup");
                     let removed_before = backend.remove_count().await;
 
@@ -12755,10 +12765,45 @@ mod tests {
         }
     }
 
+    /// Every physical copy must carry the replacement plus its tier
+    /// free-version owner, and none may still hold the pre-overwrite live
+    /// transitioned source. A stale minority copy is exactly what a lost
+    /// early-ACK rename tail leaves behind, and exact cleanup refuses to
+    /// delete remote bytes while such a live reference exists.
+    #[cfg(feature = "test-util")]
+    async fn assert_every_disk_holds_only_the_cleanup_owner(
+        set: &crate::set_disk::SetDisks,
+        bucket: &str,
+        object: &str,
+        remote: &str,
+    ) {
+        use crate::disk::DiskAPI as _;
+
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        for (index, disk) in set.disk_inventory().await.into_iter().enumerate() {
+            let disk = disk.unwrap_or_else(|| panic!("disk{index} should be online"));
+            let raw = disk
+                .read_xl(bucket, &disk_object, false)
+                .await
+                .unwrap_or_else(|err| panic!("disk{index} xl.meta should be readable after the overwrite: {err:?}"));
+            let versions = rustfs_filemeta::FileMeta::load(&raw.buf)
+                .and_then(|meta| meta.get_all_file_info_versions(bucket, object, true))
+                .unwrap_or_else(|err| panic!("disk{index} xl.meta should decode: {err:?}"));
+            let all: Vec<_> = versions.versions.iter().chain(versions.free_versions.iter()).collect();
+            let owners = all.iter().filter(|fi| fi.tier_free_version()).count();
+            let live_sources = all
+                .iter()
+                .filter(|fi| !fi.tier_free_version() && fi.transitioned_objname == remote)
+                .count();
+            assert_eq!(owners, 1, "disk{index} must hold exactly one cleanup owner after the drained overwrite");
+            assert_eq!(live_sources, 0, "disk{index} must not retain the pre-overwrite live transitioned source");
+        }
+    }
+
     #[cfg(feature = "test-util")]
     async fn wait_for_expiry_workers_idle(store: &crate::store::ECStore) {
         let expiry_state = store.ctx.expiry_state();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let idle = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let idle = {
                     let state = expiry_state.read().await;
@@ -12778,8 +12823,15 @@ mod tests {
                 }
             }
         })
-        .await
-        .expect("lifecycle expiry workers should become idle");
+        .await;
+        if idle.is_err() {
+            let state = expiry_state.read().await;
+            panic!(
+                "lifecycle expiry workers should become idle: pending={} active={}",
+                state.pending_tasks(),
+                state.active_tasks()
+            );
+        }
     }
 
     #[cfg(feature = "test-util")]
