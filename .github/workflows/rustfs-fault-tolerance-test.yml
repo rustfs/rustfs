@@ -203,11 +203,15 @@ jobs:
             (.expected_cases | unique | length) == 38 and
             (.seen_cases | length) == 38 and
             (.seen_cases | unique | length) == 38 and
+            (.seen_cases | sort) == (.expected_cases | sort) and
             (.missing_cases | length) == 0 and
             (.harness_errors | length) == 0 and
             (.cases | length) == 38 and
             ([.cases[].case_id] | sort) == (.expected_cases | sort) and
-            ([.cases[].case_id] | unique | length) == 38
+            ([.cases[].case_id] | unique | length) == 38 and
+            all(.cases[]; .verdict == "pass" or .verdict == "known-divergence" or .verdict == "UNEXPECTED") and
+            .counts.unexpected == ([.cases[] | select(.verdict == "UNEXPECTED")] | length) and
+            .counts.known_divergence == ([.cases[] | select(.verdict == "known-divergence")] | length)
           ' "${RESULTS_FILE}" >/dev/null
           printf 'complete=true\n' >> "${GITHUB_OUTPUT}"
 

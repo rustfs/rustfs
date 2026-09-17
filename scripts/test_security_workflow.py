@@ -537,10 +537,15 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
         }
 
     def write_result(self, *, seen: int = 38, complete: bool = True,
-                     duplicate: bool = False, testing_sha: str | None = None) -> None:
+                     duplicate: bool = False, testing_sha: str | None = None,
+                     unrelated_seen: bool = False, missing_verdict: bool = False) -> None:
         expected = [f"CASE-{index:02d}" for index in range(38)]
         seen_cases = expected[:seen]
+        if unrelated_seen:
+            seen_cases = [f"OTHER-{index:02d}" for index in range(seen)]
         case_ids = list(seen_cases)
+        if unrelated_seen:
+            case_ids = expected[:seen]
         if duplicate:
             case_ids[-1] = case_ids[0]
         payload = {
@@ -564,6 +569,8 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
                 for index, case_id in enumerate(case_ids)
             ],
         }
+        if missing_verdict:
+            payload["cases"][0].pop("verdict")
         self.results.write_text(json.dumps(payload))
 
     def run_report(self) -> subprocess.CompletedProcess[str]:
@@ -608,6 +615,14 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
 
         self.output.unlink()
         self.write_result(testing_sha="b" * 40)
+        self.assertNotEqual(self.run_report().returncode, 0)
+
+    def test_missing_verdict_or_unrelated_seen_cases_fail_the_harness_gate(self) -> None:
+        self.write_result(missing_verdict=True)
+        self.assertNotEqual(self.run_report().returncode, 0)
+
+        self.output.unlink()
+        self.write_result(unrelated_seen=True)
         self.assertNotEqual(self.run_report().returncode, 0)
 
     def test_backlog_manager_only_runs_after_complete_report(self) -> None:
