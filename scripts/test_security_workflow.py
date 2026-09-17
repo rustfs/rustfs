@@ -303,11 +303,12 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text().splitlines()
                 # Workflow-level concurrency covers every job, including cleanup,
                 # regardless of trigger or the runner hosting the job.
+                expected_group = "rustfs-performance-suite" if suite == "performance" else "rustfs-shared-functional-tests-v2"
                 self.assertEqual([
                     line.strip() for line in yaml_block(source, "concurrency", 0)
                     if line.strip() and not line.lstrip().startswith("#")
                 ], [
-                    "group: rustfs-shared-functional-tests-v2", "cancel-in-progress: false",
+                    f"group: {expected_group}", "cancel-in-progress: false",
                 ])
                 self.assertIsNotNone(yaml_block(source, "workflow_dispatch", 2))
                 self.assertIsNotNone(yaml_block(source, "repository_dispatch", 2))
