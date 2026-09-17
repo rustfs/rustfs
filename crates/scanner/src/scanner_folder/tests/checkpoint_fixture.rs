@@ -33,6 +33,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
     ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
+        checkpoint_tx: None,
     }
 }
 
@@ -382,14 +383,31 @@ fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
         assert!(next.info.scan_checkpoint.is_none());
         assert!(!next.info.snapshot_complete);
     }
-    for (source, epoch) in [(crate::DataUsageCacheSource::new(1, 0), 7), (SOURCE, 8)] {
-        let mut next = cache.clone();
-        assert_eq!(
-            next.prepare_bucket_checkpoint("bucket", 11, epoch, source, PLAN, identity),
-            crate::DataUsageCachePrepareOutcome::Reset
-        );
-        assert!(next.cache.is_empty());
-    }
+    let mut source_mismatch = cache.clone();
+    assert_eq!(
+        source_mismatch.prepare_bucket_checkpoint("bucket", 11, 7, crate::DataUsageCacheSource::new(1, 0), PLAN, identity,),
+        crate::DataUsageCachePrepareOutcome::Reset
+    );
+    assert!(source_mismatch.cache.is_empty());
+    let mut handed_off = cache.clone();
+    assert_eq!(
+        handed_off.prepare_bucket_checkpoint("bucket", 11, 8, SOURCE, PLAN, identity),
+        crate::DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(handed_off.info.leader_epoch, 8);
+    assert_eq!(handed_off.validated_scan_frontier(), Some("bucket/static"));
+    assert_eq!(retained(&handed_off), 3);
+
+    let mut unverified = cache.clone();
+    unverified.info.scan_resume_after = None;
+    unverified.info.scan_checkpoint = None;
+    unverified.info.scan_coverage_receipt = None;
+    assert_eq!(
+        unverified.prepare_bucket_checkpoint("bucket", 11, 8, SOURCE, PLAN, identity),
+        crate::DataUsageCachePrepareOutcome::Reset,
+        "a cross-epoch cache without a durable frontier proof must rebuild"
+    );
+    assert!(unverified.cache.is_empty());
     for (cycle, epoch, expected) in [
         (10, 7, crate::DataUsageCachePrepareOutcome::RejectedNewerCycle),
         (11, 6, crate::DataUsageCachePrepareOutcome::RejectedNewerLeader),
@@ -870,6 +888,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
                 ScannerDiskScanOptions {
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
+                    checkpoint_tx: None,
                 },
             )
             .await
@@ -951,6 +970,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
             ScannerDiskScanOptions {
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
+                checkpoint_tx: None,
             },
         )
         .await;

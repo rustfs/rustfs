@@ -910,11 +910,26 @@ impl DataUsageCache {
         if self.info.leader_epoch > leader_epoch {
             return DataUsageCachePrepareOutcome::RejectedNewerLeader;
         }
+        // A checkpoint is a durable traversal frontier, not a publication
+        // result.  A newer leader may adopt it only when the frontier is
+        // independently fenced by the bucket identity and has a validated
+        // cursor/coverage receipt.  Caches without that proof still take the
+        // normal rebuild path; this keeps an old, incomplete writer from
+        // authorizing a new leader to skip namespace coverage.
+        let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
+            && self.info.next_cycle == next_cycle
+            && self.info.scan_identity == Some(identity)
+            && (self.validated_scan_frontier().is_some()
+                || self.validated_raw_enumeration_cursor().is_some()
+                || self.validated_raw_enumeration_page_index().is_some());
+        let handoff_frontier = cross_epoch_checkpoint
+            .then(|| self.validated_scan_frontier().map(str::to_owned))
+            .flatten();
         let reusable = identity.is_valid()
             && name != DATA_USAGE_ROOT
             && self.info.name == name
             && self.info.source == Some(source)
-            && self.info.leader_epoch == leader_epoch
+            && (self.info.leader_epoch == leader_epoch || cross_epoch_checkpoint)
             && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
             && self.info.scan_identity == Some(identity)
             && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
@@ -974,6 +989,15 @@ impl DataUsageCache {
         self.info.tier_registry_generation = Some(identity.tier_registry_generation);
         self.info.scan_identity = Some(identity);
         self.info.snapshot_complete = false;
+        if let Some(frontier) = handoff_frontier
+            && let Ok(digest) = self.coverage_prefix_digest(&frontier)
+            && let Some(receipt) = self.info.scan_coverage_receipt.as_mut()
+        {
+            // Migrate a legacy epoch-bound receipt while the old epoch is
+            // still available for validation.  New receipts deliberately do
+            // not bind to the process-local leader epoch.
+            receipt.digest = digest;
+        }
         if let Some(progress) = &mut self.info.scan_progress {
             progress.requested_plan = scan_plan_digest;
         } else {
@@ -998,19 +1022,53 @@ impl DataUsageCache {
     }
 
     fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None)
+    }
+
+    fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch))
+    }
+
+    fn coverage_prefix_digest_with_epoch(
+        &self,
+        through: &str,
+        legacy_leader_epoch: Option<u64>,
+    ) -> Result<[u8; 32], serde_json::Error> {
         let mut writer = CheckpointDigestWriter(Sha256::new());
-        serde_json::to_writer(
-            &mut writer,
-            &(
-                &self.info.name,
-                self.info.scan_identity,
-                self.info.source,
-                self.info.leader_epoch,
-                self.info.cache_key_format,
-                self.info.scan_progress.map(|progress| progress.started_plan),
-                through,
-            ),
-        )?;
+        if let Some(leader_epoch) = legacy_leader_epoch {
+            // Keep the old tuple available for one-way migration of caches
+            // written before leader handoff recovery was introduced.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    leader_epoch,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        } else {
+            // The receipt must survive a scanner leader handoff.  The bucket
+            // identity and publication epoch below fence the namespace; the
+            // process-local leader epoch is intentionally excluded because it
+            // changes during a safe handoff.  The domain version also keeps
+            // old epoch-bound receipts from colliding with this digest.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    2u8,
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        }
         let mut prefix = self
             .cache
             .iter()
@@ -1049,7 +1107,8 @@ impl DataUsageCache {
                 .strip_prefix(&self.info.name)
                 .is_some_and(|suffix| suffix.starts_with('/'))
             && self.find(&receipt.through).is_some()
-            && self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest))
+            && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
     }
 
