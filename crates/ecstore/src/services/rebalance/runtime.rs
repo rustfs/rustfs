@@ -12,8 +12,8 @@ use super::worker::{
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
-    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalSaveOpt, RebalStatus,
-    RebalanceBucketOutcome,
+    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_MAX_DEFERS,
+    RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceDeferKind,
 };
 use crate::error::{Error, Result};
 use crate::runtime::sources as runtime_sources;
@@ -38,6 +38,12 @@ pub(super) fn source_cleanup_defer_attempt(deferred_attempts: &mut HashMap<Strin
     let attempts = deferred_attempts.entry(bucket.to_string()).or_default();
     *attempts = attempts.saturating_add(1);
     *attempts
+}
+
+/// Retryable source cleanup conflicts are bounded per run, so a source replica that stays
+/// unreclaimable fails the bucket explicitly instead of deferring forever.
+pub(super) fn reached_rebalance_source_cleanup_defer_limit(attempt: usize) -> bool {
+    attempt >= REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -623,6 +629,11 @@ impl ECStore {
                     } else {
                         0
                     };
+                    let defer_kind = if source_cleanup_deferred {
+                        RebalanceDeferKind::SourceCleanup
+                    } else {
+                        RebalanceDeferKind::Entry
+                    };
                     warn!(
                         event = EVENT_REBALANCE_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -634,7 +645,7 @@ impl ECStore {
                         "Deferred rebalance bucket after transient object failures"
                     );
                     if let Err(err) = self
-                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref())
+                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref(), defer_kind)
                         .await
                     {
                         error!(
@@ -654,10 +665,10 @@ impl ECStore {
                         break;
                     }
                     if source_cleanup_deferred {
-                        if source_cleanup_attempt >= super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS {
+                        if reached_rebalance_source_cleanup_defer_limit(source_cleanup_attempt) {
                             let err = Error::other(format!(
                                 "rebalance bucket {bucket} source cleanup remained unstable after {} deferrals: {last_error}",
-                                super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
+                                REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
                             ));
                             warn!(
                                 event = EVENT_REBALANCE_BUCKET,

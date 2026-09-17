@@ -363,7 +363,12 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("  workflow_call:", workflow)
                 self.assertIn("  workflow_dispatch:", workflow)
                 self.assertIn("group: rustfs-shared-functional-tests-v2", workflow)
-                self.assertIn("ref: ${{ steps.chain.outputs.testing_sha || 'main' }}", workflow)
+                expected_ref = (
+                    "ref: ${{ steps.chain.outputs.testing_sha || inputs.auto_testing_ref || 'main' }}"
+                    if suite == "fault-tolerance"
+                    else "ref: ${{ steps.chain.outputs.testing_sha || 'main' }}"
+                )
+                self.assertIn(expected_ref, workflow)
                 self.assertIn("steps.chain_package.outputs.package_url || inputs.package_url", workflow)
                 self.assertLess(workflow.index("prepare_functional_package.py prepare"), workflow.index("id: test"))
                 self.assertIn("prepare_functional_package.py cleanup", workflow)

@@ -663,6 +663,15 @@ pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DET
 /// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
 pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
 
+/// Environment variable for the maximum number of in-flight lock acquisition
+/// RPCs admitted to one peer. Requests beyond this bound fail fast as
+/// retryable contention so a slow endpoint cannot accumulate an unbounded
+/// queue while its channel remains healthy.
+pub const ENV_OBJECT_LOCK_RPC_REQUEST_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_REQUEST_LIMIT";
+
+/// Default per-peer in-flight lock acquisition RPC admission limit.
+pub const DEFAULT_OBJECT_LOCK_RPC_REQUEST_LIMIT: usize = 128;
+
 /// Environment variable to enable object namespace lock diagnostics.
 ///
 /// When enabled, RustFS emits slow lock acquisition and long lock hold

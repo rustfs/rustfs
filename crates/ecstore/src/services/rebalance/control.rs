@@ -9,11 +9,12 @@ use super::meta::{
 };
 use super::worker::{
     rebalance_max_attempts, rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result,
-    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, retry_rebalance_metadata_access,
+    resolve_rebalance_deferred_last_error, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+    retry_rebalance_metadata_access,
 };
 use super::{
     DiskStat, EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
-    RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
+    RebalStatus, RebalanceDeferKind, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
     encode_rebalance_stop_propagation_record,
 };
 use crate::core::pools::{
@@ -1103,6 +1104,7 @@ impl ECStore {
         bucket: String,
         last_error: String,
         expected_id: &str,
+        kind: RebalanceDeferKind,
     ) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "defer rebalance bucket")?;
@@ -1116,7 +1118,8 @@ impl ECStore {
         };
 
         defer_bucket_in_rebalance_queue(pool_stat, &bucket)?;
-        pool_stat.info.last_error = Some(last_error);
+        let pending_entry_defer = pool_stat.info.last_error.clone();
+        pool_stat.info.last_error = resolve_rebalance_deferred_last_error(kind, pending_entry_defer.as_deref(), &last_error);
         meta.last_refreshed_at = Some(OffsetDateTime::now_utc());
         Ok(())
     }
