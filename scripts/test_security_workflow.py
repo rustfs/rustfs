@@ -307,7 +307,10 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                     line.strip() for line in yaml_block(source, "concurrency", 0)
                     if line.strip() and not line.lstrip().startswith("#")
                 ], [
-                    "group: rustfs-shared-functional-tests-v2", "cancel-in-progress: false",
+                    # Performance runs on the separate pf-testing fleet, so it
+                    # holds its own lock instead of queueing behind the chain.
+                    "group: rustfs-performance-suite" if suite == "performance" else "group: rustfs-shared-functional-tests-v2",
+                    "cancel-in-progress: false",
                 ])
                 self.assertIsNotNone(yaml_block(source, "workflow_dispatch", 2))
                 self.assertIsNotNone(yaml_block(source, "repository_dispatch", 2))
