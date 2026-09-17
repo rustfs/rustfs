@@ -137,6 +137,7 @@ their issue closes.
 | `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
 | `install-protoc.sh` | dev-tool | Local protoc installer (macOS/Linux) | — |
+| `cargo_publish_workspace.sh` | dev-tool | Generates the workspace crate publish order, checks existing registry versions, and optionally runs ordered `cargo publish` dry-runs or publication | `docs/operations/cargo-publish-workspace.md` |
 | `makefile-header.sh` | dev-tool | Generates the `## —— section ——` header lines used in `.config/make/*.mak` | — |
 | `tls_gen.md` | dev-tool (doc) | Notes on generating local TLS certificates | — |
 

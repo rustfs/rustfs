@@ -65,7 +65,7 @@ rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true, features = ["os"] }
 futures = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "rt-multi-thread","macros"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
