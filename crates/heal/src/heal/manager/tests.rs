@@ -1489,6 +1489,164 @@ fn test_priority_queue_ordering() {
 }
 
 #[test]
+fn test_priority_queue_fairness_gives_best_effort_bounded_service() {
+    let mut queue = PriorityHealQueue::new();
+    for index in 0..5 {
+        assert_eq!(
+            queue.push(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf)),
+            QueuePushOutcome::Accepted
+        );
+    }
+    assert_eq!(
+        queue.push(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner)),
+        QueuePushOutcome::Accepted
+    );
+
+    for _ in 0..4 {
+        let (request, skipped) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            request.expect("MRF request should run before the fairness quantum").source,
+            HealRequestSource::Mrf
+        );
+    }
+
+    let (request, skipped) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert!(skipped.is_empty());
+    assert_eq!(
+        request
+            .expect("best-effort work must get a bounded service opportunity")
+            .source,
+        HealRequestSource::Scanner
+    );
+}
+
+#[test]
+fn test_priority_queue_fairness_covers_internal_normal_background_work() {
+    let mut queue = PriorityHealQueue::new();
+    for index in 0..5 {
+        assert_eq!(
+            queue.push(bucket_request(
+                &format!("internal-{index}"),
+                HealPriority::Normal,
+                HealRequestSource::Internal
+            )),
+            QueuePushOutcome::Accepted
+        );
+    }
+    assert_eq!(
+        queue.push(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner)),
+        QueuePushOutcome::Accepted
+    );
+
+    for _ in 0..4 {
+        let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert_eq!(request.expect("internal background work should run").source, HealRequestSource::Internal);
+    }
+    let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(
+        request.expect("Scanner should get a service opportunity").source,
+        HealRequestSource::Scanner
+    );
+}
+
+#[test]
+fn test_priority_queue_fairness_round_robins_best_effort_sources() {
+    let mut queue = PriorityHealQueue::new();
+    for index in 0..8 {
+        assert_eq!(
+            queue.push(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf)),
+            QueuePushOutcome::Accepted
+        );
+    }
+    for (bucket, source) in [
+        ("scanner", HealRequestSource::Scanner),
+        ("read-repair", HealRequestSource::ReadRepair),
+        ("auto-heal", HealRequestSource::AutoHeal),
+    ] {
+        assert_eq!(queue.push(bucket_request(bucket, HealPriority::Low, source)), QueuePushOutcome::Accepted);
+    }
+
+    for _ in 0..4 {
+        let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert_eq!(request.expect("first MRF quantum should run").source, HealRequestSource::Mrf);
+    }
+    let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(
+        request.expect("Scanner should get the first best-effort turn").source,
+        HealRequestSource::Scanner
+    );
+
+    for _ in 0..4 {
+        let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert_eq!(request.expect("second MRF quantum should run").source, HealRequestSource::Mrf);
+    }
+    let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(
+        request.expect("ReadRepair should get the next best-effort turn").source,
+        HealRequestSource::ReadRepair
+    );
+}
+
+#[test]
+fn test_priority_queue_fairness_keeps_best_effort_priority_order() {
+    let mut queue = PriorityHealQueue::new();
+    for index in 0..4 {
+        assert_eq!(
+            queue.push(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf)),
+            QueuePushOutcome::Accepted
+        );
+    }
+    assert_eq!(
+        queue.push(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner)),
+        QueuePushOutcome::Accepted
+    );
+    assert_eq!(
+        queue.push(bucket_request("read-repair", HealPriority::Normal, HealRequestSource::ReadRepair)),
+        QueuePushOutcome::Accepted
+    );
+
+    for _ in 0..4 {
+        let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert_eq!(request.expect("MRF request should run").source, HealRequestSource::Mrf);
+    }
+    let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+    assert_eq!(
+        request.expect("higher-priority best-effort work should run first").source,
+        HealRequestSource::ReadRepair
+    );
+}
+
+#[test]
+fn test_priority_queue_fairness_skips_blocked_best_effort_source() {
+    let mut queue = PriorityHealQueue::new();
+    for index in 0..4 {
+        assert_eq!(
+            queue.push(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf)),
+            QueuePushOutcome::Accepted
+        );
+    }
+    assert_eq!(
+        queue.push(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner)),
+        QueuePushOutcome::Accepted
+    );
+    assert_eq!(
+        queue.push(bucket_request("read-repair", HealPriority::Low, HealRequestSource::ReadRepair)),
+        QueuePushOutcome::Accepted
+    );
+
+    for _ in 0..4 {
+        let (request, _) = queue.pop_runnable_with_fairness(|_| true, |_| None);
+        assert_eq!(request.expect("MRF request should run").source, HealRequestSource::Mrf);
+    }
+    let (request, _) = queue.pop_runnable_with_fairness(|request| request.source != HealRequestSource::Scanner, |_| None);
+    assert_eq!(
+        request.expect("runnable ReadRepair should bypass blocked Scanner").source,
+        HealRequestSource::ReadRepair
+    );
+}
+
+#[test]
 fn test_priority_queue_fifo_same_priority() {
     let mut queue = PriorityHealQueue::new();
 
@@ -4500,7 +4658,7 @@ async fn test_displacing_registered_mrf_task_drops_notice_ownership() {
 }
 
 #[tokio::test]
-async fn test_submit_heal_request_drops_read_repair_under_pressure() {
+async fn test_submit_heal_request_admits_read_repair_under_pressure() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(
         storage,
@@ -4510,7 +4668,7 @@ async fn test_submit_heal_request_drops_read_repair_under_pressure() {
         }),
     );
 
-    for index in 0..8 {
+    for index in 0..7 {
         assert_eq!(
             manager
                 .submit_heal_request(bucket_request(
@@ -4529,12 +4687,12 @@ async fn test_submit_heal_request_drops_read_repair_under_pressure() {
         .await
         .expect("read repair admission should return a result");
 
-    assert_eq!(admission, HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped));
+    assert_eq!(admission, HealAdmissionResult::Accepted);
     assert_eq!(manager.get_queue_length().await, 8);
 }
 
 #[tokio::test]
-async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
+async fn test_submit_heal_request_admits_low_scanner_under_pressure() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(
         storage,
@@ -4544,7 +4702,7 @@ async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
         }),
     );
 
-    for index in 0..8 {
+    for index in 0..7 {
         assert_eq!(
             manager
                 .submit_heal_request(bucket_request(
@@ -4563,8 +4721,218 @@ async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
         .await
         .expect("scanner admission should return a result");
 
-    assert_eq!(admission, HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped));
+    assert_eq!(admission, HealAdmissionResult::Accepted);
     assert_eq!(manager.get_queue_length().await, 8);
+}
+
+#[tokio::test]
+async fn test_mrf_admission_preserves_best_effort_queue_reserve() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 10,
+            ..HealConfig::default()
+        }),
+    );
+
+    for index in 0..7 {
+        assert_eq!(
+            manager
+                .submit_heal_request(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf,))
+                .await
+                .expect("MRF request should be admitted before the reserve threshold"),
+            HealAdmissionResult::Accepted
+        );
+    }
+
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("mrf-deferred", HealPriority::Normal, HealRequestSource::Mrf))
+            .await
+            .expect("MRF admission should return a typed result"),
+        HealAdmissionResult::Full
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("internal-deferred", HealPriority::Normal, HealRequestSource::Internal))
+            .await
+            .expect("ordinary background admission should return a typed result"),
+        HealAdmissionResult::Full
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner-reserved", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("Scanner should consume the reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("read-repair-reserved", HealPriority::Low, HealRequestSource::ReadRepair))
+            .await
+            .expect("ReadRepair should consume its reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("auto-heal-reserved", HealPriority::Low, HealRequestSource::AutoHeal))
+            .await
+            .expect("AutoHeal should consume its reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(manager.get_queue_length().await, 10);
+}
+
+#[tokio::test]
+async fn test_small_queue_keeps_per_source_best_effort_slots() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 9,
+            ..HealConfig::default()
+        }),
+    );
+
+    for index in 0..6 {
+        assert_eq!(
+            manager
+                .submit_heal_request(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf))
+                .await
+                .expect("MRF request should be admitted before the per-source reserve"),
+            HealAdmissionResult::Accepted
+        );
+    }
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("mrf-deferred", HealPriority::Normal, HealRequestSource::Mrf))
+            .await
+            .expect("MRF admission should return a typed result"),
+        HealAdmissionResult::Full
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner-reserved", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("Scanner should consume its reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("read-repair-reserved", HealPriority::Low, HealRequestSource::ReadRepair))
+            .await
+            .expect("ReadRepair should consume its reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("auto-heal-reserved", HealPriority::Low, HealRequestSource::AutoHeal))
+            .await
+            .expect("AutoHeal should consume its reserved slot"),
+        HealAdmissionResult::Accepted
+    );
+}
+
+#[tokio::test]
+async fn test_queue_size_four_keeps_mrf_and_each_best_effort_source() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 4,
+            ..HealConfig::default()
+        }),
+    );
+
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("mrf", HealPriority::Normal, HealRequestSource::Mrf))
+            .await
+            .expect("MRF should retain one queue slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("Scanner should use its source slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("read-repair", HealPriority::Low, HealRequestSource::ReadRepair))
+            .await
+            .expect("ReadRepair should use its source slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("auto-heal", HealPriority::Low, HealRequestSource::AutoHeal))
+            .await
+            .expect("AutoHeal should use its source slot"),
+        HealAdmissionResult::Accepted
+    );
+}
+
+#[tokio::test]
+async fn test_high_priority_mrf_bypasses_best_effort_reserve() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 10,
+            ..HealConfig::default()
+        }),
+    );
+
+    for index in 0..7 {
+        assert_eq!(
+            manager
+                .submit_heal_request(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf))
+                .await
+                .expect("normal MRF request should be admitted before the reserve"),
+            HealAdmissionResult::Accepted
+        );
+    }
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("urgent-mrf", HealPriority::Urgent, HealRequestSource::Mrf))
+            .await
+            .expect("urgent MRF admission should return a typed result"),
+        HealAdmissionResult::Accepted
+    );
+}
+
+#[tokio::test]
+async fn test_high_priority_best_effort_bypasses_source_quota() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 10,
+            ..HealConfig::default()
+        }),
+    );
+
+    for index in 0..7 {
+        assert_eq!(
+            manager
+                .submit_heal_request(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf))
+                .await
+                .expect("normal MRF request should be admitted before the reserve"),
+            HealAdmissionResult::Accepted
+        );
+    }
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner-low", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("low Scanner request should be admitted into its source slot"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner-high", HealPriority::High, HealRequestSource::Scanner))
+            .await
+            .expect("high Scanner retry should bypass its low-priority quota"),
+        HealAdmissionResult::Accepted
+    );
 }
 
 #[tokio::test]
@@ -4578,7 +4946,7 @@ async fn test_submit_heal_request_accepts_admin_high_under_pressure() {
         }),
     );
 
-    for index in 0..8 {
+    for index in 0..7 {
         assert_eq!(
             manager
                 .submit_heal_request(bucket_request(
@@ -4598,7 +4966,56 @@ async fn test_submit_heal_request_accepts_admin_high_under_pressure() {
         .expect("admin admission should return a result");
 
     assert_eq!(admission, HealAdmissionResult::Accepted);
-    assert_eq!(manager.get_queue_length().await, 9);
+    assert_eq!(manager.get_queue_length().await, 8);
+}
+
+#[tokio::test]
+async fn test_admin_normal_displaces_best_effort_when_queue_is_full() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 10,
+            ..HealConfig::default()
+        }),
+    );
+
+    for index in 0..7 {
+        assert_eq!(
+            manager
+                .submit_heal_request(bucket_request(&format!("mrf-{index}"), HealPriority::Normal, HealRequestSource::Mrf))
+                .await
+                .expect("MRF request should be queued"),
+            HealAdmissionResult::Accepted
+        );
+    }
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("Scanner request should be queued"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("read-repair", HealPriority::Low, HealRequestSource::ReadRepair))
+            .await
+            .expect("ReadRepair request should be queued"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("auto-heal", HealPriority::Low, HealRequestSource::AutoHeal))
+            .await
+            .expect("AutoHeal request should be queued"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(bucket_request("admin", HealPriority::Normal, HealRequestSource::Admin))
+            .await
+            .expect("admin admission should return a typed result"),
+        HealAdmissionResult::Accepted
+    );
 }
 
 #[tokio::test]
