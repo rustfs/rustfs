@@ -520,7 +520,9 @@ fn build_notification_event_rules(
     notification_configuration: &NotificationConfiguration,
 ) -> S3Result<Vec<(Vec<EventName>, String, String, Vec<TargetID>)>> {
     let mut event_rules = Vec::new();
-    let invalid_arn = |e: TargetIDError| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}");
+    let invalid_arn = |e: TargetIDError| {
+        S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid ARN in notification configuration: {e}"))
+    };
 
     process_queue_configurations(
         &mut event_rules,
