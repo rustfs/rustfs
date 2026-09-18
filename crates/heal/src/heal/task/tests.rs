@@ -3472,6 +3472,40 @@ async fn test_prefix_heal_lists_and_repairs_objects_under_prefix() {
 }
 
 #[tokio::test]
+async fn admin_object_heal_fails_when_drive_remains_unhealthy() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("outcomes").insert(
+        "object-a".to_string(),
+        VecDeque::from([MockHealObjectOutcome::UnavailableDrive(DriveState::Missing)]),
+    );
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket-a".to_string(),
+            object: "object-a".to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            recreate_missing: false,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("admin heal must not finish with an unhealthy drive");
+    assert!(error.to_string().contains("left one or more drives unhealthy"));
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.failed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+}
+
+#[tokio::test]
 async fn test_data_usage_cache_lock_timeout_does_not_fail_object_heal() {
     let storage = Arc::new(MockStorage::default());
     let request = HealRequest::new(
