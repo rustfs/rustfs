@@ -18,6 +18,11 @@ operators should start with:
 | [Replication object size limits](operations/replication-object-size-limits.md) | Multipart routing, large-object limits, and retry characteristics. |
 | [Replication outbound transport](operations/replication-outbound-transport.md) | Integrity headers, generic target behavior, and transport knobs. |
 
+For the erasure-coded cluster lifecycle (planning, parity and `EC:0`,
+expansion, rebalance, decommission, heal, drive replacement, restart
+recovery, and the `rc` CLI mapping), start with
+[Cluster and erasure-coding lifecycle operations](operations/cluster-lifecycle-operations.md).
+
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
