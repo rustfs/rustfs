@@ -72,6 +72,41 @@ const LEGACY_ROOT_HEAL_PATH: &str = ".";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 const RESUME_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BEST_EFFORT_QUEUE_RESERVE_PERCENT: usize = 10;
+const BEST_EFFORT_SOURCE_COUNT: usize = 3;
+
+fn is_best_effort_source(source: HealRequestSource) -> bool {
+    matches!(
+        source,
+        HealRequestSource::Scanner | HealRequestSource::AutoHeal | HealRequestSource::ReadRepair
+    )
+}
+
+fn best_effort_source_quota_index(source: HealRequestSource) -> Option<usize> {
+    match source {
+        HealRequestSource::Scanner => Some(0),
+        HealRequestSource::ReadRepair => Some(1),
+        HealRequestSource::AutoHeal => Some(2),
+        _ => None,
+    }
+}
+
+fn best_effort_queue_reserve(queue_capacity: usize) -> usize {
+    match queue_capacity {
+        0..=2 => 0,
+        capacity => (capacity.saturating_mul(BEST_EFFORT_QUEUE_RESERVE_PERCENT) / 100).max(BEST_EFFORT_SOURCE_COUNT),
+    }
+}
+
+fn best_effort_source_reserves(queue_capacity: usize) -> [usize; BEST_EFFORT_SOURCE_COUNT] {
+    let reserve = best_effort_queue_reserve(queue_capacity);
+    if reserve == 0 {
+        return [0; BEST_EFFORT_SOURCE_COUNT];
+    }
+    let base = reserve / BEST_EFFORT_SOURCE_COUNT;
+    let remainder = reserve % BEST_EFFORT_SOURCE_COUNT;
+    [base + usize::from(remainder > 0), base + usize::from(remainder > 1), base]
+}
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -965,11 +1000,7 @@ struct HealQueueContext<'a> {
 
 impl HealManager {
     fn classify_full_admission(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
-        let best_effort_source = matches!(
-            request.source,
-            HealRequestSource::Scanner | HealRequestSource::AutoHeal | HealRequestSource::ReadRepair
-        );
-        if best_effort_source || (request.priority == HealPriority::Low && config.low_priority_drop_when_full) {
+        if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
         } else {
             HealAdmissionResult::Full
@@ -978,32 +1009,6 @@ impl HealManager {
 
     fn queue_usage_pct(queue_len: usize, queue_capacity: usize) -> usize {
         queue_len.saturating_mul(100).checked_div(queue_capacity).unwrap_or(0)
-    }
-
-    fn classify_pressure_admission(
-        request: &HealRequest,
-        queue_len: usize,
-        queue_capacity: usize,
-    ) -> Option<HealAdmissionResult> {
-        if request.force_start || queue_capacity == 0 {
-            return None;
-        }
-
-        let queue_usage_pct = Self::queue_usage_pct(queue_len, queue_capacity);
-        if queue_usage_pct < 80 {
-            return None;
-        }
-
-        match request.source {
-            HealRequestSource::ReadRepair => Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)),
-            HealRequestSource::Scanner if request.priority == HealPriority::Low => {
-                Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
-            }
-            HealRequestSource::AutoHeal if queue_usage_pct >= 95 => {
-                Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
-            }
-            _ => None,
-        }
     }
 
     fn duplicate_admission_for_request(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
@@ -1156,6 +1161,8 @@ impl HealManager {
         publish_heal_queue_length(queue);
         let queue_capacity = config.queue_size;
         let per_object_request = request.heal_type.is_per_object();
+        let best_effort_reserve = best_effort_queue_reserve(queue_capacity);
+        let best_effort_source_reserves = best_effort_source_reserves(queue_capacity);
 
         if queue_len >= queue_capacity && !request.force_start {
             if Self::can_displace_queued_work(&request)
@@ -1243,27 +1250,55 @@ impl HealManager {
             return HealAdmissionDecision::new(admission);
         }
 
-        if let Some(admission) = Self::classify_pressure_admission(&request, queue_len, queue_capacity) {
-            Self::record_admission_metric(request.source, admission, context);
-            if let HealAdmissionResult::Dropped(reason) = admission {
-                debug!(
-                    target: "rustfs::heal::manager",
-                    event = EVENT_HEAL_QUEUE_ADMISSION,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_MANAGER,
-                    request_id = %request.id,
-                    priority = ?request.priority,
-                    source = request.source.as_str(),
-                    context,
-                    queue_len,
-                    queue_capacity,
-                    queue_usage_pct = Self::queue_usage_pct(queue_len, queue_capacity),
-                    reason = reason.as_str(),
-                    result = "dropped_pressure",
-                    "Heal queue request dropped under pressure"
-                );
-            }
-            return HealAdmissionDecision::new(admission);
+        if !is_best_effort_source(request.source)
+            && request.priority <= HealPriority::Normal
+            && !request.force_start
+            && best_effort_reserve > 0
+            && queue_len >= queue_capacity.saturating_sub(best_effort_reserve)
+        {
+            Self::record_admission_metric(request.source, HealAdmissionResult::Full, context);
+            demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request.id,
+                priority = ?request.priority,
+                source = request.source.as_str(),
+                context,
+                queue_len,
+                queue_capacity,
+                reserved_for_best_effort = best_effort_reserve,
+                result = "rejected_for_reserved_capacity",
+                "Normal heal request deferred to preserve best-effort capacity"
+            });
+            return HealAdmissionDecision::new(HealAdmissionResult::Full);
+        }
+
+        if is_best_effort_source(request.source)
+            && request.priority <= HealPriority::Normal
+            && !request.force_start
+            && best_effort_reserve > 0
+            && queue_len >= queue_capacity.saturating_sub(best_effort_reserve)
+            && let Some(source_index) = best_effort_source_quota_index(request.source)
+            && queue.best_effort_source_count(request.source) >= best_effort_source_reserves[source_index]
+        {
+            Self::record_admission_metric(request.source, HealAdmissionResult::Full, context);
+            demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request.id,
+                priority = ?request.priority,
+                source = request.source.as_str(),
+                context,
+                queue_len,
+                queue_capacity,
+                reserved_for_best_effort = best_effort_reserve,
+                source_quota = best_effort_source_reserves[source_index],
+                result = "rejected_for_source_quota",
+                "Best-effort source deferred to preserve per-source capacity"
+            });
+            return HealAdmissionDecision::new(HealAdmissionResult::Full);
         }
 
         if queue_capacity > 0 {

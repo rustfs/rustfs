@@ -642,6 +642,21 @@ pub(crate) fn data_movement_stage_source(err: &Error) -> Option<&Error> {
         .downcast_ref::<Error>()
 }
 
+/// Recover a concrete typed error wrapped by [`data_movement_stage_error`].
+pub(crate) fn data_movement_stage_source_as<T>(err: &Error) -> Option<&T>
+where
+    T: std::error::Error + 'static,
+{
+    let Error::Io(io_err) = err else {
+        return None;
+    };
+    io_err
+        .get_ref()?
+        .downcast_ref::<DataMovementStageError>()?
+        .source
+        .downcast_ref::<T>()
+}
+
 fn schedule_data_movement_multipart_abort_cleanup(
     store: Arc<ECStore>,
     target_pool_idx: usize,

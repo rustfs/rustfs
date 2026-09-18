@@ -135,6 +135,15 @@ impl DataUsageCache {
         Ok(DataUsageCacheRevisions { main, backup })
     }
 
+    pub(crate) async fn read_revisions<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheRevisions> {
+        let main_path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let backup_name = format!("{name}.bkp");
+        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
+        let main = read_config_revision(store.clone(), &main_path).await?;
+        let backup = Some(read_config_revision(store, &backup_path).await?);
+        Ok(DataUsageCacheRevisions { main, backup })
+    }
+
     async fn load_cache<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheLoadResult> {
         let mut last_retryable = None;
 

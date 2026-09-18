@@ -391,8 +391,9 @@ pub mod data_usage {
     #[cfg(feature = "test-util")]
     pub use crate::data_movement::scanner_backlog::test_util::NativeScannerPauseBacklogWriteFault;
     pub use crate::data_movement::scanner_backlog::{
-        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementPlanner,
-        ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+        ScannerPauseBacklogRetirementPlanner, ScannerPauseBacklogRetirementReplica,
+        register_scanner_pause_backlog_retirement_planner,
     };
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,

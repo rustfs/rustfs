@@ -61,10 +61,13 @@ on:
 permissions:
   contents: read
 
-# The default performance nodes overlap the other suites' remote VMs, even
-# though the runner differs. Hold the shared lock through cleanup as well.
+# Workflow-level so the lock is held through cleanup as well.
 concurrency:
-  group: rustfs-shared-functional-tests-v2
+  # Own group: the performance suite runs on the pf-testing fleet - a fully
+  # separate environment from the smoke-testing fleet the functional suites
+  # use. No shared node, no shared runner: it must never queue behind them
+  # (or block them).
+  group: rustfs-performance-suite
   cancel-in-progress: false
 
 defaults:

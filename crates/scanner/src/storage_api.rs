@@ -29,8 +29,8 @@ pub(crate) use s3s::dto::{
 pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
-    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
-    register_scanner_pause_backlog_retirement_planner,
+    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+    ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::data_usage::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
@@ -143,8 +143,8 @@ pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::Heal
 
 pub(crate) mod owner {
     pub(crate) use super::{
-        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
-        register_scanner_pause_backlog_retirement_planner,
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+        ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
     };
     #[cfg(test)]
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};

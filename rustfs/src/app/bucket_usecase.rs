@@ -92,7 +92,7 @@ use rustfs_policy::policy::{
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::{
     EventName,
-    arn::{ARN, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
@@ -506,6 +506,46 @@ fn validate_notification_configuration_filters(notification_configuration: &Noti
         }
     }
     Ok(())
+}
+
+fn parse_notification_target_id(arn_str: &str) -> Result<TargetID, TargetIDError> {
+    ARN::parse(arn_str)
+        .map(|arn| arn.target_id)
+        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+}
+
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
+
+/// Builds the notify runtime rules for a bucket notification configuration
+/// without touching the store or the runtime rule state.
+fn build_notification_event_rules(
+    notification_configuration: &NotificationConfiguration,
+) -> S3Result<Vec<NotificationEventRule>> {
+    let mut event_rules = Vec::new();
+    let invalid_arn = |e: TargetIDError| {
+        S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid ARN in notification configuration: {e}"))
+    };
+
+    process_queue_configurations(
+        &mut event_rules,
+        notification_configuration.queue_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_topic_configurations(
+        &mut event_rules,
+        notification_configuration.topic_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_lambda_configurations(
+        &mut event_rules,
+        notification_configuration.lambda_function_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+
+    Ok(event_rules)
 }
 
 fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
@@ -2440,6 +2480,17 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let region = resolve_notification_region(self.global_region(), request_region);
+        let notify = current_notify_interface_for_context(self.context.as_deref());
+        let event_rules = build_notification_event_rules(&notification_configuration)?;
+
+        // Reject the request before the store write so a failure cannot leave a
+        // persisted configuration that the notify runtime refused to activate.
+        notify
+            .validate_event_specific_rules(&bucket, region.as_str(), &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
         let data = serialize_config(&notification_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -2447,40 +2498,10 @@ impl DefaultBucketUsecase {
 
         notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false).await;
 
-        let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = current_notify_interface_for_context(self.context.as_deref());
-        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
-        let parse_rules = async {
-            let mut event_rules = Vec::new();
-
-            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_lambda_configurations(
-                &mut event_rules,
-                notification_configuration.lambda_function_configurations.clone(),
-                |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                },
-            )?;
-
-            Ok::<_, TargetIDError>(event_rules)
-        };
-
-        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
-
-        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
-        let event_rules =
-            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
+        notify
+            .clear_bucket_notification_rules(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
         notify
             .add_event_specific_rules(&bucket, region.as_str(), &event_rules)

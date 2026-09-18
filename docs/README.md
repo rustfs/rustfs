@@ -18,6 +18,11 @@ operators should start with:
 | [Replication object size limits](operations/replication-object-size-limits.md) | Multipart routing, large-object limits, and retry characteristics. |
 | [Replication outbound transport](operations/replication-outbound-transport.md) | Integrity headers, generic target behavior, and transport knobs. |
 
+For the erasure-coded cluster lifecycle (planning, parity and `EC:0`,
+expansion, rebalance, decommission, heal, drive replacement, restart
+recovery, and the `rc` CLI mapping), start with
+[Cluster and erasure-coding lifecycle operations](operations/cluster-lifecycle-operations.md).
+
 For persisted administrator bucket tasks and bucket recreation, see
 [Bucket heal recovery](operations/bucket-heal-recovery.md).
 
@@ -36,3 +41,7 @@ drive ownership, snapshot freshness, counter queries, and rolling upgrades.
 
 For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
 activation, legacy repair results, multipart mode changes, and rollback limits.
+
+For crates.io publication of workspace crates, see
+[Workspace Cargo Publish](operations/cargo-publish-workspace.md): dependency
+ordering, dry-run, publish, and failure handling.

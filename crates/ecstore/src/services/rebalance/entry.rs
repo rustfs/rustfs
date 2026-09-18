@@ -1209,7 +1209,7 @@ mod tests {
             cancel: &warning_cancel,
         };
         let warning_result = store
-            .finish_rebalance_entry_after_cleanup(&warning_cleanup_context, async { Err(Error::SlowDown.into()) })
+            .finish_rebalance_entry_after_cleanup(&warning_cleanup_context, async { Err(Error::FileAccessDenied.into()) })
             .await
             .expect("cleanup warnings should not fail the completed migration");
         assert!(matches!(warning_result, RebalanceEntryCleanupResult::Completed { warning: Some(_) }));
@@ -1250,6 +1250,35 @@ mod tests {
         let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
         assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
         assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
+        drop(meta);
+
+        let transient_guard = store
+            .rebalance_run_guard(rebalance_id, "rebalance transient cleanup deferral test")
+            .await
+            .expect("rebalance transient cleanup deferral test guard should be acquired");
+        let transient_cancel = CancellationToken::new();
+        let transient_stats_updates = [&warning_version];
+        let transient_cleanup_context = RebalanceEntryCleanupContext {
+            run_guard: &transient_guard,
+            pool_index: 0,
+            bucket: "bucket",
+            object: "object.bin",
+            stats_updates: &transient_stats_updates,
+            expected_id: rebalance_id,
+            cancel: &transient_cancel,
+        };
+        let transient = store
+            .finish_rebalance_entry_after_cleanup(&transient_cleanup_context, async { Err(Error::SlowDown.into()) })
+            .await
+            .expect("retryable cleanup failures should defer without failing the worker");
+        assert!(matches!(transient, RebalanceEntryCleanupResult::Deferred { .. }));
+        let meta = store.rebalance_meta.read().await;
+        let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(pool_stats.bytes, 0, "retryable cleanup failures must not commit completion stats");
+        assert_eq!(
+            pool_stats.cleanup_warnings.count, 1,
+            "retryable cleanup failures must not add a permanent warning"
+        );
     }
 
     #[tokio::test]

@@ -1899,6 +1899,61 @@ impl AsyncWrite for DirectWriter {
         }
     }
 
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // Bitrot writes arrive as [hash, data]. Coalesce both slices into the
+        // aligned bounce buffer so the O_DIRECT path has the same byte-stream
+        // contract as the buffered writer instead of relying on the trait's
+        // first-slice fallback.
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                DirectWriteState::Busy(_) => {
+                    std::task::ready!(this.poll_drive_busy(cx))?;
+                }
+                DirectWriteState::Idle(inner_opt) => {
+                    let inner = inner_opt.as_mut().expect("idle direct writer must hold inner state");
+                    let capacity = inner.buf.len;
+                    let space = capacity - inner.filled;
+                    let mut remaining = space;
+                    let mut written = 0;
+                    for src in bufs {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = src.len().min(remaining);
+                        let start = inner.filled + written;
+                        inner.buf.as_mut_slice()[start..start + take].copy_from_slice(&src[..take]);
+                        written += take;
+                        remaining -= take;
+                    }
+
+                    if written == 0 {
+                        return std::task::Poll::Ready(Ok(0));
+                    }
+                    inner.filled += written;
+
+                    if inner.filled == capacity {
+                        let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let res = inner.flush_batch();
+                            (inner, res)
+                        });
+                        this.state = DirectWriteState::Busy(handle);
+                    }
+                    return std::task::Poll::Ready(Ok(written));
+                }
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
     fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         // Only drive an in-flight batch to completion. Sub-alignment staged
         // bytes cannot be flushed mid-stream (they would misalign the next
@@ -22134,7 +22189,7 @@ mod test {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn direct_writer_state_machine_round_trips_over_plain_file() {
-        use std::io::Read;
+        use std::io::{IoSlice, Read};
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
@@ -22153,6 +22208,16 @@ mod test {
 
             let mut writer = DirectWriter::from_std_file_for_test(file, align, capacity);
             let mut off = 0;
+            if content.len() >= 2 {
+                let split = content.len().min(300);
+                let first = split / 2;
+                let written = writer
+                    .write_vectored(&[IoSlice::new(&content[..first]), IoSlice::new(&content[first..split])])
+                    .await
+                    .expect("vectored write");
+                assert_eq!(written, split, "vectored write must consume both hash/data-like slices");
+                off = split;
+            }
             while off < content.len() {
                 let end = (off + 300).min(content.len());
                 writer.write_all(&content[off..end]).await.expect("write_all");

@@ -298,6 +298,18 @@ impl HealTask {
                     "Heal object stage entered"
                 );
                 let object_size = result.object_size as u64;
+                let ok_drive_state = DriveState::Ok.to_string();
+                if self.source == HealRequestSource::Admin
+                    && !self.options.dry_run
+                    && !result.after.drives.is_empty()
+                    && result.after.drives.iter().any(|drive| drive.state != ok_drive_state)
+                {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!(
+                            "Heal left one or more drives unhealthy for {bucket}/{object}; retry after the missing drives are restored"
+                        ),
+                    });
+                }
                 debug!(
                     target: "rustfs::heal::task",
                     event = EVENT_HEAL_OBJECT_RESULT,
