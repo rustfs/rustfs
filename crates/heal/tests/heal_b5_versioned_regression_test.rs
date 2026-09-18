@@ -36,6 +36,7 @@ use rustfs_heal::heal::{
 };
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -720,6 +721,91 @@ mod serial_tests {
             matches!(&latest_after, Ok(info) if info.delete_marker) || latest_after.is_err(),
             "latest must remain a delete marker after heal"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_recursive_deep_heal_reports_stale_delete_marker_repair() {
+        let (disk_paths, ecstore, storage) = heal_env().await;
+        let manager = HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                heal_interval: Duration::from_millis(1),
+                ..Default::default()
+            }),
+        );
+        manager.start().await.expect("heal manager should start");
+
+        let bucket = "b5-stale-delete-marker-recursive";
+        let object = "obj.bin";
+        create_versioned_bucket(&ecstore, bucket).await;
+        put_unversioned(&ecstore, bucket, "control/object.bin", &versioned_test_data(42)).await;
+        let historical_data = versioned_test_data(43);
+        let historical = put_versioned(&ecstore, bucket, object, &historical_data).await;
+        let target = &disk_paths[1];
+        let target_meta = xl_meta_path(&object_dir(target, bucket, object));
+        let stale_meta = std::fs::read(&target_meta).expect("target xl.meta must exist before marker creation");
+        let stale_digest = Sha256::digest(&stale_meta);
+        let marker = put_delete_marker(&ecstore, bucket, object).await;
+        std::fs::write(&target_meta, &stale_meta).expect("restore stale target xl.meta");
+
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: bucket.to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                scan_mode: HealScanMode::Deep,
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task_id = request.id.clone();
+        assert!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("submit recursive heal")
+                .is_admitted()
+        );
+        wait_for_task(&manager, &task_id, Duration::from_secs(60)).await;
+
+        let report = manager.get_task_report(&task_id).await.expect("completed task report");
+        let outcome = report.outcome.expect("recursive task must have an outcome");
+        assert_eq!(outcome.counters.failed, 0);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert_eq!(outcome.counters.processed, 3);
+        assert_eq!(outcome.counters.healed, 1, "delete marker repair must be counted as healed");
+        assert_eq!(outcome.counters.unchanged, 2);
+
+        let repaired_meta = std::fs::read(&target_meta).expect("repaired target xl.meta must exist");
+        assert_ne!(
+            Sha256::digest(&repaired_meta),
+            stale_digest,
+            "deep heal must replace stale rejoined metadata"
+        );
+
+        let marker_info = physical_version(target, bucket, object, &marker);
+        assert!(
+            marker_info.deleted && marker_info.is_latest,
+            "target metadata must converge to delete-marker latest"
+        );
+        let historical_info = physical_version(target, bucket, object, &historical);
+        assert!(!historical_info.is_latest, "historical version must no longer be marked latest");
+        assert_eq!(
+            read_version(&ecstore, bucket, object, &historical).await,
+            historical_data,
+            "historical version must remain readable after marker convergence"
+        );
+        let marker_receipt = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.version_id.as_deref() == Some(marker.as_str()))
+            .expect("deep heal must emit a receipt for the repaired delete marker");
+        assert_eq!(marker_receipt.disposition, HealObjectDisposition::Repaired);
+        manager.stop().await.expect("heal manager should stop");
     }
 
     /// A missing xl.meta must produce an exact marker repair receipt, while a
