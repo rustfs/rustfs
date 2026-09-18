@@ -1464,9 +1464,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
                 "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
             )));
         }
-    } else if incarnation.is_some() {
-        return Err(Error::other("bucket incarnation sidecar exists without bucket metadata"));
     }
+    // A sidecar without `.metadata.bin` is the window between the two legacy
+    // migration writes (rustfs/rustfs#8003): the sidecar lands first, and a
+    // crash or lost namespace lease before the metadata write leaves the
+    // bucket in this state on every node. Report it as not persisted so the
+    // migration runs again; the writers adopt the stored incarnation instead
+    // of minting a new one, so the sidecar keeps its authority.
 
     bm.default_timestamps();
 

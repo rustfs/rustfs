@@ -645,6 +645,17 @@ impl ECStore {
                     .as_ref()
                     .and_then(|info| info.created)
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+                // A sidecar left by an interrupted legacy migration is the
+                // bucket's published incarnation; keep it rather than minting
+                // one that would invalidate fences taken on the stored value.
+                // A retired incarnation is residue of a deleted bucket and
+                // must not come back.
+                let store = metadata_sys::object_store_in(&self.ctx).await?;
+                if let Some(stored) = crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket).await?
+                    && !crate::bucket::retirement::is_retired(store, bucket, stored).await?
+                {
+                    metadata.bucket_incarnation_id = stored;
+                }
             } else if !metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() {
                 return Err(Error::other(format!(
                     "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
@@ -2878,6 +2889,57 @@ mod tests {
         assert!(
             !meta.versioning_config_xml.is_empty(),
             "Object Lock requires versioning, so that must be persisted too"
+        );
+    }
+
+    /// rustfs/rustfs#8003: a force-create (site replication replay, admin
+    /// import) against a bucket whose legacy migration stopped after the
+    /// sidecar write must persist `.metadata.bin` under the stored incarnation
+    /// rather than fail closed or replace the published identity.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn issue_8003_force_create_adopts_existing_incarnation_sidecar() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-8003-sidecar-{}", Uuid::new_v4().simple());
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let stored = metadata_sys::get_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("metadata should load")
+            .bucket_incarnation_id;
+        assert!(!stored.is_nil());
+
+        let metadata_path = format!("{BUCKET_META_PREFIX}/{bucket}/{}", crate::bucket::metadata::BUCKET_METADATA_FILE);
+        crate::config::com::delete_config(ecstore.clone(), &metadata_path)
+            .await
+            .expect("simulate the interrupted migration by removing only .metadata.bin");
+        assert!(!any_disk_path_exists(&disk_paths, format!("{RUSTFS_META_BUCKET}/{metadata_path}")).await);
+        metadata_sys::remove_bucket_metadata_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("drop the cached copy so the next read hits disk");
+
+        ecstore
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    force_create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("force create must repair the sidecar-only bucket");
+
+        let (repaired, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("repaired metadata should load");
+        assert!(persisted, "force create must persist .metadata.bin again");
+        assert!(repaired.bucket_incarnation_sidecar);
+        assert_eq!(
+            repaired.bucket_incarnation_id, stored,
+            "the repair must keep the incarnation the sidecar already published"
         );
     }
 

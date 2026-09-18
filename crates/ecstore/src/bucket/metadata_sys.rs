@@ -2504,6 +2504,16 @@ impl BucketMetadataSys {
         if !persisted {
             metadata = BucketMetadata::new(bucket);
             metadata.created = bucket_info.created.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            // An interrupted migration may already have published this
+            // bucket's incarnation; re-read it under the transaction lock so
+            // the retry never replaces an identity other nodes fenced on. A
+            // retired incarnation is residue of a deleted bucket and must not
+            // come back, or heal would reclaim the bucket's new objects.
+            if let Some(stored) = load_bucket_incarnation(self.object_store(), bucket).await?
+                && !crate::bucket::retirement::is_retired(self.object_store(), bucket, stored).await?
+            {
+                metadata.bucket_incarnation_id = stored;
+            }
         } else if metadata.bucket_incarnation_id.is_nil() {
             metadata.bucket_incarnation_id = Uuid::new_v4();
         }
@@ -3554,6 +3564,98 @@ mod tests {
             .await
             .expect_err("new-format metadata without its sidecar must fail closed");
         assert!(err.to_string().contains("sidecar is missing"));
+    }
+
+    /// rustfs/rustfs#8003: the legacy migration writes the incarnation sidecar
+    /// before `.metadata.bin`. A crash or lost namespace lease between the two
+    /// left every pre-existing bucket answering 500 on every request, with no
+    /// path back. The sidecar-only state must load as a legacy bucket, and the
+    /// retried migration must keep the stored incarnation.
+    #[tokio::test]
+    async fn issue_8003_sidecar_without_metadata_loads_as_legacy_and_migrates_with_its_incarnation() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore.clone());
+        let bucket = "issue-8003-sidecar-only";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).unwrap();
+        }
+        let stored = Uuid::new_v4();
+        save_bucket_incarnation(ecstore.clone(), bucket, stored)
+            .await
+            .expect("simulate the interrupted migration's first write");
+
+        let (fabricated, persisted) = load_bucket_metadata_parse_with_presence(ecstore.clone(), bucket, true)
+            .await
+            .expect("a sidecar without metadata must read as a legacy bucket, not fail closed");
+        assert!(!persisted);
+        assert!(!fabricated.bucket_incarnation_sidecar);
+
+        let (_, fabricated_read) = sys
+            .get_config(bucket)
+            .await
+            .expect("request-path metadata reads must not fail closed on the sidecar-only state");
+        assert!(fabricated_read);
+
+        let migrated = sys
+            .get_authoritative_metadata(bucket)
+            .await
+            .expect("the retried legacy migration must complete");
+        assert!(migrated.bucket_incarnation_sidecar);
+        assert_eq!(
+            migrated.bucket_incarnation_id, stored,
+            "the retry must adopt the published incarnation instead of minting a new one"
+        );
+        assert_eq!(sys.get_bucket_incarnation_id(bucket).await.unwrap(), stored);
+
+        let on_disk = sys.get_config_from_disk(bucket).await.expect("metadata is now persisted");
+        assert!(on_disk.bucket_incarnation_sidecar);
+        assert_eq!(on_disk.bucket_incarnation_id, stored);
+        assert_eq!(load_bucket_incarnation(ecstore, bucket).await.unwrap(), Some(stored));
+    }
+
+    /// A sidecar left behind by a deleted bucket names a retired incarnation.
+    /// The migration must mint a new identity for a same-name volume instead
+    /// of re-publishing the retired one, or heal would treat the bucket's new
+    /// objects as reclaimable residue.
+    #[tokio::test]
+    async fn issue_8003_sidecar_only_migration_does_not_adopt_a_retired_incarnation() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore.clone());
+        let bucket = "issue-8003-retired-sidecar";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).unwrap();
+        }
+        let retired = Uuid::new_v4();
+        save_bucket_incarnation(ecstore.clone(), bucket, retired)
+            .await
+            .expect("residual sidecar");
+        crate::bucket::retirement::commit_retirement(
+            ecstore.clone(),
+            bucket,
+            retired,
+            &ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("retirement record");
+
+        let migrated = sys
+            .get_authoritative_metadata(bucket)
+            .await
+            .expect("the migration must still complete for the same-name volume");
+        assert!(migrated.bucket_incarnation_sidecar);
+        assert_ne!(
+            migrated.bucket_incarnation_id, retired,
+            "a retired incarnation must never be re-published"
+        );
+        assert!(!migrated.bucket_incarnation_id.is_nil());
+        assert_eq!(
+            load_bucket_incarnation(ecstore, bucket).await.unwrap(),
+            Some(migrated.bucket_incarnation_id),
+            "the sidecar must be rewritten to the new incarnation"
+        );
     }
 
     /// Concurrent cache misses for one bucket must collapse into a single disk
