@@ -4109,10 +4109,11 @@ mod heal_result_report_tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
+        let expected_payload = vec![0x6d; 1024 * 1024];
         set.put_object(
             bucket,
             object,
-            &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024]),
+            &mut PutObjReader::from_vec(expected_payload.clone()),
             &ObjectOptions {
                 no_lock: true,
                 ..Default::default()
@@ -4144,6 +4145,16 @@ mod heal_result_report_tests {
         file.set_len(original_len - 1)
             .await
             .expect("target shard should be truncated");
+
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET should remain readable after a one-byte shard truncation");
+        let mut read_back = Vec::new();
+        tokio::io::copy(&mut reader, &mut read_back)
+            .await
+            .expect("GET should reconstruct the truncated shard through EC");
+        assert_eq!(read_back, expected_payload, "EC GET must preserve the object bytes");
 
         let (result, error) = set
             .heal_object(

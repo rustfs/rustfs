@@ -36,6 +36,7 @@ use rustfs_heal::heal::{
 };
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -739,10 +740,12 @@ mod serial_tests {
         let object = "obj.bin";
         create_versioned_bucket(&ecstore, bucket).await;
         put_unversioned(&ecstore, bucket, "control/object.bin", &versioned_test_data(42)).await;
-        let historical = put_versioned(&ecstore, bucket, object, &versioned_test_data(43)).await;
+        let historical_data = versioned_test_data(43);
+        let historical = put_versioned(&ecstore, bucket, object, &historical_data).await;
         let target = &disk_paths[1];
         let target_meta = xl_meta_path(&object_dir(target, bucket, object));
         let stale_meta = std::fs::read(&target_meta).expect("target xl.meta must exist before marker creation");
+        let stale_digest = Sha256::digest(&stale_meta);
         let marker = put_delete_marker(&ecstore, bucket, object).await;
         std::fs::write(&target_meta, &stale_meta).expect("restore stale target xl.meta");
 
@@ -775,6 +778,14 @@ mod serial_tests {
         assert_eq!(outcome.counters.unknown, 0);
         assert_eq!(outcome.counters.processed, 3);
         assert_eq!(outcome.counters.healed, 1, "delete marker repair must be counted as healed");
+        assert_eq!(outcome.counters.unchanged, 2);
+
+        let repaired_meta = std::fs::read(&target_meta).expect("repaired target xl.meta must exist");
+        assert_ne!(
+            Sha256::digest(&repaired_meta),
+            stale_digest,
+            "deep heal must replace stale rejoined metadata"
+        );
 
         let marker_info = physical_version(target, bucket, object, &marker);
         assert!(
@@ -783,6 +794,17 @@ mod serial_tests {
         );
         let historical_info = physical_version(target, bucket, object, &historical);
         assert!(!historical_info.is_latest, "historical version must no longer be marked latest");
+        assert_eq!(
+            read_version(&ecstore, bucket, object, &historical).await,
+            historical_data,
+            "historical version must remain readable after marker convergence"
+        );
+        let marker_receipt = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.version_id.as_deref() == Some(marker.as_str()))
+            .expect("deep heal must emit a receipt for the repaired delete marker");
+        assert_eq!(marker_receipt.disposition, HealObjectDisposition::Repaired);
         manager.stop().await.expect("heal manager should stop");
     }
 
