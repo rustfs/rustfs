@@ -37,6 +37,14 @@ esac
 
 semver_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 prerelease_id='(alpha|beta|rc)\.(0|[1-9][0-9]*)'
+# Every SemVer pre-release separator becomes '~' in both package formats.
+# dpkg and rpm (>= 4.10) both treat '~' as "sorts before anything, even the
+# empty string", so 1.0.0~rc.5 < 1.0.0 and 1.0.0~rc.5~preview.2 < 1.0.0~rc.5.
+# Neither '_' (an ordinary rpm segment separator, which makes 1.0.0_rc.5 sort
+# above 1.0.0) nor a second '-' (which dpkg reads as the start of the Debian
+# revision, so 1.0.0~rc.5-preview.2 sorts above 1.0.0~rc.5) preserves the
+# SemVer ordering. GitHub stores '~' in asset names as '.'; package.yml
+# accounts for that when it writes the release checksums.
 tilde='~'
 
 case "$build_type" in
@@ -65,8 +73,8 @@ case "$build_type" in
     [[ "$source_version" =~ ^${semver_core}-${prerelease_id}$ ]] ||
       fail "prerelease version must be strict alpha, beta, or rc SemVer"
 
-    deb_version=${source_version/-/$tilde}
-    rpm_version=${source_version//-/_}
+    deb_version=${source_version//-/$tilde}
+    rpm_version=${source_version//-/$tilde}
     rpm_release=1
     ;;
   preview)
@@ -74,8 +82,8 @@ case "$build_type" in
     [[ "$source_version" =~ ^${semver_core}-${prerelease_id}-preview\.(0|[1-9][0-9]*)$ ]] ||
       fail "preview version must be strict prerelease-preview SemVer"
 
-    deb_version=${source_version/-/$tilde}
-    rpm_version=${source_version//-/_}
+    deb_version=${source_version//-/$tilde}
+    rpm_version=${source_version//-/$tilde}
     rpm_release=1
     ;;
   *) fail "unsupported build type" ;;
