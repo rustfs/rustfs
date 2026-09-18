@@ -40,7 +40,7 @@ use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -249,7 +249,7 @@ impl Operation for ListTargetSubscriptions {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         let (target_type, target_name) = extract_target_params(&params)?;
         let Some(store) = object_store_from_extensions(&req.extensions) else {
-            return Err(s3_error!(InternalError, "object store is not initialized"));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
         let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
         let target_arn = rustfs_targets::arn::TargetID::new(target_name.to_string(), target_type.to_string())
@@ -258,17 +258,18 @@ impl Operation for ListTargetSubscriptions {
         let buckets = store
             .list_bucket(&BucketOptions::default())
             .await
-            .map_err(|e| s3_error!(InternalError, "failed to list buckets: {e}"))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to list buckets: {e}")))?;
         let mut subscriptions = Vec::new();
         for bucket in buckets {
-            let Some(config) = get_notification_config(&bucket.name)
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to load notification config: {e}"))?
+            let Some(config) = get_notification_config(&bucket.name).await.map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load notification config: {e}"))
+            })?
             else {
                 continue;
             };
-            let value = serde_json::to_value(config)
-                .map_err(|e| s3_error!(InternalError, "failed to serialize notification config: {e}"))?;
+            let value = serde_json::to_value(config).map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
+            })?;
             for key in [
                 "queue_configurations",
                 "topic_configurations",
@@ -311,8 +312,8 @@ impl Operation for ListTargetSubscriptions {
                 }
             }
         }
-        let data =
-            serde_json::to_vec(&subscriptions).map_err(|e| s3_error!(InternalError, "failed to serialize subscriptions: {e}"))?;
+        let data = serde_json::to_vec(&subscriptions)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
