@@ -6715,7 +6715,7 @@ fn remote_version_state_writer_enabled() -> bool {
 }
 
 fn remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
-    transaction_fencing_fleet_proof(remote_version_state_writer_requested())
+    crate::services::notification_sys::acquire_remote_version_state_writer_fleet_proof()
 }
 
 fn remote_version_state_writer_requested() -> bool {
