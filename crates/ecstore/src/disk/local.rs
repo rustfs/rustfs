@@ -7611,7 +7611,7 @@ impl LocalDisk {
         objs_returned: &mut i32,
         skip_current_dir_object: bool,
         multipart_dir_to_skip: Option<HashSet<String>>,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         W: AsyncWrite + Unpin + Send,
     {
@@ -7629,7 +7629,7 @@ impl LocalDisk {
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
-            return Ok(());
+            return Ok(true);
         }
 
         // TODO(backlog): add directory listing lock to prevent concurrent enumeration
@@ -7690,12 +7690,12 @@ impl LocalDisk {
                     return Err(DiskError::FileNotFound);
                 }
 
-                return Ok(());
+                return Ok(false);
             }
         };
 
         if entries.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         current = current.trim_matches('/').to_owned();
@@ -7709,7 +7709,7 @@ impl LocalDisk {
             let entry = item.clone();
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(());
+                return Ok(true);
             }
             // check multipart dir
             if skip_current_dir_object
@@ -7814,12 +7814,12 @@ impl LocalDisk {
         prefix = "".to_owned();
 
         for entry in entries.iter() {
-            if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(());
-            }
-
             if entry.is_empty() {
                 continue;
+            }
+
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(true);
             }
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
@@ -7835,7 +7835,7 @@ impl LocalDisk {
                 // moment the limit is reached, same as the check below this
                 // loop guards against for the current entry itself.
                 if opts.limit > 0 && *objs_returned >= opts.limit {
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
@@ -7849,23 +7849,25 @@ impl LocalDisk {
                 .await?;
 
                 let scan_path = pop.clone();
-                if opts.recursive
-                    && scan_required
-                    && let Err(er) =
-                        Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
-                {
-                    if !er.is_metacache_output_stream_closed() {
-                        error!(
-                            event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            path = %scan_path,
-                            operation = "scan_dir",
-                            error = ?er,
-                            "Disk local scan failed"
-                        );
+                if opts.recursive && scan_required {
+                    match Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => {}
+                        Err(er) => {
+                            if !er.is_metacache_output_stream_closed() {
+                                error!(
+                                    event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    path = %scan_path,
+                                    operation = "scan_dir",
+                                    error = ?er,
+                                    "Disk local scan failed"
+                                );
+                            }
+                            return Err(er);
+                        }
                     }
-                    return Err(er);
                 }
             }
 
@@ -7876,7 +7878,7 @@ impl LocalDisk {
             // tail, permanently skipping those keys on the next page instead
             // of just deferring them to it.
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(());
+                return Ok(true);
             }
 
             let mut meta = MetaCacheEntry {
@@ -8019,7 +8021,7 @@ impl LocalDisk {
 
         while let Some((dir, skip_object, dir_to_skip, scan_required)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                return Ok(());
+                return Ok(true);
             }
 
             write_metacache_obj(
@@ -8032,27 +8034,29 @@ impl LocalDisk {
             .await?;
 
             let scan_path = dir.clone();
-            if opts.recursive
-                && scan_required
-                && let Err(er) =
-                    Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
-            {
-                if !er.is_metacache_output_stream_closed() {
-                    error!(
-                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = %scan_path,
-                        operation = "scan_dir",
-                        error = ?er,
-                        "Disk local recursive scan failed"
-                    );
+            if opts.recursive && scan_required {
+                match Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(er) => {
+                        if !er.is_metacache_output_stream_closed() {
+                            error!(
+                                event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                path = %scan_path,
+                                operation = "scan_dir",
+                                error = ?er,
+                                "Disk local recursive scan failed"
+                            );
+                        }
+                        return Err(er);
+                    }
                 }
-                return Err(er);
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Whether the backing directory of plain object `object_name` also holds
@@ -10176,21 +10180,25 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        self.scan_dir(
-            opts.base_dir.clone(),
-            opts.filter_prefix.clone().unwrap_or_default(),
-            &opts,
-            &mut out,
-            &mut objs_returned,
-            skip_current_dir_object,
-            if multipart_dir_to_skip.is_empty() {
-                None
-            } else {
-                Some(multipart_dir_to_skip)
-            },
-        )
-        .await?;
+        let limit_reached = self
+            .scan_dir(
+                opts.base_dir.clone(),
+                opts.filter_prefix.clone().unwrap_or_default(),
+                &opts,
+                &mut out,
+                &mut objs_returned,
+                skip_current_dir_object,
+                if multipart_dir_to_skip.is_empty() {
+                    None
+                } else {
+                    Some(multipart_dir_to_skip)
+                },
+            )
+            .await?;
 
+        if let Some(flag) = opts.producer_limit_reached.as_ref() {
+            flag.store(limit_reached, std::sync::atomic::Ordering::Release);
+        }
         out.close().await?;
         Ok(())
     }

@@ -66,7 +66,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
@@ -341,6 +341,18 @@ pub struct ListPathOptions {
     pub cursor_generation: Option<String>,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
+    /// Shared by the collector and raw producers to preserve bounded-walk
+    /// completion when filtering removes all entries from a batch.
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
+}
+
+fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool> {
+    let state = options
+        .producer_limit_reached
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    options.producer_limit_reached = Some(state.clone());
+    state
 }
 
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
@@ -4304,6 +4316,7 @@ impl ECStore {
         // cancel channel
         let cancel = CancellationToken::new();
         let _cancel_guard = cancel.clone().drop_guard();
+        ensure_producer_limit_state(&mut o);
 
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
@@ -5047,6 +5060,15 @@ async fn gather_results(
         }
     }
 
+    // A producer can close its stream after exhausting its own scan budget
+    // before this collector reaches its output limit.  In that case the input
+    // channel closing is not authoritative EOF: the caller must advertise a
+    // continuation page even when every remaining entry was filtered out.
+    let producer_limit_reached = opts
+        .producer_limit_reached
+        .as_ref()
+        .is_some_and(|reached| reached.load(Ordering::Acquire));
+
     // finish not full, return eof
     let filtered = scanned_entries.saturating_sub(candidate_entries);
     if let Some(started) = gather_started {
@@ -5083,7 +5105,7 @@ async fn gather_results(
                 o: MetaCacheEntries(entries),
                 ..Default::default()
             }),
-            err: Some(rustfs_filemeta::Error::Unexpected),
+            err: (!producer_limit_reached).then_some(rustfs_filemeta::Error::Unexpected),
         })
         .await
         .is_err()
@@ -5734,6 +5756,7 @@ impl Sets {
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
+        ensure_producer_limit_state(&mut o);
         let sets = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
@@ -6777,6 +6800,7 @@ impl SetDisks {
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
+        ensure_producer_limit_state(&mut o);
         let set = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
@@ -7098,6 +7122,7 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
+                producer_limit_reached: opts.producer_limit_reached.clone(),
                 // A foreground listing is bounded by lack of drive progress (the walk
                 // stall timeout) and by the page limit, never by how long a healthy
                 // walk takes — a large prefix on slow media is not a fault (#4644).
@@ -7328,6 +7353,7 @@ mod test {
     };
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -8345,6 +8371,45 @@ mod test {
         assert_eq!(state, GatherResultsState::ConsumerGone);
         // The eof branch never cancels; the wrapper's ConsumerGone arm does.
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_preserves_bounded_producer_after_filtering() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let producer_limit_reached = Arc::new(AtomicBool::new(true));
+
+        entry_tx
+            .send(test_meta_entry("outside-prefix"))
+            .await
+            .expect("filtered test entry should be queued");
+        drop(entry_tx);
+
+        let handle = tokio::spawn(gather_results(
+            cancel,
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                prefix: "requested/".to_owned(),
+                limit: 8,
+                incl_deleted: true,
+                producer_limit_reached: Some(producer_limit_reached),
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = result_rx.recv().await.expect("bounded producer result should be delivered");
+        assert!(result.entries.expect("entries should be present").entries().is_empty());
+        assert!(result.err.is_none(), "bounded producer must not be reported as EOF");
+        assert_eq!(
+            handle
+                .await
+                .expect("gather task should not panic")
+                .expect("gather should succeed"),
+            GatherResultsState::InputClosed
+        );
     }
 
     /// A-1 guard (rustfs/backlog#1306): pin that a *successful* send is never
