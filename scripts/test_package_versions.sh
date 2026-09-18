@@ -74,16 +74,16 @@ run_success stable-amd64 \
   $'deb_version=1.2.3\nrpm_version=1.2.3\nrpm_release=1\ndeb_file=rustfs_1.2.3_amd64.deb\nrpm_file=rustfs-1.2.3-1.x86_64.rpm' \
   release 1.2.3 '' amd64 x86_64
 run_success alpha-arm64 \
-  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3_alpha.1\nrpm_release=1\ndeb_file=rustfs_1.2.3~alpha.1_arm64.deb\nrpm_file=rustfs-1.2.3_alpha.1-1.aarch64.rpm' \
+  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3~alpha.1\nrpm_release=1\ndeb_file=rustfs_1.2.3~alpha.1_arm64.deb\nrpm_file=rustfs-1.2.3~alpha.1-1.aarch64.rpm' \
   prerelease 1.2.3-alpha.1 '' arm64 aarch64
 run_success beta-amd64 \
-  $'deb_version=1.2.3~beta.2\nrpm_version=1.2.3_beta.2\nrpm_release=1\ndeb_file=rustfs_1.2.3~beta.2_amd64.deb\nrpm_file=rustfs-1.2.3_beta.2-1.x86_64.rpm' \
+  $'deb_version=1.2.3~beta.2\nrpm_version=1.2.3~beta.2\nrpm_release=1\ndeb_file=rustfs_1.2.3~beta.2_amd64.deb\nrpm_file=rustfs-1.2.3~beta.2-1.x86_64.rpm' \
   prerelease 1.2.3-beta.2 '' amd64 x86_64
 run_success rc-amd64 \
-  $'deb_version=1.2.3~rc.4\nrpm_version=1.2.3_rc.4\nrpm_release=1\ndeb_file=rustfs_1.2.3~rc.4_amd64.deb\nrpm_file=rustfs-1.2.3_rc.4-1.x86_64.rpm' \
+  $'deb_version=1.2.3~rc.4\nrpm_version=1.2.3~rc.4\nrpm_release=1\ndeb_file=rustfs_1.2.3~rc.4_amd64.deb\nrpm_file=rustfs-1.2.3~rc.4-1.x86_64.rpm' \
   prerelease 1.2.3-rc.4 '' amd64 x86_64
 run_success preview-amd64 \
-  $'deb_version=1.0.0~rc.5-preview.2\nrpm_version=1.0.0_rc.5_preview.2\nrpm_release=1\ndeb_file=rustfs_1.0.0~rc.5-preview.2_amd64.deb\nrpm_file=rustfs-1.0.0_rc.5_preview.2-1.x86_64.rpm' \
+  $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs_1.0.0~rc.5~preview.2_amd64.deb\nrpm_file=rustfs-1.0.0~rc.5~preview.2-1.x86_64.rpm' \
   preview 1.0.0-rc.5-preview.2 '' amd64 x86_64
 run_success development-amd64 \
   "deb_version=0~dev.7463.${sha}
@@ -126,23 +126,43 @@ run_failure newline release $'1.2.3\nforged=1' '' amd64 x86_64
 run_failure unsupported-deb-arch release 1.2.3 '' x86_64 x86_64
 run_failure mismatched-arch release 1.2.3 '' amd64 aarch64
 
+# Ordering contract shared by both package managers: every pre-release sorts
+# below its final release, every preview sorts below the pre-release it
+# previews, and pre-release kinds/numbers keep their SemVer order.
 if command -v dpkg >/dev/null 2>&1; then
   dpkg --compare-versions "0~dev.7462.${sha}" lt "0~dev.7463.${sha}"
   dpkg --compare-versions "0~dev.7463.${sha}" lt 0.1.0
   dpkg --compare-versions 1.2.3~rc.4 lt 1.2.3
-  passed=$((passed + 3))
+  dpkg --compare-versions 1.2.3~alpha.1 lt 1.2.3~beta.2
+  dpkg --compare-versions 1.2.3~beta.2 lt 1.2.3~rc.4
+  dpkg --compare-versions 1.2.3~rc.9 lt 1.2.3~rc.10
+  dpkg --compare-versions 1.0.0~rc.5~preview.2 lt 1.0.0~rc.5
+  dpkg --compare-versions 1.0.0~rc.5~preview.1 lt 1.0.0~rc.5~preview.2
+  dpkg --compare-versions 1.0.0~rc.5~preview.2 lt 1.0.0~rc.6
+  dpkg --compare-versions 1.0.0~rc.5 lt 1.0.1
+  passed=$((passed + 10))
 elif [[ $require_package_managers == true ]]; then
   printf 'FAIL package ordering: dpkg is required\n' >&2
   exit 1
 fi
 
 if command -v rpm >/dev/null 2>&1; then
-  rpm_old="0-0.dev.7462.${sha}"
-  rpm_new="0-0.dev.7463.${sha}"
-  rpm_release=0.1.0-1
-  [[ $(rpm --eval "%{lua: print(rpm.vercmp('${rpm_old}', '${rpm_new}'))}") == -1 ]]
-  [[ $(rpm --eval "%{lua: print(rpm.vercmp('${rpm_new}', '${rpm_release}'))}") == -1 ]]
-  passed=$((passed + 2))
+  rpm_lt() {
+    [[ $(rpm --eval "%{lua: print(rpm.vercmp('$1', '$2'))}") == -1 ]] ||
+      { printf 'FAIL rpm ordering: expected %s < %s\n' "$1" "$2" >&2; exit 1; }
+    passed=$((passed + 1))
+  }
+  rpm_lt "0-0.dev.7462.${sha}" "0-0.dev.7463.${sha}"
+  rpm_lt "0-0.dev.7463.${sha}" 0.1.0-1
+  # The former 1.2.3_rc.4 spelling compared as newer than 1.2.3 (issue #8012).
+  rpm_lt 1.2.3~rc.4-1 1.2.3-1
+  rpm_lt 1.2.3~alpha.1-1 1.2.3~beta.2-1
+  rpm_lt 1.2.3~beta.2-1 1.2.3~rc.4-1
+  rpm_lt 1.2.3~rc.9-1 1.2.3~rc.10-1
+  rpm_lt 1.0.0~rc.5~preview.2-1 1.0.0~rc.5-1
+  rpm_lt 1.0.0~rc.5~preview.1-1 1.0.0~rc.5~preview.2-1
+  rpm_lt 1.0.0~rc.5~preview.2-1 1.0.0~rc.6-1
+  rpm_lt 1.0.0~rc.5-1 1.0.1-1
 elif [[ $require_package_managers == true ]]; then
   printf 'FAIL package ordering: rpm is required\n' >&2
   exit 1
