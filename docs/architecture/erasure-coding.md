@@ -17,6 +17,7 @@ This document describes the algorithm as implemented on `main`. The *invariant* 
   - [placement-repair-invariants.md](placement-repair-invariants.md) — owns object-to-**set** placement (which erasure set a key lands in), per-set readiness/lock quorum, scanner/heal admission, and the behavior-change gates.
   - [ecstore-layout-boundary.md](ecstore-layout-boundary.md) — owns the ecstore module ownership map, `FormatV3` set-ordering and disk-UUID-position invariants, and where the erasure engine physically lives.
   - [decommission-compatibility.md](decommission-compatibility.md) — owns moving encoded objects between pools (decommission/rebalance) and its persisted `PoolMeta` contract.
+  - [../operations/cluster-lifecycle-operations.md](../operations/cluster-lifecycle-operations.md) — owns the operator runbook (planning, `EC:0` consequences, expansion, rebalance, decommission, heal, drive replacement, restart recovery); this spec stays normative for the rules it cites.
   - [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md) — owns the ILM/tier runtime runbook, the dual internal-metadata-key table, the defensive binary-UUID read pattern, and the `xl.meta` inspection tooling (`dump_fileinfo` / `dump_versions`).
   - [AGENTS.md](../../AGENTS.md) "Cross-Cutting Domain Invariants" — dual internal metadata keys, defensive UUID reads, unversioned tier buckets.
   - [../../ARCHITECTURE.md](../../ARCHITECTURE.md) — crate roles (`ecstore`, `filemeta`, the `rustfs-erasure-codec` codec fork, `heal`, `scanner`).
