@@ -55,6 +55,13 @@ pub(crate) struct HealedObjectAbsence {
     pub removed: bool,
 }
 
+/// Conditions under which a missing object may become a storage-owned proof.
+#[derive(Clone, Copy)]
+pub(crate) struct AbsenceProofRequest<'a> {
+    pub retirement: Option<&'a MarkerRetirementContext<'a>>,
+    pub allow_unversioned: bool,
+}
+
 fn is_unavailable_heal_rpc(error: &DiskError) -> bool {
     let DiskError::Io(error) = error else {
         return false;
@@ -3012,8 +3019,18 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.heal_object_with_absence(bucket, object, version_id, opts, &mut None)
-            .await
+        self.heal_object_with_absence(
+            bucket,
+            object,
+            version_id,
+            opts,
+            &mut None,
+            AbsenceProofRequest {
+                retirement: None,
+                allow_unversioned: false,
+            },
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3098,8 +3115,9 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
         absence: &mut Option<HealedObjectAbsence>,
+        proof: AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.heal_object_with_retirement(bucket, object, version_id, opts, absence, None)
+        self.heal_object_with_retirement(bucket, object, version_id, opts, absence, proof)
             .await
     }
 
@@ -3110,7 +3128,7 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
         absence: &mut Option<HealedObjectAbsence>,
-        retirement: Option<&MarkerRetirementContext<'_>>,
+        proof: AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
         *absence = None;
         let _write_lock_guard = if !opts.no_lock {
@@ -3176,7 +3194,7 @@ impl SetDisks {
                 .await;
             // Check the lease after the final await before publishing the proof.
             if !opts.dry_run
-                && !version_id.is_empty()
+                && (proof.allow_unversioned || !version_id.is_empty())
                 && !disks.is_empty()
                 && disks.iter().all(Option::is_some)
                 && errs
@@ -3205,7 +3223,7 @@ impl SetDisks {
                 ExplicitVersionHeal {
                     opts: &inner_opts,
                     allow_regeneration: true,
-                    retirement,
+                    retirement: proof.retirement,
                 },
                 absence,
             )
@@ -3225,7 +3243,7 @@ impl SetDisks {
                             ExplicitVersionHeal {
                                 opts: &inner_opts,
                                 allow_regeneration: true,
-                                retirement,
+                                retirement: proof.retirement,
                             },
                             absence,
                         )
@@ -3277,7 +3295,7 @@ impl SetDisks {
 #[cfg(test)]
 mod heal_result_report_tests {
     use super::{
-        DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
+        AbsenceProofRequest, DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
         ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
     };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
@@ -5385,7 +5403,17 @@ mod heal_result_report_tests {
             let failure = DanglingDeleteFailure::install(bucket, object, 0, DiskError::FaultyDisk);
             let mut proof = None;
             let (_, error) = set
-                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
                 .await
                 .expect("heal should return a per-object failure");
             assert!(
@@ -5401,7 +5429,17 @@ mod heal_result_report_tests {
             );
             drop(failure);
             let (result, error) = set
-                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
                 .await
                 .expect("retry should execute cleanup");
             assert!(error.is_none(), "retry should complete: {error:?}");
@@ -5416,7 +5454,17 @@ mod heal_result_report_tests {
                     .all(|drive| drive.state == DriveState::Missing.to_string())
             );
             let (_, _) = set
-                .heal_object_with_absence(bucket, object, &version.to_string(), &opts, &mut proof)
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version.to_string(),
+                    &opts,
+                    &mut proof,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
                 .await
                 .expect("already absent replay should execute");
             assert!(!proof.expect("exact already-absent replay must remain provable").removed);

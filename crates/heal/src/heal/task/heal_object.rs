@@ -429,6 +429,10 @@ impl HealTask {
 
     /// Recreate missing object (for EC decode scenarios)
     async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+        if self.source == HealRequestSource::Mrf {
+            return self.recreate_missing_mrf_object(bucket, object, version_id).await;
+        }
+
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_OBJECT_STAGE,
@@ -528,5 +532,66 @@ impl HealTask {
                 })
             }
         }
+    }
+
+    /// Durable MRF responsibilities may complete only with an exact storage proof.
+    async fn recreate_missing_mrf_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: true,
+            scan_mode: HealScanMode::Deep,
+            update_parity: true,
+            no_lock: self.options.no_lock,
+            read_repair: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let mut expected = self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
+        let bucket_incarnation_id = self
+            .outcome_bucket_incarnation_id(bucket, self.options.dry_run)
+            .await?
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing bucket incarnation for durable MRF repair {bucket}/{object}"),
+            })?;
+        expected.bucket_incarnation_id = Some(bucket_incarnation_id);
+
+        let storage_result = self
+            .await_with_control(self.storage.heal_mrf_object_at_incarnation(
+                bucket,
+                object,
+                version_id,
+                bucket_incarnation_id,
+                &heal_opts,
+            ))
+            .await?;
+        if let Some(error) = storage_result.error {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
+            });
+        }
+
+        let object_size = storage_result.item.object_size as u64;
+        let authoritatively_absent = matches!(
+            storage_result.receipt.as_ref().map(|receipt| &receipt.disposition),
+            Some(HealObjectDisposition::AuthoritativelyAbsent)
+        );
+        if !self.record_verified_storage_receipt(expected, storage_result.receipt).await {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
+            });
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            if authoritatively_absent {
+                progress.update_object_progress(1, 0, 0, 1, 0);
+            } else {
+                progress.update_object_progress(1, 1, 0, 0, object_size);
+            }
+        }
+        self.record_result_item(storage_result.item).await;
+        Ok(())
     }
 }

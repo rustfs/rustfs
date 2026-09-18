@@ -532,6 +532,19 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("storage does not support incarnation-bound object healing"))
     }
 
+    /// Durable MRF repair may request an authoritative unversioned absence proof.
+    async fn heal_mrf_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.heal_object_at_incarnation(bucket, object, version_id, expected, opts)
+            .await
+    }
+
     /// Heal object using ecstore
     async fn heal_object(
         &self,
@@ -960,6 +973,24 @@ impl HealStorageAPI for ECStoreHealStorage {
         let result = self
             .ecstore
             .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+        Ok(self
+            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+            .await)
+    }
+
+    async fn heal_mrf_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let result = self
+            .ecstore
+            .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
             .await
             .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
         Ok(self

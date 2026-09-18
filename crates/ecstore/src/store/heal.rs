@@ -296,6 +296,24 @@ impl ECStore {
         .await
     }
 
+    pub async fn heal_mrf_object_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected: uuid::Uuid,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        let object = object.to_owned();
+        let version_id = version_id.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+            store
+                .heal_object_with_authoritative_absence_proof(&bucket, &object, &version_id, &opts)
+                .await
+        })
+        .await
+    }
+
     async fn acquire_heal_format_fence(
         &self,
     ) -> Result<(
@@ -684,8 +702,18 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.handle_heal_object_with_absence(bucket, object, version_id, opts, &mut None, None)
-            .await
+        self.handle_heal_object_with_absence(
+            bucket,
+            object,
+            version_id,
+            opts,
+            &mut None,
+            crate::set_disk::AbsenceProofRequest {
+                retirement: None,
+                allow_unversioned: false,
+            },
+        )
+        .await
     }
 
     pub async fn heal_object_with_proof(
@@ -695,7 +723,34 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<HealObjectStorageResult> {
-        if opts.dry_run || opts.no_lock || version_id.is_empty() || super::utils::is_reserved_or_invalid_bucket(bucket, false) {
+        self.heal_object_with_absence_proof(bucket, object, version_id, opts, false)
+            .await
+    }
+
+    async fn heal_object_with_authoritative_absence_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<HealObjectStorageResult> {
+        self.heal_object_with_absence_proof(bucket, object, version_id, opts, true)
+            .await
+    }
+
+    async fn heal_object_with_absence_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        allow_unversioned_absence: bool,
+    ) -> Result<HealObjectStorageResult> {
+        if opts.dry_run
+            || opts.no_lock
+            || (!allow_unversioned_absence && version_id.is_empty())
+            || super::utils::is_reserved_or_invalid_bucket(bucket, false)
+        {
             let (item, error) = self.handle_heal_object(bucket, object, version_id, opts).await?;
             return Ok(HealObjectStorageResult {
                 item,
@@ -738,7 +793,17 @@ impl ECStore {
         };
         let mut proofs = None;
         let (item, mut error) = self
-            .handle_heal_object_with_absence(bucket, object, version_id, opts, &mut proofs, Some(&retirement))
+            .handle_heal_object_with_absence(
+                bucket,
+                object,
+                version_id,
+                opts,
+                &mut proofs,
+                crate::set_disk::AbsenceProofRequest {
+                    retirement: Some(&retirement),
+                    allow_unversioned: allow_unversioned_absence,
+                },
+            )
             .await?;
         // Read the authoritative incarnation only for an absence candidate.
         // The lifecycle guard has pinned it throughout the storage operation.
@@ -780,7 +845,7 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
         absence: &mut Option<Vec<crate::set_disk::HealedObjectAbsence>>,
-        retirement: Option<&crate::bucket::retirement::MarkerRetirementContext<'_>>,
+        proof: crate::set_disk::AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
         trace!(
             event = EVENT_HEAL_OBJECT_STARTED,
@@ -871,7 +936,7 @@ impl ECStore {
                             }
                             #[cfg(test)]
                             crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                            pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, proof)
                                 .await
                         }
                     });
@@ -895,7 +960,7 @@ impl ECStore {
                     move |opts| async move {
                         #[cfg(test)]
                         crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
-                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, retirement)
+                        pool.heal_object_with_absence(bucket, &pool_object, version_id, &opts, proof)
                             .await
                     },
                 ));
