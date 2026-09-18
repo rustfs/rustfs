@@ -35,6 +35,7 @@ use crate::bucket::lifecycle::tier_sweeper::{
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::object_api::{ObjectInfo, ObjectOptions};
+use crate::services::notification_sys::acquire_remote_version_state_writer_fleet_proof;
 use crate::services::tier::{tier::TierConfigMgr, warm_backend::TransitionCandidateProbe};
 use crate::storage_api_contracts::{
     list::ListOperations as _,
@@ -1237,6 +1238,12 @@ pub async fn delete_transition_candidate_for_operator(
     lease
         .validate_remote_version_id(remote_version_id)
         .map_err(TransitionOperatorError::Remote)?;
+    if remote_version_requires_fleet_proof(remote_version_id) && acquire_remote_version_state_writer_fleet_proof().is_none() {
+        return Err(TransitionOperatorError::Remote(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opaque remote tier version cleanup requires the operator-attested live fleet capability gate",
+        )));
+    }
     let before_delete_probe = lease
         .probe_transition_candidate_for(&transaction.remote_object, transaction.transaction_id)
         .await
@@ -1845,6 +1852,11 @@ async fn recover_unknown_upload_outcome(
             ))
         }
         TransitionCandidateProbe::VersionedPresent(version_id) => {
+            if remote_version_requires_fleet_proof(&version_id) && acquire_remote_version_state_writer_fleet_proof().is_none() {
+                return Ok(TransitionTransactionRecoveryOutcome::RetainedAmbiguous(
+                    IlmRecoveryErrorCode::RemoteVersionUnknown,
+                ));
+            }
             cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::versioned(version_id)).await
         }
         TransitionCandidateProbe::Ambiguous => Ok(TransitionTransactionRecoveryOutcome::RetainedAmbiguous(
@@ -1940,6 +1952,14 @@ fn transition_source_lookup_options(transaction: &TransitionTransaction) -> Obje
 async fn delete_transition_remote_candidate(api: Arc<ECStore>, transaction: &TransitionTransaction) -> EcstoreResult<()> {
     let version_id = transaction.remote_version.tier_delete_version_id().unwrap_or_default();
     let version_id_exact = transaction.remote_version.kind == TransitionRemoteVersionKind::Versioned;
+    if version_id_exact
+        && remote_version_requires_fleet_proof(version_id)
+        && acquire_remote_version_state_writer_fleet_proof().is_none()
+    {
+        return Err(Error::other(
+            "opaque remote tier version cleanup requires the operator-attested live fleet capability gate",
+        ));
+    }
     delete_object_from_remote_tier_idempotent_with_manager_and_identity(
         &transaction.remote_object,
         version_id,
@@ -1951,6 +1971,10 @@ async fn delete_transition_remote_candidate(api: Arc<ECStore>, transaction: &Tra
     .await
     .map(|_| ())
     .map_err(Error::other)
+}
+
+fn remote_version_requires_fleet_proof(version_id: &str) -> bool {
+    !version_id.is_empty() && Uuid::parse_str(version_id).is_err()
 }
 
 pub async fn recover_transition_transaction_records(
@@ -2437,6 +2461,14 @@ mod tests {
             backend_fingerprint: transaction.backend_fingerprint,
             decision,
         }
+    }
+
+    #[test]
+    fn opaque_remote_versions_require_the_fleet_proof_boundary() {
+        assert!(!remote_version_requires_fleet_proof(""));
+        assert!(!remote_version_requires_fleet_proof(&Uuid::new_v4().to_string()));
+        assert!(remote_version_requires_fleet_proof("null"));
+        assert!(remote_version_requires_fleet_proof("b2-opaque-version"));
     }
 
     #[test]

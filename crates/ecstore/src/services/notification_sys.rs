@@ -453,6 +453,20 @@ pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersion
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(RemoteVersionStateFleetProofToken)
 }
 
+pub(crate) fn acquire_remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    let requested = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+    );
+    (requested && fleet_confirmed)
+        .then(acquire_remote_version_state_fleet_proof)
+        .flatten()
+}
+
 fn acquire_fleet_capability_proof_from(
     state: &FleetCapabilityProofState,
     expected_topology: &str,
