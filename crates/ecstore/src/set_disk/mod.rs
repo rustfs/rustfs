@@ -874,6 +874,7 @@ mod ctx;
 mod metadata;
 mod ops;
 pub(crate) use ops::bucket::BucketInfoQuorum;
+pub(crate) use ops::heal::AbsenceProofRequest;
 #[cfg(test)]
 pub(crate) use ops::heal::DanglingDeleteFailure;
 pub(crate) use ops::heal::HealedObjectAbsence;

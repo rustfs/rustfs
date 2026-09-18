@@ -90,6 +90,82 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
     );
 }
 
+#[test]
+fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof() {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mrf-partial-write-absence".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("partial-write absence runtime should build");
+            runtime.block_on(unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inner());
+        })
+        .expect("partial-write absence test thread should spawn")
+        .join()
+        .expect("partial-write absence test thread should finish");
+}
+
+async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inner() {
+    use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent};
+
+    temp_env::async_with_vars([("RUSTFS_HEAL_MRF_ENABLE", Some("true"))], async {
+        let root = tempfile::tempdir().expect("partial-write absence fixture directory");
+        let env = TestECStoreEnv::builder().disk_count(16).base_dir(root.path()).build().await;
+        env.make_bucket("partial-absence", false).await;
+        let mut coordinator_pool = env.endpoint_pools.as_ref()[0].clone();
+        let mut endpoints = coordinator_pool.endpoints.as_ref().to_vec();
+        for endpoint in endpoints.iter_mut().skip(4) {
+            endpoint.is_local = false;
+        }
+        coordinator_pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks(EndpointServerPools::from(vec![coordinator_pool]))
+            .await
+            .expect("coordinator journal disks");
+
+        let manager = manager(&env);
+        mrf_queue::spawn_mrf_consumer(manager.clone());
+        for (object, version_id) in [
+            ("deleted-unversioned.bin", None),
+            ("deleted-versioned.bin", Some(uuid::Uuid::new_v4())),
+        ] {
+            persist_partial_write_intent(
+                "partial-absence",
+                object,
+                version_id,
+                MrfScope {
+                    pool_index: 0,
+                    set_index: 0,
+                },
+            )
+            .await
+            .expect("durable partial-write responsibility must commit before scheduling");
+            assert!(snapshot_contains(object).await, "committed responsibility must exist before repair runs");
+        }
+
+        manager.start().await.expect("MRF scheduler should start");
+        for object in ["deleted-unversioned.bin", "deleted-versioned.bin"] {
+            assert!(
+                wait_until(|| async { !snapshot_contains(object).await }).await,
+                "complete absence proof must discharge the durable responsibility"
+            );
+        }
+        assert!(
+            wait_until(|| async {
+                let snapshot = manager.operations_snapshot().await;
+                snapshot.queue_length == 0 && snapshot.active_tasks == 0
+            })
+            .await,
+            "discharged absence repair must leave no queued work"
+        );
+        manager.stop().await.expect("absence manager should stop");
+    })
+    .await;
+}
+
 async fn wait_until<F: FnMut() -> Fut, Fut: Future<Output = bool>>(mut probe: F) -> bool {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {

@@ -717,6 +717,49 @@ mod absence_receipt_regressions {
         assert_versions(&store, bucket, &old, &current).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn unversioned_missing_object_produces_fenced_absence_receipt() {
+        let bucket = "absence-receipt-unversioned";
+        let object = "deleted.bin";
+        let (_paths, store, storage) = heal_env_n(16).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create unversioned bucket");
+        let incarnation = storage
+            .admit_bucket_incarnation(bucket)
+            .await
+            .expect("admit bucket incarnation for the durable proof");
+
+        let result = storage
+            .heal_mrf_object_at_incarnation(
+                bucket,
+                object,
+                None,
+                incarnation,
+                &HealOpts {
+                    pool: Some(0),
+                    set: Some(0),
+                    ..deep_heal_opts()
+                },
+            )
+            .await
+            .expect("fenced absence probe should return a storage result");
+        assert!(
+            result.error.is_none(),
+            "complete unversioned absence must not remain an error: {:?}",
+            result.error
+        );
+        let receipt = result.receipt.expect("complete unversioned absence needs a receipt");
+        assert_eq!(receipt.disposition, HealObjectDisposition::AuthoritativelyAbsent);
+        assert_eq!(receipt.identity.bucket, bucket);
+        assert_eq!(receipt.identity.object, object);
+        assert!(receipt.identity.version_id.is_none());
+        assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
+        assert_eq!(receipt.identity.bucket_incarnation_id, Some(incarnation));
+    }
+
     #[test]
     #[serial]
     fn historical_absence_receipt_bucket_outcome_matches_c06() {

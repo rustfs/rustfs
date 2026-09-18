@@ -3890,6 +3890,67 @@ async fn test_heal_recreate_scanner_non_dir_not_found_fails() {
 }
 
 #[tokio::test]
+async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        object_exists: Mutex::new(Some(false)),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "deleted.bin".to_string(),
+            VecDeque::from([HealObjectReceipt {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket-a".to_string(),
+                    object: "deleted.bin".to_string(),
+                    version_id: None,
+                    bucket_incarnation_id: Some(incarnation),
+                    pool_index: Some(2),
+                    set_index: Some(3),
+                },
+                disposition: HealObjectDisposition::AuthoritativelyAbsent,
+            }]),
+        )])),
+        ..Default::default()
+    });
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket-a".to_string(),
+            object: "deleted.bin".to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            recreate_missing: true,
+            pool_index: Some(2),
+            set_index: Some(3),
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Mrf;
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("a complete MRF absence receipt must complete the task");
+
+    let opts = storage.object_heal_opts.lock().unwrap()[0];
+    assert_eq!(opts.pool, Some(2));
+    assert_eq!(opts.set, Some(3));
+    assert!(opts.recreate);
+    assert_eq!(opts.scan_mode, HealScanMode::Deep);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.unchanged, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::AuthoritativelyAbsent);
+    assert_eq!(
+        (outcome.objects[0].identity.pool_index, outcome.objects[0].identity.set_index),
+        (Some(2), Some(3))
+    );
+}
+
+#[tokio::test]
 async fn test_heal_scanner_missing_object_without_recreate_probes_storage() {
     let storage = Arc::new(MockStorage {
         object_exists: Mutex::new(Some(false)),
