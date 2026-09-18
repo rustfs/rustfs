@@ -23,7 +23,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     task::{Context, Poll},
     time::Duration,
 };
@@ -234,6 +234,8 @@ pub struct ListPathRawOptions {
     pub skip_walkdir_total_timeout: bool,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
+    /// Shared terminal state for bounded producer walks.
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
@@ -267,6 +269,7 @@ impl Clone for ListPathRawOptions {
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
             walkdir_timeout: self.walkdir_timeout,
             walkdir_stall_timeout: self.walkdir_stall_timeout,
+            producer_limit_reached: self.producer_limit_reached.clone(),
             #[cfg(test)]
             test_reader_behaviors: self.test_reader_behaviors.clone(),
             #[cfg(test)]
@@ -292,6 +295,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         skip_total_timeout: opts.skip_walkdir_total_timeout,
         timeout_ms: opts.walkdir_timeout.map(duration_millis),
         stall_timeout_ms: opts.walkdir_stall_timeout.map(duration_millis),
+        producer_limit_reached: opts.producer_limit_reached.clone(),
         ..Default::default()
     }
 }
