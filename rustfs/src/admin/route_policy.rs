@@ -312,6 +312,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/target/{target_type}/{target_name}/subscriptions",
+        GET_BUCKET_TARGET,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/info", SERVER_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/storageinfo", STORAGE_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS, RouteRiskLevel::Sensitive),
