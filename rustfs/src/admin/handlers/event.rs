@@ -16,8 +16,6 @@ use crate::admin::{
     auth::authorize_admin_request,
     handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::supervise_admin_mutation,
-    runtime_sources::object_store_from_extensions,
-    storage_api::contract::bucket::{BucketOperations, BucketOptions},
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
         build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
@@ -25,8 +23,10 @@ use crate::admin::{
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::object_store_from_extensions,
     runtime_sources::{AppContext, app_context_from_req},
     service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
+    storage_api::contract::bucket::{BucketOperations, BucketOptions},
 };
 use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
 use crate::server::{
@@ -269,7 +269,11 @@ impl Operation for ListTargetSubscriptions {
             };
             let value = serde_json::to_value(config)
                 .map_err(|e| s3_error!(InternalError, "failed to serialize notification config: {e}"))?;
-            for key in ["queue_configurations", "topic_configurations", "lambda_function_configurations"] {
+            for key in [
+                "queue_configurations",
+                "topic_configurations",
+                "lambda_function_configurations",
+            ] {
                 if let Some(entries) = value.get(key).and_then(Value::as_array) {
                     for entry in entries {
                         let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
@@ -307,8 +311,8 @@ impl Operation for ListTargetSubscriptions {
                 }
             }
         }
-        let data = serde_json::to_vec(&subscriptions)
-            .map_err(|e| s3_error!(InternalError, "failed to serialize subscriptions: {e}"))?;
+        let data =
+            serde_json::to_vec(&subscriptions).map_err(|e| s3_error!(InternalError, "failed to serialize subscriptions: {e}"))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
