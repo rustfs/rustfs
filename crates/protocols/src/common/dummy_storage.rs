@@ -185,6 +185,11 @@ struct Inner {
     // mid-await.
     stall_list_objects_v2: bool,
     list_objects_v2_entered: Option<Arc<Notify>>,
+
+    // When stall_head_object is true every head_object invocation
+    // signals head_object_entered and then awaits std::future::pending.
+    stall_head_object: bool,
+    head_object_entered: Option<Arc<Notify>>,
 }
 
 impl Inner {
@@ -222,6 +227,8 @@ impl Inner {
             put_object_entered: None,
             stall_list_objects_v2: false,
             list_objects_v2_entered: None,
+            stall_head_object: false,
+            head_object_entered: None,
         }
     }
 }
@@ -554,6 +561,14 @@ impl DummyBackend {
         inner.list_objects_v2_entered = None;
     }
 
+    /// Configure head_object to stall indefinitely. Each call notifies
+    /// the supplied Notify once, then awaits std::future::pending.
+    pub fn stall_head_object(&self, entered: Arc<Notify>) {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.stall_head_object = true;
+        inner.head_object_entered = Some(entered);
+    }
+
     // Observers. Tests call these after the driver has run to verify the
     // backend received the expected calls.
 
@@ -676,16 +691,27 @@ impl StorageBackend for DummyBackend {
     }
 
     async fn head_object(&self, bucket: &str, key: &str, _credentials: &Credentials) -> Result<HeadObjectOutput, Self::Error> {
-        {
+        let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
             inner.head_object_calls.push(HeadObjectCall {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             });
-        }
-        match self.inner.lock().expect("lock").head_object.pop_front() {
-            Some(r) => r,
-            None => Err(DummyError::NoSuchKey(format!("{bucket}/{key}"))),
+            let stall = inner.stall_head_object;
+            let entered = inner.head_object_entered.clone();
+            let popped = if stall { None } else { inner.head_object.pop_front() };
+            (stall, entered, popped)
+        };
+        if stall {
+            if let Some(n) = entered {
+                n.notify_one();
+            }
+            std::future::pending::<Result<HeadObjectOutput, Self::Error>>().await
+        } else {
+            match popped {
+                Some(r) => r,
+                None => Err(DummyError::NoSuchKey(format!("{bucket}/{key}"))),
+            }
         }
     }
 

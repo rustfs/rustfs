@@ -254,6 +254,7 @@ pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Act
             S3Action::GetObjectAcl => false,
             S3Action::PutObjectAcl => false,
         },
+        super::session::Protocol::Tftp => matches!(action, S3Action::GetObject | S3Action::HeadObject),
     }
 }
 
