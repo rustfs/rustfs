@@ -7703,10 +7703,11 @@ impl SetDisks {
         drop(namespace_owner);
         if quorum_result.is_ok()
             && errs.iter().any(Option::is_some)
-            && let Some(purge) = delete_marker_purge
+            && let Some(purge) = delete_marker_purge.as_ref()
             && let Some(version) = fi.version_id.filter(|version| !version.is_nil())
         {
-            let _ = self.persist_delete_marker_purge(bucket, object, version, purge).await;
+            let _ = self.persist_marker_purge_receipt(bucket, object, version, purge).await;
+            let _ = self.persist_delete_marker_purge(bucket, object, version, purge.clone()).await;
         }
         // An explicit purge can carry deleted=true for the existing marker.
         // It must not create a repair intent that could reintroduce that marker.
