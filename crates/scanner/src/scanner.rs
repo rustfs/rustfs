@@ -1778,9 +1778,7 @@ where
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
-        BackgroundHealInfoReadStatus::ErasureSd
-        | BackgroundHealInfoReadStatus::Loaded
-        | BackgroundHealInfoReadStatus::Missing => {}
+        BackgroundHealInfoReadStatus::Loaded | BackgroundHealInfoReadStatus::Missing => {}
     }
     let mut background_heal_info = background_heal_read.info;
     let background_heal_epoch = background_heal_read.expected_epoch;
