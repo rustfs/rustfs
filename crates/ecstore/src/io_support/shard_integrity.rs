@@ -587,7 +587,11 @@ pub(crate) async fn verify_deep_parts(
             return Err(DiskError::FileCorrupt);
         }
         let part_status = statuses.get_mut(&part_index).ok_or(DiskError::FileCorrupt)?;
-        let length = erasure.shard_file_offset(0, part.size, part.size);
+        // Deep verification reads the complete encoded shard. `shard_file_offset`
+        // is a range-read helper and can stop before the final encoded byte for
+        // a partial data block, which would let a one-byte tail truncation pass
+        // as healthy. Use the physical shard length for the integrity proof.
+        let length = usize::try_from(erasure.shard_file_size(part.size as i64)).map_err(|_| DiskError::FileCorrupt)?;
         let mut readers = Vec::with_capacity(disks.len());
         for (index, disk) in disks.iter().enumerate() {
             if part_status[index] != CHECK_PART_UNKNOWN {
