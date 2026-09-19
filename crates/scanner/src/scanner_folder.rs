@@ -1806,6 +1806,14 @@ impl FolderScanner {
                     continue;
                 }
 
+                // Do not start another metadata read while foreground work is
+                // active. The post-object timer protects the next request only
+                // after the read has already been dispatched; this admission
+                // point keeps the scanner from extending a single-disk I/O
+                // burst across foreground requests.
+                if crate::workload_admission::foreground_workload_activity() > 0 {
+                    self.sleeper.sleep_folder().await;
+                }
                 let timer = self.sleeper.timer();
 
                 let heal_enabled = this_hash.mod_alt(

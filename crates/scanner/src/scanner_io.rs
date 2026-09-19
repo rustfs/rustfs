@@ -1609,8 +1609,8 @@ use dirty_usage::*;
 use guards::*;
 
 pub(crate) use cache::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistResult, acquire_scanner_cache_locks,
-    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
+    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,
