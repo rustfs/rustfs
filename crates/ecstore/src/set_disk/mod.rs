@@ -3915,6 +3915,72 @@ pub struct SetDisks {
     >,
 }
 
+fn marker_purge_receipt_path(
+    bucket: &str,
+    object: &str,
+    version: Uuid,
+    purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+) -> String {
+    let object_hash = rustfs_utils::crypto::hex(Sha256::digest(object.as_bytes()));
+    let marker_hash = rustfs_utils::crypto::hex(purge.marker_identity);
+    format!(
+        "marker-purge-receipts/{}/{}/{}-{}-{}.json",
+        bucket, purge.bucket_incarnation_id, version, object_hash, marker_hash
+    )
+}
+
+impl SetDisks {
+    /// Persist a quorum DELETE receipt outside the object marker itself. The
+    /// receipt is written to the metadata bucket so it survives a node restart
+    /// while an inaccessible member still holds the stale marker.
+    pub(crate) async fn persist_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> bool {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        let api = Arc::new(self.clone());
+        crate::config::com::save_config_with_opts(
+            api,
+            &path,
+            b"rustfs-marker-purge-receipt-v1".to_vec(),
+            &ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    pub(crate) async fn has_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> bool {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        crate::config::com::read_config_limited_preserve_empty(Arc::new(self.clone()), &path, 128)
+            .await
+            .is_ok()
+    }
+
+    pub(crate) async fn consume_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        let _ = crate::config::com::delete_config_no_lock(Arc::new(self.clone()), &path).await;
+    }
+}
+
 /// Read every physical copy before selecting a version quorum. A minority
 /// legacy record is still evidence and must not disappear behind a majority
 /// not-found result. Only an explicit file/volume absence produces `None`;

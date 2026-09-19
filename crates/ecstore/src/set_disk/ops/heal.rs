@@ -38,6 +38,7 @@ use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use tracing::trace;
 
@@ -1469,7 +1470,12 @@ impl SetDisks {
                                     })
                                     .transpose()
                                     .map_err(DiskError::from)?;
-                                let till_offset = erasure.shard_file_offset(0, part.size, part.size);
+                                // This reader covers the whole encoded shard. A range
+                                // offset can exclude the final encoded byte when the
+                                // logical part ends inside a data block, allowing a
+                                // one-byte tail truncation to evade deep Heal.
+                                let till_offset = usize::try_from(erasure.shard_file_size(part.size as i64))
+                                    .map_err(|_| DiskError::FileCorrupt)?;
                                 let use_mmap_read = object_mmap_read_enabled();
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
@@ -1907,13 +1913,26 @@ impl SetDisks {
                         .zip(&errs)
                         .any(|(info, error)| error.is_none() && info.is_canonical_delete_marker())
                 {
-                    let cleanup = match Self::retired_marker_candidate(&parts_metadata, &errs) {
-                        Ok(marker) => {
-                            self.remove_retired_marker(retirement, bucket, object, marker, opts, &disks)
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    // A current-generation delete marker can be left behind on
+                    // an inaccessible member after an acknowledged S3 DELETE.
+                    // That case has no bucket-retirement record, so evaluate its
+                    // stricter same-incarnation proof before the retired-marker
+                    // path. The proof requires an exact marker identity, at
+                    // least one replica already absent, and every target online.
+                    let cleanup =
+                        match Self::same_incarnation_marker_candidate(&parts_metadata, &errs, retirement.current_incarnation) {
+                            Ok(marker) => {
+                                self.remove_current_marker(retirement, bucket, object, marker, opts, &disks)
+                                    .await
+                            }
+                            Err(_) => match Self::retired_marker_candidate(&parts_metadata, &errs) {
+                                Ok(marker) => {
+                                    self.remove_retired_marker(retirement, bucket, object, marker, opts, &disks)
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            },
+                        };
                     let absent = cleanup.is_ok();
                     let item = self
                         .dangling_heal_result(FileInfo::default(), &errs, bucket, object, version_id, absent)
@@ -2027,6 +2046,41 @@ impl SetDisks {
         candidate.ok_or_else(|| DiskError::retired_marker_deferred("no exact marker candidate"))
     }
 
+    fn same_incarnation_marker_candidate(
+        metadata: &[FileInfo],
+        errors: &[Option<DiskError>],
+        current_incarnation: Option<Uuid>,
+    ) -> disk::error::Result<rustfs_filemeta::MetaDeleteMarker> {
+        let defer = DiskError::retired_marker_deferred;
+        let Some(current) = current_incarnation.filter(|id| !id.is_nil()) else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        let mut candidate = None;
+        let mut missing_replica = false;
+        for (info, error) in metadata.iter().zip(errors) {
+            match error {
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {
+                    missing_replica = true;
+                    continue;
+                }
+                Some(_) => return Err(defer("not every replica is readable")),
+                None => {}
+            }
+            if !info.is_canonical_delete_marker() || info.delete_marker_incarnation() != Some(current) {
+                return Err(defer("marker is not a canonical current-generation marker"));
+            }
+            let marker = rustfs_filemeta::MetaDeleteMarker::from(info.clone());
+            if candidate.as_ref().is_some_and(|previous| previous != &marker) {
+                return Err(defer("surviving marker identities conflict"));
+            }
+            candidate = Some(marker);
+        }
+        if !missing_replica {
+            return Err(defer("marker is present on every replica"));
+        }
+        candidate.ok_or_else(|| defer("no exact current-generation marker candidate"))
+    }
+
     async fn remove_retired_marker(
         &self,
         context: &MarkerRetirementContext<'_>,
@@ -2065,6 +2119,72 @@ impl SetDisks {
         if context.lifecycle_guard.is_lock_lost() {
             return Err(defer("bucket lifecycle fence was lost"));
         }
+        let result = self
+            .remove_marker_exact_under_fence(bucket, object, marker, version, disks)
+            .await;
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        result
+    }
+
+    async fn remove_current_marker(
+        &self,
+        context: &MarkerRetirementContext<'_>,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        opts: &HealOpts,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
+        let defer = DiskError::retired_marker_deferred;
+        if opts.dry_run || !opts.remove {
+            return Err(defer("cleanup requires remove=true and dry_run=false"));
+        }
+        if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
+            return Err(defer("every target disk must be online"));
+        }
+        let Some(current) = context.current_incarnation.filter(|id| !id.is_nil()) else {
+            return Err(defer("current bucket incarnation is unavailable"));
+        };
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        let incarnation = marker.into_fileinfo(bucket, object, false)?.delete_marker_incarnation();
+        if incarnation != Some(current) {
+            return Err(defer("marker is not from the current bucket incarnation"));
+        }
+        let Some(version) = marker.version_id.filter(|id| !id.is_nil()) else {
+            return Err(defer("cleanup requires an explicit non-null version"));
+        };
+        let marker_identity = marker.stable_identity();
+        let marker_bytes = marker.marshal_msg().map_err(DiskError::other)?;
+        let Some(purge) = MrfDeleteMarkerPurge::new(current, current, marker_identity, marker_bytes) else {
+            return Err(defer("marker purge proof payload is invalid"));
+        };
+        if !self.has_marker_purge_receipt(bucket, object, version, &purge).await {
+            return Err(defer("same-incarnation marker lacks an acknowledged delete receipt"));
+        }
+        let result = self
+            .remove_marker_exact_under_fence(bucket, object, marker, version, disks)
+            .await;
+        if context.lifecycle_guard.is_lock_lost() {
+            return Err(defer("bucket lifecycle fence was lost"));
+        }
+        if result.is_ok() {
+            self.consume_marker_purge_receipt(bucket, object, version, &purge).await;
+        }
+        result
+    }
+
+    async fn remove_marker_exact_under_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        marker: rustfs_filemeta::MetaDeleteMarker,
+        version: Uuid,
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<()> {
         let request = FileInfo {
             volume: bucket.to_owned(),
             name: object.to_owned(),
@@ -2105,13 +2225,14 @@ impl SetDisks {
         let same_targets = selected.len() == disks.len() && selected.iter().zip(disks).all(|(current, original)| {
             matches!((current, original), (Some(current), Some(original)) if std::sync::Arc::ptr_eq(current, original))
         });
-        if context.lifecycle_guard.is_lock_lost()
-            || !same_targets
+        if !same_targets
             || !errors
                 .iter()
                 .all(|error| matches!(error, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)))
         {
-            return Err(defer("complete marker absence could not be verified under the original fence"));
+            return Err(DiskError::retired_marker_deferred(
+                "complete marker absence could not be verified under the original target set",
+            ));
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(())
@@ -3319,7 +3440,9 @@ mod heal_result_report_tests {
     use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, new_disk};
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
-    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use crate::set_disk::ops::object::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity_isolated, hermetic_set_disks_isolated,
+    };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -4180,6 +4303,89 @@ mod heal_result_report_tests {
                 .len(),
             original_len,
             "deep heal must restore the complete shard length"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_heal_rebuilds_h2_near_tail_truncated_part() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(16, 0, 4).await;
+        let bucket = "deep-heal-h2-near-tail-truncation";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let expected_payload = vec![0x6d; 5 * 1024 * 1024 + 123];
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_payload.clone()),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before shard truncation");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let truncated_part = temp_dirs[1]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        let original_len = tokio::fs::metadata(&truncated_part)
+            .await
+            .expect("target shard should exist")
+            .len();
+        assert!(original_len > 1, "test shard must be large enough to truncate");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated_part)
+            .await
+            .expect("target shard should be writable");
+        file.set_len(original_len - 1)
+            .await
+            .expect("target shard should be truncated");
+
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET should remain readable after a one-byte shard truncation");
+        let mut read_back = Vec::new();
+        tokio::io::copy(&mut reader, &mut read_back)
+            .await
+            .expect("GET should reconstruct the truncated shard through EC");
+        assert_eq!(read_back, expected_payload, "EC GET must preserve the object bytes");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after a one-byte H2 tail truncation");
+
+        assert!(error.is_none(), "deep heal should recover the H2 truncated shard: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        assert_eq!(result.before.drives[1].state, DriveState::Corrupt.to_string());
+        assert_eq!(
+            tokio::fs::metadata(&truncated_part)
+                .await
+                .expect("repaired H2 shard should exist")
+                .len(),
+            original_len,
+            "deep heal must restore the complete H2 shard length"
         );
     }
 
