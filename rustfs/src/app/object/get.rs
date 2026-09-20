@@ -499,6 +499,14 @@ fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
     }
 }
 
+/// A mid-stream reopen can recover only when another representation of the
+/// committed object may exist. A single-disk, no-parity object has no alternate
+/// shard after a bitrot/read-quorum failure, so retrying the same read only
+/// repeats the failure and adds latency.
+fn should_attach_get_object_resume(info: &ObjectInfo) -> bool {
+    info.parity_blocks > 0 || info.data_blocks > 1 || !info.transitioned_object.tier.is_empty()
+}
+
 fn record_get_object_reader_stream_failure(
     reason: &'static str,
     error_class: &'static str,
@@ -4188,16 +4196,18 @@ impl DefaultObjectUsecase {
                 part_number,
                 lifecycle,
                 |info| {
-                    Some(get_object_resume_control(GetObjectResumeContext::new(
-                        store,
-                        &bucket,
-                        &key,
-                        opts,
-                        &req.headers,
-                        info,
-                        resume_range_start,
-                        resume_range_end,
-                    )))
+                    should_attach_get_object_resume(info).then(|| {
+                        get_object_resume_control(GetObjectResumeContext::new(
+                            store,
+                            &bucket,
+                            &key,
+                            opts,
+                            &req.headers,
+                            info,
+                            resume_range_start,
+                            resume_range_end,
+                        ))
+                    })
                 },
             )
             .await;
@@ -8363,6 +8373,34 @@ mod tests {
         );
         assert_eq!(out, b"hello world");
         assert_eq!(reopen_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn get_object_resume_only_attaches_for_recoverable_layouts() {
+        let single_disk = ObjectInfo {
+            data_blocks: 1,
+            parity_blocks: 0,
+            ..Default::default()
+        };
+        assert!(!should_attach_get_object_resume(&single_disk));
+
+        let erasure = ObjectInfo {
+            data_blocks: 2,
+            parity_blocks: 1,
+            ..Default::default()
+        };
+        assert!(should_attach_get_object_resume(&erasure));
+
+        let transitioned = ObjectInfo {
+            data_blocks: 1,
+            parity_blocks: 0,
+            transitioned_object: crate::storage_api::server::event::contract::lifecycle::TransitionedObject {
+                tier: "remote-tier".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(should_attach_get_object_resume(&transitioned));
     }
 
     #[test]
