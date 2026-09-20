@@ -1984,9 +1984,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.6"
+version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
+checksum = "54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -4410,9 +4410,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 
 [[package]]
 name = "findshlibs"
@@ -11258,9 +11258,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3s"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87d22507a8ebd0ea64972c76dfedbc477418dc70afd98bfce928263894067d2f"
+version = "0.16.0"
+source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11278,7 +11277,6 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "httparse",
  "hyper",
  "itoa",
  "jiff",
@@ -11291,6 +11289,7 @@ dependencies = [
  "pin-project-lite",
  "quick-xml",
  "regex",
+ "s3s-multipart",
  "s3s-rfc2047",
  "s3s-sigv2",
  "s3s-sigv4",
@@ -11316,10 +11315,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "s3s-multipart"
+version = "0.17.0-alpha.1"
+source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+dependencies = [
+ "arrayvec",
+ "bytes",
+ "futures-core",
+ "httparse",
+ "memchr",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "s3s-rfc2047"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d3e6b36be7cca3da377b4cabcd668ffe5b16c3b73a83f7a8f7b63ff6a178ee"
+version = "0.16.0"
+source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.20",
@@ -11327,9 +11338,8 @@ dependencies = [
 
 [[package]]
 name = "s3s-sigv2"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d96880b5ad8d639c9224155126741708aeb62ad3682e0476d2fd14290af808ef"
+version = "0.16.0"
+source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11341,9 +11351,8 @@ dependencies = [
 
 [[package]]
 name = "s3s-sigv4"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fed605cbaaa1cf4d82e8ee15098fb3e42d49c92bb6215eb1359f63bfc0c6b020"
+version = "0.16.0"
+source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
 dependencies = [
  "arrayvec",
  "base64-simd",

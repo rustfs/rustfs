@@ -4224,6 +4224,78 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_rebuilds_a_stale_current_delete_marker_metadata_replica() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-stale-current-marker";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+        }
+
+        let versioned = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+        let original = set
+            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x41; 1024]), &versioned)
+            .await
+            .expect("versioned source object should be written");
+        let stale_metadata = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("pre-marker metadata should be readable");
+
+        let marker = set
+            .delete_object(bucket, object, versioned)
+            .await
+            .expect("versioned delete should create a current marker");
+        let marker_version = marker.version_id.expect("delete marker should have a version id");
+
+        // Simulate a member that was offline while the acknowledged marker was
+        // committed on the other members: its physical root still contains the
+        // pre-delete metadata and the original data version.
+        let mut stale_metadata = stale_metadata;
+        stale_metadata.fresh = true;
+        disks[0]
+            .write_metadata("", bucket, object, stale_metadata)
+            .await
+            .expect("stale member metadata should be restored for the fixture");
+        assert_eq!(
+            disks[0]
+                .read_version("", bucket, object, &marker_version.to_string(), &ReadOptions::default())
+                .await
+                .expect_err("stale member must not contain the current marker")
+                .to_string(),
+            "file version not found"
+        );
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                &marker_version.to_string(),
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should report the stale marker result");
+
+        assert!(error.is_none(), "deep heal should repair stale marker metadata: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        let repaired = disks[0]
+            .read_version("", bucket, object, &marker_version.to_string(), &ReadOptions::default())
+            .await
+            .expect("rejoined member should contain the marker");
+        assert!(repaired.deleted, "repaired metadata must remain a delete marker");
+        assert_eq!(repaired.version_id, Some(marker_version));
+        assert!(original.version_id.is_some(), "source object should have a version id");
+    }
+
+    #[tokio::test]
     async fn deep_heal_rebuilds_near_tail_truncated_part() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "deep-heal-near-tail-truncation";
