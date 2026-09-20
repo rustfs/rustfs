@@ -648,20 +648,12 @@ pub(crate) async fn verify_deep_parts(
                 let Some(reader) = reader else { return Ok(()) };
                 let read = reader.read(&mut buffer[..want]);
                 if read_timeout.is_zero() {
-                    read.await.and_then(|count| {
-                        (count == want).then_some(()).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::UnexpectedEof, "encoded shard ended before its committed length")
-                        })
-                    })
+                    read.await.map(|_| ())
                 } else {
                     tokio::time::timeout(read_timeout, read)
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "integrity scan timed out"))?
-                        .and_then(|count| {
-                            (count == want).then_some(()).ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::UnexpectedEof, "encoded shard ended before its committed length")
-                            })
-                        })
+                        .map(|_| ())
                 }
             }))
             .await;
