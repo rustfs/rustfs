@@ -158,8 +158,6 @@ pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE: &str = "put_object_
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH: &str = "put_object_quota_begin_meta_bucket_fast_path";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK: &str = "put_object_quota_begin_metadata_lock";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ: &str = "put_object_quota_begin_config_read";
-pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ_COUNTERFACTUAL_SKIP: &str =
-    "put_object_quota_begin_config_read_counterfactual_skip";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK: &str = "put_object_quota_begin_lock_lost_check";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE: &str = "put_object_quota_begin_policy_evaluate";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF: &str = "put_object_quota_begin_capability_proof";
@@ -2179,6 +2177,49 @@ pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Op
 }
 
 #[inline(always)]
+pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
+}
+
+/// Observe a future's latency and wakeup behavior only while detailed PUT
+/// attribution is enabled. The disabled path awaits the original future
+/// directly, so normal remote mutation RPCs do not gain a polling wrapper.
+pub async fn observe_put_stage_future<F>(
+    future: F,
+    duration_stage: &'static str,
+    pending_count_stage: &'static str,
+    first_pending_to_ready_stage: &'static str,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    if !put_stage_metrics_enabled() {
+        return future.await;
+    }
+
+    let duration_started = put_stage_timer();
+    let mut first_pending_at = None;
+    let mut pending_count = 0_u64;
+    let mut future = std::pin::pin!(future);
+    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+        std::task::Poll::Pending => {
+            pending_count = pending_count.saturating_add(1);
+            first_pending_at.get_or_insert_with(std::time::Instant::now);
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    record_put_object_stage_duration_from(duration_stage, duration_started);
+    record_put_object_stage_count(pending_count_stage, pending_count);
+    record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
+    output
+}
+
+#[inline(always)]
 pub fn record_put_object_commit_lock_admission(budget: &'static str, outcome: &'static str) {
     if !put_stage_metrics_enabled() {
         return;
@@ -3310,7 +3351,6 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ,
-            PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ_COUNTERFACTUAL_SKIP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF,
@@ -3329,11 +3369,9 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
-            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REQUEST_SCOPE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL,
-            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_FIRST_PENDING_TO_READY,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_INTO_INNER,
@@ -3387,6 +3425,12 @@ mod tests {
                 && !stage.contains('{')
         }));
 
+        let count_stages = [
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
+        ];
+        assert_eq!(count_stages.iter().copied().collect::<HashSet<_>>().len(), count_stages.len());
+
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
@@ -3394,9 +3438,15 @@ mod tests {
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
+            for stage in count_stages {
+                record_put_object_stage_count(stage, 1);
+            }
             set_put_stage_metrics_enabled(true);
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
+            }
+            for stage in count_stages {
+                record_put_object_stage_count(stage, 1);
             }
             set_put_stage_metrics_enabled(false);
         });
@@ -3419,6 +3469,25 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(recorded.len(), stages.len());
         assert!(stages.iter().all(|stage| recorded.contains(*stage)));
+
+        let recorded_counts = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_s3_put_object_stage_count"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded_counts.len(), count_stages.len());
+        assert!(count_stages.iter().all(|stage| recorded_counts.contains(*stage)));
     }
 
     #[test]

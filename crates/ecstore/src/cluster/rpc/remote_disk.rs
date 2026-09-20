@@ -176,42 +176,6 @@ fn attach_mutation_body_digest<T>(
     crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
 }
 
-async fn observe_put_stage_future<F, T>(
-    future: F,
-    duration_stage: &'static str,
-    pending_count_stage: &'static str,
-    first_pending_to_ready_stage: &'static str,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    // Keep the normal PUT path identical to the pre-instrumentation future
-    // when detailed stage metrics are disabled. In particular, do not wrap the
-    // RPC in poll_fn: that adds an extra poll layer and pending counter work to
-    // every remote rename even though no samples will be emitted.
-    if !rustfs_io_metrics::put_stage_metrics_enabled() {
-        return future.await;
-    }
-
-    let duration_started = rustfs_io_metrics::put_stage_timer();
-    let mut first_pending_at = None;
-    let mut pending_count = 0usize;
-    let mut future = std::pin::pin!(future);
-    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
-        Poll::Ready(output) => Poll::Ready(output),
-        Poll::Pending => {
-            pending_count = pending_count.saturating_add(1);
-            first_pending_at.get_or_insert_with(Instant::now);
-            Poll::Pending
-        }
-    })
-    .await;
-    rustfs_io_metrics::record_put_object_stage_duration_from(duration_stage, duration_started);
-    rustfs_io_metrics::record_put_object_stage_duration(pending_count_stage, pending_count as f64);
-    rustfs_io_metrics::record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
-    output
-}
-
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
     volume_infos
         .into_iter()
@@ -2207,7 +2171,7 @@ impl RemoteDisk {
                 );
 
                 let rpc_started = rustfs_io_metrics::put_stage_timer();
-                let response = observe_put_stage_future(
+                let response = rustfs_io_metrics::observe_put_stage_future(
                     async {
                         if incarnation_bound {
                             // Older peers return Unimplemented before mutation; never downgrade.
