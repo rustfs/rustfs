@@ -19,8 +19,15 @@ if [ -d /run/systemd/system ]; then
         if [ -z "${2:-}" ]; then
             rm -f "$marker"
         else
+            # Versions published before this fix had no upgrade-aware prerm:
+            # the old prerm stopped the service and left no marker, so the
+            # marker check below cannot see it. Fall back to restarting for
+            # upgrades from those versions. NOTE: these are dpkg control-file
+            # versions - package_versions.sh maps the SemVer prerelease "-"
+            # to "~", so 1.0.0-rc.5 was published as 1.0.0~rc.5. Drop this list once
+            # upgrades from <= 1.0.0 no longer need support.
             case $2 in
-                1.0.0|1.0.0.rc.[1-6]|1.0.0.rc.[1-6]-preview.*) legacy_upgrade=true ;;
+                1.0.0|1.0.0~rc.[1-6]|1.0.0~rc.[1-6]~preview.*) legacy_upgrade=true ;;
                 *) legacy_upgrade=false ;;
             esac
             if [ -f "$marker" ] || [ "$legacy_upgrade" = true ]; then

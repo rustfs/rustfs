@@ -77,7 +77,7 @@ run_script after-install configure 1.0.1
 assert_log $'systemctl is-active --quiet rustfs\nsystemctl daemon-reload\nsystemctl daemon-reload'
 
 : > "$PACKAGE_SCRIPT_LOG"
-run_script after-install configure 1.0.0.rc.5
+run_script after-install configure 1.0.0~rc.5
 assert_log $'systemctl daemon-reload\ndeb-systemd-invoke restart rustfs.service'
 
 : > "$PACKAGE_SCRIPT_LOG"
