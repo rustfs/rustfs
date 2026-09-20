@@ -24,7 +24,9 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
       - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
@@ -40,7 +42,9 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
       - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
@@ -157,6 +161,9 @@ jobs:
 
       - name: Check package version contract
         run: ./scripts/test_package_versions.sh
+
+      - name: Check package service lifecycle contract
+        run: ./scripts/test_package_service_scripts.sh
 
   dependency-review:
     name: Dependency Review
