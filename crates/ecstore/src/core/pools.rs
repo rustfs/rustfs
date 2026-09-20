@@ -41,7 +41,7 @@ use crate::config::com::{
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
-use crate::data_usage::DATA_USAGE_CACHE_NAME;
+use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_cache};
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, DiskAPI, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
@@ -923,6 +923,29 @@ fn capacity_target_physical_bytes(data_bytes: usize, layout: DecommissionErasure
         )));
     }
     Ok(capacity_mul_div_ceil(data_bytes, layout.width(), layout.data))
+}
+
+async fn decommission_owned_physical_usage(sets: &Sets, layout: DecommissionErasureLayout) -> HashMap<i32, usize> {
+    let mut usage = HashMap::with_capacity(sets.disk_set.len());
+    for (set_index, set) in sets.disk_set.iter().enumerate() {
+        let Ok(cache) = load_data_usage_cache(set.as_ref(), DATA_USAGE_CACHE_NAME).await else {
+            continue;
+        };
+        let data_usage = cache.dui(DATA_USAGE_ROOT, &[]);
+        if !data_usage.is_complete_bucket_usage_snapshot() {
+            continue;
+        }
+        let Ok(logical_bytes) = usize::try_from(data_usage.objects_total_size) else {
+            continue;
+        };
+        let Ok(set_index) = i32::try_from(set_index) else {
+            continue;
+        };
+        // The data-usage snapshot excludes unrelated files on a shared mount.
+        // Convert logical object bytes to the source set's physical EC footprint.
+        usage.insert(set_index, capacity_mul_div_ceil(logical_bytes, layout.width(), layout.data));
+    }
+    usage
 }
 
 fn worst_decommission_target_layout(targets: &[DecommissionPoolCapacityInfo]) -> Result<DecommissionErasureLayout> {
@@ -12386,7 +12409,11 @@ impl ECStore {
         Ok(())
     }
 
-    async fn get_decommission_pool_capacity_info(&self, idx: usize) -> Result<DecommissionPoolCapacityInfo> {
+    async fn get_decommission_pool_capacity_info(
+        &self,
+        idx: usize,
+        use_owned_usage: bool,
+    ) -> Result<DecommissionPoolCapacityInfo> {
         if let Some(sets) = self.pools.get(idx) {
             let mut info = sets.storage_info_snapshot().await;
             info.backend = StorageAdminApi::backend_info(self).await;
@@ -12418,8 +12445,13 @@ impl ECStore {
                     layout.data, layout.parity
                 )));
             }
+            let owned_physical_used = if use_owned_usage {
+                Some(decommission_owned_physical_usage(sets, layout).await)
+            } else {
+                None
+            };
             let (physical_total, physical_free, physical_used) =
-                decommission_physical_pool_capacity(&info.disks, idx, layout, space);
+                decommission_physical_pool_capacity(&info.disks, idx, layout, space, owned_physical_used.as_ref());
 
             Ok(DecommissionPoolCapacityInfo {
                 pool_index: idx,
@@ -12442,7 +12474,20 @@ impl ECStore {
 
         let mut capacity_infos = Vec::with_capacity(self.pools.len());
         for idx in 0..self.pools.len() {
-            capacity_infos.push(self.get_decommission_pool_capacity_info(idx).await?);
+            capacity_infos.push(self.get_decommission_pool_capacity_info(idx, false).await?);
+        }
+        Ok(capacity_infos)
+    }
+
+    async fn get_decommission_all_pool_capacity_infos_with_owned_usage(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+            return Ok(capacity_infos);
+        }
+
+        let mut capacity_infos = Vec::with_capacity(self.pools.len());
+        for idx in 0..self.pools.len() {
+            capacity_infos.push(self.get_decommission_pool_capacity_info(idx, true).await?);
         }
         Ok(capacity_infos)
     }
@@ -13048,7 +13093,7 @@ impl ECStore {
             let capacity_infos = if self.pools.is_empty() {
                 Vec::new()
             } else {
-                self.get_decommission_all_pool_capacity_infos().await?
+                self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?
             };
             let target_fence_proof = crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof();
             let mut pool_meta = self.pool_meta.write().await;
@@ -15355,7 +15400,7 @@ impl ECStore {
                 .is_some_and(|reservation| !reservation.active())
         };
         if needs_capacity_reservation {
-            let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+            let capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
             let mut pool_meta = self.pool_meta.write().await;
             let version = pool_meta.version;
             pool_meta.version = POOL_META_VERSION;
@@ -16219,7 +16264,7 @@ impl ECStore {
         self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate()
             .await?;
 
-        let all_capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+        let all_capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
         let target_fence_proof_available =
             crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof().is_some();
         // Signal cancellation before waiting for the movement writer so active
@@ -22653,6 +22698,7 @@ fn decommission_physical_pool_capacity(
     pool_index: usize,
     layout: DecommissionErasureLayout,
     logical: PoolSpaceInfo,
+    owned_physical_used: Option<&HashMap<i32, usize>>,
 ) -> (usize, usize, usize) {
     let width = layout.width();
     let mut sets: HashMap<i32, Vec<&rustfs_madmin::Disk>> = HashMap::new();
@@ -22692,13 +22738,20 @@ fn decommission_physical_pool_capacity(
             .map(|disk| disk.available_space as usize)
             .min()
             .unwrap_or_default();
-        let max_used = set_disks
-            .iter()
-            .map(|disk| (disk.used_space as usize).max((disk.total_space as usize).saturating_sub(disk.available_space as usize)))
-            .max()
-            .unwrap_or_default();
+        let physical_used_for_set = owned_physical_used
+            .and_then(|owned| owned.get(&set_disks[0].set_index).copied())
+            .unwrap_or_else(|| {
+                set_disks
+                    .iter()
+                    .map(|disk| {
+                        (disk.used_space as usize).max((disk.total_space as usize).saturating_sub(disk.available_space as usize))
+                    })
+                    .max()
+                    .unwrap_or_default()
+                    .saturating_mul(width)
+            });
         physical_total = physical_total.saturating_add(min_total.saturating_mul(width));
-        physical_used = physical_used.saturating_add(max_used.saturating_mul(width));
+        physical_used = physical_used.saturating_add(physical_used_for_set);
         if set_disks.len() >= width {
             physical_free = physical_free.saturating_add(min_free.saturating_mul(width));
         }
@@ -22881,6 +22934,8 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 
 #[cfg(test)]
 mod pools_tests {
+    use std::collections::HashMap;
+
     use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
     use super::persist_v3_pool_meta_for_test;
     use super::record_decommission_entry_error;
@@ -29028,9 +29083,44 @@ mod pools_tests {
                 total: 0,
                 used: 0,
             },
+            None,
         );
 
         assert_eq!(capacity, (400, 40, 360));
+    }
+
+    #[test]
+    fn decommission_physical_capacity_prefers_rustfs_owned_usage_over_filesystem_usage() {
+        let disks = [10_u64, 20, 30, 40]
+            .into_iter()
+            .enumerate()
+            .map(|(disk_index, available_space)| rustfs_madmin::Disk {
+                endpoint: format!("http://node-{disk_index}"),
+                drive_path: format!("/disk-{disk_index}"),
+                state: "ok".to_string(),
+                total_space: 100,
+                used_space: 100 - available_space,
+                available_space,
+                pool_index: 0,
+                set_index: 0,
+                disk_index: disk_index as i32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let owned = HashMap::from([(0, 12)]);
+        let capacity = decommission_physical_pool_capacity(
+            &disks,
+            0,
+            DecommissionErasureLayout { data: 2, parity: 2 },
+            PoolSpaceInfo {
+                free: 0,
+                total: 0,
+                used: 0,
+            },
+            Some(&owned),
+        );
+
+        assert_eq!(capacity, (400, 40, 12));
     }
 
     #[test]
