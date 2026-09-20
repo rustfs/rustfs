@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -112,6 +113,25 @@ def prepare():
     candidate = resolve(run_id, attempt)
     revision = (ROOT / ".config/functional-script-revision.txt").read_text().strip()
     require(sha(revision), "private test script revision must be pinned")
+    # The revision file is refreshed only by release syncs and goes stale
+    # within days, so the nightly chain keeps replaying an old harness while
+    # fixes (conffile prompts, FT --results-file, tier retries, STS-105
+    # signing) sit untested on auto-testing main. When the pinned revision is
+    # older than a day, fall back to auto-testing main HEAD. Any probe
+    # failure keeps the pinned revision - the chain still runs, just on the
+    # old harness.
+    try:
+        head = api("repos/rustfs/auto-testing/git/ref/heads/main")["object"]["sha"]
+        pinned_date = api(f"repos/rustfs/auto-testing/commits/{revision}")["commit"]["committer"]["date"]
+        pinned_at = datetime.fromisoformat(pinned_date.replace("Z", "+00:00"))
+        age_hours = (datetime.now(timezone.utc) - pinned_at).total_seconds() / 3600
+        if age_hours > 24:
+            print(f"functional-script revision {revision[:8]} is {age_hours:.0f}h old; falling back to auto-testing main HEAD {head[:8]}")
+            revision = head
+        else:
+            print(f"functional-script revision {revision[:8]} is {age_hours:.0f}h old; keeping pin")
+    except Exception as error:
+        print(f"staleness probe failed ({error}); keeping pinned revision {revision[:8]}")
     chain = {"schema": 1, "run_id": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
              "workflow_sha": os.environ["GITHUB_SHA"], "testing_sha": revision, "candidate": candidate}
     encoded = json.dumps(chain, sort_keys=True, separators=(",", ":"))
