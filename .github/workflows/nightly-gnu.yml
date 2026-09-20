@@ -117,10 +117,15 @@ jobs:
 
           cat > "${PKG_DIR}/etc/default/rustfs" << 'ENVEOF'
           # RustFS Environment Configuration
-          # See https://rustfs.com/docs/ for more information
+          # See https://docs.rustfs.com for more information
+          # RUSTFS_ACCESS_KEY=<changeme>
+          # RUSTFS_SECRET_KEY=<changeme>
           # RUSTFS_VOLUMES=""
-          # RUSTFS_ROOT_USER=""
-          # RUSTFS_ROOT_PASSWORD=""
+          # RUSTFS_ADDRESS=":9000"
+          # RUSTFS_CONSOLE_ADDRESS=":9001"
+          # RUSTFS_CONSOLE_ENABLE=true
+          # RUSTFS_OBS_LOGGER_LEVEL=error
+          # RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"
           ENVEOF
 
           # dpkg versions must start with a digit and cannot contain hyphens;
@@ -190,10 +195,15 @@ jobs:
           mkdir -p ./tmp-pkg/etc/default
           cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
           # RustFS Environment Configuration
-          # See https://rustfs.com/docs/ for more information
+          # See https://docs.rustfs.com for more information
+          # RUSTFS_ACCESS_KEY=<changeme>
+          # RUSTFS_SECRET_KEY=<changeme>
           # RUSTFS_VOLUMES=""
-          # RUSTFS_ROOT_USER=""
-          # RUSTFS_ROOT_PASSWORD=""
+          # RUSTFS_ADDRESS=":9000"
+          # RUSTFS_CONSOLE_ADDRESS=":9001"
+          # RUSTFS_CONSOLE_ENABLE=true
+          # RUSTFS_OBS_LOGGER_LEVEL=error
+          # RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"
           ENVEOF
 
           fpm -s dir -t rpm \
