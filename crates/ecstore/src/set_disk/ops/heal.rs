@@ -4390,6 +4390,89 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_rebuilds_h2_half_truncated_part() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(16, 0, 4).await;
+        let bucket = "deep-heal-h2-half-truncation";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let expected_payload = vec![0x6d; 5 * 1024 * 1024 + 123];
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_payload.clone()),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before shard truncation");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let truncated_part = temp_dirs[1]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        let original_len = tokio::fs::metadata(&truncated_part)
+            .await
+            .expect("target shard should exist")
+            .len();
+        assert!(original_len > 1, "test shard must be large enough to truncate");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated_part)
+            .await
+            .expect("target shard should be writable");
+        file.set_len(original_len / 2)
+            .await
+            .expect("target shard should be truncated");
+
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET should remain readable after a half shard truncation");
+        let mut read_back = Vec::new();
+        tokio::io::copy(&mut reader, &mut read_back)
+            .await
+            .expect("GET should reconstruct the truncated shard through EC");
+        assert_eq!(read_back, expected_payload, "EC GET must preserve the object bytes");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after a half H2 truncation");
+
+        assert!(error.is_none(), "deep heal should recover the H2 truncated shard: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        assert_eq!(result.before.drives[1].state, DriveState::Corrupt.to_string());
+        assert_eq!(
+            tokio::fs::metadata(&truncated_part)
+                .await
+                .expect("repaired shard should exist")
+                .len(),
+            original_len,
+            "deep heal must restore the complete H2 shard length"
+        );
+    }
+
+    #[tokio::test]
     async fn deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards() {
         use crate::storage_api_contracts::range::HTTPRangeSpec;
         use tokio::io::AsyncReadExt;
