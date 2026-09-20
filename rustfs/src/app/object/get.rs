@@ -221,6 +221,16 @@ const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
 
 const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 
+const GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT: &str = "body_cache_hook_hit";
+const GET_OBJECT_STAGE_BODY_CACHE_LOOKUP: &str = "body_cache_lookup";
+const GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF: &str = "body_cache_fill_handoff";
+const GET_OBJECT_STAGE_BODY_BUFFERED_HANDOFF: &str = "body_buffered_handoff";
+const GET_OBJECT_STAGE_OUTPUT_STRUCT_BUILD: &str = "output_struct_build";
+const GET_OBJECT_STAGE_PREPARE_READ_EXECUTION: &str = "prepare_read_execution";
+const GET_OBJECT_STAGE_RESPONSE_CORS_WRAP: &str = "response_cors_wrap";
+const GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT: &str = "response_header_inject";
+const GET_OBJECT_STAGE_RESPONSE_EVENT_COMPLETE: &str = "response_event_complete";
+
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
@@ -499,10 +509,10 @@ fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
     }
 }
 
-/// A mid-stream reopen can recover only when another representation of the
-/// committed object may exist. A single-disk, no-parity object has no alternate
-/// shard after a bitrot/read-quorum failure, so retrying the same read only
-/// repeats the failure and adds latency.
+/// A mid-stream reopen can only recover when another representation of the
+/// committed object may exist. Single-disk, no-parity objects have no alternate
+/// shard to discover after a bitrot/read-quorum failure, so arming the normal
+/// three-attempt resume loop only repeats the same failing read and adds delay.
 fn should_attach_get_object_resume(info: &ObjectInfo) -> bool {
     info.parity_blocks > 0 || info.data_blocks > 1 || !info.transitioned_object.tier.is_empty()
 }
@@ -3322,12 +3332,15 @@ impl DefaultObjectUsecase {
         // already supplied this body, the request-level plan was built before
         // the authoritative lookup. Serve it without planning a second time.
         if cache_hook_served && let Some(bytes) = buffered_body.take() {
-            return Ok(Self::build_memory_bytes_blob(
+            let hook_hit_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let body = Self::build_memory_bytes_blob(
                 bytes,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
                 lifecycle,
-            ));
+            );
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT, hook_hit_start);
+            return Ok(body);
         }
 
         if !cache_fill_allowed {
@@ -3368,20 +3381,27 @@ impl DefaultObjectUsecase {
         // authoritative because it ran after fresh metadata resolution, so the
         // app layer skips its own lookup and only uses the plan to fill.
         if !cache_hook_probed {
-            match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
+            let cache_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let cache_lookup = lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await;
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_LOOKUP, cache_lookup_start);
+            match cache_lookup {
                 GetObjectBodyCacheLookup::Hit(bytes) => {
-                    return Ok(Self::build_memory_bytes_blob(
+                    let cache_hit_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+                    let body = Self::build_memory_bytes_blob(
                         bytes,
                         response_content_length,
                         GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
                         lifecycle,
-                    ));
+                    );
+                    record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT, cache_hit_start);
+                    return Ok(body);
                 }
                 GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
             }
         }
 
         if let Some(buffered_body) = buffered_body {
+            let cache_fill_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             // ODC-15: the body is already fully in hand, so keep the fill off the
             // response's critical path. For a cacheable plan, run the fill in a
             // detached task (Bytes is a cheap clone) and return immediately. For
@@ -3397,13 +3417,17 @@ impl DefaultObjectUsecase {
             } else if cache_fill_allowed {
                 let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
             }
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF, cache_fill_handoff_start);
 
-            return Ok(Self::build_memory_bytes_blob(
+            let buffered_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let body = Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 lifecycle,
-            ));
+            );
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUFFERED_HANDOFF, buffered_handoff_start);
+            return Ok(body);
         }
 
         let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
@@ -3457,6 +3481,7 @@ impl DefaultObjectUsecase {
             {
                 Ok(buf) => {
                     let bytes = Bytes::from(buf);
+                    let cache_fill_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
                     // ODC-15: fill off the response's critical path (see the
                     // buffered-body branch above).
                     let cache_adapter = cache_adapter.clone();
@@ -3465,6 +3490,10 @@ impl DefaultObjectUsecase {
                     tokio::spawn(async move {
                         let _ = fill_get_object_body_cache_from_materialized_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                     });
+                    record_get_object_s3_handler_stage_duration(
+                        GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF,
+                        cache_fill_handoff_start,
+                    );
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
@@ -3603,13 +3632,19 @@ impl DefaultObjectUsecase {
             None => helper,
         };
         let helper = helper.version_id(version_id_for_event);
+        let cors_wrap_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_CORS_WRAP, cors_wrap_start);
+        let header_inject_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         inject_accept_ranges_header(&mut response.headers);
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
+        let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let _ = helper.complete(&result);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_EVENT_COMPLETE, event_complete_start);
         result
     }
 
@@ -3720,6 +3755,7 @@ impl DefaultObjectUsecase {
         let metadata = filter_object_metadata(&info.user_defined);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
 
+        let output_struct_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output = GetObjectOutput {
             body: Some(body),
             content_length: Some(response_content_length),
@@ -3748,6 +3784,7 @@ impl DefaultObjectUsecase {
             storage_class,
             ..Default::default()
         };
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_OUTPUT_STRUCT_BUILD, output_struct_start);
 
         Ok(GetObjectOutputContext {
             output,
@@ -4048,6 +4085,7 @@ impl DefaultObjectUsecase {
 
         let manager = get_concurrency_manager();
 
+        let prepare_read_start = stage_metrics_enabled.then(std::time::Instant::now);
         let mut prepared_read = self
             .prepare_get_object_read_execution(
                 &req,
@@ -4063,6 +4101,7 @@ impl DefaultObjectUsecase {
                 object_traffic_health.clone(),
             )
             .await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_PREPARE_READ_EXECUTION, prepare_read_start);
         // An object missing locally (and only missing — other errors keep
         // their semantics) may still be served by a remote copy.
         if let Err(err) = &prepared_read
@@ -4100,6 +4139,7 @@ impl DefaultObjectUsecase {
                     return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
                 }
                 Some(OdmGetOutcome::RetryLocal) => {
+                    let prepare_read_retry_start = stage_metrics_enabled.then(std::time::Instant::now);
                     prepared_read = self
                         .prepare_get_object_read_execution(
                             &req,
@@ -4115,6 +4155,10 @@ impl DefaultObjectUsecase {
                             object_traffic_health,
                         )
                         .await;
+                    record_get_object_s3_handler_stage_duration(
+                        GET_OBJECT_STAGE_PREPARE_READ_EXECUTION,
+                        prepare_read_retry_start,
+                    );
                 }
             }
         }

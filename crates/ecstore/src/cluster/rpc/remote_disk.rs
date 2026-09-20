@@ -176,6 +176,42 @@ fn attach_mutation_body_digest<T>(
     crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
 }
 
+async fn observe_put_stage_future<F, T>(
+    future: F,
+    duration_stage: &'static str,
+    pending_count_stage: &'static str,
+    first_pending_to_ready_stage: &'static str,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    // Keep the normal PUT path identical to the pre-instrumentation future
+    // when detailed stage metrics are disabled. In particular, do not wrap the
+    // RPC in poll_fn: that adds an extra poll layer and pending counter work to
+    // every remote rename even though no samples will be emitted.
+    if !rustfs_io_metrics::put_stage_metrics_enabled() {
+        return future.await;
+    }
+
+    let duration_started = rustfs_io_metrics::put_stage_timer();
+    let mut first_pending_at = None;
+    let mut pending_count = 0usize;
+    let mut future = std::pin::pin!(future);
+    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(output) => Poll::Ready(output),
+        Poll::Pending => {
+            pending_count = pending_count.saturating_add(1);
+            first_pending_at.get_or_insert_with(Instant::now);
+            Poll::Pending
+        }
+    })
+    .await;
+    rustfs_io_metrics::record_put_object_stage_duration_from(duration_stage, duration_started);
+    rustfs_io_metrics::record_put_object_stage_duration(pending_count_stage, pending_count as f64);
+    rustfs_io_metrics::record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
+    output
+}
+
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
     volume_infos
         .into_iter()
@@ -2137,6 +2173,7 @@ impl RemoteDisk {
         self.execute_with_timeout_for_op(
             "rename_data",
             || async {
+                let prepare_started = rustfs_io_metrics::put_stage_timer();
                 let file_info = compat_json(fi)?;
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
@@ -2164,24 +2201,56 @@ impl RemoteDisk {
                 } else {
                     attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
+                    prepare_started,
+                );
 
-                let response = if incarnation_bound {
-                    // Older peers return Unimplemented before mutation; never downgrade.
-                    client.rename_data_at_incarnation(request).await?
-                } else {
-                    client.rename_data(request).await?
-                }
-                .into_inner();
+                let rpc_started = rustfs_io_metrics::put_stage_timer();
+                let response = observe_put_stage_future(
+                    async {
+                        if incarnation_bound {
+                            // Older peers return Unimplemented before mutation; never downgrade.
+                            client.rename_data_at_incarnation(request).await
+                        } else {
+                            client.rename_data(request).await
+                        }
+                    },
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT,
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
+                )
+                .await?;
+                let into_inner_started = rustfs_io_metrics::put_stage_timer();
+                let response = response.into_inner();
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_INTO_INNER,
+                    into_inner_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
+                    rpc_started,
+                );
 
+                let success_check_started = rustfs_io_metrics::put_stage_timer();
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_SUCCESS_CHECK,
+                    success_check_started,
+                );
 
+                let decode_started = rustfs_io_metrics::put_stage_timer();
                 let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
                     &response.rename_data_resp_bin,
                     &response.rename_data_resp,
                     "RenameDataResp",
                 )?;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_DECODE,
+                    decode_started,
+                );
 
                 Ok(rename_data_resp)
             },
