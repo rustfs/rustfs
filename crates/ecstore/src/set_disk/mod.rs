@@ -6473,6 +6473,28 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
         .map_err(|_| DiskError::FileCorrupt)
 }
 
+fn validate_deep_scan_results(results: &[usize], expected_parts: usize) -> disk::error::Result<()> {
+    if results.len() != expected_parts {
+        return Err(DiskError::other(format!(
+            "incomplete deep scan result: expected {expected_parts} parts, received {}",
+            results.len()
+        )));
+    }
+    for (part, status) in results.iter().enumerate() {
+        match *status {
+            CHECK_PART_SUCCESS | CHECK_PART_FILE_NOT_FOUND | CHECK_PART_FILE_CORRUPT => {}
+            CHECK_PART_DISK_NOT_FOUND => return Err(DiskError::DiskNotFound),
+            crate::disk::CHECK_PART_VOLUME_NOT_FOUND => return Err(DiskError::VolumeNotFound),
+            _ => {
+                return Err(DiskError::other(format!(
+                    "incomplete deep scan result: part {part} has unverified status {status}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// disks_with_all_partsv2 is a corrected version based on Go implementation.
 /// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
 /// It also checks if the status of each part (corrupted, missing, ok) in each drive.
@@ -6693,9 +6715,13 @@ async fn disks_with_all_parts(
             // it needs healing too.
             match disk.verify_file(bucket, object, meta).await {
                 Ok(v) => {
+                    validate_deep_scan_results(&v.results, latest_meta.parts.len())?;
                     verify_resp = v;
                 }
                 Err(err) => {
+                    if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::FileCorrupt) {
+                        return Err(err);
+                    }
                     debug!(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
@@ -11107,6 +11133,50 @@ mod tests {
 
         let other_err = DiskError::other("other error");
         assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // Other errors should return UNKNOWN, not SUCCESS
+    }
+
+    #[test]
+    fn deep_scan_results_accept_only_complete_verified_or_repairable_parts() {
+        for (results, expected_parts) in [
+            (vec![], 0),
+            (vec![CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_FILE_NOT_FOUND], 1),
+            (vec![CHECK_PART_FILE_CORRUPT], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT], 3),
+        ] {
+            validate_deep_scan_results(&results, expected_parts)
+                .expect("complete results must allow healthy or repairable parts");
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_reject_unknown_and_incomplete_observations() {
+        for (results, expected_parts) in [
+            (vec![CHECK_PART_UNKNOWN], 1),
+            (vec![usize::MAX], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN], 2),
+            (vec![], 1),
+            (vec![CHECK_PART_SUCCESS], 2),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_SUCCESS], 0),
+        ] {
+            let error =
+                validate_deep_scan_results(&results, expected_parts).expect_err("unverified parts must not become healthy");
+            assert!(matches!(error, DiskError::Io(_)), "an incomplete observation is not proven corruption");
+            assert!(error.to_string().contains("incomplete deep scan result"));
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_preserve_disk_and_volume_failures() {
+        for (status, expected_error) in [
+            (CHECK_PART_DISK_NOT_FOUND, DiskError::DiskNotFound),
+            (CHECK_PART_VOLUME_NOT_FOUND, DiskError::VolumeNotFound),
+        ] {
+            let error = validate_deep_scan_results(&[CHECK_PART_SUCCESS, status], 2)
+                .expect_err("an unavailable part cannot certify a healthy disk");
+            assert_eq!(error, expected_error);
+        }
     }
 
     #[test]

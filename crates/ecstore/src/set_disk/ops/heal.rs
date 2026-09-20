@@ -4378,6 +4378,267 @@ mod heal_result_report_tests {
         );
     }
 
+    #[derive(Debug)]
+    struct FailedIntegrityReadTransport {
+        error: DiskError,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cluster::rpc::internode_data_transport::InternodeDataTransport for FailedIntegrityReadTransport {
+        async fn open_read(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::ReadStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileReader> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let error = match &self.error {
+                DiskError::FileCorrupt => DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error()),
+                DiskError::FileNotFound => DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error()),
+                DiskError::VolumeNotFound => DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error()),
+                error => error.clone(),
+            };
+            Err(error)
+        }
+
+        async fn open_write(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::WriteStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileWriter> {
+            panic!("an integrity scan must not write remote data");
+        }
+
+        async fn open_walk_dir(
+            &self,
+            _request: crate::cluster::rpc::internode_data_transport::WalkDirStreamRequest,
+        ) -> crate::disk::error::Result<crate::disk::FileReader> {
+            panic!("an object integrity scan must not walk remote directories");
+        }
+
+        fn name(&self) -> &'static str {
+            "failed-integrity-read"
+        }
+
+        fn capabilities(&self) -> crate::cluster::rpc::internode_data_transport::InternodeDataTransportCapabilities {
+            crate::cluster::rpc::internode_data_transport::InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    async fn assert_remote_integrity_read_failure(expected_error: DiskError) {
+        use crate::disk::{CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN};
+        use crate::object_api::ShardIntegrityWriteMode;
+
+        let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
+        let bucket = "remote-integrity-read-failure";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write protected external fixture");
+
+        let mut files = Vec::new();
+        let mut snapshots = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            let file = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read fixture metadata");
+            assert!(file.data.is_none(), "the remote test must open an external shard");
+            let object_dir = dir.path().join(bucket).join(object);
+            let part_path = object_dir
+                .join(file.data_dir.expect("external shard directory").to_string())
+                .join("part.1");
+            for path in [part_path, object_dir.join("xl.meta")] {
+                let bytes = tokio::fs::read(&path).await.expect("snapshot fixture before scan");
+                snapshots.push((path, bytes));
+            }
+            files.push(file);
+        }
+        let transport = Arc::new(FailedIntegrityReadTransport {
+            error: expected_error.clone(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-integrity.invalid:9000/data/disk0").expect("fixture endpoint"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let remote = crate::cluster::rpc::RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            transport.clone(),
+        )
+        .await
+        .expect("construct remote disk with failing data transport");
+        let mut verification_disks: Vec<_> = disks.iter().cloned().map(Some).collect();
+        verification_disks[0] = Some(Arc::new(crate::disk::Disk::Remote(Box::new(remote))));
+        let mut statuses = [(0, vec![CHECK_PART_UNKNOWN; disks.len()])].into_iter().collect();
+        let result = crate::io_support::shard_integrity::verify_deep_parts(
+            &files,
+            &verification_disks,
+            &files[0],
+            bucket,
+            object,
+            &mut statuses,
+        )
+        .await;
+        assert!(transport.reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        if matches!(expected_error, DiskError::FileCorrupt | DiskError::FileNotFound) {
+            result.expect("typed remote payload damage must identify a repairable shard");
+            let expected_status = if expected_error == DiskError::FileCorrupt {
+                CHECK_PART_FILE_CORRUPT
+            } else {
+                CHECK_PART_FILE_NOT_FOUND
+            };
+            assert_eq!(statuses[&0][0], expected_status);
+            assert!(statuses[&0][1..].iter().all(|status| *status == CHECK_PART_SUCCESS));
+            let (heal, metadata, reason) = super::should_heal_object_on_disk(&None, &[statuses[&0][0]], &files[0], &files[0]);
+            assert!(heal, "remote payload damage must schedule repair: {expected_error:?}");
+            assert!(!metadata);
+            let expected_reason = if expected_error == DiskError::FileCorrupt {
+                DiskError::FileCorrupt
+            } else {
+                DiskError::PartMissingOrCorrupt
+            };
+            assert_eq!(reason, Some(expected_reason));
+        } else {
+            let error = result.expect_err("unavailable payload storage must abort health verification");
+            if expected_error.is_internode_http_status(500) {
+                assert!(error.is_internode_http_status(500), "preserve the original transport error: {error:?}");
+            } else {
+                assert_eq!(error, expected_error, "preserve the original storage failure");
+            }
+            assert_eq!(statuses[&0][0], CHECK_PART_UNKNOWN, "failed verification cannot certify the shard");
+        }
+        for (path, before) in snapshots {
+            assert_eq!(tokio::fs::read(path).await.expect("read fixture after scan"), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_scan_remote_payload_damage_schedules_repair() {
+        for error in [DiskError::FileCorrupt, DiskError::FileNotFound] {
+            assert_remote_integrity_read_failure(error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_scan_remote_storage_failure_cannot_certify_healthy() {
+        for error in [
+            DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+                rustfs_rio::InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            )),
+            DiskError::DiskNotFound,
+            DiskError::VolumeNotFound,
+            DiskError::FileAccessDenied,
+        ] {
+            assert_remote_integrity_read_failure(error).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deep_heal_legacy_verification_error_cannot_certify_healthy() {
+        use crate::object_api::ShardIntegrityWriteMode;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "legacy-deep-scan-verification-error";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create legacy fixture bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write external legacy fixture");
+
+        let mut files = Vec::new();
+        let mut part_paths = Vec::new();
+        let mut preserved = Vec::new();
+        for (index, (dir, disk)) in dirs.iter().zip(&disks).enumerate() {
+            let file = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read legacy fixture metadata");
+            assert!(file.data.is_none(), "legacy verification must open the physical shard");
+            assert!(file.parts.iter().all(|part| part.integrity.is_none()));
+            let object_dir = dir.path().join(bucket).join(object);
+            let part = object_dir
+                .join(file.data_dir.expect("external legacy shard directory").to_string())
+                .join("part.1");
+            let metadata = object_dir.join("xl.meta");
+            let bytes = tokio::fs::read(&metadata).await.expect("snapshot legacy metadata");
+            preserved.push((metadata, bytes));
+            if index != 0 {
+                let bytes = tokio::fs::read(&part).await.expect("snapshot healthy legacy shard");
+                preserved.push((part.clone(), bytes));
+            }
+            part_paths.push(part);
+            files.push(file);
+        }
+        let broken_part = &part_paths[0];
+        tokio::fs::remove_file(broken_part)
+            .await
+            .expect("remove fixture shard before symlink fault");
+        std::os::unix::fs::symlink("part.1", broken_part).expect("create self-referential shard symlink");
+        let open_error = tokio::fs::File::open(broken_part)
+            .await
+            .expect_err("self-referential symlink must fail to open");
+        assert_eq!(open_error.raw_os_error(), Some(libc::ELOOP));
+
+        let verification_error = disks[0]
+            .verify_file(bucket, object, &files[0])
+            .await
+            .expect_err("legacy disk verifier must reject the symlink path");
+        assert_eq!(verification_error, DiskError::InvalidPath);
+        let error = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an unverified legacy part must fail the complete heal operation");
+        assert_eq!(error, DiskError::InvalidPath, "complete heal must preserve the verifier's path error");
+        assert_eq!(
+            tokio::fs::read_link(broken_part)
+                .await
+                .expect("failed heal must preserve the symlink fault"),
+            std::path::Path::new("part.1")
+        );
+        for (path, before) in preserved {
+            assert_eq!(tokio::fs::read(path).await.expect("read unchanged legacy fixture"), before);
+        }
+    }
+
     async fn assert_h2_truncated_shards(
         mode: crate::object_api::ShardIntegrityWriteMode,
         coding_indexes: &[usize],
