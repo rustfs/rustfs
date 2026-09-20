@@ -2573,6 +2573,11 @@ impl Erasure {
         .with_deferred_parity_reopeners(deferred_reopeners);
 
         let integrity = reader.integrity.clone();
+        // Copy sources use demand-bound scheduling for backpressure, but retain
+        // the ordinary GET read quorum. Only the opt-in GET rollout requires a
+        // surplus source; available surplus shards and integrity proofs are
+        // still verified before any reconstructed copy bytes are emitted.
+        let require_surplus_source = reader.demand_bound_lockstep && matches!(decode_read_policy(), DecodeReadPolicy::Default);
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
@@ -2667,7 +2672,6 @@ impl Erasure {
                         // `shards` are borrowed again below. In the `Stop` case that
                         // drop is what cancels the still-in-flight prefetch read.
                         let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
-                            let require_surplus_source = reader.demand_bound_lockstep;
                             let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
                             let emit_fut = self.emit_decoded_stripe(
                                 writer,
@@ -2728,7 +2732,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
-                                reader.demand_bound_lockstep,
+                                require_surplus_source,
                                 integrity.as_ref(),
                                 offset,
                             )
@@ -2771,7 +2775,7 @@ impl Erasure {
                         &mut written,
                         &mut ret_err,
                         stage_metrics_enabled,
-                        reader.demand_bound_lockstep,
+                        require_surplus_source,
                         integrity.as_ref(),
                         offset,
                     )
@@ -3446,6 +3450,150 @@ mod tests {
             assert!(err.is_none(), "{}: unexpected error: {:?}", desc, err);
             assert_eq!(written, len, "{}: written != length", desc);
             assert_eq!(output, total_data[off..off + len], "{}: bytes mismatch", desc);
+        }
+    }
+
+    async fn copy_source_bitrot_shards(erasure: &Erasure, payload: &[u8], corrupt_parity: bool) -> Vec<Vec<u8>> {
+        let mut writers: Vec<_> = (0..erasure.data_shards + erasure.parity_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), erasure.shard_size(), HashAlgorithm::HighwayHash256))
+            .collect();
+        for block in payload.chunks(erasure.block_size) {
+            let shards = erasure.encode_data(block).expect("copy source should encode");
+            for (index, shard) in shards.iter().enumerate() {
+                let mut bytes = shard.to_vec();
+                if corrupt_parity && index == erasure.data_shards {
+                    // A stale source can have a valid per-shard bitrot checksum.
+                    // Reframe the changed parity to exercise reconstruction verification.
+                    bytes[0] ^= 0x80;
+                }
+                writers[index].write(&bytes).await.expect("copy source should frame");
+            }
+        }
+        writers.into_iter().map(|writer| writer.into_inner().into_inner()).collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_reads_exact_quorum_across_stripes_and_ranges() {
+        const BLOCK_SIZE: usize = 768;
+        let payload: Vec<_> = (0..BLOCK_SIZE * 3 + 37)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            for offline in [[0, 1, 2, 3], [0, 5, 12, 15]] {
+                for (offset, length) in [(0, payload.len()), (BLOCK_SIZE + 17, payload.len() - BLOCK_SIZE - 17)] {
+                    let frame_offset = offset / BLOCK_SIZE * (erasure.shard_size() + HashAlgorithm::HighwayHash256.size());
+                    let positioned: Vec<_> = buffers.iter().map(|bytes| bytes[frame_offset..].to_vec()).collect();
+                    let (mut readers, handles) =
+                        readers_with_deferred_parity(&positioned, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+                    for index in offline {
+                        readers[index] = None;
+                    }
+                    let mut output = Vec::new();
+                    let (written, error) = crate::set_disk::with_get_object_read_policy(
+                        crate::set_disk::GetObjectReadPolicy::CopySource,
+                        erasure.decode_with_stripe_handles(&mut output, readers, offset, length, payload.len(), None, handles),
+                    )
+                    .await;
+
+                    assert!(error.is_none(), "legacy={uses_legacy}, offline={offline:?}, offset={offset}: {error:?}");
+                    assert_eq!(written, length);
+                    assert_eq!(output, payload[offset..offset + length]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_recovers_exact_quorum_after_first_stripe() {
+        const BLOCK_SIZE: usize = 768;
+        let payload: Vec<_> = (0..BLOCK_SIZE * 3 + 37)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            let first_frame = erasure.shard_size() + HashAlgorithm::HighwayHash256.size();
+            let (readers, handles) = readers_with_deferred_parity(
+                &buffers,
+                12,
+                erasure.shard_size(),
+                &HashAlgorithm::HighwayHash256,
+                &[(0, first_frame), (1, first_frame), (2, first_frame), (3, first_frame)],
+            );
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert!(error.is_none(), "legacy={uses_legacy}: late shard loss should recover: {error:?}");
+            assert_eq!(written, payload.len());
+            assert_eq!(output, payload);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_below_read_quorum_fails_before_output() {
+        const BLOCK_SIZE: usize = 768;
+        let payload = vec![0x5a; BLOCK_SIZE * 2 + 37];
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            let (mut readers, handles) =
+                readers_with_deferred_parity(&buffers, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+            for reader in readers.iter_mut().take(5) {
+                *reader = None;
+            }
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert_eq!(written, 0);
+            assert!(output.is_empty());
+            assert_eq!(
+                error
+                    .expect("eleven shards cannot reconstruct twelve data shards")
+                    .to_string(),
+                Error::ErasureReadQuorum.to_string()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_rejects_corrupt_surplus_parity_before_output() {
+        const BLOCK_SIZE: usize = 768;
+        let payload = vec![0x5a; BLOCK_SIZE * 2 + 37];
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, true).await;
+            let (mut readers, handles) =
+                readers_with_deferred_parity(&buffers, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+            for reader in readers.iter_mut().take(3) {
+                *reader = None;
+            }
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert_eq!(written, 0);
+            assert!(output.is_empty());
+            let error = error.expect("copy must reject inconsistent surplus parity despite valid bitrot framing");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("inconsistent read source shards"));
         }
     }
 
