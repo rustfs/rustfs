@@ -102,7 +102,7 @@ pub(crate) async fn build_acceptor_from_loaded(
 
     match server {
         Some(RuntimeServerTlsMaterial::SingleCert { certs, key }) => {
-            let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
+            let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier, ServerProtocol::Tcp)?;
             info!(
                 component = LOG_COMPONENT_TLS,
                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -116,7 +116,7 @@ pub(crate) async fn build_acceptor_from_loaded(
         Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => {
             let resolver = create_multi_cert_resolver(cert_key_pairs)
                 .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
-            let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
+            let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier, ServerProtocol::Tcp)?;
             info!(
                 component = LOG_COMPONENT_TLS,
                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -129,6 +129,47 @@ pub(crate) async fn build_acceptor_from_loaded(
         }
         None => Ok(None),
     }
+}
+
+#[cfg(feature = "http3")]
+pub(crate) async fn build_http3_server_config_from_loaded(
+    server: Option<&RuntimeServerTlsMaterial>,
+    tls_dir: &Path,
+) -> Result<Option<quinn::ServerConfig>, TlsMaterialError> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+
+    let mtls_verifier = build_webpki_client_verifier(
+        WebPkiClientVerifierOptions::builder(tls_dir, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
+            .enabled(get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE))
+            .build(),
+    )
+    .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
+
+    let source = match server {
+        RuntimeServerTlsMaterial::SingleCert { certs, key } => ServerCertSource::SingleCert {
+            certs: certs.clone(),
+            key: key.clone_key(),
+        },
+        RuntimeServerTlsMaterial::MultiCert { cert_key_pairs } => {
+            let pairs = cert_key_pairs
+                .iter()
+                .map(|(domain, (certs, key))| (domain.clone(), (certs.clone(), key.clone_key())))
+                .collect();
+
+            let resolver = create_multi_cert_resolver(pairs)
+                .map_err(|e| TlsMaterialError::Parse(format!("build HTTP/3 SNI resolver: {e}")))?;
+
+            ServerCertSource::Resolver(Arc::new(resolver))
+        }
+    };
+
+    let tls = build_server_config(source, mtls_verifier, ServerProtocol::Http3)?;
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|e| TlsMaterialError::Io(format!("configure QUIC TLS: {e}")))?;
+
+    Ok(Some(quinn::ServerConfig::with_crypto(Arc::new(crypto))))
 }
 
 // ── Outbound Enrichment ──
@@ -422,30 +463,37 @@ enum ServerCertSource {
     },
 }
 
+enum ServerProtocol {
+    Tcp,
+    Http3,
+}
+
 fn build_server_config(
     cert_source: ServerCertSource,
     mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    protocol: ServerProtocol,
 ) -> Result<rustls::ServerConfig, TlsMaterialError> {
+    let builder = match protocol {
+        ServerProtocol::Tcp => rustls::ServerConfig::builder(),
+        ServerProtocol::Http3 => rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]),
+    };
+
     let mut config = match cert_source {
         ServerCertSource::Resolver(resolver) => {
             if let Some(verifier) = mtls_verifier {
-                rustls::ServerConfig::builder()
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(resolver)
+                builder.with_client_cert_verifier(verifier).with_cert_resolver(resolver)
             } else {
-                rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver)
+                builder.with_no_client_auth().with_cert_resolver(resolver)
             }
         }
         ServerCertSource::SingleCert { certs, key } => {
             if let Some(verifier) = mtls_verifier {
-                rustls::ServerConfig::builder()
+                builder
                     .with_client_cert_verifier(verifier)
                     .with_single_cert(certs, key)
                     .map_err(|e| TlsMaterialError::Io(format!("configure single cert with mTLS: {e}")))?
             } else {
-                rustls::ServerConfig::builder()
+                builder
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .map_err(|e| TlsMaterialError::Io(format!("configure single cert: {e}")))?
@@ -453,7 +501,17 @@ fn build_server_config(
         }
     };
 
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+    config.alpn_protocols = match protocol {
+        ServerProtocol::Tcp => {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()]
+        }
+        ServerProtocol::Http3 => vec![b"h3".to_vec()],
+    };
+
+    if matches!(protocol, ServerProtocol::Http3) {
+        config.max_early_data_size = 0;
+    }
+
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
 
     if tls_key_log() {

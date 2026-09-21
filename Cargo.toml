@@ -177,6 +177,11 @@ tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
+quinn = { version = "0.11.11", default-features = false, features = [
+      "futures-io",
+      "runtime-tokio",
+      "rustls-ring",
+] }
 
 # Serialization and Data Formats
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
@@ -312,8 +317,24 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { version = "0.16.0", features = ["minio"] }
-s3s-http3 = { version = "0.16.0-alpha.1" }
+
+# `s3s-http3 0.16.0-alpha.1` on crates.io depends on `s3s = 0.15.0`.
+#  RustFS now uses `s3s 0.16.0` after PR #757, so passing RustFS's `S3Service` to `s3s_http3::serve` fails because the two `S3Service` types come from different crate versions.
+# change this when s3s-http3 = { version = "0.17.0-alpha.1" } published
+s3s = {
+  version = "0.16.0",
+  git = "https://github.com/s3s-project/s3s.git",
+  rev = "4f83b149341ebdcd76dc4df76db3821033ae2d47",
+  features = ["minio"],
+}
+s3s-http3 = {
+  version = "0.17.0-alpha.1",
+  git = "https://github.com/s3s-project/s3s.git",
+  rev = "4f83b149341ebdcd76dc4df76db3821033ae2d47",
+}
+# s3s = { version = "0.16.0", features = ["minio"] }
+# s3s-http3 = { version = "0.17.0-alpha.1" }
+
 s3s-sigv4 = { version = "0.16.0" }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }

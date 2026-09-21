@@ -30,6 +30,9 @@ mod service_state;
 mod ssec_transport;
 pub mod tls_material;
 
+#[cfg(feature = "http3")]
+mod http3;
+
 use tracing::warn;
 
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.

@@ -210,3 +210,9 @@ pub const ENV_TLS_RELOAD_INTERVAL: &str = "RUSTFS_TLS_RELOAD_INTERVAL";
 
 /// Default interval for TLS certificate reload check
 pub const DEFAULT_TLS_RELOAD_INTERVAL: u64 = 30;
+
+/// Environment variable to enable experimental HTTP/3 support.
+pub const ENV_HTTP3_ENABLE: &str = "RUSTFS_HTTP3_ENABLE";
+
+/// HTTP/3 is disabled unless explicitly enabled.
+pub const DEFAULT_HTTP3_ENABLE: bool = false;

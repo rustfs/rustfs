@@ -36,6 +36,8 @@ use crate::server::{
         load_tls_material, spawn_reload_loop,
     },
 };
+#[cfg(feature = "http3")]
+use crate::server::{http3, tls_material::build_http3_server_config_from_loaded};
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 #[cfg(test)]
@@ -1241,6 +1243,19 @@ pub async fn start_http_server(
 
     let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
     let tls_path_configured = !tls_path.is_empty();
+
+    #[cfg(feature = "http3")]
+    let http3_enabled = !config.console_enable
+        && rustfs_utils::get_env_bool(rustfs_config::ENV_HTTP3_ENABLE, rustfs_config::DEFAULT_HTTP3_ENABLE);
+
+    #[cfg(feature = "http3")]
+    if http3_enabled && !tls_path_configured {
+        return Err(Error::other("HTTP/3 requires TLS configuration"));
+    }
+
+    #[cfg(feature = "http3")]
+    let mut http3_server_config = None;
+
     // Load TLS materials and build server acceptor in a single pass.
     // Outbound material (root CAs, mTLS identity) was already published in main.rs;
     // this load is needed for the server-side TLS acceptor and reload loop.
@@ -1251,6 +1266,14 @@ pub async fn start_http_server(
                 tls_path, e
             ))
         })?;
+
+        #[cfg(feature = "http3")]
+        if http3_enabled {
+            http3_server_config = build_http3_server_config_from_loaded(snapshot.server.as_ref(), std::path::Path::new(tls_path))
+                .await
+                .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?;
+        }
+
         let acceptor = build_acceptor_from_loaded(snapshot.server, std::path::Path::new(tls_path))
             .await
             .map_err(|e| Error::other(e.to_string()))?;
@@ -1398,6 +1421,16 @@ pub async fn start_http_server(
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+    #[cfg(feature = "http3")]
+    let http3_task = if let Some(server_config) = http3_server_config {
+        let (_, task) = http3::spawn(server_config, local_addr, s3_service.clone(), shutdown_tx.subscribe())
+            .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
+        Some(task)
+    } else {
+        None
+    };
+
     // Create compression configuration from environment variables
     let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
@@ -1755,6 +1788,20 @@ pub async fn start_http_server(
                     active_connections,
                     timeout_secs = 10,
                     "HTTP connection drain timed out"
+                );
+            }
+        }
+
+        #[cfg(feature = "http3")]
+        if let Some(task) = http3_task {
+            if let Err(error) = task.await {
+                error!(
+                    event = EVENT_HTTP_TRANSPORT_FAILED,
+                    component = LOG_COMPONENT_SERVER,
+                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                    protocol = "http3",
+                    error = ?error,
+                    "HTTP/3 server task failed during shutdown"
                 );
             }
         }

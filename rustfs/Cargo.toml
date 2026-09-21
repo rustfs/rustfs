@@ -77,7 +77,7 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
-http3 = ["dep:s3s-http3"]
+http3 = ["dep:s3s-http3", "dep:quinn"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -301,6 +301,7 @@ tokio-util = { workspace = true, features = ["io", "compat", "time"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
+quinn = { workspace = true, optional = true }
 
 # Serialization and Data Formats
 apache-avro = { workspace = true }
