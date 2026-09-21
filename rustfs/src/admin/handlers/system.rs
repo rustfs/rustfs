@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{cluster_snapshot, metrics};
+use super::{cluster_snapshot, realtime};
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
 use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
@@ -168,7 +168,7 @@ pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/realtime").as_str(),
-        AdminOperation(&metrics::MetricsHandler {}),
+        AdminOperation(&realtime::MetricsHandler {}),
     )?;
 
     r.insert(
