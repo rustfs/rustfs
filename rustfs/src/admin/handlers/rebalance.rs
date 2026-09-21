@@ -43,13 +43,21 @@ use s3s::{
     s3_error,
 };
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
 const EVENT_ADMIN_REBALANCE_STATE: &str = "admin_rebalance_state";
+const REBALANCE_START_FLEET_PROOF_MARKER: &str = "pool activation requires a live fleet capability proof";
+const REBALANCE_START_FLEET_PROOF_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const REBALANCE_START_FLEET_PROOF_RETRY_DELAY: Duration = Duration::from_secs(5);
+const REBALANCE_START_RETRY_AFTER_SECS: &str = "5";
 
 fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -103,6 +111,80 @@ fn rebalance_start_rollback_error(start_err: &str, rollback_result: &Result<(), 
 
 fn rebalance_internal_error(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, message.into())
+}
+
+fn rebalance_fleet_proof_unavailable_error() -> S3Error {
+    let mut err = S3Error::with_message(
+        S3ErrorCode::ServiceUnavailable,
+        "rebalance start is waiting for cluster capability readiness; retry later",
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static(REBALANCE_START_RETRY_AFTER_SECS));
+    err.set_headers(headers);
+    err
+}
+
+fn is_rebalance_start_fleet_proof_retryable(err: &StorageError) -> bool {
+    crate::storage_api::capacity::is_pool_activation_fleet_proof_error(err)
+        && err.to_string().contains(REBALANCE_START_FLEET_PROOF_MARKER)
+}
+
+fn rebalance_start_failure_error(start_err: &StorageError, rollback_result: &Result<(), String>) -> S3Error {
+    if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(start_err) {
+        if rollback_result.is_ok() {
+            return rebalance_fleet_proof_unavailable_error();
+        }
+        return rebalance_internal_error("failed to roll back rebalance start after fleet capability readiness failure");
+    }
+
+    rebalance_internal_error(rebalance_start_rollback_error(&start_err.to_string(), rollback_result))
+}
+
+async fn retry_rebalance_start_operation<T, F, Fut>(
+    operation: &'static str,
+    rebalance_id: &str,
+    request_id: &str,
+    actor: &str,
+    remote_addr: &str,
+    deadline: Instant,
+    mut operation_fn: F,
+) -> Result<T, StorageError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StorageError>>,
+{
+    let mut attempt = 1_u32;
+    loop {
+        match operation_fn().await {
+            Ok(value) => return Ok(value),
+            Err(err) if is_rebalance_start_fleet_proof_retryable(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let delay = REBALANCE_START_FLEET_PROOF_RETRY_DELAY.min(deadline.saturating_duration_since(now));
+                warn!(
+                    event = EVENT_ADMIN_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    action = "start",
+                    state = "fleet_proof_retry_scheduled",
+                    result = "retrying",
+                    operation,
+                    attempt,
+                    retry_delay_ms = delay.as_millis(),
+                    request_id = %request_id,
+                    actor = %actor,
+                    remote_addr = %remote_addr,
+                    rebalance_id = %rebalance_id,
+                    "admin rebalance state"
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn rebalance_rollback_stop_failure_message(rebalance_id: &str, failures: &[String]) -> String {
@@ -209,7 +291,7 @@ async fn rollback_rebalance_start_for_admin(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
     rebalance_id: &str,
-    start_err: &str,
+    start_err: &StorageError,
     request_id: &str,
     actor: &str,
     remote_addr: &str,
@@ -246,7 +328,7 @@ async fn rollback_rebalance_start_for_admin(
         ),
     }
 
-    Err(rebalance_internal_error(rebalance_start_rollback_error(start_err, &rollback_result)))
+    Err(rebalance_start_failure_error(start_err, &rollback_result))
 }
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -562,6 +644,7 @@ impl Operation for RebalanceStart {
             "admin rebalance state"
         );
         let notification_sys = current_notification_system();
+        let fleet_proof_deadline = Instant::now() + REBALANCE_START_FLEET_PROOF_RETRY_BUDGET;
         for step in rebalance_start_steps(notification_sys.is_some()) {
             match step {
                 RebalanceStartStep::PropagateFence => {
@@ -592,13 +675,11 @@ impl Operation for RebalanceStart {
                                 error = %err,
                                 "admin rebalance state"
                             );
-
-                            let start_err = err.to_string();
                             rollback_rebalance_start_for_admin(
                                 &store,
                                 Some(notification_sys),
                                 &id,
-                                &start_err,
+                                &err,
                                 &request_id,
                                 &actor,
                                 &remote_addr,
@@ -608,7 +689,17 @@ impl Operation for RebalanceStart {
                     }
                 }
                 RebalanceStartStep::StartLocal => {
-                    if let Err(err) = store.start_rebalance_for_id(&id).await {
+                    let start_result = retry_rebalance_start_operation(
+                        "start_rebalance_for_id",
+                        &id,
+                        &request_id,
+                        &actor,
+                        &remote_addr,
+                        fleet_proof_deadline,
+                        || store.start_rebalance_for_id(&id),
+                    )
+                    .await;
+                    if let Err(err) = start_result {
                         error!(
                             event = EVENT_ADMIN_REBALANCE_STATE,
                             component = LOG_COMPONENT_ADMIN,
@@ -682,6 +773,9 @@ impl Operation for RebalanceStart {
                                 )));
                             }
                         }
+                        if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(&err) {
+                            return Err(rebalance_fleet_proof_unavailable_error());
+                        }
                         return Err(rebalance_internal_error(format!(
                             "failed to start rebalance after metadata initialized for {id}; local metadata was finalized as failed: {start_err}"
                         )));
@@ -701,7 +795,17 @@ impl Operation for RebalanceStart {
                             rebalance_id = %id,
                             "admin rebalance state"
                         );
-                        if let Err(err) = notification_sys.load_rebalance_meta(true).await {
+                        let worker_result = retry_rebalance_start_operation(
+                            "load_rebalance_meta(start=true)",
+                            &id,
+                            &request_id,
+                            &actor,
+                            &remote_addr,
+                            fleet_proof_deadline,
+                            || notification_sys.load_rebalance_meta(true),
+                        )
+                        .await;
+                        if let Err(err) = worker_result {
                             error!(
                                 event = EVENT_ADMIN_REBALANCE_STATE,
                                 component = LOG_COMPONENT_ADMIN,
@@ -715,13 +819,11 @@ impl Operation for RebalanceStart {
                                 error = %err,
                                 "admin rebalance state"
                             );
-
-                            let start_err = err.to_string();
                             rollback_rebalance_start_for_admin(
                                 &store,
                                 Some(notification_sys),
                                 &id,
-                                &start_err,
+                                &err,
                                 &request_id,
                                 &actor,
                                 &remote_addr,
@@ -1059,12 +1161,14 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         Body, HeaderMap, Method, Operation, Params, RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStart,
-        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, S3Request, Uri,
-        build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
-        rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
-        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id,
-        rebalance_used_pct, rollback_result_label, stop_rebalance_admission_first,
+        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, S3Request, StatusCode,
+        Uri, build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
+        is_rebalance_start_fleet_proof_retryable, rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets,
+        rebalance_rollback_failure_message, rebalance_rollback_stop_failure_message, rebalance_start_failure_error,
+        rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id, rebalance_used_pct,
+        retry_rebalance_start_operation, rollback_result_label, stop_rebalance_admission_first,
     };
+    use crate::admin::storage_api::error::StorageError;
     use crate::admin::storage_api::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
@@ -1326,6 +1430,108 @@ mod rebalance_handler_tests {
         assert!(message.contains("failed to propagate rebalance start: peer a failed"));
         assert!(message.contains("rollback result: rollback_partial"));
         assert!(message.contains("rollback error: peer b stop_rebalance failed: timeout"));
+    }
+
+    #[test]
+    fn test_rebalance_start_fleet_proof_maps_to_retryable_503() {
+        let start_err = StorageError::other(super::REBALANCE_START_FLEET_PROOF_MARKER);
+
+        let err = rebalance_start_failure_error(&start_err, &Ok(()));
+
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            err.headers()
+                .and_then(|headers| headers.get(http::header::RETRY_AFTER))
+                .and_then(|value| value.to_str().ok()),
+            Some(super::REBALANCE_START_RETRY_AFTER_SECS)
+        );
+        assert!(
+            !err.message()
+                .expect("retryable rebalance start error should have a message")
+                .contains(super::REBALANCE_START_FLEET_PROOF_MARKER)
+        );
+    }
+
+    #[test]
+    fn test_rebalance_start_fleet_proof_rollback_failure_is_generic_internal_error() {
+        let start_err = StorageError::other(super::REBALANCE_START_FLEET_PROOF_MARKER);
+        let rollback_result = Err("peer rollback failed".to_string());
+
+        let err = rebalance_start_failure_error(&start_err, &rollback_result);
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(
+            !err.message()
+                .expect("internal rebalance start error should have a message")
+                .contains(super::REBALANCE_START_FLEET_PROOF_MARKER)
+        );
+    }
+
+    #[test]
+    fn test_rebalance_start_unrelated_failure_remains_internal_error() {
+        let start_err = StorageError::other("disk read failed");
+
+        let err = rebalance_start_failure_error(&start_err, &Ok(()));
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.message().is_some_and(|message| message.contains("disk read failed")));
+    }
+
+    #[test]
+    fn test_rebalance_start_fleet_proof_retry_only_matches_missing_live_proof() {
+        let missing = StorageError::other(super::REBALANCE_START_FLEET_PROOF_MARKER);
+        let expired = StorageError::other(format!(
+            "rebalance meta save failed during start_rebalance: {}",
+            "pool activation fleet capability proof expired before commit"
+        ));
+
+        assert!(is_rebalance_start_fleet_proof_retryable(&missing));
+        assert!(!is_rebalance_start_fleet_proof_retryable(&expired));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rebalance_start_retry_waits_for_fleet_proof() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let attempts = Arc::clone(&attempts);
+            async move {
+                retry_rebalance_start_operation(
+                    "load_rebalance_meta(start=true)",
+                    "rebalance-id",
+                    "request-id",
+                    "actor",
+                    "remote",
+                    std::time::Instant::now() + super::REBALANCE_START_FLEET_PROOF_RETRY_BUDGET,
+                    move || {
+                        let attempts = Arc::clone(&attempts);
+                        async move {
+                            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                            if attempt == 0 {
+                                Err(StorageError::other(super::REBALANCE_START_FLEET_PROOF_MARKER))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(super::REBALANCE_START_FLEET_PROOF_RETRY_DELAY).await;
+        task.await
+            .expect("retry task should not panic")
+            .expect("fleet proof retry should eventually succeed");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
