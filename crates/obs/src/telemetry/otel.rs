@@ -68,7 +68,7 @@ use std::{fs, io::IsTerminal, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_request_duration_seconds",
@@ -184,7 +184,8 @@ pub(super) fn init_observability_http(
         // active, the OpenTelemetry bridge is the authoritative sink for
         // `tracing` events unless local file logging is needed as a fallback.
     }
-    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    let span_events = crate::telemetry::local::resolve_span_events();
+    let span_list = crate::telemetry::local::resolve_span_list(logger_level);
     // ── Case 2: File Logging
     // If a log directory is configured and OTLP log export is unavailable, use
     // the same rolling-file behavior as the local-only telemetry backend.
@@ -221,7 +222,7 @@ pub(super) fn init_observability_http(
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
@@ -267,7 +268,7 @@ pub(super) fn init_observability_http(
     if force_stdout_logging || crate::telemetry::local::resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events, span_list));
     }
     let local_file_fallback_enabled = file_layer_opt.is_some();
     let stdout_mirror_enabled = stdout_guard.is_some();
