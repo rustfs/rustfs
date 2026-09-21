@@ -407,7 +407,7 @@ class FunctionalWorkflowTests(unittest.TestCase):
         "kms": "Run KMS suite", "storage": "Run storage engine suite",
         "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
         "replication": "Run replication suite",
-        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2, D)",
+        "table": "Run table suite", "fault-tolerance": "Run fault-tolerance scenarios (A, B, C, C2, D, E)",
     }
 
     def test_failure_and_always_step_wiring(self) -> None:
@@ -538,10 +538,10 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
             "GITHUB_RUN_ID": "314159",
         }
 
-    def write_result(self, *, seen: int = 38, complete: bool = True,
+    def write_result(self, *, seen: int = 44, complete: bool = True,
                      duplicate: bool = False, testing_sha: str | None = None,
                      unrelated_seen: bool = False, missing_verdict: bool = False) -> None:
-        expected = [f"CASE-{index:02d}" for index in range(38)]
+        expected = [f"CASE-{index:02d}" for index in range(44)]
         seen_cases = expected[:seen]
         if unrelated_seen:
             seen_cases = [f"OTHER-{index:02d}" for index in range(seen)]
@@ -553,14 +553,14 @@ class FaultToleranceWorkflowContractTests(unittest.TestCase):
         payload = {
             "schema_version": 1,
             "auto_testing_sha": testing_sha or self.TESTING_SHA,
-            "selected_scenarios": ["A", "B", "C", "C2", "D"],
+            "selected_scenarios": ["A", "B", "C", "C2", "D", "E"],
             "complete": complete,
             "expected_cases": expected,
             "seen_cases": seen_cases,
             "missing_cases": expected[seen:],
             "harness_errors": [],
             "counts": {
-                "expected": 38,
+                "expected": 44,
                 "seen": seen,
                 "unexpected": 1,
                 "known_divergence": 0,
