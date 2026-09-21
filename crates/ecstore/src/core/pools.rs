@@ -1890,6 +1890,7 @@ fn grow_decommission_target_reservation(
     source_pool_index: usize,
     target_pool_index: usize,
     expected_data_bytes: usize,
+    mutation_id: uuid::Uuid,
     now: OffsetDateTime,
 ) -> Result<bool> {
     let original = meta.clone();
@@ -1920,14 +1921,34 @@ fn grow_decommission_target_reservation(
         let data_bytes = expected_data_bytes.max(1);
         let required_target_bytes = capacity_target_physical_bytes(data_bytes, target_layout)?;
         let required_peak = required_target_bytes.saturating_mul(1usize.saturating_add(reservation.temporary_copies));
-        let existing_remaining = reservation
+        let existing_target = reservation
             .targets
             .iter()
-            .find(|target| target.pool_index == target_pool_index)
+            .find(|target| target.pool_index == target_pool_index);
+        if let Some(target) = existing_target {
+            if target.pending_physical_bytes > 0 && target.pending_mutation_id != Some(mutation_id) {
+                return Err(decommission_capacity_blocked_error(format!(
+                    "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent"
+                )));
+            }
+        }
+        let existing_remaining = existing_target
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
             .unwrap_or_default();
         if required_peak <= existing_remaining {
             return Ok(false);
+        }
+        if reservation.source_data_equivalent_bytes > 0 {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} reservation estimate is exhausted"
+            )));
+        }
+        if let Some(target) = existing_target {
+            if target_capacity.physical_free <= target.physical_free_at_reservation {
+                return Err(decommission_capacity_blocked_error(format!(
+                    "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
+                )));
+            }
         }
         let current_peak = reservation.remaining_peak_physical_bytes();
         let additional_peak = required_peak.saturating_sub(existing_remaining);
@@ -1936,6 +1957,9 @@ fn grow_decommission_target_reservation(
         reservation.source_data_equivalent_bytes = reservation
             .source_data_equivalent_bytes
             .saturating_add(additional_source_data);
+        reservation.source_physical_bytes = reservation
+            .source_physical_bytes
+            .saturating_add(capacity_target_physical_bytes(additional_source_data, reservation.source_layout)?);
         reservation.predicted_physical_bytes = reservation
             .predicted_physical_bytes
             .saturating_add(additional_predicted)
@@ -11612,6 +11636,7 @@ impl ECStore {
                 source_pool_index,
                 target_pool_index,
                 data_bytes,
+                mutation_id,
                 OffsetDateTime::now_utc(),
             )?;
             ensure_decommission_capacity_reservations_available(&snapshot, &capacity_infos, "mutation")?;
@@ -12691,12 +12716,13 @@ impl ECStore {
             (required_peak <= remaining).then_some((target.pool_index, remaining))
         };
         if let Some(permitted_target_pool_index) = decommission_capacity_target_permit_index(self.id, owner) {
-            if reservation
+            if let Some((pool_index, _)) = reservation
                 .targets
                 .iter()
-                .any(|target| target.pool_index == permitted_target_pool_index)
+                .find(|target| target.pool_index == permitted_target_pool_index)
+                .and_then(&candidate)
             {
-                return Ok(permitted_target_pool_index);
+                return Ok(pool_index);
             }
             // The holder that preceded this waiter may have consumed the
             // remaining allocation. Release that guard before selecting a
@@ -12710,6 +12736,12 @@ impl ECStore {
             .max_by_key(|(_, remaining)| *remaining)
         {
             return Ok(pool_index);
+        }
+        if reservation.source_data_equivalent_bytes > 0 {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {} has no target allocation for {expected_data_bytes} data bytes",
+                owner.source_pool_index
+            )));
         }
         let capacities = self.get_decommission_all_pool_capacity_infos().await?;
         let active_sources = active_decommission_source_indices(&pool_meta);
@@ -28682,7 +28714,7 @@ mod pools_tests {
             DECOMMISSION_CAPACITY_MODEL_VERSION,
         )
         .expect("an empty scanner snapshot should still start decommission");
-        let grew = grow_decommission_target_reservation(&mut meta, &capacity_infos, 0, 1, 1, now)
+        let grew = grow_decommission_target_reservation(&mut meta, &capacity_infos, 0, 1, 1, uuid::Uuid::new_v4(), now)
             .expect("the reservation should grow against current target capacity");
         assert!(grew);
         let reservation = meta.pools[0]
