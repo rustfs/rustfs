@@ -167,7 +167,7 @@ pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
 
     r.insert(
         Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/metrics").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/realtime").as_str(),
         AdminOperation(&metrics::MetricsHandler {}),
     )?;
 

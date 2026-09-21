@@ -11,7 +11,7 @@ Every stage is env-gated, so "before" and "after" run the *same binary* with dif
 | --- | --- |
 | RPC secret | Internode RPC fails closed: remote endpoints with default credentials and no `RUSTFS_RPC_SECRET` abort startup with `store init aborted: endpoints include remote nodes but ...` (`crates/ecstore/src/store/init.rs`). Set a non-default `RUSTFS_RPC_SECRET`, identical on every node. |
 | systemd start timeout | `deploy/build/rustfs.service` is `Type=notify` and ships `TimeoutStartSec=120s`; READY fires only after quorum. If freshly purged disks need longer, raise it in a drop-in rather than lowering it. |
-| Metrics export | RustFS has no Prometheus pull endpoint (`/admin/v3/metrics` is NDJSON, see `rustfs/src/admin/handlers/metrics.rs`); it pushes OTLP. Run an otel-collector (OTLP receiver → Prometheus exporter) and set `RUSTFS_OBS_ENDPOINT`, `RUSTFS_OBS_METRICS_EXPORT_ENABLED=true`, `RUSTFS_OBS_METER_INTERVAL=5`. For lock p99 also set `RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true` (default off). |
+| Metrics export | RustFS has no Prometheus pull endpoint (`/admin/v3/realtime` is NDJSON, see `rustfs/src/admin/handlers/metrics.rs`); it pushes OTLP. Run an otel-collector (OTLP receiver → Prometheus exporter) and set `RUSTFS_OBS_ENDPOINT`, `RUSTFS_OBS_METRICS_EXPORT_ENABLED=true`, `RUSTFS_OBS_METER_INTERVAL=5`. For lock p99 also set `RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true` (default off). |
 | Server env | `RUSTFS_INTERNODE_*` are **server** env. For p0/p1/p2, source the emitted `server-env.sh` on every node and restart before the run; the driver cannot mutate a running server. |
 
 ## Driver

@@ -320,7 +320,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/info", SERVER_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/storageinfo", STORAGE_INFO, RouteRiskLevel::Sensitive),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/realtime", GET_METRICS, RouteRiskLevel::Sensitive),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/object-data-cache/stats",
@@ -2303,7 +2303,7 @@ mod tests {
 
     #[test]
     fn route_policy_maps_metrics_to_explicit_admin_action() {
-        assert_action(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/realtime", GET_METRICS);
     }
 
     #[test]

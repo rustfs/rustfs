@@ -317,7 +317,7 @@ Use the harness around a post-start bucket creation workload to cover the timing
 1. Start RustFS from an empty data path.
 2. Start the harness before creating buckets.
 3. Create a bucket, upload objects, and keep the harness running until at least one usage save is observed.
-4. Compare `scanner-summary.csv` with `/rustfs/admin/v3/metrics?types=1&n=1` bucket metrics.
+4. Compare `scanner-summary.csv` with `/rustfs/admin/v3/realtime?types=1&n=1` bucket metrics.
 
 Expected evidence: dirty usage is marked, `life_time_scan_cycle` or `life_time_scan_bucket_drive` advances, `life_time_scan_object` advances for object workloads, and `life_time_save_usage` plus `usage_last_save_result=success` appear before non-zero bucket usage metrics are accepted as fresh.
 
