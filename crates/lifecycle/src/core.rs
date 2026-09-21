@@ -241,7 +241,11 @@ impl RuleValidate for LifecycleRule {
             return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS));
         }
         // Rule must have at least one action
-        let has_expiration = self.expiration.is_some();
+        let has_expiration = self.expiration.as_ref().is_some_and(|expiration| {
+            expiration.days.is_some()
+                || expiration.date.is_some()
+                || expiration.expired_object_delete_marker.is_some()
+        });
         let has_transition = self.transitions.as_ref().is_some_and(|t| !t.is_empty());
         // `NewerNoncurrentVersions` on its own is a MinIO extension, not an AWS
         // form: it keeps the newest N noncurrent versions and expires the rest
@@ -4453,6 +4457,19 @@ mod tests {
             .validate(&ObjectLockConfiguration::default())
             .await
             .expect_err("a negative retention count on a transition must be rejected");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_empty_expiration_action() {
+        let mut rule = rule_with_filter(LifecycleRuleFilter::default());
+        rule.expiration = Some(LifecycleExpiration::default());
+
+        let err = config_with_rules(vec![rule])
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("an empty Expiration object must not count as an action");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION);
     }
 
     #[tokio::test]
