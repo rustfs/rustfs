@@ -242,9 +242,7 @@ impl RuleValidate for LifecycleRule {
         }
         // Rule must have at least one action
         let has_expiration = self.expiration.as_ref().is_some_and(|expiration| {
-            expiration.days.is_some()
-                || expiration.date.is_some()
-                || expiration.expired_object_delete_marker.is_some()
+            expiration.days.is_some() || expiration.date.is_some() || expiration.expired_object_delete_marker.is_some()
         });
         let has_transition = self.transitions.as_ref().is_some_and(|t| !t.is_empty());
         // `NewerNoncurrentVersions` on its own is a MinIO extension, not an AWS
