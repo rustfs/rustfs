@@ -1925,12 +1925,13 @@ fn grow_decommission_target_reservation(
             .targets
             .iter()
             .find(|target| target.pool_index == target_pool_index);
-        if let Some(target) = existing_target {
-            if target.pending_physical_bytes > 0 && target.pending_mutation_id != Some(mutation_id) {
-                return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent"
-                )));
-            }
+        if let Some(target) = existing_target
+            && target.pending_physical_bytes > 0
+            && target.pending_mutation_id != Some(mutation_id)
+        {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent"
+            )));
         }
         let existing_remaining = existing_target
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
@@ -1943,12 +1944,12 @@ fn grow_decommission_target_reservation(
                 "source pool {source_pool_index} reservation estimate is exhausted"
             )));
         }
-        if let Some(target) = existing_target {
-            if target_capacity.physical_free <= target.physical_free_at_reservation {
-                return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
-                )));
-            }
+        if let Some(target) = existing_target
+            && target_capacity.physical_free <= target.physical_free_at_reservation
+        {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
+            )));
         }
         let current_peak = reservation.remaining_peak_physical_bytes();
         let additional_peak = required_peak.saturating_sub(existing_remaining);
