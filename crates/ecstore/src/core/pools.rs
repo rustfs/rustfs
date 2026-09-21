@@ -135,6 +135,7 @@ const DECOMMISSION_CAPACITY_RELEASE_FAILED: &str = "failed";
 const DECOMMISSION_CAPACITY_RELEASE_COMPLETED: &str = "completed";
 pub(crate) const DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX: &str = "decommission/capacity-target";
 const DECOMMISSION_CAPACITY_TARGET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX: &str = " target capacity mutation gate is busy";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
@@ -153,6 +154,10 @@ const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::
 const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS: usize = 3;
+
+fn decommission_capacity_target_gate_retry_exhausted(attempt: usize) -> bool {
+    attempt.saturating_add(1) >= DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS
+}
 const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
 const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
 const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v2";
@@ -13720,6 +13725,20 @@ impl ECStore {
             match self.acquire_decommission_capacity_target_guard(target_pool_index).await {
                 Ok(guard) => break guard,
                 Err(err) if is_decommission_capacity_target_gate_busy(&err) => {
+                    if decommission_capacity_target_gate_retry_exhausted(wait_attempt) {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            target_pool_index,
+                            attempts = wait_attempt.saturating_add(1),
+                            state = "capacity_gate_retry_exhausted",
+                            error = %err,
+                            "Decommission target capacity gate remained busy; pausing for supervised retry"
+                        );
+                        return Err(err);
+                    }
                     wait_attempt = wait_attempt.saturating_add(1);
                 }
                 Err(err) => return Err(err),
@@ -22812,8 +22831,9 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityAdmission, DecommissionCapacityOwner, DecommissionCapacityReleaseProof,
-        DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
+        DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS, DecommissionCapacityAdmission, DecommissionCapacityOwner,
+        DecommissionCapacityReleaseProof, DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation,
+        decommission_capacity_mutation_id, decommission_capacity_target_gate_retry_exhausted,
         ensure_decommission_target_owner_admission, ensure_exact_delete_capacity_namespace_fences,
         ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
         plan_exact_delete_capacity_reconciliations, record_decommission_target_consumption, release_decommission_target_inflight,
@@ -22918,6 +22938,17 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[test]
+    fn decommission_target_gate_retry_is_bounded() {
+        assert!(!decommission_capacity_target_gate_retry_exhausted(0));
+        assert!(!decommission_capacity_target_gate_retry_exhausted(
+            DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS - 2
+        ));
+        assert!(decommission_capacity_target_gate_retry_exhausted(
+            DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS - 1
+        ));
     }
 
     #[tokio::test]
