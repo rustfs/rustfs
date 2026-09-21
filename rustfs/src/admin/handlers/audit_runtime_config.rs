@@ -189,6 +189,7 @@ mod tests {
     use crate::admin::handlers::target_descriptor::admin_target_spec_from_builtin;
     use crate::admin::runtime_sources::{IamInterface, KmsInterface};
     use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::admin::storage_api::error::StorageError;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::server_config::KVS;
     use rustfs_config::{ENABLE_KEY, EnableState, SCANNER_CYCLE, SCANNER_SUB_SYS, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
@@ -237,7 +238,7 @@ mod tests {
                             return;
                         }
                     }
-                    Err(rustfs_ecstore::api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })) => {
+                    Err(StorageError::Lock(rustfs_lock::LockError::Timeout { .. })) => {
                         // The writer may still be committing the config snapshot. Retry after
                         // the object lock is released instead of failing the polling helper.
                     }
