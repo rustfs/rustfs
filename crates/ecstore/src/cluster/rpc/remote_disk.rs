@@ -2141,7 +2141,7 @@ impl RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
-                    bucket_incarnation_id: crate::store::bucket_heal_scope(dst_volume)
+                    bucket_incarnation_id: crate::store::bucket_heal_scope_for_object(dst_volume, dst_path)
                         .map(|scope| scope.incarnation.as_bytes().to_vec().into())
                         .unwrap_or_default(),
                     disk: self.endpoint.to_string(),

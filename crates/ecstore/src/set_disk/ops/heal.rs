@@ -854,7 +854,7 @@ impl SetDisks {
         );
 
         let disks = self.get_disks_internal().await;
-        let bucket_heal_scope = crate::store::bucket_heal_scope(bucket);
+        let bucket_heal_scope = crate::store::bucket_heal_scope_for_object(bucket, object);
         if let Some(scope) = &bucket_heal_scope {
             scope.check()?;
         }
