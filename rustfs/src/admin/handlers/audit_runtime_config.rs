@@ -231,11 +231,17 @@ mod tests {
             let mut poll = tokio::time::interval(Duration::from_millis(10));
             loop {
                 poll.tick().await;
-                let config = read_admin_config_without_migrate(store.clone())
-                    .await
-                    .expect("read persisted server config");
-                if config.0.get(subsystem).is_some_and(|targets| targets.contains_key(target)) {
-                    return;
+                match read_admin_config_without_migrate(store.clone()).await {
+                    Ok(config) => {
+                        if config.0.get(subsystem).is_some_and(|targets| targets.contains_key(target)) {
+                            return;
+                        }
+                    }
+                    Err(rustfs_ecstore::api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })) => {
+                        // The writer may still be committing the config snapshot. Retry after
+                        // the object lock is released instead of failing the polling helper.
+                    }
+                    Err(error) => panic!("read persisted server config: {error}"),
                 }
             }
         })
