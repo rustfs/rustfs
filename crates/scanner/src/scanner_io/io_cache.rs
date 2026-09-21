@@ -1191,12 +1191,15 @@ impl ScannerIOCache for SetDisks {
                                 }
                                 match persist_scanner_checkpoint(
                                     store_clone_clone.clone(),
+                                    ScannerCheckpointPersistContext {
+                                        ctx: &ctx_clone,
+                                        expected_publication_epoch: expected_publication_epoch_clone,
+                                        cycle: want_cycle,
+                                        leader_epoch,
+                                    },
                                     cache_name.as_str(),
                                     &checkpoint,
                                     &mut revisions,
-                                    expected_publication_epoch_clone,
-                                    want_cycle,
-                                    leader_epoch,
                                 )
                                 .await
                                 {

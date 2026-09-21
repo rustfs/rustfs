@@ -542,6 +542,54 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Docker Hub's overview is a separate `full_description` field that
+  # `docker push` never touches, so it drifted from README.md and kept
+  # linking to pages that no longer exist (#7995). Republish it from the
+  # commit the images were built from, only when images were pushed.
+  sync-dockerhub-description:
+    name: Sync Docker Hub Description
+    needs: [ build-check, build-docker ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build-check.outputs.source_ref }}
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: Sync Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.REGISTRY_DOCKERHUB }}
+          readme-filepath: ./README.md
+          # README.md links to docs/ and CONTRIBUTING.md by relative path;
+          # rewrite those to github.com URLs so they resolve on Docker Hub.
+          enable-url-completion: true
+
+      # Docker Hub caps `full_description` at 25,000 bytes and the action
+      # truncates to fit with only a warning, which would publish a README
+      # cut off mid-sentence. README.md is already near the cap, so read the
+      # published overview back and fail if it hit the limit.
+      - name: Check published description was not truncated
+        env:
+          REPOSITORY: ${{ env.REGISTRY_DOCKERHUB }}
+        run: |
+          limit=25000
+          published=$(curl -sSf "https://hub.docker.com/v2/repositories/${REPOSITORY}/" \
+            | jq -j '.full_description' | wc -c | tr -d ' ')
+          echo "Published overview: ${published} bytes (Docker Hub limit: ${limit})"
+          # Truncation lands within one UTF-8 character of the cap.
+          if [ "$published" -ge $((limit - 4)) ]; then
+            echo "::error file=README.md::Docker Hub overview was truncated at ${limit} bytes; trim README.md before the next release."
+            exit 1
+          fi
+
   # Docker build summary
   docker-summary:
     name: Docker Build Summary

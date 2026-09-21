@@ -54,7 +54,10 @@ jobs:
       - name: Resolve published candidate
         id: candidate
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The staleness probe in resolve_functional_candidate.py reads the
+          # private rustfs/auto-testing repo; github.token cannot, and a probe
+          # failure silently keeps a stale testing_sha pinned for the chain.
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
           CHAIN_OUTPUT: ${{ runner.temp }}/chain-candidate.json

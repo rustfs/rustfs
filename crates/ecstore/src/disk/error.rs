@@ -244,12 +244,15 @@ impl StdError for ConditionalFileNotCommittedError {
     }
 }
 
-fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
+fn classify_internode_disk_error(error: &InternodeHttpError) -> Option<DiskError> {
     if error.is_remote_file_not_found() {
         return Some(DiskError::FileNotFound);
     }
     if error.is_remote_volume_not_found() {
         return Some(DiskError::VolumeNotFound);
+    }
+    if error.is_remote_file_corrupt() {
+        return Some(DiskError::FileCorrupt);
     }
     None
 }
@@ -526,13 +529,10 @@ fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorK
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
-            if error.is_remote_file_not_found() {
-                return DiskError::FileNotFound;
-            }
-            if error.is_remote_volume_not_found() {
-                return DiskError::VolumeNotFound;
-            }
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            && let Some(classified) = classify_internode_disk_error(error)
+        {
+            return classified;
         }
         let e = match e.downcast::<TerminalReadError>() {
             Ok(terminal_error) => {
@@ -541,7 +541,7 @@ impl From<std::io::Error> for DiskError {
                     && let Some(internode_error) = io_error
                         .get_ref()
                         .and_then(|source| source.downcast_ref::<InternodeHttpError>())
-                    && let Some(classified) = classify_internode_missing_error(internode_error)
+                    && let Some(classified) = classify_internode_disk_error(internode_error)
                 {
                     return classified;
                 }
@@ -963,6 +963,7 @@ mod tests {
         for (remote_error, expected) in [
             (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
             (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+            (rustfs_rio::new_test_remote_file_corrupt_http_io_error(), DiskError::FileCorrupt),
         ] {
             let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
             assert_eq!(DiskError::from(wrapped), expected);
@@ -1533,25 +1534,23 @@ mod tests {
     }
 
     #[test]
-    fn test_internode_missing_errors_preserve_disk_error_types() {
+    fn test_internode_disk_errors_preserve_disk_error_types() {
         let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
         let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let file_corrupt = DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error());
         let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
             rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
         ));
 
         assert_eq!(file_missing, DiskError::FileNotFound);
         assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert_eq!(file_corrupt, DiskError::FileCorrupt);
         assert!(matches!(unmarked_server_error, DiskError::Io(_)));
-        for missing in [file_missing, volume_missing] {
-            assert_eq!(missing.clone(), missing);
+        for error in [file_missing, volume_missing, file_corrupt] {
+            assert_eq!(error.clone(), error);
             assert_eq!(
-                crate::disk::error_reduce::reduce_write_quorum_errs(
-                    &[Some(missing.clone()), Some(missing.clone()), None],
-                    &[],
-                    2
-                ),
-                Some(missing)
+                crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error.clone()), Some(error.clone()), None], &[], 2),
+                Some(error)
             );
         }
     }

@@ -1712,16 +1712,17 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
 }
 
 fn response_with_disk_error(error: &DiskError, message: impl Into<String>) -> Response<Body> {
-    let missing = match error {
+    let disk_error = match error {
         DiskError::FileNotFound => Some(rustfs_rio::INTERNODE_FILE_NOT_FOUND),
         DiskError::VolumeNotFound => Some(rustfs_rio::INTERNODE_VOLUME_NOT_FOUND),
+        DiskError::FileCorrupt => Some(rustfs_rio::INTERNODE_FILE_CORRUPT),
         _ => None,
     };
     let mut response = response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
-    if let Some(missing) = missing {
+    if let Some(disk_error) = disk_error {
         response
             .headers_mut()
-            .insert(rustfs_rio::INTERNODE_DISK_ERROR_HEADER, HeaderValue::from_static(missing));
+            .insert(rustfs_rio::INTERNODE_DISK_ERROR_HEADER, HeaderValue::from_static(disk_error));
     }
     response
 }
@@ -3087,12 +3088,14 @@ mod tests {
     }
 
     #[test]
-    fn read_file_error_response_marks_only_missing_disk_errors() {
+    fn read_file_error_response_preserves_typed_disk_errors() {
         for (error, expected) in [
             (DiskError::FileNotFound, rustfs_rio::INTERNODE_FILE_NOT_FOUND),
             (DiskError::VolumeNotFound, rustfs_rio::INTERNODE_VOLUME_NOT_FOUND),
+            (DiskError::FileCorrupt, rustfs_rio::INTERNODE_FILE_CORRUPT),
         ] {
             let response = response_with_disk_error(&error, error.to_string());
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(
                 response.headers().get(rustfs_rio::INTERNODE_DISK_ERROR_HEADER),
                 Some(&HeaderValue::from_static(expected))

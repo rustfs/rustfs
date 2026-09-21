@@ -58,6 +58,26 @@ pub(crate) fn bucket_heal_scope(bucket: &str) -> Option<Arc<BucketHealScope>> {
         .flatten()
 }
 
+/// Resolve only the two canonical bucket records; other internal paths carry no bucket authority.
+pub(super) fn bucket_metadata_owner(object: &str) -> Option<&str> {
+    use crate::bucket::metadata::{BUCKET_INCARNATION_FILE, BUCKET_METADATA_FILE};
+    let (prefix, rest) = object.split_once('/')?;
+    let (bucket, file) = rest.split_once('/')?;
+    (prefix == disk::BUCKET_META_PREFIX
+        && matches!(file, BUCKET_METADATA_FILE | BUCKET_INCARNATION_FILE)
+        && check_valid_bucket_name_strict(bucket).is_ok())
+    .then_some(bucket)
+}
+
+pub(crate) fn bucket_heal_scope_for_object(bucket: &str, object: &str) -> Option<Arc<BucketHealScope>> {
+    let owner = if bucket == RUSTFS_META_BUCKET {
+        bucket_metadata_owner(object)?
+    } else {
+        bucket
+    };
+    bucket_heal_scope(owner)
+}
+
 /// Storage-owned proof for the exact version and every selected erasure location.
 /// This is an in-process result, never reconstructed from admin drive telemetry.
 #[derive(Debug)]
@@ -420,6 +440,97 @@ impl ECStore {
             },
         )?;
         Ok(Arc::ptr_eq(&target_set, &pool.get_disks_by_key(POOL_META_NAME)))
+    }
+
+    /// Restore the bucket configuration and incarnation before retiring a replacement marker.
+    pub async fn heal_replacement_bucket_metadata(
+        self: &Arc<Self>,
+        bucket: &str,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<()> {
+        use crate::bucket::metadata::{BUCKET_INCARNATION_FILE, BUCKET_METADATA_FILE};
+        use crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in;
+
+        let (Some(pool_index), Some(set_index)) = (opts.pool, opts.set) else {
+            return Err(Error::PreconditionFailed);
+        };
+        if targets.is_empty() || opts.dry_run || opts.no_lock || check_valid_bucket_name_strict(bucket).is_err() {
+            return Err(Error::PreconditionFailed);
+        }
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let target_set = pool.get_disks_for_heal_object(BUCKET_METADATA_FILE, opts)?;
+        if targets.iter().any(|target| {
+            target_set
+                .set_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.to_string() == *target)
+                .count()
+                != 1
+        }) {
+            return Err(Error::PreconditionFailed);
+        }
+        let objects: Vec<_> = [BUCKET_METADATA_FILE, BUCKET_INCARNATION_FILE]
+            .into_iter()
+            .map(|file| format!("{}/{bucket}/{file}", disk::BUCKET_META_PREFIX))
+            .filter(|object| Arc::ptr_eq(&target_set, &pool.get_disks_by_key(object)))
+            .collect();
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        // Read the persisted identity without lazy migration: a replacement
+        // must never turn lost configuration into newly fabricated defaults.
+        let incarnation = self.bucket_incarnation_id_from_disk(bucket).await?;
+        let targets = targets.to_vec();
+        self.run_bucket_heal_at_incarnation(bucket, incarnation, opts, move |store, bucket, opts| async move {
+            // Match config writers: lifecycle, metadata transaction, object locks.
+            // Keep the transaction stable through target readback, including when
+            // the caller is cancelled and the storage owner finishes its write.
+            let transaction = acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, &bucket).await?;
+            for object in objects {
+                let scope = bucket_heal_scope(&bucket).ok_or(Error::PreconditionFailed)?;
+                scope.check()?;
+                if transaction.is_lock_lost() {
+                    return Err(Error::PreconditionFailed);
+                }
+                // Config objects occupy one pool, unlike pool.bin. Require a
+                // successful all-pool lookup before accepting another pool's ownership.
+                if !store.single_pool() {
+                    let (owner, _) = store
+                        .get_pool_info_for_delete_marker(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+                        .await?;
+                    if owner.index != pool_index {
+                        continue;
+                    }
+                }
+                let metadata_opts = HealOpts { remove: false, ..opts };
+                let (result, error) = store.heal_object(RUSTFS_META_BUCKET, &object, "", &metadata_opts).await?;
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                for target in &targets {
+                    let mut drives = result.after.drives.iter().filter(|drive| &drive.endpoint == target);
+                    if !drives.next().is_some_and(|drive| drive.state == "ok") || drives.next().is_some() {
+                        return Err(Error::PreconditionFailed);
+                    }
+                }
+                if !store
+                    .replacement_targets_have_version(RUSTFS_META_BUCKET, &object, "", pool_index, set_index, &targets)
+                    .await?
+                {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
+            if transaction.is_lock_lost() {
+                return Err(Error::PreconditionFailed);
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Return every live erasure set selected by an object-heal scope.
@@ -1345,6 +1456,16 @@ mod tests {
                 .await
                 .is_err()
         );
+        for file in [".metadata.bin", ".bucket-incarnation"] {
+            let metadata = format!("buckets/{bucket}/{file}");
+            assert!(
+                store
+                    .rename_local_data_at_incarnation(&disk_ref, (&bucket, object), &fi, (RUSTFS_META_BUCKET, &metadata), old)
+                    .await
+                    .is_err(),
+                "stale remote heal must not replace the successor's {file}"
+            );
+        }
         assert!(store.heal_bucket_at_incarnation(&bucket, old, &opts).await.is_err());
         assert!(
             store
@@ -1741,6 +1862,194 @@ mod tests {
         .expect("multi-pool test store should initialize");
         metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         (temp_dir, store, shutdown)
+    }
+
+    #[test]
+    fn bucket_metadata_heal_owner_rejects_path_aliases_and_unrelated_records() {
+        for file in [".metadata.bin", ".bucket-incarnation"] {
+            assert_eq!(bucket_metadata_owner(&format!("buckets/example/{file}")), Some("example"));
+        }
+        for path in [
+            "/buckets/example/.metadata.bin",
+            "buckets/../.metadata.bin",
+            "buckets/example/../.metadata.bin",
+            "buckets/example/.metadata.bin/extra",
+            "buckets/example//.metadata.bin",
+            "buckets/example/.metadata.bin.old",
+            "config/iam/example/.metadata.bin",
+            "buckets/example/usage.json",
+        ] {
+            assert_eq!(bucket_metadata_owner(path), None, "unexpected bucket authority for {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_bucket_metadata_respects_pool_ownership_and_required_records() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "replacement-bucket-metadata";
+        for invalid_bucket in ["MixedCase", "../example", RUSTFS_META_BUCKET] {
+            assert!(matches!(
+                store
+                    .heal_replacement_bucket_metadata(
+                        invalid_bucket,
+                        &HealOpts {
+                            pool: Some(0),
+                            set: Some(0),
+                            ..Default::default()
+                        },
+                        &[root.path().join("pool0-disk0").to_string_lossy().into_owned()],
+                    )
+                    .await,
+                Err(Error::PreconditionFailed)
+            ));
+        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket and its persisted records");
+        let mut owned = 0;
+        for pool in 0..2 {
+            let target = root.path().join(format!("pool{pool}-disk0"));
+            let records: Vec<_> = [".metadata.bin", ".bucket-incarnation"]
+                .into_iter()
+                .map(|file| {
+                    let path = target.join(RUSTFS_META_BUCKET).join("buckets").join(bucket).join(file);
+                    let exists = path.join("xl.meta").exists();
+                    if exists {
+                        std::fs::remove_dir_all(&path).expect("remove replacement metadata shard");
+                        owned += 1;
+                    }
+                    (path, exists)
+                })
+                .collect();
+            store
+                .heal_replacement_bucket_metadata(
+                    bucket,
+                    &HealOpts {
+                        pool: Some(pool),
+                        set: Some(0),
+                        recreate: true,
+                        ..Default::default()
+                    },
+                    &[target.to_string_lossy().into_owned()],
+                )
+                .await
+                .expect("repair owned records and accept authoritative ownership in the other pool");
+            for (path, existed) in records {
+                assert_eq!(path.join("xl.meta").exists(), existed, "wrong placement for {}", path.display());
+            }
+        }
+        assert_eq!(owned, 2, "each required record must have exactly one owning pool");
+        let object = format!("buckets/{bucket}/.metadata.bin");
+        let owner = store
+            .get_pool_idx_existing_with_opts(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+            .await
+            .expect("persisted metadata owner");
+        let disk = store.pools[owner].disk_set[0].disks.read().await[0]
+            .clone()
+            .expect("metadata target disk");
+        let fi = disk
+            .read_version(
+                "",
+                RUSTFS_META_BUCKET,
+                &object,
+                "",
+                &disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("inline metadata to repair through target-side admission");
+        assert!(fi.data.is_some(), "fixture must contain an inline metadata shard");
+        let target_path = root.path().join(format!("pool{owner}-disk0"));
+        std::fs::remove_dir_all(target_path.join(RUSTFS_META_BUCKET).join(&object)).expect("remove remote target shard");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("current incarnation");
+        store
+            .rename_local_data_at_incarnation(
+                &disk.endpoint().to_string(),
+                (disk::RUSTFS_META_TMP_BUCKET, "metadata-heal-control"),
+                &fi,
+                (RUSTFS_META_BUCKET, &object),
+                incarnation,
+            )
+            .await
+            .expect("the target-side RPC admission must accept current bucket metadata repair");
+        assert!(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta").exists());
+        let (configuration, _) = read_config_no_lock_preserve_empty_with_metadata(store.clone(), &object)
+            .await
+            .expect("read the current bucket configuration");
+        save_config(store.clone(), &object, configuration)
+            .await
+            .expect("publish a newer config revision in the same bucket incarnation");
+        let committed =
+            std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("new target configuration");
+        assert!(
+            store
+                .rename_local_data_at_incarnation(
+                    &disk.endpoint().to_string(),
+                    (disk::RUSTFS_META_TMP_BUCKET, "delayed-metadata-heal"),
+                    &fi,
+                    (RUSTFS_META_BUCKET, &object),
+                    incarnation,
+                )
+                .await
+                .is_err(),
+            "a delayed repair must not overwrite a newer config in the same incarnation"
+        );
+        assert_eq!(
+            std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("retained configuration"),
+            committed,
+            "rejected repair must leave the newer configuration unchanged"
+        );
+        for pool in 0..2 {
+            for disk in 0..4 {
+                let path = root
+                    .path()
+                    .join(format!("pool{pool}-disk{disk}"))
+                    .join(RUSTFS_META_BUCKET)
+                    .join("buckets")
+                    .join(bucket)
+                    .join(".metadata.bin");
+                if path.exists() {
+                    std::fs::remove_dir_all(path).expect("remove every copy of required bucket configuration");
+                }
+            }
+        }
+        metadata_sys::remove_bucket_metadata_in(&store.ctx, bucket)
+            .await
+            .expect("remove the cached configuration so repair cannot rely on it");
+        assert!(
+            store
+                .heal_replacement_bucket_metadata(
+                    bucket,
+                    &HealOpts {
+                        pool: Some(0),
+                        set: Some(0),
+                        recreate: true,
+                        ..Default::default()
+                    },
+                    &[root.path().join("pool0-disk0").to_string_lossy().into_owned()],
+                )
+                .await
+                .is_err(),
+            "total metadata loss must not be accepted as ownership in another pool"
+        );
+        for pool in 0..2 {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("pool{pool}-disk0"))
+                    .join(RUSTFS_META_BUCKET)
+                    .join(&object)
+                    .exists(),
+                "missing required configuration must not be recreated with defaults"
+            );
+        }
+        shutdown.cancel();
     }
 
     #[tokio::test]

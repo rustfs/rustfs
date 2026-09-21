@@ -39,7 +39,7 @@ allow-git = [
     # Official s3s repository. Temporarily pinned to the merged generic REST
     # SigV4 payload-checksum fix until it is available in a crates.io release.
     # owner: marshawcoco  review: 2026-10
-    # "https://github.com/s3s-project/s3s.git",
+    "https://github.com/s3s-project/s3s.git",
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
     # "https://github.com/rustfs/s3s.git",
