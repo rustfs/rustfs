@@ -52,9 +52,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    future::Future,
     io::Cursor,
     pin::Pin,
     sync::{Arc, LazyLock, OnceLock},
+    time::Instant,
 };
 use time::OffsetDateTime;
 use tokio::spawn;
@@ -78,6 +80,9 @@ const EVENT_RPC_REQUEST_FAILED: &str = "rpc_request_failed";
 const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
 const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
+const REBALANCE_START_FLEET_PROOF_MARKER: &str = "pool activation requires a live fleet capability proof";
+const REBALANCE_START_FLEET_PROOF_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const REBALANCE_START_FLEET_PROOF_RETRY_DELAY: Duration = Duration::from_secs(5);
 const HEAL_CONTROL_REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
 const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
 const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
@@ -499,6 +504,48 @@ fn unimplemented_rpc(method: &str) -> Status {
 
 fn background_rebalance_start_error_message(result: StorageResult<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
+}
+
+fn is_rebalance_start_fleet_proof_retryable(err: &Error) -> bool {
+    crate::storage::storage_api::ecstore_capacity::is_pool_activation_fleet_proof_error(err)
+        && err.to_string().contains(REBALANCE_START_FLEET_PROOF_MARKER)
+}
+
+async fn retry_rebalance_start_fleet_proof<F, Fut>(mut operation: F) -> StorageResult<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
+    let deadline = Instant::now() + REBALANCE_START_FLEET_PROOF_RETRY_BUDGET;
+    let mut attempt = 1_u32;
+
+    loop {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(err) if is_rebalance_start_fleet_proof_retryable(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let delay = REBALANCE_START_FLEET_PROOF_RETRY_DELAY.min(deadline.saturating_duration_since(now));
+                warn!(
+                    event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    operation = "start_rebalance",
+                    state = "fleet_proof_retry_scheduled",
+                    result = "retrying",
+                    attempt,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %err,
+                    "node rpc background task retry"
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn stop_rebalance_response(result: StorageResult<()>) -> StopRebalanceResponse {
@@ -2800,7 +2847,9 @@ impl Node for NodeService {
 
         if start_rebalance {
             log_background_rebalance_task_spawned!(start_rebalance);
-            if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
+            if let Some(message) =
+                background_rebalance_start_error_message(retry_rebalance_start_fleet_proof(|| store.start_rebalance()).await)
+            {
                 error!(
                     event = EVENT_RPC_BACKGROUND_TASK_FAILED,
                     component = LOG_COMPONENT_STORAGE,
@@ -2975,9 +3024,10 @@ mod tests {
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, admit_heal_control_replay,
         background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
-        initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response,
-        make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
-        make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
+        initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe,
+        is_rebalance_start_fleet_proof_retryable, legacy_scanner_activity_response, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
+        previous_scanner_activity_response, remove_heal_control_replay, retry_rebalance_start_fleet_proof,
         scanner_activity_response_v7, start_decommission_failure_response, stop_rebalance_response,
         validate_admin_heal_control_start,
     };
@@ -8119,6 +8169,49 @@ mod tests {
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn test_rebalance_start_retry_ignores_expired_fleet_proof() {
+        let expired = Error::other("pool activation fleet capability proof expired before commit");
+
+        assert!(!is_rebalance_start_fleet_proof_retryable(&expired));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_rebalance_start_waits_for_fleet_proof() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let attempts = Arc::clone(&attempts);
+            async move {
+                retry_rebalance_start_fleet_proof(move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            Err(Error::other(super::REBALANCE_START_FLEET_PROOF_MARKER))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(super::REBALANCE_START_FLEET_PROOF_RETRY_DELAY).await;
+        task.await
+            .expect("retry task should not panic")
+            .expect("fleet proof retry should eventually succeed");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
