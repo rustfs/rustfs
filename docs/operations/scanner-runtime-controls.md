@@ -481,7 +481,7 @@ Read this snapshot before changing scanner controls: `blocked_source` with `life
 
 ## Reading Distributed Metrics
 
-`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
+`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/realtime` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
 
 ```bash
 for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
@@ -493,7 +493,7 @@ for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
     --access_key "$RUSTFS_ACCESS_KEY" \
     --secret_key "$RUSTFS_SECRET_KEY" \
     --request GET \
-    "${endpoint}/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" \
+    "${endpoint}/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" \
     > "artifacts/scanner-metrics.${node}.$(date -u +%Y%m%dT%H%M%SZ).ndjson"
 done
 ```

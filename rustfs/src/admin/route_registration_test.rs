@@ -190,7 +190,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
-        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/realtime"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),
         admin_route(Method::GET, "/v3/pools/list"),
@@ -1333,7 +1333,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/storageinfo"));
-    assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
+    assert_route(&router, Method::GET, &admin_path("/v3/realtime"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
