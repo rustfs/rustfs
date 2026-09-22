@@ -818,9 +818,7 @@ jobs:
 
           echo ""
           echo "🐳 Docker Images:"
-          if [[ "$BUILD_TYPE" == "preview" ]]; then
-            echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
+          if [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
