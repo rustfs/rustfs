@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
@@ -239,7 +240,7 @@ fn short_shard_read(got: usize, want: usize) -> std::io::Error {
         want,
         "short shard read: got {got} of {want} bytes"
     );
-    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("short shard read: got {got} of {want} bytes"))
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, DiskError::FileCorrupt)
 }
 
 /// Split a `[hash][data]` block, verify the hash (unless `skip_verify`), and
@@ -265,7 +266,7 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
             data_len = data.len(),
             "bitrot hash mismatch"
         );
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
     }
     Ok((data, verify))
 }
@@ -434,7 +435,7 @@ where
                             data_len = want,
                             "bitrot hash mismatch"
                         );
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
                     }
                     hash_offset += take;
                     remaining -= take;
@@ -1140,6 +1141,26 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn bitrot_damage_preserves_typed_repair_evidence() {
+        use crate::disk::error::Error as DiskError;
+        let algo = HashAlgorithm::HighwayHash256;
+        let data = b"repair evidence";
+        let mut frame = algo.hash_encode(data).as_ref().to_vec();
+        frame.extend_from_slice(data);
+        *frame.last_mut().expect("test frame has payload") ^= 1;
+        let error = super::split_and_verify(&algo, false, &frame).expect_err("a hash mismatch must reject the shard");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+        let error = super::short_shard_read(3, 4);
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+        assert!(matches!(
+            DiskError::from(io::Error::new(io::ErrorKind::InvalidData, "unrelated invalid data")),
+            DiskError::Io(_)
+        ));
+    }
 
     struct FragmentedSource {
         chunks: VecDeque<Bytes>,

@@ -4308,6 +4308,13 @@ mod tests {
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
+        next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestFormatReadGate {
+        entered: tokio::sync::Notify,
+        release: CancellationToken,
     }
 
     impl AuthenticatedReadPeer {
@@ -4319,7 +4326,14 @@ mod tests {
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
+                next_format_read_gate: Arc::default(),
             }
+        }
+
+        fn pause_next_format_read(&self) -> Arc<TestFormatReadGate> {
+            let gate = Arc::new(TestFormatReadGate::default());
+            *self.next_format_read_gate.lock().expect("format gate lock poisoned") = Some(Arc::clone(&gate));
+            gate
         }
 
         fn disk_info_calls(&self) -> u32 {
@@ -4429,6 +4443,11 @@ mod tests {
                                 let disk = request.disk;
                                 peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
                                 let data = if is_format_read {
+                                    let gate = peer.next_format_read_gate.lock().expect("format gate lock poisoned").take();
+                                    if let Some(gate) = gate {
+                                        gate.entered.notify_one();
+                                        gate.release.cancelled().await;
+                                    }
                                     peer.format_data.clone()
                                 } else {
                                     peer.object_read_all_disks
@@ -7128,6 +7147,319 @@ mod tests {
         )
         .await;
 
+        peer.stop().await;
+    }
+
+    async fn missing_read_set(peer: &TestGrpcPeer, format: crate::layout::format::FormatV3) -> Arc<crate::set_disk::SetDisks> {
+        let count = format.erasure.sets[0].len();
+        let endpoints = (0..count)
+            .map(|index| Endpoint {
+                url: url::Url::parse(&format!("{}/data/rustfs{index}", peer.addr)).expect("endpoint should parse"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i32::try_from(index).expect("fixture index fits"),
+            })
+            .collect();
+        crate::set_disk::SetDisks::new(
+            "missing-read-test".to_string(),
+            Arc::new(tokio::sync::RwLock::new(vec![None; count])),
+            count,
+            0,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reconnect_before_periodic_monitor_and_coalesce() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut format = crate::layout::format::FormatV3::new(1, 1);
+        let disk_id = format.erasure.sets[0][0];
+        format.erasure.this = disk_id;
+        let Some(peer) = TestGrpcPeer::spawn(
+            Bytes::from(format.to_json().expect("format should serialize")),
+            Bytes::from_static(b"startup-recovered-data"),
+        )
+        .await
+        else {
+            panic!("authenticated regression peer is required");
+        };
+        let set = missing_read_set(&peer, format).await;
+        let snapshots = futures::future::join_all((0..8).map(|_| set.get_disks_for_data_read())).await;
+        let disk = snapshots[0][0]
+            .as_ref()
+            .expect("a ready peer must be usable before the periodic reconnect");
+        for snapshot in &snapshots {
+            assert!(Arc::ptr_eq(
+                disk,
+                snapshot[0]
+                    .as_ref()
+                    .expect("every waiting read should observe the same handle")
+            ));
+        }
+        assert_eq!(peer.peer.read_all_calls(), 1, "concurrent requests must share the format probe");
+        assert_eq!(disk.get_disk_id().await.expect("disk identity should be available"), Some(disk_id));
+        let raw = disk
+            .read_all("bucket", "object")
+            .await
+            .expect("reconnected handle should read data");
+        assert_eq!(raw, Bytes::from_static(b"startup-recovered-data"));
+        assert_eq!(peer.peer.object_read_all_disks(), vec![disk_id.to_string()]);
+        let healthy = set.get_disks_for_data_read().await;
+        assert!(Arc::ptr_eq(disk, healthy[0].as_ref().expect("healthy handle must remain registered")));
+        assert_eq!(peer.peer.read_all_calls(), 2, "healthy reads must not re-probe the format");
+        disk.close().await.expect("reconnected disk should close");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reject_foreign_format_and_back_off() {
+        runtime_sources::ensure_test_rpc_secret();
+        let reference = crate::layout::format::FormatV3::new(1, 1);
+        let mut foreign = reference.clone();
+        foreign.id = Uuid::new_v4();
+        foreign.erasure.this = reference.erasure.sets[0][0];
+        let Some(peer) = TestGrpcPeer::spawn(
+            Bytes::from(foreign.to_json().expect("foreign format should serialize")),
+            Bytes::from_static(b"foreign-data"),
+        )
+        .await
+        else {
+            panic!("authenticated regression peer is required");
+        };
+        let set = missing_read_set(&peer, reference).await;
+        assert!(
+            set.get_disks_for_data_read().await[0].is_none(),
+            "a matching disk ID cannot authorize a foreign deployment"
+        );
+        assert_eq!(peer.peer.read_all_calls(), 1, "the foreign format must actually be inspected");
+        assert!(set.get_disks_for_data_read().await[0].is_none());
+        assert_eq!(peer.peer.read_all_calls(), 1, "failed probes must not repeat on every degraded GET");
+        assert!(peer.peer.object_read_all_disks().is_empty(), "foreign object data must never be read");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reject_wrong_slot_and_invalid_formats() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 2);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let mut nil = reference.clone();
+        nil.erasure.this = Uuid::nil();
+        let mut unknown = reference.clone();
+        unknown.erasure.this = Uuid::new_v4();
+        let mut future = reference.clone();
+        future.erasure.version = crate::layout::format::FormatErasureVersion::Unknown;
+        for (name, payload, first_accepted) in [
+            ("duplicate slot zero", reference.to_json().expect("format should serialize"), true),
+            ("nil drive", nil.to_json().expect("nil format should serialize"), false),
+            ("unknown drive", unknown.to_json().expect("unknown format should serialize"), false),
+            ("future version", future.to_json().expect("future format should serialize"), false),
+            ("malformed", "not-json".to_string(), false),
+        ] {
+            let peer = TestGrpcPeer::spawn(Bytes::from(payload), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference.clone()).await;
+            let disks = set.get_disks_for_data_read().await;
+            assert_eq!(disks[0].is_some(), first_accepted, "{name}: slot zero identity decision");
+            assert!(disks[1].is_none(), "{name}: a peer cannot claim another topology slot");
+            assert_eq!(peer.peer.read_all_calls(), 2, "{name}: both missing slots must be probed");
+            assert!(peer.peer.object_read_all_disks().is_empty(), "{name}: no object payload may be read");
+            for disk in disks.into_iter().flatten() {
+                disk.close().await.expect("accepted disk should close");
+            }
+            peer.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_do_not_claim_local_or_misconfigured_endpoints() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        for (local, pool, set_index, disk_index) in [(true, 0, 0, 0), (false, -1, 0, 0), (false, 0, 1, 0), (false, 0, 0, 1)] {
+            let mut set = missing_read_set(&peer, reference.clone()).await;
+            let endpoint = &mut Arc::get_mut(&mut set)
+                .expect("fixture set must be uniquely owned")
+                .set_endpoints[0];
+            endpoint.is_local = local;
+            endpoint.pool_idx = pool;
+            endpoint.set_idx = set_index;
+            endpoint.disk_idx = disk_index;
+            assert!(set.get_disks_for_data_read().await[0].is_none());
+        }
+        assert_eq!(peer.peer.read_all_calls(), 0, "invalid endpoint ownership must fail before I/O");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_preserve_concurrently_published_handles() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        for reader_first in [false, true] {
+            let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference.clone()).await;
+            let gate = peer.peer.pause_next_format_read();
+            let pending_set = Arc::clone(&set);
+            let pending = tokio::spawn(async move {
+                if reader_first {
+                    pending_set.get_disks_for_data_read().await;
+                } else {
+                    pending_set.renew_disk(&pending_set.set_endpoints[0]).await;
+                }
+            });
+            time::timeout(Duration::from_secs(2), gate.entered.notified())
+                .await
+                .expect("the first reconnect must reach the format barrier");
+            if reader_first {
+                set.renew_disk(&set.set_endpoints[0]).await;
+            } else {
+                set.get_disks_for_data_read().await;
+            }
+            let published = set.disks.read().await[0]
+                .clone()
+                .expect("the competing reconnect must publish");
+            gate.release.cancel();
+            pending.await.expect("paused reconnect must complete");
+            assert!(
+                Arc::ptr_eq(&published, set.disks.read().await[0].as_ref().expect("published slot must remain")),
+                "neither reconnect may replace a handle published while its format I/O was pending"
+            );
+            published.close().await.expect("published disk should close");
+            peer.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe, internode_metrics)]
+    async fn missing_read_disks_expired_waiter_does_not_start_another_probe() {
+        // Disable cooldown so this independently proves deadline admission,
+        // rather than passing only because the leader has just finished.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("0"))], async {
+            runtime_sources::ensure_test_rpc_secret();
+            let mut reference = crate::layout::format::FormatV3::new(1, 1);
+            reference.erasure.this = reference.erasure.sets[0][0];
+            let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference).await;
+            let gate = peer.peer.pause_next_format_read();
+            let mut leader = Box::pin(set.get_disks_for_data_read());
+            time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = gate.entered.notified() => {}
+                    _ = &mut leader => panic!("leader must remain blocked in its format RPC"),
+                }
+            })
+            .await
+            .expect("leader must reach the format barrier");
+            time::pause();
+            let mut waiter = Box::pin(set.get_disks_for_data_read());
+            assert!(futures::poll!(&mut waiter).is_pending(), "waiter must queue behind the leader");
+            let requests_before =
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total;
+
+            time::advance(crate::disk::disk_store::get_drive_active_check_timeout()).await;
+            assert!(leader.await[0].is_none(), "expired leader must not publish a disk");
+            assert!(waiter.await[0].is_none(), "expired waiter must not publish a disk");
+            time::resume();
+
+            // Count client dispatches, not server arrivals: a cancelled RPC can still
+            // be buffered in the transport when the expired waiter returns.
+            assert_eq!(
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total,
+                requests_before,
+                "an expired waiter must not dispatch another format RPC after the leader releases the lock"
+            );
+            gate.release.cancel();
+            peer.stop().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_timeout_releases_singleflight_and_allows_retry() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let gate = peer.peer.pause_next_format_read();
+        let deadline = crate::disk::disk_store::get_drive_active_check_timeout();
+        let snapshots = time::timeout(
+            deadline + Duration::from_secs(2),
+            futures::future::join_all((0..4).map(|_| set.get_disks_for_data_read())),
+        )
+        .await
+        .expect("all waiting requests must respect the bounded probe deadline");
+        assert!(snapshots.iter().all(|snapshot| snapshot[0].is_none()));
+        assert_eq!(peer.peer.read_all_calls(), 1, "only one format RPC may remain stalled");
+        gate.release.cancel();
+        time::pause();
+        time::advance(crate::disk::health_state::get_drive_returning_probe_interval()).await;
+        time::resume();
+        let disks = set.get_disks_for_data_read().await;
+        let disk = disks[0]
+            .as_ref()
+            .expect("a timed-out probe must not prevent a later read from reconnecting");
+        assert_eq!(peer.peer.read_all_calls(), 2, "retry must validate the format again");
+        disk.close().await.expect("reconnected disk should close");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_cancellation_leaves_no_published_handle() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let gate = peer.peer.pause_next_format_read();
+        let pending_set = Arc::clone(&set);
+        let pending = tokio::spawn(async move { pending_set.get_disks_for_data_read().await });
+        time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("probe must reach the format barrier");
+        // Cancellation can happen after the start-based cooldown has elapsed.
+        // It must still cool down before another caller probes the same peer.
+        time::pause();
+        time::advance(crate::disk::health_state::get_drive_returning_probe_interval()).await;
+        time::resume();
+        pending.abort();
+        assert!(pending.await.expect_err("probe must be cancelled").is_cancelled());
+        assert!(
+            set.disks.read().await[0].is_none(),
+            "cancelled format I/O must not publish an unvalidated handle"
+        );
+        let waiting = time::timeout(Duration::from_secs(1), set.get_disks_for_data_read())
+            .await
+            .expect("cancelled probe must release the singleflight lock");
+        assert!(waiting[0].is_none(), "retry cooldown must still apply after cancellation");
+        assert_eq!(peer.peer.read_all_calls(), 1);
+        gate.release.cancel();
         peer.stop().await;
     }
 
