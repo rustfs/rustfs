@@ -216,6 +216,37 @@ fn fingerprint_is_independent_of_metadata_insertion_order() {
 }
 
 #[test]
+fn fingerprint_is_independent_of_part_checksum_insertion_order() {
+    let mut checksums = [
+        ("SHA256", "sha256"),
+        ("SHA1", "sha1"),
+        ("CRC32", "crc32"),
+        ("CRC32C", "crc32c"),
+    ];
+    let a = crate::object_api::ObjectInfo {
+        parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+            checksums: Some(checksums.map(|(key, value)| (key.to_string(), value.to_string())).into()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let mut b = a.clone();
+    let expected = model::fingerprint(&a);
+    for _ in 0..checksums.len() {
+        checksums.rotate_left(1);
+        Arc::make_mut(&mut b.parts)[0].checksums =
+            Some(checksums.map(|(key, value)| (key.to_string(), value.to_string())).into());
+        assert_eq!(expected, model::fingerprint(&b));
+    }
+    Arc::make_mut(&mut b.parts)[0]
+        .checksums
+        .as_mut()
+        .expect("part checksums")
+        .insert("SHA256".into(), "changed".into());
+    assert_ne!(expected, model::fingerprint(&b));
+}
+
+#[test]
 fn rejects_migration_into_a_source_key() {
     let request = JobRequest {
         mode: JobMode::Migrate,

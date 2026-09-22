@@ -218,7 +218,9 @@ pub(crate) fn fingerprint(info: &ObjectInfo) -> String {
         hash.update(values.len().to_le_bytes());
         hash.update(values.as_bytes());
         if let Some(checksums) = &part.checksums {
-            for (key, value) in checksums.iter().collect::<BTreeMap<_, _>>() {
+            let mut checksums: Vec<_> = checksums.iter().collect();
+            checksums.sort_unstable_by_key(|(key, _)| *key);
+            for (key, value) in checksums {
                 hash.update(key.len().to_le_bytes());
                 hash.update(key.as_bytes());
                 hash.update(value.len().to_le_bytes());
@@ -226,7 +228,9 @@ pub(crate) fn fingerprint(info: &ObjectInfo) -> String {
             }
         }
     }
-    for (key, value) in info.user_defined.iter().collect::<BTreeMap<_, _>>() {
+    let mut metadata: Vec<_> = info.user_defined.iter().collect();
+    metadata.sort_unstable_by_key(|(key, _)| *key);
+    for (key, value) in metadata {
         hash.update(key.len().to_le_bytes());
         hash.update(key.as_bytes());
         hash.update(value.len().to_le_bytes());
