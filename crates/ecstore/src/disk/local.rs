@@ -22455,13 +22455,34 @@ mod test {
         std::fs::create_dir_all(root.join(volume).join("object")).expect("fixture directory");
         std::fs::write(root.join(volume).join(path), &content).expect("fixture contents");
 
-        for cap in [4096usize, 4097] {
+        for (cap_index, cap) in [4096usize, 4097].into_iter().enumerate() {
             let chunk_size = uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new(&cap.to_string())))
                 .expect("valid test cap");
             let Some(backend) = UringBackend::try_new_with_read_chunk_size(root.clone(), chunk_size) else {
+                assert_eq!(
+                    cap_index, 0,
+                    "io_uring already worked for this fixture; a later backend failure is not a capability skip"
+                );
                 uring_test_skip("uring_configured_read_chunks (io_uring probe)");
                 return;
             };
+            if direct && cap_index == 0 {
+                // Establish support with one fixed, aligned read before testing
+                // any chunk shape. Only this preflight may skip for O_DIRECT;
+                // later EINVAL/alignment errors must fail even outside MUST_RUN.
+                let native_before = backend.native_direct_reads.load(Ordering::Relaxed);
+                let preflight = backend.pread_uring_direct(volume, path, 0, 4096).await;
+                let bytes = match preflight {
+                    Ok(bytes) => bytes,
+                    Err(_) if !backend.direct_uring.supported.load(Ordering::Relaxed) => {
+                        uring_test_skip("uring_configured_read_chunks (native O_DIRECT preflight unavailable)");
+                        return;
+                    }
+                    Err(error) => panic!("aligned O_DIRECT preflight failed unexpectedly: {error:?}"),
+                };
+                assert_eq!(bytes.as_ref(), &content[..4096], "preflight must read the exact fixture bytes");
+                assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), native_before + 1);
+            }
             // Cover the fast-path boundary, multiple operations, unaligned heads,
             // non-block-multiple caps, exact EOF and the zero-length no-op.
             for (offset, length) in [
@@ -22483,10 +22504,6 @@ mod test {
                 };
                 let bytes = match result {
                     Ok(bytes) => bytes,
-                    Err(_) if direct && !backend.direct_uring.supported.load(Ordering::Relaxed) => {
-                        uring_test_skip("uring_configured_read_chunks (native O_DIRECT unavailable)");
-                        return;
-                    }
                     Err(error) => {
                         panic!("chunked read failed: direct={direct} cap={cap} offset={offset} length={length}: {error:?}")
                     }
