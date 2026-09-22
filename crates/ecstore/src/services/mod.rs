@@ -16,6 +16,7 @@
 
 pub(crate) mod batch_processor;
 pub(crate) mod event_notification;
+pub(crate) mod integrity;
 pub(crate) mod metrics_realtime;
 pub(crate) mod notification_sys;
 pub(crate) mod rebalance;
