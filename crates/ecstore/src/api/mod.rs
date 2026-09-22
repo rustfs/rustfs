@@ -504,6 +504,13 @@ pub mod notification {
     };
 }
 
+pub mod integrity {
+    pub use crate::services::integrity::{
+        IntegrityError, InventoryItem, InventoryPage, ItemRequest, ItemResult, ItemState, Job, JobMode, JobRequest, JobState,
+        Protection, Readiness, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
+
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,

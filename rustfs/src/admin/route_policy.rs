@@ -1585,6 +1585,36 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/readiness",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/{bucket}/inventory",
+        INSPECT_DATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs",
+        START_BATCH_JOB,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs/{job_id}",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs/{job_id}/control",
+        START_BATCH_JOB,
+        RouteRiskLevel::High,
+    ),
     // MinIO admin compat: batch job lifecycle (backlog#613).
     admin(HttpMethod::Post, "/rustfs/admin/v3/start-job", START_BATCH_JOB, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/list-jobs", LIST_BATCH_JOBS, RouteRiskLevel::Sensitive),

@@ -4253,6 +4253,13 @@ mod decommission_lock_order_tests {
                 panic!("cancellation probe finished before observing target contention: {result:?}");
             }
         }
+        // The mutation absorbs the gate contention inline before the outer wait
+        // loop ever sees it, and that inline budget is bounded.
+        assert_eq!(
+            retry_observer.target_gate_inline_retries(),
+            crate::core::pools::DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS - 1,
+            "inline target-gate retries must stop at their bounded attempt budget"
+        );
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),

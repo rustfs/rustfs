@@ -21,6 +21,12 @@ use std::time::Duration;
 
 use rand::RngExt as _;
 use rustfs_storage_api as storage_contracts;
+
+pub(crate) mod ecstore_integrity {
+    pub(crate) use rustfs_ecstore::api::integrity::{
+        IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
