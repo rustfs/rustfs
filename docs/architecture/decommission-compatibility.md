@@ -92,7 +92,21 @@ When decommission metadata is present, `decommissionInfo` includes:
 - progress counters: `objectsDecommissioned`, `objectsDecommissionedFailed`, `bytesDecommissioned`, and `bytesDecommissionedFailed`;
 - current location: `bucket`, `prefix`, and `object`;
 - queue/history lists: `queuedBuckets` and `decommissionedBuckets`;
-- `waitingReason`: `queued` for queued entries and `waiting_for_worker` when metadata exists but no worker has started.
+- `waitingReason`: `capacity` while the pool is paused on target capacity,
+  `queued` for queued entries, and `waiting_for_worker` when metadata exists but
+  no worker has started;
+- `capacityBlockedReason`: the persisted detail for the active capacity pause,
+  absent once the pause clears.
+
+A capacity pause is reported ahead of the worker states so operators can tell
+"contending but progressing" from "genuinely out of target capacity". The existing `pool.bin` layout is unchanged;
+cumulative pause history requires a separately versioned persistence contract.
+
+The object-attempt metrics count entry passes and repeated version-copy attempts
+within a listing and its deferred replay. Inline gate waits use the gate-retry
+counter. A new listing after a durable pause starts a new per-object observation;
+the maximum is the highest observation in the process, not a persisted lifetime
+attempt count.
 
 This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
 
