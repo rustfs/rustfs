@@ -6416,6 +6416,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
+name = "md5-simd"
+version = "0.2.0"
+source = "git+https://github.com/reatang/md5-simd?rev=a202406#a2024068d11f5879036138aedb9e6612f05688c5"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10565,6 +10570,7 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-tls-runtime",
  "rustfs-utils",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -10990,6 +10996,7 @@ dependencies = [
  "local-ip-address",
  "lz4",
  "md-5 0.11.0",
+ "md5-simd",
  "netif",
  "proptest",
  "regex",

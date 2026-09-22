@@ -37,6 +37,9 @@ pub mod io;
 pub mod hash;
 
 #[cfg(feature = "hash")]
+pub mod hash_lanes;
+
+#[cfg(feature = "hash")]
 pub mod hash_stream;
 
 #[cfg(feature = "os")]

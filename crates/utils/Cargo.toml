@@ -42,6 +42,7 @@ local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 fast-md5 = { workspace = true, optional = true }
+md5-simd = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -94,6 +95,8 @@ hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake2", "dep:serde", "dep:s
 # Deliberately outside `default` and `full`: enabling it is an explicit build decision. `md-5` stays
 # compiled in as the differential-test reference.
 hash-md5-fast-md5 = ["hash", "dep:fast-md5"]
+# Multi-stream MD5 kernel behind `hash_lanes::Md5LaneEngine` (Port C). Trial wiring.
+hash-md5-simd = ["hash", "dep:md5-simd"]
 os = ["dep:rustix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
 http = ["dep:convert_case", "dep:http", "dep:regex"]

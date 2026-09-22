@@ -290,6 +290,9 @@ md-5 = "0.11.0"
 # MD5 backend selectable with the `hash-md5-fast-md5` feature (crates/utils/src/hash_stream.rs).
 # Pinned exactly: single-maintainer crate with hand-written assembly; bump deliberately.
 fast-md5 = "=1.0.0"
+# Multi-stream SIMD MD5 (incremental `update_many`), from the reatang fork until
+# houseme/md5-simd#1 is merged and released; then switch to the crates.io version.
+md5-simd = { git = "https://github.com/reatang/md5-simd", rev = "a202406", default-features = false, features = ["std", "opt", "simd"] }
 mime_guess = "2.0.5"
 moka = { version = "0.12.16" }
 netif = "0.1.6"

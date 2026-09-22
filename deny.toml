@@ -43,6 +43,10 @@ allow-git = [
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
     # "https://github.com/rustfs/s3s.git",
+    # reatang fork of houseme/md5-simd carrying incremental SIMD `update_many`
+    # (houseme/md5-simd#1). Pinned by rev; switch to crates.io once released.
+    # owner: reatang  review: 2026-11
+    "https://github.com/reatang/md5-simd",
 ]
 
 [bans]
