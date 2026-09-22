@@ -679,6 +679,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn valid_args() -> AMQPArgs {
@@ -766,14 +767,32 @@ mod tests {
         let target = AMQPTarget::new("notification".to_string(), args.clone()).unwrap();
         let event = notification_event();
         let expected = target.build_queued_payload(&event).unwrap();
+        let unix_time_ms = || {
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock should be after the Unix epoch")
+                    .as_millis(),
+            )
+            .expect("current Unix timestamp should fit in u64")
+        };
+        let before_save = unix_time_ms();
         target.save(Arc::new(event.clone())).await.unwrap();
+        let after_save = unix_time_ms();
         let store = target.store().unwrap();
         let keys = store.list();
         assert_eq!(keys.len(), 1);
         let raw = store.get_raw(&keys[0]).unwrap();
         let queued = QueuedPayload::decode(&raw).unwrap();
         assert_eq!(queued.body, expected.body);
-        assert_eq!(serde_json::to_value(&queued.meta).unwrap(), serde_json::to_value(&expected.meta).unwrap());
+        assert_eq!(queued.meta.event_name, expected.meta.event_name);
+        assert_eq!(queued.meta.bucket_name, expected.meta.bucket_name);
+        assert_eq!(queued.meta.object_name, expected.meta.object_name);
+        assert_eq!(queued.meta.content_type, expected.meta.content_type);
+        assert_eq!(queued.meta.payload_len, expected.meta.payload_len);
+        assert_eq!(queued.meta.dedup_id, expected.meta.dedup_id);
+        assert_eq!(queued.meta.failure, expected.meta.failure);
+        assert!((before_save..=after_save).contains(&queued.meta.queued_at_unix_ms));
         let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
         assert_eq!(payload["Records"], json!([event.data]));
         std::fs::remove_dir_all(args.queue_dir).unwrap();
