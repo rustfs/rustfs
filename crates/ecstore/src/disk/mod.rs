@@ -1554,6 +1554,14 @@ pub struct RenameDataResp {
     /// "cannot vote", never as `Absent`.
     #[serde(default)]
     pub old_current_size: Option<OldCurrentSize>,
+    /// Whether this disk decoded enough of the overwritten current version to
+    /// decide if a transitioned source has to be returned.
+    #[serde(default)]
+    pub old_current_source_checked: bool,
+    /// Transitioned old-current source used by PUT free-version cleanup receipt.
+    /// Empty when the old current is not transitioned or no source was known.
+    #[serde(default)]
+    pub old_current_source: Option<FileInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2001,6 +2009,8 @@ mod tests {
             cleanup_data_dir: Some(uuid),
             sign: Some(signature.clone()),
             old_current_size: Some(OldCurrentSize::Present(42)),
+            old_current_source_checked: false,
+            old_current_source: None,
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
@@ -2021,6 +2031,8 @@ mod tests {
                 cleanup_data_dir: Some(Uuid::new_v4()),
                 sign: Some(vec![0x01, 0x02, 0x03]),
                 old_current_size,
+                old_current_source_checked: false,
+                old_current_source: None,
             };
 
             let encoded = rmp_serde::encode::to_vec_named(&resp).expect("named msgpack should encode");
@@ -2058,6 +2070,8 @@ mod tests {
         assert_eq!(decoded.cleanup_data_dir, None);
         assert_eq!(decoded.sign, legacy.sign);
         assert_eq!(decoded.old_current_size, None);
+        assert!(!decoded.old_current_source_checked);
+        assert!(decoded.old_current_source.is_none());
     }
 
     /// Test constants

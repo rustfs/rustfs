@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use storage_api::metadata_lock::{
     BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys,
-    isolated_store_over_temp_disks,
+    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, enable_safe_no_quota_cache_fast_path_for_test,
+    init_bucket_metadata_sys, isolated_store_over_temp_disks,
 };
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -168,6 +168,103 @@ async fn reused_metadata_lock_still_enforces_quota() {
         .await
         .expect("release metadata reader after denial")
         .expect("acquire writer");
+}
+
+#[tokio::test]
+async fn safe_no_quota_cache_fast_path_does_not_ignore_later_quota() {
+    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "safe-no-quota-cache-quota-set";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+
+    let mut first = PutObjReader::from_vec(b"cache no quota".to_vec());
+    store
+        .put_object(bucket, "warm", &mut first, &ObjectOptions::default())
+        .await
+        .expect("warm no-quota metadata cache");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+        .await
+        .expect("set quota after no-quota cache was observed");
+
+    let mut opts = quota_snapshot_options(&store, bucket).await;
+    assert!(opts.set_quota_admission(0, 1));
+    let mut data = PutObjReader::from_vec(b"too large".to_vec());
+    let error = store
+        .put_object(bucket, "object", &mut data, &opts)
+        .await
+        .expect_err("quota set after a no-quota cache hit must still reject growth");
+    assert!(matches!(error, Error::QuotaExceeded { limit: 1, .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn safe_no_quota_cache_fast_path_allows_write_after_quota_is_cleared() {
+    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "safe-no-quota-cache-quota-cleared";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+        .await
+        .expect("set quota");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", Vec::new())
+        .await
+        .expect("clear quota");
+
+    let mut data = PutObjReader::from_vec(b"allowed after clear".to_vec());
+    store
+        .put_object(bucket, "object", &mut data, &ObjectOptions::default())
+        .await
+        .expect("cleared quota should allow writes through the no-quota fast path");
+
+    let mut reader = store
+        .get_object_reader(bucket, "object", None, Default::default(), &ObjectOptions::default())
+        .await
+        .expect("read object written after quota clear");
+    let mut bytes = Vec::new();
+    reader.stream.read_to_end(&mut bytes).await.expect("read body");
+    assert_eq!(bytes, b"allowed after clear");
+}
+
+#[tokio::test]
+async fn safe_no_quota_cache_fast_path_fails_closed_on_invalid_quota_json() {
+    let _guard = enable_safe_no_quota_cache_fast_path_for_test();
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "safe-no-quota-cache-invalid-quota";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", b"{not-json".to_vec())
+        .await
+        .expect("persist invalid quota bytes for fail-closed read");
+
+    let mut data = PutObjReader::from_vec(b"must fail".to_vec());
+    store
+        .put_object(bucket, "object", &mut data, &ObjectOptions::default())
+        .await
+        .expect_err("invalid quota JSON must not degrade to no-quota");
+}
+
+async fn quota_snapshot_options(store: &Arc<storage_api::ECStore>, bucket: &str) -> ObjectOptions {
+    ObjectOptions {
+        versioned: true,
+        version_id: Some(Uuid::new_v4().to_string()),
+        expected_bucket_incarnation_id: Some(store.bucket_incarnation_id(bucket).await.expect("load incarnation")),
+        object_lock_config_snapshot: Some(store.object_lock_config_snapshot(bucket).await.expect("capture snapshot")),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]

@@ -166,7 +166,7 @@ use sha2::Sha256;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -410,6 +410,12 @@ impl Drop for ObjectLockDiagGuard {
         }
 
         let hold = self.acquired_at.elapsed();
+        if self.op == "put_object_commit" && self.mode == "write" && rustfs_io_metrics::put_stage_metrics_enabled() {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD,
+                hold.as_secs_f64() * 1000.0,
+            );
+        }
         record_object_lock_diag_hold_duration(self.op, self.mode, hold);
         let threshold = get_object_lock_diag_slow_hold_threshold();
         if hold >= threshold {
@@ -3901,6 +3907,9 @@ pub struct SetDisks {
     /// writes skip the global registry mutex (backlog#1315). `Arc` so clones of
     /// a set share one generation marker.
     capacity_dirty_generation: Arc<AtomicU64>,
+    /// Per-set proof that successful rename_data peers return the old-current
+    /// source capability needed before PUT may skip its pre-rename lookup.
+    tier_free_version_rename_data_source_capable: Arc<AtomicBool>,
     /// Orphan prefixes whose last purge scan met data that can never be
     /// purged by listing (residue without a committed marker, an in-flight
     /// write), keyed by `bucket/prefix` with the time of that scan. Empty
@@ -4697,6 +4706,7 @@ impl SetDisks {
             ctx,
             capacity_scope_cache: Arc::new(std::sync::RwLock::new(CapacityScopeCache::default())),
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            tier_free_version_rename_data_source_capable: Arc::new(AtomicBool::new(false)),
             orphan_purge_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
@@ -4709,6 +4719,15 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    pub(in crate::set_disk) fn tier_free_version_rename_data_source_capable(&self) -> bool {
+        self.tier_free_version_rename_data_source_capable.load(Ordering::Acquire)
+    }
+
+    pub(in crate::set_disk) fn observe_tier_free_version_rename_data_source_capability(&self, capable: bool) {
+        self.tier_free_version_rename_data_source_capable
+            .store(capable, Ordering::Release);
     }
 
     #[cfg(test)]

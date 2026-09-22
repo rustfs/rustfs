@@ -178,6 +178,13 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     Ok(ObjectLockConfigState::ConfirmedAbsent)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CachedQuotaMetadataSnapshot {
+    pub(crate) quota: Option<BucketQuota>,
+    pub(crate) bucket_incarnation: Uuid,
+    pub(crate) quota_revision: OffsetDateTime,
+}
+
 /// Convert the persisted serving-layer configuration into the storage-level
 /// [`DefaultRetention`](crate::bucket::object_lock::types::DefaultRetention)
 /// the WORM evaluation code consumes (rustfs/backlog#1842). A rule without a
@@ -1308,6 +1315,9 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_in(
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+                return Err(Error::other("persisted bucket quota configuration is invalid"));
+            }
             Ok((
                 metadata.quota_config.clone(),
                 metadata.bucket_incarnation_id,
@@ -1320,6 +1330,15 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_in(
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         BucketMetadataAuthority::Fabricated => Err(Error::other(format!("bucket quota metadata is not authoritative: {bucket}"))),
     }
+}
+
+pub(crate) async fn get_cached_quota_config_and_incarnation_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+    bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
 }
 
 pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
@@ -2725,6 +2744,27 @@ impl BucketMetadataSys {
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+
+    async fn cached_quota_config_and_incarnation(&self, bucket: &str) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+        let metadata = {
+            let metadata_map = self.metadata_map.read().await;
+            metadata_map.get(bucket).cloned()
+        };
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        if !metadata.bucket_incarnation_sidecar || metadata.bucket_incarnation_id.is_nil() {
+            return Ok(None);
+        }
+        if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+            return Err(Error::other("persisted bucket quota configuration is invalid"));
+        }
+        Ok(Some(CachedQuotaMetadataSnapshot {
+            quota: metadata.quota_config.clone(),
+            bucket_incarnation: metadata.bucket_incarnation_id,
+            quota_revision: metadata.quota_config_updated_at,
+        }))
     }
 
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {

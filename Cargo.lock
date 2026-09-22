@@ -306,7 +306,7 @@ dependencies = [
  "num-bigint 0.4.8",
  "ouroboros",
  "quad-rand",
- "rand 0.10.2",
+ "rand 0.10.3",
  "regex-lite",
  "serde",
  "serde_bytes",
@@ -750,7 +750,7 @@ dependencies = [
  "nuid",
  "pin-project",
  "portable-atomic",
- "rand 0.10.2",
+ "rand 0.10.3",
  "regex",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -1305,9 +1305,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.14.2"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3296253d3a91b3f938a3f2bcce4daebadcb4aa4228153fcec90f9d23532b4484"
+checksum = "591e0024cdf2a8de8711860f7e1d5cfbca26b800ce13793a9aa2f4f5918e6d95"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
@@ -1318,9 +1318,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
- "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
  "pin-project-lite",
@@ -1331,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.16.2"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d881a7b7ad179fd6611680c9de89f716fb00ab40299a9a7b8c6913e8f7511a8"
+checksum = "3fbf162725183ec0df77a9dc82ce22d9ba0b6ea7f376e8ec4f6b695727c70698"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -1371,17 +1369,15 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.6.4"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b791f3ac597193fe1d08b82366986eb1f5bc31f2ac6c194c0855276116c76cd"
+checksum = "16ecf7989e381d0cbb7ca06104140d940bf38d8eb9004bd3a12d23df03e3d363"
 dependencies = [
  "base64-simd",
  "bytes",
  "bytes-utils",
  "futures-core",
- "http 0.2.12",
  "http 1.5.0",
- "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
  "itoa",
@@ -4044,7 +4040,7 @@ dependencies = [
  "minlz",
  "opentelemetry-proto",
  "prost 0.14.4",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rcgen",
  "reqwest",
  "rmp-serde",
@@ -4799,7 +4795,7 @@ dependencies = [
  "google-cloud-wkt",
  "http 1.5.0",
  "pin-project",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -5197,7 +5193,7 @@ dependencies = [
  "idna",
  "ipnet",
  "jni",
- "rand 0.10.2",
+ "rand 0.10.3",
  "thiserror 2.0.20",
  "tinyvec",
  "tokio",
@@ -5217,7 +5213,7 @@ dependencies = [
  "jni",
  "once_cell",
  "prefix-trie",
- "rand 0.10.2",
+ "rand 0.10.3",
  "ring",
  "thiserror 2.0.20",
  "tinyvec",
@@ -5242,7 +5238,7 @@ dependencies = [
  "ndk-context",
  "once_cell",
  "parking_lot",
- "rand 0.10.2",
+ "rand 0.10.3",
  "resolv-conf",
  "smallvec",
  "system-configuration",
@@ -5463,9 +5459,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.9"
+version = "0.27.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
 dependencies = [
  "http 1.5.0",
  "hyper",
@@ -6030,9 +6026,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lapin"
-version = "4.11.0"
+version = "4.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24b99d8cdfe3f6223f9f75e35e7510a8662767bee27c1cf870d503fc3bb2428a"
+checksum = "7b86b2a46f42a1d565c7ba327e03725708c1ff212baa4c271cec291e265ae542"
 dependencies = [
  "amq-protocol",
  "async-rs",
@@ -6209,9 +6205,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
+checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
 ]
@@ -6802,7 +6798,7 @@ dependencies = [
  "lru 0.18.4",
  "mysql_common",
  "percent-encoding",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustls",
  "serde",
  "socket2",
@@ -7023,7 +7019,7 @@ checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_core 0.10.1",
 ]
 
@@ -7532,7 +7528,7 @@ dependencies = [
  "hmac 0.12.1",
  "pkcs12",
  "pkcs5 0.7.1",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rc2",
  "sha1 0.10.7",
  "sha2 0.10.9",
@@ -7627,7 +7623,7 @@ dependencies = [
  "delegate",
  "futures",
  "log",
- "rand 0.10.2",
+ "rand 0.10.3",
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
@@ -8134,7 +8130,7 @@ dependencies = [
  "hmac 0.13.0",
  "md-5 0.11.0",
  "memchr",
- "rand 0.10.2",
+ "rand 0.10.3",
  "sha2 0.11.0",
  "stringprep",
 ]
@@ -8717,7 +8713,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -8798,9 +8794,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -9378,7 +9374,7 @@ dependencies = [
  "pkcs5 0.8.1",
  "pkcs8 0.11.0",
  "polyval",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_core 0.10.1",
  "rsa 0.10.0-rc.18",
  "russh-cryptovec",
@@ -9563,7 +9559,7 @@ dependencies = [
  "prost 0.14.4",
  "pyroscope",
  "quick-xml",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rcgen",
  "regex",
  "reqwest",
@@ -9738,7 +9734,7 @@ dependencies = [
  "base64-simd",
  "hmac 0.13.0",
  "hotpath",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9756,7 +9752,7 @@ dependencies = [
  "hotpath",
  "jsonwebtoken",
  "pbkdf2 0.13.0",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rsa 0.10.0-rc.18",
  "serde",
  "serde_json",
@@ -9828,7 +9824,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "proptest",
- "rand 0.10.2",
+ "rand 0.10.3",
  "ratelimit",
  "rcgen",
  "reed-solomon-simd",
@@ -10015,7 +10011,7 @@ dependencies = [
  "openidconnect",
  "pollster",
  "qrcode-rs",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rcgen",
  "reqwest",
  "rustfs-config",
@@ -10089,7 +10085,7 @@ dependencies = [
  "kafka-protocol",
  "metrics",
  "pbkdf2 0.13.0",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustls",
  "sha2 0.11.0",
  "socket2",
@@ -10112,7 +10108,7 @@ dependencies = [
  "kafka-protocol",
  "metrics",
  "pbkdf2 0.13.0",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustfs-kafka",
  "rustls",
  "sha2 0.11.0",
@@ -10175,7 +10171,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "moka",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rcgen",
  "reqwest",
  "rustfs-s3-types",
@@ -10239,7 +10235,7 @@ dependencies = [
  "futures",
  "hotpath",
  "parking_lot",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustfs-io-metrics",
  "rustfs-utils",
  "serde",
@@ -10597,7 +10593,7 @@ dependencies = [
  "minlz",
  "pin-project-lite",
  "proptest",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest",
  "rustfs-config",
  "rustfs-io-metrics",
@@ -10629,7 +10625,7 @@ dependencies = [
  "hotpath",
  "minlz",
  "pin-project-lite",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustfs-filemeta",
  "rustfs-rio",
  "rustfs-utils",
@@ -10659,7 +10655,7 @@ dependencies = [
  "lazy_static",
  "md-5 0.11.0",
  "quick-xml",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustfs-checksums",
  "rustfs-config",
  "rustfs-rio",
@@ -10771,7 +10767,7 @@ dependencies = [
  "hotpath",
  "http 1.5.0",
  "metrics",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rmp-serde",
  "rustfs-common",
  "rustfs-concurrency",
@@ -11259,7 +11255,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.16.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3da7ca7684d6e93b8e8250f037aadfe3e599134#f3da7ca7684d6e93b8e8250f037aadfe3e599134"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11317,7 +11313,7 @@ dependencies = [
 [[package]]
 name = "s3s-multipart"
 version = "0.17.0-alpha.1"
-source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3da7ca7684d6e93b8e8250f037aadfe3e599134#f3da7ca7684d6e93b8e8250f037aadfe3e599134"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -11330,7 +11326,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.16.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3da7ca7684d6e93b8e8250f037aadfe3e599134#f3da7ca7684d6e93b8e8250f037aadfe3e599134"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.20",
@@ -11339,7 +11335,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.16.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3da7ca7684d6e93b8e8250f037aadfe3e599134#f3da7ca7684d6e93b8e8250f037aadfe3e599134"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11352,7 +11348,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.16.0"
-source = "git+https://github.com/s3s-project/s3s.git?rev=50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6#50c94aeb1e5ea9ef8e7393ef6bbc87b72f6891c6"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f3da7ca7684d6e93b8e8250f037aadfe3e599134#f3da7ca7684d6e93b8e8250f037aadfe3e599134"
 dependencies = [
  "arrayvec",
  "base64-simd",
@@ -12257,9 +12253,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "12.0.0"
+version = "12.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c6978f1b04fc86f122f767b88a9d1d89e80cfe3dc97d670598507d713c4ce48"
+checksum = "ba93b140f4d07f1b3f3fb4d7264b2d422d5c8b4e925eb6a2646e1342d5d2070a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -12727,7 +12723,7 @@ dependencies = [
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
- "rand 0.10.2",
+ "rand 0.10.3",
  "socket2",
  "tokio",
  "tokio-util",
@@ -13319,7 +13315,7 @@ checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",

@@ -47,6 +47,33 @@ use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+fn transitioned_old_current_source(
+    dst_meta_existed: bool,
+    dst_meta_unparsable: bool,
+    xlmeta: &FileMeta,
+    volume: &str,
+    path: &str,
+    version_id: Uuid,
+) -> (bool, Option<FileInfo>) {
+    if dst_meta_unparsable {
+        return (false, None);
+    }
+    if !dst_meta_existed {
+        return (true, None);
+    }
+    let Ok(old_current) = xlmeta.into_fileinfo(volume, path, "", false, false, true) else {
+        return (false, None);
+    };
+    if old_current.version_id.unwrap_or_default() != version_id {
+        return (true, None);
+    }
+    if old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
+        (true, Some(old_current))
+    } else {
+        (true, None)
+    }
+}
+
 /// Hold later repair publications after admitting one baseline object. The
 /// fixture arms this on one replacement disk before rejoining the cluster.
 #[cfg(feature = "e2e-test-hooks")]
@@ -491,6 +518,14 @@ impl LocalDisk {
             }
 
             let version_id = fi.version_id.unwrap_or_default();
+            let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
+                has_dst_buf.is_some(),
+                dst_meta_unparsable,
+                &xlmeta,
+                dst_volume,
+                dst_path,
+                version_id,
+            );
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
             let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
             let rollback_data_dir = has_old_data_dir.or_else(|| {
@@ -924,6 +959,8 @@ impl LocalDisk {
                 cleanup_data_dir: has_old_data_dir,
                 sign: version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
             })
         } else {
             // Inline metadata preparation is blocking. The transaction lease is
@@ -937,6 +974,8 @@ impl LocalDisk {
                 None
             };
             let dst_path_for_failpoint = dst_path.to_string();
+            let dst_volume_for_source = dst_volume.to_string();
+            let dst_path_for_source = dst_path.to_string();
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = rename_commit_guard.clone();
@@ -981,6 +1020,14 @@ impl LocalDisk {
                 };
 
                 let version_id = fi.version_id.unwrap_or_default();
+                let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
+                    has_dst_buf.is_some(),
+                    dst_meta_unparsable,
+                    &xlmeta,
+                    &dst_volume_for_source,
+                    &dst_path_for_source,
+                    version_id,
+                );
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
                 let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
                 let rollback_data_dir = old_data_dir.or_else(|| {
@@ -1030,6 +1077,8 @@ impl LocalDisk {
                     old_data_dir,
                     version_signature,
                     old_current_size,
+                    old_current_source_checked,
+                    old_current_source,
                     staged_rollback_path,
                     has_dst_buf.is_none(),
                     prepared_metadata_source,
@@ -1048,6 +1097,8 @@ impl LocalDisk {
                 cleanup_data_dir,
                 version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
                 mut local_rollback_path,
                 destination_was_absent,
                 prepared_metadata_source,
@@ -1285,6 +1336,8 @@ impl LocalDisk {
                 cleanup_data_dir,
                 sign: version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
             })
         }
     }
