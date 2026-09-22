@@ -42,7 +42,7 @@ use crate::disk::DiskAPI;
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
-use crate::set_disk::shard_source::ShardReadCost;
+use crate::set_disk::shard_source::{ShardReadCost, ShardReadRepair};
 use std::{
     future::Future,
     io::IoSlice,
@@ -1226,34 +1226,24 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
-            let (written, err, exact_quorum) = if require_reconstruction_surplus {
-                erasure
-                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await
-            } else {
-                let (written, err) = erasure
-                    .decode_with_stripe_handles_and_reopeners(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await;
-                (written, err, false)
-            };
+            let coding::decode::DecodeOutcome {
+                written,
+                error: err,
+                exact_quorum,
+                repair,
+            } = erasure
+                .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                    writer,
+                    readers,
+                    part_offset,
+                    part_length,
+                    part_size,
+                    read_costs,
+                    deferred_stripe_handles,
+                    deferred_reopeners,
+                )
+                .await;
+            let mut repair_needed = repair.needed(!unattempted_data_shards);
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1263,7 +1253,7 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
-            if exact_quorum && err.is_none() {
+            if require_reconstruction_surplus && exact_quorum && err.is_none() {
                 return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
             }
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
@@ -1302,33 +1292,7 @@ impl SetDisks {
                     let should_enqueue_heal = matches!(de_err, DiskError::FileCorrupt)
                         || (matches!(de_err, DiskError::FileNotFound) && !unattempted_data_shards);
                     if should_enqueue_heal {
-                        debug!(
-                            bucket,
-                            object,
-                            part_number,
-                            error = ?de_err,
-                            "Recoverable decode error triggered read repair"
-                        );
-                        let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                        // Single-flight (backlog#1894 axis A): the durable
-                        // MRF intent (Urgent ECDecode across restarts, HS-01)
-                        // is bound to the read-repair reservation, so only the
-                        // first sighting within the dedup TTL books a journal
-                        // record instead of one per retried read.
-                        submit_read_repair_heal_with_submitter(
-                            ReadRepairHealSubmission {
-                                bucket,
-                                object,
-                                version_id: version_id.as_deref(),
-                                pool_index,
-                                set_index,
-                                part_number: Some(part_number),
-                                reason: "decode_error",
-                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
-                            },
-                            send_read_repair_heal_request,
-                        )
-                        .await;
+                        repair_needed = true;
                         has_err = false;
                     }
                 }
@@ -1367,6 +1331,12 @@ impl SetDisks {
                     record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
+            }
+
+            if written == part_length && repair_needed {
+                DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number)
+                    .submit()
+                    .await;
             }
 
             // debug!("ec decode {} written size {}", part_number, n);
@@ -1481,8 +1451,8 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
-        _set_index: usize,
-        _pool_index: usize,
+        set_index: usize,
+        pool_index: usize,
         skip_verify_bitrot: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
@@ -1502,6 +1472,8 @@ impl SetDisks {
                 bucket,
                 object,
                 fi,
+                pool_index,
+                set_index,
                 &files,
                 &disks,
                 &erasure,
@@ -1556,6 +1528,8 @@ impl SetDisks {
             bucket,
             object,
             fi,
+            pool_index,
+            set_index,
             &files,
             &disks,
             &erasure,
@@ -1588,6 +1562,8 @@ impl SetDisks {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             fi: fi.clone(),
+            pool_index,
+            set_index,
             files,
             disks,
             erasure,
@@ -1604,6 +1580,8 @@ impl SetDisks {
                     &ctx.bucket,
                     &ctx.object,
                     &ctx.fi,
+                    ctx.pool_index,
+                    ctx.set_index,
                     &ctx.files,
                     &ctx.disks,
                     &ctx.erasure,
@@ -1638,6 +1616,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         fi: &FileInfo,
+        pool_index: usize,
+        set_index: usize,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
         erasure: &coding::Erasure,
@@ -1737,6 +1717,7 @@ impl SetDisks {
                     state = "codec_streaming_mid_stream_legacy_fallback",
                     "Codec streaming later part degraded in place to legacy per-part decode"
                 );
+                let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
                 let reader = build_legacy_per_part_fallback_reader(
                     erasure.clone(),
                     reader_setup.readers,
@@ -1746,12 +1727,18 @@ impl SetDisks {
                     part_offset,
                     part_length,
                     part_size,
+                    Some((
+                        DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number),
+                        allow_missing,
+                    )),
                 );
                 return Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader));
             }
             return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
         }
 
+        let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
+        let repair = Arc::new(ShardReadRepair::default());
         let readers = reader_setup.readers;
         let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
         let deferred_reopeners = reader_setup.deferred_reopeners;
@@ -1774,7 +1761,8 @@ impl SetDisks {
             )
         }
         .with_deferred_parity_handles(deferred_stripe_handles)
-        .with_deferred_parity_reopeners(deferred_reopeners);
+        .with_deferred_parity_reopeners(deferred_reopeners)
+        .with_repair_evidence(Arc::clone(&repair));
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = if single_inflight {
             coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
@@ -1786,13 +1774,132 @@ impl SetDisks {
         } else {
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?
         };
-        if single_inflight {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(reader)))
+        let inner: Box<dyn AsyncRead + Unpin + Send + Sync> = if single_inflight {
+            Box::new(reader)
         } else {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-                coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-            )))
+            Box::new(coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(
+                reader,
+                metrics_path,
+            ))
+        };
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(RepairReportingReader {
+            inner,
+            evidence: repair,
+            remaining: part_length,
+            allow_missing,
+            context: Some(DecodeReadRepairContext::new(
+                bucket,
+                object,
+                fi.version_id,
+                pool_index,
+                set_index,
+                part_number,
+            )),
+        })))
+    }
+}
+
+struct DecodeReadRepairContext {
+    bucket: String,
+    object: String,
+    version_id: Option<uuid::Uuid>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: usize,
+    submitter: ReadRepairAdmissionSubmitter,
+}
+
+impl DecodeReadRepairContext {
+    fn new(
+        bucket: &str,
+        object: &str,
+        version_id: Option<uuid::Uuid>,
+        pool_index: usize,
+        set_index: usize,
+        part_number: usize,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter: send_read_repair_heal_request,
         }
+    }
+
+    async fn submit(self) {
+        let Self {
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter,
+        } = self;
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "decode_repair_observed",
+            bucket,
+            object,
+            version_id = ?version_id,
+            part_number,
+            pool_index,
+            set_index,
+            "Recovered shard damage triggered read repair"
+        );
+        let version = version_id.map(|value| value.to_string());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: &object,
+                version_id: version.as_deref(),
+                pool_index,
+                set_index,
+                part_number: Some(part_number),
+                reason: "decode_error",
+                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, version_id)),
+            },
+            submitter,
+        )
+        .await;
+    }
+}
+
+/// Report observed damage only after the requested part has reconstructed and
+/// reached the caller. Read errors and a client dropping a partial body are not
+/// successful repair admissions.
+struct RepairReportingReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    evidence: Arc<ShardReadRepair>,
+    remaining: usize,
+    allow_missing: bool,
+    context: Option<DecodeReadRepairContext>,
+}
+
+impl AsyncRead for RepairReportingReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        match &result {
+            Poll::Ready(Ok(())) => {
+                this.remaining = this.remaining.saturating_sub(buf.filled().len() - before);
+                if this.remaining == 0
+                    && let Some(context) = this.context.take()
+                    && this.evidence.needed(this.allow_missing)
+                {
+                    tokio::spawn(context.submit());
+                }
+            }
+            Poll::Ready(Err(_)) => this.context = None,
+            Poll::Pending => {}
+        }
+        result
     }
 }
 
@@ -2006,6 +2113,8 @@ struct LazyCodecPartContext {
     bucket: String,
     object: String,
     fi: FileInfo,
+    pool_index: usize,
+    set_index: usize,
     files: Vec<FileInfo>,
     disks: Vec<Option<DiskStore>>,
     erasure: Arc<coding::Erasure>,
@@ -2161,12 +2270,13 @@ fn build_legacy_per_part_fallback_reader(
     part_offset: usize,
     part_length: usize,
     part_size: usize,
+    read_repair: Option<(DecodeReadRepairContext, bool)>,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
     let buffer = adaptive_duplex_buffer_size(part_size as i64);
     let (read_half, mut write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
-        let (_written, err) = erasure
-            .decode_with_stripe_handles_and_reopeners(
+        let outcome = erasure
+            .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                 &mut write_half,
                 readers,
                 part_offset,
@@ -2177,6 +2287,26 @@ fn build_legacy_per_part_fallback_reader(
                 deferred_reopeners,
             )
             .await;
+        let allow_missing = read_repair.as_ref().is_some_and(|(_, allow_missing)| *allow_missing);
+        let err = match outcome.error {
+            Some(error) if outcome.written == part_length => {
+                let error = DiskError::from(error);
+                if matches!(error, DiskError::FileCorrupt) || (allow_missing && matches!(error, DiskError::FileNotFound)) {
+                    outcome.repair.observe(&[Some(error)]);
+                    None
+                } else {
+                    Some(error.into())
+                }
+            }
+            error => error,
+        };
+        if err.is_none()
+            && outcome.written == part_length
+            && outcome.repair.needed(allow_missing)
+            && let Some((context, _)) = read_repair
+        {
+            context.submit().await;
+        }
         // Dropping `write_half` on return signals EOF to the reader half.
         err
     });
@@ -3645,6 +3775,14 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn capture_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
 
     #[test]
     #[serial]
@@ -5074,6 +5212,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5096,6 +5236,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5644,6 +5786,101 @@ mod tests {
         Ok(decoded)
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codec_streaming_repair_evidence_requires_recovered_damage() {
+        for (corrupt, inconsistent, expected_calls) in [(false, false, 0), (true, false, 1), (true, true, 0)] {
+            CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+            let erasure = coding::Erasure::new(2, 2, 64);
+            let data: Vec<u8> = (0..64).collect();
+            let setup = setup_codec_data_blocks_first_encoded_bitrot_readers(
+                &erasure,
+                &data,
+                &[],
+                if corrupt { &[0] } else { &[] },
+                if inconsistent { &[2] } else { &[] },
+                HashAlgorithm::HighwayHash256,
+            )
+            .await;
+            let allow_missing = setup.data_shards_attempted(erasure.data_shards);
+            let evidence = Arc::new(ShardReadRepair::default());
+            let source = coding::decode::ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+                setup.readers,
+                erasure.clone(),
+                0,
+                data.len(),
+                Some(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE),
+            )
+            .with_deferred_parity_handles(setup.deferred_stripe_handles)
+            .with_repair_evidence(Arc::clone(&evidence));
+            let engine = CodecStreamingDecodeEngine::rustfs(&erasure).unwrap();
+            let inner = coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
+                source,
+                engine,
+                data.len(),
+                GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE,
+            )
+            .unwrap();
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", Some(Uuid::new_v4()), 0, 0, 1);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(inner),
+                evidence: Arc::clone(&evidence),
+                remaining: data.len(),
+                allow_missing,
+                context: Some(context),
+            };
+            let mut decoded = Vec::new();
+            let result = reader.read_to_end(&mut decoded).await;
+            if inconsistent {
+                assert!(result.is_err(), "inconsistent reconstruction must still fail");
+            } else {
+                result.unwrap();
+                assert_eq!(decoded, data);
+            }
+            assert_eq!(evidence.needed(false), corrupt);
+            assert!(reader.context.is_none(), "terminal reads cannot report a second repair");
+            // The reporter detaches admission from response completion.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), expected_calls);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_reporting_reader_does_not_report_partial_or_unattempted_missing_shards() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        for (partial, missing) in [(true, false), (false, true)] {
+            let evidence = Arc::new(ShardReadRepair::default());
+            evidence.observe(&[Some(if missing {
+                DiskError::FileNotFound
+            } else {
+                DiskError::FileCorrupt
+            })]);
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 1);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(Cursor::new(vec![7; 16])),
+                evidence,
+                remaining: 16,
+                allow_missing: false,
+                context: Some(context),
+            };
+            if partial {
+                reader.read_exact(&mut [0; 1]).await.unwrap();
+            } else {
+                reader.read_to_end(&mut Vec::new()).await.unwrap();
+            }
+            drop(reader);
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 0);
+    }
+
     async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &[u8]) -> Vec<FileInfo> {
         let shards = erasure.encode_data(part_data).expect("test part should encode");
         let distribution = (1..=erasure.total_shard_count()).collect::<Vec<_>>();
@@ -6136,6 +6373,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();
@@ -6144,6 +6382,37 @@ mod tests {
             .await
             .expect("legacy per-part fallback reader should reconstruct the degraded part");
         assert_eq!(decoded, data, "reconstructed bytes must match the original part payload");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_per_part_fallback_preserves_repair_evidence() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data: Vec<u8> = (0..64).collect();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[], HashAlgorithm::HighwayHash256)
+                .await;
+        let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 2);
+        context.submitter = capture_read_repair_submitter;
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            Vec::new(),
+            None,
+            0,
+            data.len(),
+            data.len(),
+            Some((context, false)),
+        );
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, data);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 1);
     }
 
     // backlog#879: the whole multipart object must stream to completion when a
@@ -6187,6 +6456,7 @@ mod tests {
                     0,
                     part2_len,
                     part2_len,
+                    None,
                 );
                 Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))
             })
@@ -6228,6 +6498,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();
