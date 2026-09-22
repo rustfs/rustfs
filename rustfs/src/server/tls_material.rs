@@ -1019,4 +1019,24 @@ mod tests {
 
         assert!(acceptor.is_some());
     }
+
+    #[test]
+    fn http3_server_config_uses_h3_and_disables_early_dta() {
+        ensure_rustls_crypto_provider();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let config = build_server_config(
+            ServerCertSource::SingleCert {
+                certs: vec![cert.cert.der().clone()],
+                key: rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+                    .expect("private key should convert"),
+            },
+            None,
+            ServerProtocol::Http3,
+        )
+        .expect("HTTP/3 TLS config should build");
+
+        assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(config.max_early_data_size, 0);
+    }
 }
