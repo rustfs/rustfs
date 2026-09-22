@@ -16,8 +16,8 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
-    get_total_usable_capacity_free,
+    DecommissionCapacityPauses, DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus,
+    get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -43,6 +43,10 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+
+/// `waitingReason` value reported while a pool is paused on target capacity.
+const DECOMMISSION_WAITING_REASON_CAPACITY: &str = "capacity";
+
 pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
 pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
 pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
@@ -108,6 +112,10 @@ pub struct AdminPoolDecommissionInfo {
     pub bytes_failed: usize,
     #[serde(rename = "waitingReason")]
     pub waiting_reason: Option<String>,
+    #[serde(rename = "capacityBlockedReason", skip_serializing_if = "Option::is_none")]
+    pub capacity_blocked_reason: Option<String>,
+    #[serde(rename = "capacityPauses")]
+    pub capacity_pauses: DecommissionCapacityPauses,
     #[serde(rename = "unresolvedEntries", skip_serializing_if = "Vec::is_empty")]
     pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
 }
@@ -622,12 +630,24 @@ impl DefaultAdminUsecase {
             bytes_done: info.bytes_done,
             bytes_failed: info.bytes_failed,
             waiting_reason,
+            capacity_blocked_reason: info.capacity_blocked_reason,
+            capacity_pauses: info.capacity_pauses,
             unresolved_entries: info.unresolved_entries,
         }
     }
 
+    /// Why a pool is not currently making progress.
+    ///
+    /// A durable capacity pause is reported ahead of the worker states: it is
+    /// the actionable condition, and `capacityBlockedReason` carries the detail.
     fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
-        if !info.has_decommission_state() || info.complete || info.failed || info.canceled || info.start_time.is_some() {
+        if !info.has_decommission_state() || info.complete || info.failed || info.canceled {
+            return None;
+        }
+        if info.capacity_blocked_reason.is_some() {
+            return Some(DECOMMISSION_WAITING_REASON_CAPACITY);
+        }
+        if info.start_time.is_some() {
             return None;
         }
         if info.queued {
@@ -680,7 +700,9 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::admin_usecase::capacity::{DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus};
+    use super::super::storage_api::admin_usecase::capacity::{
+        DecommissionCapacityPauses, DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus,
+    };
     use super::*;
     use time::OffsetDateTime;
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
@@ -995,6 +1017,67 @@ mod tests {
         assert_eq!(item.rebalance_status, "started");
     }
 
+    /// A durable capacity pause must be distinguishable from "slow but
+    /// progressing": the pause surfaces its own waiting reason, the persisted
+    /// detail, and the cumulative pause count.
+    #[test]
+    fn admin_pool_list_item_exposes_decommission_capacity_pause() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    total_size: 1_000,
+                    current_size: 500,
+                    capacity_blocked_reason: Some("target pool 1 target capacity mutation gate is busy".to_string()),
+                    capacity_pauses: DecommissionCapacityPauses {
+                        count: 3,
+                        last_reason: Some("target capacity mutation gate is busy".to_string()),
+                    },
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("paused pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "capacity");
+        assert_eq!(
+            value["decommissionInfo"]["capacityBlockedReason"],
+            "target pool 1 target capacity mutation gate is busy"
+        );
+        assert_eq!(value["decommissionInfo"]["capacityPauses"]["count"], 3);
+    }
+
+    /// Once the pause clears, `waitingReason` must return to the worker states
+    /// while the pause count is retained for post-mortem analysis.
+    #[test]
+    fn admin_pool_list_item_clears_capacity_pause_but_keeps_the_count() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    capacity_pauses: DecommissionCapacityPauses {
+                        count: 3,
+                        last_reason: Some("target capacity mutation gate is busy".to_string()),
+                    },
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("resumed pool status should serialize");
+        assert!(value["decommissionInfo"]["waitingReason"].is_null());
+        assert!(value["decommissionInfo"].get("capacityBlockedReason").is_none());
+        assert_eq!(value["decommissionInfo"]["capacityPauses"]["count"], 3);
+    }
+
     #[test]
     fn admin_pool_list_item_exposes_queued_decommission_state() {
         let item = DefaultAdminUsecase::pool_list_item_from_status(
@@ -1210,7 +1293,10 @@ mod tests {
                     "objectsDecommissionedFailed": 0,
                     "bytesDecommissioned": 0,
                     "bytesDecommissionedFailed": 0,
-                    "waitingReason": null
+                    "waitingReason": null,
+                    "capacityPauses": {
+                        "count": 0
+                    }
                 }
             })
         );

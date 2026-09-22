@@ -92,7 +92,18 @@ When decommission metadata is present, `decommissionInfo` includes:
 - progress counters: `objectsDecommissioned`, `objectsDecommissionedFailed`, `bytesDecommissioned`, and `bytesDecommissionedFailed`;
 - current location: `bucket`, `prefix`, and `object`;
 - queue/history lists: `queuedBuckets` and `decommissionedBuckets`;
-- `waitingReason`: `queued` for queued entries and `waiting_for_worker` when metadata exists but no worker has started.
+- `waitingReason`: `capacity` while the pool is paused on target capacity,
+  `queued` for queued entries, and `waiting_for_worker` when metadata exists but
+  no worker has started;
+- `capacityBlockedReason`: the persisted detail for the active capacity pause,
+  absent once the pause clears;
+- `capacityPauses`: cumulative durable pauses for the pool, with `count` and the
+  `lastReason` that caused the most recent one.
+
+A capacity pause is reported ahead of the worker states so operators can tell
+"contending but progressing" from "genuinely out of target capacity". The count
+is retained after the pause clears, which is what distinguishes a pool that
+paused once from one that keeps re-blocking.
 
 This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
 
