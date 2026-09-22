@@ -14,7 +14,9 @@
 
 use crate::{
     config::Config,
-    startup_runtime_hooks::{init_profiling_runtime, install_default_crypto_provider, log_startup_runtime_diagnostics},
+    startup_runtime_hooks::{
+        init_profiling_runtime, install_default_crypto_provider, install_md5_lane_server, log_startup_runtime_diagnostics,
+    },
     startup_tls_material::init_outbound_tls_material,
 };
 use rustfs_config::{DEFAULT_API_OBJECT_MAX_VERSIONS, ENV_API_OBJECT_MAX_VERSIONS};
@@ -26,6 +28,7 @@ pub(crate) async fn init_startup_runtime_foundation(config: &Config) -> Result<(
     init_profiling_runtime().await;
     rustfs_trusted_proxies::init();
     install_default_crypto_provider();
+    install_md5_lane_server();
     init_object_max_versions_config()?;
     init_outbound_tls_material(config).await
 }

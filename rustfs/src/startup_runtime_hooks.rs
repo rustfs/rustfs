@@ -25,6 +25,7 @@ const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_LICENSE: &str = "license";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_CRYPTO_PROVIDER_STATE: &str = "crypto_provider_state";
+const EVENT_MD5_LANE_SERVER_STATE: &str = "md5_lane_server_state";
 const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
 const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
 
@@ -117,6 +118,32 @@ pub(crate) fn install_default_crypto_provider() {
             "Rustls crypto provider state checked"
         );
     }
+}
+
+/// ETag hashing: optionally move it from the request tasks to the multi-stream lane server.
+pub(crate) fn install_md5_lane_server() {
+    use rustfs_rio::md5_lanes::{LaneServerInstall, install_lane_server_from_env};
+    let (state, engine, threads, min_streams) = match install_lane_server_from_env() {
+        LaneServerInstall::Disabled => return,
+        LaneServerInstall::Unavailable => ("unavailable", "none", 0, 0),
+        LaneServerInstall::AlreadyInstalled => ("already_installed", "none", 0, 0),
+        LaneServerInstall::Installed {
+            engine,
+            threads,
+            min_streams,
+        } => ("installed", engine, threads, min_streams),
+    };
+    info!(
+        target: "rustfs::main",
+        event = EVENT_MD5_LANE_SERVER_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state,
+        engine,
+        threads,
+        min_streams,
+        "MD5 lane server state checked"
+    );
 }
 
 pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {

@@ -76,6 +76,8 @@ offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
 # Alternate MD5 backend for ETag / Content-MD5 (crates/utils/src/hash_stream.rs). Not in `default` or `full`.
 hash-md5-fast-md5 = ["rustfs-utils/hash-md5-fast-md5", "rustfs-rio/hash-md5-fast-md5"]
+# Multi-stream SIMD MD5 for ETags: enables `RUSTFS_MD5_LANE_SERVER=on` (crates/rio/src/md5_lanes.rs). Trial wiring.
+hash-md5-simd = ["rustfs-utils/hash-md5-simd", "rustfs-rio/hash-md5-simd"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
