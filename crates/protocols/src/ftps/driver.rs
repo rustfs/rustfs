@@ -16,12 +16,12 @@ use crate::common::client::s3::StorageBackend as S3StorageBackend;
 use crate::common::gateway::S3Action;
 use crate::common::gateway::authorize_operation;
 use async_trait::async_trait;
-use futures_util::stream;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tracing::{debug, error};
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
@@ -94,12 +94,12 @@ impl Metadata for FtpsMetadata {
 /// FTPS storage driver implementation
 pub struct FtpsDriver<S> {
     /// Storage backend for S3 operations
-    storage: S,
+    storage: Arc<S>,
 }
 
 impl<S> Debug for FtpsDriver<S>
 where
-    S: S3StorageBackend + Debug,
+    S: S3StorageBackend + Debug + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FtpsDriver").field("storage", &"StorageBackend").finish()
@@ -108,11 +108,13 @@ where
 
 impl<S> FtpsDriver<S>
 where
-    S: S3StorageBackend + Debug,
+    S: S3StorageBackend + Debug + 'static,
 {
     /// Create a new FTPS driver with the given storage backend
     pub fn new(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage: Arc::new(storage),
+        }
     }
 
     /// List all buckets (for root path)
@@ -232,7 +234,7 @@ where
 #[async_trait]
 impl<S> StorageBackend<super::server::FtpsUser> for FtpsDriver<S>
 where
-    S: S3StorageBackend + Debug,
+    S: S3StorageBackend + Debug + 'static,
 {
     type Metadata = FtpsMetadata;
 
@@ -544,55 +546,18 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        // Convert AsyncRead to bytes
-        let bytes_vec = {
-            let mut buffer = Vec::new();
-            let mut reader = bytes;
-            tokio::io::copy(&mut reader, &mut buffer)
-                .await
-                .map_err(|e| Error::new(ErrorKind::TransientFileNotAvailable, e.to_string()))?;
-            buffer
-        };
-
-        let file_size = bytes_vec.len();
-
-        let mut put_builder = PutObjectInput::builder();
-        put_builder.set_bucket(bucket.clone());
-        put_builder.set_key(key.clone());
-        put_builder.set_content_length(Some(file_size as i64));
-
-        // Create StreamingBlob with known size
-        let data_bytes = bytes::Bytes::from(bytes_vec);
-        let stream = stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(data_bytes) });
-        let streaming_blob = s3s::dto::StreamingBlob::wrap(stream);
-        put_builder.set_body(Some(streaming_blob));
-        let put_input = put_builder
-            .build()
-            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build PutObjectInput"))?;
-
-        match self.storage.put_object(put_input, session_context.credentials()).await {
-            Ok(_output) => {
-                Ok(file_size as u64) // Return the size of the uploaded object
-            }
-            Err(e) => {
+        super::upload::upload(Arc::clone(&self.storage), session_context, bytes, &bucket, &key)
+            .await
+            .inspect_err(|e| {
                 error!(
                     event = EVENT_FTPS_OBJECT_PUT_FAILED,
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
                     username = %masked_username,
-                    path = %path_str,
-                    bucket = %bucket,
-                    object = %key,
-                    file_size,
-                    error = ?e,
+                    error = %e,
                     "ftps object put failed"
                 );
-                Err(Error::new(
-                    ErrorKind::PermanentFileNotAvailable,
-                    format!("Failed to upload object: {:?}", e),
-                ))
-            }
-        }
+            })
     }
 
     async fn del<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
