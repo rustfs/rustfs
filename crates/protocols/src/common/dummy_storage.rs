@@ -133,6 +133,8 @@ pub struct DeleteObjectCall {
 }
 
 struct Inner {
+    capture_upload_bodies: bool,
+    upload_bodies: Vec<Vec<u8>>,
     // Response queues. Each method pops from its own queue. Empty queue
     // plus no default means a configured-miss error.
     get_object: VecDeque<Result<GetObjectOutput, DummyError>>,
@@ -190,6 +192,8 @@ struct Inner {
 impl Inner {
     fn new() -> Self {
         Self {
+            capture_upload_bodies: false,
+            upload_bodies: Vec::new(),
             get_object: VecDeque::new(),
             get_object_range: VecDeque::new(),
             put_object: VecDeque::new(),
@@ -263,6 +267,30 @@ impl DummyBackend {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
         }
+    }
+
+    /// Opt in to consuming upload bodies for byte-for-byte protocol tests.
+    pub fn capture_upload_bodies(&self) {
+        self.inner.lock().expect("lock").capture_upload_bodies = true;
+    }
+
+    pub fn upload_bodies(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().expect("lock").upload_bodies.clone()
+    }
+
+    async fn record_upload_body(&self, body: &mut Option<StreamingBlob>) -> Result<(), DummyError> {
+        use futures_util::TryStreamExt;
+        if !self.inner.lock().expect("lock").capture_upload_bodies {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = body.take() {
+            while let Some(chunk) = stream.try_next().await.map_err(|e| DummyError::Injected(e.to_string()))? {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        self.inner.lock().expect("lock").upload_bodies.push(bytes);
+        Ok(())
     }
 
     // Queue-configuration helpers. Each test stages the responses it
@@ -629,7 +657,8 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, mut input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
@@ -789,7 +818,8 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn upload_part(&self, input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+    async fn upload_part(&self, mut input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Record the call and decide the control flow while holding the
         // lock. Release the lock before awaiting so the stall path does
         // not hold the Mutex across an await point.
