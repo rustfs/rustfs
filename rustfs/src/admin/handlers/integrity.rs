@@ -8,12 +8,12 @@ use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::object_store_from_req;
 use crate::admin::storage_api::integrity as service;
+use crate::admin::storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, error as admin_s3_error};
 use crate::admin::utils::{extract_query_params, json_response, read_compatible_admin_body};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -66,18 +66,24 @@ enum Control {
 
 fn map_error(error: service::IntegrityError) -> S3Error {
     match error {
-        service::IntegrityError::Invalid(message) => s3_error!(InvalidArgument, "{message}"),
-        service::IntegrityError::Conflict => s3_error!(PreconditionFailed, "integrity job or target changed"),
-        service::IntegrityError::Busy => s3_error!(SlowDown, "an integrity worker is already active; retry resume later"),
-        service::IntegrityError::NotFound => s3_error!(NoSuchKey, "integrity job not found"),
-        service::IntegrityError::NotActivated => {
-            s3_error!(InvalidRequest, "protected writes must be explicitly activated before migration")
+        service::IntegrityError::Invalid(message) => admin_s3_error(S3ErrorCode::InvalidArgument, message),
+        service::IntegrityError::Conflict => admin_s3_error(S3ErrorCode::PreconditionFailed, "integrity job or target changed"),
+        service::IntegrityError::Busy => {
+            admin_s3_error(S3ErrorCode::SlowDown, "an integrity worker is already active; retry resume later")
         }
-        service::IntegrityError::UnsupportedBucket => s3_error!(
-            InvalidRequest,
-            "migration requires a plain unversioned bucket without configured automation or retention"
+        service::IntegrityError::NotFound => admin_s3_error(S3ErrorCode::NoSuchKey, "integrity job not found"),
+        service::IntegrityError::NotActivated => admin_s3_error(
+            S3ErrorCode::InvalidRequest,
+            "protected writes must be explicitly activated before migration",
         ),
-        _ => s3_error!(InternalError, "integrity operation failed; inspect the durable job before retrying"),
+        service::IntegrityError::UnsupportedBucket => admin_s3_error(
+            S3ErrorCode::InvalidRequest,
+            "migration requires a plain unversioned bucket without configured automation or retention",
+        ),
+        _ => admin_s3_error(
+            S3ErrorCode::InternalError,
+            "integrity operation failed; inspect the durable job before retrying",
+        ),
     }
 }
 
@@ -88,10 +94,11 @@ impl Operation for Handler {
         if matches!(self.0, Route::Readiness) {
             return json_response(StatusCode::OK, &service::readiness());
         }
-        let store = object_store_from_req(&req).ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+        let store = object_store_from_req(&req)
+            .ok_or_else(|| admin_s3_error(S3ErrorCode::InternalError, "object store is not initialized"))?;
         let bucket = params
             .get("bucket")
-            .ok_or_else(|| s3_error!(InvalidArgument, "bucket is required"))?;
+            .ok_or_else(|| admin_s3_error(S3ErrorCode::InvalidArgument, "bucket is required"))?;
         match self.0 {
             Route::Inventory => {
                 let query = extract_query_params(&req.uri);
@@ -99,12 +106,12 @@ impl Operation for Handler {
                     .keys()
                     .any(|key| !["prefix", "key-marker", "version-marker", "limit"].contains(&key.as_str()))
                 {
-                    return Err(s3_error!(InvalidArgument, "unknown inventory parameter"));
+                    return Err(admin_s3_error(S3ErrorCode::InvalidArgument, "unknown inventory parameter"));
                 }
                 let limit = query
                     .get("limit")
                     .map_or(Ok(100), |v| v.parse::<i32>())
-                    .map_err(|_| s3_error!(InvalidArgument, "invalid limit"))?;
+                    .map_err(|_| admin_s3_error(S3ErrorCode::InvalidArgument, "invalid limit"))?;
                 let page = service::inventory(
                     store,
                     bucket,
@@ -119,8 +126,8 @@ impl Operation for Handler {
             }
             Route::Create => {
                 let body = read_compatible_admin_body(req.input, 128 * 1024, req.uri.path(), &credentials.secret_key).await?;
-                let request: service::JobRequest =
-                    serde_json::from_slice(&body).map_err(|_| s3_error!(InvalidArgument, "invalid integrity job request"))?;
+                let request: service::JobRequest = serde_json::from_slice(&body)
+                    .map_err(|_| admin_s3_error(S3ErrorCode::InvalidArgument, "invalid integrity job request"))?;
                 let job = service::create_job(store, bucket, request).await.map_err(map_error)?;
                 json_response(StatusCode::CREATED, &job)
             }
@@ -129,13 +136,13 @@ impl Operation for Handler {
                     .get("job_id")
                     .and_then(|s| Uuid::parse_str(s).ok())
                     .filter(|id| !id.is_nil())
-                    .ok_or_else(|| s3_error!(InvalidArgument, "invalid job id"))?;
+                    .ok_or_else(|| admin_s3_error(S3ErrorCode::InvalidArgument, "invalid job id"))?;
                 let job = if matches!(self.0, Route::Status) {
                     service::get_job(store, bucket, id).await.map_err(map_error)?
                 } else {
                     let body = read_compatible_admin_body(req.input, 1024, req.uri.path(), &credentials.secret_key).await?;
                     let request: ControlRequest = serde_json::from_slice(&body)
-                        .map_err(|_| s3_error!(InvalidArgument, "expected pause, resume or cancel"))?;
+                        .map_err(|_| admin_s3_error(S3ErrorCode::InvalidArgument, "expected pause, resume or cancel"))?;
                     match request.operation {
                         Control::Resume => service::resume_job(store, bucket, id).await,
                         Control::Pause => service::control_job(store, bucket, id, false).await,
@@ -194,7 +201,7 @@ async fn integrity_routes_reject_unauthenticated_requests_before_storage_access(
             .call(req, router.at("/example").expect("params").params)
             .await
             .expect_err("credentials required");
-        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some("get cred failed"));
     }
 }
