@@ -3877,6 +3877,9 @@ pub struct SetDisks {
     pub format: FormatV3,
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+    /// Coalesce bounded GET probes of missing remote slots. Shared by set clones;
+    /// the timestamp also limits repeated probes while a peer remains absent.
+    read_reconnect: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
@@ -4743,6 +4746,7 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
+            read_reconnect: Arc::new(tokio::sync::Mutex::new(None)),
             get_object_metadata_cache: moka::future::Cache::builder()
                 .max_capacity(get_object_metadata_cache_max_entries() as u64)
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)

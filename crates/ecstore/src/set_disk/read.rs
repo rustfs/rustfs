@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use super::{
-    Arc, Bytes, DiskError, DiskStore, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason, GetObjectFileInfo,
-    GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey, GetObjectReadPolicy, HashAlgorithm,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET,
-    ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
-    build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
-    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    Arc, Bytes, DiskError, DiskOption, DiskStore, Endpoint, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason,
+    GetObjectFileInfo, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey,
+    GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo,
+    ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size,
+    build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index,
+    debug, error, get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
     is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
     reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
@@ -38,11 +38,12 @@ use crate::diagnostics::get::{
     get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::DiskAPI;
+use crate::disk::{DiskAPI, new_disk};
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::{ShardReadCost, ShardReadRepair};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     future::Future,
     io::IoSlice,
@@ -225,6 +226,101 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
 }
 
 impl SetDisks {
+    /// A startup quorum can leave remote slots unregistered even after their
+    /// peers become ready. Refresh those slots before taking the GET metadata
+    /// snapshot, without waiting for the periodic reconnect loop.
+    pub(crate) async fn get_disks_for_data_read(&self) -> Vec<Option<DiskStore>> {
+        let disks = self.get_disks_internal().await;
+        if !disks
+            .iter()
+            .enumerate()
+            .any(|(index, disk)| disk.is_none() && self.set_endpoints.get(index).is_some_and(|endpoint| !endpoint.is_local))
+        {
+            return disks;
+        }
+
+        let mut recovered = 0;
+        let timed_out = tokio::time::timeout(crate::disk::disk_store::get_drive_active_check_timeout(), async {
+            // Lock order: read_reconnect -> disks. Only this bounded probe sweep
+            // holds read_reconnect across I/O; disks guards never cross I/O.
+            let mut last_attempt = self.read_reconnect.lock().await;
+            if last_attempt.is_some_and(|at| at.elapsed() < crate::disk::health_state::get_drive_returning_probe_interval()) {
+                return;
+            }
+            let current = self.get_disks_internal().await;
+            *last_attempt = Some(tokio::time::Instant::now());
+            let mut probes = self
+                .set_endpoints
+                .iter()
+                .enumerate()
+                .filter(|(index, endpoint)| !endpoint.is_local && current.get(*index).is_some_and(Option::is_none))
+                .map(|(index, endpoint)| async move { (index, self.probe_missing_read_disk(index, endpoint).await) })
+                .collect::<FuturesUnordered<_>>();
+            while let Some((index, result)) = probes.next().await {
+                let Ok(disk) = result else {
+                    continue;
+                };
+                let mut slots = self.disks.write().await;
+                // A background reconnect may have published a handle while the
+                // format probe was pending. Never replace or close its handle.
+                if let Some(slot) = slots.get_mut(index).filter(|slot| slot.is_none()) {
+                    disk.enable_health_check();
+                    *slot = Some(disk);
+                    recovered += 1;
+                }
+            }
+        })
+        .await
+        .is_err();
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "missing_read_disks_probed",
+            pool_index = self.pool_index,
+            set_index = self.set_index,
+            recovered_disks = recovered,
+            timed_out,
+            "Missing GET disk slots probed"
+        );
+        self.get_disks_internal().await
+    }
+
+    async fn probe_missing_read_disk(&self, index: usize, endpoint: &Endpoint) -> Result<DiskStore> {
+        if endpoint.is_local
+            || usize::try_from(endpoint.pool_idx).ok() != Some(self.pool_index)
+            || usize::try_from(endpoint.set_idx).ok() != Some(self.set_index)
+            || usize::try_from(endpoint.disk_idx).ok() != Some(index)
+        {
+            return Err(Error::CorruptedFormat);
+        }
+        // An unregistered probe must not leave a health monitor running after
+        // failure/cancellation. Only an identity-validated published handle gets
+        // monitoring. No replacement formatting or healing is initiated here.
+        let probe = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await?;
+        let format = super::load_format_erasure(&probe, false).await?;
+        if self.find_disk_index(&format)? != (self.set_index, index) {
+            return Err(Error::CorruptedFormat);
+        }
+        let disk = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await?;
+        disk.set_disk_id(Some(format.erasure.this)).await?;
+        Ok(disk)
+    }
+
     async fn get_object_metadata_cache_bypass_reason(
         &self,
         bucket: &str,
@@ -490,9 +586,11 @@ impl SetDisks {
             .then(|| self.get_object_metadata_cache_generation(bucket, object))
             .flatten();
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        let disks = if read_data && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            self.get_disks_for_data_read().await
+        } else {
+            self.get_disks_internal().await
+        };
 
         // Early-stop for safe metadata reads is handled inside
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
