@@ -32,6 +32,8 @@ workspace = true
 default = []
 # Forwarded so `-p rustfs-rio --features hash-md5-fast-md5` tests rio on the alternate MD5 backend.
 hash-md5-fast-md5 = ["rustfs-utils/hash-md5-fast-md5"]
+# Multi-stream MD5 kernel for `md5_lanes::LaneServer` (trial wiring, see rustfs-utils).
+hash-md5-simd = ["rustfs-utils/hash-md5-simd"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -92,6 +94,8 @@ hex-simd.workspace = true
 [dev-dependencies]
 # Independent MD5 reference for etag/checksum tests; production code goes through rustfs-utils.
 md-5 = { workspace = true }
+# Process CPU time for the ignored `etag_throughput` benchmark.
+rustix = { workspace = true, features = ["time"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }

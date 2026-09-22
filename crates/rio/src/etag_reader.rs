@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
+use crate::md5_lanes::{Md5Lane, Md5StreamSink, md5_stream_sink};
 use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
 use pin_project_lite::pin_project;
-use rustfs_utils::hash::Md5Stream;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::error;
 
@@ -25,9 +25,11 @@ pin_project! {
     pub struct  EtagReader<R> {
         #[pin]
         pub inner: R,
-        // `Some` until EOF; taken (consumed) exactly once when the stream ends.
-        // `Md5Stream` has no snapshot/clone: the digest exists only after EOF.
-        md5: Option<Md5Stream>,
+        // Where the plaintext goes to be hashed. `Some` until the digest has been taken.
+        // The digest exists only after EOF: there is no snapshot of a stream in progress.
+        lane: Option<Box<dyn Md5Lane>>,
+        // The inner reader reported EOF; from here on only the digest is awaited.
+        inner_eof: bool,
         pub finished: bool,
         pub checksum: Option<String>,
         resolved_etag: Option<String>,
@@ -35,10 +37,17 @@ pin_project! {
 }
 
 impl<R> EtagReader<R> {
+    /// Hash through the process-wide [`Md5StreamSink`] (inline unless one was installed).
     pub fn new(inner: R, checksum: Option<String>) -> Self {
+        Self::with_sink(inner, checksum, md5_stream_sink().as_ref())
+    }
+
+    /// Hash through `sink`. Tests and benchmarks use this to stay off the process-wide sink.
+    pub fn with_sink(inner: R, checksum: Option<String>, sink: &dyn Md5StreamSink) -> Self {
         Self {
             inner,
-            md5: Some(Md5Stream::new()),
+            lane: Some(sink.open()),
+            inner_eof: false,
             finished: false,
             checksum,
             resolved_etag: None,
@@ -53,17 +62,6 @@ impl<R> EtagReader<R> {
     pub fn get_etag(&self) -> Option<String> {
         self.resolved_etag.clone()
     }
-
-    /// Runs exactly once, on the poll that observes EOF: `finished` is set on
-    /// that same poll and every later poll returns early, so `md5` is always
-    /// `Some` here. Hashing nothing on the impossible `None` beats panicking
-    /// inside the data path.
-    fn resolve_at_eof(md5: &mut Option<Md5Stream>, resolved_etag: &mut Option<String>) -> String {
-        let digest = md5.take().unwrap_or_default().finalize();
-        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
-        *resolved_etag = Some(etag.clone());
-        etag
-    }
 }
 
 impl<R> AsyncRead for EtagReader<R>
@@ -75,35 +73,46 @@ where
         if *this.finished {
             return Poll::Ready(Ok(()));
         }
+        // `lane` is `Some` until `finished`; treat the impossible `None` as EOF rather than
+        // panicking inside the data path.
+        let Some(lane) = this.lane.as_mut() else {
+            *this.finished = true;
+            return Poll::Ready(Ok(()));
+        };
 
-        let orig_filled = buf.filled().len();
-        let poll = this.inner.as_mut().poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
+        if !*this.inner_eof {
+            // Do not pull more plaintext while the hasher is behind on what it already has.
+            ready!(lane.poll_ready(cx));
+            let orig_filled = buf.filled().len();
+            ready!(this.inner.as_mut().poll_read(cx, buf))?;
             let filled = &buf.filled()[orig_filled..];
             if !filled.is_empty() {
-                if let Some(md5) = this.md5.as_mut() {
-                    md5.update(filled);
-                }
-            } else {
-                // EOF
-                *this.finished = true;
-                let etag = Self::resolve_at_eof(this.md5, this.resolved_etag);
-
-                if let Some(checksum) = this.checksum
-                    && *checksum != etag
-                {
-                    error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        BadDigest {
-                            expected_md5: checksum.clone(),
-                            calculated_md5: etag,
-                        },
-                    )));
-                }
+                lane.write(filled);
+                return Poll::Ready(Ok(()));
             }
+            *this.inner_eof = true;
         }
-        poll
+
+        // EOF: nothing was added to `buf` on this path, so resolving late still reads as EOF.
+        let digest = ready!(lane.poll_finish(cx));
+        *this.finished = true;
+        *this.lane = None;
+        let etag = hex_simd::encode_to_string(digest?, hex_simd::AsciiCase::Lower);
+        *this.resolved_etag = Some(etag.clone());
+
+        if let Some(checksum) = this.checksum
+            && *checksum != etag
+        {
+            error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                BadDigest {
+                    expected_md5: checksum.clone(),
+                    calculated_md5: etag,
+                },
+            )));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 

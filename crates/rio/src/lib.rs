@@ -106,6 +106,8 @@ pub use s2_decoder::{MAX_S2_DECOMPRESSED_BLOCK_SIZE, S2Decoder};
 mod etag_reader;
 pub use etag_reader::EtagReader;
 
+pub mod md5_lanes;
+
 mod compress_index;
 mod compress_reader;
 pub use compress_reader::{CompressReader, DecompressReader};
