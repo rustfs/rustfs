@@ -115,6 +115,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACE_ENDPOINT`           | _(empty)_ | Dedicated trace endpoint (overrides root + `/v1/traces`)   |
 | `RUSTFS_OBS_METRIC_ENDPOINT`          | _(empty)_ | Dedicated metrics endpoint                                 |
 | `RUSTFS_OBS_LOG_ENDPOINT`             | _(empty)_ | Dedicated log endpoint                                     |
+| `RUSTFS_OBS_TLS_CA_FILE`              | _(empty)_ | Absolute PEM CA bundle added to system trust for OTLP/HTTP |
 | `RUSTFS_OBS_PROFILING_ENDPOINT`       | _(empty)_ | Dedicated profiling endpoint (e.g. Pyroscope)              |
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED`    | `true`    | Toggle trace export                                        |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED`   | `true`    | Toggle metrics export                                      |
@@ -123,6 +124,8 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
 | `RUSTFS_OBS_METER_INTERVAL`           | `30`      | Metrics export interval (seconds)                          |
+
+`RUSTFS_OBS_TLS_CA_FILE` is read only while OTLP exporters are initialized. Its PEM certificates are added to, not substituted for, the platform trust roots, and TLS chain, expiry, and hostname checks remain enabled. Restart RustFS after rotating the bundle. A missing, unreadable, non-absolute, empty, or invalid bundle fails OTLP initialization.
 
 The export interval is separate from application metric collection. Without interval overrides, node/disk metrics refresh every 60 seconds (`RUSTFS_METRICS_NODE_INTERVAL_SEC`), cluster metrics every 60 seconds (`RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`), and per-bucket metrics every 300 seconds (`RUSTFS_METRICS_BUCKET_INTERVAL_SEC`). See the [collection defaults](src/metrics/config.rs) and [interval configuration](src/metrics/scheduler.rs) for collector-specific and global overrides.
 

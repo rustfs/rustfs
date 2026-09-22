@@ -139,6 +139,7 @@ opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["gzip-http", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 percent-encoding = { workspace = true }
+reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
@@ -167,3 +168,8 @@ tempfile = { workspace = true }
 temp-env = { workspace = true }
 log.workspace = true
 metrics-util = { workspace = true, features = ["debugging"] }
+rcgen.workspace = true
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-rustls = { workspace = true, default-features = false, features = ["aws-lc-rs"] }

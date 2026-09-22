@@ -40,7 +40,8 @@ use rustfs_config::observability::{
     ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL, ENV_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, ENV_OBS_LOG_ZSTD_WORKERS,
     ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT,
     ENV_OBS_METRICS_EXPORT_ENABLED, ENV_OBS_PROFILING_ENDPOINT, ENV_OBS_PROFILING_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO,
-    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED, ENV_OBS_USE_STDOUT,
+    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TLS_CA_FILE, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED,
+    ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
@@ -139,6 +140,9 @@ pub struct OtelConfig {
     pub metric_timeout_millis: Option<u64>,
     /// Timeout (milliseconds) for log OTLP HTTP export.
     pub log_timeout_millis: Option<u64>,
+    /// Absolute path to a PEM bundle whose certificates are added to the
+    /// system trust roots used by OTLP/HTTP exporters.
+    pub tls_ca_file: Option<String>,
     /// Dedicated profiling endpoint.
     pub profiling_endpoint: Option<String>,
     /// Whether to export distributed traces (default: `true`).
@@ -292,6 +296,9 @@ impl OtelConfig {
             trace_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS),
             metric_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS),
             log_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS),
+            tls_ca_file: get_env_opt_str(ENV_OBS_TLS_CA_FILE)
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty()),
             profiling_endpoint: get_env_opt_str(ENV_OBS_PROFILING_ENDPOINT),
             traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
             metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
@@ -506,6 +513,24 @@ mod tests {
             });
             temp_env::with_var(ENV_OBS_LOG_STDOUT_ENABLED, Some("false"), || {
                 assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, Some(false));
+            });
+        });
+    }
+
+    #[test]
+    fn otlp_tls_ca_file_environment_preserves_unset_empty_and_configured_values() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_TLS_CA_FILE, || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).tls_ca_file, None);
+            });
+            temp_env::with_var(ENV_OBS_TLS_CA_FILE, Some(""), || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).tls_ca_file, None);
+            });
+            temp_env::with_var(ENV_OBS_TLS_CA_FILE, Some("/etc/rustfs/otlp-ca.pem"), || {
+                assert_eq!(
+                    OtelConfig::extract_otel_config_from_env(None).tls_ca_file.as_deref(),
+                    Some("/etc/rustfs/otlp-ca.pem")
+                );
             });
         });
     }
