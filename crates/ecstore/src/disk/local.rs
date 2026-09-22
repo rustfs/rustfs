@@ -18,6 +18,9 @@ use self::commit::lock_rename_commit_directories;
 
 mod commit;
 mod replacement_lease;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_read_chunks.rs"]
+mod uring_read_chunks;
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -795,6 +798,8 @@ const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback
 /// (rustfs/backlog#1172). The gray-release signal operators watch for.
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_READ_CHUNKS: &str = "disk_local_uring_read_chunks";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
@@ -1094,15 +1099,30 @@ const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
 
-/// Maximum bytes handed to the driver in a single op on the buffered read path
-/// (rustfs/backlog#1174). Backpressure permits count OPS, not bytes, and the
-/// driver zero-fills a full-size buffer per op, so an unbounded single read could
-/// pin ~length bytes per permit. Reads at or below this cap take the fast
-/// single-op, zero-copy path; larger reads are split into sequential chunks so
-/// worst-case in-flight memory is bounded by `permits x this` per shard. Set high
-/// so ordinary shard reads are never chunked.
 #[cfg(target_os = "linux")]
-const URING_MAX_OP_LEN: usize = 128 << 20;
+const ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES: &str = "RUSTFS_IO_URING_READ_CHUNK_BYTES";
+
+// Snapshot on first enabled backend construction. Invalid configuration disables
+// this backend rather than silently using a different logical read cap.
+#[cfg(target_os = "linux")]
+static URING_READ_CHUNK_SIZE: std::sync::LazyLock<Option<uring_read_chunks::ReadChunkSize>> = std::sync::LazyLock::new(|| {
+    let value = std::env::var_os(ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES);
+    match uring_read_chunks::ReadChunkSize::from_env_value(value.as_deref()) {
+        Ok(size) => Some(size),
+        Err(error) => {
+            warn!(
+                event = EVENT_DISK_LOCAL_URING_READ_CHUNKS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "invalid_configuration",
+                config = ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES,
+                reason = %error,
+                "Invalid io_uring read chunk size; using StdBackend"
+            );
+            None
+        }
+    }
+});
 
 /// Number of independent io_uring rings (each with its own driver thread) to run
 /// per disk (backlog#1145).
@@ -4073,6 +4093,9 @@ impl FdCache {
 #[cfg(target_os = "linux")]
 pub(crate) struct UringBackend {
     root: PathBuf,
+    /// Per-operation logical read cap, excluding direct padding, concurrent
+    /// requests and the full assembled/returned application result.
+    read_chunk_size: uring_read_chunks::ReadChunkSize,
     /// Caches `root.display().to_string()` for the metric `"root"` label. `root`
     /// never changes after construction, so formatting the `Path` on every
     /// fallback emission is pure waste (rustfs/backlog#1185).
@@ -4196,6 +4219,10 @@ impl UringBackend {
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
     /// unexpected errno is surfaced as a warning (both still fall back).
     pub(crate) fn try_new(root: PathBuf) -> Option<Self> {
+        Self::try_new_with_read_chunk_size(root, (*URING_READ_CHUNK_SIZE)?)
+    }
+
+    fn try_new_with_read_chunk_size(root: PathBuf, read_chunk_size: uring_read_chunks::ReadChunkSize) -> Option<Self> {
         // Per-disk probe cache: skip a disk already known not to support
         // io_uring (backlog#1101).
         if URING_UNSUPPORTED_DISKS
@@ -4243,6 +4270,7 @@ impl UringBackend {
                 Some(Self {
                     inner: StdBackend::new_without_fd_cache(root.clone()),
                     root,
+                    read_chunk_size,
                     root_label,
                     driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
@@ -4474,7 +4502,7 @@ impl UringBackend {
 
         // The driver consumes the handle; keep one for the post-read reclaim.
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = if length <= URING_MAX_OP_LEN {
+        let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
             match self.driver.read_at(file, offset_u64, length).await {
                 Ok(bytes) => bytes,
@@ -4489,14 +4517,13 @@ impl UringBackend {
                 }
             }
         } else {
-            // Very large read: split into sequential chunks so a single op cannot
-            // pin ~length bytes of driver buffer, bounding worst-case in-flight
-            // memory (rustfs/backlog#1174). Chunks are awaited one at a time, so
-            // only one is in flight per read.
+            // Sequential chunks cap each driver operation's logical length.
+            // The full assembled result below is a separate allocation and is
+            // not bounded by the per-operation cap.
             let mut assembled = Vec::with_capacity(length);
             let mut done = 0usize;
             while done < length {
-                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
                 let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
                     Ok(part) => part,
@@ -4610,7 +4637,7 @@ impl UringBackend {
 
         let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = if length <= URING_MAX_OP_LEN {
+        let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
             match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
                 Ok(bytes) => bytes,
@@ -4620,15 +4647,14 @@ impl UringBackend {
                 }
             }
         } else {
-            // Split a very large O_DIRECT read into sequential chunks so a single
-            // op cannot pin ~length bytes of driver buffer, bounding worst-case
-            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
-            // chunk's sub-range internally; chunk sizes are a multiple of
-            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            // The cap is logical: read_at_direct aligns each chunk internally.
+            // A configured cap need not be block-aligned; adjacent chunks may
+            // re-read a boundary block. Padding and the full assembled result
+            // are not limited by this cap.
             let mut assembled = Vec::with_capacity(length);
             let mut done = 0usize;
             while done < length {
-                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
                 let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
                     Ok(part) => part,
@@ -22414,6 +22440,99 @@ mod test {
             panic!("SKIP {name}: io_uring unavailable but RUSTFS_URING_TESTS_MUST_RUN is set — this leg must exercise io_uring");
         }
         eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn check_uring_configured_read_chunks(direct: bool) {
+        const FILE_LEN: usize = 65536 + 7;
+        let root_dir = tempfile::tempdir().expect("chunked read fixture");
+        let root = root_dir.path().to_path_buf();
+        let volume = "chunk-bucket";
+        let path = "object/part.1";
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        std::fs::create_dir_all(root.join(volume).join("object")).expect("fixture directory");
+        std::fs::write(root.join(volume).join(path), &content).expect("fixture contents");
+
+        for cap in [4096usize, 4097] {
+            let chunk_size = uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new(&cap.to_string())))
+                .expect("valid test cap");
+            let Some(backend) = UringBackend::try_new_with_read_chunk_size(root.clone(), chunk_size) else {
+                uring_test_skip("uring_configured_read_chunks (io_uring probe)");
+                return;
+            };
+            // Cover the fast-path boundary, multiple operations, unaligned heads,
+            // non-block-multiple caps, exact EOF and the zero-length no-op.
+            for (offset, length) in [
+                (0, cap),
+                (3, cap + 1),
+                (31, 3 * cap + 13),
+                (cap - 1, 2 * cap + 7),
+                (FILE_LEN - 2 * cap - 7, 2 * cap + 7),
+                (FILE_LEN, 0),
+            ] {
+                let before = backend.driver.stats().submitted;
+                let direct_before = backend.native_direct_reads.load(Ordering::Relaxed);
+                // Invoke the actual backend read implementations directly: no env
+                // mutation and no StdBackend fallback can hide a missing chunk.
+                let result = if direct {
+                    backend.pread_uring_direct(volume, path, offset, length).await
+                } else {
+                    backend.pread_uring(volume, path, offset, length).await
+                };
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(_) if direct && !backend.direct_uring.supported.load(Ordering::Relaxed) => {
+                        uring_test_skip("uring_configured_read_chunks (native O_DIRECT unavailable)");
+                        return;
+                    }
+                    Err(error) => {
+                        panic!("chunked read failed: direct={direct} cap={cap} offset={offset} length={length}: {error:?}")
+                    }
+                };
+                assert_eq!(
+                    bytes.as_ref(),
+                    &content[offset..offset + length],
+                    "direct={direct} cap={cap} offset={offset}"
+                );
+                let operations = u64::try_from(length.div_ceil(cap)).expect("small fixture operation count");
+                assert_eq!(
+                    backend.driver.stats().submitted - before,
+                    operations,
+                    "configured chunk cap must reach the driver"
+                );
+                if direct && length != 0 {
+                    assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), direct_before + 1);
+                }
+            }
+            for (offset, length) in [(FILE_LEN - 1, 2), (FILE_LEN + 1, 0)] {
+                let before = backend.driver.stats().submitted;
+                let result = if direct {
+                    backend.pread_uring_direct(volume, path, offset, length).await
+                } else {
+                    backend.pread_uring(volume, path, offset, length).await
+                };
+                assert!(matches!(result, Err(DiskError::FileCorrupt)), "range validation changed: {result:?}");
+                assert_eq!(
+                    backend.driver.stats().submitted,
+                    before,
+                    "invalid full ranges must fail before the first chunk"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_configured_read_chunks_buffered_match_bytes_and_operation_count() {
+        check_uring_configured_read_chunks(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_configured_read_chunks_direct_match_bytes_and_operation_count() {
+        check_uring_configured_read_chunks(true).await;
     }
 
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
