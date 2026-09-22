@@ -15,7 +15,7 @@ pub(super) async fn run<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 's
     run_with_permits(Arc::clone(&PROBE_PERMITS), probe).await
 }
 
-async fn run_with_permits<T: Send + 'static>(
+pub(super) async fn run_with_permits<T: Send + 'static>(
     permits: Arc<Semaphore>,
     probe: impl FnOnce() -> T + Send + 'static,
 ) -> io::Result<T> {

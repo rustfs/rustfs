@@ -19,6 +19,9 @@ use self::commit::lock_rename_commit_directories;
 mod commit;
 mod replacement_lease;
 #[cfg(any(target_os = "linux", test))]
+#[path = "uring_driver_budget.rs"]
+mod uring_driver_budget;
+#[cfg(any(target_os = "linux", test))]
 #[path = "uring_probe.rs"]
 mod uring_probe;
 pub use replacement_lease::ReplacementExecutionLease;
@@ -798,6 +801,8 @@ const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback
 /// (rustfs/backlog#1172). The gray-release signal operators watch for.
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_DRIVER_BUDGET: &str = "disk_local_uring_driver_budget";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
@@ -1124,6 +1129,35 @@ const URING_MAX_OP_LEN: usize = 128 << 20;
 const ENV_RUSTFS_IO_URING_SHARDS: &str = "RUSTFS_IO_URING_SHARDS";
 #[cfg(target_os = "linux")]
 const MAX_URING_SHARDS: usize = 16;
+
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS: &str = "RUSTFS_IO_URING_MAX_DRIVER_THREADS";
+
+// Read once on first enabled backend initialization. Invalid configuration is
+// explicitly disabled, never silently converted into unlimited admission.
+#[cfg(target_os = "linux")]
+static URING_DRIVER_THREAD_BUDGET: std::sync::LazyLock<Option<uring_driver_budget::DriverThreadBudget>> =
+    std::sync::LazyLock::new(|| {
+        let value = std::env::var_os(ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS);
+        match uring_driver_budget::DriverThreadBudget::from_env_value(value.as_deref()) {
+            Ok(budget) => Some(budget),
+            Err(error) => {
+                warn!(
+                    event = EVENT_DISK_LOCAL_URING_DRIVER_BUDGET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    state = "invalid_configuration",
+                    config = ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS,
+                    reason = %error,
+                    "Invalid io_uring driver thread budget; using StdBackend"
+                );
+                None
+            }
+        }
+    });
+
+#[cfg(target_os = "linux")]
+static URING_DRIVER_BUDGET_EXHAUSTION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Shards per disk: `RUSTFS_IO_URING_SHARDS` when set, else a quarter of the
 /// available parallelism clamped to `1..=4`. Clamped to `1..=MAX_URING_SHARDS`
@@ -4064,6 +4098,9 @@ impl FdCache {
     }
 }
 
+#[cfg(target_os = "linux")]
+type BudgetedUringDriver = uring_driver_budget::BudgetedDriver<rustfs_uring::UringDriver>;
+
 /// Runtime-probed io_uring read backend (backlog#1104).
 ///
 /// Wraps a [`StdBackend`] for everything except positioned reads, which go
@@ -4086,7 +4123,7 @@ pub(crate) struct UringBackend {
     /// can block up to the bounded-drain timeout on a hung disk, which must never
     /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
     /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
-    driver: std::mem::ManuallyDrop<Arc<rustfs_uring::UringDriver>>,
+    driver: std::mem::ManuallyDrop<Arc<BudgetedUringDriver>>,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -4199,6 +4236,11 @@ impl UringBackend {
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
     /// unexpected errno is surfaced as a warning (both still fall back).
     pub(crate) async fn try_new(root: PathBuf) -> Option<Self> {
+        let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
+        Self::try_new_with_budget(root, get_io_uring_shards(), budget).await
+    }
+
+    async fn try_new_with_budget(root: PathBuf, shards: usize, budget: &uring_driver_budget::DriverThreadBudget) -> Option<Self> {
         // Per-disk probe cache: skip a disk already known not to support
         // io_uring (backlog#1101).
         if URING_UNSUPPORTED_DISKS
@@ -4208,13 +4250,33 @@ impl UringBackend {
         {
             return None;
         }
-        let shards = get_io_uring_shards();
+        let thread_slots = match budget.try_reserve(shards) {
+            Ok(slots) => slots,
+            Err(_) => {
+                if !URING_DRIVER_BUDGET_EXHAUSTION_LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_URING_DRIVER_BUDGET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        state = "capacity_unavailable",
+                        requested_shards = shards,
+                        "io_uring driver thread budget exhausted; using StdBackend"
+                    );
+                }
+                // Capacity can return after another driver retires. This is not
+                // an io_uring restriction and must not enter the negative cache.
+                return None;
+            }
+        };
         // Only the driver probe is detached into blocking work. `root` may be
         // rooted at a mount-lease fd owned by LocalDisk::new; keep all path-based
         // backend construction in this future so cancellation cannot outlive it.
-        let probe = uring_probe::run(move || rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards))
-            .await
-            .unwrap_or_else(|error| Err(rustfs_uring::ProbeFailure::Setup(error)));
+        let probe = uring_probe::run(move || {
+            rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards)
+                .map(|driver| uring_driver_budget::BudgetedDriver::new(driver, thread_slots))
+        })
+        .await
+        .unwrap_or_else(|error| Err(rustfs_uring::ProbeFailure::Setup(error)));
         match probe {
             Ok(driver) => {
                 info!(
@@ -4331,7 +4393,7 @@ impl UringBackend {
     /// reference it takes to read stats is dropped on the blocking pool so that,
     /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
     /// runs on an async worker (rustfs/backlog#1170).
-    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
+    fn spawn_stats_exporter(driver: &Arc<BudgetedUringDriver>, root: PathBuf) {
         // Export into the caller's runtime after the blocking probe completes;
         // backend construction remains in async LocalDisk::new's task.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -22458,6 +22520,58 @@ mod test {
             .expect("uring probe cache mutex poisoned")
             .remove(&cached);
         assert!(skipped, "a cached-unsupported disk must skip the probe and return None");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_driver_thread_budget_denial_is_retryable_after_real_driver_retirement() {
+        let root_dir = tempfile::tempdir().expect("budget test root");
+        let root = root_dir.path().to_path_buf();
+        let budget = uring_driver_budget::DriverThreadBudget::from_env_value(Some(std::ffi::OsStr::new("1")))
+            .expect("one driver thread budget");
+        // Positive precondition: do not mistake a restricted-kernel None for
+        // successful budget denial. Fix shards locally without changing env.
+        let Some(backend) = UringBackend::try_new_with_budget(root.clone(), 1, &budget).await else {
+            uring_test_skip("uring_driver_thread_budget_denial_is_retryable_after_real_driver_retirement");
+            return;
+        };
+        let exporter_reference = Arc::clone(&*backend.driver);
+        let weak = Arc::downgrade(&exporter_reference);
+        let denied = tokio::time::timeout(Duration::from_secs(2), UringBackend::try_new_with_budget(root.clone(), 1, &budget))
+            .await
+            .expect("budget exhaustion must not queue behind a live driver");
+        assert!(denied.is_none());
+        assert!(
+            !URING_UNSUPPORTED_DISKS.lock().expect("probe cache lock").contains(&root),
+            "budget denial must not permanently mark the root unsupported"
+        );
+        drop(backend);
+        assert!(
+            budget.try_reserve(1).is_err(),
+            "an outstanding stats reference still owns the live driver"
+        );
+        tokio::task::spawn_blocking(move || drop(exporter_reference))
+            .await
+            .expect("drop last explicit driver reference off worker");
+        let uring_driver_budget::DriverThreadBudget::Limited(permits) = &budget else {
+            panic!("finite test budget")
+        };
+        let returned = tokio::time::timeout(Duration::from_secs(10), permits.clone().acquire_owned())
+            .await
+            .expect("real driver join must return its thread reservation")
+            .expect("budget remains open");
+        assert!(weak.upgrade().is_none(), "reservation must not return before driver owner destruction");
+        drop(returned);
+        let rebuilt = UringBackend::try_new_with_budget(root.clone(), 1, &budget)
+            .await
+            .expect("same root can probe again after temporary budget denial");
+        assert!(budget.try_reserve(1).is_err(), "replacement driver is charged");
+        drop(rebuilt);
+        let returned = tokio::time::timeout(Duration::from_secs(10), permits.clone().acquire_owned())
+            .await
+            .expect("replacement driver joins and returns capacity")
+            .expect("budget remains open");
+        drop(returned);
     }
 
     /// Shard count (backlog#1145): `disks × shards` driver threads is the cost, so
