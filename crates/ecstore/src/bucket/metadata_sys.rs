@@ -1291,6 +1291,28 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
     }
 }
 
+/// Inspect all migration-relevant settings while the caller holds an Object Lock
+/// snapshot's lifecycle and metadata transaction guards. Cached settings are not
+/// sufficient to authorize a direct storage writer that cannot apply S3 defaults.
+pub(crate) async fn integrity_migration_metadata_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Arc<BucketMetadata>> {
+    let sys = bucket_metadata_sys_of(ctx)?.read().await.clone();
+    match sys
+        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+        .await?
+    {
+        BucketMetadataAuthority::Authoritative(metadata)
+            if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
+        {
+            Ok(metadata)
+        }
+        BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
+        _ => Err(Error::other("migration requires authoritative bucket metadata")),
+    }
+}
+
 /// Re-read the quota configuration and bucket incarnation from the same
 /// authoritative metadata blob while the caller holds the bucket metadata
 /// transaction read lock.
