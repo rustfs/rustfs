@@ -149,7 +149,7 @@ jobs:
           CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
         run: python3 scripts/prepare_functional_package.py prepare
 
-      - name: Run fault-tolerance scenarios (A, B, C, C2, D)
+      - name: Run fault-tolerance scenarios (A, B, C, C2, D, E)
         timeout-minutes: 45
         id: test
         # Standalone case failures are reported by the backlog manager.
@@ -194,21 +194,21 @@ jobs:
           jq -e --arg testing_sha "${AUTO_TESTING_SHA}" '
             .schema_version == 1 and
             .auto_testing_sha == $testing_sha and
-            .selected_scenarios == ["A", "B", "C", "C2", "D"] and
+            .selected_scenarios == ["A", "B", "C", "C2", "D", "E"] and
             .complete == true and
-            .counts.expected == 38 and
-            .counts.seen == 38 and
+            .counts.expected == 44 and
+            .counts.seen == 44 and
             .counts.harness_errors == 0 and
-            (.expected_cases | length) == 38 and
-            (.expected_cases | unique | length) == 38 and
-            (.seen_cases | length) == 38 and
-            (.seen_cases | unique | length) == 38 and
+            (.expected_cases | length) == 44 and
+            (.expected_cases | unique | length) == 44 and
+            (.seen_cases | length) == 44 and
+            (.seen_cases | unique | length) == 44 and
             (.seen_cases | sort) == (.expected_cases | sort) and
             (.missing_cases | length) == 0 and
             (.harness_errors | length) == 0 and
-            (.cases | length) == 38 and
+            (.cases | length) == 44 and
             ([.cases[].case_id] | sort) == (.expected_cases | sort) and
-            ([.cases[].case_id] | unique | length) == 38 and
+            ([.cases[].case_id] | unique | length) == 44 and
             all(.cases[]; .verdict == "pass" or .verdict == "known-divergence" or .verdict == "UNEXPECTED") and
             .counts.unexpected == ([.cases[] | select(.verdict == "UNEXPECTED")] | length) and
             .counts.known_divergence == ([.cases[] | select(.verdict == "known-divergence")] | length)

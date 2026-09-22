@@ -48,7 +48,7 @@ pub use service_state::wait_for_shutdown;
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
-    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler,
+    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
 };
 #[cfg(test)]
 pub(crate) use health::{

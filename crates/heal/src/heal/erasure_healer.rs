@@ -907,6 +907,21 @@ impl ErasureSetHealer {
         }
 
         if failed_objects == 0 && skipped_objects == 0 && failed_buckets == 0 {
+            let targets = if self.pool_metadata_target_endpoints.is_empty() {
+                self.target_endpoints.as_ref()
+            } else {
+                self.pool_metadata_target_endpoints.as_ref()
+            };
+            if self.replacement_task_id.is_some() || (!self.heal_opts.dry_run && self.heal_opts.recreate && !targets.is_empty()) {
+                self.verify_replacement_identity_fence("bucket metadata").await?;
+                // Recheck even resumed buckets: their user-object cursor does not
+                // prove that the replacement holds the internal bucket records.
+                for bucket in buckets {
+                    self.storage
+                        .heal_replacement_bucket_metadata(bucket, &self.heal_opts, targets)
+                        .await?;
+                }
+            }
             self.heal_replacement_pool_metadata(
                 set_disk_id,
                 &mut ErasureSetPassCounters {
@@ -2267,6 +2282,8 @@ mod resume_loop_tests {
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         pool_metadata_placement: Mutex<Option<ReplacementCommitEvidence>>,
+        bucket_metadata_calls: Mutex<Vec<String>>,
+        bucket_metadata_failure: AtomicBool,
         fail_listing: AtomicBool,
         fail_listing_buckets: Mutex<HashSet<String>>,
     }
@@ -2461,6 +2478,13 @@ mod resume_loop_tests {
                 Some(ReplacementCommitEvidence::Error(message)) => Err(Error::other(message.clone())),
                 None => Ok(true),
             }
+        }
+        async fn heal_replacement_bucket_metadata(&self, bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+            self.bucket_metadata_calls.lock().unwrap().push(bucket.to_owned());
+            if self.bucket_metadata_failure.load(Ordering::SeqCst) {
+                return Err(Error::Storage(EcstoreError::PreconditionFailed));
+            }
+            Ok(())
         }
         async fn replacement_targets_have_version(
             &self,
@@ -3058,6 +3082,18 @@ mod resume_loop_tests {
         )
         .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
 
+        env.storage.bucket_metadata_failure.store(true, Ordering::SeqCst);
+        assert!(healer.heal_erasure_set(&["b".to_string()], "pool_0_set_0").await.is_err());
+        let incomplete = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("failed metadata repair must retain replacement intent")
+            .get_state()
+            .await;
+        assert!(!incomplete.completed);
+        assert_ne!(incomplete.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+        assert!(env.storage.calls().is_empty(), "metadata failure must stop completion before pool.bin");
+        env.storage.bucket_metadata_failure.store(false, Ordering::SeqCst);
+
         let error = healer
             .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
             .await
@@ -3073,6 +3109,11 @@ mod resume_loop_tests {
         assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
         assert_eq!(state.retry_count, 1);
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        assert_eq!(
+            *env.storage.bucket_metadata_calls.lock().unwrap(),
+            vec!["b", "b"],
+            "resuming a completed user scan must retry bucket metadata"
+        );
     }
 
     #[tokio::test]

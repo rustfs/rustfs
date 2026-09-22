@@ -117,10 +117,15 @@ jobs:
 
           cat > "${PKG_DIR}/etc/default/rustfs" << 'ENVEOF'
           # RustFS Environment Configuration
-          # See https://rustfs.com/docs/ for more information
+          # See https://docs.rustfs.com for more information
+          # RUSTFS_ACCESS_KEY=<changeme>
+          # RUSTFS_SECRET_KEY=<changeme>
           # RUSTFS_VOLUMES=""
-          # RUSTFS_ROOT_USER=""
-          # RUSTFS_ROOT_PASSWORD=""
+          # RUSTFS_ADDRESS=":9000"
+          # RUSTFS_CONSOLE_ADDRESS=":9001"
+          # RUSTFS_CONSOLE_ENABLE=true
+          # RUSTFS_OBS_LOGGER_LEVEL=error
+          # RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"
           ENVEOF
 
           # dpkg versions must start with a digit and cannot contain hyphens;
@@ -146,37 +151,13 @@ jobs:
           /etc/default/rustfs
           CONFFILES
 
-          cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
-          #!/bin/bash
-          set -e
-          if ! getent passwd rustfs > /dev/null 2>&1; then
-              useradd -r -s /bin/false -d /opt/rustfs rustfs
-          fi
-          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
-          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
-          if [ -d /run/systemd/system ]; then
-              systemctl daemon-reload
-          fi
-          echo "RustFS installed. Configure /etc/default/rustfs then: systemctl start rustfs"
-          POSTINST
+          ./scripts/release/package_service_scripts.sh after-install > "${PKG_DIR}/DEBIAN/postinst"
           chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 
-          cat > "${PKG_DIR}/DEBIAN/prerm" << 'PRERM'
-          #!/bin/bash
-          set -e
-          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
-              systemctl stop rustfs
-          fi
-          PRERM
+          ./scripts/release/package_service_scripts.sh before-remove > "${PKG_DIR}/DEBIAN/prerm"
           chmod 755 "${PKG_DIR}/DEBIAN/prerm"
 
-          cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
-          #!/bin/bash
-          set -e
-          if [ -d /run/systemd/system ]; then
-              systemctl daemon-reload
-          fi
-          POSTRM
+          ./scripts/release/package_service_scripts.sh after-remove > "${PKG_DIR}/DEBIAN/postrm"
           chmod 755 "${PKG_DIR}/DEBIAN/postrm"
 
           cp LICENSE "${PKG_DIR}/usr/share/doc/rustfs/"
@@ -214,10 +195,15 @@ jobs:
           mkdir -p ./tmp-pkg/etc/default
           cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
           # RustFS Environment Configuration
-          # See https://rustfs.com/docs/ for more information
+          # See https://docs.rustfs.com for more information
+          # RUSTFS_ACCESS_KEY=<changeme>
+          # RUSTFS_SECRET_KEY=<changeme>
           # RUSTFS_VOLUMES=""
-          # RUSTFS_ROOT_USER=""
-          # RUSTFS_ROOT_PASSWORD=""
+          # RUSTFS_ADDRESS=":9000"
+          # RUSTFS_CONSOLE_ADDRESS=":9001"
+          # RUSTFS_CONSOLE_ENABLE=true
+          # RUSTFS_OBS_LOGGER_LEVEL=error
+          # RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"
           ENVEOF
 
           fpm -s dir -t rpm \
@@ -231,35 +217,13 @@ jobs:
             --description "High-performance distributed object storage" \
             --url "https://rustfs.com" \
             --license "Apache-2.0" \
-            --after-install <(cat << 'POSTINST'
-          #!/bin/bash
-          set -e
-          if ! getent passwd rustfs > /dev/null 2>&1; then
-              useradd -r -s /bin/false -d /opt/rustfs rustfs
-          fi
-          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
-          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
-          if [ -d /run/systemd/system ]; then
-              systemctl daemon-reload
-          fi
-          POSTINST
-            ) \
-            --before-remove <(cat << 'PRERM'
-          #!/bin/bash
-          set -e
-          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
-              systemctl stop rustfs
-          fi
-          PRERM
-            ) \
-            --after-remove <(cat << 'POSTRM'
-          #!/bin/bash
-          set -e
-          if [ -d /run/systemd/system ]; then
-              systemctl daemon-reload
-          fi
-          POSTRM
-            ) \
+            --before-install <(./scripts/release/package_service_scripts.sh rpm-before-install) \
+            --before-upgrade <(./scripts/release/package_service_scripts.sh rpm-before-upgrade) \
+            --after-install <(./scripts/release/package_service_scripts.sh after-install) \
+            --after-upgrade <(./scripts/release/package_service_scripts.sh after-install) \
+            --before-remove <(./scripts/release/package_service_scripts.sh before-remove) \
+            --after-remove <(./scripts/release/package_service_scripts.sh after-remove) \
+            --rpm-posttrans <(./scripts/release/package_service_scripts.sh rpm-posttrans) \
             --config-files /etc/default/rustfs \
             "rustfs-nightly-${DEB_DATE}/usr/bin/rustfs=/usr/bin/rustfs" \
             ./tmp-pkg/etc/default/rustfs=/etc/default/rustfs \

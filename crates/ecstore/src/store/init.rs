@@ -10052,9 +10052,18 @@ mod tests {
                 recovered_transition_version.clone(),
             )))
             .await;
-        let transaction_stats = recover_transition_transaction_records(store.clone(), 100, None)
+        let transaction_stats = {
+            let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                ],
+                recover_transition_transaction_records(store.clone(), 100, None),
+            )
             .await
-            .expect("transition recovery should advance and consume the migrated transaction before completion");
+            .expect("transition recovery should advance and consume the migrated transaction before completion")
+        };
         backend.set_transition_candidate_probe_override(None).await;
         assert_eq!(
             (
@@ -21938,9 +21947,18 @@ mod tests {
             expected_removes.push((transaction.remote_object, put_version));
         }
 
-        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+        let stats = {
+            let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                    (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                ],
+                recover_transition_transaction_records(store.clone(), 100, None),
+            )
             .await
-            .expect("transition transaction recovery should run");
+            .expect("transition transaction recovery should run")
+        };
 
         assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (3, 3, 0, 0));
         assert_eq!(transition_transaction_record_count(store.clone()).await, 0);

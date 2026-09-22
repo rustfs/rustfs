@@ -50,7 +50,7 @@
 1|crates/ecstore/src/services/rebalance/entry.rs
 8|crates/ecstore/src/services/rebalance/meta.rs
 8|crates/ecstore/src/services/rebalance/runtime.rs
-18|crates/ecstore/src/services/rebalance/worker.rs
+17|crates/ecstore/src/services/rebalance/worker.rs
 33|crates/ecstore/src/services/tier/tier.rs
 1|crates/ecstore/src/services/tier/tier_config.rs
 1|crates/ecstore/src/services/tier/warm_backend.rs

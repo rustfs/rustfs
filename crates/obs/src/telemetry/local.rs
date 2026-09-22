@@ -36,7 +36,7 @@ use crate::cleaner::LogCleaner;
 use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
 use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
-use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
+use crate::telemetry::filter::{build_env_filter, effective_verbose_logging, pyroscope_log_filter};
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
@@ -44,10 +44,11 @@ use rustfs_config::observability::{
     DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN,
     DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
     DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
-    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
-    DEFAULT_OBS_LOG_ZSTD_WORKERS,
+    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SPAN_EVENTS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
+    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_LOG_SPAN_EVENTS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME};
+use rustfs_utils::get_env_str;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::{collections::BTreeMap, fmt};
@@ -76,6 +77,37 @@ const REQUEST_ID_COMPAT: &str = "request-id";
 
 pub(super) fn resolve_file_stdout_mirror(configured: Option<bool>, is_production: bool) -> bool {
     configured.unwrap_or(!is_production)
+}
+
+/// Resolves the span lifecycle events emitted by the JSON log layers.
+///
+/// Defaults to [`FmtSpan::NONE`]. A record per span lifecycle multiplies log
+/// volume on object hot paths and, combined with the ancestor span list,
+/// produced multi-megabyte lines that journald truncated (backlog#2642).
+/// Operators opt back in with `RUSTFS_OBS_LOG_SPAN_EVENTS=close|full`.
+pub(super) fn resolve_span_events() -> FmtSpan {
+    match get_env_str(ENV_OBS_LOG_SPAN_EVENTS, DEFAULT_OBS_LOG_SPAN_EVENTS)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "close" => FmtSpan::CLOSE,
+        "full" => FmtSpan::FULL,
+        "none" | "" => FmtSpan::NONE,
+        unknown => {
+            // An unrecognised value must not silently re-enable span events.
+            eprintln!("{STDERR_WARNING_PREFIX} obs: unknown {ENV_OBS_LOG_SPAN_EVENTS}={unknown:?}; falling back to none");
+            FmtSpan::NONE
+        }
+    }
+}
+
+/// Whether JSON log records embed the full ancestor span list.
+///
+/// `with_span_list(true)` re-serializes every ancestor span on each record, so
+/// it is reserved for verbose levels where that context earns its volume.
+pub(super) fn resolve_span_list(logger_level: &str) -> bool {
+    effective_verbose_logging(logger_level)
 }
 
 #[cfg(unix)]
@@ -222,7 +254,12 @@ where
     request_id
 }
 
-pub(super) fn build_json_log_layer<S, W>(writer: W, enable_ansi: bool, span_events: FmtSpan) -> impl tracing_subscriber::Layer<S>
+pub(super) fn build_json_log_layer<S, W>(
+    writer: W,
+    enable_ansi: bool,
+    span_events: FmtSpan,
+    span_list: bool,
+) -> impl tracing_subscriber::Layer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
@@ -239,7 +276,7 @@ where
         .json()
         .flatten_event(true)
         .with_current_span(true)
-        .with_span_list(true)
+        .with_span_list(span_list)
         .with_span_events(span_events)
         .map_event_format(RequestIdJsonFormat::new)
 }
@@ -311,11 +348,12 @@ pub(super) fn init_local_logging(
 fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
-    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    let span_events = resolve_span_events();
+    let span_list = resolve_span_list(logger_level);
 
     // Keep stdout formatting JSON-shaped even in local-only mode so operators
     // can ship the same log schema to external collectors if needed.
-    let fmt_layer = build_json_log_layer(nb, std::io::stdout().is_terminal(), span_events);
+    let fmt_layer = build_json_log_layer(nb, std::io::stdout().is_terminal(), span_events, span_list);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -413,11 +451,12 @@ fn init_file_logging_internal(
 
     // ── 4. Build subscriber layers ────────────────────────────────────────────
     let env_filter = build_env_filter(logger_level, None);
-    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    let span_events = resolve_span_events();
+    let span_list = resolve_span_list(logger_level);
 
     // File output stays machine-readable and free of ANSI sequences so the
     // resulting files are safe to parse or ship to log processors.
-    let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
+    let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
 
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
     // unconditionally in non-production environments so developers still see
@@ -425,7 +464,10 @@ fn init_file_logging_internal(
     let (stdout_layer, stdout_guard) = if resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let enable_color = std::io::stdout().is_terminal();
-        (Some(build_json_log_layer(stdout_nb, enable_color, span_events)), Some(stdout_guard))
+        (
+            Some(build_json_log_layer(stdout_nb, enable_color, span_events, span_list)),
+            Some(stdout_guard),
+        )
     } else {
         (None, None)
     };
@@ -773,7 +815,7 @@ mod tests {
 
     fn render_json_log(enable_ansi: bool) -> (String, Value) {
         let writer = SharedWriter::default();
-        let layer = build_json_log_layer(writer.clone(), enable_ansi, FmtSpan::NONE);
+        let layer = build_json_log_layer(writer.clone(), enable_ansi, FmtSpan::NONE, false);
         let subscriber = Registry::default().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -793,9 +835,32 @@ mod tests {
         (raw, parsed)
     }
 
+    fn render_event_in_nested_spans(depth: usize, span_list: bool) -> String {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE, span_list);
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let spans = (0..depth)
+                .map(|level| tracing::info_span!("layer", depth = level, payload = "x".repeat(1024)))
+                .collect::<Vec<_>>();
+            let _guards = spans.iter().map(tracing::Span::enter).collect::<Vec<_>>();
+            info!(component = "obs_contract_test", "nested event");
+        });
+
+        String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("log output should be valid UTF-8")
+    }
+
     fn render_json_log_with_request_span() -> Value {
         let writer = SharedWriter::default();
-        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE);
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE, false);
         let subscriber = Registry::default().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -818,7 +883,7 @@ mod tests {
 
     fn render_json_log_with_recovery_monitor_child_span() -> Value {
         let writer = SharedWriter::default();
-        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE);
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE, true);
         let subscriber = Registry::default().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -1075,6 +1140,10 @@ mod tests {
         assert_eq!(parsed["request-id"], Value::String("req-123".to_string()));
         assert_eq!(parsed["message"], Value::String("inside request span".to_string()));
         assert_eq!(parsed["span"]["request_id"], Value::String("req-123".to_string()));
+        assert!(
+            parsed.get("spans").is_none(),
+            "ancestor span list must stay out of records when span_list is disabled: {parsed}"
+        );
     }
 
     #[test]
@@ -1111,5 +1180,66 @@ mod tests {
         };
 
         assert_eq!(resolve_log_cleanup_file_pattern(&config, "rustfs.log"), "rustfs.log");
+    }
+
+    /// Regression for backlog#2642: records must not embed the ancestor span
+    /// list, so their size stays flat as the enclosing span chain deepens.
+    #[test]
+    fn record_size_does_not_grow_with_span_depth_when_span_list_is_disabled() {
+        let shallow = render_event_in_nested_spans(1, false);
+        let deep = render_event_in_nested_spans(32, false);
+
+        assert!(
+            deep.len() <= shallow.len() * 2,
+            "ancestor spans leaked into the record: shallow={} deep={}",
+            shallow.len(),
+            deep.len()
+        );
+
+        // The flag is what keeps it bounded: re-enabling the list must show the
+        // growth the default avoids.
+        let deep_with_list = render_event_in_nested_spans(32, true);
+        assert!(
+            deep_with_list.len() > deep.len(),
+            "enabling the span list must reintroduce per-ancestor growth"
+        );
+    }
+
+    #[test]
+    fn span_events_default_to_none_and_parse_overrides() {
+        temp_env::with_var(ENV_OBS_LOG_SPAN_EVENTS, None::<&str>, || {
+            assert_eq!(resolve_span_events(), FmtSpan::NONE);
+        });
+        temp_env::with_var(ENV_OBS_LOG_SPAN_EVENTS, Some("close"), || {
+            assert_eq!(resolve_span_events(), FmtSpan::CLOSE);
+        });
+        temp_env::with_var(ENV_OBS_LOG_SPAN_EVENTS, Some("FULL"), || {
+            assert_eq!(resolve_span_events(), FmtSpan::FULL);
+        });
+        temp_env::with_var(ENV_OBS_LOG_SPAN_EVENTS, Some("verbose"), || {
+            assert_eq!(
+                resolve_span_events(),
+                FmtSpan::NONE,
+                "an unrecognised value must not re-enable span events"
+            );
+        });
+    }
+
+    #[test]
+    fn span_list_is_reserved_for_verbose_levels() {
+        temp_env::with_var("RUST_LOG", None::<&str>, || {
+            assert!(!resolve_span_list("info"), "info records must not embed the ancestor span list");
+            assert!(!resolve_span_list("warn"));
+            assert!(!resolve_span_list("error"));
+            assert!(resolve_span_list("debug"));
+            assert!(resolve_span_list("trace"));
+        });
+
+        temp_env::with_var("RUST_LOG", Some("debug"), || {
+            assert!(
+                resolve_span_list("info"),
+                "RUST_LOG=debug overrides the base level and should keep span context"
+            );
+        });
     }
 }

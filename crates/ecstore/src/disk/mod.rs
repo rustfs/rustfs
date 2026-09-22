@@ -825,7 +825,7 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        let Some(scope) = crate::store::bucket_heal_scope(dst_volume) else {
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
             return self
                 .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
                 .await;

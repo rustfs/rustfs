@@ -90,6 +90,7 @@ their issue closes.
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
+| `test_package_service_scripts.sh` | ci-gate | Verifies DEB/RPM install, upgrade, removal, and service restart scriptlets | audit.yml `workflow-pin-report` |
 | `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |
 | `windows-sftp-listener-smoke.sh` | dev-tool | Confirms `rustfs.exe --features sftp` binds an SFTP listener on Windows | — |
 

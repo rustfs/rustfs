@@ -3924,6 +3924,72 @@ pub struct SetDisks {
     >,
 }
 
+fn marker_purge_receipt_path(
+    bucket: &str,
+    object: &str,
+    version: Uuid,
+    purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+) -> String {
+    let object_hash = rustfs_utils::crypto::hex(Sha256::digest(object.as_bytes()));
+    let marker_hash = rustfs_utils::crypto::hex(purge.marker_identity);
+    format!(
+        "marker-purge-receipts/{}/{}/{}-{}-{}.json",
+        bucket, purge.bucket_incarnation_id, version, object_hash, marker_hash
+    )
+}
+
+impl SetDisks {
+    /// Persist a quorum DELETE receipt outside the object marker itself. The
+    /// receipt is written to the metadata bucket so it survives a node restart
+    /// while an inaccessible member still holds the stale marker.
+    pub(crate) async fn persist_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> bool {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        let api = Arc::new(self.clone());
+        crate::config::com::save_config_with_opts(
+            api,
+            &path,
+            b"rustfs-marker-purge-receipt-v1".to_vec(),
+            &ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    pub(crate) async fn has_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> bool {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        crate::config::com::read_config_limited_preserve_empty(Arc::new(self.clone()), &path, 128)
+            .await
+            .is_ok()
+    }
+
+    pub(crate) async fn consume_marker_purge_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version: Uuid,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) {
+        let path = marker_purge_receipt_path(bucket, object, version, purge);
+        let _ = crate::config::com::delete_config_no_lock(Arc::new(self.clone()), &path).await;
+    }
+}
+
 /// Read every physical copy before selecting a version quorum. A minority
 /// legacy record is still evidence and must not disappear behind a majority
 /// not-found result. Only an explicit file/volume absence produces `None`;
@@ -6426,6 +6492,28 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
         .map_err(|_| DiskError::FileCorrupt)
 }
 
+fn validate_deep_scan_results(results: &[usize], expected_parts: usize) -> disk::error::Result<()> {
+    if results.len() != expected_parts {
+        return Err(DiskError::other(format!(
+            "incomplete deep scan result: expected {expected_parts} parts, received {}",
+            results.len()
+        )));
+    }
+    for (part, status) in results.iter().enumerate() {
+        match *status {
+            CHECK_PART_SUCCESS | CHECK_PART_FILE_NOT_FOUND | CHECK_PART_FILE_CORRUPT => {}
+            CHECK_PART_DISK_NOT_FOUND => return Err(DiskError::DiskNotFound),
+            crate::disk::CHECK_PART_VOLUME_NOT_FOUND => return Err(DiskError::VolumeNotFound),
+            _ => {
+                return Err(DiskError::other(format!(
+                    "incomplete deep scan result: part {part} has unverified status {status}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// disks_with_all_partsv2 is a corrected version based on Go implementation.
 /// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
 /// It also checks if the status of each part (corrupted, missing, ok) in each drive.
@@ -6646,9 +6734,13 @@ async fn disks_with_all_parts(
             // it needs healing too.
             match disk.verify_file(bucket, object, meta).await {
                 Ok(v) => {
+                    validate_deep_scan_results(&v.results, latest_meta.parts.len())?;
                     verify_resp = v;
                 }
                 Err(err) => {
+                    if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::FileCorrupt) {
+                        return Err(err);
+                    }
                     debug!(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
@@ -11060,6 +11152,50 @@ mod tests {
 
         let other_err = DiskError::other("other error");
         assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // Other errors should return UNKNOWN, not SUCCESS
+    }
+
+    #[test]
+    fn deep_scan_results_accept_only_complete_verified_or_repairable_parts() {
+        for (results, expected_parts) in [
+            (vec![], 0),
+            (vec![CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_FILE_NOT_FOUND], 1),
+            (vec![CHECK_PART_FILE_CORRUPT], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT], 3),
+        ] {
+            validate_deep_scan_results(&results, expected_parts)
+                .expect("complete results must allow healthy or repairable parts");
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_reject_unknown_and_incomplete_observations() {
+        for (results, expected_parts) in [
+            (vec![CHECK_PART_UNKNOWN], 1),
+            (vec![usize::MAX], 1),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN], 2),
+            (vec![], 1),
+            (vec![CHECK_PART_SUCCESS], 2),
+            (vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS], 1),
+            (vec![CHECK_PART_SUCCESS], 0),
+        ] {
+            let error =
+                validate_deep_scan_results(&results, expected_parts).expect_err("unverified parts must not become healthy");
+            assert!(matches!(error, DiskError::Io(_)), "an incomplete observation is not proven corruption");
+            assert!(error.to_string().contains("incomplete deep scan result"));
+        }
+    }
+
+    #[test]
+    fn deep_scan_results_preserve_disk_and_volume_failures() {
+        for (status, expected_error) in [
+            (CHECK_PART_DISK_NOT_FOUND, DiskError::DiskNotFound),
+            (CHECK_PART_VOLUME_NOT_FOUND, DiskError::VolumeNotFound),
+        ] {
+            let error = validate_deep_scan_results(&[CHECK_PART_SUCCESS, status], 2)
+                .expect_err("an unavailable part cannot certify a healthy disk");
+            assert_eq!(error, expected_error);
+        }
     }
 
     #[test]
