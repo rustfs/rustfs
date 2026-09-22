@@ -15,5 +15,3 @@
 pub mod config;
 pub mod driver;
 pub mod server;
-
-mod upload;

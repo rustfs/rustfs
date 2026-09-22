@@ -38,11 +38,11 @@ Use the executable path printed by that command as `test_binary`, then on macOS:
 
 ```sh
 /usr/bin/time -l "$test_binary" --ignored --exact \
-  ftps::upload::tests::ftps_large_upload_memory_probe --nocapture
+  ftps::driver::upload::tests::ftps_large_upload_memory_probe --nocapture
 
 RUSTFS_FTPS_TEST_BYTES=10737418240 RUSTFS_FTPS_TEST_CONCURRENCY=10 \
   /usr/bin/time -l "$test_binary" --ignored --exact \
-  ftps::upload::tests::ftps_large_upload_memory_probe --nocapture
+  ftps::driver::upload::tests::ftps_large_upload_memory_probe --nocapture
 ```
 
 On Linux use `/usr/bin/time -v` (its maximum RSS is reported in KiB). The default
