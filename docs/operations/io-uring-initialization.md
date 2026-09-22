@@ -28,11 +28,12 @@ does not stop a running syscall and does not release capacity for a replacement
 probe before the work finishes.
 
 A completed result that the caller has not consumed also owns its permit.
-Abandoning that result schedules potentially blocking driver destruction on the
-blocking pool while a Tokio runtime is available; capacity is retained through
-that cleanup. Outside a runtime, cleanup is synchronous, consistent with the
-backend's existing teardown boundary. This is not a guarantee that runtime
-shutdown or a hung kernel operation finishes within a deadline.
+Abandoning that result requests blocking-pool cleanup through the current Tokio
+handle; capacity is retained through that cleanup. Outside a runtime, cleanup
+is synchronous. During runtime shutdown the pool can reject new work and destroy
+its captured result on the calling thread even when a handle is present. This
+matches the backend's existing teardown boundary, not an unconditional promise
+of asynchronous destruction or a deadline for a hung kernel operation.
 
 Normal probe errors retain their existing classification: expected environment
 restrictions can be negatively cached, and unexpected failures fall back
