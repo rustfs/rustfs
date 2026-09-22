@@ -3916,14 +3916,26 @@ impl RenameTailCleanupQueue {
                 let oldest_enqueued_at = Arc::clone(&oldest_enqueued_at);
                 tokio::spawn(async move {
                     loop {
+                        let queued_before_poll = queued.load(Ordering::Relaxed);
                         let worker_poll_started = rustfs_io_metrics::put_stage_timer();
                         let Some(job) = receiver.lock().await.recv().await else {
                             return;
                         };
-                        rustfs_io_metrics::record_put_object_stage_duration_from(
-                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_POLL_WAIT,
-                            worker_poll_started,
-                        );
+                        if queued_before_poll == 0 {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_IDLE_WAIT,
+                                worker_poll_started,
+                            );
+                        } else {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_POLL_WAIT,
+                                worker_poll_started,
+                            );
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT,
+                                worker_poll_started,
+                            );
+                        }
                         let mut batch = vec![job];
                         let batch_window = rename_tail_cleanup_defer_batch_window();
                         let queued_snapshot = queued.load(Ordering::Relaxed);
