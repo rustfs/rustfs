@@ -18,6 +18,9 @@ use self::commit::lock_rename_commit_directories;
 
 mod commit;
 mod replacement_lease;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_probe.rs"]
+mod uring_probe;
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -4195,7 +4198,7 @@ impl UringBackend {
     /// Probe io_uring on `root`; `Some(backend)` if usable, `None` to fall back
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
     /// unexpected errno is surfaced as a warning (both still fall back).
-    pub(crate) fn try_new(root: PathBuf) -> Option<Self> {
+    pub(crate) async fn try_new(root: PathBuf) -> Option<Self> {
         // Per-disk probe cache: skip a disk already known not to support
         // io_uring (backlog#1101).
         if URING_UNSUPPORTED_DISKS
@@ -4206,7 +4209,13 @@ impl UringBackend {
             return None;
         }
         let shards = get_io_uring_shards();
-        match rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards) {
+        // Only the driver probe is detached into blocking work. `root` may be
+        // rooted at a mount-lease fd owned by LocalDisk::new; keep all path-based
+        // backend construction in this future so cancellation cannot outlive it.
+        let probe = uring_probe::run(move || rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards))
+            .await
+            .unwrap_or_else(|error| Err(rustfs_uring::ProbeFailure::Setup(error)));
+        match probe {
             Ok(driver) => {
                 info!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -4323,9 +4332,8 @@ impl UringBackend {
     /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
     /// runs on an async worker (rustfs/backlog#1170).
     fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
-        // try_new may be constructed outside a tokio runtime (some unit tests
-        // build the backend directly); only run the exporter when a runtime is
-        // present. Production always constructs it from async LocalDisk::new.
+        // Export into the caller's runtime after the blocking probe completes;
+        // backend construction remains in async LocalDisk::new's task.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
@@ -4784,10 +4792,10 @@ impl LocalIoBackend for UringBackend {
 /// enabled and the per-disk probe succeeds, otherwise the default
 /// [`StdBackend`] (backlog#1104). Enabling io_uring is opt-in and falls back
 /// byte-for-byte, so the default build is unchanged.
-fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
+async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     #[cfg(target_os = "linux")]
     if is_io_uring_read_enabled()
-        && let Some(backend) = UringBackend::try_new(root.clone())
+        && let Some(backend) = UringBackend::try_new(root.clone()).await
     {
         return Arc::new(backend);
     }
@@ -5288,7 +5296,7 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
-            io_backend: build_local_io_backend(io_root.clone()),
+            io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
             snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
         };
@@ -22419,8 +22427,8 @@ mod test {
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
     /// unsupported is skipped by `try_new` without a fresh probe.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn uring_probe_cache_skips_known_unsupported_disk() {
+    #[tokio::test]
+    async fn uring_probe_cache_skips_known_unsupported_disk() {
         use tempfile::tempdir;
 
         // Precondition: io_uring must be usable on this host. Otherwise a `None`
@@ -22430,7 +22438,7 @@ mod test {
         // unavailable. (The returned backend, if any, is dropped immediately,
         // shutting its driver down.)
         let probe_dir = tempdir().expect("tempdir");
-        if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+        if UringBackend::try_new(probe_dir.path().to_path_buf()).await.is_none() {
             uring_test_skip("uring_probe_cache_skips_known_unsupported_disk");
             return;
         }
@@ -22442,7 +22450,7 @@ mod test {
             .lock()
             .expect("uring probe cache mutex poisoned")
             .insert(cached.clone());
-        let skipped = UringBackend::try_new(cached.clone()).is_none();
+        let skipped = UringBackend::try_new(cached.clone()).await.is_none();
         // Clean up the process-wide cache entry so no shared state leaks to
         // other tests.
         URING_UNSUPPORTED_DISKS
@@ -22540,13 +22548,15 @@ mod test {
 
         let root_dir = tempdir().expect("operation should succeed");
         let root = root_dir.path().to_path_buf();
-        let Some(backend) = temp_env::with_vars(
+        let Some(backend) = temp_env::async_with_vars(
             [
                 (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
             ],
-            || UringBackend::try_new(root.clone()),
-        ) else {
+            async { UringBackend::try_new(root.clone()).await },
+        )
+        .await
+        else {
             // Restricted environment (CI seccomp): io_uring is unavailable, so
             // there is no descriptor cache to exercise. Do not vacuously pass.
             uring_test_skip("uring_fd_cache_hides_a_healed_shard_until_invalidated");
@@ -22850,6 +22860,7 @@ mod test {
                 // (RLIMIT_NOFILE headroom, backlog#1178). Probe the (existing)
                 // root to decide; otherwise there is nothing to exercise.
                 let cache_on = UringBackend::try_new(root.clone())
+                    .await
                     .map(|b| b.fd_cache.is_some())
                     .unwrap_or(false);
                 if !cache_on {
@@ -22985,13 +22996,15 @@ mod test {
 
         let root_dir = tempdir().expect("operation should succeed");
         let root = root_dir.path().to_path_buf();
-        let Some(backend) = temp_env::with_vars(
+        let Some(backend) = temp_env::async_with_vars(
             [
                 (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
             ],
-            || UringBackend::try_new(root.clone()),
-        ) else {
+            async { UringBackend::try_new(root.clone()).await },
+        )
+        .await
+        else {
             uring_test_skip("uring_zero_length_read_bounds_match_std_on_cache_hit");
             return;
         };
@@ -23096,8 +23109,9 @@ mod test {
         let total_pages = LEN.div_ceil(mmap_page_size().expect("page size should be available") as usize);
 
         let std_backend: Arc<dyn LocalIoBackend> = Arc::new(StdBackend::new(root.clone()));
-        let uring_backend: Option<Arc<dyn LocalIoBackend>> =
-            UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
+        let uring_backend: Option<Arc<dyn LocalIoBackend>> = UringBackend::try_new(root.clone())
+            .await
+            .map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
         if uring_backend.is_none() {
             uring_test_skip("io_uring_reclaims_page_cache_exactly_like_std (io_uring half)");
         }
@@ -23203,7 +23217,7 @@ mod test {
 
         // Skip if io_uring is unavailable on this host (restricted env, e.g. the
         // Kubernetes CI runners): there is no native O_DIRECT path to exercise.
-        let Some(backend) = UringBackend::try_new(root) else {
+        let Some(backend) = UringBackend::try_new(root).await else {
             uring_test_skip("uring_preserves_o_direct_for_eligible_reads");
             return;
         };
@@ -23286,7 +23300,7 @@ mod test {
         }
 
         // Skip if io_uring is unavailable on this host (restricted env).
-        let Some(backend) = UringBackend::try_new(root) else {
+        let Some(backend) = UringBackend::try_new(root).await else {
             uring_test_skip("uring_backend_latched_off_reads_via_std");
             return;
         };
