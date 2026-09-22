@@ -16,9 +16,9 @@ On a plain warp workload with no injected fault it recorded single polls of
 
 ## What it does not see
 
-**A drive stall is invisible to dial9.** RustFS performs disk I/O on the blocking
-pool (`spawn_blocking`) and through io_uring, never on an async worker, so a slow
-drive does not lengthen any poll. Injecting 200 ms of latency on one of four
+**A drive stall need not appear as a long poll.** The main read backends send
+blocking disk reads to the blocking pool (`spawn_blocking`) or through io_uring;
+waiting for completion need not hold an async worker. Injecting 200 ms of latency on one of four
 drives cut throughput by 64% and left the poll-duration distribution unchanged
 (polls ≥ 5 ms: 49 → 56; p999: 2.67 ms → 2.75 ms). Enabling dial9's CPU and sched
 profilers does not help either: sched events are captured per-worker only, and
@@ -26,6 +26,12 @@ the CPU profiler samples on-CPU, while a stalled drive is an off-CPU wait.
 
 For drive stalls use the `rustfs_io_*` metrics and the drive-stall budget. dial9
 answers a different question: which task held a worker, and for how long.
+
+The same distinction applies to [io_uring initialization](io-uring-initialization.md):
+driver probe/start is admitted asynchronously and runs in the blocking pool,
+but its duration can still delay disk readiness. Other synchronous work inside
+an async path can lengthen polls; offloaded reads do not prove that every
+filesystem-related operation is offloaded.
 
 **It cannot tell you where a task was stuck.** That would need a task dump, and
 dial9 only captures those for futures spawned through `dial9::spawn`.
