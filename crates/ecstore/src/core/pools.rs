@@ -138,15 +138,16 @@ pub(crate) const DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX: &str = "decommission/
 const DECOMMISSION_CAPACITY_TARGET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS: usize = 12;
 pub(crate) const DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS: usize = 3;
-static DECOMMISSION_OBJECT_ATTEMPTS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECOMMISSION_OBJECT_ATTEMPTS_MAX: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX: &str = " target capacity mutation gate is busy";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
 const METRIC_DECOMMISSION_CAPACITY_GATE_RETRIES_TOTAL: &str = "rustfs_decommission_capacity_gate_retries_total";
-/// Attempts spent per object; the ratio against completed objects is the retry
-/// amplification a decommission run is paying for.
+/// Entry passes and repeated version-copy attempts within a listing and its
+/// deferred replay. Inline gate waits have their own retry counter.
 const METRIC_DECOMMISSION_OBJECT_ATTEMPTS_TOTAL: &str = "rustfs_decommission_object_attempts_total";
-/// Highest attempt count any single object reached in this process.
+/// Highest per-entry attempt count, including its deferred replay. A new
+/// listing after a durable pause starts a new observation.
 const METRIC_DECOMMISSION_OBJECT_ATTEMPTS_MAX: &str = "rustfs_decommission_object_attempts_max";
 /// Wait time spent inside a single target capacity gate retry.
 const METRIC_DECOMMISSION_CAPACITY_GATE_WAIT_SECONDS: &str = "rustfs_decommission_capacity_gate_wait_seconds";
@@ -187,10 +188,15 @@ fn record_decommission_capacity_gate_retry(target_pool_index: usize) {
 
 /// Record one object-processing attempt plus the peak attempts any object
 /// reached, so amplification is visible without reconstructing it from logs.
-fn record_decommission_object_attempt(attempt: usize) {
+fn record_decommission_object_attempt(attempts: &mut usize) {
+    *attempts = attempts.saturating_add(1);
     metrics::counter!(METRIC_DECOMMISSION_OBJECT_ATTEMPTS_TOTAL).increment(1);
-    let attempt = u64::try_from(attempt).unwrap_or(u64::MAX);
-    if DECOMMISSION_OBJECT_ATTEMPTS_MAX.fetch_max(attempt, Ordering::AcqRel) < attempt {
+    let attempt = u64::try_from(*attempts).unwrap_or(u64::MAX);
+    // Serialize publication too: concurrent fetch_max + gauge.set can publish
+    // an older peak after a newer one. This guard never crosses an await.
+    let mut peak = DECOMMISSION_OBJECT_ATTEMPTS_MAX.lock().unwrap_or_else(|err| err.into_inner());
+    if *peak < attempt {
+        *peak = attempt;
         metrics::gauge!(METRIC_DECOMMISSION_OBJECT_ATTEMPTS_MAX).set(attempt as f64);
     }
 }
@@ -4359,6 +4365,13 @@ enum DecommissionEntryAttemptOutcome {
     SourceChanged,
 }
 
+/// Compact retry state retained until the listing has drained.
+#[derive(Debug)]
+struct DeferredDecommissionEntry {
+    name: String,
+    attempts: usize,
+}
+
 /// Terminal result of a decommission entry pass.
 #[derive(Debug)]
 enum DecommissionEntryOutcome {
@@ -7138,8 +7151,6 @@ struct PersistedPoolDecommissionInfo {
     pub capacity_reservation: Option<DecommissionCapacityReservation>,
     #[serde(rename = "capacityBlockedReason", default)]
     pub capacity_blocked_reason: Option<String>,
-    #[serde(rename = "capacityPauses", default)]
-    pub capacity_pauses: DecommissionCapacityPauses,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7386,7 +7397,6 @@ impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             terminal_reload_failures: value.terminal_reload_failures,
             capacity_reservation: value.capacity_reservation,
             capacity_blocked_reason: value.capacity_blocked_reason,
-            capacity_pauses: value.capacity_pauses,
             unresolved_entries: value.unresolved_entries,
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
@@ -7423,7 +7433,6 @@ impl TryFrom<PersistedPoolDecommissionInfoV1> for PoolDecommissionInfo {
             terminal_reload_failures: value.terminal_reload_failures,
             capacity_reservation: None,
             capacity_blocked_reason: None,
-            capacity_pauses: DecommissionCapacityPauses::default(),
             unresolved_entries: Vec::new(),
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
@@ -7460,7 +7469,6 @@ impl TryFrom<LegacyPoolDecommissionInfo> for PoolDecommissionInfo {
             terminal_reload_failures: Vec::new(),
             capacity_reservation: None,
             capacity_blocked_reason: None,
-            capacity_pauses: DecommissionCapacityPauses::default(),
             unresolved_entries: Vec::new(),
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
@@ -7533,7 +7541,6 @@ impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfo {
             terminal_reload_failures: value.terminal_reload_failures.clone(),
             capacity_reservation: value.capacity_reservation.clone(),
             capacity_blocked_reason: value.capacity_blocked_reason.clone(),
-            capacity_pauses: value.capacity_pauses.clone(),
             unresolved_entries: value.unresolved_entries.clone(),
         }
     }
@@ -8922,13 +8929,6 @@ impl PoolMeta {
             renew_decommission_capacity_reservation(reservation, now, true);
         }
         let changed = info.capacity_blocked_reason.as_deref() != Some(reason.as_str());
-        if changed {
-            // Count entries into the paused state, not repeated re-pauses with
-            // the same reason, so the counter reads as "how often did this pool
-            // get blocked" rather than "how often was it re-evaluated".
-            info.capacity_pauses.count = info.capacity_pauses.count.saturating_add(1);
-            info.capacity_pauses.last_reason = Some(reason.clone());
-        }
         info.capacity_blocked_reason = Some(reason);
         pool.last_update = now;
         Ok(changed)
@@ -9786,11 +9786,6 @@ pub struct PoolDecommissionInfo {
     pub capacity_reservation: Option<DecommissionCapacityReservation>,
     #[serde(rename = "capacityBlockedReason", default, skip_serializing_if = "Option::is_none")]
     pub capacity_blocked_reason: Option<String>,
-    /// Number of times this pool entered a durable capacity pause. The counter
-    /// is cumulative for the pool so operators can tell "slow but progressing"
-    /// from "repeatedly blocked" after the pause itself has cleared.
-    #[serde(rename = "capacityPauses", default)]
-    pub capacity_pauses: DecommissionCapacityPauses,
     #[serde(skip)]
     pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
     #[serde(skip)]
@@ -9799,16 +9794,6 @@ pub struct PoolDecommissionInfo {
     pub progress_save_retry_after: Option<OffsetDateTime>,
     #[serde(skip)]
     pub progress_save_last_at: Option<OffsetDateTime>,
-}
-
-/// Cumulative count of durable capacity pauses for one pool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DecommissionCapacityPauses {
-    #[serde(rename = "count", default)]
-    pub count: usize,
-    #[serde(rename = "lastReason", default, skip_serializing_if = "Option::is_none")]
-    pub last_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13877,7 +13862,7 @@ impl ECStore {
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         queue: Arc<tokio::sync::Mutex<mpsc::Receiver<QueuedDecommissionEntry>>>,
-        deferred: Arc<tokio::sync::Mutex<Vec<String>>>,
+        deferred: Arc<tokio::sync::Mutex<Vec<DeferredDecommissionEntry>>>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
     ) {
         loop {
@@ -13892,7 +13877,13 @@ impl ECStore {
             let Some(QueuedDecommissionEntry { entry, queue_permit }) = queued else {
                 return;
             };
+            // Only listing entries retain metadata that distinguishes prefixes
+            // from real directory objects. Deferred names are already objects.
+            if entry.is_dir() {
+                continue;
+            }
             let object_name = entry.name.clone();
+            let mut attempts = 0;
 
             if entry_error.lock().await.is_some() {
                 drop(queue_permit);
@@ -13967,6 +13958,7 @@ impl ECStore {
                     replication_config.clone(),
                     expected_bucket_incarnation_id,
                     Arc::clone(&source_changed_exhaustions),
+                    &mut attempts,
                 )
                 .await;
             drop(entry_budget_permit);
@@ -13978,10 +13970,13 @@ impl ECStore {
                     // listing drain waits for the full budget to return, and the
                     // listing has already finished for this round.
                     drop(queue_permit);
-                    // Only the name is retained. A whole-bucket contention streak
+                    // Only the name and attempt count are retained. A contention streak
                     // would otherwise pin one metadata buffer per object, and the
                     // replay reloads the versions it needs from disk anyway.
-                    deferred.lock().await.push(object_name);
+                    deferred.lock().await.push(DeferredDecommissionEntry {
+                        name: object_name,
+                        attempts,
+                    });
                     info!(
                         event = EVENT_DECOMMISSION_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
@@ -14027,7 +14022,7 @@ impl ECStore {
         idx: usize,
         set_idx: usize,
         generation: OffsetDateTime,
-        object_name: String,
+        mut deferred_entry: DeferredDecommissionEntry,
         bucket: String,
         set: Arc<SetDisks>,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
@@ -14038,6 +14033,7 @@ impl ECStore {
         entry_budget: Arc<Semaphore>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
     ) -> Result<DecommissionEntryOutcome> {
+        let object_name = deferred_entry.name;
         let entry = MetaCacheEntry {
             name: object_name.clone(),
             ..Default::default()
@@ -14102,6 +14098,7 @@ impl ECStore {
                 replication_config,
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
+                &mut deferred_entry.attempts,
             )
             .await;
         drop(entry_budget_permit);
@@ -14150,7 +14147,7 @@ impl ECStore {
         let outstanding = Arc::new(Semaphore::new(outstanding_capacity));
         let (tx, rx_queue) = mpsc::channel(queue_capacity);
         let queue = Arc::new(tokio::sync::Mutex::new(rx_queue));
-        let deferred: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let deferred: Arc<tokio::sync::Mutex<Vec<DeferredDecommissionEntry>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         let mut entry_workers = tokio::task::JoinSet::new();
         for _ in 0..worker_count {
@@ -14323,7 +14320,7 @@ impl ECStore {
             // The replay keeps the set's own worker bound: a whole-bucket
             // deferral must not spawn one task per object.
             futures::stream::iter(deferred_entries)
-                .for_each_concurrent(Some(worker_count), |object_name| {
+                .for_each_concurrent(Some(worker_count), |deferred_entry| {
                     let this = self.clone();
                     let rx = rx.clone();
                     let bucket = bi.name.clone();
@@ -14342,7 +14339,7 @@ impl ECStore {
                                 idx,
                                 set_idx,
                                 generation,
-                                object_name,
+                                deferred_entry,
                                 bucket,
                                 set,
                                 lifecycle_config,
@@ -14766,6 +14763,7 @@ impl ECStore {
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
+        attempts: &mut usize,
     ) -> Result<DecommissionEntryOutcome> {
         let mut counted_versions = HashSet::new();
 
@@ -14790,6 +14788,7 @@ impl ECStore {
                             scanner_backlog_handoff_attempt,
                             source_changed_exhaustions.as_ref(),
                             &mut counted_versions,
+                            attempts,
                         )
                         .await;
                     let retry = result
@@ -14924,8 +14923,9 @@ impl ECStore {
         scanner_backlog_handoff_attempt: usize,
         source_changed_exhaustions: &AtomicUsize,
         counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
+        attempts: &mut usize,
     ) -> Result<DecommissionEntryAttemptOutcome> {
-        record_decommission_object_attempt(entry_attempt);
+        record_decommission_object_attempt(attempts);
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
@@ -14938,19 +14938,6 @@ impl ECStore {
             max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
             "Decommission entry started"
         );
-        if entry.is_dir() {
-            debug!(
-                event = EVENT_DECOMMISSION_ENTRY,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_POOLS,
-                pool_index = idx,
-                bucket = %bucket,
-                object = %entry.name,
-                state = "skipped_directory",
-                "Decommission entry skipped directory"
-            );
-            return Ok(DecommissionEntryAttemptOutcome::Complete);
-        }
         // Scanner caches describe their own erasure set and are rebuilt there.
         // Copying one onto another set can overwrite unrelated cache contents or
         // leave an unresolvable target-capacity intent after a conditional PUT.
@@ -15085,6 +15072,9 @@ impl ECStore {
                 let mut target_busy_attempt: usize = 0;
                 let mut target_permit = None;
                 while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    if version_attempt > 1 || target_busy_attempt > 0 {
+                        record_decommission_object_attempt(attempts);
+                    }
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                             self.decommission_tiered_object(
@@ -15268,6 +15258,9 @@ impl ECStore {
                 let mut target_busy_attempt: usize = 0;
                 let mut target_permit = None;
                 while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    if version_attempt > 1 || target_busy_attempt > 0 {
+                        record_decommission_object_attempt(attempts);
+                    }
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                             self.delete_object(
@@ -15450,6 +15443,9 @@ impl ECStore {
             let mut target_busy_attempt: usize = 0;
             let mut target_permit = None;
             while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                if version_attempt > 1 || target_busy_attempt > 0 {
+                    record_decommission_object_attempt(attempts);
+                }
                 if version.is_remote() {
                     let result = self
                         .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
@@ -16103,6 +16099,7 @@ impl ECStore {
                 None,
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
+                &mut 0,
             )
             .await,
         )
@@ -16135,6 +16132,7 @@ impl ECStore {
                 None,
                 expected_bucket_incarnation_id,
                 Arc::new(AtomicUsize::new(0)),
+                &mut 0,
             )
             .await,
         )
@@ -21204,9 +21202,6 @@ mod tests {
         assert_eq!(info.items_decommission_failed, 0);
         assert_eq!(info.bytes_failed, 0);
         assert!(info.capacity_blocked_reason.is_some());
-        assert_eq!(info.capacity_pauses.count, 1, "entering the paused state must be counted for operators");
-        assert_eq!(info.capacity_pauses.last_reason.as_deref(), info.capacity_blocked_reason.as_deref());
-        let local_info_pauses = info.capacity_pauses.clone();
         assert!(
             info.capacity_reservation
                 .as_ref()
@@ -21226,10 +21221,6 @@ mod tests {
             .expect("the durable blocked state should remain nonterminal");
         assert!(!persisted_info.complete && !persisted_info.failed && !persisted_info.canceled);
         assert!(persisted_info.capacity_blocked_reason.is_some());
-        assert_eq!(
-            persisted_info.capacity_pauses, local_info_pauses,
-            "the pause count must survive the pool metadata round trip"
-        );
         assert!(
             persisted_info
                 .capacity_reservation
@@ -22416,17 +22407,148 @@ mod tests {
         ));
     }
 
-    /// The retry-amplification metrics must track the peak attempt count, not
-    /// just the latest sample, so a single runaway object stays visible.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_deferred_directory_object_is_copied_and_removed() {
+        use crate::object_api::PutObjReader;
+        let (_temp_dirs, store, _other_store) =
+            Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+        let bucket = "deferred-directory-object";
+        let object = "folder/";
+        Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        Box::pin(store.pools[0].put_object(
+            bucket,
+            &encode_dir_object(object),
+            &mut PutObjReader::from_vec(Vec::new()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed directory object");
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(&encode_dir_object(object))
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded directory object")
+                .is_some()
+        );
+        let retry_object = "retry.bin";
+        Box::pin(store.pools[0].put_object(
+            bucket,
+            retry_object,
+            &mut PutObjReader::from_vec(b"retry contents".to_vec()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed retry object");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+            ]],
+        );
+        Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+            .await
+            .expect("activate reservation");
+        let generation = store.active_decommission_generation(0).await.expect("active generation");
+        let source_set = store.pools[0].get_disks_by_key(&encode_dir_object(object));
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None));
+        let outcome = Box::pin(store.clone().replay_deferred_decommission_entry(
+            CancellationToken::new(),
+            0,
+            0,
+            generation,
+            DeferredDecommissionEntry {
+                name: object.into(),
+                attempts: 2,
+            },
+            bucket.into(),
+            source_set.clone(),
+            None,
+            None,
+            None,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Semaphore::new(1)),
+            entry_error.clone(),
+        ))
+        .await
+        .expect("replay deferred directory object");
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete));
+        assert!(entry_error.lock().await.is_none());
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read exact source versions")
+                .is_none(),
+            "source object must be removed"
+        );
+        let target = store.pools[1]
+            .get_disks_by_key(&encode_dir_object(object))
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read exact target versions")
+            .expect("directory object must reach target");
+        assert_eq!(target.versions.len(), 1);
+        assert_eq!(target.versions[0].size, 0);
+        let faults = Arc::new(AtomicUsize::new(0));
+        let observed = faults.clone();
+        let _fault = DecommissionTestFaultGuard::install(Arc::new(move |stage, b, o, attempt, success| {
+            if stage == "object_read" && b == bucket && o == retry_object && attempt == 1 && success {
+                observed.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            false
+        }));
+        let mut attempts = 2;
+        let result = Box::pin(store.decommission_entry(
+            CancellationToken::new(),
+            0,
+            generation,
+            MetaCacheEntry {
+                name: retry_object.into(),
+                ..Default::default()
+            },
+            bucket.into(),
+            store.pools[0].get_disks_by_key(retry_object),
+            None,
+            None,
+            None,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+            &mut attempts,
+        ))
+        .await
+        .expect("retry migration");
+        assert!(matches!(result, DecommissionEntryOutcome::Complete));
+        assert_eq!(faults.load(Ordering::Relaxed), 1, "inject one actual read failure");
+        assert_eq!(attempts, 4, "carry two attempts, then count the entry pass and copy retry");
+    }
+
     #[test]
     fn decommission_object_attempt_metric_keeps_the_peak() {
-        DECOMMISSION_OBJECT_ATTEMPTS_MAX.store(0, Ordering::Release);
-        record_decommission_object_attempt(1);
-        record_decommission_object_attempt(3);
-        record_decommission_object_attempt(2);
-        assert_eq!(DECOMMISSION_OBJECT_ATTEMPTS_MAX.load(Ordering::Acquire), 3);
-
-        DECOMMISSION_OBJECT_ATTEMPTS_MAX.store(0, Ordering::Release);
+        let mut attempts = 0;
+        record_decommission_object_attempt(&mut attempts);
+        record_decommission_object_attempt(&mut attempts);
+        let mut deferred = DeferredDecommissionEntry {
+            name: "object".into(),
+            attempts,
+        };
+        record_decommission_object_attempt(&mut deferred.attempts);
+        assert_eq!(deferred.attempts, 3);
+        assert!(*DECOMMISSION_OBJECT_ATTEMPTS_MAX.lock().expect("attempt peak lock") >= 3);
     }
 
     /// Gate-wait durations are recorded on the same jittered path the retry
@@ -22875,6 +22997,69 @@ mod tests {
         let mut pool_meta = build_pool_meta();
         assert!(pool_meta.decommission_failed(0));
         assert!(!pool_meta.decommission_complete(0));
+    }
+
+    #[test]
+    fn decommission_capacity_reporting_preserves_existing_disk_layout() {
+        // Frozen V2/V3 reader contract from before capacity contention reporting.
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PreContentionDecommissionInfo {
+            #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+            pub start_time: Option<OffsetDateTime>,
+            #[serde(rename = "startSize")]
+            pub start_size: usize,
+            #[serde(rename = "totalSize")]
+            pub total_size: usize,
+            #[serde(rename = "currentSize")]
+            pub current_size: usize,
+            #[serde(rename = "complete")]
+            pub complete: bool,
+            #[serde(rename = "failed")]
+            pub failed: bool,
+            #[serde(rename = "canceled")]
+            pub canceled: bool,
+            #[serde(rename = "queued", default)]
+            pub queued: bool,
+            #[serde(rename = "queuedBuckets", default)]
+            pub queued_buckets: Vec<String>,
+            #[serde(rename = "decommissionedBuckets", default)]
+            pub decommissioned_buckets: Vec<String>,
+            #[serde(rename = "bucket", default)]
+            pub bucket: String,
+            #[serde(rename = "prefix", default)]
+            pub prefix: String,
+            #[serde(rename = "object", default)]
+            pub object: String,
+            #[serde(rename = "objectsDecommissioned")]
+            pub items_decommissioned: usize,
+            #[serde(rename = "objectsDecommissionedFailed")]
+            pub items_decommission_failed: usize,
+            #[serde(rename = "bytesDecommissioned")]
+            pub bytes_done: usize,
+            #[serde(rename = "bytesDecommissionedFailed")]
+            pub bytes_failed: usize,
+            #[serde(rename = "terminalReloadAttemptAt", with = "time::serde::rfc3339::option", default)]
+            pub terminal_reload_attempt_at: Option<OffsetDateTime>,
+            #[serde(rename = "terminalReloadFailures", default)]
+            pub terminal_reload_failures: Vec<String>,
+            #[serde(rename = "unresolvedEntries", default)]
+            pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
+            #[serde(rename = "capacityReservation", default)]
+            pub capacity_reservation: Option<DecommissionCapacityReservation>,
+            #[serde(rename = "capacityBlockedReason", default)]
+            pub capacity_blocked_reason: Option<String>,
+        }
+        let current = PersistedPoolDecommissionInfo {
+            capacity_blocked_reason: Some("target gate busy".into()),
+            ..Default::default()
+        };
+        for bytes in [rmp_serde::to_vec(&current), rmp_serde::to_vec_named(&current)] {
+            let bytes = bytes.expect("serialize current decommission state");
+            let old: PreContentionDecommissionInfo =
+                rmp_serde::from_slice(&bytes).expect("existing V2/V3 readers must accept new writes");
+            assert_eq!(old.capacity_blocked_reason, current.capacity_blocked_reason);
+        }
     }
 
     #[test]
