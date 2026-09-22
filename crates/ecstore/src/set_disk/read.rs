@@ -239,16 +239,29 @@ impl SetDisks {
             return disks;
         }
 
+        let timeout = crate::disk::disk_store::get_drive_active_check_timeout();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| tokio::time::sleep(timeout).deadline());
         let mut recovered = 0;
-        let timed_out = tokio::time::timeout(crate::disk::disk_store::get_drive_active_check_timeout(), async {
+        let timed_out = tokio::time::timeout_at(deadline, async {
             // Lock order: read_reconnect -> disks. Only this bounded probe sweep
             // holds read_reconnect across I/O; disks guards never cross I/O.
             let mut last_attempt = self.read_reconnect.lock().await;
             if last_attempt.is_some_and(|at| at.elapsed() < crate::disk::health_state::get_drive_returning_probe_interval()) {
-                return;
+                return false;
             }
             let current = self.get_disks_internal().await;
-            *last_attempt = Some(tokio::time::Instant::now());
+            // Timeout polls its inner future before its timer. Lock/snapshot
+            // waits must not admit a new probe after the request budget expires.
+            if tokio::time::Instant::now() >= deadline {
+                return true;
+            }
+            // Start the cooldown when this sweep ends, including cancellation,
+            // before releasing the singleflight lock to waiting readers.
+            rustfs_common::defer! {
+                *last_attempt = Some(tokio::time::Instant::now());
+            }
             let mut probes = self
                 .set_endpoints
                 .iter()
@@ -269,9 +282,10 @@ impl SetDisks {
                     recovered += 1;
                 }
             }
+            false
         })
         .await
-        .is_err();
+        .unwrap_or(true);
         debug!(
             event = EVENT_SET_DISK_READ,
             component = LOG_COMPONENT_ECSTORE,

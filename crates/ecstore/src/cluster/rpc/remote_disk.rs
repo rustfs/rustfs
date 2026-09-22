@@ -7348,6 +7348,53 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(remote_disk_recovery_probe, internode_metrics)]
+    async fn missing_read_disks_expired_waiter_does_not_start_another_probe() {
+        // Disable cooldown so this independently proves deadline admission,
+        // rather than passing only because the leader has just finished.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("0"))], async {
+            runtime_sources::ensure_test_rpc_secret();
+            let mut reference = crate::layout::format::FormatV3::new(1, 1);
+            reference.erasure.this = reference.erasure.sets[0][0];
+            let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference).await;
+            let gate = peer.peer.pause_next_format_read();
+            let mut leader = Box::pin(set.get_disks_for_data_read());
+            time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = gate.entered.notified() => {}
+                    _ = &mut leader => panic!("leader must remain blocked in its format RPC"),
+                }
+            })
+            .await
+            .expect("leader must reach the format barrier");
+            time::pause();
+            let mut waiter = Box::pin(set.get_disks_for_data_read());
+            assert!(futures::poll!(&mut waiter).is_pending(), "waiter must queue behind the leader");
+            let requests_before =
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total;
+
+            time::advance(crate::disk::disk_store::get_drive_active_check_timeout()).await;
+            assert!(leader.await[0].is_none(), "expired leader must not publish a disk");
+            assert!(waiter.await[0].is_none(), "expired waiter must not publish a disk");
+            time::resume();
+
+            // Count client dispatches, not server arrivals: a cancelled RPC can still
+            // be buffered in the transport when the expired waiter returns.
+            assert_eq!(
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total,
+                requests_before,
+                "an expired waiter must not dispatch another format RPC after the leader releases the lock"
+            );
+            gate.release.cancel();
+            peer.stop().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
     #[serial(remote_disk_recovery_probe)]
     async fn missing_read_disks_timeout_releases_singleflight_and_allows_retry() {
         runtime_sources::ensure_test_rpc_secret();
@@ -7396,6 +7443,11 @@ mod tests {
         time::timeout(Duration::from_secs(2), gate.entered.notified())
             .await
             .expect("probe must reach the format barrier");
+        // Cancellation can happen after the start-based cooldown has elapsed.
+        // It must still cool down before another caller probes the same peer.
+        time::pause();
+        time::advance(crate::disk::health_state::get_drive_returning_probe_interval()).await;
+        time::resume();
         pending.abort();
         assert!(pending.await.expect_err("probe must be cancelled").is_cancelled());
         assert!(
