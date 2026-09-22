@@ -579,7 +579,7 @@ impl SetDisks {
             }
         }
         metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
-        if errs.iter().any(|err| err.is_some()) {
+        if !opts.suppress_read_repair && errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
                 &fi.volume,
@@ -848,6 +848,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         prefer_data_blocks_first_reader_setup: bool,
         require_reconstruction_surplus: bool,
         metrics_path: &'static str,
@@ -1192,7 +1193,7 @@ impl SetDisks {
                 "Shard availability check"
             );
 
-            if missing_shards > 0 && available_shards >= erasure.data_shards {
+            if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
                 debug!(
                     bucket,
@@ -1315,20 +1316,22 @@ impl SetDisks {
                         // is bound to the read-repair reservation, so only the
                         // first sighting within the dedup TTL books a journal
                         // record instead of one per retried read.
-                        submit_read_repair_heal_with_submitter(
-                            ReadRepairHealSubmission {
-                                bucket,
-                                object,
-                                version_id: version_id.as_deref(),
-                                pool_index,
-                                set_index,
-                                part_number: Some(part_number),
-                                reason: "decode_error",
-                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
-                            },
-                            send_read_repair_heal_request,
-                        )
-                        .await;
+                        if !suppress_read_repair {
+                            submit_read_repair_heal_with_submitter(
+                                ReadRepairHealSubmission {
+                                    bucket,
+                                    object,
+                                    version_id: version_id.as_deref(),
+                                    pool_index,
+                                    set_index,
+                                    part_number: Some(part_number),
+                                    reason: "decode_error",
+                                    mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
+                                },
+                                send_read_repair_heal_request,
+                            )
+                            .await;
+                        }
                         has_err = false;
                     }
                 }
@@ -2515,6 +2518,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2547,6 +2551,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2569,6 +2574,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2595,6 +2601,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2617,6 +2624,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2659,6 +2667,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "empty",
@@ -2690,6 +2699,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2990,6 +3000,74 @@ mod metadata_cache_tests {
             get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
             Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ)
         );
+    }
+
+    #[test]
+    fn missing_metadata_read_repair_is_suppressed_only_for_read_only_requests() {
+        use crate::object_api::{PutObjReader, ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                let bucket = format!("read-only-{}", Uuid::new_v4());
+                let object = "missing-metadata";
+                for disk in set.disks.read().await.iter().flatten() {
+                    disk.make_volume(&bucket).await.expect("bucket volume");
+                }
+                let written = set
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![7; 1024]),
+                        &ObjectOptions {
+                            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("fully committed fixture");
+                let missing = dirs[0].path().join(&bucket).join(object).join("xl.meta");
+                tokio::fs::remove_file(&missing).await.expect("remove one metadata replica");
+
+                // Intercept the production submitter at its dedup admission boundary.
+                // This avoids initializing the process-global heal channel or allowing
+                // a background worker to repair the physical fault under test.
+                let version = written.version_id.map(|id| id.to_string());
+                let reservation = reserve_read_repair_heal(&bucket, object, version.as_deref(), 0, 0)
+                    .await
+                    .expect("unique object reservation");
+                for (suppress_read_repair, submissions) in [(true, 0), (false, 1), (true, 1)] {
+                    set.get_object_fileinfo(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            include_part_checksums: true,
+                            suppress_read_repair,
+                            ..Default::default()
+                        },
+                        false,
+                        false,
+                    )
+                    .await
+                    .expect("remaining metadata replicas retain read quorum");
+                    assert_eq!(
+                        recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]),
+                        submissions,
+                        "only ordinary reads must reach read-repair admission"
+                    );
+                    assert!(!missing.exists(), "the read-only probe must not restore metadata");
+                }
+                release_read_repair_heal_reservation(&reservation).await;
+            });
+        });
     }
 
     #[tokio::test]
@@ -5052,6 +5130,7 @@ mod tests {
             &disks,
             0,
             0,
+            false,
             false,
             false,
             false,
