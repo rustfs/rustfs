@@ -224,7 +224,7 @@ fn service_job_requires_the_independently_negotiated_capability_and_signed_bound
     wrong_target.device_name.push('x');
     assert_eq!(signer.verify(&job, &wrong_target, Utc::now()), Err(DiagnosticJobError::TargetMismatch));
 
-    let mut expired = job.clone();
+    let mut expired = job;
     expired.parameters.consent_expires_at =
         (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     let (expired, signer) = sign_service_job(expired);
