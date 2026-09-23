@@ -7,8 +7,10 @@
 
 A cache key includes volume, path and open mode. Buffered and direct-mode
 descriptors must never be exchanged. Production currently populates buffered
-entries only; testing a `direct: true` key does not enable direct caching or
-prove that its file was opened with O_DIRECT.
+entries. Native O_DIRECT reads use the same cache with `direct: true`, so a
+cache hit reuses the already-open O_DIRECT descriptor and avoids another
+blocking-pool open/metadata round trip. The first miss still validates the
+filesystem's O_DIRECT capability and records the alignment used by the disk.
 
 Entries retain an `Arc<File>` and the length snapshot of that inode. Removing
 a cache entry prevents future cache hits but does not revoke descriptors
@@ -40,6 +42,7 @@ does not guarantee that both removals completed. Callers must preserve their
 mutation/invalidation lifecycle rather than assuming this method fixes every
 commit-to-cleanup cancellation window.
 
-Adding a direct cache still requires separate permission-freshness, alignment,
-capacity, replacement-race and native O_DIRECT validation. This contract does
-not change TTL, authorization checks, production cache population or durability.
+The direct cache does not change TTL, authorization checks, production cache
+population or durability. A direct read that returns an O_DIRECT shape error
+still latches only the direct path off; the cached descriptor is then simply
+unused until invalidation or eviction.

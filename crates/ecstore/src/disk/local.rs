@@ -3999,8 +3999,6 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
 
 /// A cached descriptor is keyed by the open flags too: the O_DIRECT and buffered
 /// read paths must never hand each other a descriptor opened the other way.
-/// Only the buffered path caches today, so `direct` is always `false`; keeping it
-/// in the key stops a future O_DIRECT cache from colliding with this one.
 #[cfg(any(target_os = "linux", all(unix, test)))]
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct FdKey {
@@ -4024,10 +4022,11 @@ struct FdCacheEntry {
 
 /// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
 ///
-/// Why this exists: `pread_uring` opened the file on the blocking pool for every
-/// read, so each read paid a `spawn_blocking` round trip — the very thread hop
-/// io_uring exists to avoid. Measured on a 16-core host with a 4-shard driver,
-/// removing it is worth +36% to +180% IOPS and 3-5x better p999.
+/// Why this exists: both `pread_uring` and the native O_DIRECT path used to open
+/// the file on the blocking pool for every read, so each read paid a
+/// `spawn_blocking` round trip — the very thread hop io_uring exists to avoid.
+/// Measured on a 16-core host with a 4-shard driver, removing that hop is worth
+/// +36% to +180% IOPS and 3-5x better p999.
 ///
 /// Why it is safe to cache a *part file* descriptor:
 /// - only `<object>/<data_dir>/part.N` reaches this backend's `pread_bytes`;
@@ -4785,56 +4784,91 @@ impl UringBackend {
         let Some(end_offset) = offset.checked_add(length) else {
             return Err(DiskError::FileCorrupt);
         };
-        let root = self.root.clone();
-        let volume_owned = volume.to_owned();
-        let path_owned = path.to_owned();
         // Probe the device alignment at most once per disk: pass the cached
         // value in so the blocking closure can skip `statx` when it is known.
         let cached_align = self.direct_uring.align.get().copied();
 
-        let opened = tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
-            let file = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
-                .open(&file_path)
-            {
-                Ok(file) => file,
-                // Filesystem refuses O_DIRECT: signal a latch, not a hard error.
-                Err(e) if is_direct_io_unsupported(&e) => return Err(DirectOpenError::ODirectRefused),
-                Err(e) => return Err(DirectOpenError::Disk(DiskError::from(e))),
-            };
-            let meta = file.metadata().map_err(|e| DirectOpenError::Disk(DiskError::from(e)))?;
-            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
-            if meta.len() < end_offset_u64 {
-                return Err(DirectOpenError::Disk(DiskError::FileCorrupt));
-            }
-            let offset_u64 = u64::try_from(offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
-            let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
-            Ok((file, offset_u64, align))
-        })
-        .await
-        .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
-
-        let (file, offset_u64, probed_align) = match opened {
-            Ok(t) => t,
-            Err(DirectOpenError::ODirectRefused) => {
-                // Latch the native O_DIRECT path off for this disk; the caller
-                // falls back to StdBackend's aligned path for this and every
-                // future eligible read.
-                self.direct_uring.supported.store(false, Ordering::Relaxed);
-                if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
-                    debug!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        "filesystem refused O_DIRECT under io_uring; using StdBackend aligned path (logged once per disk)"
-                    );
-                }
-                return Err(DiskError::other("filesystem refused O_DIRECT"));
-            }
-            Err(DirectOpenError::Disk(e)) => return Err(e),
+        let key = FdKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            direct: true,
         };
+        let cache = self.fd_cache.as_ref();
+        let cached = match cache {
+            Some(cache) => cache.get(&key).await,
+            None => None,
+        };
+        let (file, file_len, probed_align) = match cached {
+            Some(entry) => {
+                // Every direct cache entry is populated after the first alignment
+                // probe. Never reintroduce a blocking statx call on a Tokio worker
+                // if an entry outlives a future state change.
+                let align = cached_align.ok_or_else(|| DiskError::other("direct fd cache entry missing alignment state"))?;
+                (Arc::clone(&entry.file), entry.len, align)
+            }
+            None => {
+                let root = self.root.clone();
+                let volume_owned = volume.to_owned();
+                let path_owned = path.to_owned();
+                let gen_at_open = cache.map(FdCache::generation);
+                let opened =
+                    tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let file_path =
+                            resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
+                        let file = match std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+                            .open(&file_path)
+                        {
+                            Ok(file) => file,
+                            // Filesystem refuses O_DIRECT: signal a latch, not a hard error.
+                            Err(e) if is_direct_io_unsupported(&e) => return Err(DirectOpenError::ODirectRefused),
+                            Err(e) => return Err(DirectOpenError::Disk(DiskError::from(e))),
+                        };
+                        let len = file.metadata().map_err(|e| DirectOpenError::Disk(DiskError::from(e)))?.len();
+                        let end_offset_u64 =
+                            u64::try_from(end_offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
+                        if len < end_offset_u64 {
+                            return Err(DirectOpenError::Disk(DiskError::FileCorrupt));
+                        }
+                        let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
+                        Ok((file, len, align))
+                    })
+                    .await
+                    .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
+                let (file, len, align) = match opened {
+                    Ok(opened) => opened,
+                    Err(DirectOpenError::ODirectRefused) => {
+                        self.direct_uring.supported.store(false, Ordering::Relaxed);
+                        if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                            debug!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                "filesystem refused O_DIRECT under io_uring; using StdBackend aligned path (logged once per disk)"
+                            );
+                        }
+                        return Err(DiskError::other("filesystem refused O_DIRECT"));
+                    }
+                    Err(DirectOpenError::Disk(error)) => return Err(error),
+                };
+                let entry = Arc::new(FdCacheEntry {
+                    file: Arc::new(file),
+                    len,
+                });
+                if let (Some(cache), Some(gen_at_open)) = (cache, gen_at_open) {
+                    cache.insert_if_fresh(key.clone(), Arc::clone(&entry), gen_at_open).await;
+                }
+                (entry.file.clone(), len, align)
+            }
+        };
+
+        let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+        let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+        if file_len < end_offset_u64 {
+            return Err(DiskError::FileCorrupt);
+        }
+
         // Cache the alignment so the next read skips the statx probe.
         let align = *self.direct_uring.align.get_or_init(|| probed_align);
 
@@ -4842,7 +4876,6 @@ impl UringBackend {
             return Ok(Bytes::new());
         }
 
-        let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
         let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
@@ -22705,6 +22738,13 @@ mod test {
                 };
                 assert_eq!(bytes.as_ref(), &content[..4096], "preflight must read the exact fixture bytes");
                 assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), native_before + 1);
+                if let Some(cache) = backend.fd_cache.as_ref() {
+                    assert_eq!(
+                        cache.entry_count().await,
+                        1,
+                        "the first native direct read must populate the direct descriptor cache"
+                    );
+                }
             }
             // Cover the fast-path boundary, multiple operations, unaligned heads,
             // non-block-multiple caps, exact EOF and the zero-length no-op.
@@ -22744,6 +22784,11 @@ mod test {
                 );
                 if direct && length != 0 {
                     assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), direct_before + 1);
+                }
+            }
+            if direct {
+                if let Some(cache) = backend.fd_cache.as_ref() {
+                    assert_eq!(cache.entry_count().await, 1, "direct reads must reuse one cached O_DIRECT descriptor");
                 }
             }
             for (offset, length) in [(FILE_LEN - 1, 2), (FILE_LEN + 1, 0)] {
