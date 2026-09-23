@@ -17,6 +17,9 @@ pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
+#[cfg(all(unix, test))]
+#[path = "fd_cache_tests.rs"]
+mod fd_cache_tests;
 mod replacement_lease;
 pub use replacement_lease::ReplacementExecutionLease;
 
@@ -3794,13 +3797,13 @@ const DEFAULT_RUSTFS_IO_URING_FD_CACHE: bool = true;
 /// Open descriptors kept per disk. Each entry holds an fd, so this bounds the
 /// cache's share of `RLIMIT_NOFILE`. moka evicts asynchronously, so the count may
 /// briefly exceed this.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_CAPACITY: u64 = 512;
 
 /// Backstop on how long a cached descriptor may serve reads. Explicit
 /// invalidation (below) is the correctness mechanism; this only bounds the
 /// blast radius if a future mutation path forgets to call it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
@@ -3881,7 +3884,7 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
 /// read paths must never hand each other a descriptor opened the other way.
 /// Only the buffered path caches today, so `direct` is always `false`; keeping it
 /// in the key stops a future O_DIRECT cache from colliding with this one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct FdKey {
     volume: String,
@@ -3929,7 +3932,7 @@ struct FdCacheEntry {
 /// TTL should a future mutation path forget to invalidate; `max_capacity` bounds
 /// this cache's share of `RLIMIT_NOFILE`. Eviction drops the `Arc<File>`, closing
 /// the descriptor once no in-flight read still holds it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<FdCacheEntry>>,
     /// Bumped by every invalidation. A miss-path open snapshots this before it
@@ -3939,7 +3942,7 @@ struct FdCache {
     generation: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 impl FdCache {
     fn new() -> Self {
         Self::with_ttl(FD_CACHE_TTL)
@@ -3986,19 +3989,21 @@ impl FdCache {
         }
     }
 
-    /// Drop the descriptor for exactly this path. Preferred wherever the caller
-    /// knows the keys: unlike a predicate it costs nothing on later reads.
+    /// Drop both buffered and direct-mode descriptors for exactly this path.
+    /// Once awaited, both variants have been invalidated; the two operations
+    /// are not an atomic pair. Unlike a predicate, this adds no later-read cost.
     async fn invalidate_exact(&self, volume: &str, path: &str) {
         // Bump BEFORE the moka invalidation so a concurrent miss-path insert
         // that snapshotted the old generation is refused (rustfs/backlog#1176).
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.cache
-            .invalidate(&FdKey {
-                volume: volume.to_owned(),
-                path: path.to_owned(),
-                direct: false,
-            })
-            .await;
+        let mut key = FdKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            direct: false,
+        };
+        self.cache.invalidate(&key).await;
+        key.direct = true;
+        self.cache.invalidate(&key).await;
     }
 
     /// Drop every descriptor for `volume` whose path is `prefix` or lies under it.
