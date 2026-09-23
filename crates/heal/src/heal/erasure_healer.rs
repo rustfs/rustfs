@@ -341,6 +341,8 @@ impl ErasureSetHealer {
                 se,
                 EcstoreError::DiskNotFound
                     | EcstoreError::VolumeNotFound
+                    | EcstoreError::FaultyDisk
+                    | EcstoreError::FaultyRemoteDisk
                     | EcstoreError::SlowDown
                     | EcstoreError::OperationCanceled
             )
@@ -2055,6 +2057,8 @@ mod tests {
     fn disk_not_found_is_transient_not_absent() {
         assert!(matches!(classify(EcstoreError::DiskNotFound), HealObjectOutcome::Transient));
         assert!(matches!(classify(EcstoreError::VolumeNotFound), HealObjectOutcome::Transient));
+        assert!(matches!(classify(EcstoreError::FaultyDisk), HealObjectOutcome::Transient));
+        assert!(matches!(classify(EcstoreError::FaultyRemoteDisk), HealObjectOutcome::Transient));
     }
 
     #[test]
