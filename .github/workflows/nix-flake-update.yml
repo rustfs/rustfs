@@ -49,7 +49,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3
 
       - name: Cache Nix
-        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3.20.0
+        uses: DeterminateSystems/flakehub-cache-action@83282a8aef353db1d659d3bacf4a28b6683de0b3 # v3.22.5
 
       - name: Check Nix flake inputs
         uses: DeterminateSystems/flake-checker-action@3164002371bc90729c68af0e24d5aacf20d7c9f6 # v12

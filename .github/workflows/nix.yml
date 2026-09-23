@@ -86,7 +86,7 @@ jobs:
             max-jobs = 1
 
       - name: Cache Nix
-        uses: DeterminateSystems/flakehub-cache-action@c01e819d047464c3edf6ba778f075952af5a3aa7 # v3.21.0
+        uses: DeterminateSystems/flakehub-cache-action@83282a8aef353db1d659d3bacf4a28b6683de0b3 # v3.22.5
 
       - name: Check Nix Flake Inputs
         uses: DeterminateSystems/flake-checker-action@3164002371bc90729c68af0e24d5aacf20d7c9f6 # v12
