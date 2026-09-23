@@ -105,7 +105,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Typos check with custom config file
-        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # master
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
   # Fail early with compile-free checks for every pull request.
   quick-checks:
