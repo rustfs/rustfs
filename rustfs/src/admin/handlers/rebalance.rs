@@ -958,6 +958,12 @@ async fn rebalance_stop_target_id(store: &Arc<ECStore>) -> S3Result<Option<Strin
         .map_err(|e| s3_error!(InternalError, "failed to prepare rebalance metadata for stop: {}", e))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Test-scoped observation only: 0 = prepare, 1 = stop, 2 = stats, 3 = done.
+    static REBALANCE_STOP_TEST_PHASE: std::sync::Arc<std::sync::atomic::AtomicU8>;
+}
+
 async fn stop_rebalance_admission_first(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
@@ -972,10 +978,14 @@ async fn stop_rebalance_admission_first(
             .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e));
     }
 
+    #[cfg(test)]
+    let _ = REBALANCE_STOP_TEST_PHASE.try_with(|phase| phase.store(1, std::sync::atomic::Ordering::Relaxed));
     store
         .stop_rebalance_for_id(Some(expected_rebalance_id))
         .await
         .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
+    #[cfg(test)]
+    let _ = REBALANCE_STOP_TEST_PHASE.try_with(|phase| phase.store(2, std::sync::atomic::Ordering::Relaxed));
     store
         .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id)
         .await
@@ -1217,27 +1227,49 @@ mod rebalance_handler_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn real_admin_stop_cancels_paused_entry_before_waiting_for_activation_gate() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
         const REBALANCE_ID: &str = "admin-stop-paused-entry";
         let mut fixture =
             crate::admin::storage_api::ecstore_rebalance::test_util::PausedRebalanceEntryTestFixture::new(REBALANCE_ID).await;
         fixture.wait_until_entry_paused().await;
 
         let stop_store = fixture.store();
-        let mut stop_task = tokio::spawn(async move {
+        let phase = Arc::new(AtomicU8::new(0));
+        let task_phase = Arc::clone(&phase);
+        let mut stop_task = tokio::spawn(super::REBALANCE_STOP_TEST_PHASE.scope(Arc::clone(&phase), async move {
             let expected_rebalance_id = rebalance_stop_target_id(&stop_store)
                 .await
                 .expect("admin stop target resolution should succeed")
                 .expect("the active rebalance should remain stoppable");
-            stop_rebalance_admission_first(&stop_store, None, expected_rebalance_id.as_str()).await
-        });
+            let result = stop_rebalance_admission_first(&stop_store, None, expected_rebalance_id.as_str()).await;
+            task_phase.store(3, Ordering::Relaxed);
+            result
+        }));
         fixture.wait_until_admission_cancelled().await;
         fixture.wait_until_stop_waiting_for_entry().await;
         assert!(!stop_task.is_finished(), "admin stop must wait for the paused entry guard to drain");
 
         fixture.release_entry();
         fixture.assert_entry_cancelled().await;
+        let wait_started = std::time::Instant::now();
         let stop_failures = tokio::time::timeout(std::time::Duration::from_secs(5), &mut stop_task)
             .await
+            .inspect_err(|_| {
+                let phase = match phase.load(Ordering::Relaxed) {
+                    0 => "prepare",
+                    1 => "stop",
+                    2 => "stats",
+                    3 => "done",
+                    _ => "unknown",
+                };
+                eprintln!(
+                    "rebalance_stop_test_timeout phase={phase} elapsed_ms={} stop_task_finished={}",
+                    wait_started.elapsed().as_millis(),
+                    stop_task.is_finished()
+                );
+            })
             .expect("admin stop should finish after the entry guard drains")
             .expect("admin stop task should not panic")
             .expect("admin stop should persist the terminal state");
