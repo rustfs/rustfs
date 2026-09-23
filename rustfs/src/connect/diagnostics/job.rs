@@ -29,6 +29,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::{Uuid, Variant, Version};
 
+use super::profile_memory::MEMORY_PROFILE_SERVICE_CAPABILITY;
 use super::{
     CPU_PROFILE_CAPABILITY, DRIVE_CAPABILITY, DRIVE_SCHEMA_VERSION, DriveOutcome, DrivePerformanceError, DrivePerformanceRequest,
     DriveProvenance, LocalDriveConsent, LocalNetworkConsent, LocalProfileConsent, LocalTopConsent, MAX_NETWORK_TRAFFIC_BYTES,
@@ -45,6 +46,7 @@ use crate::connect::DeviceIdentity;
 const PROTOCOL_VERSION: &str = "v1";
 const PROFILE_CPU_JOB_TYPE: &str = "profile.cpu";
 const PROFILE_THREADS_JOB_TYPE: &str = "profile.threads";
+const PROFILE_MEMORY_JOB_TYPE: &str = "profile.memory";
 const PERFORMANCE_DRIVE_JOB_TYPE: &str = "performance.drive";
 const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
@@ -56,6 +58,7 @@ const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
 const MAX_OUTPUT_BYTES: u64 = 524_288;
 const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CPU_MILLIS: u64 = 30_000;
+const MAX_MEMORY_PROFILE_CPU_MILLIS: u64 = 5_000;
 const MAX_NETWORK_CPU_MILLIS: u64 = 5_000;
 const MIN_NETWORK_MEMORY_BYTES: u64 = 1_048_576;
 const DRIVE_TARGET_ALIAS: &str = "drive-1";
@@ -75,6 +78,7 @@ const MIN_TOP_RPC_MEMORY_BYTES: u64 = 1_048_576;
 enum DiagnosticJobKind {
     ProfileCpu,
     ProfileThreads,
+    ProfileMemory,
     PerformanceDrive,
     PerformanceNetwork,
     TopApi,
@@ -424,6 +428,11 @@ impl DiagnosticJobEnvelope {
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
+        if kind == DiagnosticJobKind::ProfileMemory
+            && (self.limits.max_cpu_millis > MAX_MEMORY_PROFILE_CPU_MILLIS || self.limits.max_memory_bytes != MAX_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
         match (kind, self.parameters.traffic_bytes) {
             (DiagnosticJobKind::PerformanceNetwork, Some(1..=MAX_NETWORK_TRAFFIC_BYTES)) => {
                 if self.limits.max_cpu_millis > MAX_NETWORK_CPU_MILLIS || self.limits.max_memory_bytes < MIN_NETWORK_MEMORY_BYTES
@@ -478,6 +487,11 @@ impl DiagnosticJobEnvelope {
             (PROFILE_THREADS_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == THREAD_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileThreads)
             }
+            (PROFILE_MEMORY_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION)
+                if capability == MEMORY_PROFILE_SERVICE_CAPABILITY =>
+            {
+                Ok(DiagnosticJobKind::ProfileMemory)
+            }
             (PERFORMANCE_DRIVE_JOB_TYPE, [capability], DRIVE_SCHEMA_VERSION) if capability == DRIVE_CAPABILITY => {
                 Ok(DiagnosticJobKind::PerformanceDrive)
             }
@@ -518,6 +532,7 @@ pub async fn execute_diagnostic_job(
     match envelope.kind()? {
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileThreads => execute_profile_threads_job(envelope, nonce, identity, provenance, cancel).await,
+        DiagnosticJobKind::ProfileMemory => execute_profile_memory_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::PerformanceDrive => {
             let Some(scratch_root) = runtime_drive_scratch_root() else {
                 return Ok(failed_drive_execution(&envelope.job_id, "SOURCE_UNAVAILABLE"));
@@ -736,6 +751,54 @@ async fn execute_performance_network_job(
         job_id: envelope.job_id,
         outcome,
         reason,
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+async fn execute_profile_memory_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = ProfileCaptureRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        // The service capability gates dispatch; schema-v1 exports retain the
+        // original allocation-aggregate capability and signed artifact format.
+        capability: super::MEMORY_PROFILE_CAPABILITY.to_owned(),
+        consent: LocalProfileConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            confirmed: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        duration: Duration::from_millis(envelope.parameters.duration_millis),
+        sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
+        provenance,
+    };
+    let export = super::export_memory_profile(&request, identity, cancel)
+        .await
+        .map_err(capture_failure)?;
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: "SUCCEEDED".to_owned(),
+        reason: "COMPLETE".to_owned(),
         artifact_uid: Some(export.artifact_uid),
         artifact_sha256: Some(export.archive_sha256),
         artifact_bytes: Some(export.archive_bytes),
@@ -1220,6 +1283,7 @@ mod tests {
             ("logs.capture@1", &["logs"][..]),
             ("profile.cpu@1", &["profile"][..]),
             ("profile.memory@1", &["profile"][..]),
+            ("profile.memory.service@1", &[][..]),
             ("profile.threads@1", &["profile"][..]),
             ("telemetry.record@1", &["telemetry", "record"][..]),
             ("telemetry.otlp@1", &["telemetry", "otlp"][..]),
@@ -1240,13 +1304,16 @@ mod tests {
         let connect = command.find_subcommand("connect").expect("connect command");
         for (capability, path) in expected {
             if path.is_empty() {
-                // Network probes use the authenticated service dispatcher and
-                // locally resolved peers, not a standalone CLI command.
                 let mut job = envelope();
-                job.job_type = PERFORMANCE_NETWORK_JOB_TYPE.to_owned();
+                let (job_type, kind) = match capability {
+                    NETWORK_CAPABILITY => (PERFORMANCE_NETWORK_JOB_TYPE, DiagnosticJobKind::PerformanceNetwork),
+                    MEMORY_PROFILE_SERVICE_CAPABILITY => (PROFILE_MEMORY_JOB_TYPE, DiagnosticJobKind::ProfileMemory),
+                    _ => panic!("{capability} is missing service dispatch"),
+                };
+                job.job_type = job_type.to_owned();
                 job.required_capabilities = vec![capability.to_owned()];
                 job.schema_version = NETWORK_SCHEMA_VERSION;
-                assert_eq!(job.kind(), Ok(DiagnosticJobKind::PerformanceNetwork));
+                assert_eq!(job.kind(), Ok(kind));
                 continue;
             }
             let mut command = connect;
