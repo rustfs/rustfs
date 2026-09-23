@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout helm chart repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -121,7 +121,7 @@ jobs:
 
     steps:
       - name: Checkout helm package repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           # persist-credentials-exempt: this checkout's token IS the push credential —
           # the job git-pushes to rustfs/helm below. Clearing it breaks chart publishing.
