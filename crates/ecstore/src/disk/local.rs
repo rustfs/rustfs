@@ -33,6 +33,9 @@ mod uring_read_budget;
 #[cfg(any(target_os = "linux", test))]
 #[path = "uring_read_chunks.rs"]
 mod uring_read_chunks;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_result_budget.rs"]
+mod uring_result_budget;
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -816,6 +819,8 @@ const EVENT_DISK_LOCAL_URING_READ_CHUNKS: &str = "disk_local_uring_read_chunks";
 const EVENT_DISK_LOCAL_URING_DRIVER_BUDGET: &str = "disk_local_uring_driver_budget";
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_URING_READ_BUDGET: &str = "disk_local_uring_read_budget";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_RESULT_BUDGET: &str = "disk_local_uring_result_budget";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
@@ -1212,6 +1217,27 @@ static URING_READ_BUDGET: std::sync::LazyLock<Option<uring_read_budget::DriverRe
         }
     }
 });
+
+#[cfg(target_os = "linux")]
+static URING_RESULT_BUDGET: std::sync::LazyLock<Option<uring_result_budget::ProcessResultBudget>> =
+    std::sync::LazyLock::new(|| {
+        let value = std::env::var_os(uring_result_budget::ENV_RESULT);
+        match uring_result_budget::ResultBudgetConfig::from_env_value(value.as_deref()) {
+            Ok(config) => Some(uring_result_budget::ProcessResultBudget::from_config(config)),
+            Err(error) => {
+                warn!(
+                    event = EVENT_DISK_LOCAL_URING_RESULT_BUDGET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    state = "invalid_configuration",
+                    config = uring_result_budget::ENV_RESULT,
+                    reason = %error,
+                    "Invalid io_uring result budget; using StdBackend"
+                );
+                None
+            }
+        }
+    });
 
 #[cfg(target_os = "linux")]
 static URING_READ_BUDGET_EXHAUSTION_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -4186,6 +4212,10 @@ pub(crate) struct UringBackend {
     /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
     /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
     driver: std::mem::ManuallyDrop<Arc<BudgetedUringDriver>>,
+    /// Optional process-wide result/fallback reservation. The receipt is
+    /// attached to returned `Bytes`, so retained result clones keep the budget
+    /// charged instead of releasing it when the read future completes.
+    result_budget: uring_result_budget::ProcessResultBudget,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -4300,8 +4330,17 @@ impl UringBackend {
     pub(crate) async fn try_new(root: PathBuf) -> Option<Self> {
         let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
         let read_budget = URING_READ_BUDGET.as_ref()?;
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
         let read_chunk_size = (*URING_READ_CHUNK_SIZE)?;
-        Self::try_new_with_budgets_and_read_chunk_size(root, get_io_uring_shards(), budget, read_budget, read_chunk_size).await
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            get_io_uring_shards(),
+            budget,
+            read_budget,
+            result_budget,
+            read_chunk_size,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -4311,14 +4350,32 @@ impl UringBackend {
         budget: &uring_driver_budget::DriverThreadBudget,
         read_budget: &uring_read_budget::DriverReadBudget,
     ) -> Option<Self> {
-        Self::try_new_with_budgets_and_read_chunk_size(root, shards, budget, read_budget, (*URING_READ_CHUNK_SIZE)?).await
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            shards,
+            budget,
+            read_budget,
+            result_budget,
+            (*URING_READ_CHUNK_SIZE)?,
+        )
+        .await
     }
 
     #[cfg(test)]
     async fn try_new_with_read_chunk_size(root: PathBuf, read_chunk_size: uring_read_chunks::ReadChunkSize) -> Option<Self> {
         let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
         let read_budget = URING_READ_BUDGET.as_ref()?;
-        Self::try_new_with_budgets_and_read_chunk_size(root, get_io_uring_shards(), budget, read_budget, read_chunk_size).await
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            get_io_uring_shards(),
+            budget,
+            read_budget,
+            result_budget,
+            read_chunk_size,
+        )
+        .await
     }
 
     async fn try_new_with_budgets_and_read_chunk_size(
@@ -4326,6 +4383,7 @@ impl UringBackend {
         shards: usize,
         budget: &uring_driver_budget::DriverThreadBudget,
         read_budget: &uring_read_budget::DriverReadBudget,
+        result_budget: &uring_result_budget::ProcessResultBudget,
         read_chunk_size: uring_read_chunks::ReadChunkSize,
     ) -> Option<Self> {
         // Per-disk probe cache: skip a disk already known not to support
@@ -4406,6 +4464,7 @@ impl UringBackend {
                     read_chunk_size,
                     root_label,
                     driver: std::mem::ManuallyDrop::new(driver),
+                    result_budget: result_budget.clone(),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
@@ -4846,6 +4905,17 @@ enum DirectOpenError {
 }
 
 #[cfg(target_os = "linux")]
+impl UringBackend {
+    fn reserve_result_bytes(&self, length: usize) -> Result<Option<uring_result_budget::ResultBudgetReservation>> {
+        self.result_budget.reserve(length).map_err(DiskError::Io)
+    }
+
+    fn wrap_result_bytes(&self, bytes: Bytes, reservation: Option<uring_result_budget::ResultBudgetReservation>) -> Bytes {
+        uring_result_budget::BudgetedBytes::wrap(bytes, reservation)
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl LocalIoBackend for UringBackend {
     async fn pread_bytes(
@@ -4856,11 +4926,13 @@ impl LocalIoBackend for UringBackend {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
+        let result_reservation = self.reserve_result_bytes(length)?;
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
             self.record_uring_fallback();
-            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+            let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+            return Ok(self.wrap_result_bytes(bytes, result_reservation));
         }
 
         // O_DIRECT interop (backlog#1102): pick the read shape by eligibility
@@ -4874,7 +4946,7 @@ impl LocalIoBackend for UringBackend {
                 // for this read; the latching errnos already flipped the
                 // relevant per-disk latch inside `pread_uring_direct`.
                 match self.pread_uring_direct(volume, path, offset, length).await {
-                    Ok(bytes) => return Ok(bytes),
+                    Ok(bytes) => return Ok(self.wrap_result_bytes(bytes, result_reservation)),
                     Err(err) => {
                         if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                             debug!(
@@ -4885,7 +4957,8 @@ impl LocalIoBackend for UringBackend {
                             );
                         }
                         self.record_uring_fallback();
-                        return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+                        let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+                        return Ok(self.wrap_result_bytes(bytes, result_reservation));
                     }
                 }
             }
@@ -4893,13 +4966,14 @@ impl LocalIoBackend for UringBackend {
             // aligned path, which itself degrades to buffered if the filesystem
             // rejects O_DIRECT. Not an io_uring downgrade — io_uring cannot
             // serve an O_DIRECT read here without polluting the page cache.
-            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+            let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+            return Ok(self.wrap_result_bytes(bytes, result_reservation));
         }
 
         // Non-O_DIRECT read: buffered io_uring, falling back to StdBackend on any
         // per-read error.
         match self.pread_uring(volume, path, offset, length).await {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok(self.wrap_result_bytes(bytes, result_reservation)),
             Err(err) => {
                 if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                     let latched = !self.active.load(Ordering::Relaxed);
@@ -4912,7 +4986,8 @@ impl LocalIoBackend for UringBackend {
                     );
                 }
                 self.record_uring_fallback();
-                self.inner.pread_bytes(volume, path, offset, length, metrics).await
+                let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+                Ok(self.wrap_result_bytes(bytes, result_reservation))
             }
         }
     }
