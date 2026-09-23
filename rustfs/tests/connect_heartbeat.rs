@@ -544,6 +544,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "logs.capture@1",
             "profile.cpu@1",
             "profile.memory@1",
+            "profile.memory.service@1",
             "profile.threads@1",
             "telemetry.record@1",
             "telemetry.otlp@1",
@@ -640,6 +641,116 @@ async fn restart_replays_pending_request_then_advances_sequence() {
     assert_eq!(seen[0]["sequence"], first["sequence"]);
     assert_ne!(seen[1]["requestId"], seen[0]["requestId"]);
     assert_eq!(seen[1]["sequence"].as_u64(), seen[0]["sequence"].as_u64().map(|value| value + 1));
+}
+
+fn pre_service_memory_capabilities(job_capable: bool) -> Vec<&'static str> {
+    let mut capabilities = vec!["heartbeat", "diagnostics.policy.v1", "inventory.environment@1"];
+    if job_capable {
+        capabilities.push("jobs");
+    }
+    // Freeze the preceding release, independently of today's advertisement.
+    capabilities.extend([
+        "performance.client@1",
+        "performance.drive@1",
+        "performance.network@1",
+        "performance.object@1",
+        "performance.siteReplication@1",
+        "logs.capture@1",
+        "profile.cpu@1",
+        "profile.memory@1",
+        "profile.threads@1",
+        "telemetry.record@1",
+        "telemetry.otlp@1",
+        "telemetry.replay@1",
+        "top.api@1",
+        "top.disk@1",
+        "top.locks@1",
+        "top.net@1",
+        "top.rpc@1",
+        "inspect.object@1",
+    ]);
+    capabilities
+}
+
+fn pending_heartbeat_with_capabilities(capabilities: &[&str]) -> Value {
+    json!({
+        "protocolVersion": "v1",
+        "requestId": "550e8400-e29b-41d4-a716-446655440000",
+        "agentVersion": format!("rustfs-agent/{}", env!("CARGO_PKG_VERSION")),
+        "capabilities": capabilities,
+        "sequence": 0,
+        "clientTime": "2026-08-22T01:02:03Z",
+        "coarseNodeSummary": {"total": 1, "healthy": 1, "degraded": 0}
+    })
+}
+
+#[tokio::test]
+async fn restart_replays_exact_pre_service_memory_capabilities_with_and_without_jobs() {
+    for job_capable in [false, true] {
+        let pki = TestPki::new();
+        let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shutdown = CancellationToken::new();
+        let config = config(&temp, &pki, &server);
+        fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
+        let pending = pending_heartbeat_with_capabilities(&pre_service_memory_capabilities(job_capable));
+        let state = json!({"nextSequence": 0, "pending": pending});
+        fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
+        private_mode(&config.state_path);
+        let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+            .expect("start runtime")
+            .expect("configured runtime");
+        let mut status = runtime.status();
+        assert!(matches!(
+            wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+            HeartbeatStatus::Online { .. }
+        ));
+        runtime.shutdown().await;
+        let seen = server.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], pending);
+    }
+}
+
+#[tokio::test]
+async fn pre_service_memory_compatibility_does_not_accept_changed_capabilities() {
+    for job_capable in [false, true] {
+        for mutation in ["unknown", "missing", "duplicate", "reordered"] {
+            let pki = TestPki::new();
+            let server = server(&pki, vec![]).await;
+            let temp = tempfile::tempdir().expect("tempdir");
+            let shutdown = CancellationToken::new();
+            let config = config(&temp, &pki, &server);
+            fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
+            let mut capabilities = pre_service_memory_capabilities(job_capable);
+            match mutation {
+                "unknown" => capabilities.push("shell.exec@1"),
+                "missing" => {
+                    capabilities.pop();
+                }
+                "duplicate" => capabilities.push("profile.memory@1"),
+                "reordered" => capabilities.swap(5, 6),
+                _ => unreachable!(),
+            }
+            let state = json!({"nextSequence": 0, "pending": pending_heartbeat_with_capabilities(&capabilities)});
+            fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON"))
+                .expect("write heartbeat state");
+            private_mode(&config.state_path);
+            let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+                .expect("start runtime")
+                .expect("configured runtime");
+            let mut status = runtime.status();
+            assert!(
+                matches!(
+                    wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+                    HeartbeatStatus::Failed { reason } if reason.contains("violates the protocol invariants")
+                ),
+                "accepted altered persisted capabilities: {mutation}, jobs={job_capable}"
+            );
+            assert!(server.seen.lock().expect("seen lock").is_empty());
+            runtime.shutdown().await;
+        }
+    }
 }
 
 #[tokio::test]
