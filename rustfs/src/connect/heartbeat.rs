@@ -111,7 +111,15 @@ impl PendingHeartbeat {
                         super::diagnostics::CPU_PROFILE_CAPABILITY,
                     ]
                 || self.capabilities == heartbeat_capabilities(false)
-                || self.capabilities == heartbeat_capabilities(true))
+                || self.capabilities == heartbeat_capabilities(true)
+                // RUSTFS_COMPAT_TODO(connect-894) Remove after upgrades from the pre-service-memory capability set are unsupported.
+                // Preserve exact pending requests; never add the capability to a retry.
+                || [false, true].into_iter().any(|job_capable| {
+                    heartbeat_capabilities(job_capable)
+                        .iter()
+                        .filter(|capability| capability.as_str() != "profile.memory.service@1")
+                        .eq(self.capabilities.iter())
+                }))
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)

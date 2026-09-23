@@ -34,6 +34,9 @@ use super::profile_cpu::{
 
 const MAX_ALLOCATOR_STATS_BYTES: usize = 262_144;
 
+/// Service-job negotiation is separate from the unchanged memory result schema.
+pub const MEMORY_PROFILE_SERVICE_CAPABILITY: &str = "profile.memory.service@1";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocationSnapshot {
     total_allocated_bytes: u64,
