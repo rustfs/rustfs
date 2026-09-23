@@ -51,7 +51,7 @@ jobs:
       source_ref: ${{ steps.source.outputs.ref }}
     steps:
       - name: Checkout selected source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ env.NIGHTLY_BUILD_REF }}
@@ -71,7 +71,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -383,7 +383,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -473,7 +473,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -501,7 +501,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue
