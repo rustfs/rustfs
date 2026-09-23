@@ -8,6 +8,9 @@ collection:
 
 ## Operations
 
+For bounded local read-backend startup and cancellation, see
+[io_uring backend initialization](operations/io-uring-initialization.md).
+
 For legacy protection assessment and bounded protected copies, see [Object integrity inventory, audit, and migration](operations/shard-integrity-audit.md).
 
 Operational runbooks live under [`operations/`](operations/). Replication
