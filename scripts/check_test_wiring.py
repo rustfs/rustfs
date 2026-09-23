@@ -512,6 +512,10 @@ SCHEDULED_ALERT_CHECKOUT_OVERRIDES = {
     ".github/workflows/audit.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/coverage.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/e2e-replication-nightly.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
+    ".github/workflows/e2e-distributed.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
+    ".github/workflows/e2e-s3tests.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
+    ".github/workflows/mint.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
+    ".github/workflows/minio-interop.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
 }
 
 
@@ -5870,6 +5874,10 @@ class SelfTests(unittest.TestCase):
             ".github/workflows/audit.yml",
             ".github/workflows/coverage.yml",
             ".github/workflows/e2e-replication-nightly.yml",
+            ".github/workflows/e2e-distributed.yml",
+            ".github/workflows/e2e-s3tests.yml",
+            ".github/workflows/mint.yml",
+            ".github/workflows/minio-interop.yml",
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

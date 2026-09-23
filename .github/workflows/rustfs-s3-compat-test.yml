@@ -47,7 +47,7 @@ jobs:
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -73,7 +73,7 @@ jobs:
         run: python3 scripts/functional_chain_evidence.py consume
 
       - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           repository: rustfs/auto-testing
           ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
