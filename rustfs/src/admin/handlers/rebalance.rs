@@ -17,8 +17,7 @@ use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::rebalance::{
-    DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-    decode_rebalance_stop_propagation_record,
+    DiskStat, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
 };
 use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
@@ -280,10 +279,6 @@ async fn rollback_cluster_rebalance_start(
         .stop_rebalance_for_id(Some(rebalance_id))
         .await
         .map_err(|err| format!("local stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
-    store
-        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, rebalance_id)
-        .await
-        .map_err(|err| format!("local rollback stop metadata save for {rebalance_id} failed: {err}"))?;
     Ok(())
 }
 
@@ -984,12 +979,14 @@ async fn stop_rebalance_admission_first(
         .stop_rebalance_for_id(Some(expected_rebalance_id))
         .await
         .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
+    // `stop_rebalance_for_id` waits for the activation fence, marks every
+    // participating pool stopped, and durably saves that terminal snapshot.
+    // Saving `StoppedAt` again would acquire the same rebalance metadata lock a
+    // second time after the stop has already completed. In-flight worker cleanup
+    // can still be releasing that lock, turning a successful stop into an
+    // unrelated lock-retry delay on the admin request path.
     #[cfg(test)]
-    let _ = REBALANCE_STOP_TEST_PHASE.try_with(|phase| phase.store(2, std::sync::atomic::Ordering::Relaxed));
-    store
-        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
+    let _ = REBALANCE_STOP_TEST_PHASE.try_with(|phase| phase.store(3, std::sync::atomic::Ordering::Relaxed));
     Ok(Vec::new())
 }
 
@@ -1275,6 +1272,19 @@ mod rebalance_handler_tests {
             .expect("admin stop should persist the terminal state");
         assert!(stop_failures.is_empty());
         assert!(!fixture.store().is_rebalance_conflicting_with_decommission().await);
+        let store = fixture.store();
+        let rebalance_meta = store.rebalance_meta.read().await;
+        let rebalance_meta = rebalance_meta
+            .as_ref()
+            .expect("admin stop must retain terminal rebalance metadata");
+        assert!(rebalance_meta.stopped_at.is_some(), "admin stop must persist a terminal timestamp");
+        assert!(
+            rebalance_meta
+                .pool_stats
+                .iter()
+                .all(|pool| pool.info.status == RebalStatus::Stopped),
+            "admin stop must persist every participating pool as stopped"
+        );
     }
 
     #[tokio::test]
