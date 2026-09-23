@@ -90,7 +90,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
-const PART_METADATA_READ_CONCURRENCY: usize = 4;
+const PART_METADATA_READ_CONCURRENCY: usize = 8;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
