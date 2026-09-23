@@ -39,7 +39,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         # persist-credentials-exempt: update-flake-lock pushes the branch and opens
         # the PR. It passes FLAKE_UPDATE_TOKEN to create-pull-request itself rather
         # than reusing .git/config, but that is unverified — exempt until a
