@@ -2490,15 +2490,15 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let bucket = bucket.to_string();
-        let part_meta_paths = part_meta_paths.to_vec();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let part_meta_paths: Arc<[String]> = Arc::from(part_meta_paths);
 
         let tasks: Vec<_> = disks
             .iter()
             .map(|disk| {
                 let disk = disk.clone();
-                let bucket = bucket.clone();
-                let part_meta_paths = part_meta_paths.clone();
+                let bucket = Arc::clone(&bucket);
+                let part_meta_paths = Arc::clone(&part_meta_paths);
 
                 async move {
                     if let Some(disk) = disk {
