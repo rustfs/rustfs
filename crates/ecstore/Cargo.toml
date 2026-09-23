@@ -282,5 +282,9 @@ harness = false
 name = "single_block_non_inline_benchmark"
 harness = false
 
+[[bench]]
+name = "multipart_read_parts_benchmark"
+harness = false
+
 [lib]
 doctest = false

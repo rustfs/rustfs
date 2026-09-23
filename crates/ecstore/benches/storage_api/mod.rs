@@ -29,3 +29,7 @@ pub(crate) mod erasure {
 pub(crate) mod single_block_non_inline {
     pub(crate) use super::{BitrotWriterWrapper, CustomWriter, Erasure};
 }
+
+pub(crate) mod multipart {
+    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, Endpoint, new_disk};
+}
