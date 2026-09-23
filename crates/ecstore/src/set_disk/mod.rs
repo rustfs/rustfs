@@ -6809,7 +6809,10 @@ pub fn should_heal_object_on_disk(
     latest_meta: &FileInfo,
 ) -> (bool, bool, Option<DiskError>) {
     if let Some(err) = err
-        && (err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt)
+        && (err == &DiskError::FileNotFound
+            || err == &DiskError::FileVersionNotFound
+            || err == &DiskError::FileCorrupt
+            || err == &DiskError::VolumeNotFound)
     {
         return (true, true, Some(err.clone()));
     }
@@ -11262,6 +11265,12 @@ mod tests {
         let err = Some(DiskError::FileNotFound);
         let (should_heal, _, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
+
+        let err = Some(DiskError::VolumeNotFound);
+        let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        assert!(should_heal);
+        assert!(is_meta);
+        assert_eq!(reason, Some(DiskError::VolumeNotFound));
 
         let err = Some(DiskError::FileCorrupt);
         let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
