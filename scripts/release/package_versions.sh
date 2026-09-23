@@ -21,18 +21,28 @@ fail() {
 }
 
 if [[ $# -ne 5 ]]; then
-  fail "expected BUILD_TYPE SOURCE_VERSION DEV_SEQUENCE DEB_ARCH RPM_ARCH"
+  fail "expected BUILD_TYPE SOURCE_VERSION DEV_SEQUENCE ARCH LIBC"
 fi
 
 build_type=$1
 source_version=$2
 dev_sequence=$3
-deb_arch=$4
-rpm_arch=$5
+arch=$4
+libc=$5
 
-case "${deb_arch}:${rpm_arch}" in
-  amd64:x86_64 | arm64:aarch64) ;;
-  *) fail "unsupported or mismatched architecture pair" ;;
+case "$arch" in
+  x86_64 | aarch64) ;;
+  *) fail "unsupported architecture (expected x86_64 or aarch64)" ;;
+esac
+
+# The libc variant of the binary being packaged. It only distinguishes the
+# package FILE names (gnu and musl builds of the same version would otherwise
+# collide on the release); the dpkg/rpm package identity stays plain "rustfs"
+# so the two variants remain mutually exclusive upgrades, not co-installable
+# packages.
+case "$libc" in
+  gnu | musl) ;;
+  *) fail "unsupported libc variant (expected gnu or musl)" ;;
 esac
 
 semver_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
@@ -89,8 +99,23 @@ case "$build_type" in
   *) fail "unsupported build type" ;;
 esac
 
-deb_file="rustfs_${deb_version}_${deb_arch}.deb"
-rpm_file="rustfs-${rpm_version}-${rpm_release}.${rpm_arch}.rpm"
+# Package file names mirror the binary artifact names, whose zips are named
+# rustfs-linux-<arch>-<libc>-<version>.zip: all release assets of one build
+# share the same stem and differ only by extension. Non-development builds
+# embed the raw release tag after the 'v' marker exactly like the zips;
+# development builds embed dev-<sha> (zips use the short SHA, packages the
+# full one). The dpkg/rpm versions with their '~' prerelease ordering live
+# in the package metadata above and are independent of the file name.
+case "$build_type" in
+  development)
+    package_stem="rustfs-linux-${arch}-${libc}-dev-${source_sha}"
+    ;;
+  *)
+    package_stem="rustfs-linux-${arch}-${libc}-v${source_version}"
+    ;;
+esac
+deb_file="${package_stem}.deb"
+rpm_file="${package_stem}.rpm"
 
 # Emit only after every input and derived value has been validated. Consumers
 # may append this fixed five-line protocol directly to GITHUB_OUTPUT.
