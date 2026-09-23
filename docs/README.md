@@ -8,6 +8,9 @@ collection:
 
 ## Operations
 
+For the logical per-operation io_uring read cap, see
+[io_uring read chunk size](operations/io-uring-read-chunks.md).
+
 For bounded local read-backend startup and cancellation, see
 [io_uring backend initialization](operations/io-uring-initialization.md).
 
