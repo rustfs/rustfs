@@ -53,19 +53,19 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout acceptance harness
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Checkout exact RustFS source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           path: rustfs-source
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
       - name: Checkout exact Connect harness
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           repository: rustfs/connect
           path: connect-harness
