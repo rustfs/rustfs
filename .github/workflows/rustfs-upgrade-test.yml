@@ -207,7 +207,7 @@ jobs:
             local version="$1" tag asset url
             [ -n "${version}" ] && [ "${version}" != "null" ] || return 0
             tag="${version#v}"
-            asset="rustfs_${tag//-/.}_amd64.deb"
+            asset="rustfs-linux-x86_64-gnu-v${tag}.deb"
             url="https://github.com/rustfs/rustfs/releases/download/${tag}/${asset}"
             if ! gh api "repos/rustfs/rustfs/releases/tags/${tag}" --jq '.assets[].name' 2>/dev/null | grep -qxF "${asset}"; then
               echo "ERROR: release ${tag} has no downloadable asset ${asset}:" >&2

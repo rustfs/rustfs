@@ -133,7 +133,7 @@ jobs:
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
           elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
-            ARGS+=(--package-url "https://github.com/rustfs/rustfs/releases/download/${RUSTFS_VERSION}/rustfs_${RUSTFS_VERSION}_amd64.deb")
+            ARGS+=(--package-url "https://github.com/rustfs/rustfs/releases/download/${RUSTFS_VERSION}/rustfs-linux-x86_64-gnu-v${RUSTFS_VERSION}.deb")
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
