@@ -1493,12 +1493,7 @@ impl SetDisks {
                             scope.check()?;
                         }
                         if disks_to_heal_count == 0 {
-                            return Ok((
-                                result,
-                                volume_creation_error.or_else(|| {
-                                    Some(DiskError::other(format!("no bucket volume targets remain for {bucket}/{object}")))
-                                }),
-                            ));
+                            return Ok((result, volume_creation_error.or(Some(DiskError::ErasureWriteQuorum))));
                         }
 
                         // We write at temporary location and then rename to final location.
