@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, Endpoint, new_disk};
 use rustfs_filemeta::ObjectPartInfo;
 use std::hint::black_box;
 use std::time::Duration;
+
+mod storage_api;
+use storage_api::multipart::{DiskAPI, DiskOption, Endpoint, new_disk};
 
 fn bench_multipart_read_parts(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
