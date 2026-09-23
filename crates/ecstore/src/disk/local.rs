@@ -4304,6 +4304,7 @@ impl UringBackend {
         Self::try_new_with_budgets_and_read_chunk_size(root, get_io_uring_shards(), budget, read_budget, read_chunk_size).await
     }
 
+    #[cfg(test)]
     async fn try_new_with_budgets(
         root: PathBuf,
         shards: usize,
@@ -4313,6 +4314,7 @@ impl UringBackend {
         Self::try_new_with_budgets_and_read_chunk_size(root, shards, budget, read_budget, (*URING_READ_CHUNK_SIZE)?).await
     }
 
+    #[cfg(test)]
     async fn try_new_with_read_chunk_size(root: PathBuf, read_chunk_size: uring_read_chunks::ReadChunkSize) -> Option<Self> {
         let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
         let read_budget = URING_READ_BUDGET.as_ref()?;
