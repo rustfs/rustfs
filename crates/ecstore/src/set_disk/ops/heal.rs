@@ -1398,6 +1398,26 @@ impl SetDisks {
                             ));
                         }
 
+                        // `errs` is reported in physical-disk order while the
+                        // reconstruction loop below uses the shard order from
+                        // the selected metadata. Preserve which targets are
+                        // missing their bucket volume across that permutation.
+                        let mut missing_bucket_volumes = vec![false; out_dated_disks.len()];
+                        for (physical_index, error) in errs.iter().enumerate() {
+                            if error.as_ref() != Some(&DiskError::VolumeNotFound) {
+                                continue;
+                            }
+                            let shard_index = latest_meta
+                                .erasure
+                                .distribution
+                                .get(physical_index)
+                                .and_then(|index| index.checked_sub(1))
+                                .unwrap_or(physical_index);
+                            if let Some(target) = missing_bucket_volumes.get_mut(shard_index) {
+                                *target = true;
+                            }
+                        }
+
                         out_dated_disks = Self::shuffle_disks(&out_dated_disks, &latest_meta.erasure.distribution);
                         let mut parts_metadata = Self::shuffle_parts_metadata(&parts_metadata, &latest_meta.erasure.distribution);
                         let mut copy_parts_metadata = vec![None; parts_metadata.len()];
@@ -1422,6 +1442,63 @@ impl SetDisks {
                                 // that is expected to be in quorum.
                                 parts_metadata[index] = clean_file_info(&latest_meta);
                             }
+                        }
+
+                        // A missing bucket volume is a repairable object target,
+                        // but the final rename cannot create its parent volume.
+                        // Recreate only the affected volumes after quorum and
+                        // lifecycle checks have passed. Keep failures visible so
+                        // a partial repair cannot be reported as successful.
+                        let mut volume_creation_error = None;
+                        for (index, outdated_disk) in out_dated_disks.iter_mut().enumerate() {
+                            if !missing_bucket_volumes.get(index).copied().unwrap_or(false) || outdated_disk.is_none() {
+                                continue;
+                            }
+                            if let Some(scope) = &bucket_heal_scope {
+                                scope.check()?;
+                            }
+                            let disk = outdated_disk.as_ref().expect("checked above").clone();
+                            let endpoint = disk.endpoint().to_string();
+                            match disk.make_volume(bucket).await {
+                                Ok(()) | Err(DiskError::VolumeExists) => {}
+                                Err(error) => {
+                                    warn!(
+                                        event = EVENT_SET_DISK_HEAL,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_HEAL,
+                                        bucket,
+                                        object,
+                                        version_id,
+                                        disk_index = index,
+                                        endpoint = %endpoint,
+                                        error = %error,
+                                        state = "bucket_volume_recreate_failed",
+                                        "Heal object could not recreate the target bucket volume"
+                                    );
+                                    if volume_creation_error.is_none() {
+                                        volume_creation_error = Some(error.clone());
+                                    }
+                                    *outdated_disk = None;
+                                    disks_to_heal_count = disks_to_heal_count.saturating_sub(1);
+                                    for drive in &mut result.after.drives {
+                                        if drive.endpoint == endpoint {
+                                            drive.state = heal_drive_state_for_error(&error).to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(scope) = &bucket_heal_scope {
+                            scope.check()?;
+                        }
+                        if disks_to_heal_count == 0 {
+                            return Ok((
+                                result,
+                                volume_creation_error.or_else(|| {
+                                    Some(DiskError::other(format!("no bucket volume targets remain for {bucket}/{object}")))
+                                }),
+                            ));
                         }
 
                         // We write at temporary location and then rename to final location.
@@ -1863,6 +1940,10 @@ impl SetDisks {
                                      {bucket}/{object}"
                                 ))),
                             ));
+                        }
+
+                        if let Some(error) = volume_creation_error {
+                            return Ok((result, Some(error)));
                         }
 
                         if result.integrity_verified
@@ -4221,6 +4302,88 @@ mod heal_result_report_tests {
             missing_part.exists(),
             "deep heal must reconstruct the missing shard on the original disk slot"
         );
+    }
+
+    #[tokio::test]
+    async fn deep_heal_recreates_missing_bucket_volume_before_rebuilding_shard() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "deep-heal-missing-bucket-volume";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![0x5c; 1024 * 1024]);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written before volume loss");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+
+        disks[1]
+            .delete_volume(bucket, true)
+            .await
+            .expect("target bucket volume should be removable for the regression setup");
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(DiskError::VolumeNotFound)));
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deep heal should finish after bucket volume loss");
+
+        assert!(error.is_none(), "deep heal should recreate the missing bucket volume: {error:?}");
+        assert!(disks[1].stat_volume(bucket).await.is_ok(), "target bucket volume should be restored");
+        let healed = disks[1]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("healed target metadata should be readable");
+        assert_eq!(healed.data_dir, Some(data_dir));
+        assert_eq!(result.after.drives[1].state, DriveState::Ok.to_string());
+        assert!(
+            temp_dirs[1]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join("part.1")
+                .exists(),
+            "deep heal should rebuild the object shard after recreating its volume"
+        );
+
+        let (_, retry_error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("repeat heal should complete");
+        assert!(retry_error.is_none(), "repeat heal should be idempotent: {retry_error:?}");
     }
 
     #[tokio::test]
