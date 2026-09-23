@@ -109,7 +109,7 @@ runs:
       uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
 
     - name: Setup Rust cache
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         # false is rust-cache's own default. With true, cleanup.ts returns
         # *before* pruning ~/.cargo/registry/src, and config.ts archives the
