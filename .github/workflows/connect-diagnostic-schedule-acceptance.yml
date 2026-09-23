@@ -90,7 +90,7 @@ jobs:
             .head_sha == $source and .head_branch == "main"
             and .head_repository.full_name == $repository
             and .name == "Build and Release" and .path == ".github/workflows/build.yml"
-            and .status == "completed"
+            and .status == "completed" and .conclusion == "success"
           ' <<<"$run" >/dev/null
           jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e '
@@ -102,6 +102,8 @@ jobs:
             .workflow_run.id == $run and .workflow_run.head_sha == $source
             and .name == ("rustfs-linux-x86_64-gnu-dev-" + $source[0:7])
             and .digest == $digest and .expired == false
+            and (.expires_at | fromdateiso8601) > now
+            and .size_in_bytes > 0 and .size_in_bytes <= 2147483648
           ' <<<"$artifact" >/dev/null
 
           gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > official-artifact.zip
@@ -128,13 +130,15 @@ jobs:
           package = f"rustfs-linux-x86_64-gnu-dev-{os.environ['SOURCE_SHA'][:7]}.zip"
           with zipfile.ZipFile('official-artifact.zip') as outer:
               entries = outer.infolist()
+              assert 1 <= len(entries) <= 16
               assert len({item.filename for item in entries}) == len(entries)
               assert all(regular(item) and pathlib.PurePosixPath(item.filename).name == item.filename for item in entries)
+              assert sum(item.file_size for item in entries) <= 2147483648
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
                   assert {item.filename for item in entries} == {'rustfs', 'rustfs-cli'} and len(entries) == 2
-                  assert all(regular(item) for item in entries)
+                  assert all(regular(item) and 0 < item.file_size <= 1073741824 for item in entries)
                   assert inner.testzip() is None
                   pathlib.Path('binary').mkdir()
                   with inner.open('rustfs') as source, open('binary/rustfs', 'xb') as destination:
@@ -143,6 +147,7 @@ jobs:
           PY
           chmod 0755 binary/rustfs
           printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
+          file binary/rustfs | grep -Eq 'ELF 64-bit LSB.*x86-64'
 
       - name: Run the real scheduler and receipt delivery scenario
         shell: bash
