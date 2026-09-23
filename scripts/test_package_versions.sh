@@ -70,73 +70,73 @@ run_failure() {
 
 sha=0123456789abcdef0123456789abcdef01234567
 
-run_success stable-amd64-gnu \
-  $'deb_version=1.2.3\nrpm_version=1.2.3\nrpm_release=1\ndeb_file=rustfs_1.2.3_gnu_amd64.deb\nrpm_file=rustfs-gnu-1.2.3-1.x86_64.rpm' \
-  release 1.2.3 '' amd64 x86_64 gnu
-run_success stable-amd64-musl \
-  $'deb_version=1.2.3\nrpm_version=1.2.3\nrpm_release=1\ndeb_file=rustfs_1.2.3_musl_amd64.deb\nrpm_file=rustfs-musl-1.2.3-1.x86_64.rpm' \
-  release 1.2.3 '' amd64 x86_64 musl
-run_success alpha-arm64-gnu \
-  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3~alpha.1\nrpm_release=1\ndeb_file=rustfs_1.2.3~alpha.1_gnu_arm64.deb\nrpm_file=rustfs-gnu-1.2.3~alpha.1-1.aarch64.rpm' \
-  prerelease 1.2.3-alpha.1 '' arm64 aarch64 gnu
-run_success alpha-arm64-musl \
-  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3~alpha.1\nrpm_release=1\ndeb_file=rustfs_1.2.3~alpha.1_musl_arm64.deb\nrpm_file=rustfs-musl-1.2.3~alpha.1-1.aarch64.rpm' \
-  prerelease 1.2.3-alpha.1 '' arm64 aarch64 musl
-run_success beta-amd64-gnu \
-  $'deb_version=1.2.3~beta.2\nrpm_version=1.2.3~beta.2\nrpm_release=1\ndeb_file=rustfs_1.2.3~beta.2_gnu_amd64.deb\nrpm_file=rustfs-gnu-1.2.3~beta.2-1.x86_64.rpm' \
-  prerelease 1.2.3-beta.2 '' amd64 x86_64 gnu
-run_success rc-amd64-musl \
-  $'deb_version=1.2.3~rc.4\nrpm_version=1.2.3~rc.4\nrpm_release=1\ndeb_file=rustfs_1.2.3~rc.4_musl_amd64.deb\nrpm_file=rustfs-musl-1.2.3~rc.4-1.x86_64.rpm' \
-  prerelease 1.2.3-rc.4 '' amd64 x86_64 musl
-run_success preview-amd64-gnu \
-  $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs_1.0.0~rc.5~preview.2_gnu_amd64.deb\nrpm_file=rustfs-gnu-1.0.0~rc.5~preview.2-1.x86_64.rpm' \
-  preview 1.0.0-rc.5-preview.2 '' amd64 x86_64 gnu
-run_success preview-arm64-musl \
-  $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs_1.0.0~rc.5~preview.2_musl_arm64.deb\nrpm_file=rustfs-musl-1.0.0~rc.5~preview.2-1.aarch64.rpm' \
-  preview 1.0.0-rc.5-preview.2 '' arm64 aarch64 musl
-run_success development-amd64-gnu \
+run_success stable-x86_64-gnu \
+  $'deb_version=1.2.3\nrpm_version=1.2.3\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-gnu-v1.2.3.deb\nrpm_file=rustfs-linux-x86_64-gnu-v1.2.3.rpm' \
+  release 1.2.3 '' x86_64 gnu
+run_success stable-x86_64-musl \
+  $'deb_version=1.2.3\nrpm_version=1.2.3\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-musl-v1.2.3.deb\nrpm_file=rustfs-linux-x86_64-musl-v1.2.3.rpm' \
+  release 1.2.3 '' x86_64 musl
+run_success alpha-aarch64-gnu \
+  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3~alpha.1\nrpm_release=1\ndeb_file=rustfs-linux-aarch64-gnu-v1.2.3-alpha.1.deb\nrpm_file=rustfs-linux-aarch64-gnu-v1.2.3-alpha.1.rpm' \
+  prerelease 1.2.3-alpha.1 '' aarch64 gnu
+run_success alpha-aarch64-musl \
+  $'deb_version=1.2.3~alpha.1\nrpm_version=1.2.3~alpha.1\nrpm_release=1\ndeb_file=rustfs-linux-aarch64-musl-v1.2.3-alpha.1.deb\nrpm_file=rustfs-linux-aarch64-musl-v1.2.3-alpha.1.rpm' \
+  prerelease 1.2.3-alpha.1 '' aarch64 musl
+run_success beta-x86_64-gnu \
+  $'deb_version=1.2.3~beta.2\nrpm_version=1.2.3~beta.2\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-gnu-v1.2.3-beta.2.deb\nrpm_file=rustfs-linux-x86_64-gnu-v1.2.3-beta.2.rpm' \
+  prerelease 1.2.3-beta.2 '' x86_64 gnu
+run_success rc-x86_64-musl \
+  $'deb_version=1.2.3~rc.4\nrpm_version=1.2.3~rc.4\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-musl-v1.2.3-rc.4.deb\nrpm_file=rustfs-linux-x86_64-musl-v1.2.3-rc.4.rpm' \
+  prerelease 1.2.3-rc.4 '' x86_64 musl
+run_success preview-x86_64-gnu \
+  $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-gnu-v1.0.0-rc.5-preview.2.deb\nrpm_file=rustfs-linux-x86_64-gnu-v1.0.0-rc.5-preview.2.rpm' \
+  preview 1.0.0-rc.5-preview.2 '' x86_64 gnu
+run_success preview-aarch64-musl \
+  $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs-linux-aarch64-musl-v1.0.0-rc.5-preview.2.deb\nrpm_file=rustfs-linux-aarch64-musl-v1.0.0-rc.5-preview.2.rpm' \
+  preview 1.0.0-rc.5-preview.2 '' aarch64 musl
+run_success development-x86_64-gnu \
   "deb_version=0~dev.7463.${sha}
 rpm_version=0
 rpm_release=0.dev.7463.${sha}
-deb_file=rustfs_0~dev.7463.${sha}_gnu_amd64.deb
-rpm_file=rustfs-gnu-0-0.dev.7463.${sha}.x86_64.rpm" \
-  development "dev-${sha}" 7463 amd64 x86_64 gnu
-run_success development-arm64-musl \
+deb_file=rustfs-linux-x86_64-gnu-dev-${sha}.deb
+rpm_file=rustfs-linux-x86_64-gnu-dev-${sha}.rpm" \
+  development "dev-${sha}" 7463 x86_64 gnu
+run_success development-aarch64-musl \
   "deb_version=0~dev.7463.${sha}
 rpm_version=0
 rpm_release=0.dev.7463.${sha}
-deb_file=rustfs_0~dev.7463.${sha}_musl_arm64.deb
-rpm_file=rustfs-musl-0-0.dev.7463.${sha}.aarch64.rpm" \
-  development "dev-${sha}" 7463 arm64 aarch64 musl
+deb_file=rustfs-linux-aarch64-musl-dev-${sha}.deb
+rpm_file=rustfs-linux-aarch64-musl-dev-${sha}.rpm" \
+  development "dev-${sha}" 7463 aarch64 musl
 
 run_failure missing-arguments
-run_failure empty-build-type '' 1.2.3 '' amd64 x86_64 gnu
-run_failure unknown-build-type nightly 1.2.3 '' amd64 x86_64 gnu
-run_failure empty-version release '' '' amd64 x86_64 gnu
-run_failure release-with-sequence release 1.2.3 1 amd64 x86_64 gnu
-run_failure release-prerelease-mismatch release 1.2.3-rc.1 '' amd64 x86_64 gnu
-run_failure prerelease-release-mismatch prerelease 1.2.3 '' amd64 x86_64 gnu
-run_failure preview-malformed preview 1.2.3-rc.1-preview '' amd64 x86_64 gnu
-run_failure preview-wrong-shape preview 1.2.3-preview.1 '' amd64 x86_64 gnu
-run_failure short-semver release 1.2 '' amd64 x86_64 gnu
-run_failure leading-v release v1.2.3 '' amd64 x86_64 gnu
-run_failure leading-zero release 01.2.3 '' amd64 x86_64 gnu
-run_failure zero-sequence development "dev-${sha}" 0 amd64 x86_64 gnu
-run_failure leading-zero-sequence development "dev-${sha}" 01 amd64 x86_64 gnu
-run_failure non-decimal-sequence development "dev-${sha}" seven amd64 x86_64 gnu
-run_failure empty-dev-sha development dev- 1 amd64 x86_64 gnu
-run_failure short-dev-sha development dev-0123456 1 amd64 x86_64 gnu
-run_failure uppercase-dev-sha development dev-0123456789ABCDEF0123456789ABCDEF01234567 1 amd64 x86_64 gnu
-run_failure dev-extra-suffix development "dev-${sha}-dirty" 1 amd64 x86_64 gnu
-run_failure whitespace release '1.2.3 bad' '' amd64 x86_64 gnu
-run_failure command-substitution release "1.2.3\$(id)" '' amd64 x86_64 gnu
-run_failure backticks release "1.2.3\`id\`" '' amd64 x86_64 gnu
-run_failure newline release $'1.2.3\nforged=1' '' amd64 x86_64 gnu
-run_failure unsupported-deb-arch release 1.2.3 '' x86_64 x86_64 gnu
-run_failure mismatched-arch release 1.2.3 '' amd64 aarch64 gnu
-run_failure empty-libc release 1.2.3 '' amd64 x86_64 ''
-run_failure unknown-libc release 1.2.3 '' amd64 x86_64 static
-run_failure too-many-arguments release 1.2.3 '' amd64 x86_64 gnu extra
+run_failure empty-build-type '' 1.2.3 '' x86_64 gnu
+run_failure unknown-build-type nightly 1.2.3 '' x86_64 gnu
+run_failure empty-version release '' '' x86_64 gnu
+run_failure release-with-sequence release 1.2.3 1 x86_64 gnu
+run_failure release-prerelease-mismatch release 1.2.3-rc.1 '' x86_64 gnu
+run_failure prerelease-release-mismatch prerelease 1.2.3 '' x86_64 gnu
+run_failure preview-malformed preview 1.2.3-rc.1-preview '' x86_64 gnu
+run_failure preview-wrong-shape preview 1.2.3-preview.1 '' x86_64 gnu
+run_failure short-semver release 1.2 '' x86_64 gnu
+run_failure leading-v release v1.2.3 '' x86_64 gnu
+run_failure leading-zero release 01.2.3 '' x86_64 gnu
+run_failure zero-sequence development "dev-${sha}" 0 x86_64 gnu
+run_failure leading-zero-sequence development "dev-${sha}" 01 x86_64 gnu
+run_failure non-decimal-sequence development "dev-${sha}" seven x86_64 gnu
+run_failure empty-dev-sha development dev- 1 x86_64 gnu
+run_failure short-dev-sha development dev-0123456 1 x86_64 gnu
+run_failure uppercase-dev-sha development dev-0123456789ABCDEF0123456789ABCDEF01234567 1 x86_64 gnu
+run_failure dev-extra-suffix development "dev-${sha}-dirty" 1 x86_64 gnu
+run_failure whitespace release '1.2.3 bad' '' x86_64 gnu
+run_failure command-substitution release "1.2.3\$(id)" '' x86_64 gnu
+run_failure backticks release "1.2.3\`id\`" '' x86_64 gnu
+run_failure newline release $'1.2.3\nforged=1' '' x86_64 gnu
+run_failure unsupported-arch release 1.2.3 '' armv7 gnu
+run_failure empty-arch release 1.2.3 '' '' gnu
+run_failure empty-libc release 1.2.3 '' x86_64 ''
+run_failure unknown-libc release 1.2.3 '' x86_64 static
+run_failure too-many-arguments release 1.2.3 '' x86_64 gnu extra
 
 # Ordering contract shared by both package managers: every pre-release sorts
 # below its final release, every preview sorts below the pre-release it

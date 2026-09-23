@@ -279,14 +279,13 @@ jobs:
           BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
           SOURCE_VERSION: ${{ needs.resolve.outputs.version }}
           DEV_SEQUENCE: ${{ needs.resolve.outputs.dev_sequence }}
-          DEB_ARCH: ${{ matrix.deb_arch }}
-          RPM_ARCH: ${{ matrix.rpm_arch }}
+          ARCH: ${{ matrix.rpm_arch }}
           LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
           normalized=$(./scripts/release/package_versions.sh \
-            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$DEB_ARCH" "$RPM_ARCH" "$LIBC")
+            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$ARCH" "$LIBC")
           printf '%s\n' "$normalized" >> "$GITHUB_OUTPUT"
 
       - name: Download binary artifact from build run
@@ -594,10 +593,11 @@ jobs:
             for f in "$DEB_FILE" "$RPM_FILE"; do
               if [[ -n "$f" && -f "$f" ]]; then
                 base="$(basename "$f")"
-                # GitHub stores release asset names with '~' normalized to '.'
-                # (e.g. rustfs_1.0.0~rc.2_amd64.deb is stored as
-                # rustfs_1.0.0.rc.2_amd64.deb), so checksum entries must
-                # reference the name as stored on the release.
+                # GitHub stores release asset names with '~' normalized to '.'.
+                # Current package file names embed the raw tag and contain no
+                # '~', but older releases may still ship such assets, so the
+                # checksum entries must reference the name as stored on the
+                # release.
                 github_base="${base//\~/.}"
                 # Remove any stale entry (both naming variants), then append
                 grep -Fv -- "$base" "$checksum_file" > "${checksum_file}.tmp" || true
