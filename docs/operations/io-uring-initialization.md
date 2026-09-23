@@ -1,7 +1,7 @@
 # io_uring Backend Initialization
 
 **Use this when:** diagnosing local-disk startup or reconnect delays with the opt-in io_uring read backend, or reviewing cancellation and capacity ownership during backend construction.
-**Source of truth:** `crates/ecstore/src/disk/local.rs` (`UringBackend::try_new`, `build_local_io_backend`, `LocalDisk::new`), `crates/ecstore/src/disk/uring_probe.rs` (`run`, `MAX_CONCURRENT_PROBES`, `ProbeResult`) and `crates/ecstore/src/disk/uring_driver_budget.rs` (`BudgetedDriver`).
+**Source of truth:** `crates/ecstore/src/disk/local.rs` (`UringBackend::try_new`, `build_local_io_backend`, `LocalDisk::new`), `crates/ecstore/src/disk/uring_probe.rs` (`run`, `MAX_CONCURRENT_PROBES`, `ProbeResult`), `crates/ecstore/src/disk/uring_driver_budget.rs` (`BudgetedDriver`) and `crates/ecstore/src/disk/uring_read_budget.rs` (`ReadBudgetConfig`, `DriverReadBudget`).
 
 ## Initialization boundary
 
@@ -77,12 +77,93 @@ For example, a budget of `8` with `4` shards per disk permits at most two such
 driver reservations, including pending or retiring instances. This is a capacity
 example, not a tuning recommendation or measured performance result.
 
+## Optional shared driver read budget
+
+Configure both of these strict decimal byte counts to opt into a shared pool:
+
+| Setting | Meaning |
+| --- | --- |
+| `RUSTFS_IO_URING_READ_BUDGET_TOTAL_BYTES` | Total whole-driver reservation capacity for participating drivers in this process |
+| `RUSTFS_IO_URING_READ_BUDGET_DRIVER_BYTES` | One driver's in-flight read-buffer quota, shared by all of that driver's shards |
+
+Both unset preserves the existing count-only driver constructor. When enabled,
+both values must be positive, the driver quota must not exceed the total, and
+the driver quota must fit `tokio::sync::Semaphore::MAX_PERMITS`. Total capacity
+uses `usize` and is not narrowed to the driver's per-read `u32` acquisition size.
+Zero, a missing half of the pair, empty/non-Unicode values, signs, whitespace,
+overflow and out-of-range values disable io_uring construction with one safe
+configuration warning. Raw values are not logged. As with the driver-thread
+setting, configuration is read once on first enabled construction; restart is
+required to change it.
+
+The process retains one pool across backend retirement and disk reconstruction.
+Inside the existing bounded blocking probe, the library reserves the complete
+driver quota before creating rings. Idle drivers keep the full block; they do
+not borrow unused capacity from another admitted driver. Pool exhaustion returns
+`WouldBlock` without a kernel errno. Construction selects StdBackend for now,
+returns its tentative driver-thread reservation, and does not negatively cache
+the root. A later reconstruction can retry; an existing std backend does not
+automatically switch back when capacity becomes available. Native OS setup
+errors retain their existing classification, including an OS `EAGAIN` rather
+than a pool-generated `WouldBlock`.
+
+The library retains the reservation through driver ownership, deferred handles,
+queued requests and pending kernel reads. An exporter Arc can delay retirement.
+Clean final ownership release refunds the block; a bounded-drain leak retains
+the **entire** driver quota, even for a small leaked read. Thread-slot return and
+read-quota return therefore need not coincide. Closing one driver does not close
+the shared pool or another driver's admission. The application must not create
+a replacement pool to bypass retained reservations.
+
+### Operation size, fallback and returned results
+
+This pool covers only participating io_uring drivers' in-flight read-buffer
+allocations. It does not cover std fallback, full-result assembly, caller-held
+`Bytes`, metadata, probe buffers, allocator overhead, rings or io-wq resources.
+It is not a process RSS limit. A retained result remains readable after its
+driver retires and returns clean quota.
+
+This change retains the existing 128 MiB logical operation cap. If a configured
+driver quota is smaller, an individual larger operation returns `InvalidInput`
+before driver submission and the existing read path falls back to std. That
+error does not latch io_uring off. Direct I/O can exceed the quota even when
+logical length fits: its charge is the aligned enclosing range plus alignment
+allocation padding. No automatic shrinking or new chunk algorithm is introduced.
+
+Future integration with configurable logical chunks must size each operation
+against the physical direct-I/O charge, using the actual alignment and offset;
+setting the logical chunk size equal to the quota is not sufficient. Neither
+logical chunking nor std fallback extends this pool to retained/assembled results.
+Budget those owners separately before claiming an end-to-end memory limit.
+
+### Dependency and verification boundary
+
+The Linux dependency temporarily pins the merged `rustfs/uring` commit
+`c92fc4016502e12e6ba03483dcb2a1c3bf2e0a94`, which provides `SharedReadBudget`.
+Published registry version 0.2.2 does not contain that API. The exact Git revision
+and lockfile make this source choice explicit; replace both with a containing
+registry release after verifying the same contracts. No diagnostics,
+fault-injection or Tokio shutdown-adapter feature is enabled by this pin.
+
+Portable tests exercise the strict configuration pair. Native backend tests
+cover shared admission, temporary denial without negative-cache pollution,
+thread-slot rollback, exporter-held retirement, same-root retry, independent
+peer reads, and small-quota fallback with retained result bytes. A native
+padding case first proves O_DIRECT with fixed 4096-byte alignment, then
+verifies that logical 4096-byte reads exceed a 4096-byte quota once allocation
+padding is charged, while std fallback remains byte-exact and does not latch
+io_uring off. The library's own fault-injection suite verifies whole-quota leak retention; the application
+tests do not inject a stuck kernel read. Compilation or restricted-host skips
+alone do not prove native execution or a memory/performance improvement.
+
 ## Scope of the limits
 
 Initialization admission ends when the caller takes the completed result. The
 optional driver-thread reservation instead follows driver lifetime. Neither
 limits disk count, Tokio blocking-pool threads, io-wq workers, retained read
 results, leaked kernel-visible buffers or process-wide read-buffer memory.
+The separate shared read pool bounds only the participating driver quotas and
+keeps their leaked reservations charged, with the exclusions described above.
 Std fallback retains its existing resource behavior; a driver thread budget
 does not become a whole-process thread or memory bound through that fallback.
 
