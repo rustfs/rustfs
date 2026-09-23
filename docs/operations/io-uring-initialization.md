@@ -117,11 +117,23 @@ a replacement pool to bypass retained reservations.
 
 ### Operation size, fallback and returned results
 
+An optional process-wide returned-result reservation can be enabled with
+`RUSTFS_IO_URING_READ_RESULT_BUDGET_BYTES`. The value is a strict positive
+decimal byte count. A read reserves its requested result length before either
+the io_uring path or its std fallback starts; exhaustion returns `WouldBlock`
+to the caller and is never routed through the fallback. Successful results use
+`Bytes::from_owner` to retain the receipt through every returned `Bytes` clone,
+so a caller-held result remains charged until its final owner is dropped. The
+pool is shared by all io_uring backends in the process and survives disk
+reconstruction.
+
 This pool covers only participating io_uring drivers' in-flight read-buffer
-allocations. It does not cover std fallback, full-result assembly, caller-held
-`Bytes`, metadata, probe buffers, allocator overhead, rings or io-wq resources.
-It is not a process RSS limit. A retained result remains readable after its
-driver retires and returns clean quota.
+allocations. The result pool covers the requested output and the std fallback
+result; it does not cover metadata, probe buffers, allocator overhead, rings or
+io-wq resources. It is not an RSS measurement and does not yet account for
+allocator slack or every physical direct-I/O padding byte. A retained result
+remains readable after its driver retires while its result receipt keeps the
+process result budget charged.
 
 This change retains the existing 128 MiB logical operation cap. If a configured
 driver quota is smaller, an individual larger operation returns `InvalidInput`
@@ -134,7 +146,9 @@ Future integration with configurable logical chunks must size each operation
 against the physical direct-I/O charge, using the actual alignment and offset;
 setting the logical chunk size equal to the quota is not sufficient. Neither
 logical chunking nor std fallback extends this pool to retained/assembled results.
-Budget those owners separately before claiming an end-to-end memory limit.
+The result pool is a separate owner domain from the driver pool. Budget direct
+physical padding, assembled intermediate buffers, and RSS sampling separately
+before claiming an end-to-end physical-memory limit.
 
 ### Dependency and verification boundary
 
@@ -160,12 +174,13 @@ alone do not prove native execution or a memory/performance improvement.
 
 Initialization admission ends when the caller takes the completed result. The
 optional driver-thread reservation instead follows driver lifetime. Neither
-limits disk count, Tokio blocking-pool threads, io-wq workers, retained read
-results, leaked kernel-visible buffers or process-wide read-buffer memory.
-The separate shared read pool bounds only the participating driver quotas and
-keeps their leaked reservations charged, with the exclusions described above.
-Std fallback retains its existing resource behavior; a driver thread budget
-does not become a whole-process thread or memory bound through that fallback.
+the driver pool nor the result pool limits disk count, Tokio blocking-pool
+threads, io-wq workers, assembled intermediate buffers, leaked kernel-visible
+buffers or RSS. The shared read pool bounds only participating driver quotas;
+the result pool bounds requested returned-result ownership, including std
+fallback results. Std fallback allocation slack and physical direct-I/O padding
+remain outside these logical byte pools; a driver thread budget does not become
+a whole-process thread or memory bound through fallback.
 
 A slow probe can still delay readiness for its disk. Offloading protects the
 async worker from performing that synchronous probe; it does not accelerate
