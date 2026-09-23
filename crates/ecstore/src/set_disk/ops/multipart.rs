@@ -66,6 +66,7 @@ use crate::disk::DiskOption;
 use crate::disk::STORAGE_FORMAT_FILE;
 #[cfg(test)]
 use crate::disk::new_disk;
+use crate::erasure::coding::BitrotWriterWrapper;
 use crate::multipart_listing::paginate_multipart_listing;
 #[cfg(test)]
 use crate::object_api::ObjectLockConfigSnapshot;
@@ -77,7 +78,7 @@ use crate::storage_api_contracts::multipart::MultipartOperations;
 #[cfg(test)]
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::storage_api_contracts::object::ObjectOperations;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future::join_all, stream};
 #[cfg(test)]
 use http::HeaderMap;
 use rustfs_filemeta::metadata_keys;
@@ -99,6 +100,49 @@ use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
+
+// The erasure-set width bounds fan-out. Await every opener so errors retain
+// their disk slots and every successful writer remains owned until quorum is checked.
+async fn create_part_writers(
+    disks: &[Option<DiskStore>],
+    path: &str,
+    length: i64,
+    shard_size: usize,
+) -> (Vec<Option<BitrotWriterWrapper>>, Vec<Option<DiskError>>) {
+    join_all(disks.iter().map(|disk| async move {
+        let Some(disk) = disk else {
+            return (None, Some(DiskError::DiskNotFound));
+        };
+        match create_bitrot_writer(
+            false,
+            Some(disk),
+            RUSTFS_META_TMP_BUCKET,
+            path,
+            length,
+            shard_size,
+            HashAlgorithm::HighwayHash256S,
+        )
+        .await
+        {
+            Ok(writer) => (Some(writer), None),
+            Err(err) => {
+                warn!(
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    disk = ?disk,
+                    state = "bitrot_writer_skipped",
+                    error = ?err,
+                    "Set disk multipart bitrot writer skipped"
+                );
+                (None, Some(err))
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .unzip()
+}
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
@@ -1542,45 +1586,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .map_err(Error::from)?);
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let mut writers = Vec::with_capacity(shuffle_disks.len());
-            let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
-                if let Some(disk) = disk_op {
-                    let writer = match create_bitrot_writer(
-                        false,
-                        Some(disk),
-                        RUSTFS_META_TMP_BUCKET,
-                        &tmp_part_path,
-                        erasure.shard_file_size(data.size()),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
-                    )
-                    .await
-                    {
-                        Ok(writer) => writer,
-                        Err(err) => {
-                            warn!(
-                                event = EVENT_SET_DISK_MULTIPART,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                disk = ?disk,
-                                state = "bitrot_writer_skipped",
-                                error = ?err,
-                                "Set disk multipart bitrot writer skipped"
-                            );
-                            errors.push(Some(err));
-                            writers.push(None);
-                            continue;
-                        }
-                    };
-
-                    writers.push(Some(writer));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    writers.push(None);
-                }
-            }
+            let (mut writers, errors) = create_part_writers(
+                &shuffle_disks,
+                &tmp_part_path,
+                erasure.shard_file_size(data.size()),
+                erasure.shard_size(),
+            )
+            .await;
 
             if let Some(stage_start) = writer_setup_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -3593,6 +3605,82 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[tokio::test]
+    async fn multipart_writer_setup_opens_disks_concurrently_and_preserves_error_slots() {
+        use crate::cluster::rpc::internode_data_transport::{
+            InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, WalkDirStreamRequest,
+            WriteStreamRequest,
+        };
+        use crate::cluster::rpc::remote_disk::RemoteDisk;
+        use crate::disk::{Disk, FileReader, FileWriter};
+
+        #[derive(Debug)]
+        struct BarrierTransport {
+            barrier: Arc<tokio::sync::Barrier>,
+            fail: bool,
+        }
+        #[async_trait::async_trait]
+        impl InternodeDataTransport for BarrierTransport {
+            async fn open_read(&self, _: ReadStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not read")
+            }
+            async fn open_walk_dir(&self, _: WalkDirStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not list")
+            }
+            async fn open_write(&self, request: WriteStreamRequest) -> disk::error::Result<FileWriter> {
+                assert_eq!(request.volume, RUSTFS_META_TMP_BUCKET);
+                assert_eq!(request.path, "upload/part.1");
+                self.barrier.wait().await;
+                if self.fail {
+                    Err(DiskError::FileAccessDenied)
+                } else {
+                    Ok(Box::new(tokio::io::sink()))
+                }
+            }
+            fn name(&self) -> &'static str {
+                "multipart-writer-test"
+            }
+            fn capabilities(&self) -> InternodeDataTransportCapabilities {
+                InternodeDataTransportCapabilities::tcp_http()
+            }
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut disks = Vec::new();
+        for i in 0..3 {
+            let endpoint = Endpoint {
+                url: url::Url::parse(&format!("http://multipart-test.invalid:9000/disk{i}")).expect("endpoint"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i,
+            };
+            let disk = RemoteDisk::new(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+                Arc::new(BarrierTransport {
+                    barrier: Arc::clone(&barrier),
+                    fail: i == 1,
+                }),
+            )
+            .await
+            .expect("remote disk");
+            disks.push(Some(Arc::new(Disk::Remote(Box::new(disk)))));
+        }
+        disks.insert(1, None);
+        // A serial opener cannot cross the barrier. The timeout only bounds failures;
+        // the assertion depends on all three independent openers making progress.
+        let (writers, errors) =
+            tokio::time::timeout(Duration::from_secs(10), create_part_writers(&disks, "upload/part.1", 1024, 256))
+                .await
+                .expect("all disk openers must be polled concurrently");
+        assert_eq!(writers.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, false, true]);
+        assert_eq!(errors, [None, Some(DiskError::DiskNotFound), Some(DiskError::FileAccessDenied), None]);
+    }
 
     #[test]
     fn multipart_bucket_incarnation_metadata_is_consistent_and_non_nil() {
