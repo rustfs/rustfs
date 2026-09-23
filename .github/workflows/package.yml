@@ -289,7 +289,7 @@ jobs:
           printf '%s\n' "$normalized" >> "$GITHUB_OUTPUT"
 
       - name: Download binary artifact from build run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: ${{ matrix.artifact_name }}*
           path: ./binary-artifact
@@ -495,7 +495,7 @@ jobs:
           echo "✅ RPM built: $RPM_FILE"
 
       - name: Upload packages to artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: packages-${{ matrix.arch }}-${{ matrix.libc }}
           path: |

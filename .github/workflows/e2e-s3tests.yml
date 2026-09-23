@@ -264,7 +264,7 @@ jobs:
               hostname: rustfs4
               volumes: [rustfs4-data:/data]
             lb:
-              image: haproxy:2.9
+              image: haproxy:3.4.4
               hostname: lb
               networks: [rustfs-net]
               ports:
@@ -307,6 +307,11 @@ jobs:
           EOF
 
           docker compose -f compose.yml up -d
+
+          # Validate the pinned HAProxy image parses the exact config before
+          # the S3 compatibility sweep starts.
+          docker compose -f compose.yml exec -T lb \
+            haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
 
       - name: Wait for RustFS ready
         run: |
@@ -357,7 +362,7 @@ jobs:
 
       - name: Upload artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s3tests-${{ env.TEST_MODE }}-shard-${{ matrix.shard-index }}
           path: artifacts/**
@@ -435,7 +440,7 @@ jobs:
 
       - name: Upload canary artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s3tests-upstream-head
           path: artifacts/s3tests-upstream-head/**
