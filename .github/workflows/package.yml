@@ -25,9 +25,10 @@
 #
 # Flow:
 # 1. Resolve and validate the selected Build workflow run and source identity
-# 2. Download Linux binaries (x86_64-gnu, aarch64-gnu) from build artifacts
-# 3. Build DEB packages for amd64 and arm64
-# 4. Build RPM packages for x86_64 and aarch64
+# 2. Download Linux binaries (x86_64-gnu, aarch64-gnu, x86_64-musl,
+#    aarch64-musl) from build artifacts
+# 3. Build DEB packages for amd64 and arm64, gnu and musl variants
+# 4. Build RPM packages for x86_64 and aarch64, gnu and musl variants
 # 5. Upload all packages to Cloudflare R2 and the GitHub release
 
 name: Package DEB/RPM
@@ -224,9 +225,9 @@ jobs:
           echo "  Build run ID: $BUILD_RUN_ID"
           echo "  Build run number: $RUN_NUMBER"
 
-  # Build DEB and RPM packages for each architecture
+  # Build DEB and RPM packages for each architecture and libc variant
   package:
-    name: Package (${{ matrix.arch }})
+    name: Package (${{ matrix.arch }}-${{ matrix.libc }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -236,13 +237,35 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            libc: gnu
             deb_arch: amd64
             rpm_arch: x86_64
             artifact_name: "rustfs-linux-x86_64-gnu"
+            # gnu binaries dynamically link glibc; musl binaries are static
+            # and run without a libc dependency.
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
           - arch: aarch64
+            libc: gnu
             deb_arch: arm64
             rpm_arch: aarch64
             artifact_name: "rustfs-linux-aarch64-gnu"
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
+          - arch: x86_64
+            libc: musl
+            deb_arch: amd64
+            rpm_arch: x86_64
+            artifact_name: "rustfs-linux-x86_64-musl"
+            deb_depends: ""
+            rpm_depends: ""
+          - arch: aarch64
+            libc: musl
+            deb_arch: arm64
+            rpm_arch: aarch64
+            artifact_name: "rustfs-linux-aarch64-musl"
+            deb_depends: ""
+            rpm_depends: ""
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -258,11 +281,12 @@ jobs:
           DEV_SEQUENCE: ${{ needs.resolve.outputs.dev_sequence }}
           DEB_ARCH: ${{ matrix.deb_arch }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
           normalized=$(./scripts/release/package_versions.sh \
-            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$DEB_ARCH" "$RPM_ARCH")
+            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$DEB_ARCH" "$RPM_ARCH" "$LIBC")
           printf '%s\n' "$normalized" >> "$GITHUB_OUTPUT"
 
       - name: Download binary artifact from build run
@@ -308,6 +332,8 @@ jobs:
           DEB_VERSION: ${{ steps.versions.outputs.deb_version }}
           DEB_ARCH: ${{ matrix.deb_arch }}
           DEB_FILE: ${{ steps.versions.outputs.deb_file }}
+          DEB_DEPENDS: ${{ matrix.deb_depends }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
@@ -345,9 +371,17 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: ${DEB_ARCH}
-          Depends: libc6 (>= 2.31)
+          EOF
+
+          # gnu binaries dynamically link glibc and must declare it; musl
+          # binaries are statically linked and need no libc dependency.
+          if [[ -n "$DEB_DEPENDS" ]]; then
+            echo "Depends: ${DEB_DEPENDS}" >> "${PKG_DIR}/DEBIAN/control"
+          fi
+
+          cat >> "${PKG_DIR}/DEBIAN/control" << EOF
           Maintainer: RustFS Team <support@rustfs.com>
-          Description: High-performance distributed object storage
+          Description: High-performance distributed object storage (${LIBC} build)
            RustFS is a high-performance distributed object storage software
            built using Rust. It is compatible with MinIO and S3 API.
           Homepage: https://rustfs.com
@@ -389,14 +423,23 @@ jobs:
           RPM_RELEASE: ${{ steps.versions.outputs.rpm_release }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
           RPM_FILE: ${{ steps.versions.outputs.rpm_file }}
+          RPM_DEPENDS: ${{ matrix.rpm_depends }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
-          echo "Building RPM for ${RPM_ARCH}"
+          echo "Building RPM for ${RPM_ARCH} (${LIBC})"
 
           sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential rpm
           sudo gem install fpm
           ./scripts/test_package_versions.sh --require-package-managers
+
+          # gnu binaries dynamically link glibc and must declare it; musl
+          # binaries are statically linked and need no libc dependency.
+          depends_args=()
+          if [[ -n "$RPM_DEPENDS" ]]; then
+            depends_args+=(--depends "$RPM_DEPENDS")
+          fi
 
           # Create config file for fpm (DEB build creates it in its package dir structure,
           # but fpm needs the file to exist before packaging)
@@ -420,9 +463,9 @@ jobs:
             --iteration "$RPM_RELEASE" \
             --architecture "$RPM_ARCH" \
             --package "$RPM_FILE" \
-            --depends "glibc >= 2.31" \
+            "${depends_args[@]}" \
+            --description "High-performance distributed object storage (${LIBC} build)" \
             --maintainer "RustFS Team <support@rustfs.com>" \
-            --description "High-performance distributed object storage" \
             --url "https://rustfs.com" \
             --license "Apache-2.0" \
             --before-install <(./scripts/release/package_service_scripts.sh rpm-before-install) \
@@ -455,7 +498,7 @@ jobs:
       - name: Upload packages to artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: packages-${{ matrix.arch }}
+          name: packages-${{ matrix.arch }}-${{ matrix.libc }}
           path: |
             *.deb
             *.rpm
