@@ -144,11 +144,7 @@ async fn real_rustfs_peer_accepts_authenticated_payload_and_attributes_disconnec
     use rustfs_ecstore::api::rpc::{NetworkPeerProbeClient, NetworkPeerProbeError};
 
     let _guard = TEST_HARNESS_LOCK.lock().await;
-    let port = match find_available_port() {
-        Ok(port) => port,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("find free port: {error}"),
-    };
+    let port = find_available_port().expect("real peer test requires an available loopback port");
     let server = RustFSServerBuilder::new()
         .address(format!("127.0.0.1:{port}"))
         .access_key("network-probe-access")
@@ -178,6 +174,19 @@ async fn real_rustfs_peer_accepts_authenticated_payload_and_attributes_disconnec
     assert_eq!(measurement.transferred_bytes, 65_536);
     assert!(!measurement.duration.is_zero());
     assert!(!measurement.latency.is_zero());
+
+    let pacing_started = tokio::time::Instant::now();
+    let paced = client
+        .clone()
+        .with_diagnostic_pacing(pacing_started, Duration::from_secs(2))
+        .expect("opt-in diagnostic pacing");
+    let paced_measurement = paced
+        .probe("peer-1", 65_536, Duration::from_secs(2), &CancellationToken::new())
+        .await
+        .expect("real authenticated peer accepts paced chunks");
+    assert_eq!(paced_measurement.transferred_bytes, 65_536);
+    assert!(pacing_started.elapsed() >= Duration::from_millis(63));
+    assert!(paced_measurement.latency <= paced_measurement.duration);
 
     server.shutdown().await;
     assert_eq!(
@@ -343,6 +352,54 @@ async fn invalid_and_over_budget_requests_fail_before_peer_io() {
         Err(NetworkPerformanceError::InvalidRequest)
     ));
     assert_eq!(harness.0.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn network_admission_preserves_the_999_millisecond_n_and_n_plus_one_boundary() {
+    let _guard = TEST_HARNESS_LOCK.lock().await;
+    let harness = CountingHarness(AtomicUsize::new(0));
+    let mut bounded = request(1);
+    bounded.duration = Duration::from_millis(999);
+    bounded.traffic_bytes_per_peer = 1_047_527;
+    let measurement = measure_network_with_harness(&bounded, &harness, &CancellationToken::new())
+        .await
+        .expect("N is admitted");
+    assert_eq!(measurement.result.outcome(), NetworkOutcome::Succeeded);
+    bounded.traffic_bytes_per_peer += 1;
+    assert!(matches!(
+        measure_network_with_harness(&bounded, &harness, &CancellationToken::new()).await,
+        Err(NetworkPerformanceError::LimitExceeded)
+    ));
+    assert_eq!(harness.0.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_and_peer_durations_share_the_tokio_clock_with_submillisecond_remainders() {
+    struct ClockHarness;
+    impl NetworkPeerHarness for ClockHarness {
+        fn probe<'a>(&'a self, _peer_alias: &'a str, traffic_bytes: u64, _cancel: &'a CancellationToken) -> PeerProbeFuture<'a> {
+            Box::pin(async move {
+                let started = tokio::time::Instant::now();
+                tokio::time::advance(Duration::from_micros(1_500)).await;
+                Ok(PeerProbeMeasurement {
+                    transferred_bytes: traffic_bytes,
+                    duration: started.elapsed(),
+                    latency: Duration::from_micros(500),
+                })
+            })
+        }
+    }
+    let _guard = TEST_HARNESS_LOCK.lock().await;
+    let mut request = request(1);
+    request.traffic_bytes_per_peer = 1;
+    let measurement = measure_network_with_harness(&request, &ClockHarness, &CancellationToken::new())
+        .await
+        .expect("clock-bound result");
+    let value = serde_json::to_value(&measurement.result).expect("result JSON");
+    assert_eq!(value["durationMillis"], 1);
+    assert_eq!(value["data"]["durationMillis"], 1);
+    assert_eq!(measurement.peers[0].duration_millis, 1);
+    assert_eq!(measurement.peers[0].latency_micros, Some(500));
 }
 
 struct BlockingHarness;
