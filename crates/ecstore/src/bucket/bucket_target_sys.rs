@@ -410,10 +410,9 @@ pub struct BucketTargetSys {
     /// a verdict from inside its synchronous PUT-response audit.
     version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
     /// Target ARNs whose remote rejected a PUT / CreateMultipartUpload
-    /// `versionId` query with `InvalidArgument`. A standard S3 target (AWS S3
-    /// included) never accepts that query on those operations; once a target
-    /// has rejected it, later requests to the same ARN omit the query instead
-    /// of failing the replica again. Reset alongside `arn_remotes_map`.
+    /// `versionId` query with `InvalidArgument`; later requests to the same
+    /// ARN omit the query instead of failing again. Reset alongside
+    /// `version_identity_map` — same lifetime, same reasoning.
     put_version_id_query_rejected: Arc<std::sync::RwLock<HashSet<String>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     /// Buckets whose persisted `bucket-targets.json` exists but cannot be
@@ -1285,6 +1284,7 @@ impl BucketTargetSys {
                     .is_none_or(|edited| !same_replication_service(edited, &target))
                 {
                     self.forget_version_identity_capability(&target.arn);
+                    self.forget_put_version_id_query_rejected(&target.arn);
                 }
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
@@ -3668,6 +3668,56 @@ mod tests {
         // A rebuilt target may point at a different service.
         sys.forget_put_version_id_query_rejected(arn);
         assert!(!sys.put_version_id_query_rejected(arn));
+    }
+
+    #[tokio::test]
+    async fn update_all_targets_forgets_put_version_id_rejection_when_endpoint_changes() {
+        // Editing a target's ARN to point at a different endpoint must not
+        // carry over a stale "this remote rejects versionId" verdict from the
+        // service it used to point at (rustfs review follow-up on the
+        // versionId-on-PUT fix): otherwise a peer that legitimately needs the
+        // query silently loses version-id fidelity until the process restarts.
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:versionid";
+        let target = |endpoint: &str| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: endpoint.to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("aws-s3.example:9000")],
+            }),
+        )
+        .await;
+        sys.record_put_version_id_query_rejected(arn);
+        assert!(sys.put_version_id_query_rejected(arn));
+
+        // Same ARN, different endpoint: the update path (not `delete`) is the
+        // only thing that runs here, so the reset must come from
+        // `update_all_targets_locked` itself.
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("minio-peer.example:9000")],
+            }),
+        )
+        .await;
+
+        assert!(
+            !sys.put_version_id_query_rejected(arn),
+            "editing the target to a different endpoint must forget the stale rejection verdict"
+        );
     }
 
     #[test]
