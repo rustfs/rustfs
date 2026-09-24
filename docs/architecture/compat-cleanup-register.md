@@ -11,6 +11,8 @@
 
 ## Open Items
 
+- `connect-894` pending Connect heartbeats: replay the exact preceding producer-capability list, with or without jobs, when upgrading to the memory-service capability. Preserve request ID, sequence, and persisted body rather than inserting the new capability into a retry. Remove after upgrades from the pre-service-memory capability set are unsupported.
+
 - `backlog-2539` administrator erasure-set scope: decode historical pending intents whose empty bucket list omitted the all-buckets marker. Normalize that representation to the explicit scope before replay or checkpoint comparison. Remove after all pre-marker administrator ErasureSet intents are retired; deployment verification must confirm that no such pending records remain on coordinator disks.
 
 - `backlog-2519` retained admin heal reports: keep the schema-1 terminal as the commit and replay fence, with a bounded versioned report in a separate namespace on the same disk. Older rollback readers can still query the terminal and suppress replay, but cannot expose its outcome; newer readers mark missing outcomes as unavailable. Remove the legacy marker and missing-report adapter only after all supported direct-upgrade and rollback readers understand the report format and retained schema-1-only receipts have expired.

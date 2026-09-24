@@ -857,11 +857,10 @@ impl ECStore {
         opts: &HealOpts,
         allow_unversioned_absence: bool,
     ) -> Result<HealObjectStorageResult> {
-        if opts.dry_run
-            || opts.no_lock
-            || (!allow_unversioned_absence && version_id.is_empty())
-            || super::utils::is_reserved_or_invalid_bucket(bucket, false)
-        {
+        // Object heal may recreate a missing bucket volume before committing a
+        // shard. Keep the current bucket generation fenced for the whole
+        // operation, including the ordinary unversioned path.
+        if opts.dry_run || opts.no_lock || super::utils::is_reserved_or_invalid_bucket(bucket, false) {
             let (item, error) = self.handle_heal_object(bucket, object, version_id, opts).await?;
             return Ok(HealObjectStorageResult {
                 item,

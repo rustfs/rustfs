@@ -6809,7 +6809,10 @@ pub fn should_heal_object_on_disk(
     latest_meta: &FileInfo,
 ) -> (bool, bool, Option<DiskError>) {
     if let Some(err) = err
-        && (err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt)
+        && (err == &DiskError::FileNotFound
+            || err == &DiskError::FileVersionNotFound
+            || err == &DiskError::FileCorrupt
+            || err == &DiskError::VolumeNotFound)
     {
         return (true, true, Some(err.clone()));
     }
@@ -6818,7 +6821,12 @@ pub fn should_heal_object_on_disk(
         return (false, false, err.clone());
     }
 
-    if !meta.equals(latest_meta) {
+    // `FileInfo::equals` intentionally compares the erasure payload shape and
+    // modification time, but it does not compare the selected version or the
+    // delete-marker bit. Heal uses this decision for versioned metadata, so a
+    // stale historical version that is still marked latest must be treated as
+    // outdated even when those storage-level fields happen to match.
+    if !meta.equals(latest_meta) || !heal_metadata_identity_matches(meta, latest_meta) {
         debug!(
             event = EVENT_SET_DISK_HEAL,
             component = LOG_COMPONENT_ECSTORE,
@@ -6839,6 +6847,11 @@ pub fn should_heal_object_on_disk(
         }
     }
     (false, false, None)
+}
+
+fn heal_metadata_identity_matches(meta: &FileInfo, latest_meta: &FileInfo) -> bool {
+    meta.deleted == latest_meta.deleted
+        && meta.version_id.filter(|version| !version.is_nil()) == latest_meta.version_id.filter(|version| !version.is_nil())
 }
 
 /// Probe every drive of the set at once. Each live probe is bounded by the
@@ -11263,6 +11276,12 @@ mod tests {
         let (should_heal, _, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
 
+        let err = Some(DiskError::VolumeNotFound);
+        let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        assert!(should_heal);
+        assert!(is_meta);
+        assert_eq!(reason, Some(DiskError::VolumeNotFound));
+
         let err = Some(DiskError::FileCorrupt);
         let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
@@ -11277,6 +11296,29 @@ mod tests {
         let (should_heal, _, reason) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
         assert_eq!(reason, Some(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn stale_delete_marker_identity_requires_metadata_heal() {
+        let historical_version = Uuid::new_v4();
+        let marker_version = Uuid::new_v4();
+        let mut stale = FileInfo {
+            version_id: Some(historical_version),
+            ..FileInfo::default()
+        };
+        let mut latest = stale.clone();
+        stale.deleted = false;
+        latest.deleted = true;
+        latest.version_id = Some(marker_version);
+
+        // The generic equality helper intentionally considers these records
+        // equal when their erasure shape and mod-time match. Heal must still
+        // repair the version identity and delete-marker state.
+        assert!(stale.equals(&latest));
+        let (should_heal, metadata, reason) = should_heal_object_on_disk(&None, &[], &stale, &latest);
+        assert!(should_heal);
+        assert!(metadata);
+        assert_eq!(reason, Some(DiskError::OutdatedXLMeta));
     }
 
     #[test]
