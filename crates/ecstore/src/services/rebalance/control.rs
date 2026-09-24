@@ -630,7 +630,7 @@ impl ECStore {
     pub async fn prepare_rebalance_stop(&self) -> Result<Option<String>> {
         let _start_guard = self.start_gate.lock().await;
 
-        {
+        let (local_stop_id, activation_gate) = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             if let Some(meta) = rebalance_meta.as_mut()
                 && is_rebalance_conflicting_with_decommission(meta)
@@ -641,7 +641,22 @@ impl ECStore {
                     .cancel();
                 #[cfg(any(test, feature = "test-util"))]
                 observe_rebalance_stop_wait_attempt(Some(meta.id.as_str()));
+                (Some(meta.id.clone()), Some(Arc::clone(&meta.activation_gate)))
+            } else {
+                (None, None)
             }
+        };
+
+        // An in-flight entry already owns the activation read gate. Admission
+        // has been cancelled above, so do not wait on that same gate merely to
+        // refresh a stop target: the eventual stop operation will take the
+        // write gate after the entry drains. If the gate is currently free,
+        // retain the historical reload behaviour (which observes a worker that
+        // reached a terminal state just before this request).
+        if let Some(gate) = activation_gate
+            && gate.try_write_owned().is_err()
+        {
+            return Ok(local_stop_id);
         }
 
         self.load_rebalance_meta_under_start_gate().await?;

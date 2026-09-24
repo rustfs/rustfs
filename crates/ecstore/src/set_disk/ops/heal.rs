@@ -502,6 +502,22 @@ fn heal_writer_error_summary(error: &DiskError) -> String {
     }
 }
 
+/// Whether a writer failure can be retried after the target disk or peer
+/// becomes available again.  Keep this decision typed: the aggregate
+/// `all_targets_unavailable` path must not turn permanent errors such as
+/// `DiskFull` into retryable failures.
+fn is_retryable_heal_writer_error(error: &DiskError) -> bool {
+    matches!(
+        error,
+        DiskError::DiskNotFound
+            | DiskError::Timeout
+            | DiskError::SourceStalled
+            | DiskError::FaultyRemoteDisk
+            | DiskError::FaultyDisk
+            | DiskError::RemoteClientUnavailable(_)
+    ) || error.is_retryable_internode_write_failure()
+}
+
 fn warn_heal_writer_failures(
     bucket: &str,
     object: &str,
@@ -1530,6 +1546,8 @@ impl SetDisks {
                             let erasure_info = latest_meta.erasure.clone();
                             let mut writer_failure_count = 0usize;
                             let mut first_writer_failure = None;
+                            let mut first_writer_error = None;
+                            let mut all_writer_failures_retryable = true;
                             let mut writer_failure_warned = false;
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
@@ -1656,9 +1674,11 @@ impl SetDisks {
                                             Ok(writer) => writer,
                                             Err(err) => {
                                                 writer_failure_count += 1;
+                                                all_writer_failures_retryable &= is_retryable_heal_writer_error(&err);
                                                 if first_writer_failure.is_none() {
                                                     first_writer_failure =
                                                         Some((part.number, index, heal_writer_error_summary(&err)));
+                                                    first_writer_error = Some(err);
                                                 }
                                                 writers.push(None);
                                                 continue;
@@ -1786,12 +1806,12 @@ impl SetDisks {
                                     }
                                     // Clean up healed shards written to .rustfs/tmp before bailing (B20).
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                    return Ok((
-                                        result,
-                                        Some(DiskError::other(format!(
-                                            "all drives had write errors, unable to heal {bucket}/{object}"
-                                        ))),
-                                    ));
+                                    let error = if all_writer_failures_retryable {
+                                        first_writer_error.take().unwrap_or(DiskError::FaultyDisk)
+                                    } else {
+                                        DiskError::other(format!("all drives had write errors, unable to heal {bucket}/{object}"))
+                                    };
+                                    return Ok((result, Some(error)));
                                 }
                             }
 
@@ -3506,7 +3526,7 @@ impl SetDisks {
 mod heal_result_report_tests {
     use super::{
         AbsenceProofRequest, DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
-        ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
+        ReadRepairPauseScope, SetDisks, heal_writer_error_summary, is_retryable_heal_writer_error,
     };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
     use crate::disk::endpoint::Endpoint;
@@ -3737,6 +3757,24 @@ mod heal_result_report_tests {
 
         assert_eq!(summary, "io::PermissionDenied");
         assert!(!summary.contains("sensitive"));
+    }
+
+    #[test]
+    fn retryable_heal_writer_error_keeps_permanent_errors_out() {
+        for error in [
+            DiskError::DiskNotFound,
+            DiskError::Timeout,
+            DiskError::SourceStalled,
+            DiskError::FaultyRemoteDisk,
+            DiskError::FaultyDisk,
+            DiskError::RemoteClientUnavailable("peer restarting".to_string()),
+        ] {
+            assert!(is_retryable_heal_writer_error(&error), "{error:?} should be retryable");
+        }
+
+        for error in [DiskError::DiskFull, DiskError::DiskAccessDenied, DiskError::FileCorrupt] {
+            assert!(!is_retryable_heal_writer_error(&error), "{error:?} should remain permanent");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
