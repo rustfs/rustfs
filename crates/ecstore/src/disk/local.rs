@@ -22954,10 +22954,8 @@ mod test {
                     assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), direct_before + 1);
                 }
             }
-            if direct {
-                if let Some(cache) = backend.fd_cache.as_ref() {
-                    assert_eq!(cache.entry_count().await, 1, "direct reads must reuse one cached O_DIRECT descriptor");
-                }
+            if direct && let Some(cache) = backend.fd_cache.as_ref() {
+                assert_eq!(cache.entry_count().await, 1, "direct reads must reuse one cached O_DIRECT descriptor");
             }
             for (offset, length) in [(FILE_LEN - 1, 2), (FILE_LEN + 1, 0)] {
                 let before = backend.driver.stats().submitted;
