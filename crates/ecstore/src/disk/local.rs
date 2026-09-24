@@ -7666,17 +7666,21 @@ impl LocalDisk {
     where
         W: AsyncWrite + Unpin + Send,
     {
+        // The part of forward_to below this directory, taken before `current`
+        // loses its trailing slash.
+        let forward_rest = opts
+            .forward_to
+            .as_ref()
+            .and_then(|v| v.strip_prefix(&current))
+            .map(str::to_owned);
         let forward = {
-            opts.forward_to
-                .as_ref()
-                .and_then(|v| v.strip_prefix(&current))
-                .map(|forward| {
-                    if let Some(idx) = forward.find('/') {
-                        forward[..idx].to_owned()
-                    } else {
-                        forward.to_owned()
-                    }
-                })
+            forward_rest.as_deref().map(|forward| {
+                if let Some(idx) = forward.find('/') {
+                    forward[..idx].to_owned()
+                } else {
+                    forward.to_owned()
+                }
+            })
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -7829,13 +7833,22 @@ impl LocalDisk {
 
         entries.sort();
 
-        if let Some(forward) = &forward {
-            for (i, entry) in entries.iter().enumerate() {
-                if entry >= forward || forward.starts_with(entry.as_str()) {
-                    entries.drain(..i);
-                    break;
+        // Every entry left here is a directory. Compare it as the key prefix it
+        // stands for, slash included: "s-x" sorts after "s" as a name, but all
+        // of "s-x/..." sorts before "s/..." ('-' < '/'), so a scan resuming
+        // inside "s/" has to leave "s-x" out even though it comes later.
+        if let Some(forward) = forward_rest.as_deref() {
+            entries.retain(|entry| {
+                if entry.is_empty() {
+                    return true;
                 }
-            }
+                let key = if entry.ends_with(SLASH_SEPARATOR) {
+                    std::borrow::Cow::Borrowed(entry.as_str())
+                } else {
+                    std::borrow::Cow::Owned(format!("{entry}{SLASH_SEPARATOR}"))
+                };
+                key.as_ref() >= forward || forward.starts_with(key.as_ref())
+            });
         }
 
         let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
@@ -18710,6 +18723,95 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_orders_directory_before_its_dash_suffixed_sibling() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        // "s-x/..." sorts before "s/..." because '-' (0x2d) sorts before '/'
+        // (0x2f), while the directory names alone sort the other way round
+        // ("s" < "s-x"). Backup tools keep "<name>" and "<name>-rollbacks" side
+        // by side this way, which is how flat listings of real buckets ended
+        // early without being reported as truncated.
+        let dir = tempdir().expect("operation should succeed");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        let mut expected = Vec::new();
+        for parent in ["s", "s-x", "db/backup/s", "db/backup/s-x"] {
+            for n in 0..3 {
+                let name = format!("{parent}/l/l/{n:05}");
+                let object_dir = bucket_dir.join(&name);
+                fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+                fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                    .await
+                    .expect("operation should succeed");
+                expected.push(name);
+            }
+        }
+        expected.sort();
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, forward_to: Option<&str>, limit: i32) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(1 << 16);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: true,
+                forward_to: forward_to.map(str::to_string),
+                limit,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("operation should succeed");
+            out.close().await.expect("operation should succeed");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let entries = reader.read_all().await.expect("operation should succeed");
+            entries
+                .into_iter()
+                .filter(|entry| !entry.metadata.is_empty())
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        assert_eq!(
+            scan_names(&disk, bucket, None, 0).await,
+            expected,
+            "a full recursive scan must emit keys in lexicographic order"
+        );
+
+        for (i, forward_to) in expected.iter().enumerate() {
+            assert_eq!(
+                scan_names(&disk, bucket, Some(forward_to), 0).await,
+                expected[i..].to_vec(),
+                "resuming at {forward_to} must return every later key"
+            );
+        }
+
+        let mut paged = Vec::new();
+        let mut forward_to: Option<String> = None;
+        while paged.len() < expected.len() {
+            let page = scan_names(&disk, bucket, forward_to.as_deref(), 2).await;
+            let page: Vec<String> = page.into_iter().filter(|name| Some(name) != forward_to.as_ref()).collect();
+            if page.is_empty() {
+                break;
+            }
+            forward_to = page.last().cloned();
+            paged.extend(page);
+        }
+        assert_eq!(paged, expected, "paging through the tree must not lose keys");
     }
 
     #[tokio::test]
