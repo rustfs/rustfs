@@ -43,7 +43,7 @@ concurrency:
 jobs:
   check-ephemerality:
     name: Check runner ephemerality
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -66,7 +66,7 @@ jobs:
     # scheduled runs file a tracking issue, manual dispatch stays quiet so
     # debugging never produces a spurious alert.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

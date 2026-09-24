@@ -88,7 +88,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -172,7 +172,7 @@ jobs:
   prepare-platform-matrix:
     name: Prepare Platform Matrix
     needs: build-check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -770,7 +770,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Build completion summary
@@ -831,7 +831,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -892,7 +892,7 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -986,7 +986,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Update latest.json
@@ -1046,7 +1046,7 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1084,7 +1084,7 @@ jobs:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1132,7 +1132,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

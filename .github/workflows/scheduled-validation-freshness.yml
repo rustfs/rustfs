@@ -29,7 +29,7 @@ concurrency:
 jobs:
   check-freshness:
     name: Check scheduled validation freshness
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       actions: read

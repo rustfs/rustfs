@@ -114,7 +114,7 @@ jobs:
     # label was abandoned (no docker.sock on the pod its only run landed on).
     # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
     # run) is added by the ci-8 composite action; do not implement it here.
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -258,7 +258,7 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

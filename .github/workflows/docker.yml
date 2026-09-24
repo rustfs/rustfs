@@ -83,7 +83,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch != 'main')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -501,7 +501,7 @@ jobs:
     name: Scan Docker Images
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: read
@@ -559,7 +559,7 @@ jobs:
     name: Sync Docker Hub Description
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -604,7 +604,7 @@ jobs:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Docker build completion summary

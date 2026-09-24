@@ -42,7 +42,7 @@ jobs:
       github.event.workflow_run.event == 'schedule' &&
       github.event.workflow_run.conclusion != 'success' &&
       github.event.workflow_run.conclusion != 'failure'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       actions: read
