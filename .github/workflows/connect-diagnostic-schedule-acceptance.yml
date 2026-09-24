@@ -38,7 +38,7 @@ permissions:
 jobs:
   diagnostic-schedule:
     name: Verify production scheduler receipts over mTLS
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
@@ -47,6 +47,9 @@ jobs:
           path: rustfs-source
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       - name: Checkout exact Connect harness
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

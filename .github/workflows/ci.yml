@@ -63,7 +63,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -72,7 +72,7 @@ jobs:
   classify-changes:
     name: Select CI scope
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
@@ -98,7 +98,7 @@ jobs:
   typos:
     name: Typos
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -111,7 +111,7 @@ jobs:
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -681,12 +681,12 @@ jobs:
     # 30662728539) and kept the cancellation run in progress for minutes.
     if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
-    # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
-    # a container, applies no seccomp filter that would block io_uring_setup — so
-    # the probe succeeds and the tests exercise the real UringBackend/FdCache/
-    # latch paths instead of the StdBackend fallback (rustfs/backlog#1179). The
-    # self-hosted sm-standard runners cannot guarantee this.
-    runs-on: ubuntu-latest
+    # Self-hosted sm-standard-4. A GitHub-hosted VM used to be required: it has
+    # a recent kernel with io_uring, no seccomp filter blocking io_uring_setup,
+    # and a loop device for the ext4 O_DIRECT mount (rustfs/backlog#1179,
+    # #1220). ARC pods may lack /dev/loop-control and may block io_uring.
+    # RUSTFS_URING_TESTS_MUST_RUN still fails the job if io_uring is unavailable.
+    runs-on: sm-standard-4
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -698,14 +698,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # Keeps its own key rather than joining ci-dev. rust-cache's key is
-          # built from runner.os/arch plus rustc and lockfile fingerprints — it
-          # does NOT include the runner label or image. ubuntu-latest and
-          # sm-standard-4 are therefore indistinguishable to it, so sharing a key
-          # would let two different system images overwrite each other's
-          # artifacts, and would make a 2-core hosted runner unpack ci-dev's ~3GB
-          # instead of this lane's ~1.3GB. cache-warm.yml warms this key on
-          # ubuntu-latest for the same reason.
+          # Keeps its own key rather than joining ci-dev. This lane's closure is
+          # about 1.3GB; ci-dev is about 3GB. cache-warm.yml warms this key on
+          # the same sm-standard-4 label.
           cache-shared-key: ci-uring
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
@@ -1230,7 +1225,7 @@ jobs:
       - build-rustfs-debug-binary-rio-v2
       - e2e-tests-rio-v2
       - e2e-full
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -1266,7 +1261,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

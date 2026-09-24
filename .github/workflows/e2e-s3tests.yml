@@ -34,16 +34,10 @@
 # Runner infrastructure (ci-1, backlog#1149): this sweep needs BOTH a working
 # Docker daemon (to build the source image and run the single/multi topologies)
 # AND a Python toolchain with pip (for awscurl/tox and the pytest harness).
-# It previously ran on the self-hosted `sm-standard-4` label, which is served
-# by heterogeneous runners: some scheduled runs landed on minimal pods that
-# had neither `pip` (bare python3, `No module named pip`) nor `docker.sock`,
-# so "Install Python tools" died before any test executed (all 15 recorded
-# runs failed). Two changes make the infra assumptions explicit instead of
-# trusting drifting runner state:
-#   1. Pin to GitHub-hosted `ubuntu-latest`, which reliably ships Docker,
-#      docker compose, python3 and pip (no self-hosted fleet drift).
-#   2. Set up Python explicitly (actions/setup-python) before any pip usage,
-#      so the workflow stays correct even if the runner image changes.
+# `sm-standard-4` pods have landed without `pip` and without `docker.sock`.
+# The job therefore runs on `dind-sm-standard-2` and still installs Python
+# with actions/setup-python before any pip usage. Docker Compose is installed
+# when the image does not already provide `docker compose`.
 # The PR gate (ci.yml s3-implemented-tests) is unaffected: it avoids Docker
 # via DEPLOY_MODE=binary and defers all pip setup to run.sh's self-bootstrap.
 
@@ -143,10 +137,9 @@ defaults:
 jobs:
   s3tests:
     name: s3tests (${{ matrix.test-mode }}, shard ${{ matrix.shard-index }})
-    # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
-    # See the header note (ci-1) for why the self-hosted sm-standard-4 label
-    # was abandoned. Scheduled failures are handled by alert-on-failure below.
-    runs-on: ubuntu-latest
+    # dind-sm-standard-2: Docker daemon. Python is installed explicitly.
+    # See the header note (ci-1). Scheduled failures are handled by alert-on-failure below.
+    runs-on: dind-sm-standard-2
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -188,6 +181,16 @@ jobs:
         run: |
           test "$(python3 -c 'import importlib.metadata as m; print(m.version("awscurl"))')" = "0.44"
           test "$(python3 -c 'import importlib.metadata as m; print(m.version("tox"))')" = "4.60.0"
+
+      - name: Ensure Docker Compose
+        run: |
+          set -euo pipefail
+          docker info >/dev/null
+          if ! docker compose version >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker-compose-plugin
+          fi
+          docker compose version
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -371,7 +374,7 @@ jobs:
     name: Upstream HEAD classification canary
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -453,7 +456,7 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

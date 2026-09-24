@@ -72,7 +72,7 @@ jobs:
     # Skip on forks: needs this repository's runners and is not a contributor
     # gate.
     if: github.repository == 'rustfs/rustfs'
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
     timeout-minutes: 90
     env:
       NO_PROXY: 127.0.0.1,localhost
@@ -183,7 +183,7 @@ jobs:
   cloud-source:
     name: ${{ matrix.provider }} source (three-case minimum)
     if: github.repository == 'rustfs/rustfs'
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -300,7 +300,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

@@ -80,6 +80,9 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Ensure gh and jq
+      uses: ../ensure-runner-cli
+
     - name: Open or update failure-tracking issue
       shell: bash
       env:

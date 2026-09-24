@@ -43,13 +43,16 @@ concurrency:
 jobs:
   check-ephemerality:
     name: Check runner ephemerality
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       # Exit 2 (inconclusive / broken) is deliberately not a pass: a window
       # where every sm-* job was still queued would otherwise look identical to
@@ -66,7 +69,7 @@ jobs:
     # scheduled runs file a tracking issue, manual dispatch stays quiet so
     # debugging never produces a spurious alert.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

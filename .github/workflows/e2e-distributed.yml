@@ -22,13 +22,12 @@
 # Upgrade cases download the same pinned previous release as e2e-upgrade.yml.
 #
 # Isolated pool filesystems: expand/decommission/rebalance cases require
-# independent `statfs` capacity. This job runs on GitHub-hosted
-# `ubuntu-latest` because the self-hosted `sm-standard-4` ARC pods cannot
-# create filesystems: `mount -o loop` fails with ENOENT (no
-# `/dev/loop-control`), and `mount -t tmpfs` fails with "cannot mount tmpfs
-# read-only" (no `CAP_SYS_ADMIN` in the initial namespace). The same reason
-# `uring-integration` and `e2e-s3tests.yml` left that label. The prepare
-# step mounts four 1 GiB tmpfs instances and exports `RUSTFS_E2E_POOL_ROOTS`.
+# independent `statfs` capacity. The prepare step mounts four 1 GiB tmpfs
+# instances and exports `RUSTFS_E2E_POOL_ROOTS`. The job runs on
+# `sm-standard-4`. Those ARC pods have historically rejected both mounts
+# (`mount -o loop` ENOENT with no `/dev/loop-control`, and `mount -t tmpfs`
+# "cannot mount tmpfs read-only" without `CAP_SYS_ADMIN`). The mount step
+# still fails the job when the runner cannot create the filesystems.
 
 name: e2e-distributed
 
@@ -78,9 +77,9 @@ concurrency:
 jobs:
   distributed:
     name: Distributed 4-node 4-disk e2e
-    # GitHub-hosted VM: loop and tmpfs mounts work here. sm-standard-4 is an
-    # ARC pod and rejects both (`mount -o loop` ENOENT, tmpfs "read-only").
-    runs-on: ubuntu-latest
+    # sm-standard-4 may reject loop and tmpfs mounts. The prepare step fails
+    # closed when it cannot create the four isolated filesystems.
+    runs-on: sm-standard-4
     timeout-minutes: 180
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -101,9 +100,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # Dedicated key: ubuntu-latest and sm-standard-4 share runner.os, so
-          # a shared key would mix VM and ARC pod target/ artifacts.
-          cache-shared-key: ci-e2e-distributed-hosted
+          cache-shared-key: ci-e2e-distributed
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: 'false'
 
@@ -117,7 +114,7 @@ jobs:
             mountpoint="${mount_base}/pool-${pool}"
             mkdir -p "${mountpoint}"
             # Sized tmpfs reports a distinct st_dev and independent 1G
-            # statfs capacity. Requires a VM runner (ubuntu-latest).
+            # statfs capacity. ARC pods without CAP_SYS_ADMIN fail this mount.
             if ! sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs "${mountpoint}"; then
               echo "tmpfs mount failed on $(uname -a)" >&2
               findmnt || true
@@ -200,7 +197,7 @@ jobs:
     name: Alert on scheduled failure
     needs: [distributed]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

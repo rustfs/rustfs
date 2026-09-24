@@ -44,7 +44,7 @@ env:
 jobs:
   resolve-source:
     name: Resolve nightly source
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
@@ -359,14 +359,13 @@ jobs:
   # The same lane runs the dev-Vault #[ignore] tests and the two self-hosting
   # live scripts (AppRole login, three-node Raft leader failover).
   #
-  # GitHub-hosted ubuntu-latest, deliberately not the self-hosted sm-standard
-  # fleet: the HA failover script needs a working Docker daemon, and the
-  # self-hosted fleet is heterogeneous — a docker-dependent workflow has been
-  # burned by it before (see the banner in e2e-s3tests.yml, rustfs/backlog#1149).
+  # Compiles the rustfs-kms suite on sm-standard-4. The Vault dev server in
+  # this job is the Vault binary, not Docker. The HA failover job is the one
+  # that needs a Docker daemon; it runs on dind-sm-standard-2.
   kms-vault-lane:
     needs: resolve-source
     name: KMS live Vault lane
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -466,7 +465,7 @@ jobs:
   kms-vault-ha-failover:
     needs: resolve-source
     name: KMS Vault HA failover lane
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -495,7 +494,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

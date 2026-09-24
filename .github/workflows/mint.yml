@@ -31,19 +31,10 @@
 #
 # Runner infrastructure (ci-2, backlog#1149): this job needs a working Docker
 # daemon to (a) build the RustFS source image with buildx and (b) run both the
-# RustFS server and the mint image. It previously ran on the self-hosted
-# `sm-standard-4` label, which is served by heterogeneous runners; its single
-# recorded run (28730530597, 2026-07-05) landed on a minimal pod with no
-# `/var/run/docker.sock`, so "Enable buildx" died at `docker buildx create`
-# ("failed to connect to the docker API at unix:///var/run/docker.sock") before
-# any test executed -- the same root cause ci-1 fixed for the weekly s3-tests
-# sweep. The fix is to pin to GitHub-hosted `ubuntu-latest`, which reliably
-# ships a running Docker daemon + buildx + python3, instead of trusting the
-# drifting self-hosted fleet. Tradeoff: the source Rust build is heavier on a
-# GitHub-hosted 4-vCPU runner than on a warm self-hosted host, but it stays
-# well inside the 120-minute budget and buys deterministic infra. The
-# docker-capable self-hosted `dind-sm-standard-2` label was the alternative but
-# has fewer cores and reintroduces fleet-state risk for no reliability gain.
+# RustFS server and the mint image. `sm-standard-4` pods have landed without
+# `/var/run/docker.sock`. The job runs on `dind-sm-standard-2`, which is the
+# docker-capable self-hosted label. That label has fewer cores than
+# `sm-standard-4`, so the source image build is slower.
 
 name: mint
 
@@ -109,12 +100,8 @@ defaults:
 
 jobs:
   mint:
-    # GitHub-hosted: reliably provides a running Docker daemon + buildx +
-    # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
-    # label was abandoned (no docker.sock on the pod its only run landed on).
-    # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
-    # run) is added by the ci-8 composite action; do not implement it here.
-    runs-on: ubuntu-latest
+    # dind-sm-standard-2 provides the Docker daemon. See the header note (ci-2).
+    runs-on: dind-sm-standard-2
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -258,7 +245,7 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

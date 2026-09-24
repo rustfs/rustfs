@@ -42,7 +42,7 @@ concurrency:
 jobs:
   prepare:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       manifest: ${{ steps.candidate.outputs.manifest }}
@@ -51,6 +51,10 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Resolve published candidate
         id: candidate
         env:
@@ -188,7 +192,7 @@ jobs:
   complete-chain:
     needs: [prepare, upgrade, s3, kms, tier, storage, heal, pool, security, replication, fault-tolerance, table, performance]
     if: ${{ always() && needs.prepare.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7

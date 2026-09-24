@@ -30,9 +30,9 @@
 # hold), and default RustFS builds do not include the read path — it is a
 # special-purpose migration capability, not a default-build feature.
 #
-# Runner: GitHub-hosted `ubuntu-latest`. It reliably ships Docker + Python,
-# unlike the self-hosted fleet, whose pods drift in Docker/pip availability
-# (see the infra note in e2e-s3tests.yml). Nightly + manual only.
+# Runner: `dind-sm-standard-2`. The job regenerates MinIO trees with Docker.
+# `sm-standard-4` pods do not reliably expose a Docker daemon (see the infra
+# note in e2e-s3tests.yml). Nightly + manual only.
 #
 # Enablement: this workflow was long disabled in the repository's Actions
 # settings (state: disabled_manually — a state that lives in GitHub's UI and is
@@ -62,7 +62,7 @@ jobs:
     name: MinIO interop (EC + SSE read parity)
     # Skip on forks: needs the repo's runners and is not a contributor gate.
     if: github.repository == 'rustfs/rustfs'
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
     timeout-minutes: 40
     env:
       # Fixed 32-byte test KMS key baked into the fixture lab; not a secret.
@@ -131,7 +131,7 @@ jobs:
     name: Alert on scheduled failure
     needs: [minio-interop]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

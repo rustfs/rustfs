@@ -14,27 +14,10 @@
 
 name: Windows Filesystem Tests
 
+# Manual only. The org has no self-hosted Windows runner, and these tests
+# exercise Windows filesystem semantics that cannot run on Linux. Dispatch
+# still uses windows-latest. Push, pull_request, and schedule do not run it.
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "crates/ecstore/src/disk/**"
-      - "crates/ecstore/src/store/init_format.rs"
-      - "crates/ecstore/Cargo.toml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/actions/setup/**"
-      - ".github/workflows/windows-filesystem.yml"
   workflow_dispatch:
 
 permissions:
@@ -52,6 +35,8 @@ env:
 jobs:
   rename-safety:
     name: Rename Safety
+    # GitHub-hosted. No self-hosted Windows runner exists, and the tests below
+    # call Windows rename, handle, and startup-cleanup behavior.
     runs-on: windows-latest
     timeout-minutes: 60
     steps:

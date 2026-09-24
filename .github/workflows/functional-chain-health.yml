@@ -11,12 +11,15 @@ concurrency:
   cancel-in-progress: false
 jobs:
   collect:
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Collect and publish verified chain health
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}

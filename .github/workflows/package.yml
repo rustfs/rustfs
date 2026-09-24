@@ -77,7 +77,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch != 'main')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
@@ -88,6 +88,14 @@ jobs:
       dev_sequence: ${{ steps.resolve.outputs.dev_sequence }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Resolve build run
         id: resolve
         shell: bash
@@ -229,7 +237,7 @@ jobs:
   package:
     name: Package (${{ matrix.arch }}-${{ matrix.libc }})
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -272,6 +280,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Normalize package metadata
         id: versions
         shell: bash
@@ -312,6 +323,11 @@ jobs:
 
           echo "Found artifact: $ZIP_FILE"
 
+          if ! command -v unzip >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y unzip
+          fi
+
           mkdir -p ./bin
           unzip -o "$ZIP_FILE" -d ./bin
 
@@ -335,6 +351,11 @@ jobs:
           LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
+
+          if ! command -v dpkg-deb >/dev/null 2>&1 || ! command -v fakeroot >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y dpkg-dev fakeroot
+          fi
 
           PKG_DIR="${DEB_FILE%.deb}"
 
@@ -619,7 +640,7 @@ jobs:
     name: Summary
     needs: [ resolve, package ]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - name: Print summary

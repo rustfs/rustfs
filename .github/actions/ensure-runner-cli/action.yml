@@ -1,0 +1,44 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Ensure gh and jq
+description: >-
+  Install the GitHub CLI and jq when the runner image does not already
+  provide them. GitHub-hosted Ubuntu images ship both; the self-hosted
+  images do not promise them.
+
+runs:
+  using: composite
+  steps:
+    - name: Install gh and jq if missing
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+          exit 0
+        fi
+        sudo apt-get update
+        sudo apt-get install -y jq ca-certificates curl
+        if ! command -v gh >/dev/null 2>&1; then
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          arch="$(dpkg --print-architecture)"
+          echo "deb [arch=${arch} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+        fi
+        gh --version
+        jq --version

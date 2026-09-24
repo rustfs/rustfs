@@ -83,7 +83,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch != 'main')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -501,7 +501,7 @@ jobs:
     name: Scan Docker Images
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: read
@@ -559,7 +559,7 @@ jobs:
     name: Sync Docker Hub Description
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -569,6 +569,9 @@ jobs:
           ref: ${{ needs.build-check.outputs.source_ref }}
           sparse-checkout: README.md
           sparse-checkout-cone-mode: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       - name: Sync Docker Hub description
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
@@ -604,7 +607,7 @@ jobs:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Docker build completion summary

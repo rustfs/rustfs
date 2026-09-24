@@ -45,13 +45,16 @@ permissions:
 jobs:
   top-disk:
     name: Verify native Linux x86_64 top.disk artifact
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     steps:
       - name: Checkout acceptance harness
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       - name: Verify source run and artifact identity
         shell: bash

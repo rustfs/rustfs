@@ -22,9 +22,12 @@
 # 3. Trigger docker.yml to build and push images using the uploaded binaries
 #
 # Platform scope:
-# - Pushes to main (development builds) build the Linux targets only — they
-#   feed the dev download channel and Docker dev images. Tags, the weekly
-#   schedule and manual dispatch build the full platform matrix.
+# - Automatic runs (main pushes, tags, the weekly schedule) build the Linux
+#   targets on sm-standard-4. `platforms=all` means those Linux targets.
+# - macOS and Windows have no self-hosted runners, and this workflow does not
+#   cross-compile them. They run only when workflow_dispatch sets `platforms`
+#   to macos-aarch64 and/or windows-x86_64. Those legs still use
+#   macos-latest and windows-latest.
 #
 # Manual Parameters:
 # - build_docker: Build and push Docker images (default: true)
@@ -66,7 +69,7 @@ on:
         default: true
         type: boolean
       platforms:
-        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,macos-aarch64)"
+        description: "Comma-separated targets or 'all' (Linux only). Name macos-aarch64 or windows-x86_64 to build those on GitHub-hosted runners."
         required: false
         default: "all"
         type: string
@@ -88,7 +91,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -172,7 +175,7 @@ jobs:
   prepare-platform-matrix:
     name: Prepare Platform Matrix
     needs: build-check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -188,22 +191,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
           selected="$RAW_PLATFORMS"
           selected="$(echo "${selected}" | tr -d '[:space:]')"
           if [[ -z "${selected}" ]]; then
             selected="all"
           fi
 
-          # Per-merge development builds only feed the dev download channel
-          # and the Docker dev images, which consume the Linux binaries; at
-          # the usual merge cadence most per-merge builds are cancelled by the
-          # next merge anyway. macOS and Windows stay covered by tag builds,
-          # the weekly scheduled build and manual dispatch.
-          if [[ "${selected}" == "all" \
-            && "${{ github.event_name }}" == "push" \
-            && "${{ needs.build-check.outputs.build_type }}" == "development" ]]; then
-            selected="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
-            echo "Development (main push) build: restricting to Linux targets"
+          # Linux targets run on sm-standard-4. macOS and Windows stay in the
+          # matrix only so an explicit workflow_dispatch can name them; `all`
+          # never selects them, and non-dispatch events drop them if present.
+          LINUX_ONLY="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
+          if [[ "${selected}" == "all" ]]; then
+            selected="${LINUX_ONLY}"
+            echo "platforms=all selects Linux self-hosted targets only"
+          elif [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            filtered="$(printf '%s\n' "${selected}" | tr ',' '\n' | grep -vxE 'macos-aarch64|windows-x86_64' | paste -sd ',' - || true)"
+            if [[ -z "${filtered}" ]]; then
+              echo "No Linux targets left after dropping macOS and Windows" >&2
+              exit 1
+            fi
+            selected="${filtered}"
           fi
 
           all='{"include":[
@@ -498,7 +510,7 @@ jobs:
           # Create zip packages for all platforms
           # Ensure zip is available
           if ! command -v zip &> /dev/null; then
-            if [[ "${{ matrix.os }}" == "ubuntu-latest" || "${{ matrix.platform }}" == "linux" ]]; then
+            if [[ "${{ matrix.platform }}" == "linux" ]]; then
               sudo apt-get update && sudo apt-get install -y zip
             fi
           fi
@@ -770,7 +782,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Build completion summary
@@ -831,7 +843,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -844,6 +856,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       - name: Create GitHub Release
         id: create
@@ -892,7 +907,7 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -902,6 +917,9 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
 
       - name: Download all build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -986,7 +1004,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Update latest.json
@@ -1009,6 +1027,11 @@ jobs:
             RELEASE_TYPE="prerelease"
           else
             RELEASE_TYPE="stable"
+          fi
+
+          if ! command -v unzip >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y unzip
           fi
 
           # Install ossutil
@@ -1046,11 +1069,19 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1084,11 +1115,19 @@ jobs:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Ensure gh and jq
+        uses: ./.github/actions/ensure-runner-cli
+
       - name: Delete preview releases for this target
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1132,7 +1171,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

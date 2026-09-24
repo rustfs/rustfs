@@ -250,13 +250,11 @@ jobs:
           cargo build -p rustfs -p rustfs-protocols --all-targets --features swift
           cargo build -p rustfs -p rustfs-protocols --all-targets --features sftp
 
-  # Reader: uring-integration. Runs on ubuntu-latest to match it: rust-cache's
-  # key covers runner.os and arch but not the runner label or image, so a cache
-  # written on sm-standard-4 would be restored by the hosted runner as if it
-  # belonged to it.
+  # Reader: uring-integration. Same sm-standard-4 label as that job so the
+  # restored cache matches the system image that consumes it.
   warm-ci-uring:
     name: Warm ci-uring
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
     timeout-minutes: 60
     steps:
       - name: Checkout repository

@@ -21,8 +21,7 @@ out of the code repository's issue tracker.
 - The issue body / comment includes the source repository, run URL, run
   attempt, event, ref and the names of the failed (or timed-out/cancelled)
   jobs of the current run attempt.
-- Requires `gh` and `jq` on the runner (both preinstalled on GitHub-hosted
-  runners such as `ubuntu-latest`).
+- Installs `gh` and `jq` when the runner image does not already provide them.
 
 ## Tokens
 
@@ -49,7 +48,7 @@ this job only; no other job may gain permissions.
     name: Alert on scheduled failure
     needs: [<the jobs to watch>]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

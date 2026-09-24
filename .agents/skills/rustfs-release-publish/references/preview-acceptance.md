@@ -7,7 +7,7 @@ Read after Phase 3 succeeds. Complete every check below before the parent skill'
 Work inside the session scratchpad directory; never leave stray data dirs.
 
 ```bash
-gh release download "<preview-tag>" -p "rustfs-macos-aarch64-v<preview-tag>.zip" -D "$SCRATCH"
+gh release download "<preview-tag>" -p "rustfs-linux-x86_64-gnu-v<preview-tag>.zip" -D "$SCRATCH"
 cd "$SCRATCH" && unzip -o rustfs-*.zip
 ./rustfs --version        # must report the PREVIEW TAG (build::TAG), not the Cargo.toml version, plus expected short SHA
 mkdir -p data

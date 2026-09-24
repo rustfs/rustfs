@@ -33,7 +33,7 @@ concurrency:
 jobs:
   update-flake:
     name: Update flake.lock
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
