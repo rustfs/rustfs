@@ -232,6 +232,10 @@ mod tier_stats_cluster_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
+// GetObject with partNumber reporting x-amz-mp-parts-count
+#[cfg(test)]
+mod get_object_parts_count_test;
+
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;

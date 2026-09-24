@@ -2276,6 +2276,17 @@ impl DefaultObjectUsecase {
         Self::validate_get_object_part_number(part_number, info)
     }
 
+    /// The `x-amz-mp-parts-count` value for a response, if one is owed.
+    ///
+    /// s3 reports the part count only on a response to a request that named a
+    /// part, and only for an object created by a multipart upload.
+    fn get_object_parts_count(part_number: Option<usize>, info: &ObjectInfo) -> Option<i32> {
+        if part_number.is_none() || !info.is_multipart() {
+            return None;
+        }
+        i32::try_from(info.parts.len()).ok()
+    }
+
     /// How long a GET waits for a disk read permit before degrading to a
     /// permit-less read. Cached: consulted per GET. Zero disables the bound.
     fn disk_permit_wait_timeout() -> Duration {
@@ -3720,6 +3731,8 @@ impl DefaultObjectUsecase {
         let metadata = filter_object_metadata(&info.user_defined);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
 
+        let parts_count = Self::get_object_parts_count(part_number, &info);
+
         let output = GetObjectOutput {
             body: Some(body),
             content_length: Some(response_content_length),
@@ -3730,6 +3743,7 @@ impl DefaultObjectUsecase {
             cache_control,
             content_disposition,
             content_range,
+            parts_count,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
             server_side_encryption,
@@ -10810,6 +10824,45 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
         assert!(DefaultObjectUsecase::validate_get_object_part_number(Some(1), &info).is_ok());
+    }
+
+    #[test]
+    fn get_object_reports_parts_count_for_multipart_objects() {
+        fn info_with_parts(count: usize, etag: &str) -> ObjectInfo {
+            ObjectInfo {
+                parts: Arc::new(
+                    (1..=count)
+                        .map(|number| rustfs_filemeta::ObjectPartInfo {
+                            number,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                etag: Some(etag.to_string()),
+                ..Default::default()
+            }
+        }
+
+        // A multipart object, asked for by part: the count is what lets the
+        // client know three more parts follow.
+        let multipart = info_with_parts(4, "d41d8cd98f00b204e9800998ecf8427e-4");
+        assert!(multipart.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &multipart), Some(4));
+
+        // Not asked for by part: s3 omits the header entirely.
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(None, &multipart), None);
+
+        // A plain PutObject is stored as one part and carries a bare 32-char
+        // etag, so it is not multipart and is owed no count.
+        let single = info_with_parts(1, "d41d8cd98f00b204e9800998ecf8427e");
+        assert!(!single.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &single), None);
+
+        // A multipart upload that happened to have one part still carries the
+        // `-1` etag suffix, so it is multipart and reports a count of 1.
+        let single_part_multipart = info_with_parts(1, "d41d8cd98f00b204e9800998ecf8427e-1");
+        assert!(single_part_multipart.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &single_part_multipart), Some(1));
     }
 
     #[test]
