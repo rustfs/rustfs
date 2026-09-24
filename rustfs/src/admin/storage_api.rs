@@ -1059,7 +1059,9 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    #[cfg(test)]
+    // Keep auth types behind the existing s3 facade so test-only callers do
+    // not widen the repository's direct s3s import footprint.
+    #[allow(unused_imports)]
     pub(crate) use s3s::auth;
     pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
 
