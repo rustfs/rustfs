@@ -43,9 +43,6 @@ allow-git = [
     # RustFS io_uring backend is now consumed from crates.io at 0.3.0.
     # owner: rustfs-maintainers  review: 2026-10
     # "https://github.com/rustfs/uring",
-    # RustFS fork carrying presigned expiry and constant-time authentication fixes.
-    # owner: rustfs-maintainers  review: 2026-10
-    # "https://github.com/rustfs/s3s.git",
 ]
 
 [bans]
