@@ -227,9 +227,9 @@ metrics = { workspace = true }
 # The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-# SharedReadBudget is merged upstream but not yet published to the registry.
-# Replace this exact revision with its containing release when available.
-rustfs-uring = { git = "https://github.com/rustfs/uring", rev = "c92fc4016502e12e6ba03483dcb2a1c3bf2e0a94" }
+# SharedReadBudget and the bounded read APIs are available in the 0.3.0
+# registry release; keep the application on the published contract.
+rustfs-uring = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
