@@ -1422,12 +1422,12 @@ mod store_tests {
     use crate::admin::runtime_sources::{NotificationSystemInterface, publish_test_app_context};
     use crate::admin::storage_api::NotificationSys;
     use crate::admin::storage_api::runtime_sources::ECStore;
-    use crate::admin::storage_api::s3::auth as s3_auth;
     use http::{Extensions, HeaderMap, Uri};
     use http_body_util::BodyExt as _;
     use rustfs_iam::store::{Store as _, UserType};
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::Policy;
+    use s3s::auth as s3_auth;
     use serde_json::Value;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
