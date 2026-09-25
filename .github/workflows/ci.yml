@@ -690,7 +690,7 @@ jobs:
     # the probe succeeds and the tests exercise the real UringBackend/FdCache/
     # latch paths instead of the StdBackend fallback (rustfs/backlog#1179). The
     # self-hosted sm-standard runners cannot guarantee this.
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
