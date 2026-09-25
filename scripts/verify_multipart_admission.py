@@ -80,8 +80,8 @@ part_size = args.part_mib * 1024 * 1024
 payload = os.urandom(part_size)
 part_count = (size + part_size - 1) // part_size
 expected = hashlib.sha256()
-for pn in range(part_count):
-    expected.update(payload[: min(part_size, size - pn * part_size)])
+for part_index in range(part_count):
+    expected.update(payload[: min(part_size, size - part_index * part_size)])
 expected_digest = expected.hexdigest()
 uploads = []
 records, attempts = [], []
@@ -110,16 +110,16 @@ client.meta.events.register("needs-retry.s3.UploadPart", retry_event)
 barrier = threading.Barrier(args.uploads)
 
 
-def upload_part(key, upload_id, pn):
+def upload_part(key, upload_id, part_number):
     began = time.monotonic()
-    record = {"key": key, "part": pn, "start": began - start}
+    record = {"key": key, "part": part_number, "start": began - start}
     try:
-        body = payload[: min(part_size, size - (pn - 1) * part_size)]
+        body = payload[: min(part_size, size - (part_number - 1) * part_size)]
         response = client.upload_part(
             Bucket=bucket,
             Key=key,
             UploadId=upload_id,
-            PartNumber=pn,
+            PartNumber=part_number,
             Body=body,
             ContentLength=len(body),
         )
@@ -146,7 +146,8 @@ def upload_object(item):
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
         parts = list(
             pool.map(
-                lambda pn: upload_part(key, upload_id, pn), range(1, part_count + 1)
+                lambda part_number: upload_part(key, upload_id, part_number),
+                range(1, part_count + 1),
             )
         )
     result = {"key": key, "ok": all(r["ok"] for r in parts)}
