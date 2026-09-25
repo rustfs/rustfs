@@ -120,6 +120,26 @@ pub const PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC: &str = "set_disk_rename_dst_d
 pub const PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC: &str = "set_disk_rename_backup_dir_fsync";
 pub const PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC: &str = "set_disk_rename_ancestor_dir_fsync";
 pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rename_syscall";
+pub const PUT_STAGE_SET_DISK_RENAME_FANOUT_DISPATCH: &str = "set_disk_rename_fanout_dispatch";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY: &str = "set_disk_rename_remote_service_entry";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER: &str = "set_disk_rename_remote_service_before_handler";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_HANDLER_AWAIT: &str = "set_disk_rename_remote_service_handler_await";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_AFTER_HANDLER: &str = "set_disk_rename_remote_service_after_handler";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE: &str = "set_disk_rename_remote_service_response_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD: &str = "set_disk_rename_remote_service_response_build";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN: &str = "set_disk_rename_remote_service_response_return";
+pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL: &str = "set_disk_rename_disk_wait_local";
+pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_disk_wait_remote";
+pub const PUT_STAGE_LOCAL_DISK_RENAME_INNER: &str = "local_disk_rename_inner";
+pub const PUT_STAGE_SET_DISK_PRE_RENAME_GUARDS: &str = "set_disk_pre_rename_guards";
+pub const PUT_STAGE_SET_DISK_TIER_RECEIPT_SOURCE: &str = "set_disk_tier_receipt_source";
+pub const PUT_STAGE_SET_DISK_RENAME_CALL: &str = "set_disk_rename_call";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_HANDOFF: &str = "set_disk_rename_tail_handoff";
+pub const PUT_STAGE_SET_DISK_QUOTA_FENCE_RELEASE: &str = "set_disk_quota_fence_release";
+pub const PUT_STAGE_SET_DISK_QUOTA_COMMIT: &str = "set_disk_quota_commit";
+pub const PUT_STAGE_SET_DISK_CLEANUP_RECEIPT: &str = "set_disk_cleanup_receipt";
+pub const PUT_STAGE_SET_DISK_METADATA_CACHE_INVALIDATE: &str = "set_disk_metadata_cache_invalidate";
+pub const PUT_STAGE_SET_DISK_GUARD_RELEASE: &str = "set_disk_guard_release";
 
 pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED: &str = "disabled";
 pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS: &str = "le_250ms";
@@ -3181,11 +3201,33 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
             PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
             PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+            PUT_STAGE_SET_DISK_RENAME_FANOUT_DISPATCH,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_HANDLER_AWAIT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_AFTER_HANDLER,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+            PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL,
+            PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE,
+            PUT_STAGE_LOCAL_DISK_RENAME_INNER,
+            PUT_STAGE_SET_DISK_PRE_RENAME_GUARDS,
+            PUT_STAGE_SET_DISK_TIER_RECEIPT_SOURCE,
+            PUT_STAGE_SET_DISK_RENAME_CALL,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_HANDOFF,
+            PUT_STAGE_SET_DISK_QUOTA_FENCE_RELEASE,
+            PUT_STAGE_SET_DISK_QUOTA_COMMIT,
+            PUT_STAGE_SET_DISK_CLEANUP_RECEIPT,
+            PUT_STAGE_SET_DISK_METADATA_CACHE_INVALIDATE,
+            PUT_STAGE_SET_DISK_GUARD_RELEASE,
         ];
         let unique = stages.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), stages.len());
         assert!(stages.iter().all(|stage| {
-            (stage.starts_with("set_disk_rename_") || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT)
+            (stage.starts_with("set_disk_")
+                || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT
+                || *stage == PUT_STAGE_LOCAL_DISK_RENAME_INNER)
                 && !stage.contains('/')
                 && !stage.contains('{')
         }));

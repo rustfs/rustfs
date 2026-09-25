@@ -1337,6 +1337,11 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        let service_entry_stage_start = rustfs_io_metrics::put_stage_timer();
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+            service_entry_stage_start,
+        );
         if !request.get_ref().scanner_publication_lease_token.is_empty() || !request.get_ref().bucket_incarnation_id.is_empty() {
             let has_body_digest = request
                 .metadata()
@@ -1394,6 +1399,12 @@ impl NodeService {
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
         #[cfg(feature = "e2e-test-hooks")]
         let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
+        let before_handler_stage_start = rustfs_io_metrics::put_stage_timer();
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+            before_handler_stage_start,
+        );
+        let handler_await_stage_start = rustfs_io_metrics::put_stage_timer();
         let result = target
             .rename_local_data(
                 &request.disk,
@@ -1404,6 +1415,10 @@ impl NodeService {
                 bucket_incarnation,
             )
             .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_HANDLER_AWAIT,
+            handler_await_stage_start,
+        );
         #[cfg(feature = "e2e-test-hooks")]
         if let Some(mut observation) = observation {
             observation["ok"] = serde_json::json!(result.is_ok());
@@ -1411,27 +1426,79 @@ impl NodeService {
             let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
             let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
         }
+        let after_handler_stage_start = rustfs_io_metrics::put_stage_timer();
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_AFTER_HANDLER,
+            after_handler_stage_start,
+        );
         match result {
-            Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
-                Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
-                    success: true,
-                    rename_data_resp,
-                    rename_data_resp_bin: rename_data_resp_bin.into(),
-                    error: None,
-                })),
-                Err(err) => Ok(Response::new(RenameDataResponse {
+            Ok(rename_data_resp) => {
+                let response_encode_stage_start = rustfs_io_metrics::put_stage_timer();
+                let encoded_response = encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack);
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
+                    response_encode_stage_start,
+                );
+                match encoded_response {
+                    Ok((rename_data_resp, rename_data_resp_bin)) => {
+                        let response_build_stage_start = rustfs_io_metrics::put_stage_timer();
+                        let response = Response::new(RenameDataResponse {
+                            success: true,
+                            rename_data_resp,
+                            rename_data_resp_bin: rename_data_resp_bin.into(),
+                            error: None,
+                        });
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+                            response_build_stage_start,
+                        );
+                        let response_return_stage_start = rustfs_io_metrics::put_stage_timer();
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                            response_return_stage_start,
+                        );
+                        Ok(response)
+                    }
+                    Err(err) => {
+                        let response_build_stage_start = rustfs_io_metrics::put_stage_timer();
+                        let response = Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(err.into()),
+                        });
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+                            response_build_stage_start,
+                        );
+                        let response_return_stage_start = rustfs_io_metrics::put_stage_timer();
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                            response_return_stage_start,
+                        );
+                        Ok(response)
+                    }
+                }
+            }
+            Err(err) => {
+                let response_build_stage_start = rustfs_io_metrics::put_stage_timer();
+                let response = Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
-                })),
-            },
-            Err(err) => Ok(Response::new(RenameDataResponse {
-                success: false,
-                rename_data_resp: String::new(),
-                rename_data_resp_bin: Vec::new().into(),
-                error: Some(err.into()),
-            })),
+                });
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+                    response_build_stage_start,
+                );
+                let response_return_stage_start = rustfs_io_metrics::put_stage_timer();
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    response_return_stage_start,
+                );
+                Ok(response)
+            }
         }
     }
 

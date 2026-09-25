@@ -289,6 +289,7 @@ impl LocalDisk {
         dst_path: &str,
         state: &mut RenameDataState,
     ) -> Result<RenameDataResp> {
+        let local_rename_started = rustfs_io_metrics::put_stage_timer();
         crate::hp_guard!("LocalDisk::rename_data");
         #[cfg(feature = "e2e-test-hooks")]
         if fi.is_healing() {
@@ -918,13 +919,18 @@ impl LocalDisk {
                 self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
             }
 
-            Ok(RenameDataResp {
+            let response = RenameDataResp {
                 old_data_dir: has_old_data_dir,
                 rollback_data_dir,
                 cleanup_data_dir: has_old_data_dir,
                 sign: version_signature,
                 old_current_size,
-            })
+            };
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_LOCAL_DISK_RENAME_INNER,
+                local_rename_started,
+            );
+            Ok(response)
         } else {
             // Inline metadata preparation is blocking. The transaction lease is
             // moved into that work so a timeout can release the async waiter without
@@ -1279,13 +1285,18 @@ impl LocalDisk {
                 self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
             }
 
-            Ok(RenameDataResp {
+            let response = RenameDataResp {
                 old_data_dir: cleanup_data_dir,
                 rollback_data_dir,
                 cleanup_data_dir,
                 sign: version_signature,
                 old_current_size,
-            })
+            };
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_LOCAL_DISK_RENAME_INNER,
+                local_rename_started,
+            );
+            Ok(response)
         }
     }
 

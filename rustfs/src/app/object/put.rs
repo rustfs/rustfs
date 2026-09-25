@@ -2035,17 +2035,36 @@ impl DefaultObjectUsecase {
                 wait_for_put_post_store_test_hook(&bucket).await;
 
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let transition_enqueue_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
-                let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_post_store_transition_enqueue",
+                    transition_enqueue_stage_start,
+                );
 
+                let cache_invalidate_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_post_store_data_cache_invalidate",
+                    cache_invalidate_stage_start,
+                );
+
+                let versioning_lookup_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_post_store_versioning_lookup",
+                    versioning_lookup_stage_start,
+                );
                 // Fast in-memory update for immediate quota and admin usage consistency.
                 // The previous current size comes from the prelookup when it ran,
                 // otherwise from the rename_data backfill (rustfs/backlog#1009); the
                 // backfill reproduces the lookup's observation bit for bit (latest
                 // version's ObjectInfo.size — 0 for a delete-marker latest — or
                 // not-found → None).
+                let quota_size_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_quota_size", quota_size_stage_start);
+                let usage_memory_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size))
                 {
                     Some(previous_current_size) => {
@@ -2071,15 +2090,26 @@ impl DefaultObjectUsecase {
                         record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, put_versioned).await;
                     }
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_usage_memory", usage_memory_stage_start);
 
                 if dsc.replicate_any() {
+                    let replication_schedule_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "app_post_store_replication_schedule",
+                        replication_schedule_stage_start,
+                    );
                 }
 
+                let dirty_usage_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 rustfs_scanner::record_dirty_usage_object_from_producer(
                     &bucket,
                     &key,
                     rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_post_store_dirty_usage_record",
+                    dirty_usage_stage_start,
                 );
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 

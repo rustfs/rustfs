@@ -4356,6 +4356,7 @@ impl SetDisks {
                 let successful_rename_completion_rank =
                     rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
                 let mut tasks = JoinSet::new();
+                let fanout_dispatch_started = rustfs_io_metrics::put_stage_timer();
                 for (i, ((disk, file_info), scanner_publication_lease_token)) in fanout_disks
                     .into_iter()
                     .zip(file_infos.iter())
@@ -4398,6 +4399,7 @@ impl SetDisks {
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             dispatch_state = RenameDispatchState::MayHavePublished;
+                            let disk_is_local = disk.is_local();
                             let observed = disk
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
@@ -4426,6 +4428,14 @@ impl SetDisks {
                                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
                                     duration_ms,
                                 );
+                                rustfs_io_metrics::record_put_object_stage_duration(
+                                    if disk_is_local {
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
+                                    } else {
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
+                                    },
+                                    duration_ms,
+                                );
                                 let position = if result.is_ok() {
                                     let rank = successful_rename_completion_rank
                                         .as_ref()
@@ -4451,6 +4461,10 @@ impl SetDisks {
                         (i, dispatch_state, result)
                     });
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FANOUT_DISPATCH,
+                    fanout_dispatch_started,
+                );
 
                 let mut commit_tx = Some(commit_tx);
                 let mut sent_commit = false;
