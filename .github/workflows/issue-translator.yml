@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: usthe/issues-translate-action@b41f55ddc81d7d54bd542a4f289fe28ec081898e # v2.7
