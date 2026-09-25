@@ -96,11 +96,11 @@ pub struct WorkloadAdmissionSnapshot {
     pub class: WorkloadClass,
     /// Current admission state.
     pub state: AdmissionState,
-    /// Active work count when the owner exposes it.
+    /// Active work count or allocated/reserved permit units, as defined by the owner.
     pub active: Option<usize>,
     /// Queued work count when the owner exposes it.
     pub queued: Option<usize>,
-    /// Admission limit when the owner exposes it.
+    /// Admission limit in the same units as `active`, when the owner exposes it.
     pub limit: Option<usize>,
     /// Optional state reason for disabled, throttled, saturated, or unknown states.
     pub reason: Option<String>,

@@ -1170,18 +1170,12 @@ pub async fn start_http_server(
 
             // 4. Socket buffers. The receive buffer is left to kernel autotuning
             // unless RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set: a fixed SO_RCVBUF
-            // is inherited by every accepted socket and disables autotuning, so a
-            // request whose body is not being read yet (a multipart part queued
-            // for a foreground write permit) lets up to the fixed size of unread
-            // body accumulate in kernel memory — the former hard-coded 4 MiB held
-            // up to 8 MiB per queued connection on Linux, which doubles the
-            // requested size. Autotuning keeps an unread connection at the
-            // kernel's initial size and grows only connections that are actually
-            // being drained (issue #7385). The send buffer stays fixed at 4 MiB
-            // because the stock Linux send autotuning ceiling (`tcp_wmem` max,
-            // 4 MiB) is below what a GB-level response stream needs, whereas the
-            // receive ceiling (`tcp_rmem` max, 6 MiB) already exceeds the old
-            // fixed request.
+            // is inherited by every accepted socket and disables autotuning.
+            // A reused autotuned connection can retain a buffer enlarged by a
+            // previous request, so queued multipart bodies still consume kernel
+            // memory. Neither policy makes socket capacity an allocation or
+            // guarantees a fixed per-waiter memory footprint. Keep the existing
+            // send-buffer tuning independent of receive autotuning.
             // Some constrained local environments reject these socket options with
             // EPERM/ENOPROTOOPT-style failures; log and continue in that case.
             if recv_buffer_bytes > 0
