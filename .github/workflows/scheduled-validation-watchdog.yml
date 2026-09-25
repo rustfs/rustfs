@@ -42,7 +42,10 @@ jobs:
       github.event.workflow_run.event == 'schedule' &&
       github.event.workflow_run.conclusion != 'success' &&
       github.event.workflow_run.conclusion != 'failure'
-    runs-on: sm-standard-2
+    # Stay on GitHub-hosted runners: this monitor must keep running when the
+    # self-hosted sm-standard-* pool is down, which is exactly when the
+    # scheduled validations it watches stall.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       actions: read
