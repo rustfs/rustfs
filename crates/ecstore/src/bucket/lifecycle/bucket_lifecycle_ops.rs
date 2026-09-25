@@ -5606,6 +5606,11 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
+    let usage_accounting = if lc_event.action == IlmAction::DeleteAction && !versioned && !version_suspended && !oi.is_dir {
+        Some(crate::data_usage::begin_expiry_usage_accounting(&oi.bucket).await)
+    } else {
+        None
+    };
     let mut dobj = match api
         .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
         .await
@@ -5625,6 +5630,14 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
             return false;
         }
     };
+    if let Some(accounting) = usage_accounting
+        && !dobj.name.is_empty()
+        && !dobj.delete_marker
+        && !dobj.is_dir
+        && let Ok(size) = crate::data_usage::quota_object_size(&dobj)
+    {
+        accounting.commit(size).await;
+    }
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
 
     // The object (or all its versions, for delete_all) was expired; evict any
@@ -12889,6 +12902,82 @@ mod tests {
                 .is_ok(),
             "table data must remain readable after lifecycle admission rejects the delete"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ordinary_expiry_accounts_the_committed_receipt_once() {
+        use crate::data_usage::{apply_bucket_usage_memory_overlay, replace_bucket_usage_memory_from_info};
+        use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for size in [0usize, 42] {
+            let bytes = u64::try_from(size).expect("fixture size fits");
+            let bucket = format!("expiry-accounting-{}", Uuid::new_v4().simple());
+            create_test_bucket(&ecstore, &bucket).await;
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            let mut queued = ecstore
+                .put_object(&bucket, "expire", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create expiring object");
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            ecstore
+                .put_object(&bucket, "keep", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create retained object");
+            let mut baseline = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::now()),
+                usage_snapshot_complete: true,
+                buckets_count: 1,
+                ..Default::default()
+            };
+            baseline.buckets_usage.insert(
+                bucket.clone(),
+                BucketUsageInfo {
+                    objects_count: 2,
+                    versions_count: 2,
+                    size: bytes * 2,
+                    ..Default::default()
+                },
+            );
+            baseline.bucket_sizes.insert(bucket.clone(), bytes * 2);
+            baseline.calculate_totals();
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            // Queued metadata is not the accounting receipt from the storage commit.
+            queued.size = 1;
+            let event = lifecycle::Event {
+                action: IlmAction::DeleteAction,
+                ..Default::default()
+            };
+            let incarnation = ecstore
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("bucket incarnation");
+            for (attempt_incarnation, expected) in [(Uuid::new_v4(), false), (incarnation, true), (incarnation, false)] {
+                assert_eq!(
+                    super::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &queued,
+                        &event,
+                        &LcEventSrc::Scanner,
+                        attempt_incarnation,
+                    )
+                    .await,
+                    expected
+                );
+                let mut response = baseline.clone();
+                apply_bucket_usage_memory_overlay(&mut response).await;
+                let remaining = if attempt_incarnation == incarnation { 1 } else { 2 };
+                assert_eq!(response.buckets_usage[&bucket].objects_count, remaining);
+                assert_eq!(response.buckets_usage[&bucket].size, remaining * bytes);
+            }
+            assert!(
+                ecstore
+                    .get_object_info(&bucket, "keep", &ObjectOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
     }
 
     #[tokio::test]

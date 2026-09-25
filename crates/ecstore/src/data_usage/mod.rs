@@ -43,7 +43,7 @@ use std::{
     future::Future,
     sync::{
         Arc, LazyLock, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -83,6 +83,74 @@ struct CachedBucketUsage {
     // necessarily a complete scanner reconciliation and therefore creates a
     // fresh cache entry with no pending hold.
     pending_negative_delta: u64,
+    pending_negative_updated_at: Option<SystemTime>,
+    pending_negative_reconciliation: Option<PendingDeleteReconciliation>,
+    in_flight_expirations: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDeleteReconciliation {
+    bytes: u64,
+    deleted_at: SystemTime,
+    observed: Option<((u64, u64), SystemTime)>,
+}
+
+impl CachedBucketUsage {
+    fn reconcile_pending_deletes(&mut self, position: Option<(u64, u64)>, updated_at: SystemTime) {
+        let Some(position) = position else { return };
+        let Some(pending) = self.pending_negative_reconciliation.as_mut() else { return };
+        match pending.observed {
+            None if updated_at >= pending.deleted_at => pending.observed = Some((position, updated_at)),
+            Some((previous, observed_at)) if position.0 >= previous.0 && position.1 > previous.1 && updated_at >= observed_at => {
+                self.pending_negative_delta = self.pending_negative_delta.saturating_sub(pending.bytes);
+                self.pending_negative_reconciliation = self
+                    .pending_negative_updated_at
+                    .filter(|_| self.pending_negative_delta > 0)
+                    .map(|deleted_at| PendingDeleteReconciliation {
+                        bytes: self.pending_negative_delta,
+                        deleted_at,
+                        observed: (updated_at >= deleted_at).then_some((position, updated_at)),
+                    });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Keeps a scanner refresh from including a delete before its memory receipt.
+pub(crate) struct ExpiryUsageAccounting {
+    bucket: String,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl ExpiryUsageAccounting {
+    pub(crate) async fn commit(self, deleted_size: u64) {
+        let mut cache = memory_cache().write().await;
+        if let Some(entry) = cache.get_mut(&self.bucket)
+            && Arc::ptr_eq(&entry.in_flight_expirations, &self.in_flight)
+        {
+            apply_bucket_object_delete_memory(entry, deleted_size, true);
+        }
+    }
+}
+
+impl Drop for ExpiryUsageAccounting {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) async fn begin_expiry_usage_accounting(bucket: &str) -> ExpiryUsageAccounting {
+    ensure_bucket_usage_cached(bucket).await;
+    let mut cache = memory_cache().write().await;
+    let entry = cache
+        .entry(bucket.to_owned())
+        .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
+    entry.in_flight_expirations.fetch_add(1, Ordering::AcqRel);
+    ExpiryUsageAccounting {
+        bucket: bucket.to_owned(),
+        in_flight: Arc::clone(&entry.in_flight_expirations),
+    }
 }
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
@@ -1945,6 +2013,9 @@ fn cached_bucket_usage_from_backend(usage: BucketUsageInfo, updated_at: SystemTi
         stale_snapshot_pending: false,
         pending_scanner_position: None,
         pending_negative_delta: 0,
+        pending_negative_updated_at: None,
+        pending_negative_reconciliation: None,
+        in_flight_expirations: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -1959,6 +2030,9 @@ fn cached_bucket_usage_now(usage: BucketUsageInfo) -> CachedBucketUsage {
         stale_snapshot_pending: false,
         pending_scanner_position: None,
         pending_negative_delta: 0,
+        pending_negative_updated_at: None,
+        pending_negative_reconciliation: None,
+        in_flight_expirations: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -2110,6 +2184,10 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
         .entry(bucket.to_string())
         .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
 
+    apply_bucket_object_delete_memory(entry, deleted_size, removed_current_object);
+}
+
+fn apply_bucket_object_delete_memory(entry: &mut CachedBucketUsage, deleted_size: u64, removed_current_object: bool) {
     entry.usage.size = entry.usage.size.saturating_sub(deleted_size);
     entry.pending_negative_delta = entry.pending_negative_delta.saturating_add(deleted_size);
     if removed_current_object {
@@ -2118,6 +2196,16 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
     }
 
     let now = SystemTime::now();
+    entry.pending_negative_updated_at = Some(now);
+    // Freeze this tranche even before its first observation. Later deletes
+    // must not keep moving the timestamp that the scanner needs to catch up to.
+    if entry.pending_negative_reconciliation.is_none() && entry.pending_negative_delta > 0 {
+        entry.pending_negative_reconciliation = Some(PendingDeleteReconciliation {
+            bytes: entry.pending_negative_delta,
+            deleted_at: now,
+            observed: None,
+        });
+    }
     entry.refreshed_at = now;
     entry.usage_updated_at = now;
     entry.dirty = true;
@@ -2257,7 +2345,12 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
     if expected_generation.is_some_and(|expected| usage_memory_generation() != expected) {
         return;
     }
-    for (bucket, existing) in cache.iter() {
+    for (bucket, existing) in cache.iter_mut() {
+        existing.reconcile_pending_deletes(snapshot_position, usage_updated_at);
+        if existing.in_flight_expirations.load(Ordering::Acquire) > 0 {
+            next_cache.insert(bucket.clone(), existing.clone());
+            continue;
+        }
         // Leadership fencing can advance the epoch without scanning. Only a
         // later cycle can reconcile a dirty overlay that disagreed with the
         // first complete observation after its last request mutation.
@@ -2295,6 +2388,7 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                         // counts until they also converge, but release the
                         // conservative quota hold.
                         preserved.pending_negative_delta = 0;
+                        preserved.pending_negative_reconciliation = None;
                     }
                     preserved.stale_snapshot_pending = true;
                     preserved.pending_scanner_position = preserved.pending_scanner_position.or(snapshot_position);
@@ -2312,6 +2406,7 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                         // Omitting the bucket from a complete snapshot confirms
                         // that its post-delete byte total is zero.
                         preserved.pending_negative_delta = 0;
+                        preserved.pending_negative_reconciliation = None;
                     }
                     preserved.stale_snapshot_pending = true;
                     preserved.pending_scanner_position = preserved.pending_scanner_position.or(snapshot_position);
@@ -5807,6 +5902,127 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiry_receipts_exclude_refresh_until_committed_or_cancelled() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "expiry-receipt";
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 2, 84, SystemTime::now())).await;
+        let first = begin_expiry_usage_accounting(bucket).await;
+        let cancelled = begin_expiry_usage_accounting(bucket).await;
+        let after_delete = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        replace_bucket_usage_memory_from_info(&after_delete).await;
+        assert_eq!(memory_cache().read().await[bucket].usage.size, 84);
+        first.commit(42).await;
+        assert_eq!(memory_cache().read().await[bucket].usage.size, 42);
+
+        let mut omitted = data_usage_info_for_test(bucket, 0, 0, SystemTime::now());
+        omitted.buckets_usage.clear();
+        omitted.bucket_sizes.clear();
+        omitted.buckets_count = 0;
+        omitted.calculate_totals();
+        replace_bucket_usage_memory_from_info(&omitted).await;
+        assert_eq!(memory_cache().read().await[bucket].usage.size, 42);
+        drop(cancelled);
+        assert_eq!(
+            memory_cache().read().await[bucket]
+                .in_flight_expirations
+                .load(Ordering::Acquire),
+            0
+        );
+
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 1, 42, SystemTime::now())).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiry_receipt_cannot_credit_a_replaced_bucket_cache() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "expiry-recreated";
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 1, 42, SystemTime::now())).await;
+        let receipt = begin_expiry_usage_accounting(bucket).await;
+        clear_usage_memory_cache_for_test().await;
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 2, 84, SystemTime::now())).await;
+        receipt.commit(42).await;
+        assert_eq!(memory_cache().read().await[bucket].usage.objects_count, 2);
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_delete_tranches_advance_despite_newer_mutations() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "expiry-busy-quota";
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 10, 420, SystemTime::now())).await;
+        record_bucket_object_delete_memory(bucket, 42, true).await;
+        let mut observation = data_usage_info_for_test(bucket, 9, 378, SystemTime::now());
+        observation.scanner_epoch = Some(7);
+        observation.scanner_cycle = Some(10);
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        replace_bucket_usage_memory_from_info(&observation).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(462));
+
+        for (epoch, cycle, partial, old_time) in [
+            (8, 10, false, false),
+            (6, 11, false, false),
+            (7, 11, true, false),
+            (7, 11, false, true),
+        ] {
+            let mut rejected = observation.clone();
+            rejected.scanner_epoch = Some(epoch);
+            rejected.scanner_cycle = Some(cycle);
+            rejected.usage_snapshot_complete = !partial;
+            rejected.usage_snapshot_partial = partial;
+            if old_time {
+                rejected.last_update = Some(SystemTime::UNIX_EPOCH);
+            }
+            replace_bucket_usage_memory_from_info(&rejected).await;
+            assert_eq!(memory_cache().read().await[bucket].pending_negative_delta, 42);
+        }
+
+        observation.last_update = Some(SystemTime::now());
+        observation.scanner_cycle = Some(11);
+        // A newer delete must stay charged, without delaying the older receipt.
+        record_bucket_object_delete_memory(bucket, 42, true).await;
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        replace_bucket_usage_memory_from_info(&observation).await;
+        assert_eq!(memory_cache().read().await[bucket].pending_negative_delta, 42);
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(462));
+
+        for cycle in [12, 13] {
+            observation.last_update = Some(SystemTime::now());
+            observation.scanner_cycle = Some(cycle);
+            record_bucket_object_write_memory(bucket, None, 42).await;
+            replace_bucket_usage_memory_from_info(&observation).await;
+        }
+        assert_eq!(memory_cache().read().await[bucket].pending_negative_delta, 0);
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(504));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_delete_hold_stays_bounded_with_deletes_after_every_observation() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "expiry-continuous-quota";
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 10, 420, SystemTime::now())).await;
+        record_bucket_object_delete_memory(bucket, 42, true).await;
+        for cycle in 1..=12 {
+            let mut observed = data_usage_info_for_test(bucket, 9, 378, SystemTime::now());
+            observed.scanner_epoch = Some(7);
+            observed.scanner_cycle = Some(cycle);
+            record_bucket_object_write_memory(bucket, None, 42).await;
+            record_bucket_object_delete_memory(bucket, 42, true).await;
+            replace_bucket_usage_memory_from_info(&observed).await;
+            let cache = memory_cache().read().await;
+            assert_eq!(cache[bucket].usage.size, 378);
+            assert!(
+                cache[bucket].pending_negative_delta <= 126,
+                "confirmed older deletes must leave the quota hold"
+            );
         }
     }
 
