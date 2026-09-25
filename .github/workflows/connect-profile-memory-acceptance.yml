@@ -38,7 +38,7 @@ permissions:
 jobs:
   profile-memory:
     name: Verify signed service memory profile over mTLS
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source

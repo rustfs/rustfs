@@ -36,7 +36,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -45,7 +45,7 @@ jobs:
   architecture-migration-rules:
     name: Architecture Migration Rules
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
