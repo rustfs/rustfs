@@ -90,7 +90,7 @@ env:
 jobs:
   runner-check:
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
