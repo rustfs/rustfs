@@ -527,11 +527,19 @@ pub(crate) async fn set_new_bucket_metadata_in(
     lock.persist_new_and_set(bm).await
 }
 
-pub(crate) async fn cache_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
+pub(crate) async fn set_new_bucket_metadata_intent_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bm: BucketMetadata,
+) -> Result<()> {
     let sys = bucket_metadata_sys_of(ctx)?;
     let lock = sys.read().await;
-    lock.set(bm.name.clone(), Arc::new(bm)).await;
-    Ok(())
+    lock.persist_new_bucket_metadata_intent(bm).await
+}
+
+pub(crate) async fn commit_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    lock.commit_bucket_metadata(bm).await
 }
 
 pub(crate) async fn remove_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
@@ -1784,13 +1792,16 @@ impl BucketMetadataSys {
         )
         .await?;
 
-        let (bm, persisted) = await_bucket_namespace_operation(
+        let (mut bm, persisted) = await_bucket_namespace_operation(
             Some(namespace_guard),
             bucket,
             "bucket metadata load",
             load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
+        if persisted && bm.lock_enabled && !bm.bucket_creation_committed {
+            bm.commit_bucket_creation(self.object_store()).await?;
+        }
         match mode {
             MetadataLoadMode::Initial if persisted => {
                 let bm = Arc::new(bm);
@@ -2074,9 +2085,28 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.bucket_creation_committed = true;
+        bm.save_with_store_committed(self.object_store()).await?;
+        save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
+        bm.bucket_incarnation_sidecar = true;
+        self.set(bm.name.clone(), Arc::new(bm)).await;
+        Ok(())
+    }
+
+    async fn persist_new_bucket_metadata_intent(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.bucket_creation_committed = false;
         bm.save_with_store(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
+        // A pending creation intent must not enter the authoritative cache. The
+        // caller publishes it only after physical creation and commit-marker write.
+        Ok(())
+    }
+
+    async fn commit_bucket_metadata(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.parse_all_configs()?;
+        bm.bucket_incarnation_sidecar = true;
+        bm.commit_bucket_creation(self.object_store()).await?;
         self.set(bm.name.clone(), Arc::new(bm)).await;
         Ok(())
     }
@@ -2125,7 +2155,7 @@ impl BucketMetadataSys {
         {
             return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
         }
-        let (metadata, persisted) = await_bucket_namespace_operation(
+        let (mut metadata, persisted) = await_bucket_namespace_operation(
             Some(namespace_guard),
             bucket,
             "peer bucket metadata load",
@@ -2134,6 +2164,9 @@ impl BucketMetadataSys {
         .await?;
         if !persisted {
             return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
+        }
+        if metadata.lock_enabled && !metadata.bucket_creation_committed {
+            metadata.commit_bucket_creation(self.object_store()).await?;
         }
         self.publish_if_unchanged(bucket, expected.as_ref(), metadata, true, namespace_guard)
             .await
@@ -2192,26 +2225,42 @@ impl BucketMetadataSys {
             )
             .await?;
 
-            let bm = Arc::new(bm);
+            let mut bm = bm;
 
             if persisted {
+                // Object Lock metadata is persisted before physical bucket creation as a
+                // creation intent. The commit marker distinguishes a committed bucket
+                // from an intent left behind by an interrupted create.
+                let require_write_quorum = bm.lock_enabled && !bm.bucket_creation_committed;
+
                 await_bucket_namespace_operation(
                     Some(&guard),
                     bucket,
                     "lazy bucket metadata existence check",
                     Box::pin(async {
-                        self.object_store()
-                            .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
-                            .await
-                            .map(|_| ())
+                        let store = self.object_store();
+                        let options = crate::storage_api_contracts::bucket::BucketOptions::default();
+                        let info = if require_write_quorum {
+                            store.get_bucket_info_from_sets(bucket, &options).await
+                        } else {
+                            store.get_bucket_info_from_sets_at_read_quorum(bucket, &options).await
+                        };
+                        info.map(|_| ())
                     }),
                 )
                 .await?;
+                if require_write_quorum {
+                    // Write quorum proved that the physical namespace committed. Persist
+                    // the committed metadata so subsequent cold reads can use read quorum
+                    // without trusting the pre-physical metadata intent.
+                    bm.commit_bucket_creation(self.object_store()).await?;
+                }
                 if guard.is_lock_lost() {
                     return Err(Error::other(format!(
                         "bucket namespace lock was lost before lazy bucket metadata publish: {bucket}"
                     )));
                 }
+                let bm = Arc::new(bm);
                 let _publish_guard = self
                     .lock_metadata_publish(bucket, &guard, "lazy bucket metadata publish")
                     .await?;
@@ -2226,6 +2275,7 @@ impl BucketMetadataSys {
                 sync_bucket_target_sys(bucket, &bm).await;
                 sync_bucket_durability(bucket, &bm);
                 sync_on_demand_migration(bucket, &bm);
+                return Ok((bm, true));
             } else {
                 let exists = self
                     .bucket_exists(bucket, &guard, "lazy bucket metadata existence check")
@@ -2245,7 +2295,7 @@ impl BucketMetadataSys {
                 }
             }
 
-            Ok((bm, true))
+            Ok((Arc::new(bm), true))
         }
     }
 
@@ -2564,6 +2614,9 @@ impl BucketMetadataSys {
                 .await?;
             }
         }
+        if metadata.lock_enabled && !metadata.bucket_creation_committed {
+            metadata.commit_bucket_creation(self.object_store()).await?;
+        }
 
         if namespace_guard.is_lock_lost() {
             return Err(Error::other(format!(
@@ -2626,6 +2679,9 @@ impl BucketMetadataSys {
             load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
         )
         .await?;
+        if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
+            return Err(Error::ErasureWriteQuorum);
+        }
         if persisted {
             Ok(BucketMetadataAuthority::Authoritative(Arc::new(metadata)))
         } else {

@@ -701,7 +701,7 @@ impl ECStore {
 
         let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
         if metadata_persisted_before_physical {
-            metadata_sys::set_new_bucket_metadata_in(&self.ctx, meta.clone()).await?;
+            metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
             if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -759,12 +759,12 @@ impl ECStore {
 
         let metadata_result = async {
             if metadata_persisted_before_physical {
-                return Ok(());
+                return metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await;
             }
             if is_meta_bucketname(bucket) {
                 metadata_sys::set_bucket_metadata_in(&self.ctx, meta).await
             } else if existing_incarnation_is_authoritative && !lock_newly_enabled {
-                metadata_sys::cache_bucket_metadata_in(&self.ctx, meta).await
+                metadata_sys::commit_bucket_metadata_in(&self.ctx, meta).await
             } else {
                 metadata_sys::set_new_bucket_metadata_in(&self.ctx, meta).await
             }
@@ -909,6 +909,9 @@ impl ECStore {
                 // authoritative bucket. Never turn fabricated defaults into
                 // permission to serve degraded reads.
                 return Err(Error::ErasureReadQuorum);
+            }
+            if metadata.lock_enabled && !metadata.bucket_creation_committed {
+                return Err(Error::ErasureWriteQuorum);
             }
             if metadata.name != bucket {
                 return Err(Error::FileCorrupt);
@@ -2391,6 +2394,187 @@ mod tests {
             restore_set_disks(&store, set, below_quorum).await;
             restore_set_disks(&store, set, offline).await;
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_metadata_load_uses_read_quorum_for_non_lock_bucket() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lazy-read-quorum-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy namespace should accept bucket creation");
+
+        // Replace the instance metadata system with a cold cache while keeping the
+        // persisted metadata and physical bucket in place.
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+
+        metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect("cold metadata load should admit the exact namespace read quorum");
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_ok(),
+            "the lazy load should publish authoritative metadata"
+        );
+        assert_eq!(
+            store
+                .get_bucket_info_from_sets(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("bucket mutations must retain their majority namespace check"),
+            StorageError::ErasureWriteQuorum
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_metadata_load_rejects_below_read_quorum() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lazy-below-quorum-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy namespace should accept bucket creation");
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1, 2]).await;
+
+        let error = metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect_err("cold metadata load must reject read quorum minus one");
+        assert!(
+            matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)),
+            "below read quorum must fail with a read-quorum error, got {error}"
+        );
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_err(),
+            "a below-quorum load must not publish metadata"
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_metadata_load_keeps_lock_creation_intent_fail_closed() {
+        let (temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lazy-lock-intent-{}", Uuid::new_v4().simple());
+        let mut intent = BucketMetadata::new(&bucket);
+        intent.lock_enabled = true;
+        metadata_sys::set_new_bucket_metadata_intent_in(&store.ctx, intent)
+            .await
+            .expect("Object Lock creation intent should persist metadata and its incarnation sidecar");
+
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+        assert_eq!(
+            store
+                .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect_err("physical creation must not commit below write quorum"),
+            StorageError::ErasureWriteQuorum
+        );
+        assert!(!temp_dir.path().join("pool0-disk0").join(&bucket).exists());
+        assert!(!temp_dir.path().join("pool0-disk1").join(&bucket).exists());
+        assert!(temp_dir.path().join("pool0-disk2").join(&bucket).is_dir());
+        assert!(temp_dir.path().join("pool0-disk3").join(&bucket).is_dir());
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let error = metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect_err("Object Lock intent must not become visible at read quorum");
+        assert_eq!(error, StorageError::ErasureWriteQuorum);
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_err(),
+            "the rejected Object Lock intent must not enter the metadata cache"
+        );
+        assert_eq!(
+            store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("bucket-info read fallback must also reject a pending Object Lock intent"),
+            StorageError::ErasureWriteQuorum
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_metadata_load_admits_committed_lock_bucket_at_read_quorum() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lazy-committed-lock-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("healthy namespace should accept Object Lock bucket creation");
+        let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+            .await
+            .expect("read committed Object Lock metadata");
+        assert!(persisted && metadata.bucket_creation_committed);
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+
+        metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect("committed Object Lock metadata should load at read quorum");
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_ok(),
+            "committed Object Lock metadata should be published"
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_metadata_load_backfills_creation_commit_at_write_quorum() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("lazy-commit-backfill-{}", Uuid::new_v4().simple());
+        let mut intent = BucketMetadata::new(&bucket);
+        intent.lock_enabled = true;
+        metadata_sys::set_new_bucket_metadata_intent_in(&store.ctx, intent)
+            .await
+            .expect("persist pending Object Lock intent");
+        store
+            .make_bucket_on_sets(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("physical creation should commit at full write quorum");
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect("write quorum should backfill the creation commit");
+        let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+            .await
+            .expect("read backfilled creation commit");
+        assert!(persisted && metadata.bucket_creation_committed);
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+        metadata_sys::get_on_demand_migration_config_in(&store, &bucket)
+            .await
+            .expect("backfilled Object Lock bucket should load at read quorum");
+        restore_set_disks(&store, set, offline).await;
     }
 
     #[tokio::test]
