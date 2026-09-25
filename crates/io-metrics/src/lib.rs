@@ -236,6 +236,17 @@ pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT: &str =
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED: &str = "set_disk_rename_tail_cleanup_defer_completed";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DURATION: &str =
     "set_disk_rename_tail_cleanup_defer_worker_duration";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT: &str = "set_disk_rename_tail_cleanup_target_receipt";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY: &str =
+    "set_disk_rename_tail_cleanup_target_commit_capacity";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT: &str = "set_disk_rename_tail_cleanup_target_report";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT: &str = "set_disk_rename_tail_cleanup_target_count";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET: &str = "set_disk_rename_tail_cleanup_zero_target";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE: &str = "set_disk_rename_tail_cleanup_tmp_delete";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP: &str =
+    "set_disk_rename_tail_cleanup_tmp_delete_counterfactual_skip";
+pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP: &str =
+    "set_disk_rename_tail_cleanup_decommission_guard_drop";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH: &str = "set_disk_rename_tail_cleanup_lane_queue_depth";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH: &str = "set_disk_rename_tail_cleanup_lane_queue_push";
 pub const PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE: &str =
@@ -3471,6 +3482,14 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_JOB_WAIT,
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_COMPLETED,
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFER_WORKER_DURATION,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
+            PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH,
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH,
             PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE,

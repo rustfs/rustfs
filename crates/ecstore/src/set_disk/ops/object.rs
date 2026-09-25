@@ -77,6 +77,7 @@ const RENAME_TAIL_CLEANUP_LANE_CAPACITY_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEA
 const RENAME_TAIL_CLEANUP_LANE_BATCH_MAX_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_BATCH_MAX";
 const RENAME_TAIL_CLEANUP_LANE_BATCH_WINDOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_BATCH_WINDOW_MS";
 const RENAME_TAIL_CLEANUP_LANE_ACTIVE_WINDOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_ACTIVE_WINDOW_MS";
+const RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP";
 const DEFAULT_RENAME_TAIL_CLEANUP_PER_DISK_LANES: usize = 1024;
 const DEFAULT_RENAME_TAIL_CLEANUP_LANE_CAPACITY: usize = 1024;
 const DEFAULT_RENAME_TAIL_CLEANUP_LANE_BATCH_MAX: usize = 1;
@@ -86,6 +87,18 @@ fn tier_free_version_source_lookup_counterfactual_skip_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var(TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP_ENV)
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP_ENV)
                 .ok()
                 .as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
@@ -3745,8 +3758,14 @@ impl SetDisks {
         let _cleanup_per_disk_permit = rename_tail_cleanup_per_disk_permit(target.disk_index).await;
         let mut disks = vec![None; self.set_drive_count];
         disks[target.disk_index] = Some(target.disk);
+        let receipt_started = rustfs_io_metrics::put_stage_timer();
         self.persist_old_data_cleanup_receipts(&disks, bucket, object, target.old_data_dir, committed_data_dir, epoch)
             .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT,
+            receipt_started,
+        );
+        let commit_capacity_started = rustfs_io_metrics::put_stage_timer();
         let cleanup = self
             .commit_rename_data_dir_and_mark_capacity(
                 &disks,
@@ -3757,8 +3776,17 @@ impl SetDisks {
                 1,
             )
             .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY,
+            commit_capacity_started,
+        );
+        let report_started = rustfs_io_metrics::put_stage_timer();
         self.report_old_data_dir_cleanup(bucket, object, &target.old_data_dir.to_string(), &cleanup)
             .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT,
+            report_started,
+        );
     }
 
     pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
@@ -5292,6 +5320,17 @@ impl SetDisks {
                                 drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
                                 async move {
+                                    let zero_target_cleanup = targets.is_empty();
+                                    rustfs_io_metrics::record_put_object_stage_duration(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
+                                        targets.len() as f64,
+                                    );
+                                    if zero_target_cleanup {
+                                        rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
+                                            1.0,
+                                        );
+                                    }
                                     cleanup_set
                                         .cleanup_rename_tail(
                                             targets,
@@ -5301,7 +5340,15 @@ impl SetDisks {
                                             transaction_epoch,
                                         )
                                         .await;
-                                    if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
+                                    let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
+                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                        rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
+                                            1.0,
+                                        );
+                                    } else if let Err(err) =
+                                        cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await
+                                    {
                                         warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
                                     } else if issue3031_diag_enabled() {
                                         warn!(
@@ -5310,8 +5357,17 @@ impl SetDisks {
                                             "issue3031_put_object_tmp_cleanup_done"
                                         );
                                     }
+                                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
+                                        tmp_delete_started,
+                                    );
+                                    let guard_drop_started = rustfs_io_metrics::put_stage_timer();
                                     drop(decommission_object_lock_guard);
                                     drop(decommission_capacity_guard);
+                                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
+                                        guard_drop_started,
+                                    );
                                 }
                             },
                             |request| async move { heal_set.submit_rename_tail_heal(request).await },
