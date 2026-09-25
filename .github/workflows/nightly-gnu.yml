@@ -44,7 +44,7 @@ env:
 jobs:
   resolve-source:
     name: Resolve nightly source
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
@@ -366,7 +366,7 @@ jobs:
   kms-vault-lane:
     needs: resolve-source
     name: KMS live Vault lane
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -466,7 +466,7 @@ jobs:
   kms-vault-ha-failover:
     needs: resolve-source
     name: KMS Vault HA failover lane
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -495,7 +495,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

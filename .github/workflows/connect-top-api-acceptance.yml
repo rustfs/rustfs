@@ -49,7 +49,7 @@ permissions:
 jobs:
   top-api:
     name: Verify native Linux x86_64 top.api service job
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout acceptance harness

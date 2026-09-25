@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   build-helm-package:
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     if: |
       (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.version, '-preview')) ||
@@ -114,7 +114,7 @@ jobs:
           retention-days: 1
 
   publish-helm-package:
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     needs: [ build-helm-package ]
     if: needs.build-helm-package.result == 'success'

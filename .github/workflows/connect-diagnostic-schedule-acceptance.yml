@@ -38,7 +38,7 @@ permissions:
 jobs:
   diagnostic-schedule:
     name: Verify production scheduler receipts over mTLS
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source

@@ -146,7 +146,7 @@ jobs:
     # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
     # See the header note (ci-1) for why the self-hosted sm-standard-4 label
     # was abandoned. Scheduled failures are handled by alert-on-failure below.
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -371,7 +371,7 @@ jobs:
     name: Upstream HEAD classification canary
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -453,7 +453,7 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
