@@ -26,7 +26,7 @@ use crate::erasure::codec::workspace::ShardBufferPool;
 use crate::erasure::coding::{BitrotReader, Erasure};
 use crate::io_support::bitrot::DeferredReaderStripeHandle;
 use crate::set_disk::shard_source::{
-    INLINE_SHARD_SLOTS, ShardBuffers, ShardErrors, ShardReadCost, ShardStripeSource, StripeReadState,
+    INLINE_SHARD_SLOTS, ShardBuffers, ShardErrors, ShardReadCost, ShardReadRepair, ShardStripeSource, StripeReadState,
 };
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -46,7 +46,13 @@ type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Re
 type OwnedShardReadFuture<'a, R> =
     Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
 pub(crate) type DeferredReaderReopener<R> = Arc<dyn Fn(usize) -> Option<BitrotReader<R>> + Send + Sync>;
-pub(crate) type DecodeOutcome = (usize, Option<std::io::Error>, bool);
+#[derive(Debug, Default)]
+pub(crate) struct DecodeOutcome {
+    pub(crate) written: usize,
+    pub(crate) error: Option<std::io::Error>,
+    pub(crate) exact_quorum: bool,
+    pub(crate) repair: ShardReadRepair,
+}
 
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
 type ActiveReaders = SmallVec<[bool; INLINE_SHARD_SLOTS]>;
@@ -596,6 +602,7 @@ pub(crate) struct ParallelReader<R> {
     hedged_readers: ActiveReaders,
     stripe_index: usize,
     integrity: Option<std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
+    repair_evidence: Option<Arc<ShardReadRepair>>,
 }
 }
 
@@ -808,7 +815,13 @@ where
             deferred_reopeners: Vec::new(),
             hedged_readers,
             stripe_index: 0,
+            repair_evidence: None,
         }
+    }
+
+    pub(crate) fn with_repair_evidence(mut self, evidence: Arc<ShardReadRepair>) -> Self {
+        self.repair_evidence = Some(evidence);
+        self
     }
 
     /// Attach the per-slot deferred stripe handles produced during bitrot
@@ -2027,6 +2040,9 @@ where
             .take()
             .unwrap_or_else(|| Box::new(StripeReadState::with_slot_count(self.readers.len(), self.data_shards)));
         self.read_into_state(&mut state).await;
+        if let Some(evidence) = &self.repair_evidence {
+            evidence.observe(state.parts_mut().1);
+        }
         if state.can_decode()
             && let Some(proof) = &self.integrity
         {
@@ -2231,10 +2247,10 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        let (written, error, _) = self
+        let outcome = self
             .decode_inner(writer, readers, offset, length, total_length, None, Vec::new(), Vec::new())
             .await;
-        (written, error)
+        (outcome.written, outcome.error)
     }
 
     #[allow(dead_code, reason = "read-cost decode path asserted by this file's tests (backlog#1823)")]
@@ -2251,10 +2267,10 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        let (written, error, _) = self
+        let outcome = self
             .decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new(), Vec::new())
             .await;
-        (written, error)
+        (outcome.written, outcome.error)
     }
 
     /// GET decode entry point that also carries the deferred-parity stripe
@@ -2311,7 +2327,7 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        let (written, error, _) = self
+        let outcome = self
             .decode_inner(
                 writer,
                 readers,
@@ -2323,7 +2339,7 @@ impl Erasure {
                 deferred_reopeners,
             )
             .await;
-        (written, error)
+        (outcome.written, outcome.error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2374,6 +2390,7 @@ impl Erasure {
         block_length: usize,
         written: &mut usize,
         ret_err: &mut Option<std::io::Error>,
+        repair: &ShardReadRepair,
         stage_metrics_enabled: bool,
         require_surplus_source: bool,
         integrity: Option<&std::sync::Arc<crate::io_support::shard_integrity::PartProofReader>>,
@@ -2382,6 +2399,7 @@ impl Erasure {
     where
         W: AsyncWrite + Send + Sync + Unpin,
     {
+        repair.observe(errs);
         if ret_err.is_none()
             && let (_, Some(err)) = reduce_errs(errs, &[])
             && (err == Error::FileNotFound || err == Error::FileCorrupt)
@@ -2516,41 +2534,42 @@ impl Erasure {
     {
         if readers.len() != self.data_shards + self.parity_shards {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")), false);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")),
+                ..Default::default()
+            };
         }
 
         // block_size/data_shards come from on-disk metadata; a corrupt FileInfo with a
         // zero here must surface as an error, not a divide-by-zero panic on every GET.
         if self.block_size == 0 || self.data_shards == 0 {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (
-                0,
-                Some(io::Error::new(ErrorKind::InvalidInput, "Invalid erasure coding parameters")),
-                false,
-            );
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "Invalid erasure coding parameters")),
+                ..Default::default()
+            };
         }
 
         let Some(end_offset) = offset.checked_add(length) else {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (
-                0,
-                Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
-                false,
-            );
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
+                ..Default::default()
+            };
         };
         if end_offset > total_length {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (
-                0,
-                Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
-                false,
-            );
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
+                ..Default::default()
+            };
         }
 
         let mut ret_err = None;
+        let repair = ShardReadRepair::default();
 
         if length == 0 {
-            return (0, ret_err, false);
+            return DecodeOutcome::default();
         }
 
         let mut written = 0;
@@ -2573,6 +2592,11 @@ impl Erasure {
         .with_deferred_parity_reopeners(deferred_reopeners);
 
         let integrity = reader.integrity.clone();
+        // Copy sources use demand-bound scheduling for backpressure, but retain
+        // the ordinary GET read quorum. Only the opt-in GET rollout requires a
+        // surplus source; available surplus shards and integrity proofs are
+        // still verified before any reconstructed copy bytes are emitted.
+        let require_surplus_source = reader.demand_bound_lockstep && matches!(decode_read_policy(), DecodeReadPolicy::Default);
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
@@ -2667,7 +2691,6 @@ impl Erasure {
                         // `shards` are borrowed again below. In the `Stop` case that
                         // drop is what cancels the still-in-flight prefetch read.
                         let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
-                            let require_surplus_source = reader.demand_bound_lockstep;
                             let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
                             let emit_fut = self.emit_decoded_stripe(
                                 writer,
@@ -2677,6 +2700,7 @@ impl Erasure {
                                 block_length,
                                 &mut written,
                                 &mut ret_err,
+                                &repair,
                                 stage_metrics_enabled,
                                 require_surplus_source,
                                 integrity.as_ref(),
@@ -2727,8 +2751,9 @@ impl Erasure {
                                 block_length,
                                 &mut written,
                                 &mut ret_err,
+                                &repair,
                                 stage_metrics_enabled,
-                                reader.demand_bound_lockstep,
+                                require_surplus_source,
                                 integrity.as_ref(),
                                 offset,
                             )
@@ -2770,8 +2795,9 @@ impl Erasure {
                         block_length,
                         &mut written,
                         &mut ret_err,
+                        &repair,
                         stage_metrics_enabled,
-                        reader.demand_bound_lockstep,
+                        require_surplus_source,
                         integrity.as_ref(),
                         offset,
                     )
@@ -2785,15 +2811,16 @@ impl Erasure {
             }
         }
 
-        if ret_err.is_some() {
-            return (written, ret_err, exact_quorum);
-        }
-
-        if written < length {
+        if ret_err.is_none() && written < length {
             ret_err = Some(Error::LessData.into());
         }
 
-        (written, ret_err, exact_quorum)
+        DecodeOutcome {
+            written,
+            error: ret_err,
+            exact_quorum,
+            repair,
+        }
     }
 }
 
@@ -3449,6 +3476,150 @@ mod tests {
         }
     }
 
+    async fn copy_source_bitrot_shards(erasure: &Erasure, payload: &[u8], corrupt_parity: bool) -> Vec<Vec<u8>> {
+        let mut writers: Vec<_> = (0..erasure.data_shards + erasure.parity_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), erasure.shard_size(), HashAlgorithm::HighwayHash256))
+            .collect();
+        for block in payload.chunks(erasure.block_size) {
+            let shards = erasure.encode_data(block).expect("copy source should encode");
+            for (index, shard) in shards.iter().enumerate() {
+                let mut bytes = shard.to_vec();
+                if corrupt_parity && index == erasure.data_shards {
+                    // A stale source can have a valid per-shard bitrot checksum.
+                    // Reframe the changed parity to exercise reconstruction verification.
+                    bytes[0] ^= 0x80;
+                }
+                writers[index].write(&bytes).await.expect("copy source should frame");
+            }
+        }
+        writers.into_iter().map(|writer| writer.into_inner().into_inner()).collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_reads_exact_quorum_across_stripes_and_ranges() {
+        const BLOCK_SIZE: usize = 768;
+        let payload: Vec<_> = (0..BLOCK_SIZE * 3 + 37)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            for offline in [[0, 1, 2, 3], [0, 5, 12, 15]] {
+                for (offset, length) in [(0, payload.len()), (BLOCK_SIZE + 17, payload.len() - BLOCK_SIZE - 17)] {
+                    let frame_offset = offset / BLOCK_SIZE * (erasure.shard_size() + HashAlgorithm::HighwayHash256.size());
+                    let positioned: Vec<_> = buffers.iter().map(|bytes| bytes[frame_offset..].to_vec()).collect();
+                    let (mut readers, handles) =
+                        readers_with_deferred_parity(&positioned, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+                    for index in offline {
+                        readers[index] = None;
+                    }
+                    let mut output = Vec::new();
+                    let (written, error) = crate::set_disk::with_get_object_read_policy(
+                        crate::set_disk::GetObjectReadPolicy::CopySource,
+                        erasure.decode_with_stripe_handles(&mut output, readers, offset, length, payload.len(), None, handles),
+                    )
+                    .await;
+
+                    assert!(error.is_none(), "legacy={uses_legacy}, offline={offline:?}, offset={offset}: {error:?}");
+                    assert_eq!(written, length);
+                    assert_eq!(output, payload[offset..offset + length]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_recovers_exact_quorum_after_first_stripe() {
+        const BLOCK_SIZE: usize = 768;
+        let payload: Vec<_> = (0..BLOCK_SIZE * 3 + 37)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            let first_frame = erasure.shard_size() + HashAlgorithm::HighwayHash256.size();
+            let (readers, handles) = readers_with_deferred_parity(
+                &buffers,
+                12,
+                erasure.shard_size(),
+                &HashAlgorithm::HighwayHash256,
+                &[(0, first_frame), (1, first_frame), (2, first_frame), (3, first_frame)],
+            );
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert!(error.is_none(), "legacy={uses_legacy}: late shard loss should recover: {error:?}");
+            assert_eq!(written, payload.len());
+            assert_eq!(output, payload);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_below_read_quorum_fails_before_output() {
+        const BLOCK_SIZE: usize = 768;
+        let payload = vec![0x5a; BLOCK_SIZE * 2 + 37];
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, false).await;
+            let (mut readers, handles) =
+                readers_with_deferred_parity(&buffers, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+            for reader in readers.iter_mut().take(5) {
+                *reader = None;
+            }
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert_eq!(written, 0);
+            assert!(output.is_empty());
+            assert_eq!(
+                error
+                    .expect("eleven shards cannot reconstruct twelve data shards")
+                    .to_string(),
+                Error::ErasureReadQuorum.to_string()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_source_rejects_corrupt_surplus_parity_before_output() {
+        const BLOCK_SIZE: usize = 768;
+        let payload = vec![0x5a; BLOCK_SIZE * 2 + 37];
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(12, 4, BLOCK_SIZE, uses_legacy);
+            let buffers = copy_source_bitrot_shards(&erasure, &payload, true).await;
+            let (mut readers, handles) =
+                readers_with_deferred_parity(&buffers, 12, erasure.shard_size(), &HashAlgorithm::HighwayHash256, &[]);
+            for reader in readers.iter_mut().take(3) {
+                *reader = None;
+            }
+            let mut output = Vec::new();
+            let (written, error) = crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                erasure.decode_with_stripe_handles(&mut output, readers, 0, payload.len(), payload.len(), None, handles),
+            )
+            .await;
+
+            assert_eq!(written, 0);
+            assert!(output.is_empty());
+            let error = error.expect("copy must reject inconsistent surplus parity despite valid bitrot framing");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("inconsistent read source shards"));
+        }
+    }
+
     /// Guards the shard-buffer reuse in `ParallelReader`: a multi-stripe
     /// `Erasure::decode` that reconstructs missing data shards on every stripe
     /// must still return byte-exact output. Reconstructed and parity buffers are
@@ -3834,10 +4005,45 @@ mod tests {
             temp_env::async_with_vars(vars, async {
                 let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, 0, &[], &[1]);
                 let mut output = Vec::new();
-                let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
-                assert!(err.is_none(), "{label}: corrupt-shard read errored {err:?}");
-                assert_eq!(written, total_len, "{label}: corrupt-shard short write");
+                let outcome = erasure
+                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                        &mut output,
+                        readers,
+                        0,
+                        total_len,
+                        total_len,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await;
+                assert!(outcome.error.is_none(), "{label}: corrupt-shard read errored {:?}", outcome.error);
+                assert_eq!(outcome.written, total_len, "{label}: corrupt-shard short write");
                 assert_eq!(output, total_data, "{label}: corrupt bytes leaked into output");
+                assert!(
+                    outcome.repair.needed(false),
+                    "{label}: minority corruption must survive successful reconstruction"
+                );
+                let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, 0, &[], &[]);
+                let mut healthy_output = Vec::new();
+                let healthy = erasure
+                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                        &mut healthy_output,
+                        readers,
+                        0,
+                        total_len,
+                        total_len,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await;
+                assert!(healthy.error.is_none());
+                assert_eq!(healthy_output, total_data);
+                assert!(
+                    !healthy.repair.needed(true),
+                    "{label}: healthy/deferred shards cannot create repair evidence"
+                );
             })
             .await;
         }
@@ -4635,40 +4841,38 @@ mod tests {
                 (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
             ],
             async {
-            const NUM_SHARDS: usize = 1;
-            const BLOCK_SIZE: usize = 64;
-            const DATA_SHARDS: usize = 4;
-            const PARITY_SHARDS: usize = 2;
-            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+                const NUM_SHARDS: usize = 1;
+                const BLOCK_SIZE: usize = 64;
+                const DATA_SHARDS: usize = 4;
+                const PARITY_SHARDS: usize = 2;
+                const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
 
-            let hash_algo = HashAlgorithm::HighwayHash256;
-            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[1]).await;
-            let read_costs = vec![
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Remote,
-                ShardReadCost::Remote,
-            ];
-            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
-                readers,
-                erasure,
-                0,
-                NUM_SHARDS * BLOCK_SIZE,
-                None,
-                read_costs,
-            );
+                let hash_algo = HashAlgorithm::HighwayHash256;
+                let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[1]).await;
+                let read_costs = vec![
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Remote,
+                    ShardReadCost::Remote,
+                ];
+                let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+                let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                    readers,
+                    erasure,
+                    0,
+                    NUM_SHARDS * BLOCK_SIZE,
+                    None,
+                    read_costs,
+                );
 
-            let (bufs, errs) = parallel_reader.read().await;
+                let (bufs, errs) = parallel_reader.read().await;
 
-            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
-            assert!(
-                matches!(&errs[1], Some(DiskError::Io(err)) if err.kind() == ErrorKind::InvalidData && err.to_string().contains("bitrot"))
-            );
-            assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
-            assert!(bufs[5].is_none());
+                assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+                assert_eq!(errs[1], Some(DiskError::FileCorrupt));
+                assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
+                assert!(bufs[5].is_none());
             },
         )
         .await;
@@ -4814,16 +5018,7 @@ mod tests {
             assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
             assert_eq!(
                 BITROT_DISKS,
-                errs.iter()
-                    .filter(|err| {
-                        match err {
-                            Some(DiskError::Io(err)) => {
-                                err.kind() == std::io::ErrorKind::InvalidData && err.to_string().contains("bitrot")
-                            }
-                            _ => false,
-                        }
-                    })
-                    .count()
+                errs.iter().filter(|err| matches!(err, Some(DiskError::FileCorrupt))).count()
             );
         }
     }

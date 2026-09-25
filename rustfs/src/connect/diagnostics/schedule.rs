@@ -380,11 +380,20 @@ async fn run_collection_schedule(
         let _ = receipts.send(state.last_receipt.clone());
     }
 
+    // The runtime's initial stopped value is not a received revocation. Keep the
+    // durable interval fenced until heartbeat supplies a policy to evaluate.
+    while *policies.borrow() == DiagnosticCollectionPolicy::stopped() {
+        let _ = status.send(DiagnosticScheduleStatus::Waiting);
+        if wait_for_policy(policies, shutdown).await {
+            return Ok(());
+        }
+    }
+
     loop {
         if shutdown.is_cancelled() {
             break;
         }
-        let policy = policies.borrow().clone();
+        let policy = policies.borrow_and_update().clone();
         if let Err(error) = policy.validate()
             && policy.should_run()
         {
@@ -690,6 +699,291 @@ mod tests {
                 Err(DiagnosticScheduleError::Cancelled)
             })
         })
+    }
+
+    #[tokio::test]
+    async fn bootstrap_stopped_policy_preserves_a_due_interval_until_fresh_policy_arrives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::new(temp.path());
+        let active = policy(7, true);
+        let due = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let previous = receipt(
+            7,
+            ENVIRONMENT_TOOL_ID,
+            now_string(),
+            ReceiptOutcome::Succeeded,
+            1,
+            None,
+            Some(b"previous"),
+        );
+        store
+            .write(ScheduleState {
+                policy_revision: Some(active.revision),
+                policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                next_due_at: Some(due.clone()),
+                active_interval_started_at: None,
+                last_receipt: Some(previous.clone()),
+            })
+            .await
+            .expect("persist scheduled interval");
+        let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+        let shutdown = CancellationToken::new();
+        let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), blocking_runner());
+        tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+            .await
+            .expect("bootstrap waiting timeout")
+            .expect("bootstrap waiting notification");
+        assert!(matches!(*runtime.status.borrow(), DiagnosticScheduleStatus::Waiting));
+        let persisted = store.read().await.expect("bootstrap state");
+        assert_eq!(persisted.next_due_at.as_deref(), Some(due.as_str()));
+        assert_eq!(persisted.last_receipt, Some(previous.clone()));
+        assert_eq!(*runtime.receipts.borrow(), Some(previous.clone()));
+
+        policy_tx
+            .send(DiagnosticCollectionPolicy::stopped())
+            .expect("bootstrap still waiting");
+        tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+            .await
+            .expect("repeated bootstrap timeout")
+            .expect("repeated bootstrap notification");
+        assert_eq!(store.read().await.expect("still scheduled").next_due_at.as_deref(), Some(due.as_str()));
+
+        policy_tx.send(active).expect("fresh unchanged policy");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+                .await
+                .is_err()
+        );
+        assert!(!runtime.task.is_finished(), "unchanged policy must not kill the scheduler");
+        let persisted = store.read().await.expect("resumed state");
+        assert_eq!(persisted.next_due_at.as_deref(), Some(due.as_str()));
+        assert_eq!(persisted.last_receipt, Some(previous));
+
+        policy_tx.send(policy(8, true)).expect("new revision");
+        wait_running(&mut runtime.status).await;
+        assert!(matches!(
+            *runtime.status.borrow(),
+            DiagnosticScheduleStatus::Running { policy_revision: 8, .. }
+        ));
+        shutdown.cancel();
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn overdue_restart_waits_for_fresh_policy_and_keeps_the_original_interval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::new(temp.path());
+        let active = policy(7, true);
+        let due = Utc::now() - chrono::Duration::seconds(10);
+        let due_string = due.to_rfc3339_opts(SecondsFormat::Secs, true);
+        store
+            .write(ScheduleState {
+                policy_revision: Some(7),
+                policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                next_due_at: Some(due_string.clone()),
+                ..ScheduleState::default()
+            })
+            .await
+            .expect("persist overdue interval");
+        let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+        let shutdown = CancellationToken::new();
+        let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), blocking_runner());
+        tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+            .await
+            .expect("bootstrap timeout")
+            .expect("waiting");
+        assert!(matches!(*runtime.status.borrow(), DiagnosticScheduleStatus::Waiting));
+        let before = store.read().await.expect("before authorization");
+        assert_eq!(before.next_due_at, Some(due_string.clone()));
+        assert!(before.active_interval_started_at.is_none());
+        assert!(before.last_receipt.is_none());
+
+        policy_tx.send(active).expect("fresh policy");
+        wait_running(&mut runtime.status).await;
+        let running = store.read().await.expect("running original interval");
+        assert_eq!(running.active_interval_started_at, Some(due_string.clone()));
+        assert_eq!(
+            running.next_due_at,
+            Some((due + chrono::Duration::seconds(300)).to_rfc3339_opts(SecondsFormat::Secs, true))
+        );
+        shutdown.cancel();
+        runtime.shutdown().await;
+        let completed = store.read().await.expect("cancelled interval").last_receipt.expect("receipt");
+        assert_eq!(completed.interval_started_at, due_string);
+        assert_eq!(completed.outcome, ReceiptOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn fresh_policy_received_before_startup_does_not_cancel_its_own_overdue_interval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::new(temp.path());
+        let active = policy(7, true);
+        let due = Utc::now() - chrono::Duration::seconds(10);
+        let due_string = due.to_rfc3339_opts(SecondsFormat::Secs, true);
+        store
+            .write(ScheduleState {
+                policy_revision: Some(7),
+                policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                next_due_at: Some(due_string.clone()),
+                ..ScheduleState::default()
+            })
+            .await
+            .expect("persist overdue interval");
+        let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+        policy_tx.send(active).expect("heartbeat arrives before state read completes");
+        let shutdown = CancellationToken::new();
+        let runner: Runner = Arc::new(|_| Box::pin(async { Ok(b"collected".to_vec()) }));
+        let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), runner);
+        tokio::time::timeout(Duration::from_secs(2), runtime.receipts.changed())
+            .await
+            .expect("collection timeout")
+            .expect("receipt");
+        let receipt = runtime.receipts.borrow().clone().expect("collection receipt");
+        shutdown.cancel();
+        runtime.shutdown().await;
+        assert_eq!(receipt.outcome, ReceiptOutcome::Succeeded);
+        assert_eq!(receipt.interval_started_at, due_string);
+        assert_eq!(receipt.attempt_count, 1);
+        assert_eq!(receipt.result_bytes, Some(b"collected".len()));
+        let persisted = store.read().await.expect("completed interval");
+        assert_eq!(
+            persisted.next_due_at,
+            Some((due + chrono::Duration::seconds(300)).to_rfc3339_opts(SecondsFormat::Secs, true))
+        );
+        assert_eq!(persisted.last_receipt, Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_expired_policy_and_corrupt_same_revision_state() {
+        for invalid in ["expired policy", "missing due", "invalid due", "fingerprint mismatch"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = StateStore::new(temp.path());
+            let mut active = policy(7, true);
+            if invalid == "expired policy" {
+                active.consent_expires_at = Some("2020-01-01T00:00:00Z".to_owned());
+            }
+            let mut state = ScheduleState {
+                policy_revision: Some(7),
+                policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                next_due_at: Some(now_string()),
+                ..ScheduleState::default()
+            };
+            match invalid {
+                "missing due" => state.next_due_at = None,
+                "invalid due" => state.next_due_at = Some("not-a-timestamp".to_owned()),
+                "fingerprint mismatch" => state.policy_fingerprint = Some("different-policy".to_owned()),
+                _ => {}
+            }
+            store.write(state).await.expect("persist invalid input");
+            let (policy_tx, mut policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+            let shutdown = CancellationToken::new();
+            let runner = blocking_runner();
+            let (status_tx, mut status_rx) = watch::channel(DiagnosticScheduleStatus::Waiting);
+            let (receipt_tx, _receipt_rx) = watch::channel(None);
+            let schedule = run_collection_schedule(&store, &mut policy_rx, &shutdown, &runner, &status_tx, &receipt_tx);
+            tokio::pin!(schedule);
+            tokio::select! {
+                result = &mut schedule => panic!("scheduler ended before fresh policy: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(2), status_rx.changed()) => {
+                    result.expect("bootstrap timeout").expect("waiting");
+                }
+            }
+            policy_tx.send(active).expect("fresh invalid policy");
+            let result = tokio::time::timeout(Duration::from_secs(2), schedule)
+                .await
+                .expect("invalid input must fail closed");
+            match invalid {
+                "expired policy" | "invalid due" => {
+                    assert!(matches!(result, Err(DiagnosticScheduleError::Policy)), "{invalid}: {result:?}")
+                }
+                _ => assert!(matches!(result, Err(DiagnosticScheduleError::StateCorrupt)), "{invalid}: {result:?}"),
+            }
+            let persisted = store.read().await.expect("rejected state");
+            assert!(persisted.active_interval_started_at.is_none());
+            assert!(persisted.last_receipt.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_disabled_or_revoked_policy_clears_due_before_a_new_revision_can_resume() {
+        for reason in [ReasonCode::Disabled, ReasonCode::ConsentInactive] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = StateStore::new(temp.path());
+            let active = policy(7, true);
+            store
+                .write(ScheduleState {
+                    policy_revision: Some(7),
+                    policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                    next_due_at: Some(now_string()),
+                    ..ScheduleState::default()
+                })
+                .await
+                .expect("persist interval");
+            let (policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+            let shutdown = CancellationToken::new();
+            let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), blocking_runner());
+            tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+                .await
+                .expect("bootstrap timeout")
+                .expect("waiting");
+            let mut stopped = policy(8, false);
+            stopped.reason_code = Some(reason);
+            policy_tx.send(stopped).expect("fresh stop");
+            tokio::time::timeout(Duration::from_secs(2), runtime.status.changed())
+                .await
+                .expect("stop timeout")
+                .expect("stopped policy processed");
+            assert!(matches!(*runtime.status.borrow(), DiagnosticScheduleStatus::Waiting));
+            let stopped = store.read().await.expect("revoked state");
+            assert!(stopped.next_due_at.is_none());
+            assert!(stopped.active_interval_started_at.is_none());
+            assert!(stopped.last_receipt.is_none());
+            policy_tx.send(policy(9, true)).expect("new authorization");
+            wait_running(&mut runtime.status).await;
+            assert!(matches!(
+                *runtime.status.borrow(),
+                DiagnosticScheduleStatus::Running { policy_revision: 9, .. }
+            ));
+            shutdown.cancel();
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_interval_is_reported_without_collecting_before_fresh_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::new(temp.path());
+        let active = policy(7, true);
+        let started = now_string();
+        let next = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        store
+            .write(ScheduleState {
+                policy_revision: Some(7),
+                policy_fingerprint: Some(active.fingerprint().expect("fingerprint")),
+                next_due_at: Some(next.clone()),
+                active_interval_started_at: Some(started.clone()),
+                last_receipt: None,
+            })
+            .await
+            .expect("persist interrupted interval");
+        let (_policy_tx, policy_rx) = watch::channel(DiagnosticCollectionPolicy::stopped());
+        let shutdown = CancellationToken::new();
+        let mut runtime = spawn_schedule(store.clone(), policy_rx, shutdown.clone(), blocking_runner());
+        tokio::time::timeout(Duration::from_secs(2), runtime.receipts.changed())
+            .await
+            .expect("recovery timeout")
+            .expect("crash receipt");
+        let receipt = runtime.receipts.borrow().clone().expect("recovery receipt");
+        assert_eq!(receipt.policy_revision, 7);
+        assert_eq!(receipt.interval_started_at, started);
+        assert_eq!(receipt.outcome, ReceiptOutcome::Failed);
+        assert_eq!(receipt.reason.as_deref(), Some("producer_restarted_during_collection"));
+        shutdown.cancel();
+        runtime.shutdown().await;
+        let persisted = store.read().await.expect("recovered state");
+        assert!(persisted.active_interval_started_at.is_none());
+        assert_eq!(persisted.next_due_at, Some(next));
+        assert_eq!(persisted.last_receipt, Some(receipt));
     }
 
     #[tokio::test]

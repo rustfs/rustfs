@@ -673,7 +673,10 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
         return None;
     }
 
-    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    // `x-amz-expiration` is a date-valued S3 response header and therefore uses
+    // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
+    // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
+    let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
@@ -709,10 +712,21 @@ pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Tim
 }
 
 pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
+    format_http_date(expires)
+}
+
+/// Render a date-valued S3 response header (`Expires`, `x-amz-expiration`) as
+/// HTTP-date: RFC 1123 with a literal `GMT` zone, e.g.
+/// `Fri, 23 Dec 2012 00:00:00 GMT`.
+///
+/// Interoperability depends on this shape. `x-amz-expiration` in particular is
+/// parsed with an RFC 822 parser by the AWS SDKs, which rejects an RFC 3339
+/// value such as `2026-10-02T00:00:00Z` and then discards the whole header.
+pub(super) fn format_http_date(timestamp: &Timestamp) -> S3Result<String> {
     let mut formatted = Vec::new();
-    expires
+    timestamp
         .format(TimestampFormat::HttpDate, &mut formatted)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: {e}"))))?;
     Ok(String::from_utf8_lossy(&formatted).into_owned())
 }
 
@@ -1873,9 +1887,10 @@ mod tests {
             storage_class: String::new(),
         };
 
-        let expiry_date = expire_time.format(&Rfc3339).unwrap();
-        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
-        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+        // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
+        // RFC 822 parser, so `2026-10-02T00:00:00Z` loses the metadata.
+        let expected = "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"rule-1\"";
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected.to_string()));
     }
 
     #[test]

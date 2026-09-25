@@ -12,7 +12,7 @@ The broad `rustfs_ecstore::api` facade is a compatibility boundary, not an archi
 | `storage`, `layout`, `error`, `runtime`, `cluster`, `rpc` | Compatibility spine for storage, topology, runtime handles, cluster control, and internode calls. | Keep until replacement contracts compile in downstream boundary files. |
 | `bucket` | Domain facade consumed through owner-local `storage_api` boundaries; explicit submodules and symbol lists, never whole bucket owner modules. | Keep lists aligned with boundary consumers; never restore whole-module passthroughs. |
 | `config`, `disk`, `tier` | Compatibility paths with explicit nested submodules and symbol lists. | Same as `bucket`. |
-| `data_usage`, `capacity`, `notification`, `metrics`, `rebalance` | Domain and service facades consumed through owner-local boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
+| `data_usage`, `capacity`, `notification`, `metrics`, `rebalance`, `integrity` | Domain and service facades consumed through owner-local boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
 | `set_disk`, `object`, `object_api_utils`, `rio`, `bitrot`, `erasure`, `compression`, `cache`, `store_list` | Low-level object IO, reader, erasure, cache, and migration helper compatibility. | Keep stable while `SetDisks` remains the shared state carrier. |
 | `admin`, `event`, `global` | Admin, event hook, and bootstrap-global compatibility. | `global` is limited to bootstrap writes and lifecycle controls; read-only runtime access goes through `runtime`. |
 
@@ -28,7 +28,7 @@ External `rustfs_ecstore::api` imports stay in these local boundary files:
 
 | Boundary file | Facade families consumed |
 |---|---|
-| `rustfs/src/storage/storage_api.rs` | Broad storage-owner bridge: admin, bucket submodules, capacity, compression, cluster, config, data usage, disk, error, event, global bootstrap controls, runtime getters, layout, metrics, notification, rebalance, rio, rpc, set disk, storage, tier. Replication pool/stat handles are projected into RustFS-local wrapper types here. |
+| `rustfs/src/storage/storage_api.rs` | Broad storage-owner bridge: admin, bucket submodules, capacity, compression, cluster, config, data usage, disk, error, event, global bootstrap controls, runtime getters, layout, metrics, notification, rebalance, integrity, rio, rpc, set disk, storage, tier. Replication pool/stat handles are projected into RustFS-local wrapper types here. |
 | `rustfs/src/storage_api.rs`, `rustfs/src/admin/storage_api.rs`, `rustfs/src/app/storage_api.rs` | Root, admin, and app owner boundaries: explicit aliases only, no `metadata`, `metadata_sys`, `quota`, `com`, or bare `init` module passthroughs; object and error aliases anchor on storage-api associated types and a local `StorageError`. |
 | `crates/scanner/src/storage_api.rs` | Bucket lifecycle, replication, metadata, capacity, config, data usage, disk, error, runtime, set disk, storage, tier. Replication queue config, admission, and heal object DTOs are projected into scanner-local types. |
 | `crates/obs/src/metrics/storage_api.rs` | Bucket bandwidth, lifecycle, replication, quota, capacity, data usage, error, runtime, storage; data usage is consumed as a local DTO projection. |

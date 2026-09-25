@@ -53,6 +53,7 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
 use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
@@ -87,6 +88,9 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// Bound outstanding filesystem jobs and metadata buffers per disk request.
+const PART_METADATA_READ_CONCURRENCY: usize = 8;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -6679,6 +6683,53 @@ impl LocalDisk {
         Ok(data)
     }
 
+    async fn read_part_metadata(&self, bucket: &str, volume_dir: &Path, path_str: &str) -> Result<ObjectPartInfo> {
+        let path = Path::new(path_str);
+        let num = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default()
+            .strip_prefix("part.")
+            .and_then(|v| v.strip_suffix(".meta"))
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_default();
+        let data_path = self.io_get_object_path(
+            bucket,
+            &path_join_buf(&[
+                path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
+                &format!("part.{num}"),
+            ]),
+        )?;
+        let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
+        // A part's existence check, metadata read and decode share one dispatch.
+        // Keep open errors unmapped for the existing missing-volume fallback.
+        let result = tokio::task::spawn_blocking(move || -> Result<_> {
+            let part_error = |error: String| ObjectPartInfo {
+                number: num,
+                error: Some(error),
+                ..Default::default()
+            };
+            if let Err(err) = std::fs::metadata(data_path) {
+                return Ok(Ok(part_error(err.to_string())));
+            }
+            // Invalid metadata paths remain request errors, but missing data wins
+            // first, as it does in the serial reader.
+            let metadata_path = metadata_path?;
+            Ok(read_all_data_std(&metadata_path)
+                .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
+        })
+        .await;
+        let result = match result {
+            Ok(result) => self.resolve_read_all_result(bucket, volume_dir, result?).await,
+            Err(err) => Err(DiskError::from(err)),
+        };
+        Ok(result.unwrap_or_else(|err| ObjectPartInfo {
+            number: num,
+            error: Some(err.to_string()),
+            ..Default::default()
+        }))
+    }
+
     async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
         let object_dir = self.io_get_object_path(volume, object_name)?;
         let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
@@ -7615,17 +7666,21 @@ impl LocalDisk {
     where
         W: AsyncWrite + Unpin + Send,
     {
+        // The part of forward_to below this directory, taken before `current`
+        // loses its trailing slash.
+        let forward_rest = opts
+            .forward_to
+            .as_ref()
+            .and_then(|v| v.strip_prefix(&current))
+            .map(str::to_owned);
         let forward = {
-            opts.forward_to
-                .as_ref()
-                .and_then(|v| v.strip_prefix(&current))
-                .map(|forward| {
-                    if let Some(idx) = forward.find('/') {
-                        forward[..idx].to_owned()
-                    } else {
-                        forward.to_owned()
-                    }
-                })
+            forward_rest.as_deref().map(|forward| {
+                if let Some(idx) = forward.find('/') {
+                    forward[..idx].to_owned()
+                } else {
+                    forward.to_owned()
+                }
+            })
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -7778,13 +7833,22 @@ impl LocalDisk {
 
         entries.sort();
 
-        if let Some(forward) = &forward {
-            for (i, entry) in entries.iter().enumerate() {
-                if entry >= forward || forward.starts_with(entry.as_str()) {
-                    entries.drain(..i);
-                    break;
+        // Every entry left here is a directory. Compare it as the key prefix it
+        // stands for, slash included: "s-x" sorts after "s" as a name, but all
+        // of "s-x/..." sorts before "s/..." ('-' < '/'), so a scan resuming
+        // inside "s/" has to leave "s-x" out even though it comes later.
+        if let Some(forward) = forward_rest.as_deref() {
+            entries.retain(|entry| {
+                if entry.is_empty() {
+                    return true;
                 }
-            }
+                let key = if entry.ends_with(SLASH_SEPARATOR) {
+                    std::borrow::Cow::Borrowed(entry.as_str())
+                } else {
+                    std::borrow::Cow::Owned(format!("{entry}{SLASH_SEPARATOR}"))
+                };
+                key.as_ref() >= forward || forward.starts_with(key.as_ref())
+            });
         }
 
         let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
@@ -9340,72 +9404,14 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         let volume_dir = self.io_get_bucket_path(bucket)?;
-
-        let mut ret = vec![ObjectPartInfo::default(); paths.len()];
-
-        for (i, path_str) in paths.iter().enumerate() {
-            let path = Path::new(path_str);
-            let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-            let num = file_name
-                .strip_prefix("part.")
-                .and_then(|v| v.strip_suffix(".meta"))
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or_default();
-
-            if let Err(err) = access(
-                self.io_get_object_path(
-                    bucket,
-                    path_join_buf(&[
-                        path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
-                        &format!("part.{num}"),
-                    ])
-                    .as_str(),
-                )?,
-            )
+        stream::iter(0..paths.len())
+            .map(|index| self.read_part_metadata(bucket, &volume_dir, &paths[index]))
+            .buffered(PART_METADATA_READ_CONCURRENCY)
+            .try_fold(Vec::with_capacity(paths.len()), |mut parts, part| async move {
+                parts.push(part);
+                Ok(parts)
+            })
             .await
-            {
-                ret[i] = ObjectPartInfo {
-                    number: num,
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                };
-                continue;
-            }
-
-            let data = match self
-                .read_all_data(
-                    bucket,
-                    volume_dir.clone(),
-                    self.io_get_object_path(bucket, path.to_string_lossy().as_ref())?,
-                )
-                .await
-            {
-                Ok(data) => data,
-                Err(err) => {
-                    ret[i] = ObjectPartInfo {
-                        number: num,
-                        error: Some(err.to_string()),
-                        ..Default::default()
-                    };
-                    continue;
-                }
-            };
-
-            match ObjectPartInfo::unmarshal(&data) {
-                Ok(meta) => {
-                    ret[i] = meta;
-                }
-                Err(err) => {
-                    ret[i] = ObjectPartInfo {
-                        number: num,
-                        error: Some(err.to_string()),
-                        ..Default::default()
-                    };
-                }
-            };
-        }
-
-        Ok(ret)
     }
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
@@ -12458,6 +12464,79 @@ mod test {
             vec![CHECK_PART_VOLUME_NOT_FOUND; fi.parts.len()],
             "missing volume must not be reported as recoverable missing shards"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_parts_preserves_order_across_concurrency_windows() {
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+        let count = PART_METADATA_READ_CONCURRENCY * 3 + 1;
+        let mut paths = Vec::with_capacity(count);
+        let mut expected = Vec::with_capacity(count);
+        for number in (1..=count).rev() {
+            let part = ObjectPartInfo {
+                number,
+                etag: format!("etag-{number}"),
+                size: number,
+                actual_size: i64::try_from(number).expect("small part"),
+                ..Default::default()
+            };
+            let data_path = format!("upload/part.{number}");
+            let meta_path = format!("{data_path}.meta");
+            disk.write_all(bucket, &data_path, Bytes::from_static(b"data"))
+                .await
+                .expect("part data");
+            disk.write_all(bucket, &meta_path, Bytes::from(part.marshal_msg().expect("metadata")))
+                .await
+                .expect("part metadata");
+            paths.push(meta_path);
+            expected.push(part);
+        }
+        assert_eq!(disk.read_parts(bucket, &paths).await.expect("read parts"), expected);
+        assert!(disk.read_parts(bucket, &[]).await.expect("empty batch").is_empty());
+        let missing_meta = "upload/part.99.meta".to_owned();
+        disk.write_all(bucket, "upload/part.99", Bytes::from_static(b"data"))
+            .await
+            .expect("data without metadata");
+        paths.insert(PART_METADATA_READ_CONCURRENCY, missing_meta.clone());
+        let parts = disk.read_parts(bucket, &paths).await.expect("per-part failures");
+        let error = disk
+            .read_all_data(
+                bucket,
+                disk.io_get_bucket_path(bucket).expect("bucket path"),
+                disk.io_get_object_path(bucket, &missing_meta).expect("metadata path"),
+            )
+            .await
+            .expect_err("missing metadata");
+        assert_eq!(parts[PART_METADATA_READ_CONCURRENCY].number, 99);
+        assert_eq!(parts[PART_METADATA_READ_CONCURRENCY].error.as_deref(), Some(error.to_string().as_str()));
+        let successful: Vec<_> = parts.into_iter().filter(|part| part.error.is_none()).collect();
+        assert_eq!(successful, expected, "later windows must survive an earlier part error");
+
+        #[cfg(unix)]
+        {
+            let meta_path = disk
+                .io_get_object_path(bucket, "upload")
+                .expect("upload path")
+                .join("part.100.meta");
+            std::os::unix::fs::symlink(dir.path(), meta_path).expect("invalid metadata symlink");
+            let paths = ["upload/part.100.meta".to_owned()];
+            let parts = disk
+                .read_parts(bucket, &paths)
+                .await
+                .expect("missing data remains a per-part error");
+            assert!(parts[0].error.is_some());
+            disk.write_all(bucket, "upload/part.100", Bytes::from_static(b"data"))
+                .await
+                .expect("data for invalid metadata path");
+            assert_eq!(
+                disk.read_parts(bucket, &paths).await.expect_err("reject metadata symlink"),
+                DiskError::InvalidPath
+            );
+        }
     }
 
     #[tokio::test]
@@ -18644,6 +18723,95 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_orders_directory_before_its_dash_suffixed_sibling() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        // "s-x/..." sorts before "s/..." because '-' (0x2d) sorts before '/'
+        // (0x2f), while the directory names alone sort the other way round
+        // ("s" < "s-x"). Backup tools keep "<name>" and "<name>-rollbacks" side
+        // by side this way, which is how flat listings of real buckets ended
+        // early without being reported as truncated.
+        let dir = tempdir().expect("operation should succeed");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        let mut expected = Vec::new();
+        for parent in ["s", "s-x", "db/backup/s", "db/backup/s-x"] {
+            for n in 0..3 {
+                let name = format!("{parent}/l/l/{n:05}");
+                let object_dir = bucket_dir.join(&name);
+                fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+                fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                    .await
+                    .expect("operation should succeed");
+                expected.push(name);
+            }
+        }
+        expected.sort();
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, forward_to: Option<&str>, limit: i32) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(1 << 16);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: true,
+                forward_to: forward_to.map(str::to_string),
+                limit,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("operation should succeed");
+            out.close().await.expect("operation should succeed");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let entries = reader.read_all().await.expect("operation should succeed");
+            entries
+                .into_iter()
+                .filter(|entry| !entry.metadata.is_empty())
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        assert_eq!(
+            scan_names(&disk, bucket, None, 0).await,
+            expected,
+            "a full recursive scan must emit keys in lexicographic order"
+        );
+
+        for (i, forward_to) in expected.iter().enumerate() {
+            assert_eq!(
+                scan_names(&disk, bucket, Some(forward_to), 0).await,
+                expected[i..].to_vec(),
+                "resuming at {forward_to} must return every later key"
+            );
+        }
+
+        let mut paged = Vec::new();
+        let mut forward_to: Option<String> = None;
+        while paged.len() < expected.len() {
+            let page = scan_names(&disk, bucket, forward_to.as_deref(), 2).await;
+            let page: Vec<String> = page.into_iter().filter(|name| Some(name) != forward_to.as_ref()).collect();
+            if page.is_empty() {
+                break;
+            }
+            forward_to = page.last().cloned();
+            paged.extend(page);
+        }
+        assert_eq!(paged, expected, "paging through the tree must not lose keys");
     }
 
     #[tokio::test]

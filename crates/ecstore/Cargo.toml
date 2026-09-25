@@ -227,7 +227,7 @@ metrics = { workspace = true }
 # crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.2.2"
+rustfs-uring = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
@@ -280,6 +280,10 @@ harness = false
 
 [[bench]]
 name = "single_block_non_inline_benchmark"
+harness = false
+
+[[bench]]
+name = "multipart_read_parts_benchmark"
 harness = false
 
 [lib]

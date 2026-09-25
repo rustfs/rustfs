@@ -143,6 +143,8 @@ impl Error {
                         err,
                         EcstoreError::DiskNotFound
                             | EcstoreError::VolumeNotFound
+                            | EcstoreError::FaultyDisk
+                            | EcstoreError::FaultyRemoteDisk
                             | EcstoreError::SlowDown
                             | EcstoreError::OperationCanceled
                             | EcstoreError::RemoteClientUnavailable(_)
@@ -348,6 +350,8 @@ mod tests {
         assert!(Error::Disk(DiskError::DiskNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::DiskNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::FaultyDisk).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::FaultyRemoteDisk).is_recoverable_heal());
     }
 
     #[test]

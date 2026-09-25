@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use super::{
-    Arc, Bytes, DiskError, DiskStore, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason, GetObjectFileInfo,
-    GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey, GetObjectReadPolicy, HashAlgorithm,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET,
-    ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
-    build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
-    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    Arc, Bytes, DiskError, DiskOption, DiskStore, Endpoint, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason,
+    GetObjectFileInfo, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey,
+    GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo,
+    ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size,
+    build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index,
+    debug, error, get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
     is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
     reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
@@ -38,11 +38,12 @@ use crate::diagnostics::get::{
     get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::DiskAPI;
+use crate::disk::{DiskAPI, new_disk};
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
-use crate::set_disk::shard_source::ShardReadCost;
+use crate::set_disk::shard_source::{ShardReadCost, ShardReadRepair};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     future::Future,
     io::IoSlice,
@@ -225,6 +226,115 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
 }
 
 impl SetDisks {
+    /// A startup quorum can leave remote slots unregistered even after their
+    /// peers become ready. Refresh those slots before taking the GET metadata
+    /// snapshot, without waiting for the periodic reconnect loop.
+    pub(crate) async fn get_disks_for_data_read(&self) -> Vec<Option<DiskStore>> {
+        let disks = self.get_disks_internal().await;
+        if !disks
+            .iter()
+            .enumerate()
+            .any(|(index, disk)| disk.is_none() && self.set_endpoints.get(index).is_some_and(|endpoint| !endpoint.is_local))
+        {
+            return disks;
+        }
+
+        let timeout = crate::disk::disk_store::get_drive_active_check_timeout();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| tokio::time::sleep(timeout).deadline());
+        let mut recovered = 0;
+        let timed_out = tokio::time::timeout_at(deadline, async {
+            // Lock order: read_reconnect -> disks. Only this bounded probe sweep
+            // holds read_reconnect across I/O; disks guards never cross I/O.
+            let mut last_attempt = self.read_reconnect.lock().await;
+            if last_attempt.is_some_and(|at| at.elapsed() < crate::disk::health_state::get_drive_returning_probe_interval()) {
+                return false;
+            }
+            let current = self.get_disks_internal().await;
+            // Timeout polls its inner future before its timer. Lock/snapshot
+            // waits must not admit a new probe after the request budget expires.
+            if tokio::time::Instant::now() >= deadline {
+                return true;
+            }
+            // Start the cooldown when this sweep ends, including cancellation,
+            // before releasing the singleflight lock to waiting readers.
+            rustfs_common::defer! {
+                *last_attempt = Some(tokio::time::Instant::now());
+            }
+            let mut probes = self
+                .set_endpoints
+                .iter()
+                .enumerate()
+                .filter(|(index, endpoint)| !endpoint.is_local && current.get(*index).is_some_and(Option::is_none))
+                .map(|(index, endpoint)| async move { (index, self.probe_missing_read_disk(index, endpoint).await) })
+                .collect::<FuturesUnordered<_>>();
+            while let Some((index, result)) = probes.next().await {
+                let Ok(disk) = result else {
+                    continue;
+                };
+                let mut slots = self.disks.write().await;
+                // A background reconnect may have published a handle while the
+                // format probe was pending. Never replace or close its handle.
+                if let Some(slot) = slots.get_mut(index).filter(|slot| slot.is_none()) {
+                    disk.enable_health_check();
+                    *slot = Some(disk);
+                    recovered += 1;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(true);
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "missing_read_disks_probed",
+            pool_index = self.pool_index,
+            set_index = self.set_index,
+            recovered_disks = recovered,
+            timed_out,
+            "Missing GET disk slots probed"
+        );
+        self.get_disks_internal().await
+    }
+
+    async fn probe_missing_read_disk(&self, index: usize, endpoint: &Endpoint) -> Result<DiskStore> {
+        if endpoint.is_local
+            || usize::try_from(endpoint.pool_idx).ok() != Some(self.pool_index)
+            || usize::try_from(endpoint.set_idx).ok() != Some(self.set_index)
+            || usize::try_from(endpoint.disk_idx).ok() != Some(index)
+        {
+            return Err(Error::CorruptedFormat);
+        }
+        // An unregistered probe must not leave a health monitor running after
+        // failure/cancellation. Only an identity-validated published handle gets
+        // monitoring. No replacement formatting or healing is initiated here.
+        let probe = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await?;
+        let format = super::load_format_erasure(&probe, false).await?;
+        if self.find_disk_index(&format)? != (self.set_index, index) {
+            return Err(Error::CorruptedFormat);
+        }
+        let disk = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await?;
+        disk.set_disk_id(Some(format.erasure.this)).await?;
+        Ok(disk)
+    }
+
     async fn get_object_metadata_cache_bypass_reason(
         &self,
         bucket: &str,
@@ -490,9 +600,11 @@ impl SetDisks {
             .then(|| self.get_object_metadata_cache_generation(bucket, object))
             .flatten();
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        let disks = if read_data && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            self.get_disks_for_data_read().await
+        } else {
+            self.get_disks_internal().await
+        };
 
         // Early-stop for safe metadata reads is handled inside
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
@@ -579,7 +691,7 @@ impl SetDisks {
             }
         }
         metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
-        if errs.iter().any(|err| err.is_some()) {
+        if !opts.suppress_read_repair && errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
                 &fi.volume,
@@ -848,6 +960,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         prefer_data_blocks_first_reader_setup: bool,
         require_reconstruction_surplus: bool,
         metrics_path: &'static str,
@@ -1192,7 +1305,7 @@ impl SetDisks {
                 "Shard availability check"
             );
 
-            if missing_shards > 0 && available_shards >= erasure.data_shards {
+            if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
                 debug!(
                     bucket,
@@ -1226,34 +1339,24 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
-            let (written, err, exact_quorum) = if require_reconstruction_surplus {
-                erasure
-                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await
-            } else {
-                let (written, err) = erasure
-                    .decode_with_stripe_handles_and_reopeners(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await;
-                (written, err, false)
-            };
+            let coding::decode::DecodeOutcome {
+                written,
+                error: err,
+                exact_quorum,
+                repair,
+            } = erasure
+                .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                    writer,
+                    readers,
+                    part_offset,
+                    part_length,
+                    part_size,
+                    read_costs,
+                    deferred_stripe_handles,
+                    deferred_reopeners,
+                )
+                .await;
+            let mut repair_needed = repair.needed(!unattempted_data_shards);
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1263,7 +1366,7 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
-            if exact_quorum && err.is_none() {
+            if require_reconstruction_surplus && exact_quorum && err.is_none() {
                 return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
             }
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
@@ -1302,33 +1405,7 @@ impl SetDisks {
                     let should_enqueue_heal = matches!(de_err, DiskError::FileCorrupt)
                         || (matches!(de_err, DiskError::FileNotFound) && !unattempted_data_shards);
                     if should_enqueue_heal {
-                        debug!(
-                            bucket,
-                            object,
-                            part_number,
-                            error = ?de_err,
-                            "Recoverable decode error triggered read repair"
-                        );
-                        let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                        // Single-flight (backlog#1894 axis A): the durable
-                        // MRF intent (Urgent ECDecode across restarts, HS-01)
-                        // is bound to the read-repair reservation, so only the
-                        // first sighting within the dedup TTL books a journal
-                        // record instead of one per retried read.
-                        submit_read_repair_heal_with_submitter(
-                            ReadRepairHealSubmission {
-                                bucket,
-                                object,
-                                version_id: version_id.as_deref(),
-                                pool_index,
-                                set_index,
-                                part_number: Some(part_number),
-                                reason: "decode_error",
-                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
-                            },
-                            send_read_repair_heal_request,
-                        )
-                        .await;
+                        repair_needed = true;
                         has_err = false;
                     }
                 }
@@ -1367,6 +1444,12 @@ impl SetDisks {
                     record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
+            }
+
+            if !suppress_read_repair && written == part_length && repair_needed {
+                DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number, false)
+                    .submit()
+                    .await;
             }
 
             // debug!("ec decode {} written size {}", part_number, n);
@@ -1410,6 +1493,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1424,6 +1508,7 @@ impl SetDisks {
             set_index,
             pool_index,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             prefer_data_blocks_first_reader_setup,
@@ -1449,6 +1534,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1463,6 +1549,7 @@ impl SetDisks {
             set_index,
             pool_index,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             prefer_data_blocks_first_reader_setup,
@@ -1481,9 +1568,10 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
-        _set_index: usize,
-        _pool_index: usize,
+        set_index: usize,
+        pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1502,6 +1590,8 @@ impl SetDisks {
                 bucket,
                 object,
                 fi,
+                pool_index,
+                set_index,
                 &files,
                 &disks,
                 &erasure,
@@ -1510,6 +1600,7 @@ impl SetDisks {
                 part_length,
                 part.size,
                 skip_verify_bitrot,
+                suppress_read_repair,
                 metrics_object_class,
                 metrics_size_bucket,
                 prefer_data_blocks_first_reader_setup,
@@ -1556,6 +1647,8 @@ impl SetDisks {
             bucket,
             object,
             fi,
+            pool_index,
+            set_index,
             &files,
             &disks,
             &erasure,
@@ -1564,6 +1657,7 @@ impl SetDisks {
             first_part.size,
             first_part.size,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             false,
@@ -1588,10 +1682,13 @@ impl SetDisks {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             fi: fi.clone(),
+            pool_index,
+            set_index,
             files,
             disks,
             erasure,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             metrics_path,
@@ -1604,6 +1701,8 @@ impl SetDisks {
                     &ctx.bucket,
                     &ctx.object,
                     &ctx.fi,
+                    ctx.pool_index,
+                    ctx.set_index,
                     &ctx.files,
                     &ctx.disks,
                     &ctx.erasure,
@@ -1612,6 +1711,7 @@ impl SetDisks {
                     part_size,
                     part_size,
                     ctx.skip_verify_bitrot,
+                    ctx.suppress_read_repair,
                     ctx.metrics_object_class,
                     ctx.metrics_size_bucket,
                     false,
@@ -1638,6 +1738,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         fi: &FileInfo,
+        pool_index: usize,
+        set_index: usize,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
         erasure: &coding::Erasure,
@@ -1646,6 +1748,7 @@ impl SetDisks {
         part_length: usize,
         part_size: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1737,6 +1840,7 @@ impl SetDisks {
                     state = "codec_streaming_mid_stream_legacy_fallback",
                     "Codec streaming later part degraded in place to legacy per-part decode"
                 );
+                let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
                 let reader = build_legacy_per_part_fallback_reader(
                     erasure.clone(),
                     reader_setup.readers,
@@ -1746,12 +1850,26 @@ impl SetDisks {
                     part_offset,
                     part_length,
                     part_size,
+                    Some((
+                        DecodeReadRepairContext::new(
+                            bucket,
+                            object,
+                            fi.version_id,
+                            pool_index,
+                            set_index,
+                            part_number,
+                            suppress_read_repair,
+                        ),
+                        allow_missing,
+                    )),
                 );
                 return Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader));
             }
             return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
         }
 
+        let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
+        let repair = Arc::new(ShardReadRepair::default());
         let readers = reader_setup.readers;
         let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
         let deferred_reopeners = reader_setup.deferred_reopeners;
@@ -1774,7 +1892,8 @@ impl SetDisks {
             )
         }
         .with_deferred_parity_handles(deferred_stripe_handles)
-        .with_deferred_parity_reopeners(deferred_reopeners);
+        .with_deferred_parity_reopeners(deferred_reopeners)
+        .with_repair_evidence(Arc::clone(&repair));
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = if single_inflight {
             coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
@@ -1786,13 +1905,140 @@ impl SetDisks {
         } else {
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?
         };
-        if single_inflight {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(reader)))
+        let inner: Box<dyn AsyncRead + Unpin + Send + Sync> = if single_inflight {
+            Box::new(reader)
         } else {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-                coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-            )))
+            Box::new(coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(
+                reader,
+                metrics_path,
+            ))
+        };
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(RepairReportingReader {
+            inner,
+            evidence: repair,
+            remaining: part_length,
+            allow_missing,
+            context: Some(DecodeReadRepairContext::new(
+                bucket,
+                object,
+                fi.version_id,
+                pool_index,
+                set_index,
+                part_number,
+                suppress_read_repair,
+            )),
+        })))
+    }
+}
+
+struct DecodeReadRepairContext {
+    bucket: String,
+    object: String,
+    version_id: Option<uuid::Uuid>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: usize,
+    submitter: ReadRepairAdmissionSubmitter,
+    suppress_read_repair: bool,
+}
+
+impl DecodeReadRepairContext {
+    fn new(
+        bucket: &str,
+        object: &str,
+        version_id: Option<uuid::Uuid>,
+        pool_index: usize,
+        set_index: usize,
+        part_number: usize,
+        suppress_read_repair: bool,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter: send_read_repair_heal_request,
+            suppress_read_repair,
         }
+    }
+
+    async fn submit(self) {
+        if self.suppress_read_repair {
+            return;
+        }
+        let Self {
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter,
+            suppress_read_repair: _,
+        } = self;
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "decode_repair_observed",
+            bucket,
+            object,
+            version_id = ?version_id,
+            part_number,
+            pool_index,
+            set_index,
+            "Recovered shard damage triggered read repair"
+        );
+        let version = version_id.map(|value| value.to_string());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: &object,
+                version_id: version.as_deref(),
+                pool_index,
+                set_index,
+                part_number: Some(part_number),
+                reason: "decode_error",
+                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, version_id)),
+            },
+            submitter,
+        )
+        .await;
+    }
+}
+
+/// Report observed damage only after the requested part has reconstructed and
+/// reached the caller. Read errors and a client dropping a partial body are not
+/// successful repair admissions.
+struct RepairReportingReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    evidence: Arc<ShardReadRepair>,
+    remaining: usize,
+    allow_missing: bool,
+    context: Option<DecodeReadRepairContext>,
+}
+
+impl AsyncRead for RepairReportingReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        match &result {
+            Poll::Ready(Ok(())) => {
+                this.remaining = this.remaining.saturating_sub(buf.filled().len() - before);
+                if this.remaining == 0
+                    && let Some(context) = this.context.take()
+                    && this.evidence.needed(this.allow_missing)
+                {
+                    tokio::spawn(context.submit());
+                }
+            }
+            Poll::Ready(Err(_)) => this.context = None,
+            Poll::Pending => {}
+        }
+        result
     }
 }
 
@@ -2006,10 +2252,13 @@ struct LazyCodecPartContext {
     bucket: String,
     object: String,
     fi: FileInfo,
+    pool_index: usize,
+    set_index: usize,
     files: Vec<FileInfo>,
     disks: Vec<Option<DiskStore>>,
     erasure: Arc<coding::Erasure>,
     skip_verify_bitrot: bool,
+    suppress_read_repair: bool,
     metrics_object_class: &'static str,
     metrics_size_bucket: &'static str,
     metrics_path: &'static str,
@@ -2161,12 +2410,13 @@ fn build_legacy_per_part_fallback_reader(
     part_offset: usize,
     part_length: usize,
     part_size: usize,
+    read_repair: Option<(DecodeReadRepairContext, bool)>,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
     let buffer = adaptive_duplex_buffer_size(part_size as i64);
     let (read_half, mut write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
-        let (_written, err) = erasure
-            .decode_with_stripe_handles_and_reopeners(
+        let outcome = erasure
+            .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                 &mut write_half,
                 readers,
                 part_offset,
@@ -2177,6 +2427,26 @@ fn build_legacy_per_part_fallback_reader(
                 deferred_reopeners,
             )
             .await;
+        let allow_missing = read_repair.as_ref().is_some_and(|(_, allow_missing)| *allow_missing);
+        let err = match outcome.error {
+            Some(error) if outcome.written == part_length => {
+                let error = DiskError::from(error);
+                if matches!(error, DiskError::FileCorrupt) || (allow_missing && matches!(error, DiskError::FileNotFound)) {
+                    outcome.repair.observe(&[Some(error)]);
+                    None
+                } else {
+                    Some(error.into())
+                }
+            }
+            error => error,
+        };
+        if err.is_none()
+            && outcome.written == part_length
+            && outcome.repair.needed(allow_missing)
+            && let Some((context, _)) = read_repair
+        {
+            context.submit().await;
+        }
         // Dropping `write_half` on return signals EOF to the reader half.
         err
     });
@@ -2515,6 +2785,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2547,6 +2818,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2569,6 +2841,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2595,6 +2868,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2617,6 +2891,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2659,6 +2934,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "empty",
@@ -2690,6 +2966,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2990,6 +3267,74 @@ mod metadata_cache_tests {
             get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
             Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ)
         );
+    }
+
+    #[test]
+    fn missing_metadata_read_repair_is_suppressed_only_for_read_only_requests() {
+        use crate::object_api::{PutObjReader, ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                let bucket = format!("read-only-{}", Uuid::new_v4());
+                let object = "missing-metadata";
+                for disk in set.disks.read().await.iter().flatten() {
+                    disk.make_volume(&bucket).await.expect("bucket volume");
+                }
+                let written = set
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![7; 1024]),
+                        &ObjectOptions {
+                            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("fully committed fixture");
+                let missing = dirs[0].path().join(&bucket).join(object).join("xl.meta");
+                tokio::fs::remove_file(&missing).await.expect("remove one metadata replica");
+
+                // Intercept the production submitter at its dedup admission boundary.
+                // This avoids initializing the process-global heal channel or allowing
+                // a background worker to repair the physical fault under test.
+                let version = written.version_id.map(|id| id.to_string());
+                let reservation = reserve_read_repair_heal(&bucket, object, version.as_deref(), 0, 0)
+                    .await
+                    .expect("unique object reservation");
+                for (suppress_read_repair, submissions) in [(true, 0), (false, 1), (true, 1)] {
+                    set.get_object_fileinfo(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            include_part_checksums: true,
+                            suppress_read_repair,
+                            ..Default::default()
+                        },
+                        false,
+                        false,
+                    )
+                    .await
+                    .expect("remaining metadata replicas retain read quorum");
+                    assert_eq!(
+                        recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]),
+                        submissions,
+                        "only ordinary reads must reach read-repair admission"
+                    );
+                    assert!(!missing.exists(), "the read-only probe must not restore metadata");
+                }
+                release_read_repair_heal_reservation(&reservation).await;
+            });
+        });
     }
 
     #[tokio::test]
@@ -3645,6 +3990,14 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn capture_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
 
     #[test]
     #[serial]
@@ -4651,6 +5004,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "test-object-class",
             "test-size-bucket",
             false,
@@ -4674,6 +5028,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "test-object-class",
             "test-size-bucket",
             false,
@@ -4694,6 +5049,7 @@ mod tests {
                 &[],
                 0,
                 0,
+                false,
                 false,
                 "test-object-class",
                 "test-size-bucket",
@@ -4719,6 +5075,7 @@ mod tests {
                 &[],
                 0,
                 0,
+                false,
                 false,
                 "test-object-class",
                 "test-size-bucket",
@@ -4748,6 +5105,7 @@ mod tests {
                     &[],
                     0,
                     0,
+                    false,
                     false,
                     "test-object-class",
                     "test-size-bucket",
@@ -4803,6 +5161,7 @@ mod tests {
                     0,
                     0,
                     false,
+                    false,
                     "test-object-class",
                     "test-size-bucket",
                     false,
@@ -4857,6 +5216,7 @@ mod tests {
                 0,
                 0,
                 false,
+                false,
                 "test-object-class",
                 "test-size-bucket",
                 false,
@@ -4901,6 +5261,7 @@ mod tests {
                 0,
                 0,
                 false,
+                false,
                 "plain_single_part",
                 "le_1mib",
                 false,
@@ -4944,6 +5305,7 @@ mod tests {
                 &disks,
                 0,
                 0,
+                false,
                 false,
                 "plain_single_part",
                 "le_1mib",
@@ -5007,6 +5369,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "plain_single_part",
             "le_1mib",
             false,
@@ -5055,6 +5418,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "test-object-class",
             "test-size-bucket",
@@ -5074,6 +5438,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5081,6 +5447,7 @@ mod tests {
             0,
             9,
             8,
+            false,
             false,
             "test-object-class",
             "test-size-bucket",
@@ -5096,6 +5463,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5103,6 +5472,7 @@ mod tests {
             0,
             8,
             8,
+            false,
             false,
             "test-object-class",
             "test-size-bucket",
@@ -5644,6 +6014,102 @@ mod tests {
         Ok(decoded)
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codec_streaming_repair_evidence_requires_recovered_damage() {
+        for (corrupt, inconsistent, expected_calls) in [(false, false, 0), (true, false, 1), (true, true, 0)] {
+            CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+            let erasure = coding::Erasure::new(2, 2, 64);
+            let data: Vec<u8> = (0..64).collect();
+            let setup = setup_codec_data_blocks_first_encoded_bitrot_readers(
+                &erasure,
+                &data,
+                &[],
+                if corrupt { &[0] } else { &[] },
+                if inconsistent { &[2] } else { &[] },
+                HashAlgorithm::HighwayHash256,
+            )
+            .await;
+            let allow_missing = setup.data_shards_attempted(erasure.data_shards);
+            let evidence = Arc::new(ShardReadRepair::default());
+            let source = coding::decode::ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+                setup.readers,
+                erasure.clone(),
+                0,
+                data.len(),
+                Some(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE),
+            )
+            .with_deferred_parity_handles(setup.deferred_stripe_handles)
+            .with_repair_evidence(Arc::clone(&evidence));
+            let engine = CodecStreamingDecodeEngine::rustfs(&erasure).unwrap();
+            let inner = coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
+                source,
+                engine,
+                data.len(),
+                GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE,
+            )
+            .unwrap();
+            let mut context =
+                DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", Some(Uuid::new_v4()), 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(inner),
+                evidence: Arc::clone(&evidence),
+                remaining: data.len(),
+                allow_missing,
+                context: Some(context),
+            };
+            let mut decoded = Vec::new();
+            let result = reader.read_to_end(&mut decoded).await;
+            if inconsistent {
+                assert!(result.is_err(), "inconsistent reconstruction must still fail");
+            } else {
+                result.unwrap();
+                assert_eq!(decoded, data);
+            }
+            assert_eq!(evidence.needed(false), corrupt);
+            assert!(reader.context.is_none(), "terminal reads cannot report a second repair");
+            // The reporter detaches admission from response completion.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), expected_calls);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_reporting_reader_does_not_report_partial_or_unattempted_missing_shards() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        for (partial, missing) in [(true, false), (false, true)] {
+            let evidence = Arc::new(ShardReadRepair::default());
+            evidence.observe(&[Some(if missing {
+                DiskError::FileNotFound
+            } else {
+                DiskError::FileCorrupt
+            })]);
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(Cursor::new(vec![7; 16])),
+                evidence,
+                remaining: 16,
+                allow_missing: false,
+                context: Some(context),
+            };
+            if partial {
+                reader.read_exact(&mut [0; 1]).await.unwrap();
+            } else {
+                reader.read_to_end(&mut Vec::new()).await.unwrap();
+            }
+            drop(reader);
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 0);
+    }
+
     async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &[u8]) -> Vec<FileInfo> {
         let shards = erasure.encode_data(part_data).expect("test part should encode");
         let distribution = (1..=erasure.total_shard_count()).collect::<Vec<_>>();
@@ -5686,6 +6152,197 @@ mod tests {
                 .expect("external fixture shard should be written");
         }
         (data_dir, files)
+    }
+
+    #[test]
+    #[serial]
+    fn payload_read_repair_is_suppressed_only_for_read_only_requests() {
+        use rustfs_common::mrf_channel::{MrfKind, init_mrf_channel, release_mrf_intent, set_mrf_delivery_enabled};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("read-repair test runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        // nextest isolates process-global channel owners in separate processes.
+        let mut receiver = init_mrf_channel().expect("first MRF channel initialization in this process");
+        set_mrf_delivery_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(temp_env::async_with_vars(
+                [(ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true"))],
+                async {
+                    let part_data = b"abcdefgh";
+                    let erasure = coding::Erasure::new(4, 2, part_data.len());
+                    let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+                    // Local disks retain cleanup (and, on Linux, I/O metrics)
+                    // tasks for their lifetime. These same disks stay alive
+                    // throughout the matrix; only read/admission tasks are new.
+                    let idle_tasks = runtime.metrics().num_alive_tasks();
+                    for path in ["legacy", "codec", "mid-size", "mid-size-fallback", "lazy", "lazy-fallback"] {
+                        let multipart = path.starts_with("lazy");
+                        let fallback = path.ends_with("fallback");
+                        let part_count = if multipart { 2 } else { 1 };
+                        let expected = part_data.repeat(part_count);
+                        let mut fi = codec_streaming_test_fileinfo(
+                            i64::try_from(expected.len()).expect("fixture size fits i64"),
+                            part_count,
+                        );
+                        fi.erasure.block_size = erasure.block_size;
+                        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+                        for part in &mut fi.parts {
+                            part.size = part_data.len();
+                            part.actual_size = i64::try_from(part_data.len()).expect("part size fits i64");
+                        }
+                        let mut files = codec_streaming_inline_files(&erasure, part_data).await;
+                        if multipart {
+                            let data_dir = Uuid::new_v4();
+                            fi.data_dir = Some(data_dir);
+                            for (index, file) in files.iter_mut().enumerate() {
+                                let shard = file.data.take().expect("encoded fixture shard");
+                                file.data_dir = Some(data_dir);
+                                for part in 1..=part_count {
+                                    // Only the lazy second part is damaged. Its missing
+                                    // shard forces the in-place fallback in that case.
+                                    if fallback && part == 2 && index == 0 {
+                                        continue;
+                                    }
+                                    let mut bytes = shard.to_vec();
+                                    if part == 2 && index == 1 {
+                                        *bytes.last_mut().expect("shard payload byte") ^= 1;
+                                    }
+                                    disks[index]
+                                        .as_ref()
+                                        .expect("fixture disk")
+                                        .write_all(
+                                            CODEC_STREAMING_TEST_BUCKET,
+                                            &format!("{CODEC_STREAMING_TEST_OBJECT}/{data_dir}/part.{part}"),
+                                            Bytes::from(bytes),
+                                        )
+                                        .await
+                                        .expect("write external fixture shard");
+                                }
+                            }
+                        } else {
+                            if fallback {
+                                files[0].data = None;
+                            }
+                            let mut bytes = files[1].data.take().expect("inline fixture shard").to_vec();
+                            *bytes.last_mut().expect("shard payload byte") ^= 1;
+                            files[1].data = Some(Bytes::from(bytes));
+                        }
+
+                        for suppress_read_repair in [true, false, true] {
+                            let version_id = Uuid::new_v4();
+                            fi.version_id = Some(version_id);
+                            let version = version_id.to_string();
+                            // Observe Heal admission without allowing a worker to
+                            // remove the fault. MRF ingress is independently observed.
+                            let reservation = reserve_read_repair_heal(
+                                CODEC_STREAMING_TEST_BUCKET,
+                                CODEC_STREAMING_TEST_OBJECT,
+                                Some(&version),
+                                0,
+                                0,
+                            )
+                            .await
+                            .expect("unique version reservation");
+                            let before =
+                                recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]);
+                            let mut body = Vec::new();
+                            if path == "legacy" {
+                                SetDisks::get_object_with_fileinfo(
+                                    CODEC_STREAMING_TEST_BUCKET,
+                                    CODEC_STREAMING_TEST_OBJECT,
+                                    Arc::new(ErasureCache::new()),
+                                    0,
+                                    fi.size,
+                                    &mut body,
+                                    fi.clone(),
+                                    files.clone(),
+                                    &disks,
+                                    0,
+                                    0,
+                                    false,
+                                    suppress_read_repair,
+                                    false,
+                                    false,
+                                    GET_OBJECT_PATH_SET_DISK,
+                                    "test-object-class",
+                                    "test-size-bucket",
+                                )
+                                .await
+                                .expect("legacy read must recover the complete body");
+                            } else {
+                                let outcome = if path.starts_with("mid-size") {
+                                    SetDisks::get_object_mid_size_reader_with_fileinfo(
+                                        CODEC_STREAMING_TEST_BUCKET,
+                                        CODEC_STREAMING_TEST_OBJECT,
+                                        Arc::new(ErasureCache::new()),
+                                        &fi,
+                                        &files,
+                                        &disks,
+                                        0,
+                                        0,
+                                        false,
+                                        suppress_read_repair,
+                                        "test-object-class",
+                                        "test-size-bucket",
+                                        false,
+                                    )
+                                    .await
+                                } else {
+                                    SetDisks::get_object_decode_reader_with_fileinfo(
+                                        CODEC_STREAMING_TEST_BUCKET,
+                                        CODEC_STREAMING_TEST_OBJECT,
+                                        Arc::new(ErasureCache::new()),
+                                        &fi,
+                                        &files,
+                                        &disks,
+                                        0,
+                                        0,
+                                        false,
+                                        suppress_read_repair,
+                                        "test-object-class",
+                                        "test-size-bucket",
+                                        false,
+                                    )
+                                    .await
+                                }
+                                .expect("streaming reader must retain read quorum");
+                                let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+                                    panic!("{path} must construct a reader, including in-place fallback");
+                                };
+                                reader.read_to_end(&mut body).await.expect("complete recovered stream");
+                            }
+                            assert_eq!(body, expected, "{path}: suppression must not change recovered bytes");
+                            // Drive the current-thread runtime until all detached
+                            // admissions finish, instead of assuming a sleep/yield
+                            // was long enough to prove the absence of a submission.
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while runtime.metrics().num_alive_tasks() != idle_tasks {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("all read/admission tasks must finish");
+                            let after = recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]);
+                            assert_eq!(after - before, u64::from(!suppress_read_repair), "{path}: Heal admission");
+                            if !suppress_read_repair {
+                                let intent = receiver.try_recv().expect("ordinary read must submit recovered-damage MRF");
+                                assert_eq!(&*intent.bucket, CODEC_STREAMING_TEST_BUCKET);
+                                assert_eq!(&*intent.object, CODEC_STREAMING_TEST_OBJECT);
+                                assert_eq!(intent.version_id, Some(version_id.into_bytes()));
+                                assert_eq!(intent.kind, MrfKind::DecodeFailure);
+                                release_mrf_intent(&intent);
+                            }
+                            assert!(receiver.try_recv().is_err(), "{path}: no suppressed or duplicate MRF ingress");
+                            release_read_repair_heal_reservation(&reservation).await;
+                        }
+                    }
+                },
+            ));
+        });
+        set_mrf_delivery_enabled(false);
     }
 
     #[tokio::test]
@@ -6136,6 +6793,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();
@@ -6144,6 +6802,37 @@ mod tests {
             .await
             .expect("legacy per-part fallback reader should reconstruct the degraded part");
         assert_eq!(decoded, data, "reconstructed bytes must match the original part payload");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_per_part_fallback_preserves_repair_evidence() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data: Vec<u8> = (0..64).collect();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[], HashAlgorithm::HighwayHash256)
+                .await;
+        let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 2, false);
+        context.submitter = capture_read_repair_submitter;
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            Vec::new(),
+            None,
+            0,
+            data.len(),
+            data.len(),
+            Some((context, false)),
+        );
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, data);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 1);
     }
 
     // backlog#879: the whole multipart object must stream to completion when a
@@ -6187,6 +6876,7 @@ mod tests {
                     0,
                     part2_len,
                     part2_len,
+                    None,
                 );
                 Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))
             })
@@ -6228,6 +6918,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();

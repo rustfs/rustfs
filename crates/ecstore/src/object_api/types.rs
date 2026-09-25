@@ -935,6 +935,8 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Internal read-only inspection must not enqueue metadata or payload repairs.
+    pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
     /// key use TailDrained without changing namespace lock ownership.
     #[doc(hidden)]

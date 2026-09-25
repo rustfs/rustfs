@@ -9124,6 +9124,168 @@ mod tests {
         assert_eq!(dirs.len(), 16);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_marker_delete_ack_removes_stale_rejoined_copy() {
+        let bucket = "current-marker-stale-rejoin";
+        let object = "marker.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original) = make_local_set_disks_with_ctx(16, 4, ctx.clone()).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .handle_make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let mut history = Vec::new();
+        for value in 1..=3_u8 {
+            let payload = vec![value; 4097];
+            let version = store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the historical data versions")
+                .version_id
+                .expect("historical version must have an explicit identity");
+            history.push((version, payload));
+        }
+        let marker = store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create current marker")
+            .version_id
+            .expect("marker has explicit version");
+        let current = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("bucket incarnation");
+        let set = &store.pools[0].disk_set[0];
+        let before = set.disks.read().await.clone();
+        for slot in 12..16 {
+            set.disks.write().await[slot] = None;
+        }
+        store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(marker.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("acknowledged delete should remove the marker from the online quorum");
+        *set.disks.write().await = before.clone();
+
+        for disk in before.iter().take(12).flatten() {
+            assert!(matches!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await,
+                Err(crate::disk::error::DiskError::FileVersionNotFound | crate::disk::error::DiskError::FileNotFound)
+            ));
+        }
+        for disk in before.iter().skip(12).flatten() {
+            assert!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .is_ok(),
+                "offline member must retain the stale current marker"
+            );
+        }
+        let healed = store
+            .heal_object_at_incarnation(
+                bucket,
+                object,
+                &marker.to_string(),
+                current,
+                &rustfs_heal_contracts::heal_channel::HealOpts {
+                    remove: true,
+                    scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale current marker heal should complete");
+        assert!(healed.error.is_none(), "stale current marker heal: {:?}", healed.error);
+        assert!(healed.absence.as_ref().is_some_and(|proof| proof.removed));
+        for disk in before.iter().flatten() {
+            assert!(matches!(
+                disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
+                    .await,
+                Err(crate::disk::error::DiskError::FileVersionNotFound | crate::disk::error::DiskError::FileNotFound)
+            ));
+        }
+        let replay = store
+            .heal_object_at_incarnation(
+                bucket,
+                object,
+                &marker.to_string(),
+                current,
+                &rustfs_heal_contracts::heal_channel::HealOpts {
+                    remove: true,
+                    scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("replay the exact removed marker identity");
+        assert!(replay.error.is_none(), "exact marker replay: {:?}", replay.error);
+        let absence = replay.absence.expect("exact replay must prove authoritative absence");
+        assert!(!absence.removed, "replay must not claim another physical repair");
+        assert_eq!(absence.bucket_incarnation_id, current);
+        assert_eq!(absence.version_id, marker.to_string());
+        let listed = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list surviving versions after marker cleanup");
+        assert_eq!(listed.objects.len(), history.len(), "an absent marker is not enumerable in a new walk");
+        assert!(listed.objects.iter().all(|info| !info.delete_marker));
+        for (version, expected) in history {
+            assert!(listed.objects.iter().any(|info| info.version_id == Some(version)));
+            let mut reader = store
+                .handle_get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("historical data must remain readable after cleanup and replay");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("read all historical bytes");
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[tokio::test]
     async fn multipool_delete_marker_stays_with_existing_versions() {
         let bucket = "multipool-marker-routing";

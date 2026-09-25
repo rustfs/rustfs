@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Regression for replacement healing requiring pool.bin on a non-owning set.
+//! Replacement healing must restore internal records only on their owning sets.
 #![recursion_limit = "256"]
 
 use http::HeaderMap;
@@ -101,6 +101,31 @@ async fn replacement_pool_metadata_follows_real_two_set_placement() {
             storage.replacement_pool_metadata_required(&opts).is_err(),
             "invalid scope must fail closed"
         );
+        assert!(
+            storage
+                .heal_replacement_bucket_metadata(bucket, &opts, &[paths[0].to_string_lossy().into_owned()])
+                .await
+                .is_err(),
+            "bucket metadata repair must reject an incomplete or invalid replacement scope"
+        );
+    }
+
+    for targets in [vec![], vec![paths[4].to_string_lossy().into_owned()]] {
+        assert!(
+            storage
+                .heal_replacement_bucket_metadata(
+                    bucket,
+                    &HealOpts {
+                        pool: Some(0),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                    &targets,
+                )
+                .await
+                .is_err(),
+            "empty or wrong-set targets must be rejected before repairing metadata"
+        );
     }
 
     let mut owning_set = None;
@@ -120,6 +145,17 @@ async fn replacement_pool_metadata_follows_real_two_set_placement() {
             assert!(owning_set.replace(set).is_none(), "only one set owns pool.bin");
             std::fs::remove_dir_all(&metadata_path).unwrap();
         }
+        let bucket_records: Vec<_> = [".metadata.bin", ".bucket-incarnation"]
+            .into_iter()
+            .map(|file| {
+                let path = target_path.join(RUSTFS_META_BUCKET).join("buckets").join(bucket).join(file);
+                let existed = path.join("xl.meta").exists();
+                if existed {
+                    std::fs::remove_dir_all(&path).expect("remove bucket metadata shard from replacement");
+                }
+                (path, existed)
+            })
+            .collect();
         // Select a user key using the real placement algorithm, independently
         // of the metadata-scope decision under test.
         let key = (0..1000)
@@ -191,6 +227,14 @@ async fn replacement_pool_metadata_follows_real_two_set_placement() {
             "completed repair must clear its healing marker"
         );
         assert_eq!(metadata_path.join("xl.meta").exists(), owns_metadata);
+        for (path, owned) in bucket_records {
+            assert_eq!(
+                path.join("xl.meta").exists(),
+                owned,
+                "replacement must restore each owned bucket record without creating a wrong-set copy: {}",
+                path.display()
+            );
+        }
         for (relative, bytes) in original_parts {
             assert_eq!(std::fs::read(object_path.join(relative)).unwrap(), bytes, "reconstructed shard differs");
         }

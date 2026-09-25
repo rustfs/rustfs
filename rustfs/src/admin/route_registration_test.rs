@@ -190,7 +190,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
-        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/realtime"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),
         admin_route(Method::GET, "/v3/pools/list"),
@@ -337,6 +337,19 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
         admin_route(Method::POST, "/v3/replication/diff"),
         admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::GET, "/v3/integrity/readiness"),
+        admin_route_sample(Method::GET, "/v3/integrity/{bucket}/inventory", "/v3/integrity/example/inventory"),
+        admin_route_sample(Method::POST, "/v3/integrity/{bucket}/jobs", "/v3/integrity/example/jobs"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/integrity/{bucket}/jobs/{job_id}",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/integrity/{bucket}/jobs/{job_id}/control",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111/control",
+        ),
         admin_route(Method::POST, "/v3/start-job"),
         admin_route(Method::GET, "/v3/list-jobs"),
         admin_route(Method::GET, "/v3/status-job"),
@@ -1333,7 +1346,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/storageinfo"));
-    assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
+    assert_route(&router, Method::GET, &admin_path("/v3/realtime"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));

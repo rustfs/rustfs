@@ -28,7 +28,12 @@ def current_chain():
     require(sha(chain["workflow_sha"]) and chain["workflow_sha"] == os.environ["GITHUB_SHA"], "chain workflow source mismatch")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     require(head == chain["workflow_sha"], "lane checkout differs from chain workflow source")
-    require(chain["testing_sha"] == (ROOT / ".config/functional-script-revision.txt").read_text().strip() and sha(chain["testing_sha"]), "private script pin differs from chain")
+    # testing_sha is either the committed pin or auto-testing main HEAD via
+    # resolve_functional_candidate.py's >24h staleness fallback, so pin
+    # equality is no longer an invariant (the 09-21 chain died on exactly
+    # that check once the fallback finally fired). Lanes check out exactly
+    # this sha, which is what the format check guards.
+    require(sha(chain["testing_sha"]), "private script revision is not a valid commit sha")
     candidate = chain["candidate"]
     require(isinstance(candidate, dict) and set(candidate) == {"manifest", "artifact_id", "artifact_digest", "workflow_sha", "workflow_ref", "build_started_at"}, "invalid candidate envelope")
     manifest = candidate["manifest"]

@@ -591,6 +591,11 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("replacement pool metadata placement is unsupported"))
     }
 
+    /// Heal and physically verify bucket configuration on its replacement targets.
+    async fn heal_replacement_bucket_metadata(&self, _bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+        Err(Error::Storage(StorageError::PreconditionFailed))
+    }
+
     /// Read target-specific physical evidence for one replacement version.
     ///
     /// This is only used by automatic replacement healing after the normal
@@ -1592,6 +1597,13 @@ impl HealStorageAPI for ECStoreHealStorage {
             .ok_or_else(|| Error::other("replacement pool metadata placement is missing set scope"))?;
         self.ecstore
             .replacement_pool_metadata_required(pool_index, set_index)
+            .map_err(Error::Storage)
+    }
+
+    async fn heal_replacement_bucket_metadata(&self, bucket: &str, opts: &HealOpts, targets: &[String]) -> Result<()> {
+        self.ecstore
+            .heal_replacement_bucket_metadata(bucket, opts, targets)
+            .await
             .map_err(Error::Storage)
     }
 

@@ -1185,14 +1185,18 @@ mod decommission_lock_order_tests {
         barrier.wait_until_paused().await;
 
         let probe_store = Arc::clone(&other_store);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async move {
-            probe_store
-                .save_current_pool_meta_for_test(&[0])
-                .await
-                .expect("pool metadata mutation probe should commit before UploadPart admission");
-        })
+        let pool_meta_lock = probe_store
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("create the public UploadPart capacity guard probe");
+        let pool_meta_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool_meta_lock.get_write_lock(std::time::Duration::from_secs(30)),
+        )
         .await
-        .expect("public UploadPart must not hold a capacity read guard during staging");
+        .expect("public UploadPart must not hold a capacity read guard during staging")
+        .expect("public UploadPart capacity guard probe should acquire");
+        drop(pool_meta_guard);
 
         barrier.release();
         let part = tokio::time::timeout(std::time::Duration::from_secs(30), put)
@@ -4253,6 +4257,13 @@ mod decommission_lock_order_tests {
                 panic!("cancellation probe finished before observing target contention: {result:?}");
             }
         }
+        // The mutation absorbs the gate contention inline before the outer wait
+        // loop ever sees it, and that inline budget is bounded.
+        assert_eq!(
+            retry_observer.target_gate_inline_retries(),
+            crate::core::pools::DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS - 1,
+            "inline target-gate retries must stop at their bounded attempt budget"
+        );
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),

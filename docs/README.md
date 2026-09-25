@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+For legacy protection assessment and bounded protected copies, see [Object integrity inventory, audit, and migration](operations/shard-integrity-audit.md).
+
 Operational runbooks live under [`operations/`](operations/). Replication
 operators should start with:
 

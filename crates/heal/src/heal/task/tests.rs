@@ -407,6 +407,64 @@ mod canonical_outcome {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn faulty_storage_disks_recover_or_exhaust_without_losing_objects() {
+        for remote in [false, true] {
+            for failures in [1, 4] {
+                let incarnation = Uuid::new_v4();
+                let storage = Arc::new(MockStorage {
+                    bucket_incarnation_id: Mutex::new(Some(incarnation)),
+                    heal_object_receipts: Mutex::new(HashMap::from([
+                        (
+                            "object-a".to_string(),
+                            VecDeque::from([object_receipt("object-a", None, HealObjectDisposition::Repaired, incarnation)]),
+                        ),
+                        (
+                            "object-b".to_string(),
+                            VecDeque::from([object_receipt("object-b", None, HealObjectDisposition::Repaired, incarnation)]),
+                        ),
+                    ])),
+                    ..Default::default()
+                });
+                storage.heal_object_outcomes.lock().expect("outcomes").insert(
+                    "object-a".to_string(),
+                    (0..failures)
+                        .map(|_| MockHealObjectOutcome::FaultyStorageDisk(remote))
+                        .collect(),
+                );
+                let task = bucket_task(storage.clone());
+                let result = task.execute().await;
+                let outcome = task.get_outcome().await;
+                assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+                assert_eq!(outcome.counters.processed, 2);
+                assert_eq!(outcome.counters.attempt_failures, failures);
+                assert_eq!(outcome.counters.unknown, 0);
+                let object = outcome
+                    .objects
+                    .iter()
+                    .find(|item| item.identity.object == "object-a")
+                    .expect("object outcome");
+                if failures == 1 {
+                    result.expect("faulty disk recovered within retry budget");
+                    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+                    assert_eq!((outcome.counters.healed, outcome.counters.failed), (2, 0));
+                    assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+                } else {
+                    result.expect_err("persistent faulty disk must fail");
+                    assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+                    assert_eq!((outcome.counters.healed, outcome.counters.failed), (1, 1));
+                    assert_eq!(object.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
+                }
+                let calls = storage.heal_object_calls.lock().expect("calls");
+                assert_eq!(
+                    calls.iter().filter(|name| name.as_str() == "object-a").count(),
+                    if failures == 1 { 2 } else { 4 }
+                );
+                assert_eq!(calls.iter().filter(|name| name.as_str() == "object-b").count(), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mixed_grace_and_legacy_success_keep_distinct_dispositions() {
         let storage = Arc::new(MockStorage::default());
@@ -1854,6 +1912,7 @@ enum MockHealObjectOutcome {
     RetiredMarkerDeferred,
     UnavailableDrive(DriveState),
     RetryableReadQuorum,
+    FaultyStorageDisk(bool),
     InternodeHttp(http::StatusCode),
     RetryableSlowDown,
     PermanentOther(&'static str),
@@ -2016,6 +2075,11 @@ impl HealStorageAPI for MockStorage {
                     ))),
                 )),
                 MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
+                MockHealObjectOutcome::FaultyStorageDisk(remote) => Err(Error::Storage(if remote {
+                    EcstoreError::FaultyRemoteDisk
+                } else {
+                    EcstoreError::FaultyDisk
+                })),
                 MockHealObjectOutcome::InternodeHttp(status) => Err(Error::Storage(EcstoreError::from(DiskError::from(
                     rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)),
                 )))),
@@ -2071,6 +2135,11 @@ impl HealStorageAPI for MockStorage {
                     ))),
                 )),
                 MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
+                MockHealObjectOutcome::FaultyStorageDisk(remote) => Err(Error::Storage(if remote {
+                    EcstoreError::FaultyRemoteDisk
+                } else {
+                    EcstoreError::FaultyDisk
+                })),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) | MockHealObjectOutcome::PermanentOther(message) => {
                     Err(Error::other(message))

@@ -24,8 +24,11 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
       - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_tier_artifact_workflow.sh'
@@ -40,8 +43,11 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_service_scripts.sh'
       - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_tier_artifact_workflow.sh'
@@ -71,7 +77,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -83,11 +89,11 @@ jobs:
   cargo-deny:
     name: Cargo Deny
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -106,7 +112,7 @@ jobs:
       # default is now "false", but state it explicitly — see
       # scripts/security/check_cache_save_if.sh.
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Same reasoning as the setup composite: true archives every
           # dependency's unpacked source tree.
@@ -116,7 +122,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-deny
 
@@ -126,11 +132,11 @@ jobs:
   workflow-pin-report:
     name: Workflow Pin Report
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -158,9 +164,12 @@ jobs:
       - name: Check package version contract
         run: ./scripts/test_package_versions.sh
 
+      - name: Check package service lifecycle contract
+        run: ./scripts/test_package_service_scripts.sh
+
   dependency-review:
     name: Dependency Review
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
@@ -168,7 +177,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -195,13 +204,13 @@ jobs:
     # open the Actions tab. Same ci-8 mechanism coverage.yml and
     # e2e-replication-nightly.yml already use.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

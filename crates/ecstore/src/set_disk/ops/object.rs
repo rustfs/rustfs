@@ -2776,6 +2776,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
+                    opts.suppress_read_repair,
                     true,
                     true,
                     GET_OBJECT_PATH_LEGACY_DUPLEX,
@@ -2805,6 +2806,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         self.set_index,
                         self.pool_index,
                         opts.skip_verify_bitrot,
+                        opts.suppress_read_repair,
                         true,
                         false,
                         GET_OBJECT_PATH_LEGACY_DUPLEX,
@@ -2893,6 +2895,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 self.set_index,
                 self.pool_index,
                 opts.skip_verify_bitrot,
+                opts.suppress_read_repair,
                 true,
                 false,
                 GET_OBJECT_PATH_DIRECT_MEMORY,
@@ -2949,6 +2952,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 self.set_index,
                 self.pool_index,
                 opts.skip_verify_bitrot,
+                opts.suppress_read_repair,
                 object_class.as_str(),
                 size_bucket,
                 false,
@@ -2995,6 +2999,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
+                    opts.suppress_read_repair,
                     object_class.as_str(),
                     size_bucket,
                     codec_streaming_gate.prefer_data_blocks_first_reader_setup,
@@ -3063,6 +3068,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let suppress_read_repair = opts.suppress_read_repair;
         // The producer runs in a separate Tokio task, so carry the caller's
         // read policy across the task boundary explicitly. Tokio task-local
         // values are not inherited by spawned tasks.
@@ -3093,6 +3099,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         set_index,
                         pool_index,
                         skip_verify,
+                        suppress_read_repair,
                         false,
                         false,
                         GET_OBJECT_PATH_LEGACY_DUPLEX,
@@ -6761,7 +6768,7 @@ fn remote_version_state_writer_enabled() -> bool {
 }
 
 fn remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
-    transaction_fencing_fleet_proof(remote_version_state_writer_requested())
+    crate::services::notification_sys::acquire_remote_version_state_writer_fleet_proof()
 }
 
 fn remote_version_state_writer_requested() -> bool {
@@ -7749,10 +7756,11 @@ impl SetDisks {
         drop(namespace_owner);
         if quorum_result.is_ok()
             && errs.iter().any(Option::is_some)
-            && let Some(purge) = delete_marker_purge
+            && let Some(purge) = delete_marker_purge.as_ref()
             && let Some(version) = fi.version_id.filter(|version| !version.is_nil())
         {
-            let _ = self.persist_delete_marker_purge(bucket, object, version, purge).await;
+            let _ = self.persist_marker_purge_receipt(bucket, object, version, purge).await;
+            let _ = self.persist_delete_marker_purge(bucket, object, version, purge.clone()).await;
         }
         // An explicit purge can carry deleted=true for the existing marker.
         // It must not create a repair intent that could reintroduce that marker.
@@ -9538,6 +9546,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let suppress_read_repair = opts.suppress_read_repair;
         let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(cloned_fi.size);
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let producer = async move {
@@ -9555,6 +9564,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 set_index,
                 pool_index,
                 skip_verify,
+                suppress_read_repair,
                 false,
                 false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,

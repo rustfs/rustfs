@@ -1163,13 +1163,10 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) set_index: usize,
     pub(in crate::set_disk) part_number: Option<usize>,
     pub(in crate::set_disk) reason: &'static str,
-    /// Durable MRF journal intent to file alongside the read-repair request
-    /// (backlog#1894 axis A): the intent kind plus its native `Uuid`
-    /// version id (the submission's string form stays display-only). Bound
-    /// to the reservation — the intent is only delivered when this sighting
-    /// wins the dedup TTL, so a burst of reads failing on the same object
-    /// books exactly one journal record instead of one per retry. `None`
-    /// keeps the historical no-intent behavior.
+    /// Best-effort ingress for the durable MRF consumer. Its identity coalescer
+    /// is independent of the heal reservation: an earlier metadata repair must
+    /// not suppress newly observed payload damage, and rejected ingress must
+    /// remain retryable. Channel admission does not prove checkpoint commit.
     pub(in crate::set_disk) mrf_intent: Option<(rustfs_common::mrf_channel::MrfKind, Option<uuid::Uuid>)>,
 }
 
@@ -1224,6 +1221,27 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         mrf_intent,
     } = submission;
 
+    if let Some((kind, version_uuid)) = mrf_intent
+        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
+    {
+        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+        let ingress = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "mrf_ingress",
+            mrf_kind = ?kind,
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            result = ?ingress,
+            "Read-repair MRF ingress result"
+        );
+    }
+
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
@@ -1232,15 +1250,6 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         );
         return;
     };
-
-    // Reservation won: this sighting owns the repair records for the object,
-    // including the durable journal intent when the caller asked for one.
-    if let Some((kind, version_uuid)) = mrf_intent
-        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
-    {
-        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
-        let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
-    }
 
     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -2481,15 +2490,15 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let bucket = bucket.to_string();
-        let part_meta_paths = part_meta_paths.to_vec();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let part_meta_paths: Arc<[String]> = Arc::from(part_meta_paths);
 
         let tasks: Vec<_> = disks
             .iter()
             .map(|disk| {
                 let disk = disk.clone();
-                let bucket = bucket.clone();
-                let part_meta_paths = part_meta_paths.clone();
+                let bucket = Arc::clone(&bucket);
+                let part_meta_paths = Arc::clone(&part_meta_paths);
 
                 async move {
                     if let Some(disk) = disk {
@@ -12975,7 +12984,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn mrf_intent_is_filed_once_per_read_repair_reservation() {
+    async fn mrf_ingress_is_coalesced_independently_of_read_repair_reservations() {
         // Serial: owns the process-global MRF channel for this test binary
         // (same key as the other channel-owning tests above).
         let bucket = format!("mrf-intent-bucket-{}", Uuid::new_v4());
@@ -12996,8 +13005,13 @@ mod tests {
             }
         }
 
-        // First sighting wins the reservation: the journal intent is filed
-        // synchronously before the admission task is spawned.
+        // An earlier metadata/missing-shard admission has no payload MRF intent.
+        let mut metadata_submission = intent_submission(&bucket, &object);
+        metadata_submission.mrf_intent = None;
+        submit_read_repair_heal_with_submitter(metadata_submission, accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+
+        // Newly observed corruption must reach MRF despite that reservation.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         let first = receiver.try_recv().expect("first sighting must file exactly one MRF intent");
         assert_eq!(*first.bucket, bucket);
@@ -13007,6 +13021,20 @@ mod tests {
         // second journal record.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         assert!(receiver.try_recv().is_err(), "duplicate sighting must not file another MRF intent");
+
+        let retry_object = format!("retry-object-{}", Uuid::new_v4());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(true);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        let retried = receiver
+            .try_recv()
+            .expect("a heal reservation cannot suppress a previously rejected MRF intent");
+        assert_eq!(*retried.object, retry_object);
+        rustfs_common::mrf_channel::release_mrf_intent(&first);
+        rustfs_common::mrf_channel::release_mrf_intent(&retried);
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
     }
 
     #[tokio::test]
