@@ -42,6 +42,7 @@ use std::{
     pin::Pin,
     sync::{LazyLock, Mutex},
     task::{Context, Poll},
+    time::Instant,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tower::Service;
@@ -355,6 +356,41 @@ fn apply_peer_replay_response(
     }
 }
 
+fn rename_data_grpc_stage(path: &str) -> bool {
+    matches!(
+        path,
+        "/node_service.NodeService/RenameData" | "/node_service.NodeService/RenameDataAtIncarnation"
+    )
+}
+
+async fn observe_put_stage_future<F, T>(
+    future: F,
+    duration_stage: &'static str,
+    pending_count_stage: &'static str,
+    first_pending_to_ready_stage: &'static str,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let duration_started = rustfs_io_metrics::put_stage_timer();
+    let mut first_pending_at = None;
+    let mut pending_count = 0usize;
+    let mut future = std::pin::pin!(future);
+    let output = std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(output) => Poll::Ready(output),
+        Poll::Pending => {
+            pending_count = pending_count.saturating_add(1);
+            first_pending_at.get_or_insert_with(Instant::now);
+            Poll::Pending
+        }
+    })
+    .await;
+    rustfs_io_metrics::record_put_object_stage_duration_from(duration_stage, duration_started);
+    rustfs_io_metrics::record_put_object_stage_duration(pending_count_stage, pending_count as f64);
+    rustfs_io_metrics::record_put_object_stage_duration_from(first_pending_to_ready_stage, first_pending_at);
+    output
+}
+
 impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ReplayScopeChannel<S>
 where
     S: Service<HttpRequest<ReqBody>, Response = HttpResponse<ResBody>>,
@@ -372,6 +408,12 @@ where
     }
 
     fn call(&mut self, mut request: HttpRequest<ReqBody>) -> Self::Future {
+        let observe_rename_data = rustfs_io_metrics::put_stage_metrics_enabled() && rename_data_grpc_stage(request.uri().path());
+        let request_scope_started = if observe_rename_data {
+            rustfs_io_metrics::put_stage_timer()
+        } else {
+            None
+        };
         let authenticated = self.audience.as_ref().is_some_and(|_| {
             request
                 .headers()
@@ -406,11 +448,30 @@ where
                 }
             }
         }
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REQUEST_SCOPE,
+            request_scope_started,
+        );
 
         let audience = self.audience.clone();
         let future = self.inner.call(request);
         Box::pin(async move {
-            let response = future.await?;
+            let response = if observe_rename_data {
+                observe_put_stage_future(
+                    future,
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL,
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_FIRST_PENDING_TO_READY,
+                )
+                .await?
+            } else {
+                future.await?
+            };
+            let replay_response_started = if observe_rename_data {
+                rustfs_io_metrics::put_stage_timer()
+            } else {
+                None
+            };
             if let (Some(audience), Some(challenge)) = (audience, challenge) {
                 let response_state = verify_tonic_peer_replay_capabilities_response(&audience, challenge, response.headers());
                 if let Err(error) = &response_state
@@ -428,6 +489,10 @@ where
                 }
                 apply_peer_replay_response(audience, sent_state, response_state);
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
+                replay_response_started,
+            );
             Ok(response)
         })
     }
