@@ -25,7 +25,7 @@ use crate::data_usage_define::{
     PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
-use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageIndexError};
+use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageWriter};
 use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
@@ -95,7 +95,6 @@ const SCANNER_CHECKPOINT_OBJECT_INTERVAL: u64 = 1024;
 const SCANNER_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const SCANNER_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT: usize = 128;
-const SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET: usize = 1;
 // Erasure data directories contain direct part.N files; keep namespace probes bounded.
 const ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT: usize = 64;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
@@ -761,33 +760,21 @@ struct RawEnumerationProgress {
     last_entry: Option<String>,
     entries_seen: u64,
     digest: Sha256,
-    observed_entries: Vec<String>,
-    revalidate_after_entries: usize,
-    page_index: Option<RawEnumerationPageIndex>,
+    page_index: Option<RawEnumerationPageWriter>,
 }
 
 impl RawEnumerationProgress {
     fn new(parent: &str, page_index: Option<RawEnumerationPageIndex>) -> Self {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
-        let mut revalidate_after_entries = 0;
-        let page_index = match page_index {
-            Some(index) => match index.indexed_entries() {
-                Ok(entries) => {
-                    revalidate_after_entries = entries.len();
-                    Some(index)
-                }
-                Err(_) => None,
-            },
-            None => RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
-        };
+        let page_index = page_index
+            .or_else(|| RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok())
+            .and_then(|index| RawEnumerationPageWriter::new(index).ok());
         Self {
             parent: parent.to_string(),
             last_entry: None,
             entries_seen: 0,
             digest,
-            observed_entries: Vec::new(),
-            revalidate_after_entries,
             page_index,
         }
     }
@@ -796,34 +783,10 @@ impl RawEnumerationProgress {
         update_raw_enumeration_digest(&mut self.digest, b"entry", entry.as_bytes());
         self.last_entry = Some(entry.to_string());
         self.entries_seen = self.entries_seen.saturating_add(1);
-        self.observed_entries.push(entry.to_string());
-        if let Some(index) = &mut self.page_index {
-            if self.observed_entries.len() < self.revalidate_after_entries {
-                return;
-            }
-            let result = index
-                .generation()
-                .ok_or(RawEnumerationPageIndexError::Unsupported)
-                .and_then(|generation| {
-                    index.ingest_partial_owner_entries(
-                        self.observed_entries.clone(),
-                        SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET,
-                        generation,
-                    )
-                });
-            match result {
-                Ok(outcome) if outcome.ready_to_commit => {
-                    if let Some(generation) = index.generation()
-                        && index.commit_building_page(generation).is_err()
-                    {
-                        self.page_index = None;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    self.page_index = None;
-                }
-            }
+        if let Some(index) = &mut self.page_index
+            && index.record_entry(entry).is_err()
+        {
+            self.page_index = None;
         }
     }
 
@@ -840,28 +803,20 @@ impl RawEnumerationProgress {
     }
 
     fn page_index(&self) -> Option<RawEnumerationPageIndex> {
-        self.page_index.clone().and_then(|mut index| {
-            if let Some(generation) = index.generation()
-                && matches!(index.status(), crate::raw_page_index::RawEnumerationPageOwnerStatus::Building { .. })
-                && index.commit_building_page(generation).is_err()
-            {
-                return None;
-            }
-            match index.indexed_entries() {
-                Ok(entries) if !entries.is_empty() => Some(index),
-                _ => None,
-            }
-        })
+        self.page_index
+            .as_ref()
+            .filter(|index| index.indexed_entry_count() > 0)
+            .and_then(|index| index.checkpoint().ok())
     }
 
     fn has_checkpointable_page_index(&self) -> bool {
-        self.page_index().is_some()
+        self.checkpointable_entry_count() > 0
     }
 
     fn checkpointable_entry_count(&self) -> usize {
-        self.page_index()
-            .and_then(|index| index.indexed_entries().ok())
-            .map_or(0, |entries| entries.len())
+        self.page_index
+            .as_ref()
+            .map_or(0, RawEnumerationPageWriter::indexed_entry_count)
     }
 }
 
@@ -1130,19 +1085,6 @@ impl FolderScanner {
         if self.old_cache.info.scan_progress.is_none() {
             return;
         }
-        let page_index = self
-            .old_cache
-            .validated_raw_enumeration_page_index()
-            .filter(|index| match index.status() {
-                crate::raw_page_index::RawEnumerationPageOwnerStatus::Building {
-                    parent: index_parent, ..
-                }
-                | crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready {
-                    parent: index_parent, ..
-                } => index_parent == parent,
-                crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => false,
-            })
-            .cloned();
         if let Some(position) = self
             .raw_enumeration_progress
             .iter()
@@ -1150,6 +1092,7 @@ impl FolderScanner {
         {
             self.raw_enumeration_progress.truncate(position + 1);
         } else {
+            let page_index = self.raw_enumeration_page_index_for_parent(parent).cloned();
             self.raw_enumeration_progress
                 .push(RawEnumerationProgress::new(parent, page_index));
         }
@@ -1158,8 +1101,17 @@ impl FolderScanner {
         }
     }
 
+    fn raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+        self.old_cache
+            .info
+            .scan_raw_enumeration_page_index
+            .as_ref()
+            .filter(|index| index.parent() == Some(parent))?;
+        self.old_cache.validated_raw_enumeration_page_index()
+    }
+
     fn raw_enumeration_committed_entry_oracle(&self, parent: &str) -> HashSet<String> {
-        let Some(index) = self.old_cache.validated_raw_enumeration_page_index() else {
+        let Some(index) = self.raw_enumeration_page_index_for_parent(parent) else {
             return HashSet::new();
         };
         let generation_matches_parent = match index.status() {
