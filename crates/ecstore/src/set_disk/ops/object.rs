@@ -67,6 +67,7 @@ use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks
 
 const TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP_ENV: &str =
     "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP";
+const TIER_FREE_VERSION_SOURCE_LOOKUP_SAFE_REUSE_ENV: &str = "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_LOOKUP_SAFE_REUSE";
 const TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV: &str = "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA";
 const TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ASSUME_HOMOGENEOUS_ENV: &str =
     "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ASSUME_HOMOGENEOUS";
@@ -89,6 +90,16 @@ fn tier_free_version_source_lookup_counterfactual_skip_enabled() -> bool {
             std::env::var(TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP_ENV)
                 .ok()
                 .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn tier_free_version_source_lookup_safe_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(TIER_FREE_VERSION_SOURCE_LOOKUP_SAFE_REUSE_ENV).ok().as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
         )
     })
@@ -783,6 +794,33 @@ fn transitioned_delete_publishes_free_version(source: &ObjectInfo, delete_reques
             || (!purge_status.is_empty() && purge_status != VersionPurgeStatusType::Complete));
 
     !metadata_only
+}
+
+fn tier_free_version_source_lookup_safe_reuse_decision(
+    opts: &ObjectOptions,
+    object_size: i64,
+    expected_restore_operation: bool,
+) -> (&'static str, &'static str) {
+    if !tier_free_version_source_lookup_safe_reuse_enabled() {
+        return ("deny", "disabled");
+    }
+    if object_size > 32 * 1024 {
+        return ("deny", "too_large");
+    }
+    if opts.versioned || opts.version_suspended {
+        return ("deny", "versioned");
+    }
+    if opts.data_movement || opts.raw_data_movement_read {
+        return ("deny", "data_movement");
+    }
+    if expected_restore_operation {
+        return ("deny", "restore");
+    }
+    if opts.skip_free_version {
+        return ("deny", "skip_free_version");
+    }
+
+    ("allow", "ordinary_small_put")
 }
 
 fn record_committed_tier_free_version_receipt(
@@ -4930,6 +4968,12 @@ impl SetDisks {
             let commit_put_tier_free_version_id = put_tier_free_version_id;
             let commit_tier_free_version_receipt_sink = opts.tier_free_version_receipt_sink.clone();
             let commit_skip_free_version = opts.skip_free_version;
+            let (commit_tier_source_safe_reuse_decision, commit_tier_source_safe_reuse_reason) =
+                tier_free_version_source_lookup_safe_reuse_decision(
+                    &opts,
+                    w_size as i64,
+                    expected_restore_operation_id.is_some(),
+                );
             let request_cancellation = operation_cancellation.clone();
             tmp_cleanup_owned = true;
             rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -5148,9 +5192,14 @@ impl SetDisks {
                 );
 
                 let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
-                let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
-                        || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
+                rustfs_io_metrics::record_put_tier_free_version_source_lookup_safe_reuse_decision(
+                    commit_tier_source_safe_reuse_decision,
+                    commit_tier_source_safe_reuse_reason,
+                );
+                let rename_data_source_capable = commit_set.tier_free_version_rename_data_source_capable();
+                let reuse_rename_data_source_for_tier_free_version = (tier_free_version_source_reuse_rename_data_enabled()
+                    && (rename_data_source_capable || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled()))
+                    || (commit_tier_source_safe_reuse_decision == "allow" && rename_data_source_capable);
                 let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
                     && commit_tier_free_version_receipt_sink.is_some()
                     && !tier_free_version_source_lookup_counterfactual_skip_enabled()

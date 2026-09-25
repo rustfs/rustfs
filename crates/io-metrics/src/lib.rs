@@ -2294,6 +2294,19 @@ pub fn record_put_object_commit_lock_admission(budget: &'static str, outcome: &'
 }
 
 #[inline(always)]
+pub fn record_put_tier_free_version_source_lookup_safe_reuse_decision(decision: &'static str, reason: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_s3_put_tier_free_version_source_lookup_safe_reuse_total",
+        "decision" => decision,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+#[inline(always)]
 fn put_stage_count_value(value: usize) -> f64 {
     match u32::try_from(value) {
         Ok(value) => f64::from(value),
@@ -3689,6 +3702,39 @@ mod tests {
             ("budget".to_string(), PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS.to_string()),
             ("outcome".to_string(), PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED.to_string()),
         ])));
+    }
+
+    #[test]
+    fn put_tier_source_safe_reuse_decision_labels_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let labels = ["allow", "deny", "ordinary_small_put", "too_large", "versioned"];
+        assert!(labels.iter().all(|label| {
+            !label.contains('/')
+                && !label.contains('{')
+                && !label.contains('}')
+                && !label.contains(' ')
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        }));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_put_tier_free_version_source_lookup_safe_reuse_decision("deny", "disabled");
+
+            set_put_stage_metrics_enabled(true);
+            record_put_tier_free_version_source_lookup_safe_reuse_decision("allow", "ordinary_small_put");
+            record_put_tier_free_version_source_lookup_safe_reuse_decision("deny", "too_large");
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_tier_free_version_source_lookup_safe_reuse_total"),
+            Some(2)
+        );
     }
 
     #[test]
