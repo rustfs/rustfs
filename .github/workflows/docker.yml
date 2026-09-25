@@ -47,7 +47,7 @@ on:
         default: true
         type: boolean
       version:
-        description: "Version to build (latest for stable release, or specific version like v1.0.0, v1.0.0-alpha1)"
+        description: "Version to build (latest, v1.0.0, v1.0.0-alpha1, or v1.0.1-preview.1)"
         required: false
         default: "latest"
         type: string
@@ -82,9 +82,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main' &&
-       !contains(github.event.workflow_run.head_branch, '-preview'))
-    runs-on: ubuntu-latest
+       github.event.workflow_run.head_branch != 'main')
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -97,7 +96,7 @@ jobs:
       source_ref: ${{ steps.check.outputs.source_ref }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -197,7 +196,14 @@ jobs:
                   version="${version#v}"
                 fi
 
-                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                if [[ "$version" =~ -preview\.[0-9]+$ ]]; then
+                  build_type="preview"
+                  is_prerelease=true
+                  echo "🔍 Building Docker image for preview: $version (version tags only)"
+                elif [[ "$version" == *"-preview"* ]]; then
+                  echo "❌ Invalid preview tag: $version (expected suffix: -preview.<number>)" >&2
+                  exit 1
+                elif [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
                   # Pre-GA policy: prereleases update latest until the first stable tag exists.
@@ -249,11 +255,14 @@ jobs:
                 echo "🚀 Building with latest stable release version"
                 ;;
               *-preview*)
+                if [[ ! "$input_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-preview\.[0-9]+$ ]]; then
+                  echo "❌ Invalid preview version: $input_version" >&2
+                  exit 1
+                fi
                 build_type="preview"
                 is_prerelease=true
-                should_build=false
-                should_push=false
-                echo "⏭️  Preview tags do not publish Docker images"
+                version="${input_version#v}"
+                echo "🔍 Building with preview version: $version (version tags only)"
                 ;;
               # Prerelease versions (must match first, more specific)
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
@@ -343,7 +352,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.build-check.outputs.source_ref }}
@@ -492,7 +501,7 @@ jobs:
     name: Scan Docker Images
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: read
@@ -535,7 +544,7 @@ jobs:
           category: container-image-${{ matrix.variant }}
 
       - name: Upload container scan report
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: container-image-scan-${{ matrix.variant }}
           path: trivy-${{ matrix.variant }}.sarif
@@ -550,11 +559,11 @@ jobs:
     name: Sync Docker Hub Description
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.build-check.outputs.source_ref }}
@@ -595,7 +604,7 @@ jobs:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Docker build completion summary
@@ -611,6 +620,10 @@ jobs:
           echo ""
 
           case "$BUILD_TYPE" in
+            "preview")
+              echo "🔍 Preview Docker image has been built with ${VERSION} tags"
+              echo "⏭️  Preview images do not update latest or prerelease channels"
+              ;;
             "release")
               echo "🚀 Release Docker image has been built with ${VERSION} tags"
               echo "✅ This image is ready for production use"

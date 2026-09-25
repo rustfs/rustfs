@@ -44,14 +44,14 @@ env:
 jobs:
   resolve-source:
     name: Resolve nightly source
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
       source_ref: ${{ steps.source.outputs.ref }}
     steps:
       - name: Checkout selected source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ env.NIGHTLY_BUILD_REF }}
@@ -71,7 +71,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -237,12 +237,12 @@ jobs:
           echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload DEB artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.deb.outputs.deb_file }}
           path: ${{ steps.deb.outputs.deb_file }}
       - name: Upload RPM artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.rpm.outputs.rpm_file }}
           path: ${{ steps.rpm.outputs.rpm_file }}
@@ -328,7 +328,7 @@ jobs:
 
       - name: Upload nightly candidate manifest
         if: ${{ steps.publish.outputs.candidate_file != '' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.publish.outputs.candidate_file }}
@@ -366,7 +366,7 @@ jobs:
   kms-vault-lane:
     needs: resolve-source
     name: KMS live Vault lane
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -383,7 +383,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -466,14 +466,14 @@ jobs:
   kms-vault-ha-failover:
     needs: resolve-source
     name: KMS Vault HA failover lane
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       NO_PROXY: 127.0.0.1,localhost
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-source.outputs.source_sha }}
@@ -495,13 +495,13 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

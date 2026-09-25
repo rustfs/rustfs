@@ -25,9 +25,10 @@
 #
 # Flow:
 # 1. Resolve and validate the selected Build workflow run and source identity
-# 2. Download Linux binaries (x86_64-gnu, aarch64-gnu) from build artifacts
-# 3. Build DEB packages for amd64 and arm64
-# 4. Build RPM packages for x86_64 and aarch64
+# 2. Download Linux binaries (x86_64-gnu, aarch64-gnu, x86_64-musl,
+#    aarch64-musl) from build artifacts
+# 3. Build DEB packages for amd64 and arm64, gnu and musl variants
+# 4. Build RPM packages for x86_64 and aarch64, gnu and musl variants
 # 5. Upload all packages to Cloudflare R2 and the GitHub release
 
 name: Package DEB/RPM
@@ -76,7 +77,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch != 'main')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
@@ -224,11 +225,11 @@ jobs:
           echo "  Build run ID: $BUILD_RUN_ID"
           echo "  Build run number: $RUN_NUMBER"
 
-  # Build DEB and RPM packages for each architecture
+  # Build DEB and RPM packages for each architecture and libc variant
   package:
-    name: Package (${{ matrix.arch }})
+    name: Package (${{ matrix.arch }}-${{ matrix.libc }})
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -236,16 +237,38 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            libc: gnu
             deb_arch: amd64
             rpm_arch: x86_64
             artifact_name: "rustfs-linux-x86_64-gnu"
+            # gnu binaries dynamically link glibc; musl binaries are static
+            # and run without a libc dependency.
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
           - arch: aarch64
+            libc: gnu
             deb_arch: arm64
             rpm_arch: aarch64
             artifact_name: "rustfs-linux-aarch64-gnu"
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
+          - arch: x86_64
+            libc: musl
+            deb_arch: amd64
+            rpm_arch: x86_64
+            artifact_name: "rustfs-linux-x86_64-musl"
+            deb_depends: ""
+            rpm_depends: ""
+          - arch: aarch64
+            libc: musl
+            deb_arch: arm64
+            rpm_arch: aarch64
+            artifact_name: "rustfs-linux-aarch64-musl"
+            deb_depends: ""
+            rpm_depends: ""
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -256,17 +279,17 @@ jobs:
           BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
           SOURCE_VERSION: ${{ needs.resolve.outputs.version }}
           DEV_SEQUENCE: ${{ needs.resolve.outputs.dev_sequence }}
-          DEB_ARCH: ${{ matrix.deb_arch }}
-          RPM_ARCH: ${{ matrix.rpm_arch }}
+          ARCH: ${{ matrix.rpm_arch }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
           normalized=$(./scripts/release/package_versions.sh \
-            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$DEB_ARCH" "$RPM_ARCH")
+            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$ARCH" "$LIBC")
           printf '%s\n' "$normalized" >> "$GITHUB_OUTPUT"
 
       - name: Download binary artifact from build run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: ${{ matrix.artifact_name }}*
           path: ./binary-artifact
@@ -308,6 +331,8 @@ jobs:
           DEB_VERSION: ${{ steps.versions.outputs.deb_version }}
           DEB_ARCH: ${{ matrix.deb_arch }}
           DEB_FILE: ${{ steps.versions.outputs.deb_file }}
+          DEB_DEPENDS: ${{ matrix.deb_depends }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
@@ -345,9 +370,17 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: ${DEB_ARCH}
-          Depends: libc6 (>= 2.31)
+          EOF
+
+          # gnu binaries dynamically link glibc and must declare it; musl
+          # binaries are statically linked and need no libc dependency.
+          if [[ -n "$DEB_DEPENDS" ]]; then
+            echo "Depends: ${DEB_DEPENDS}" >> "${PKG_DIR}/DEBIAN/control"
+          fi
+
+          cat >> "${PKG_DIR}/DEBIAN/control" << EOF
           Maintainer: RustFS Team <support@rustfs.com>
-          Description: High-performance distributed object storage
+          Description: High-performance distributed object storage (${LIBC} build)
            RustFS is a high-performance distributed object storage software
            built using Rust. It is compatible with MinIO and S3 API.
           Homepage: https://rustfs.com
@@ -389,14 +422,23 @@ jobs:
           RPM_RELEASE: ${{ steps.versions.outputs.rpm_release }}
           RPM_ARCH: ${{ matrix.rpm_arch }}
           RPM_FILE: ${{ steps.versions.outputs.rpm_file }}
+          RPM_DEPENDS: ${{ matrix.rpm_depends }}
+          LIBC: ${{ matrix.libc }}
         run: |
           set -euo pipefail
 
-          echo "Building RPM for ${RPM_ARCH}"
+          echo "Building RPM for ${RPM_ARCH} (${LIBC})"
 
           sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential rpm
           sudo gem install fpm
           ./scripts/test_package_versions.sh --require-package-managers
+
+          # gnu binaries dynamically link glibc and must declare it; musl
+          # binaries are statically linked and need no libc dependency.
+          depends_args=()
+          if [[ -n "$RPM_DEPENDS" ]]; then
+            depends_args+=(--depends "$RPM_DEPENDS")
+          fi
 
           # Create config file for fpm (DEB build creates it in its package dir structure,
           # but fpm needs the file to exist before packaging)
@@ -420,9 +462,9 @@ jobs:
             --iteration "$RPM_RELEASE" \
             --architecture "$RPM_ARCH" \
             --package "$RPM_FILE" \
-            --depends "glibc >= 2.31" \
+            "${depends_args[@]}" \
+            --description "High-performance distributed object storage (${LIBC} build)" \
             --maintainer "RustFS Team <support@rustfs.com>" \
-            --description "High-performance distributed object storage" \
             --url "https://rustfs.com" \
             --license "Apache-2.0" \
             --before-install <(./scripts/release/package_service_scripts.sh rpm-before-install) \
@@ -453,9 +495,9 @@ jobs:
           echo "✅ RPM built: $RPM_FILE"
 
       - name: Upload packages to artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: packages-${{ matrix.arch }}
+          name: packages-${{ matrix.arch }}-${{ matrix.libc }}
           path: |
             *.deb
             *.rpm
@@ -551,10 +593,11 @@ jobs:
             for f in "$DEB_FILE" "$RPM_FILE"; do
               if [[ -n "$f" && -f "$f" ]]; then
                 base="$(basename "$f")"
-                # GitHub stores release asset names with '~' normalized to '.'
-                # (e.g. rustfs_1.0.0~rc.2_amd64.deb is stored as
-                # rustfs_1.0.0.rc.2_amd64.deb), so checksum entries must
-                # reference the name as stored on the release.
+                # GitHub stores release asset names with '~' normalized to '.'.
+                # Current package file names embed the raw tag and contain no
+                # '~', but older releases may still ship such assets, so the
+                # checksum entries must reference the name as stored on the
+                # release.
                 github_base="${base//\~/.}"
                 # Remove any stale entry (both naming variants), then append
                 grep -Fv -- "$base" "$checksum_file" > "${checksum_file}.tmp" || true
@@ -576,7 +619,7 @@ jobs:
     name: Summary
     needs: [ resolve, package ]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - name: Print summary

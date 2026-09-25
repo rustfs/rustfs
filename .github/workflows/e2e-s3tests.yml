@@ -146,7 +146,7 @@ jobs:
     # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
     # See the header note (ci-1) for why the self-hosted sm-standard-4 label
     # was abandoned. Scheduled failures are handled by alert-on-failure below.
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -159,7 +159,7 @@ jobs:
       TEST_MODE: ${{ matrix.test-mode }}
       S3_SHARD_INDEX: ${{ matrix.shard-index }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -167,7 +167,7 @@ jobs:
       # ship a working pip (ci-1: a bare python3 without pip is what broke the
       # scheduled sweep). Keeps the workflow correct across runner drift.
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -264,7 +264,7 @@ jobs:
               hostname: rustfs4
               volumes: [rustfs4-data:/data]
             lb:
-              image: haproxy:2.9
+              image: haproxy:3.4.4
               hostname: lb
               networks: [rustfs-net]
               ports:
@@ -307,6 +307,11 @@ jobs:
           EOF
 
           docker compose -f compose.yml up -d
+
+          # Validate the pinned HAProxy image parses the exact config before
+          # the S3 compatibility sweep starts.
+          docker compose -f compose.yml exec -T lb \
+            haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
 
       - name: Wait for RustFS ready
         run: |
@@ -357,7 +362,7 @@ jobs:
 
       - name: Upload artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s3tests-${{ env.TEST_MODE }}-shard-${{ matrix.shard-index }}
           path: artifacts/**
@@ -366,15 +371,15 @@ jobs:
     name: Upstream HEAD classification canary
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -435,7 +440,7 @@ jobs:
 
       - name: Upload canary artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s3tests-upstream-head
           path: artifacts/s3tests-upstream-head/**
@@ -448,13 +453,13 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

@@ -9142,6 +9142,25 @@ mod tests {
             )
             .await
             .expect("create versioned bucket");
+        let mut history = Vec::new();
+        for value in 1..=3_u8 {
+            let payload = vec![value; 4097];
+            let version = store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the historical data versions")
+                .version_id
+                .expect("historical version must have an explicit identity");
+            history.push((version, payload));
+        }
         let marker = store
             .delete_object(
                 bucket,
@@ -9215,6 +9234,55 @@ mod tests {
                     .await,
                 Err(crate::disk::error::DiskError::FileVersionNotFound | crate::disk::error::DiskError::FileNotFound)
             ));
+        }
+        let replay = store
+            .heal_object_at_incarnation(
+                bucket,
+                object,
+                &marker.to_string(),
+                current,
+                &rustfs_heal_contracts::heal_channel::HealOpts {
+                    remove: true,
+                    scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("replay the exact removed marker identity");
+        assert!(replay.error.is_none(), "exact marker replay: {:?}", replay.error);
+        let absence = replay.absence.expect("exact replay must prove authoritative absence");
+        assert!(!absence.removed, "replay must not claim another physical repair");
+        assert_eq!(absence.bucket_incarnation_id, current);
+        assert_eq!(absence.version_id, marker.to_string());
+        let listed = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list surviving versions after marker cleanup");
+        assert_eq!(listed.objects.len(), history.len(), "an absent marker is not enumerable in a new walk");
+        assert!(listed.objects.iter().all(|info| !info.delete_marker));
+        for (version, expected) in history {
+            assert!(listed.objects.iter().any(|info| info.version_id == Some(version)));
+            let mut reader = store
+                .handle_get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("historical data must remain readable after cleanup and replay");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("read all historical bytes");
+            assert_eq!(actual, expected);
         }
     }
 
