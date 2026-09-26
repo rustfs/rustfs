@@ -41,8 +41,7 @@ use super::super::ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE;
 #[cfg(test)]
 use super::super::get_metadata_slowtail_fault_delay;
 use super::super::{
-    BUCKET_META_PREFIX, Bytes, CHECK_PART_DISK_NOT_FOUND, DeleteOptions, DiskError, DiskStore,
-    EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED,
+    Bytes, CHECK_PART_DISK_NOT_FOUND, DeleteOptions, DiskError, DiskStore, EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED,
     EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED, EVENT_SET_DISK_WRITE, Error, FileInfo, FileMeta, FileMetaShallowVersion,
     GetCodecStreamingFallbackReason, GetObjectMetadataCacheEntry, HTTPPreconditions, HashAlgorithm, HealAdmissionResult,
     HealChannelPriority, HealRequestSource, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, MultipartWriteQuorumContext,
@@ -1207,11 +1206,6 @@ pub(in crate::set_disk) async fn submit_read_repair_heal(
     .await;
 }
 
-fn is_scanner_owned_usage_observation(bucket: &str, object: &str) -> bool {
-    bucket == RUSTFS_META_BUCKET
-        && object == format!("{BUCKET_META_PREFIX}/{}", rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME)
-}
-
 pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     submission: ReadRepairHealSubmission<'_>,
     submitter: ReadRepairAdmissionSubmitter,
@@ -1226,10 +1220,6 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         reason,
         mrf_intent,
     } = submission;
-
-    if is_scanner_owned_usage_observation(bucket, object) {
-        return;
-    }
 
     if let Some((kind, version_uuid)) = mrf_intent
         && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
@@ -7841,15 +7831,6 @@ mod tests {
         Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
     }
 
-    static READ_REPAIR_TEST_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
-
-    fn counting_read_repair_submitter(
-        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
-    ) -> ReadRepairAdmissionFuture {
-        READ_REPAIR_TEST_SUBMISSIONS.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
-    }
-
     fn accepted_read_repair_submitter(
         _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) -> ReadRepairAdmissionFuture {
@@ -12985,31 +12966,6 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].exists);
         assert_eq!(responses[0].error, Error::ErasureReadQuorum.to_string());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn submit_read_repair_heal_skips_scanner_owned_usage_observation() {
-        READ_REPAIR_TEST_SUBMISSIONS.store(0, Ordering::SeqCst);
-        let object = format!("{BUCKET_META_PREFIX}/{}", rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME);
-
-        submit_read_repair_heal_with_submitter(
-            ReadRepairHealSubmission {
-                bucket: RUSTFS_META_BUCKET,
-                object: &object,
-                version_id: None,
-                pool_index: 1,
-                set_index: 2,
-                part_number: Some(1),
-                reason: "metadata_read_error",
-                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, None)),
-            },
-            counting_read_repair_submitter,
-        )
-        .await;
-        tokio::task::yield_now().await;
-
-        assert_eq!(READ_REPAIR_TEST_SUBMISSIONS.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use crate::heal::storage::HealStorageObjectResult;
 
 mod concurrent_delete;
 mod deferred_retry;
+mod usage_observation;
 
 mod canonical_outcome {
     use super::*;
@@ -1901,6 +1902,7 @@ fn replacement_identity(
 
 #[derive(Clone)]
 enum MockHealObjectOutcome {
+    MissingObject { outer: bool },
     MissingVersion,
     PermissionDenied,
     RetryableLock,
@@ -2058,6 +2060,14 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2118,6 +2128,14 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::MissingObject { outer } => {
+                    let error = Error::Storage(EcstoreError::FileNotFound);
+                    if outer {
+                        Err(error)
+                    } else {
+                        Ok((HealResultItem::default(), Some(error)))
+                    }
+                }
                 MockHealObjectOutcome::MissingVersion => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
