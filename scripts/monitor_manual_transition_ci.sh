@@ -129,14 +129,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-require_cmd gh
-require_cmd jq
-require_cmd date
-
+# Validate arguments before probing for external commands: CI's script-test
+# lane has no `gh`, and a missing tool must not mask an argument error that the
+# guard tests assert on.
 if ! [[ "${RUNS}" =~ ^[0-9]+$ ]] || (( RUNS == 0 )); then
   echo "ERROR: --runs must be a positive integer" >&2
   exit 1
 fi
+
+require_cmd gh
+require_cmd jq
+require_cmd date
 
 run_failed=0
 active_found=0
