@@ -104,6 +104,10 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+      - name: Install typos download dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget
       - name: Typos check with custom config file
         uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
