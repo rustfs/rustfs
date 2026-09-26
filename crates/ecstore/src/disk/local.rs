@@ -3302,7 +3302,7 @@ impl LocalIoBackend for StdBackend {
             let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
 
             // Descriptor cache (rustfs/backlog#1801): on a hit the read reuses an
-            // already-open descriptor (via dup below) and skips `access` +
+            // already-open descriptor by reference and skips `access` +
             // `File::open`. Linux-only — on other Unix `cached_fd` is None and the
             // read opens per call exactly as before. `fd_lookup` snapshots the
             // invalidation generation BEFORE the open so a heal/delete that lands
@@ -3339,22 +3339,19 @@ impl LocalIoBackend for StdBackend {
 
                 let file_open_start = metrics_enabled.then(StdInstant::now);
                 // Acquire the read handle (rustfs/backlog#1801). On a descriptor-cache
-                // hit this reuses the cached descriptor via `dup` (one syscall, no path
-                // resolution or permission re-check) and skips the volume access probe;
+                // hit this borrows the cached descriptor without duplicating it
+                // and skips the volume access probe;
                 // on a miss it resolves the volume, access-checks, and opens the file.
-                // `File::try_clone` shares the cached descriptor's open-file offset, so
+                // Cached readers share the same descriptor, so
                 // the read below is positioned (mmap offset argument / `read_exact_at`)
                 // and never depends on the descriptor's current offset. `cached_fd` being
                 // None also marks this call as a miss for the cache-insert side-channel.
                 // The cached length is the metadata snapshot captured at open time;
                 // all in-place/replacement writers invalidate this entry before
                 // publishing a mutation, so cache hits avoid a redundant fstat.
+                let mut opened_file = None;
                 let (file, cached_len, access_check_duration) = if let Some(cached) = cached_fd.as_ref() {
-                    (
-                        cached.file.as_ref().try_clone().map_err(DiskError::from)?,
-                        Some(cached.len),
-                        StdDuration::ZERO,
-                    )
+                    (cached.file.as_ref(), Some(cached.len), StdDuration::ZERO)
                 } else {
                     // Measure the volume access probe only — the part-path resolution
                     // above is accounted in `path_resolve_duration` (rustfs/backlog#1801).
@@ -3365,7 +3362,8 @@ impl LocalIoBackend for StdBackend {
                             .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
                     }
                     let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                    (std::fs::File::open(&file_path).map_err(DiskError::from)?, None, access_check_duration)
+                    let file = opened_file.insert(std::fs::File::open(&file_path).map_err(DiskError::from)?);
+                    (&*file, None, access_check_duration)
                 };
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
@@ -3392,7 +3390,7 @@ impl LocalIoBackend for StdBackend {
 
                 #[cfg(target_os = "macos")]
                 if should_reclaim_after_read {
-                    let _ = set_std_fd_nocache(&file);
+                    let _ = set_std_fd_nocache(file);
                 }
 
                 let mut mmap_map_duration = StdDuration::ZERO;
@@ -3470,7 +3468,7 @@ impl LocalIoBackend for StdBackend {
                             if should_populate_mmap_read {
                                 mmap_options.populate();
                             }
-                            let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
+                            let mmap = unsafe { mmap_options.map(file) }.map_err(DiskError::other)?;
                             let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
                             mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
                             mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
@@ -3495,8 +3493,8 @@ impl LocalIoBackend for StdBackend {
                             let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
                             let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
                             let mut buffer = vec![0; length];
-                            // Positioned read: a cache hit reads through a `dup`'d handle
-                            // that shares the cached descriptor's offset, so this must not
+                            // Positioned read: cache hits share the cached descriptor,
+                            // so concurrent readers must not
                             // touch the descriptor offset (rustfs/backlog#1801).
                             file.read_exact_at(&mut buffer, offset_u64).map_err(DiskError::from)?;
                             let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
@@ -3518,7 +3516,7 @@ impl LocalIoBackend for StdBackend {
                         u64::try_from(_reclaim_len).map_err(|_| DiskError::other("read reclaim length overflow"))?,
                     )
                     .ok_or_else(|| DiskError::other("read reclaim length overflow"))?;
-                    fadvise(&file, _reclaim_offset, Some(reclaim_len), Advice::DontNeed)
+                    fadvise(file, _reclaim_offset, Some(reclaim_len), Advice::DontNeed)
                         .map_err(std::io::Error::from)
                         .map_err(DiskError::from)?;
                 }
@@ -3528,10 +3526,10 @@ impl LocalIoBackend for StdBackend {
                 // Hand the freshly opened descriptor back so the async caller can index
                 // the cache — None on a hit (the cache already holds it). mmap/reclaim
                 // above only borrowed `file`, so it is still owned here and moves into the
-                // Arc; `cached_fd.is_none()` is true exactly when this call did the open.
+                // Arc; `opened_file` is populated only when this call did the open.
                 // Non-Linux has no fd cache, so skip the Arc allocation there.
                 #[cfg(target_os = "linux")]
-                let opened_fd: Option<Arc<FdCacheEntry>> = cached_fd.is_none().then(|| {
+                let opened_fd: Option<Arc<FdCacheEntry>> = opened_file.map(|file| {
                     Arc::new(FdCacheEntry {
                         file: Arc::new(file),
                         len: metadata_len,
@@ -23553,6 +23551,14 @@ mod test {
             .await
             .expect("operation should succeed");
         assert_eq!(second, Bytes::from_static(payload));
+
+        // Concurrent cache hits must use positioned reads on the shared descriptor.
+        let reads =
+            futures::future::join_all((0..payload.len()).map(|offset| backend.pread_bytes(volume, object, offset, 1, None)))
+                .await;
+        for (offset, read) in reads.into_iter().enumerate() {
+            assert_eq!(read.expect("cached offset read"), &payload[offset..offset + 1]);
+        }
 
         // Invalidating by the object prefix drops the cached descriptor.
         backend.invalidate_cached_fds_under(volume, "obj/abc");

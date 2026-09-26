@@ -307,6 +307,32 @@ fn bench_memory_patterns(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
 
+    // The reader owns an EC-sized buffer before encoding. Keep ingest outside
+    // the timed region to isolate the borrowed-copy versus ownership transfer.
+    let erasure = Erasure::new(data_shards, parity_shards, block_size);
+    let payload = generate_test_data(block_size);
+    for owned in [false, true] {
+        group.bench_function(if owned { "owned_ingest" } else { "borrowed_ingest" }, |b| {
+            b.iter_batched(
+                || {
+                    let mut buffer = bytes::BytesMut::with_capacity(erasure.shard_size() * (data_shards + parity_shards));
+                    buffer.extend_from_slice(&payload);
+                    buffer
+                },
+                |buffer| {
+                    let shards = if owned {
+                        erasure.encode_data_bytes_mut(buffer, block_size)
+                    } else {
+                        erasure.encode_data(&buffer)
+                    }
+                    .expect("encode benchmark block");
+                    black_box(shards)
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+
     // Test reusing the same Erasure instance
     group.bench_function("reuse_erasure_instance", |b| {
         let erasure = Erasure::new(data_shards, parity_shards, block_size);

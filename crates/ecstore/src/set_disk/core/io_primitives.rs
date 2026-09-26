@@ -5472,11 +5472,13 @@ impl SetDisks {
         // Use improved simple batch processor instead of join_all for better performance
         let processor = runtime_sources::batch_processors().write_processor();
 
+        // Batch tasks require owned inputs; share the immutable paths across disks.
+        let paths: Arc<[String]> = Arc::from(paths);
         let tasks: Vec<_> = disks
             .iter()
             .map(|disk| {
                 let disk = disk.clone();
-                let paths = paths.to_vec();
+                let paths = Arc::clone(&paths);
 
                 async move {
                     if let Some(disk) = disk {
