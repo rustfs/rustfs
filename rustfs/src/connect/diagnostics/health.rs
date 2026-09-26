@@ -36,8 +36,8 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use super::ProfileProvenance;
 use crate::connect::DeviceIdentity;
-use crate::storage::storage_api::contract::admin::{DiskSetSelector, StorageAdminApi};
-use crate::storage::storage_api::{DiskInfoOptions, StorageDiskRpcExt};
+use crate::storage_api::connect::contract::admin::{DiskSetSelector, StorageAdminApi};
+use crate::storage_api::connect::{DiskInfoOptions, StorageDiskRpcExt};
 
 pub const HEALTH_SCHEMA_VERSION: u16 = 1;
 pub const HEALTH_TOOL_ID: &str = "health.check";
@@ -642,7 +642,7 @@ fn flags_check(observation: &HealthSourceObservation, freshness: HealthFreshness
             Some(flags) if flags.iter().any(|flag| !ALLOWED_FLAGS.contains(&flag.as_str())) => {
                 (HealthRuleOutcome::Unknown, "INVALID_EVIDENCE")
             }
-            Some(flags) if flags.is_empty() => (HealthRuleOutcome::Pass, "NO_COARSE_CONDITION_REPORTED"),
+            Some([]) => (HealthRuleOutcome::Pass, "NO_COARSE_CONDITION_REPORTED"),
             Some(_) => (HealthRuleOutcome::Fail, "COARSE_CONDITION_REPORTED"),
             None => (HealthRuleOutcome::Unknown, "EVIDENCE_MISSING"),
         },

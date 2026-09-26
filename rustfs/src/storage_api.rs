@@ -242,6 +242,19 @@ pub(crate) mod server {
     }
 }
 
+/// Storage surface of the connect diagnostics module
+/// (`crate::connect::diagnostics`): disk info and admin API primitives used
+/// by the health-check observation path.
+pub(crate) mod connect {
+    pub(crate) mod contract {
+        pub(crate) mod admin {
+            pub(crate) use super::super::super::storage_contracts::{DiskSetSelector, StorageAdminApi};
+        }
+    }
+
+    pub(crate) use crate::storage::storage_api::{DiskInfoOptions, StorageDiskRpcExt};
+}
+
 /// Storage surface of the site-replication service module
 /// (`crate::site_replication`, backlog#1840): bucket metadata, bucket
 /// targets, replication-config primitives, and the config-object lock
