@@ -185,6 +185,14 @@ impl ProfileProvenance {
     pub(crate) fn build_features(&self) -> &[String] {
         &self.build_features
     }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        lower_hex(&self.source_commit, 40)
+            && lower_hex(&self.executable_sha256, 64)
+            && version(&self.rustfs_version)
+            && self.build_features.len() <= MAX_BUILD_FEATURES
+            && self.build_features.iter().all(|feature| build_feature(feature))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -969,11 +977,7 @@ impl ProfileCaptureRequest {
             || !uuid7(&self.artifact_uid)
             || !uuid7(&self.consent.consent_uid)
             || !resource_names_match(self)
-            || !lower_hex(&self.provenance.source_commit, 40)
-            || !lower_hex(&self.provenance.executable_sha256, 64)
-            || !version(&self.provenance.rustfs_version)
-            || self.provenance.build_features.len() > MAX_BUILD_FEATURES
-            || !self.provenance.build_features.iter().all(|feature| build_feature(feature))
+            || !self.provenance.is_valid()
         {
             return Err(ProfileError::InvalidRequest);
         }

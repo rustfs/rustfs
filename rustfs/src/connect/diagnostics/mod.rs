@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod health;
 mod inspect;
 mod job;
 pub(crate) mod job_delivery;
@@ -40,6 +41,7 @@ mod trace_runtime;
 
 /// Signed diagnostic producers available through the CLI or authenticated service jobs.
 pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
+    health::HEALTH_SERVICE_CAPABILITY,
     perf_client::CLIENT_CAPABILITY,
     perf_drive::DRIVE_CAPABILITY,
     perf_network::NETWORK_CAPABILITY,
@@ -64,6 +66,13 @@ pub const CONNECT_DIAGNOSTIC_CAPABILITIES: &[&str] = &[
 #[path = "trace_runtime_unsupported.rs"]
 mod trace_runtime;
 
+pub use health::{
+    HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome,
+    HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
+    MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
+    sign_health_export,
+};
 pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
     InspectOutcome, InspectProvenance, InspectReason, InspectReasonCode, InspectRequest, InspectRule, InspectRuleOutcome,
