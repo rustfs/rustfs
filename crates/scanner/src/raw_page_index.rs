@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+mod writer;
+pub(crate) use writer::RawEnumerationPageWriter;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RAW_PAGE_DIGEST_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const RAW_PAGE_INDEX_VERSION: u16 = 1;
 const RAW_PAGE_ENTRY_MAX_BYTES: usize = 16 * 1024;
 
@@ -142,6 +150,13 @@ impl RawEnumerationPageIndex {
         match &self.state {
             RawEnumerationPageIndexState::Unsupported => None,
             RawEnumerationPageIndexState::Supported(inner) => Some(inner.generation),
+        }
+    }
+
+    pub(crate) fn parent(&self) -> Option<&str> {
+        match &self.state {
+            RawEnumerationPageIndexState::Unsupported => None,
+            RawEnumerationPageIndexState::Supported(inner) => Some(&inner.parent),
         }
     }
 
@@ -295,25 +310,7 @@ impl RawEnumerationPageIndex {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
         let entries_start = inner.validated_committed_entries()?.len();
-        let Some(building) = inner.building.as_ref() else {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        };
-        if building.entries.is_empty() {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        }
-        building.validate(
-            u64::try_from(inner.pages.len()).unwrap_or(u64::MAX),
-            u64::try_from(entries_start).unwrap_or(u64::MAX),
-            inner.page_entry_limit,
-        )?;
-        let Some(building) = inner.building.take() else {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        };
-        let page = RawEnumerationPage::new(&inner.parent, building);
-        inner.complete = page.terminal;
-        inner.pages.push(page.clone());
-        inner.generation = inner.generation.saturating_add(1);
-        Ok(page)
+        inner.commit_building_page(entries_start)
     }
 
     pub fn page(&self, page_index: u64, expected_digest: [u8; 32]) -> Result<&RawEnumerationPage, RawEnumerationPageIndexError> {
@@ -349,6 +346,30 @@ impl RawEnumerationPageIndex {
 }
 
 impl RawEnumerationPageIndexInner {
+    // Callers validate the committed prefix at the restore/API boundary. The
+    // live writer maintains its entry count without revisiting that prefix.
+    fn commit_building_page(&mut self, entries_start: usize) -> Result<RawEnumerationPage, RawEnumerationPageIndexError> {
+        let Some(building) = self.building.as_ref() else {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        };
+        if building.entries.is_empty() {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        }
+        building.validate(
+            u64::try_from(self.pages.len()).unwrap_or(u64::MAX),
+            u64::try_from(entries_start).unwrap_or(u64::MAX),
+            self.page_entry_limit,
+        )?;
+        let Some(building) = self.building.take() else {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        };
+        let page = RawEnumerationPage::new(&self.parent, building);
+        self.complete = page.terminal;
+        self.pages.push(page.clone());
+        self.generation = self.generation.saturating_add(1);
+        Ok(page)
+    }
+
     fn status(&self) -> RawEnumerationPageOwnerStatus {
         let indexed_entries = u64::try_from(self.indexed_entries()).unwrap_or(u64::MAX);
         if let Some(building) = &self.building {
@@ -528,6 +549,8 @@ fn entry_sets_match(left: &[String], right: &[String]) -> bool {
 }
 
 fn raw_page_digest(parent: &str, building: &RawEnumerationPageBuilder) -> [u8; 32] {
+    #[cfg(test)]
+    RAW_PAGE_DIGEST_ENTRIES.with(|count| count.set(count.get().saturating_add(building.entries.len())));
     let mut digest = Sha256::new();
     update_digest(&mut digest, b"version", &RAW_PAGE_INDEX_VERSION.to_le_bytes());
     update_digest(&mut digest, b"parent", parent.as_bytes());
