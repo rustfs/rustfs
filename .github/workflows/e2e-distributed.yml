@@ -80,7 +80,7 @@ jobs:
     name: Distributed 4-node 4-disk e2e
     # GitHub-hosted VM: loop and tmpfs mounts work here. sm-standard-4 is an
     # ARC pod and rejects both (`mount -o loop` ENOENT, tmpfs "read-only").
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
