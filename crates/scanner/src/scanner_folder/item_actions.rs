@@ -1302,9 +1302,7 @@ pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) 
     }
 
     if is_scanner_metadata_corrupt_error(err) {
-        return GetSizeFailureAction::HealMetadata {
-            object: metadata_object,
-        };
+        return GetSizeFailureAction::HealMetadata { object: metadata_object };
     }
 
     if is_scanner_metadata_transient_error(err) {
