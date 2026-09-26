@@ -41,6 +41,11 @@ use super::{
     capture_top_rpc, encode_signed_profile_export, measure_drive, measure_network, runtime_network_peer_aliases,
     sign_drive_export, sign_network_export, sign_top_export_with_nonce,
 };
+use super::{
+    HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthError, HealthServiceRequest,
+    LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS, MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES,
+    collect_runtime_health,
+};
 use crate::connect::DeviceIdentity;
 
 const PROTOCOL_VERSION: &str = "v1";
@@ -52,6 +57,7 @@ const PERFORMANCE_NETWORK_JOB_TYPE: &str = "performance.network";
 const TOP_API_JOB_TYPE: &str = "top.api";
 const TOP_LOCKS_JOB_TYPE: &str = "top.locks";
 const TOP_RPC_JOB_TYPE: &str = "top.rpc";
+const HEALTH_JOB_TYPE: &str = "health.check";
 pub const DIAGNOSTIC_JOB_SIGNATURE_DOMAIN: &[u8] = b"rustfs-connect-agent-job-v1\0";
 const MAX_JOB_LIFETIME_SECONDS: i64 = 1_800;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
@@ -76,6 +82,7 @@ const MIN_TOP_RPC_MEMORY_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiagnosticJobKind {
+    Health,
     ProfileCpu,
     ProfileThreads,
     ProfileMemory,
@@ -109,8 +116,12 @@ pub struct DiagnosticJobParameters {
     pub consent_uid: String,
     pub consent_policy_revision: u64,
     pub consent_expires_at: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub duration_millis: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub sample_period_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evidence_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -415,13 +426,29 @@ impl DiagnosticJobEnvelope {
             || self.limits.max_memory_bytes > MAX_MEMORY_BYTES
             || self.limits.max_cpu_millis == 0
             || self.limits.max_cpu_millis > MAX_CPU_MILLIS
-            || self.parameters.duration_millis == 0
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::Health {
+            if self.limits.timeout_seconds != HEALTH_TIMEOUT_SECONDS
+                || self.limits.max_output_bytes != MAX_HEALTH_OUTPUT_BYTES
+                || self.limits.max_memory_bytes != MAX_HEALTH_MEMORY_BYTES
+                || self.limits.max_cpu_millis != MAX_HEALTH_CPU_MILLIS
+                || self.parameters.duration_millis != 0
+                || self.parameters.sample_period_micros != 0
+                || !matches!(self.parameters.max_evidence_age_seconds, Some(1..=MAX_EVIDENCE_AGE_SECONDS))
+            {
+                return Err(DiagnosticJobError::LimitExceeded);
+            }
+        } else if self.parameters.duration_millis == 0
             || self.parameters.duration_millis > self.limits.timeout_seconds.saturating_mul(1_000)
             || self.parameters.duration_millis > self.limits.max_cpu_millis
             || self.parameters.sample_period_micros == 0
             || self.parameters.sample_period_micros > self.parameters.duration_millis.saturating_mul(1_000)
         {
             return Err(DiagnosticJobError::LimitExceeded);
+        } else if self.parameters.max_evidence_age_seconds.is_some() {
+            return Err(DiagnosticJobError::Invalid);
         }
         if kind == DiagnosticJobKind::TopApi
             && (self.limits.max_cpu_millis > MAX_TOP_API_CPU_MILLIS || self.limits.max_memory_bytes < MIN_TOP_API_MEMORY_BYTES)
@@ -481,6 +508,9 @@ impl DiagnosticJobEnvelope {
 
     fn kind(&self) -> Result<DiagnosticJobKind, DiagnosticJobError> {
         match (self.job_type.as_str(), self.required_capabilities.as_slice(), self.schema_version) {
+            (HEALTH_JOB_TYPE, [capability], HEALTH_SCHEMA_VERSION) if capability == HEALTH_SERVICE_CAPABILITY => {
+                Ok(DiagnosticJobKind::Health)
+            }
             (PROFILE_CPU_JOB_TYPE, [capability], PROFILE_SCHEMA_VERSION) if capability == CPU_PROFILE_CAPABILITY => {
                 Ok(DiagnosticJobKind::ProfileCpu)
             }
@@ -530,6 +560,7 @@ pub async fn execute_diagnostic_job(
     let nonce = job.nonce;
     let envelope = job.envelope;
     match envelope.kind()? {
+        DiagnosticJobKind::Health => execute_health_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileCpu => execute_profile_cpu_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileThreads => execute_profile_threads_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::ProfileMemory => execute_profile_memory_job(envelope, nonce, identity, provenance, cancel).await,
@@ -549,6 +580,88 @@ pub async fn execute_diagnostic_job(
         DiagnosticJobKind::TopLocks => execute_top_locks_job(envelope, nonce, identity, provenance, cancel).await,
         DiagnosticJobKind::TopRpc => execute_top_rpc_job(envelope, nonce, identity, provenance, cancel).await,
     }
+}
+
+async fn execute_health_job(
+    envelope: DiagnosticJobEnvelope,
+    nonce: [u8; 32],
+    identity: &DeviceIdentity,
+    provenance: ProfileProvenance,
+    cancel: &CancellationToken,
+) -> Result<DiagnosticJobExecution, DiagnosticJobError> {
+    let expire = parse_time(&envelope.expire_time)?;
+    let consent_expire = parse_time(&envelope.parameters.consent_expires_at)?;
+    let request = HealthServiceRequest {
+        organization_name: envelope.organization_name,
+        cluster_name: envelope.cluster_name,
+        device_name: envelope.device_name,
+        run_uid: envelope.job_id.clone(),
+        artifact_uid: envelope.parameters.artifact_uid,
+        schema_version: envelope.schema_version,
+        capability: HEALTH_SERVICE_CAPABILITY.to_owned(),
+        consent: LocalHealthConsent {
+            consent_uid: envelope.parameters.consent_uid,
+            policy_revision: envelope.parameters.consent_policy_revision,
+            expires_at_unix: consent_expire.timestamp(),
+            active: true,
+        },
+        produced_at_unix: Utc::now().timestamp(),
+        expires_at_unix: expire.timestamp(),
+        nonce,
+        max_evidence_age_seconds: envelope
+            .parameters
+            .max_evidence_age_seconds
+            .ok_or(DiagnosticJobError::LimitExceeded)?,
+        provenance,
+    };
+    let timeout = Duration::from_secs(envelope.limits.timeout_seconds);
+    let health_cancel = cancel.child_token();
+    let collected = tokio::time::timeout(timeout, collect_runtime_health(&request, identity, &health_cancel)).await;
+    let export = match collected {
+        Ok(Ok(export)) => export,
+        Ok(Err(HealthError::SourceUnavailable)) => {
+            return Ok(DiagnosticJobExecution {
+                job_id: envelope.job_id,
+                outcome: "FAILED".to_owned(),
+                reason: "SOURCE_UNAVAILABLE".to_owned(),
+                artifact_uid: None,
+                artifact_sha256: None,
+                artifact_bytes: None,
+            });
+        }
+        Ok(Err(error)) => return Err(health_failure(error)),
+        Err(_) => {
+            health_cancel.cancel();
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+    };
+    if export.archive_bytes.len() > usize::try_from(envelope.limits.max_output_bytes).unwrap_or(usize::MAX) {
+        return Err(DiagnosticJobError::LimitExceeded);
+    }
+    Ok(DiagnosticJobExecution {
+        job_id: envelope.job_id,
+        outcome: export.outcome.as_str().to_owned(),
+        reason: export.reason_code.as_str().to_owned(),
+        artifact_uid: Some(export.artifact_uid),
+        artifact_sha256: Some(export.archive_sha256),
+        artifact_bytes: Some(export.archive_bytes),
+    })
+}
+
+fn health_failure(error: HealthError) -> DiagnosticJobError {
+    match error {
+        HealthError::Cancelled => DiagnosticJobError::Cancelled,
+        HealthError::LimitExceeded | HealthError::Busy => DiagnosticJobError::LimitExceeded,
+        HealthError::SourceUnavailable | HealthError::CollectionFailed => DiagnosticJobError::CollectionFailed,
+        HealthError::Signing | HealthError::Encoding => DiagnosticJobError::ExportFailed,
+        HealthError::ConsentExpired | HealthError::Expired => DiagnosticJobError::Expired,
+        HealthError::Unsupported => DiagnosticJobError::Unsupported,
+        HealthError::ConsentRequired | HealthError::InvalidRequest => DiagnosticJobError::Invalid,
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn runtime_drive_scratch_root() -> Option<std::path::PathBuf> {
@@ -1233,6 +1346,7 @@ mod tests {
                 consent_expires_at: "2030-01-01T00:01:00Z".to_owned(),
                 duration_millis: 1_000,
                 sample_period_micros: 10_000,
+                max_evidence_age_seconds: None,
                 traffic_bytes: None,
                 target_alias: None,
                 scratch_bytes: None,
@@ -1275,6 +1389,7 @@ mod tests {
         use clap::CommandFactory;
 
         let expected = [
+            ("health.check.service@1", &[][..]),
             ("performance.client@1", &["performance", "client"][..]),
             ("performance.drive@1", &["performance", "drive"][..]),
             ("performance.network@1", &[][..]),
@@ -1306,6 +1421,7 @@ mod tests {
             if path.is_empty() {
                 let mut job = envelope();
                 let (job_type, kind) = match capability {
+                    HEALTH_SERVICE_CAPABILITY => (HEALTH_JOB_TYPE, DiagnosticJobKind::Health),
                     NETWORK_CAPABILITY => (PERFORMANCE_NETWORK_JOB_TYPE, DiagnosticJobKind::PerformanceNetwork),
                     MEMORY_PROFILE_SERVICE_CAPABILITY => (PROFILE_MEMORY_JOB_TYPE, DiagnosticJobKind::ProfileMemory),
                     _ => panic!("{capability} is missing service dispatch"),
@@ -1313,6 +1429,17 @@ mod tests {
                 job.job_type = job_type.to_owned();
                 job.required_capabilities = vec![capability.to_owned()];
                 job.schema_version = NETWORK_SCHEMA_VERSION;
+                if capability == HEALTH_SERVICE_CAPABILITY {
+                    job.limits = DiagnosticJobLimits {
+                        timeout_seconds: HEALTH_TIMEOUT_SECONDS,
+                        max_output_bytes: MAX_HEALTH_OUTPUT_BYTES,
+                        max_memory_bytes: MAX_HEALTH_MEMORY_BYTES,
+                        max_cpu_millis: MAX_HEALTH_CPU_MILLIS,
+                    };
+                    job.parameters.duration_millis = 0;
+                    job.parameters.sample_period_micros = 0;
+                    job.parameters.max_evidence_age_seconds = Some(300);
+                }
                 assert_eq!(job.kind(), Ok(kind));
                 continue;
             }
@@ -1331,6 +1458,70 @@ mod tests {
         signer
             .verify(&envelope, &target(&envelope), "2030-01-01T00:00:10Z".parse().expect("time"))
             .expect("valid job");
+    }
+
+    #[test]
+    fn accepts_only_the_bounded_health_service_contract() {
+        let mut health = envelope();
+        health.job_type = HEALTH_JOB_TYPE.to_owned();
+        health.required_capabilities = vec![HEALTH_SERVICE_CAPABILITY.to_owned()];
+        health.limits = DiagnosticJobLimits {
+            timeout_seconds: HEALTH_TIMEOUT_SECONDS,
+            max_output_bytes: MAX_HEALTH_OUTPUT_BYTES,
+            max_memory_bytes: MAX_HEALTH_MEMORY_BYTES,
+            max_cpu_millis: MAX_HEALTH_CPU_MILLIS,
+        };
+        health.parameters.duration_millis = 0;
+        health.parameters.sample_period_micros = 0;
+        health.parameters.max_evidence_age_seconds = Some(300);
+        let (health, signer) = signed_envelope(health);
+        signer
+            .verify(&health, &target(&health), "2030-01-01T00:00:10Z".parse().expect("time"))
+            .expect("valid health service job");
+
+        let unsigned = serde_json::to_value(health.unsigned()).expect("unsigned health job");
+        assert!(unsigned["parameters"].get("durationMillis").is_none());
+        assert!(unsigned["parameters"].get("samplePeriodMicros").is_none());
+        assert_eq!(unsigned["parameters"]["maxEvidenceAgeSeconds"], 300);
+
+        let mut old_capability = health.clone();
+        old_capability.required_capabilities = vec!["health.check@1".to_owned()];
+        assert_eq!(
+            signer.verify(&old_capability, &target(&old_capability), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::Unsupported)
+        );
+
+        let mut oversized = health.clone();
+        oversized.limits.max_output_bytes += 1;
+        let (oversized, oversized_signer) = signed_envelope(oversized);
+        assert_eq!(
+            oversized_signer.verify(&oversized, &target(&oversized), "2030-01-01T00:00:10Z".parse().expect("time")),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut missing_freshness = health.clone();
+        missing_freshness.parameters.max_evidence_age_seconds = None;
+        let (missing_freshness, missing_signer) = signed_envelope(missing_freshness);
+        assert_eq!(
+            missing_signer.verify(
+                &missing_freshness,
+                &target(&missing_freshness),
+                "2030-01-01T00:00:10Z".parse().expect("time")
+            ),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
+
+        let mut profile_parameter = health;
+        profile_parameter.parameters.duration_millis = 1;
+        let (profile_parameter, profile_parameter_signer) = signed_envelope(profile_parameter);
+        assert_eq!(
+            profile_parameter_signer.verify(
+                &profile_parameter,
+                &target(&profile_parameter),
+                "2030-01-01T00:00:10Z".parse().expect("time")
+            ),
+            Err(DiagnosticJobError::LimitExceeded)
+        );
     }
 
     #[test]

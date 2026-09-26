@@ -110,6 +110,12 @@ use uuid::Uuid;
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
 const PART_METADATA_READ_CONCURRENCY: usize = 8;
 
+/// The fresh health path uses a synchronous capacity syscall. Keep the permit
+/// inside the blocking closure so cancelling its async caller cannot admit a
+/// second probe while the first syscall is still running.
+static FRESH_CAPACITY_PROBE_PERMIT: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -11123,7 +11129,34 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
+        if opts.fresh_capacity {
+            let permit = FRESH_CAPACITY_PROBE_PERMIT
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| DiskError::other("fresh capacity probe unavailable"))?;
+            let root = self.root.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let drive_path = root.to_string_lossy().to_string();
+                check_path_length(&drive_path)?;
+                get_info(&drive_path).map_err(DiskError::from)
+            })
+            .await
+            .map_err(|_| DiskError::other("fresh capacity probe failed"))??;
+            let healing = fs::try_exists(self.root.join(RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
+                .await
+                .unwrap_or(false);
+            return Ok(DiskInfo {
+                total: info.total,
+                free: info.free,
+                used: info.used,
+                healing,
+                fresh_capacity: true,
+                ..Default::default()
+            });
+        }
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
@@ -21108,6 +21141,7 @@ mod test {
             disk_id: "test-disk".to_string(),
             metrics: true,
             noop: false,
+            fresh_capacity: false,
         };
 
         let disk_info = disk.disk_info(&disk_info_opts).await.expect("operation should succeed");
@@ -21124,6 +21158,26 @@ mod test {
         assert_eq!(disk_info.rotational, disk.rotational);
         assert!(!disk_info.mount_path.is_empty());
         assert!(!disk_info.endpoint.is_empty());
+
+        let fresh = disk
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fresh capacity should be available");
+        assert!(fresh.fresh_capacity);
+        assert!(fresh.total > 0);
+        assert!(fresh.used <= fresh.total);
+        assert!(fresh.endpoint.is_empty());
+        assert!(fresh.mount_path.is_empty());
+        assert!(fresh.physical_device_ids.is_empty());
+        assert!(fresh.id.is_none());
+        assert!(fresh.fs_type.is_empty());
+        assert_eq!(fresh.major, 0);
+        assert_eq!(fresh.minor, 0);
+        assert_eq!(fresh.used_inodes, 0);
+        assert_eq!(fresh.free_inodes, 0);
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;

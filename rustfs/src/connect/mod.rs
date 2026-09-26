@@ -87,6 +87,13 @@ pub use diagnostics::{
     DiagnosticJobParameters, DiagnosticJobTarget, TrustedDiagnosticJobSigner, VerifiedDiagnosticJob, execute_diagnostic_job,
 };
 pub use diagnostics::{
+    HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome,
+    HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
+    MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
+    sign_health_export,
+};
+pub use diagnostics::{
     LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,
     MAX_NETWORK_DURATION, MAX_NETWORK_ENVELOPE_BYTES, MAX_NETWORK_OPERATIONS, MAX_NETWORK_PEERS, MAX_NETWORK_RESULT_BYTES,
     MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NETWORK_TOOL_ID, NetworkCoverage,
