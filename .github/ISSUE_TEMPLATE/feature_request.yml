@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest an idea for this project
+body:
+  - type: checkboxes
+    id: request-scope
+    attributes:
+      label: Request scope
+      description: |
+        RustFS data directories backed by NFS, SMB/Samba/CIFS, or other remote or shared filesystems are unsupported, including those behind Docker volumes or Kubernetes PersistentVolumes.
+        Troubleshooting requests for these deployments will be closed without investigation. Use this form for new or improved functionality.
+      options:
+        - label: This is a feature request and does not ask for troubleshooting an unsupported remote or shared filesystem deployment.
+          required: true
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: Problem or use case
+      description: Describe the problem or use case that motivates this feature request.
+      placeholder: "For example: I am trying to ... but ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: A clear and concise description of what you would like to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any alternative solutions or features you have considered.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other context or drag and drop screenshots about the feature request here.
