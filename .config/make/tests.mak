@@ -24,6 +24,7 @@ TEST_THREADS ?= 1
 .PHONY: script-tests
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
+	trap 'status=$$?; printf "ERROR: script-tests failed (exit %s): %s\n" "$$status" "$$BASH_COMMAND" >&2; exit "$$status"' ERR
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_docker_runtime_timezone.sh
 	./scripts/test_entrypoint_credentials.sh
