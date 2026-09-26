@@ -636,6 +636,13 @@ fn feature_specs() -> &'static [FeatureSpec] {
             default_enabled: false,
         },
         FeatureSpec {
+            name: "tftp",
+            enabled: cfg!(feature = "tftp"),
+            description: "TFTP protocol support (PXE boot file serving)",
+            dependencies: "rustfs-protocols/tftp",
+            default_enabled: false,
+        },
+        FeatureSpec {
             name: "license",
             enabled: cfg!(feature = "license"),
             description: "License validation",
@@ -660,7 +667,7 @@ fn feature_specs() -> &'static [FeatureSpec] {
             name: "full",
             enabled: cfg!(feature = "full"),
             description: "Full protocol and observability bundle",
-            dependencies: "metrics-gpu + ftps + swift + webdav + sftp + pyroscope",
+            dependencies: "metrics-gpu + ftps + swift + webdav + sftp + tftp + pyroscope",
             default_enabled: false,
         },
         FeatureSpec {

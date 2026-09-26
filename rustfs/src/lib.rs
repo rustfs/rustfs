@@ -95,7 +95,7 @@ pub mod memory_observability;
 pub mod module_switches;
 pub mod on_demand_migration;
 pub mod profiling;
-#[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
+#[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp", feature = "tftp"))]
 pub mod protocols;
 pub mod runtime_capabilities;
 pub(crate) mod runtime_sources;
