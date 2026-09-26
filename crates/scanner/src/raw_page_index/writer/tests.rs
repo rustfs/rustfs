@@ -69,8 +69,8 @@ fn raw_enumeration_writer_matches_cumulative_pages_with_duplicates_and_restarts(
         let empty = RawEnumerationPageIndex::new("bucket/metadata", limit).expect("empty index");
         compare_with_cumulative_ingestion(empty.clone(), &source);
         let mut writer = RawEnumerationPageWriter::new(empty).expect("writer");
-        for prefix in 0..source.len() {
-            writer.record_entry(source[prefix]).expect("entry before interruption");
+        for entry in source {
+            writer.record_entry(entry).expect("entry before interruption");
             let saved = writer.checkpoint().expect("save interrupted enumeration");
             let encoded = rmp_serde::to_vec(&saved).expect("encode checkpoint");
             let restored = rmp_serde::from_slice(&encoded).expect("restore checkpoint");
