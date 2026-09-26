@@ -73,6 +73,7 @@ hotpath-cpu = [
 [dependencies]
 hotpath.workspace = true
 rustfs-config = { workspace = true }
+rustfs-data-usage = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-lock = { workspace = true }
