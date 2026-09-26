@@ -320,7 +320,7 @@ impl Operation for InfoCannedPolicy {
                 error = ?e,
                 "admin policy state"
             );
-            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            iam_error_to_s3_error(e)
         })?;
 
         let body = serde_json::to_vec(&pd).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;

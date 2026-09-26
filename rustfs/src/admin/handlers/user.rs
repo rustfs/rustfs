@@ -510,9 +510,7 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query temporary user state: {e}"))
-        })?;
+        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(iam_error_to_s3_error)?;
 
         if is_temp {
             return Err(s3_error!(InvalidArgument, "cannot remove a temporary user"));
