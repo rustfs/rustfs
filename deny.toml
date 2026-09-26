@@ -33,13 +33,13 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Official s3s repository; the application consumes the 0.17.0 crates.io
-    # releases for s3s and s3s-sigv4.
+    # Official s3s repository; the application now consumes the 0.17.0
+    # crates.io releases for s3s and s3s-sigv4.
     # owner: marshawcoco  review: 2026-10
     # "https://github.com/s3s-project/s3s.git",
-    # RustFS fork carrying presigned expiry and constant-time authentication fixes.
+    # RustFS io_uring backend is now consumed from crates.io at 0.3.0.
     # owner: rustfs-maintainers  review: 2026-10
-    # "https://github.com/rustfs/s3s.git",
+    # "https://github.com/rustfs/uring",
 ]
 
 [bans]

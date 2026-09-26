@@ -223,10 +223,12 @@ aws-smithy-http-client = { workspace = true, default-features = false, features 
 # Observability and Metrics
 metrics = { workspace = true }
 
-# Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
-# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only.
+# The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
+# SharedReadBudget and the bounded read APIs are available in the 0.3.0
+# registry release; keep the application on the published contract.
 rustfs-uring = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]

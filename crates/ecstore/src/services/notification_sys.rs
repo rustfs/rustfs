@@ -23,7 +23,6 @@ use crate::error::{Error, Result};
 use crate::layout::endpoints::EndpointServerPools;
 use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
-use crate::services::rebalance::RebalSaveOpt;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -2455,30 +2454,11 @@ impl NotificationSys {
             None => store.current_rebalance_id().await,
         };
         match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
-            Ok(_) => {
-                let save_result = match local_rebalance_id.as_deref() {
-                    Some(expected_id) => {
-                        store
-                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
-                            .await
-                    }
-                    None => Ok(()),
-                };
-                if let Err(err) = save_result {
-                    error!(
-                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        action = "stop_rebalance",
-                        result = "local_save_failed",
-                        error = %err,
-                        "notification peer propagation"
-                    );
-                    return Err(Error::other(format!(
-                        "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
-                    )));
-                }
-            }
+            // `stop_rebalance_for_id` durably saves the terminal snapshot after
+            // activation readers drain. Do not acquire the same metadata lock
+            // again for an equivalent `StoppedAt` save while cleanup is still
+            // releasing its own metadata work.
+            Ok(_) => {}
             Err(err) => {
                 error!(
                     event = EVENT_NOTIFICATION_PEER_PROPAGATION,
