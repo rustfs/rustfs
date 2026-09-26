@@ -84,6 +84,16 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
 }
 
 pub(crate) fn manifest_list_avro_entries_with_content(manifests: &[(&str, usize, i32, i32, i64, i64)]) -> Vec<u8> {
+    let manifests = manifests
+        .iter()
+        .map(|(path, length, spec_id, content, sequence_number, snapshot_id)| {
+            (*path, *length, *spec_id, *content, *sequence_number, *sequence_number, *snapshot_id)
+        })
+        .collect::<Vec<_>>();
+    manifest_list_avro_entries_with_min_sequences(&manifests)
+}
+
+pub(crate) fn manifest_list_avro_entries_with_min_sequences(manifests: &[(&str, usize, i32, i32, i64, i64, i64)]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -109,7 +119,9 @@ pub(crate) fn manifest_list_avro_entries_with_content(manifests: &[(&str, usize,
     )
     .expect("manifest list avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
-    for (manifest_path, manifest_length, partition_spec_id, content, sequence_number, snapshot_id) in manifests {
+    for (manifest_path, manifest_length, partition_spec_id, content, sequence_number, min_sequence_number, snapshot_id) in
+        manifests
+    {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
                 (
@@ -123,7 +135,7 @@ pub(crate) fn manifest_list_avro_entries_with_content(manifests: &[(&str, usize,
                 ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
                 ("content".to_string(), apache_avro::types::Value::Int(*content)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
-                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*min_sequence_number)),
                 ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
                 ("added_files_count".to_string(), apache_avro::types::Value::Int(1)),
                 ("existing_files_count".to_string(), apache_avro::types::Value::Int(0)),
@@ -283,6 +295,16 @@ pub(crate) fn nullable_long(value: Option<i64>) -> apache_avro::types::Value {
 }
 
 pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i32, i64, Option<i64>)]) -> Vec<u8> {
+    let files = files
+        .iter()
+        .map(|(path, content, status, snapshot_id, sequence_number)| {
+            (*path, *content, *status, *snapshot_id, *sequence_number, *sequence_number)
+        })
+        .collect::<Vec<_>>();
+    manifest_avro_bytes_with_entry_sequences(&files)
+}
+
+pub(crate) fn manifest_avro_bytes_with_entry_sequences(files: &[(&str, i32, i32, i64, Option<i64>, Option<i64>)]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -313,13 +335,13 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
     )
     .expect("manifest avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
-    for (file_path, content, status, snapshot_id, sequence_number) in files {
+    for (file_path, content, status, snapshot_id, sequence_number, file_sequence_number) in files {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(*status)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
                 ("sequence_number".to_string(), nullable_long(*sequence_number)),
-                ("file_sequence_number".to_string(), nullable_long(*sequence_number)),
+                ("file_sequence_number".to_string(), nullable_long(*file_sequence_number)),
                 (
                     "data_file".to_string(),
                     apache_avro::types::Value::Record(vec![

@@ -8129,6 +8129,118 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     assert_eq!(unchanged.generation, current.generation);
 }
 
+#[tokio::test]
+async fn row_level_conflict_rewrite_data_sequence_numbers() {
+    use crate::table_catalog::test_support::{
+        manifest_avro_bytes_with_entry_sequences, manifest_list_avro_entries_with_min_sequences,
+    };
+
+    let invalid_data_sequence = "Iceberg v2 manifest entry sequence number exceeds its manifest sequence";
+    let invalid_file_sequence = "added manifest entry file sequence must match its manifest";
+    // A rewrite preserves the data age while adding a new physical file.
+    for (data_sequence, file_sequence, expected_error) in [
+        (Some(1), None, None),
+        (Some(1), Some(2), None),
+        (None, None, None),
+        (Some(0), Some(2), None),
+        (Some(2), Some(2), None),
+        (Some(1), Some(1), Some(invalid_file_sequence)),
+        (Some(-1), Some(2), Some(invalid_data_sequence)),
+        (Some(3), Some(2), Some(invalid_data_sequence)),
+    ] {
+        let store = TestTableCatalogStore::default();
+        let backend = TestTableCatalogObjectBackend::content_addressed();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &backend, &namespace).await;
+        let location = created.metadata["location"].as_str().expect("table location should exist");
+        let old_file = format!("{location}/data/old.parquet");
+        let old_list = format!("{location}/metadata/snap-10.avro");
+        seed_test_snapshot_manifest(&backend, "warehouse", &old_list, 10, 1, &[(&old_file, 0, 1, 10, 1)]).await;
+        let append = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {"action": "add-snapshot", "snapshot": {
+                    "snapshot-id": 10, "sequence-number": 1, "timestamp-ms": 1234,
+                    "manifest-list": old_list, "summary": {"operation": "append"}
+                }},
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 10, "type": "branch"}
+            ]
+        }))
+        .expect("append request should parse");
+        commit_table_response(&store, &trusted_table_commit_backend(&backend), "warehouse", &namespace, "events", append)
+            .await
+            .expect("initial append should succeed");
+        let before = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+
+        let new_file = format!("{location}/data/rewritten.parquet");
+        let manifest = format!("{location}/metadata/rewrite.avro");
+        let manifest_list = format!("{location}/metadata/snap-11.avro");
+        let manifest_bytes = manifest_avro_bytes_with_entry_sequences(&[
+            (&old_file, 0, 2, 11, Some(1), Some(1)),
+            (&new_file, 0, 1, 11, data_sequence, file_sequence),
+        ]);
+        let list_bytes = manifest_list_avro_entries_with_min_sequences(&[(
+            &manifest,
+            manifest_bytes.len(),
+            0,
+            0,
+            2,
+            data_sequence.unwrap_or(2).clamp(0, 2),
+            11,
+        )]);
+        backend
+            .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), manifest_bytes)
+            .await;
+        backend
+            .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest_list), list_bytes)
+            .await;
+        backend
+            .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &new_file), b"data".to_vec())
+            .await;
+        let rewrite = serde_json::from_value(serde_json::json!({
+            "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 10}],
+            "updates": [
+                {"action": "add-snapshot", "snapshot": {
+                    "snapshot-id": 11, "parent-snapshot-id": 10, "sequence-number": 2,
+                    "timestamp-ms": 2234, "manifest-list": manifest_list,
+                    "summary": {"operation": "replace"}
+                }},
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 11, "type": "branch"}
+            ]
+        }))
+        .expect("rewrite request should parse");
+        let result = commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&backend),
+            "warehouse",
+            &namespace,
+            "events",
+            rewrite,
+        )
+        .await;
+        let after = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+        if expected_error.is_none() {
+            let commit = result.unwrap_or_else(|err| panic!("data={data_sequence:?}, file={file_sequence:?}: {err}"));
+            assert_eq!(commit.metadata["current-snapshot-id"], 11);
+            assert_eq!(commit.metadata["last-sequence-number"], 2);
+            assert_eq!(after.generation, before.generation + 1);
+            let live_files = load_snapshot_live_files(&backend, "warehouse", &after, &commit.metadata, Some(11))
+                .await
+                .expect("committed snapshot should load");
+            assert!(!live_files.data_files.contains_key(&old_file));
+            let added = live_files.data_files.get(&new_file).expect("rewritten file should be live");
+            assert_eq!(added.sequence_number, Some(data_sequence.unwrap_or(2)));
+            assert_eq!(added.file_sequence_number, Some(2));
+        } else {
+            let error = result.expect_err("invalid sequence numbers must be rejected");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(error.message(), expected_error);
+            assert_eq!(after.metadata_location, before.metadata_location);
+            assert_eq!(after.generation, before.generation);
+            assert_eq!(after.version_token, before.version_token);
+        }
+    }
+}
+
 /// Table-driven coverage for stale or historical manifest sequence failures.
 #[tokio::test]
 async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
@@ -8142,7 +8254,7 @@ async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
             "new manifest sequence must match the committed snapshot",
         ),
         (
-            "stale-added-entry-sequence",
+            "stale-added-file-sequence",
             2,
             "11",
             11,
