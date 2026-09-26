@@ -1,0 +1,107 @@
+name: Bug report
+description: Create a report to help us improve
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Storage support requirements
+        **NFS, SMB/Samba/CIFS, and other remote or shared filesystems are not supported as RustFS data directories.**
+        This also applies to the underlying host storage for Docker volumes and Kubernetes PersistentVolumes.
+        Reports that only reproduce on these mounts will be closed without investigation.
+        Reproduce the issue on supported local filesystems before submitting a bug report.
+  - type: checkboxes
+    id: storage-support
+    attributes:
+      label: Supported storage confirmation
+      options:
+        - label: I have reproduced this issue with all RustFS data directories on supported local filesystems, without NFS, SMB/Samba/CIFS, or other remote or shared filesystem mounts, including storage backing Docker volumes and Kubernetes PersistentVolumes.
+          required: true
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the commands, configuration, or actions needed to reproduce the problem.
+      placeholder: |
+        1. Start RustFS with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+  - type: input
+    id: rustfs-version
+    attributes:
+      label: RustFS version
+      description: Provide the release version, container image tag, or commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment-method
+    attributes:
+      label: Deployment method
+      description: How are you running RustFS? Add any relevant details in Additional context.
+      options:
+        - Binary
+        - Docker / Docker Compose
+        - Kubernetes / Helm
+        - Built from source
+        - Other
+  - type: textarea
+    id: storage-mounts
+    attributes:
+      label: Data directory filesystems and mounts
+      description: |
+        Identify the filesystem type and mount source for every RustFS data directory.
+        On Linux, include output from `findmnt -T /path/to/data -o TARGET,SOURCE,FSTYPE,OPTIONS` for each data path; on other systems, provide equivalent mount information.
+        For Docker, identify the backing host path and filesystem, not just the container path or volume name.
+        For Kubernetes, identify the PV, StorageClass/CSI driver, and actual backing filesystem; a PVC name alone is not sufficient.
+        Remove credentials and other sensitive information before submitting.
+      placeholder: |
+        RustFS data paths:
+        Filesystem types and mount sources:
+        Mount command output:
+        Docker host paths or Kubernetes volume backing storage (if applicable):
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Server operating system and architecture
+      description: Include the operating system version and CPU architecture where RustFS is running.
+      placeholder: "For example: Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+  - type: textarea
+    id: client-environment
+    attributes:
+      label: Client environment
+      description: Include the S3 client or SDK and version. For console issues, include the browser, operating system, and desktop or mobile device details.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste relevant log output. Remove credentials and other sensitive information before submitting.
+      render: shell
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If applicable, drag and drop screenshots here to help explain the problem.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other context, such as deployment topology or relevant configuration. Remove credentials and other sensitive information before submitting.
