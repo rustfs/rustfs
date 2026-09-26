@@ -229,6 +229,8 @@ IFS= read -r -d '' expected_helm_guard <<'EOF' || true
 EOF
 expected_helm_guard=${expected_helm_guard%$'\n'}
 require_job_if "$helm_workflow" "build-helm-package" "$expected_helm_guard"
+require_line "$helm_workflow" "          ref: \${{ github.event.workflow_run.head_sha || (startsWith(inputs.version, 'refs/tags/') && inputs.version || format('refs/tags/{0}', inputs.version)) }}" "Helm release source checkout"
+python3 scripts/test_helm_release_workflow.py
 
 assert_equal() {
   local expected="$1"
