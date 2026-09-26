@@ -584,6 +584,32 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
 }
 
 #[test]
+fn test_classify_get_size_failure_skips_scanner_owned_usage_observation() {
+    let temp_dir = std::env::temp_dir();
+    let file_type = std::fs::metadata(&temp_dir)
+        .expect("temp dir metadata should be readable")
+        .file_type();
+    let item = ScannerItem {
+        path: temp_dir.join("internal/buckets/.usage.observed.json/xl.meta").to_string_lossy().to_string(),
+        bucket: crate::RUSTFS_META_BUCKET.to_string(),
+        prefix: crate::data_usage_define::DATA_USAGE_OBSERVED_OBJ_NAME_PATH.to_string(),
+        object_name: "xl.meta".to_string(),
+        file_type,
+        lifecycle: None,
+        object_lock: None,
+        replication: None,
+        heal_enabled: false,
+        heal_bitrot: false,
+        debug: false,
+    };
+    let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
+
+    let action = classify_get_size_failure(&item, &err);
+
+    assert_eq!(action, GetSizeFailureAction::Skip);
+}
+
+#[test]
 fn test_classify_get_size_failure_records_transient_metadata_error_without_heal() {
     let temp_dir = std::env::temp_dir();
     let file_type = std::fs::metadata(&temp_dir)

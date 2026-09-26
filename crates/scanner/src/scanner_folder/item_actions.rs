@@ -1296,9 +1296,14 @@ pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) 
         return GetSizeFailureAction::Skip;
     }
 
+    let metadata_object = item.metadata_object_path();
+    if is_scanner_owned_usage_observation(&item.bucket, &metadata_object) {
+        return GetSizeFailureAction::Skip;
+    }
+
     if is_scanner_metadata_corrupt_error(err) {
         return GetSizeFailureAction::HealMetadata {
-            object: item.metadata_object_path(),
+            object: metadata_object,
         };
     }
 
