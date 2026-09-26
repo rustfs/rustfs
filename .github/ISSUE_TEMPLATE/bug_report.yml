@@ -5,16 +5,19 @@ body:
     attributes:
       value: |
         ### Storage support requirements
-        **NFS, SMB/Samba/CIFS, and other remote or shared filesystems are not supported as RustFS data directories.**
-        This also applies to the underlying host storage for Docker volumes and Kubernetes PersistentVolumes.
-        Reports that only reproduce on these mounts will be closed without investigation.
-        Reproduce the issue on supported local filesystems before submitting a bug report.
+        **Supported:** local disks, SAN (Fibre Channel) attached volumes, or JBOD-mounted disks. We recommend formatting them with the **XFS** file system.
+
+        **Not supported:** NFS, SMB/Samba/CIFS, and other remote or shared filesystems as RustFS data directories. This also applies to the underlying host storage for Docker volumes and Kubernetes PersistentVolumes.
+
+        Reports that only reproduce on unsupported storage will be closed without investigation. Please reproduce the issue on supported storage before submitting a bug report.
+
+        See [Disk Planning and File System Selection](https://docs.rustfs.com/en/installation/linux/prerequisites-and-service) for details.
   - type: checkboxes
     id: storage-support
     attributes:
       label: Supported storage confirmation
       options:
-        - label: I have reproduced this issue with all RustFS data directories on supported local filesystems, without NFS, SMB/Samba/CIFS, or other remote or shared filesystem mounts, including storage backing Docker volumes and Kubernetes PersistentVolumes.
+        - label: I have reproduced this issue with all RustFS data directories on supported storage (local disks, SAN/Fibre Channel, or JBOD; XFS recommended), without NFS, SMB/Samba/CIFS, or other remote or shared filesystem mounts, including storage backing Docker volumes and Kubernetes PersistentVolumes.
           required: true
   - type: textarea
     id: bug-description

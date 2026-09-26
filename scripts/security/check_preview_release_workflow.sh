@@ -161,7 +161,7 @@ require_line "$release_script" "  gh api --method POST \"repos/\${GITHUB_REPOSIT
 require_line "$release_script" "    local create_args=(release create \"\$tag\" --title \"\$title\" --notes-file \"\$notes_file\" --latest=false --draft)" "draft release creation with a notes file"
 
 release_channel_block=$(awk '
-  $0 == "          if [[ \"\$BUILD_TYPE\" == \"release\" ]]; then" { in_block = 1 }
+  $0 == "          if [[ \"$BUILD_TYPE\" == \"release\" ]]; then" { in_block = 1 }
   in_block { print }
   in_block && $0 == "          fi" { exit }
 ' "$build_workflow")
