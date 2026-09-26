@@ -9,6 +9,7 @@
     "inventory.environment@1"
   ],
   "producerCapabilities": [
+    "health.check.service@1",
     "performance.client@1",
     "performance.drive@1",
     "performance.network@1",
@@ -33,6 +34,7 @@
     "heartbeat",
     "diagnostics.policy.v1",
     "inventory.environment@1",
+    "health.check.service@1",
     "performance.client@1",
     "performance.drive@1",
     "performance.network@1",
