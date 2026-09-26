@@ -256,7 +256,7 @@ jobs:
   # belonged to it.
   warm-ci-uring:
     name: Warm ci-uring
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     steps:
       - name: Checkout repository

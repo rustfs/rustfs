@@ -230,7 +230,7 @@ jobs:
     # manual workflow_dispatch runs stay quiet so a debugging run never files a
     # spurious alert.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

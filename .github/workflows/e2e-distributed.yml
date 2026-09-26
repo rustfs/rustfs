@@ -200,7 +200,7 @@ jobs:
     name: Alert on scheduled failure
     needs: [distributed]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

@@ -49,7 +49,7 @@ permissions:
 jobs:
   profile-cpu:
     name: Verify native Linux x86_64 profile.cpu service job
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout acceptance harness

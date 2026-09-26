@@ -51,7 +51,7 @@ concurrency:
 jobs:
   oidc-keycloak-live:
     name: OIDC Keycloak live gate
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -95,7 +95,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (needs.oidc-keycloak-live.result == 'failure' || needs.oidc-keycloak-live.result == 'cancelled')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
