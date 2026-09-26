@@ -364,11 +364,14 @@ const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
 
-/// Maximum automatic foreground write requests admitted concurrently per process.
+/// Explicit maximum foreground write requests admitted concurrently per process.
 ///
-/// `0` derives a conservative default from the local disk-read scheduler cap,
-/// currently clamped to protect the commit path without making ordinary high
-/// throughput uploads single-file.
+/// `0` derives up to 32 large-write slots from the local disk-read scheduler.
+/// Each automatic slot has eight units: a gated direct PUT or unknown-size
+/// part uses all eight, while a known-size part uses one unit per 8 MiB,
+/// rounded up and capped at eight. Thus stock settings share one budget across
+/// at most 32 large/unknown writes or 256 parts of up to 8 MiB. A positive
+/// override retains request-count semantics for every gated write.
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: usize = 0;
 
