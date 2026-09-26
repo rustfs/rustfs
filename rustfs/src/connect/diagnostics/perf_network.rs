@@ -20,7 +20,7 @@ use std::io::{Cursor, Write as _};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
@@ -29,6 +29,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::{Uuid, Variant, Version};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -416,7 +417,14 @@ pub async fn measure_network(
     if aliases != request.peer_aliases {
         return Err(NetworkPerformanceError::InvalidRequest);
     }
-    measure_network_with_harness(request, &harness, cancel).await
+    let started = Instant::now();
+    let harness = RuntimeNetworkPeerHarness {
+        client: harness
+            .client
+            .with_diagnostic_pacing(started, request.duration)
+            .map_err(|_| NetworkPerformanceError::LimitExceeded)?,
+    };
+    measure_network_with_harness_at(request, &harness, cancel, started).await
 }
 
 pub(crate) fn runtime_network_peer_aliases() -> Option<Vec<String>> {
@@ -434,13 +442,23 @@ pub async fn measure_network_with_harness(
     harness: &dyn NetworkPeerHarness,
     cancel: &CancellationToken,
 ) -> Result<NetworkMeasurement, NetworkPerformanceError> {
+    measure_network_with_harness_at(request, harness, cancel, Instant::now()).await
+}
+
+async fn measure_network_with_harness_at(
+    request: &NetworkPerformanceRequest,
+    harness: &dyn NetworkPeerHarness,
+    cancel: &CancellationToken,
+    started: Instant,
+) -> Result<NetworkMeasurement, NetworkPerformanceError> {
     request.validate(unix_now()?)?;
     if cancel.is_cancelled() {
         return Ok(terminal_measurement(request, NetworkOutcome::Cancelled, NetworkReasonCode::Cancelled));
     }
     let _lease = CollectorLease::acquire()?;
-    let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + request.duration;
+    let deadline = started
+        .checked_add(request.duration)
+        .ok_or(NetworkPerformanceError::LimitExceeded)?;
     let mut peers = Vec::with_capacity(request.peer_aliases.len());
     let mut transferred_bytes = 0_u64;
     let mut completed_units = 0_u32;
@@ -448,6 +466,7 @@ pub async fn measure_network_with_harness(
     for alias in &request.peer_aliases {
         let peer_started = Instant::now();
         let outcome = tokio::select! {
+            biased;
             () = cancel.cancelled() => {
                 return Ok(cancelled_measurement(request, started.elapsed(), completed_units, peers));
             }
