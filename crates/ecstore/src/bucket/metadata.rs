@@ -597,32 +597,20 @@ impl BucketMetadata {
         metadata
     }
 
-    /// Persist the creation-commit proof for this bucket generation.
+    /// Whether this generation still needs its creation-commit proof.
     ///
-    /// Callers must already have proven that the physical bucket exists at write
-    /// quorum. Object Lock metadata is written before physical creation as an
-    /// intent, so this flag is what allows later cold reads to use read quorum
-    /// without exposing an uncommitted creation. It is stored in the metadata
-    /// object itself so the commit proof shares the metadata object's erasure
-    /// quorum rather than requiring a separate object's shards.
-    pub(crate) async fn commit_bucket_creation(&mut self, store: Arc<ECStore>) -> Result<()> {
-        if !self.lock_enabled {
-            self.bucket_creation_committed = true;
-            return Ok(());
-        }
-        if self.bucket_creation_committed {
-            return Ok(());
-        }
-        if self.bucket_incarnation_id.is_nil() || !self.bucket_incarnation_sidecar {
-            // Legacy metadata without a generation sidecar has no stable value to
-            // bind a commit marker to. Keep this generation on the write-quorum
-            // path; the existing legacy migration owns sidecar creation.
-            return Ok(());
-        }
-
-        self.bucket_creation_committed = true;
-        self.save_with_store_committed(store).await?;
-        Ok(())
+    /// The proof is only ever written while the caller holds the bucket
+    /// metadata transaction fence; see
+    /// `BucketMetadataSys::migrate_bucket_creation_commit`.
+    ///
+    /// Metadata without an authoritative incarnation sidecar is owned by the
+    /// legacy migration path, which mints the sidecar first; it must not be
+    /// rewritten by this migration.
+    pub(crate) fn needs_bucket_creation_commit(&self) -> bool {
+        self.lock_enabled
+            && !self.bucket_creation_committed
+            && self.bucket_incarnation_sidecar
+            && !self.bucket_incarnation_id.is_nil()
     }
 
     pub fn save_file_path(&self) -> String {
@@ -1016,6 +1004,11 @@ impl BucketMetadata {
                 self.object_lock_config = None;
                 if !data.is_empty() {
                     self.lock_enabled = true;
+                    // Enabling Object Lock is only reachable for a bucket that
+                    // already exists: the caller validated physical presence and
+                    // holds the incarnation fence, so this generation is committed
+                    // and must never be mistaken for a pre-physical creation intent.
+                    self.bucket_creation_committed = true;
                 }
                 self.object_lock_config_xml = data;
                 self.object_lock_config_updated_at = updated;
