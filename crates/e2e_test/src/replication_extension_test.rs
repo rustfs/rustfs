@@ -3875,11 +3875,10 @@ async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket
         .body(ByteStream::from_static(body))
         .send()
         .await?;
-    assert!(
-        put.version_id()
-            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
-        "a directory marker is the null version even in a versioned bucket: {:?}",
-        put.version_id()
+    assert_eq!(
+        put.version_id(),
+        Some("null"),
+        "a directory marker must expose its null version without leaking the internal nil UUID"
     );
 
     wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
@@ -6130,6 +6129,327 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
         .await?;
 
     wait_for_replicated_object_over_https(&https_client, &target_env, bucket, key, body).await?;
+
+    Ok(())
+}
+
+/// rustfs/backlog#2479: a site resync must count a replicated delete marker
+/// as converged. The peer answers `HEAD ?versionId=<marker>` with a bodiless
+/// 405, which the SDK surfaces without an error code; the resync worker used
+/// to record that as `target service error` and fail the whole bucket.
+#[tokio::test]
+async fn test_site_replication_resync_replicates_delete_marker() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let bucket = "site-repl-resync-marker";
+    let live_key = "live.bin";
+    let gone_key = "gone.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    wait_for_remote_target_arn(&source_env, bucket).await?;
+
+    // One live object and one key whose latest version is a delete marker,
+    // both converged to the peer through live replication first so the
+    // resync re-drives objects the peer already holds.
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(live_key)
+        .body(ByteStream::from(vec![b'l'; 4096]))
+        .send()
+        .await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(gone_key)
+        .body(ByteStream::from(vec![b'g'; 128]))
+        .send()
+        .await?;
+    let delete = source_client.delete_object().bucket(bucket).key(gone_key).send().await?;
+    assert_eq!(delete.delete_marker(), Some(true), "a versioned delete must create a delete marker");
+    wait_for_object_on_target(&target_client, bucket, live_key).await?;
+    wait_for_target_delete_marker(&target_client, bucket, gone_key).await?;
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "the delete marker must verify as replicated, not fail the bucket: {finished:?}"
+    );
+    assert!(
+        entry.replicated_objects >= 2,
+        "the live object and the delete marker both count as replicated: {entry:?}"
+    );
+    assert!(entry.err_detail.is_empty(), "unexpected bucket error: {entry:?}");
+
+    Ok(())
+}
+
+/// rustfs/backlog#2489: an operator's bucket-level replication to a site that
+/// later becomes a peer keeps working through the site's add, resync and
+/// removal. Site replication wires its own same-name target next to the
+/// operator's and never takes the operator's target over; a bucket-level
+/// `replication-reset` run before the join must not make the site resync
+/// report the bucket as owned by another resync.
+#[tokio::test]
+async fn test_site_replication_keeps_operator_bucket_target_to_peer() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "site-repl-operator-src";
+    let operator_target_bucket = "site-repl-operator-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    target_client.create_bucket().bucket(operator_target_bucket).send().await?;
+    enable_bucket_versioning(&target_env, operator_target_bucket).await?;
+
+    let operator_arn = set_replication_target(&source_env, source_bucket, &target_env, operator_target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &operator_arn).await?;
+    let put_and_wait = |key: &'static str, fill: u8, on: Vec<&'static str>| {
+        let source_client = source_client.clone();
+        let target_client = target_client.clone();
+        async move {
+            source_client
+                .put_object()
+                .bucket(source_bucket)
+                .key(key)
+                .body(ByteStream::from(vec![fill; 4096]))
+                .send()
+                .await?;
+            for bucket in on {
+                let body = wait_for_object_on_target(&target_client, bucket, key).await?;
+                if body != vec![fill; 4096] {
+                    return Err(format!("{key} arrived on {bucket} with the wrong body").into());
+                }
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        }
+    };
+    put_and_wait("before-add.bin", b'a', vec![operator_target_bucket]).await?;
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, operator_arn, "the reset must target the operator ARN");
+    wait_for_replication_reset_target(&source_env, source_bucket, &operator_arn, |target| {
+        target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+    let remote_peer = source_info
+        .sites
+        .into_iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .ok_or("target peer missing from source site replication info")?;
+    wait_for_bucket_on_target(&target_client, source_bucket).await?;
+
+    // Both targets: the operator's (untouched) and the site's same-name one.
+    let list_targets = || async {
+        let response = list_replication_targets_request(&source_env, Some(source_bucket)).await?;
+        let targets: Vec<serde_json::Value> = if response.status() == StatusCode::OK {
+            response.json().await?
+        } else {
+            Vec::new()
+        };
+        Ok::<Vec<(String, String)>, Box<dyn Error + Send + Sync>>(
+            targets
+                .iter()
+                .map(|target| {
+                    (
+                        target["arn"].as_str().unwrap_or_default().to_string(),
+                        target["targetbucket"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let site_arn = loop {
+        let targets = list_targets().await?;
+        let operator_kept = targets
+            .iter()
+            .any(|(arn, target_bucket)| arn == &operator_arn && target_bucket == operator_target_bucket);
+        let site = targets
+            .iter()
+            .find(|(arn, target_bucket)| arn.contains(&remote_peer.deployment_id) && target_bucket == source_bucket)
+            .map(|(arn, _)| arn.clone());
+        assert!(operator_kept, "site replication must not take the operator target over: {targets:?}");
+        if let Some(arn) = site {
+            break arn;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication never added its own target next to the operator's: {targets:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
+    assert_ne!(site_arn, operator_arn);
+
+    // The operator's path and the site's path both deliver.
+    put_and_wait("after-add.bin", b'b', vec![operator_target_bucket, source_bucket]).await?;
+
+    let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
+    let entry = started
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("start response lost the bucket: {started:?}"))?;
+    assert_ne!(
+        entry.status, "conflict",
+        "a finished bucket-level resync must not block the site resync: {entry:?}"
+    );
+    assert_eq!(
+        entry.target_arn, site_arn,
+        "the site resync must drive the site target, not the operator's"
+    );
+    assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let finished = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" | "failed" => break status,
+            _ if tokio::time::Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
+            _ => return Err(format!("site resync did not reach a terminal state in time: {status:?}").into()),
+        }
+    };
+    let entry = finished
+        .buckets
+        .iter()
+        .find(|entry| entry.bucket == source_bucket)
+        .ok_or_else(|| format!("resync status lost the bucket: {finished:?}"))?;
+    assert_eq!(
+        (finished.state.as_str(), entry.status.as_str(), entry.failed_objects),
+        ("completed", "completed", 0),
+        "{finished:?}"
+    );
+
+    // Leaving site replication removes only the site's own target and rule.
+    let removed = site_replication_remove(
+        &source_env,
+        &SRRemoveReq {
+            remove_all: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(removed.err_detail.is_empty(), "unexpected remove result: {removed:?}");
+    let targets = list_targets().await?;
+    assert!(
+        targets
+            .iter()
+            .any(|(arn, target_bucket)| arn == &operator_arn && target_bucket == operator_target_bucket),
+        "peer removal must keep the operator target: {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|(arn, _)| arn == &site_arn),
+        "peer removal must drop the site target: {targets:?}"
+    );
+    let rules = source_client
+        .get_bucket_replication()
+        .bucket(source_bucket)
+        .send()
+        .await?
+        .replication_configuration
+        .map(|config| config.rules)
+        .unwrap_or_default();
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule.destination.as_ref().map(|d| d.bucket.as_str()) == Some(operator_arn.as_str())),
+        "peer removal must keep the operator rule: {rules:?}"
+    );
+    put_and_wait("after-remove.bin", b'c', vec![operator_target_bucket]).await?;
 
     Ok(())
 }
@@ -10185,13 +10505,14 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     let target_bucket = "proxy-tag-dst";
     let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
 
-    target_client
+    let tagged = target_client
         .put_object()
         .bucket(target_bucket)
         .key("proxy-tagged")
         .body(ByteStream::from_static(b"tagged payload"))
         .send()
         .await?;
+    let tagged_version = tagged.version_id().ok_or("versioned target PUT omitted its identity")?;
     target_client
         .put_object_tagging()
         .bucket(target_bucket)
@@ -10215,6 +10536,11 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
     assert_eq!(tags.tag_set[0].key.as_str(), "team");
     assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+    assert_eq!(
+        tags.version_id(),
+        Some(tagged_version),
+        "proxy must preserve the resolved remote identity"
+    );
 
     let record = target
         .requests()
@@ -10227,6 +10553,33 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
         "proxied tagging read must carry the anti-loop marker"
     );
     assert!(record.proxy_headers.replication_check.is_none());
+
+    let empty = target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"new version without tags"))
+        .send()
+        .await?;
+    let empty_version = empty.version_id().ok_or("empty-tag version omitted its identity")?;
+    for selector in [None, Some(empty_version), Some(tagged_version)] {
+        let tags = source_client
+            .get_object_tagging()
+            .bucket(source_bucket)
+            .key("proxy-tagged")
+            .set_version_id(selector.map(str::to_owned))
+            .send()
+            .await?;
+        let expected_version = selector.unwrap_or(empty_version);
+        assert_eq!(tags.version_id(), Some(expected_version));
+        if expected_version == tagged_version {
+            assert_eq!(tags.tag_set().len(), 1);
+            assert_eq!(tags.tag_set()[0].key(), "team");
+            assert_eq!(tags.tag_set()[0].value(), "storage");
+        } else {
+            assert!(tags.tag_set().is_empty());
+        }
+    }
 
     drop(source_env);
     target.shutdown().await;

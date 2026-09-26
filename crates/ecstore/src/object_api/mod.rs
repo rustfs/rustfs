@@ -34,13 +34,12 @@ use crate::store::utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
+use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, RestoreStatusOps as _, parse_restore_obj_status};
 use rustfs_rio::Checksum;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS, SUFFIX_PLAINTEXT_CHECKSUM, get_consistent_str,
-};
+use rustfs_utils::http::{SUFFIX_PLAINTEXT_CHECKSUM, get_consistent_str};
 use rustfs_utils::path::decode_dir_object;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -105,6 +104,9 @@ mod hook_slot;
 mod object_mutation_hook;
 mod readers;
 mod types;
+
+#[cfg(test)]
+mod persisted_metadata_keys_tests;
 
 #[cfg(test)]
 pub(crate) use body_cache_hook::clear_get_object_body_cache_hook;

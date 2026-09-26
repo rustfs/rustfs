@@ -8,12 +8,13 @@ use super::meta::{
     validate_init_rebalance_state,
 };
 use super::worker::{
-    rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result, resolve_rebalance_meta_load_result,
-    resolve_rebalance_meta_save_result,
+    rebalance_max_attempts, rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result,
+    resolve_rebalance_deferred_last_error, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+    retry_rebalance_metadata_access,
 };
 use super::{
     DiskStat, EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
-    RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
+    RebalStatus, RebalanceDeferKind, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
     encode_rebalance_stop_propagation_record,
 };
 use crate::core::pools::{
@@ -513,10 +514,13 @@ impl ECStore {
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
         let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-        let guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|err| rebalance_meta_lock_error(err, "write"))?;
+        let guard = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || async {
+            ns_lock
+                .get_write_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|err| rebalance_meta_lock_error(err, "write"))
+        })
+        .await?;
         let mut opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
@@ -626,7 +630,7 @@ impl ECStore {
     pub async fn prepare_rebalance_stop(&self) -> Result<Option<String>> {
         let _start_guard = self.start_gate.lock().await;
 
-        {
+        let (local_stop_id, activation_gate) = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             if let Some(meta) = rebalance_meta.as_mut()
                 && is_rebalance_conflicting_with_decommission(meta)
@@ -637,7 +641,22 @@ impl ECStore {
                     .cancel();
                 #[cfg(any(test, feature = "test-util"))]
                 observe_rebalance_stop_wait_attempt(Some(meta.id.as_str()));
+                (Some(meta.id.clone()), Some(Arc::clone(&meta.activation_gate)))
+            } else {
+                (None, None)
             }
+        };
+
+        // An in-flight entry already owns the activation read gate. Admission
+        // has been cancelled above, so do not wait on that same gate merely to
+        // refresh a stop target: the eventual stop operation will take the
+        // write gate after the entry drains. If the gate is currently free,
+        // retain the historical reload behaviour (which observes a worker that
+        // reached a terminal state just before this request).
+        if let Some(gate) = activation_gate
+            && gate.try_write_owned().is_err()
+        {
+            return Ok(local_stop_id);
         }
 
         self.load_rebalance_meta_under_start_gate().await?;
@@ -1100,6 +1119,7 @@ impl ECStore {
         bucket: String,
         last_error: String,
         expected_id: &str,
+        kind: RebalanceDeferKind,
     ) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "defer rebalance bucket")?;
@@ -1113,7 +1133,8 @@ impl ECStore {
         };
 
         defer_bucket_in_rebalance_queue(pool_stat, &bucket)?;
-        pool_stat.info.last_error = Some(last_error);
+        let pending_entry_defer = pool_stat.info.last_error.clone();
+        pool_stat.info.last_error = resolve_rebalance_deferred_last_error(kind, pending_entry_defer.as_deref(), &last_error);
         meta.last_refreshed_at = Some(OffsetDateTime::now_utc());
         Ok(())
     }
@@ -1347,6 +1368,105 @@ mod tests {
     };
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
+
+    #[tokio::test]
+    async fn rebalance_status_read_recovers_after_metadata_lock_timeout() {
+        let id = "rebalance-status-lock-retry";
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        })
+        .await;
+        let ns_lock = store.pools[0]
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME)
+            .await
+            .expect("metadata lock should be available");
+        let writer = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("hold metadata writer");
+        let retried = Arc::new(tokio::sync::Notify::new());
+        let refresh = super::super::worker::REBALANCE_METADATA_RETRY_PROBE
+            .scope(Arc::clone(&retried), store.refresh_rebalance_status_meta());
+        tokio::pin!(refresh);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                _ = retried.notified() => {},
+                result = &mut refresh => panic!("status read must retry its contended metadata lock: {result:?}"),
+            }
+        })
+        .await
+        .expect("status read should encounter a real lock timeout");
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(30), refresh)
+            .await
+            .expect("status refresh should finish after the writer releases")
+            .expect("transient metadata contention must not fail status refresh");
+        assert_eq!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("metadata must remain present")
+                .id,
+            id
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalance_stats_save_recovers_after_metadata_lock_timeout() {
+        let id = "rebalance-stats-lock-retry";
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        })
+        .await;
+        store
+            .rebalance_meta
+            .write()
+            .await
+            .as_mut()
+            .expect("local metadata must exist")
+            .pool_stats[0]
+            .num_objects = 7;
+        let ns_lock = store.pools[0]
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME)
+            .await
+            .expect("metadata lock should be available");
+        let reader = ns_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .expect("hold a migration read fence");
+        let retried = Arc::new(tokio::sync::Notify::new());
+        let save = super::super::worker::REBALANCE_METADATA_RETRY_PROBE.scope(
+            Arc::clone(&retried),
+            store.save_rebalance_stats_for_id(0, super::super::RebalSaveOpt::Stats, id),
+        );
+        tokio::pin!(save);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                _ = retried.notified() => {},
+                result = &mut save => panic!("stats save must retry its contended metadata lock: {result:?}"),
+            }
+        })
+        .await
+        .expect("stats save should encounter a real lock timeout");
+        drop(reader);
+        tokio::time::timeout(std::time::Duration::from_secs(30), save)
+            .await
+            .expect("stats save should finish after the migration read fence releases")
+            .expect("transient metadata contention must not lose stats");
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(Arc::clone(&store.pools[0]))
+            .await
+            .expect("persisted stats must be readable");
+        assert_eq!(persisted.id, id);
+        assert_eq!(persisted.pool_stats[0].num_objects, 7);
+    }
 
     async fn persist_initialized_identity_then_remove_pool_meta(store: &Arc<ECStore>) {
         let deployment_id = store

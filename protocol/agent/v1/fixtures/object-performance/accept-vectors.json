@@ -1,0 +1,222 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "object-performance",
+  "toolId": "performance.object",
+  "schemaVersion": 1,
+  "capability": "performance.object@1",
+  "classification": "L1",
+  "description": "Frozen performance.object@1 result vectors. Payload bytes are synthetic and remain on the customer deployment; bucket, object, endpoint, credential, and free-text fields are forbidden.",
+  "fixture": "accept-vectors",
+  "vectors": [
+    {
+      "id": "performance.object.succeeded",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "SUCCEEDED",
+        "reasonCode": "COMPLETE",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 1,
+          "completedUnits": 1,
+          "unit": "WINDOW"
+        },
+        "data": {
+          "operation": "GET_OBJECT",
+          "transferredBytes": 1048576,
+          "completedOperations": 1,
+          "durationMillis": 1000,
+          "errorCount": 0
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "performance.object.put-succeeded",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "SUCCEEDED",
+        "reasonCode": "COMPLETE",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 1,
+          "completedUnits": 1,
+          "unit": "WINDOW"
+        },
+        "data": {
+          "operation": "PUT_OBJECT",
+          "transferredBytes": 1048576,
+          "completedOperations": 1,
+          "durationMillis": 1000,
+          "errorCount": 0
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "performance.object.partial",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "PARTIAL",
+        "reasonCode": "LIMIT_EXCEEDED",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 2,
+          "completedUnits": 1,
+          "unit": "WINDOW"
+        },
+        "data": {
+          "operation": "GET_OBJECT",
+          "transferredBytes": 1048576,
+          "completedOperations": 1,
+          "durationMillis": 1000,
+          "errorCount": 0
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "performance.object.failed",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "FAILED",
+        "reasonCode": "COLLECTION_FAILED",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 1,
+          "completedUnits": 0,
+          "unit": "WINDOW"
+        },
+        "data": null
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "performance.object.unsupported",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "UNSUPPORTED",
+        "reasonCode": "UNSUPPORTED_TOOL",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 1,
+          "completedUnits": 0,
+          "unit": "WINDOW"
+        },
+        "data": null
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "performance.object.cancelled",
+      "schemaValid": true,
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "019e3ae0-0000-7000-8000-000000000001",
+        "toolId": "performance.object",
+        "capability": "performance.object@1",
+        "outcome": "CANCELLED",
+        "reasonCode": "CANCELLED",
+        "durationMillis": 1000,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0-rc.6",
+          "osFamily": "LINUX",
+          "architecture": "aarch64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 1,
+          "completedUnits": 0,
+          "unit": "WINDOW"
+        },
+        "data": null
+      },
+      "expected": {
+        "accepted": true,
+        "reason": null
+      }
+    }
+  ]
+}

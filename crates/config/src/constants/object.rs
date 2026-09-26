@@ -116,6 +116,30 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Create independent shard commitments for new writes after the fleet is upgraded.
+/// Existing protected objects and multipart uploads retain their protection.
+pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
+pub const DEFAULT_SHARD_INTEGRITY_WRITE: bool = false;
+
+/// Operator confirmation that every reader, writer and background coordinator
+/// understands independent shard commitments. This is not capability discovery
+/// or a fence against an old binary rejoining the fleet.
+pub const ENV_SHARD_INTEGRITY_FLEET_CONFIRMED: &str = "RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED";
+pub const DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_WRITE);
+const _: () = assert!(!DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED);
+
+/// How object writes treat a bucket whose stored versioning configuration
+/// cannot be parsed: `permissive` writes as if unversioned (the historical
+/// behavior, recorded by metrics and an error log) and `strict` refuses the
+/// write with 503. Paths that already refuse an unreadable configuration do
+/// so in both modes. Any other value fails startup.
+pub const ENV_BUCKET_CONFIG_PARSE_MODE: &str = "RUSTFS_BUCKET_CONFIG_PARSE_MODE";
+
+/// Default bucket config parse mode.
+pub const DEFAULT_BUCKET_CONFIG_PARSE_MODE: &str = "permissive";
+
 /// Request writing the complete remote-tier version state into object metadata.
 ///
 /// This remains ineffective until
@@ -638,6 +662,15 @@ pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DET
 
 /// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
 pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
+
+/// Environment variable for the maximum number of in-flight lock acquisition
+/// RPCs admitted to one peer. Requests beyond this bound fail fast as
+/// retryable contention so a slow endpoint cannot accumulate an unbounded
+/// queue while its channel remains healthy.
+pub const ENV_OBJECT_LOCK_RPC_REQUEST_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_REQUEST_LIMIT";
+
+/// Default per-peer in-flight lock acquisition RPC admission limit.
+pub const DEFAULT_OBJECT_LOCK_RPC_REQUEST_LIMIT: usize = 128;
 
 /// Environment variable to enable object namespace lock diagnostics.
 ///

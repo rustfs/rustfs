@@ -24,14 +24,15 @@ use crate::data_usage_define::DataUsageCacheRevision;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::owner::ObjectIO as _;
 use crate::storage_api::owner::{
-    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
-    register_scanner_pause_backlog_retirement_planner,
+    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+    ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
 };
 use crate::{BUCKET_META_PREFIX, ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerObjectOptions, SetDisks};
 use futures::future::join_all;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -426,6 +427,23 @@ impl ScannerPauseBacklogLedger {
         self.exhaust_retry_budget(now);
 
         ScannerPauseBacklogAttemptDecision::Tracked(serial)
+    }
+
+    fn blocks_usage_bootstrap_rebuild(&self) -> bool {
+        match self.phase {
+            ScannerPauseBacklogPhase::Idle => false,
+            ScannerPauseBacklogPhase::Paused => true,
+            ScannerPauseBacklogPhase::CatchingUp | ScannerPauseBacklogPhase::RetryExhausted => {
+                self.pending_full_scan || self.pending_work_items() != 0 || self.has_unfinished_attempt()
+            }
+        }
+    }
+
+    fn begin_usage_bootstrap_rebuild_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        if !self.blocks_usage_bootstrap_rebuild() {
+            return ScannerPauseBacklogAttemptDecision::Untracked;
+        }
+        self.begin_attempt(now)
     }
 
     fn finish_attempt(
@@ -979,10 +997,77 @@ fn scanner_pause_backlog_replica_ids(replicas: &[ScannerPauseBacklogReplica]) ->
     ids
 }
 
+#[derive(Clone, Debug)]
+enum ScannerPauseBacklogCommitSelectionError {
+    ConflictingMaximumMembershipCommitProofs,
+}
+
+impl fmt::Display for ScannerPauseBacklogCommitSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("scanner pause backlog has conflicting maximum-membership commit proofs")
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ScannerPauseBacklogSelectionError {
+    RetryableHandoffConflict,
+    AuthorityConflict(String),
+    InvalidRecord(String),
+}
+
+impl fmt::Display for ScannerPauseBacklogSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RetryableHandoffConflict => {
+                f.write_str("scanner pause backlog has conflicting maximum-membership commit proofs")
+            }
+            Self::AuthorityConflict(reason) | Self::InvalidRecord(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<ScannerPauseBacklogCommitSelectionError> for ScannerPauseBacklogSelectionError {
+    fn from(_err: ScannerPauseBacklogCommitSelectionError) -> Self {
+        Self::RetryableHandoffConflict
+    }
+}
+
+fn scanner_pause_backlog_retirement_selection_error(
+    err: ScannerPauseBacklogSelectionError,
+) -> ScannerPauseBacklogRetirementError {
+    match err {
+        ScannerPauseBacklogSelectionError::RetryableHandoffConflict => {
+            ScannerPauseBacklogRetirementError::HandoffConflict { reason: err.to_string() }
+        }
+        ScannerPauseBacklogSelectionError::AuthorityConflict(reason) => {
+            ScannerPauseBacklogRetirementError::AuthorityConflict { reason }
+        }
+        ScannerPauseBacklogSelectionError::InvalidRecord(reason) => ScannerPauseBacklogRetirementError::InvalidRecord { reason },
+    }
+}
+
+fn scanner_pause_backlog_retirement_commit_error(
+    err: ScannerPauseBacklogCommitSelectionError,
+) -> ScannerPauseBacklogRetirementError {
+    scanner_pause_backlog_retirement_handoff_conflict(err.to_string())
+}
+
+fn scanner_pause_backlog_retirement_handoff_conflict(reason: impl Into<String>) -> ScannerPauseBacklogRetirementError {
+    ScannerPauseBacklogRetirementError::HandoffConflict { reason: reason.into() }
+}
+
+fn scanner_pause_backlog_retirement_authority_conflict(reason: impl Into<String>) -> ScannerPauseBacklogRetirementError {
+    ScannerPauseBacklogRetirementError::AuthorityConflict { reason: reason.into() }
+}
+
+fn scanner_pause_backlog_retirement_invalid_record(reason: impl Into<String>) -> ScannerPauseBacklogRetirementError {
+    ScannerPauseBacklogRetirementError::InvalidRecord { reason: reason.into() }
+}
+
 fn select_scanner_pause_backlog_commit(
     replicas: &[ScannerPauseBacklogReplica],
     replica_ids: &[ScannerPauseBacklogReplicaId],
-) -> Result<Option<ScannerPauseBacklogCommitRecord>, String> {
+) -> Result<Option<ScannerPauseBacklogCommitRecord>, ScannerPauseBacklogCommitSelectionError> {
     let current_ids = replica_ids.iter().copied().collect::<BTreeSet<_>>();
     let replicas_by_id = replicas
         .iter()
@@ -1014,15 +1099,19 @@ fn select_scanner_pause_backlog_commit(
     let Some(max_membership_len) = valid.iter().map(|committed| committed.replicas.len()).max() else {
         return Ok(None);
     };
-    let mut largest = valid
+    let largest = valid
         .into_iter()
         .filter(|committed| committed.replicas.len() == max_membership_len);
-    let Some(mut selected) = largest.next() else {
+    let largest = largest.collect::<Vec<_>>();
+    let Some(mut selected) = largest.first().cloned() else {
         return Ok(None);
     };
-    for committed in largest {
+    if largest.iter().any(|committed| committed.ledger != selected.ledger) {
+        return Err(ScannerPauseBacklogCommitSelectionError::ConflictingMaximumMembershipCommitProofs);
+    }
+    for committed in largest.into_iter().skip(1) {
         if committed.ledger != selected.ledger {
-            return Err("scanner pause backlog has conflicting maximum-membership commit proofs".to_string());
+            unreachable!("conflicting maximum-membership commit proofs were checked above");
         }
         if committed.replicas < selected.replicas {
             selected = committed;
@@ -1031,21 +1120,26 @@ fn select_scanner_pause_backlog_commit(
     Ok(Some(selected))
 }
 
-fn select_scanner_pause_backlog_replicas(replicas: Vec<ScannerPauseBacklogReplica>) -> Result<LoadedScannerPauseBacklog, String> {
+fn select_scanner_pause_backlog_replicas(
+    replicas: Vec<ScannerPauseBacklogReplica>,
+) -> Result<LoadedScannerPauseBacklog, ScannerPauseBacklogSelectionError> {
     if replicas.is_empty() {
-        return Err("scanner pause backlog has no storage replicas".to_string());
+        return Err(ScannerPauseBacklogSelectionError::AuthorityConflict(
+            "scanner pause backlog has no storage replicas".to_string(),
+        ));
     }
     for replica in &replicas {
         if let ScannerPauseBacklogReplicaState::FutureSchema(version) = &replica.state {
-            return Err(format!(
+            return Err(ScannerPauseBacklogSelectionError::InvalidRecord(format!(
                 "scanner pause backlog pool {} set {} uses future schema {version}",
                 replica.id.pool_index, replica.id.set_index
-            ));
+            )));
         }
     }
 
     let replica_ids = scanner_pause_backlog_replica_ids(&replicas);
-    let authoritative_commit = select_scanner_pause_backlog_commit(&replicas, &replica_ids)?;
+    let authoritative_commit =
+        select_scanner_pause_backlog_commit(&replicas, &replica_ids).map_err(ScannerPauseBacklogSelectionError::from)?;
     let stable_consensus = if replicas.iter().all(|replica| {
         matches!(
             &replica.state,
@@ -1076,17 +1170,21 @@ fn select_scanner_pause_backlog_replicas(replicas: Vec<ScannerPauseBacklogReplic
                     }
                     _ => unreachable!("replica state was checked above"),
                 };
-                return Err(format!(
+                let reason = format!(
                     "scanner pause backlog pool {} set {} is unavailable: {reason}",
                     replica.id.pool_index, replica.id.set_index
-                ));
+                );
+                return Err(match &replica.state {
+                    ScannerPauseBacklogReplicaState::Invalid(_) => ScannerPauseBacklogSelectionError::InvalidRecord(reason),
+                    _ => ScannerPauseBacklogSelectionError::AuthorityConflict(reason),
+                });
             }
             match &stable_consensus {
                 Ok(stable) => stable.clone(),
                 Err(()) => {
-                    return Err(
+                    return Err(ScannerPauseBacklogSelectionError::AuthorityConflict(
                         "scanner pause backlog has neither a surviving membership commit nor a stable rollback point".to_string(),
-                    );
+                    ));
                 }
             }
         }
@@ -1175,7 +1273,7 @@ pub fn register_scanner_pause_backlog_retirement() {
 fn decode_scanner_pause_backlog_retirement_replicas(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementReplica],
-) -> Result<Vec<ScannerPauseBacklogReplica>, String> {
+) -> Result<Vec<ScannerPauseBacklogReplica>, ScannerPauseBacklogRetirementError> {
     let mut ids = BTreeSet::new();
     let mut decoded = Vec::with_capacity(replicas.len());
     let mut has_source = false;
@@ -1185,19 +1283,27 @@ fn decode_scanner_pause_backlog_retirement_replicas(
             set_index: replica.set_index,
         };
         if !ids.insert(id) {
-            return Err("scanner pause backlog retirement has duplicate replica membership".to_string());
+            return Err(scanner_pause_backlog_retirement_invalid_record(
+                "scanner pause backlog retirement has duplicate replica membership",
+            ));
         }
         let state = match replica.data.as_deref() {
             Some(data) if data.len() <= MAX_SCANNER_PAUSE_BACKLOG_BYTES as usize => {
                 let state = decode_scanner_pause_backlog_ledger(data);
                 if !matches!(state, ScannerPauseBacklogReplicaState::Valid(_)) {
-                    return Err("scanner pause backlog retirement found an invalid or unsupported native record".to_string());
+                    return Err(scanner_pause_backlog_retirement_invalid_record(
+                        "scanner pause backlog retirement found an invalid or unsupported native record",
+                    ));
                 }
                 has_source |= replica.pool_index == source_pool_index;
                 state
             }
             None => ScannerPauseBacklogReplicaState::Missing,
-            _ => return Err("scanner pause backlog retirement has an oversized replica".to_string()),
+            _ => {
+                return Err(scanner_pause_backlog_retirement_invalid_record(
+                    "scanner pause backlog retirement has an oversized replica",
+                ));
+            }
         };
         decoded.push(ScannerPauseBacklogReplica {
             id,
@@ -1206,7 +1312,9 @@ fn decode_scanner_pause_backlog_retirement_replicas(
         });
     }
     if !has_source {
-        return Err("scanner pause backlog retirement has no native source record".to_string());
+        return Err(scanner_pause_backlog_retirement_invalid_record(
+            "scanner pause backlog retirement has no native source record",
+        ));
     }
     Ok(decoded)
 }
@@ -1214,12 +1322,14 @@ fn decode_scanner_pause_backlog_retirement_replicas(
 fn verify_scanner_pause_backlog_retirement(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementReplica],
-) -> Result<(), String> {
+) -> Result<(), ScannerPauseBacklogRetirementError> {
     let mut decoded = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
     if decoded.iter().any(|replica| {
         replica.id.pool_index != source_pool_index && matches!(replica.state, ScannerPauseBacklogReplicaState::Missing)
     }) {
-        return Err("scanner pause backlog retirement has a missing surviving replica".to_string());
+        return Err(scanner_pause_backlog_retirement_authority_conflict(
+            "scanner pause backlog retirement has a missing surviving replica",
+        ));
     }
     // Earlier entries may already have removed a source sibling after a
     // successful handoff. It contributes no stored authority to final cleanup.
@@ -1229,15 +1339,17 @@ fn verify_scanner_pause_backlog_retirement(
         .filter(|replica| replica.id.pool_index != source_pool_index)
         .cloned()
         .collect::<Vec<_>>();
-    let selected = select_scanner_pause_backlog_replicas(surviving)?;
+    let selected = select_scanner_pause_backlog_replicas(surviving).map_err(scanner_pause_backlog_retirement_selection_error)?;
     if !selected.durable || !selected.stable_matches_ledger {
-        return Err(
-            "scanner pause backlog retirement requires stable authority on the complete surviving membership".to_string(),
-        );
+        return Err(scanner_pause_backlog_retirement_authority_conflict(
+            "scanner pause backlog retirement requires stable authority on the complete surviving membership",
+        ));
     }
-    let before = select_scanner_pause_backlog_replicas(decoded)?;
+    let before = select_scanner_pause_backlog_replicas(decoded).map_err(scanner_pause_backlog_retirement_selection_error)?;
     if !before.durable || before.ledger != selected.ledger {
-        return Err("scanner pause backlog retirement would change the native ledger authority".to_string());
+        return Err(scanner_pause_backlog_retirement_authority_conflict(
+            "scanner pause backlog retirement would change the native ledger authority",
+        ));
     }
     Ok(())
 }
@@ -1245,7 +1357,7 @@ fn verify_scanner_pause_backlog_retirement(
 fn plan_scanner_pause_backlog_retirement(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementReplica],
-) -> Result<Option<ScannerPauseBacklogRetirementPlan>, String> {
+) -> Result<Option<ScannerPauseBacklogRetirementPlan>, ScannerPauseBacklogRetirementError> {
     // Missing entries stay in the native selection. Omitting them could turn
     // an incomplete old cohort into a fabricated stable consensus.
     let decoded = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
@@ -1255,12 +1367,16 @@ fn plan_scanner_pause_backlog_retirement(
         .cloned()
         .collect::<Vec<_>>();
     if surviving.is_empty() {
-        return Err("scanner pause backlog retirement has no surviving membership".to_string());
+        return Err(scanner_pause_backlog_retirement_authority_conflict(
+            "scanner pause backlog retirement has no surviving membership",
+        ));
     }
     let all_ids = scanner_pause_backlog_replica_ids(&decoded);
     let surviving_ids = scanner_pause_backlog_replica_ids(&surviving);
-    let full_commit = select_scanner_pause_backlog_commit(&decoded, &all_ids)?;
-    let surviving_commit = select_scanner_pause_backlog_commit(&surviving, &surviving_ids)?;
+    let full_commit =
+        select_scanner_pause_backlog_commit(&decoded, &all_ids).map_err(scanner_pause_backlog_retirement_commit_error)?;
+    let surviving_commit =
+        select_scanner_pause_backlog_commit(&surviving, &surviving_ids).map_err(scanner_pause_backlog_retirement_commit_error)?;
     let selected = select_scanner_pause_backlog_replicas(surviving.clone());
     let full_selection = select_scanner_pause_backlog_replicas(decoded.clone());
     if full_commit.is_none()
@@ -1276,15 +1392,20 @@ fn plan_scanner_pause_backlog_retirement(
                 if record.committed.as_ref().is_some_and(|committed|
                     committed.replicas.iter().any(|id| !all_ids.contains(id))))
         }) {
-            return Err("scanner pause backlog bootstrap has an unread native commit member".to_string());
+            return Err(scanner_pause_backlog_retirement_invalid_record(
+                "scanner pause backlog bootstrap has an unread native commit member",
+            ));
         }
-        let ledger = claim_scanner_pause_backlog_writer(&all.ledger, unix_now())?;
+        let ledger = claim_scanner_pause_backlog_writer(&all.ledger, unix_now())
+            .map_err(scanner_pause_backlog_retirement_invalid_record)?;
         let committed = commit_scanner_pause_backlog_record(None, &ledger, &surviving_ids);
         let stable = stable_scanner_pause_backlog_record(&ledger, committed.committed.as_ref(), &surviving_ids);
         return Ok(Some(ScannerPauseBacklogRetirementPlan {
             seed_record: None,
-            commit_record: encode_scanner_pause_backlog_record(&committed)?,
-            stable_record: encode_scanner_pause_backlog_record(&stable)?,
+            commit_record: encode_scanner_pause_backlog_record(&committed)
+                .map_err(scanner_pause_backlog_retirement_invalid_record)?,
+            stable_record: encode_scanner_pause_backlog_record(&stable)
+                .map_err(scanner_pause_backlog_retirement_invalid_record)?,
         }));
     }
     let ledger = if let Some(committed) = &full_commit {
@@ -1292,7 +1413,9 @@ fn plan_scanner_pause_backlog_retirement(
             .as_ref()
             .is_some_and(|current| current.ledger != committed.ledger)
         {
-            return Err("scanner pause backlog retirement found a different surviving native commit".to_string());
+            return Err(scanner_pause_backlog_retirement_authority_conflict(
+                "scanner pause backlog retirement found a different surviving native commit",
+            ));
         }
         if let Ok(current) = &selected
             && current.durable
@@ -1307,20 +1430,28 @@ fn plan_scanner_pause_backlog_retirement(
                         if record.committed.as_ref() == Some(committed))
             });
             if !acknowledged_full_commit {
-                return Err("scanner pause backlog retirement would replace surviving stable authority".to_string());
+                return Err(scanner_pause_backlog_retirement_authority_conflict(
+                    "scanner pause backlog retirement would replace surviving stable authority",
+                ));
             }
         }
         // Use the same native selector that validates the full commit, rather
         // than inferring authority from source epoch or physical object time.
-        full_selection?.ledger
+        full_selection
+            .map_err(scanner_pause_backlog_retirement_selection_error)?
+            .ledger
     } else {
         // An interrupted cohort switch can invalidate the old full commit
         // while all survivors still have its stable rollback point. Source
         // stable fields need not match, but any valid conflicting commit above
         // must have been rejected before this recovery path.
-        let current = selected.as_ref().map_err(|err| err.clone())?;
+        let current = selected
+            .as_ref()
+            .map_err(|err| scanner_pause_backlog_retirement_selection_error(err.clone()))?;
         if !current.durable {
-            return Err("scanner pause backlog retirement has no proven native authority".to_string());
+            return Err(scanner_pause_backlog_retirement_authority_conflict(
+                "scanner pause backlog retirement has no proven native authority",
+            ));
         }
         if decoded
             .iter()
@@ -1331,7 +1462,9 @@ fn plan_scanner_pause_backlog_retirement(
                     && record.committed.as_ref().is_none_or(|committed| committed.ledger != current.ledger))
             })
         {
-            return Err("scanner pause backlog retirement has unrelated source stable authority".to_string());
+            return Err(scanner_pause_backlog_retirement_authority_conflict(
+                "scanner pause backlog retirement has unrelated source stable authority",
+            ));
         }
         current.ledger.clone()
     };
@@ -1353,19 +1486,23 @@ fn plan_scanner_pause_backlog_retirement(
             .as_ref()
             .filter(|committed| committed.ledger == ledger)
             .or_else(|| surviving_commit.as_ref().filter(|committed| committed.ledger == ledger))
-            .ok_or_else(|| "scanner pause backlog retirement cannot seed without a native commit proof".to_string())?;
-        Some(encode_scanner_pause_backlog_record(&stable_scanner_pause_backlog_record(
-            &ledger,
-            Some(authority),
-            &surviving_ids,
-        ))?)
+            .ok_or_else(|| {
+                scanner_pause_backlog_retirement_authority_conflict(
+                    "scanner pause backlog retirement cannot seed without a native commit proof",
+                )
+            })?;
+        Some(
+            encode_scanner_pause_backlog_record(&stable_scanner_pause_backlog_record(&ledger, Some(authority), &surviving_ids))
+                .map_err(scanner_pause_backlog_retirement_invalid_record)?,
+        )
     };
     let committed = commit_scanner_pause_backlog_record(Some(&ledger), &ledger, &surviving_ids);
     let stable = stable_scanner_pause_backlog_record(&ledger, committed.committed.as_ref(), &surviving_ids);
     Ok(Some(ScannerPauseBacklogRetirementPlan {
         seed_record,
-        commit_record: encode_scanner_pause_backlog_record(&committed)?,
-        stable_record: encode_scanner_pause_backlog_record(&stable)?,
+        commit_record: encode_scanner_pause_backlog_record(&committed)
+            .map_err(scanner_pause_backlog_retirement_invalid_record)?,
+        stable_record: encode_scanner_pause_backlog_record(&stable).map_err(scanner_pause_backlog_retirement_invalid_record)?,
     }))
 }
 
@@ -1415,7 +1552,7 @@ where
         return Err("scanner pause backlog has no surviving storage replicas".to_string());
     }
     let replicas = join_all(writable.into_iter().map(read_scanner_pause_backlog_replica)).await;
-    select_scanner_pause_backlog_replicas(replicas)
+    select_scanner_pause_backlog_replicas(replicas).map_err(|err| err.to_string())
 }
 
 async fn write_scanner_pause_backlog_record<S>(
@@ -1613,9 +1750,12 @@ where
         controller
     }
 
-    pub(super) fn scheduling_delay(&self, now: u64) -> Option<Duration> {
+    pub(super) fn scheduling_delay(&self, now: u64, usage_bootstrap_rebuild_pending: bool) -> Option<Duration> {
         if self.persistence_disabled {
             return Some(Duration::from_secs(self.persistence_retry_at_unix_secs.saturating_sub(now)));
+        }
+        if usage_bootstrap_rebuild_pending && !self.loaded.ledger.blocks_usage_bootstrap_rebuild() {
+            return None;
         }
         match self.loaded.ledger.phase {
             ScannerPauseBacklogPhase::Idle => None,
@@ -1638,11 +1778,24 @@ where
     }
 
     pub(super) async fn begin_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        self.begin_attempt_with(now, ScannerPauseBacklogLedger::begin_attempt).await
+    }
+
+    pub(super) async fn begin_usage_bootstrap_rebuild_attempt(&mut self, now: u64) -> ScannerPauseBacklogAttemptDecision {
+        self.begin_attempt_with(now, ScannerPauseBacklogLedger::begin_usage_bootstrap_rebuild_attempt)
+            .await
+    }
+
+    async fn begin_attempt_with(
+        &mut self,
+        now: u64,
+        begin: fn(&mut ScannerPauseBacklogLedger, u64) -> ScannerPauseBacklogAttemptDecision,
+    ) -> ScannerPauseBacklogAttemptDecision {
         if self.persistence_disabled {
             return ScannerPauseBacklogAttemptDecision::PersistenceUnavailable;
         }
         let mut candidate = self.loaded.ledger.clone();
-        let decision = candidate.begin_attempt(now);
+        let decision = begin(&mut candidate, now);
         if candidate == self.loaded.ledger {
             self.record_status(now);
             return decision;
@@ -2977,7 +3130,10 @@ mod tests {
         ];
         let blocked = verify_scanner_pause_backlog_retirement(0, &replicas)
             .expect_err("a complete commit still needs its native stabilization barrier");
-        assert!(blocked.contains("stable authority"), "{blocked}");
+        assert!(
+            matches!(blocked, ScannerPauseBacklogRetirementError::AuthorityConflict { .. }),
+            "a commit without the native stabilization barrier is an authority conflict: {blocked}"
+        );
 
         let stable = replica_record_for_members(&new, &new, &targets);
         replicas[1] = retirement_replica(targets[0], &stable);
@@ -2999,7 +3155,10 @@ mod tests {
         new.claim_writer(100).unwrap();
         prepare_scanner_pause_backlog_persist(&mut new, 100).unwrap();
         let stable = replica_record_for_members(&new, &new, &targets);
-        for source_sets in [2, 3] {
+        // Equal-size competing source proofs are a transient handoff conflict
+        // the native writer can still resolve. A strictly larger source proof
+        // is durable authority that must never be discarded.
+        for (source_sets, authority_conflict) in [(2, false), (3, true)] {
             let sources = (0..source_sets).map(|set| replica_id(0, set)).collect::<Vec<_>>();
             let source_record = replica_record_for_members(&old, &old, &sources);
             let mut replicas = sources
@@ -3007,8 +3166,13 @@ mod tests {
                 .map(|id| retirement_replica(*id, &source_record))
                 .collect::<Vec<_>>();
             replicas.extend(targets.iter().map(|id| retirement_replica(*id, &stable)));
-            verify_scanner_pause_backlog_retirement(0, &replicas)
+            let error = verify_scanner_pause_backlog_retirement(0, &replicas)
                 .expect_err("all source sets must be consulted before discarding a competing or larger native proof");
+            match (authority_conflict, &error) {
+                (true, ScannerPauseBacklogRetirementError::AuthorityConflict { .. })
+                | (false, ScannerPauseBacklogRetirementError::HandoffConflict { .. }) => {}
+                _ => panic!("competing source proofs must keep their typed classification: {error}"),
+            }
             assert!(plan_scanner_pause_backlog_retirement(0, &replicas).is_err());
         }
     }
@@ -3035,7 +3199,10 @@ mod tests {
         let error = plan_scanner_pause_backlog_retirement(0, &replicas)
             .err()
             .expect("bootstrap must not turn an unread old cohort into a missing member");
-        assert!(error.contains("unread"), "{error}");
+        let ScannerPauseBacklogRetirementError::InvalidRecord { reason } = &error else {
+            panic!("an unread old cohort member is an invalid record, not a missing member: {error}");
+        };
+        assert!(reason.contains("unread"), "{reason}");
 
         let new = durable_ledger(100);
         let source_record = replica_record_for_members(&old, &old, &[source]);
@@ -3046,7 +3213,10 @@ mod tests {
         let error = plan_scanner_pause_backlog_retirement(0, &replicas)
             .err()
             .expect("an independent source-only proof must not overwrite stable surviving authority");
-        assert!(error.contains("stable authority"), "{error}");
+        assert!(
+            matches!(error, ScannerPauseBacklogRetirementError::AuthorityConflict { .. }),
+            "an independent source-only proof must be an authority conflict: {error}"
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -3552,6 +3722,40 @@ mod tests {
         assert_eq!(ledger.pending_work_items(), 0);
         prepare_scanner_pause_backlog_persist(&mut ledger, 430).expect("converged ledger should persist");
         assert_eq!(decode_valid_ledger(&ledger).phase, ScannerPauseBacklogPhase::Idle);
+    }
+
+    #[test]
+    fn usage_bootstrap_rebuild_bypasses_empty_catch_up_backlog() {
+        let mut empty_catch_up = durable_ledger(100);
+        empty_catch_up.phase = ScannerPauseBacklogPhase::CatchingUp;
+        empty_catch_up.pending_full_scan = false;
+        empty_catch_up.next_attempt_at_unix_secs = 420;
+
+        assert!(!empty_catch_up.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            empty_catch_up.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::Untracked
+        );
+        assert_eq!(
+            empty_catch_up.next_attempt_at_unix_secs, 420,
+            "usage bootstrap rebuild must not rewrite an unrelated empty catch-up ledger"
+        );
+
+        let mut movement_full_scan = empty_catch_up.clone();
+        movement_full_scan.pending_full_scan = true;
+        assert!(movement_full_scan.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            movement_full_scan.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::RateLimited
+        );
+
+        let mut known_work = empty_catch_up;
+        known_work.discovered_expiry_items = 1;
+        assert!(known_work.blocks_usage_bootstrap_rebuild());
+        assert_eq!(
+            known_work.begin_usage_bootstrap_rebuild_attempt(120),
+            ScannerPauseBacklogAttemptDecision::RateLimited
+        );
     }
 
     #[test]

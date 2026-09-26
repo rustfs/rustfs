@@ -57,6 +57,7 @@ const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty ch
 pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
 pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
 pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
+pub const INTERNODE_FILE_CORRUPT: &str = "file-corrupt";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -185,6 +186,7 @@ pub struct InternodeHttpError {
 enum RemoteDiskErrorKind {
     FileNotFound,
     VolumeNotFound,
+    FileCorrupt,
 }
 
 impl std::fmt::Debug for InternodeHttpError {
@@ -213,6 +215,10 @@ impl InternodeHttpError {
 
     pub fn is_remote_volume_not_found(&self) -> bool {
         self.remote_disk_error == Some(RemoteDiskErrorKind::VolumeNotFound)
+    }
+
+    pub fn is_remote_file_corrupt(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileCorrupt)
     }
 
     fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
@@ -324,6 +330,20 @@ pub fn new_test_remote_volume_not_found_http_io_error() -> io::Error {
             operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
         },
         RemoteDiskErrorKind::VolumeNotFound,
+    )
+    .into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_file_corrupt_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileCorrupt,
     )
     .into_io_error()
 }
@@ -850,6 +870,7 @@ fn classify_http_response(
     let remote_disk_error = match headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok()) {
         Some(INTERNODE_FILE_NOT_FOUND) => Some(RemoteDiskErrorKind::FileNotFound),
         Some(INTERNODE_VOLUME_NOT_FOUND) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        Some(INTERNODE_FILE_CORRUPT) => Some(RemoteDiskErrorKind::FileCorrupt),
         _ => None,
     };
     ClassifiedHttpResponse { kind, remote_disk_error }
@@ -2047,6 +2068,7 @@ mod tests {
         assert_eq!(INTERNODE_DISK_ERROR_HEADER, "x-rustfs-disk-error");
         assert_eq!(INTERNODE_FILE_NOT_FOUND, "file-not-found");
         assert_eq!(INTERNODE_VOLUME_NOT_FOUND, "volume-not-found");
+        assert_eq!(INTERNODE_FILE_CORRUPT, "file-corrupt");
     }
 
     #[test]
@@ -2088,6 +2110,48 @@ mod tests {
         let wrong_operation =
             classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
         assert!(wrong_operation.remote_disk_error.is_none());
+    }
+
+    #[test]
+    fn classify_http_response_scopes_corrupt_disk_error_to_read_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT.parse().expect("valid error token"));
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileCorrupt));
+        for status in [reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(
+                classify_http_response(status, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM))
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        for operation in [
+            None,
+            Some(INTERNODE_OPERATION_WALK_DIR),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        ] {
+            assert!(
+                classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, operation)
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "unknown-disk-error".parse().expect("valid unknown token"));
+        for headers in [&headers, &HeaderMap::new()] {
+            assert!(
+                classify_http_response(
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+                )
+                .remote_disk_error
+                .is_none()
+            );
+        }
     }
 
     #[derive(Clone, Default)]
@@ -2158,6 +2222,16 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route(
+                READ_FILE_STREAM_PATH,
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT)],
+                        "read file err file corrupt",
+                    )
+                }),
+            )
             .route(WALK_DIR_PATH, get(get_stream))
             .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
@@ -2170,6 +2244,44 @@ mod tests {
         });
 
         Some((format!("http://{addr}/stream"), handle))
+    }
+
+    #[tokio::test]
+    async fn http_readers_preserve_remote_file_corruption() {
+        let (url, server) = start_test_server(TestState::default())
+            .await
+            .expect("corruption regression server must bind");
+        let url = format!("{}{READ_FILE_STREAM_PATH}", url.strip_suffix("/stream").expect("test server URL suffix"));
+        let byte_error = HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None)
+            .await
+            .err()
+            .expect("byte reader must reject corrupt shard response");
+        let chunk_error = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .err()
+            .expect("chunk reader must reject corrupt shard response");
+        for error in [byte_error, chunk_error] {
+            let source = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("HTTP error must retain typed internode source");
+            assert!(source.is_remote_file_corrupt());
+            assert!(!source.is_remote_file_not_found());
+            assert!(!source.is_remote_volume_not_found());
+            assert_eq!(
+                source.kind(),
+                InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            let cloned = clone_internode_http_io_error(&error).expect("typed transport error must be cloneable");
+            assert!(
+                cloned
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("clone must retain typed internode source")
+                    .is_remote_file_corrupt()
+            );
+        }
+        server.abort();
     }
 
     struct BlockedH2Server {

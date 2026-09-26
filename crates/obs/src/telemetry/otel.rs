@@ -64,11 +64,11 @@ use rustfs_config::{
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
-use std::{fs, io::IsTerminal, time::Duration};
+use std::{fs, io::IsTerminal, path::Path, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_request_duration_seconds",
@@ -82,6 +82,12 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
+const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
+const OTEL_EXPORTER_OTLP_METRICS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT";
+const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
 
 #[cfg(all(
     feature = "pyroscope",
@@ -130,6 +136,8 @@ pub(super) fn init_observability_http(
     logger_level: &str,
     is_production: bool,
 ) -> Result<OtelGuard, TelemetryError> {
+    let otlp_tls_ca_bundle = OtlpTlsCaBundle::load(config)?;
+
     // ── Resource & sampling ──────────────────────────────────────────────────
     // Build the common resource once so all enabled signals report the same
     // service identity and deployment metadata.
@@ -153,10 +161,12 @@ pub(super) fn init_observability_http(
     let log_ep = resolve_signal_endpoint(config.log_endpoint.as_deref(), root_ep, "/v1/logs");
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
-    let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
+    let tracer_provider =
+        build_tracer_provider(&trace_ep, config, otlp_tls_ca_bundle.as_ref(), res.clone(), sampler, use_stdout)?;
 
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
-    let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
+    let meter_provider =
+        build_meter_provider(&metric_ep, config, otlp_tls_ca_bundle.as_ref(), res.clone(), &service_name, use_stdout)?;
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
     // Logging is the only signal that may intentionally route to either OTLP
@@ -175,7 +185,7 @@ pub(super) fn init_observability_http(
         // Init OTLP logger logic.
         // We initialize the OTLP collector and honor the configured stdout setting
         // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
-        logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
+        logger_provider = build_logger_provider(&log_ep, config, otlp_tls_ca_bundle.as_ref(), res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
         otel_bridge = logger_provider.as_ref().map(OpenTelemetryTracingBridge::new);
@@ -184,7 +194,8 @@ pub(super) fn init_observability_http(
         // active, the OpenTelemetry bridge is the authoritative sink for
         // `tracing` events unless local file logging is needed as a fallback.
     }
-    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    let span_events = crate::telemetry::local::resolve_span_events();
+    let span_list = crate::telemetry::local::resolve_span_list(logger_level);
     // ── Case 2: File Logging
     // If a log directory is configured and OTLP log export is unavailable, use
     // the same rolling-file behavior as the local-only telemetry backend.
@@ -221,7 +232,7 @@ pub(super) fn init_observability_http(
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
@@ -267,7 +278,7 @@ pub(super) fn init_observability_http(
     if force_stdout_logging || crate::telemetry::local::resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events, span_list));
     }
     let local_file_fallback_enabled = file_layer_opt.is_some();
     let stdout_mirror_enabled = stdout_guard.is_some();
@@ -320,6 +331,7 @@ pub(super) fn init_observability_http(
 fn build_tracer_provider(
     trace_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     sampler: Sampler,
     use_stdout: bool,
@@ -337,8 +349,12 @@ fn build_tracer_provider(
     if !trace_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(trace_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
@@ -408,6 +424,7 @@ fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix:
 fn build_meter_provider(
     metric_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     service_name: &str,
     use_stdout: bool,
@@ -426,8 +443,12 @@ fn build_meter_provider(
     if !metric_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(metric_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
@@ -484,6 +505,7 @@ fn is_get_object_duration_histogram_metric(name: &str) -> bool {
 fn build_logger_provider(
     log_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     use_stdout: bool,
 ) -> Result<Option<SdkLoggerProvider>, TelemetryError> {
@@ -500,8 +522,12 @@ fn build_logger_provider(
     if !log_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(log_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_LOGS_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
@@ -659,15 +685,238 @@ fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_mil
         .map(Duration::from_millis)
 }
 
+struct OtlpTlsCaBundle {
+    certificates: Vec<reqwest::Certificate>,
+}
+
+impl OtlpTlsCaBundle {
+    fn load(config: &OtelConfig) -> Result<Option<Self>, TelemetryError> {
+        let Some(ca_file) = config.tls_ca_file.as_deref() else {
+            return Ok(None);
+        };
+        let path = Path::new(ca_file);
+        if !path.is_absolute() {
+            return Err(TelemetryError::OtlpTlsCaPathNotAbsolute);
+        }
+
+        let pem_bundle = fs::read(path).map_err(TelemetryError::OtlpTlsCaRead)?;
+        if pem_bundle.iter().all(u8::is_ascii_whitespace) {
+            return Err(TelemetryError::OtlpTlsCaEmpty);
+        }
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem_bundle).map_err(TelemetryError::OtlpTlsCaParse)?;
+        if certificates.is_empty() {
+            return Err(TelemetryError::OtlpTlsCaInvalid);
+        }
+        Ok(Some(Self { certificates }))
+    }
+
+    fn build_http_client(
+        &self,
+        configured_timeout: Option<Duration>,
+        otel_signal_timeout_env: &str,
+    ) -> Result<reqwest::Client, TelemetryError> {
+        let timeout = configured_timeout.unwrap_or_else(|| resolve_otlp_http_timeout(otel_signal_timeout_env));
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .tls_certs_merge(self.certificates.clone())
+            .build()
+            .map_err(TelemetryError::BuildOtlpHttpClient)
+    }
+}
+
+fn build_otlp_http_client(
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
+    configured_timeout: Option<Duration>,
+    otel_signal_timeout_env: &str,
+) -> Result<Option<reqwest::Client>, TelemetryError> {
+    otlp_tls_ca_bundle
+        .map(|bundle| bundle.build_http_client(configured_timeout, otel_signal_timeout_env))
+        .transpose()
+}
+
+fn resolve_otlp_http_timeout(signal_timeout_env: &str) -> Duration {
+    [signal_timeout_env, OTEL_EXPORTER_OTLP_TIMEOUT]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok()))
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OTLP_HTTP_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
     use std::io::{self, Write};
+    use std::path::Path;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     const LOG_TRACER_CHILD_ENV: &str = "RUSTFS_OBS_LOG_TRACER_CHILD";
+
+    fn config_with_tls_ca_file(path: &Path) -> OtelConfig {
+        OtelConfig {
+            tls_ca_file: Some(path.display().to_string()),
+            ..OtelConfig::default()
+        }
+    }
+
+    fn load_tls_ca_bundle(path: &Path) -> OtlpTlsCaBundle {
+        OtlpTlsCaBundle::load(&config_with_tls_ca_file(path))
+            .expect("load CA bundle")
+            .expect("configured CA file should produce a bundle")
+    }
+
+    async fn spawn_test_tls_server() -> (String, String, tokio::task::JoinHandle<bool>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
+        let ca_pem = certified.cert.pem();
+        let private_key = rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .expect("convert TLS server private key");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], private_key)
+            .expect("build TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS test server");
+        let endpoint = format!("https://{}", listener.local_addr().expect("read TLS test server address"));
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return false;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return false;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1_024];
+            loop {
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return false;
+                };
+                if read == 0 {
+                    return false;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .is_ok()
+                && stream.shutdown().await.is_ok()
+        });
+        (endpoint, ca_pem, server)
+    }
+
+    #[tokio::test]
+    async fn otlp_http_client_trusts_every_certificate_in_a_pem_bundle() {
+        let (first_endpoint, first_ca_pem, first_server) = spawn_test_tls_server().await;
+        let (second_endpoint, second_ca_pem, second_server) = spawn_test_tls_server().await;
+        let file = tempfile::NamedTempFile::new().expect("create CA bundle file");
+        std::fs::write(file.path(), format!("{first_ca_pem}\n{second_ca_pem}")).expect("write CA bundle");
+
+        let bundle = load_tls_ca_bundle(file.path());
+        let client = build_otlp_http_client(Some(&bundle), Some(Duration::from_millis(250)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+            .expect("build client with CA bundle");
+        let client = client.expect("custom CA should build a client");
+        assert_eq!(
+            client
+                .get(first_endpoint)
+                .send()
+                .await
+                .expect("first bundled CA should complete TLS handshake")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(second_endpoint)
+                .send()
+                .await
+                .expect("second bundled CA should complete TLS handshake")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert!(first_server.await.expect("first bundled TLS server task"));
+        assert!(second_server.await.expect("second bundled TLS server task"));
+    }
+
+    #[test]
+    fn otlp_http_client_rejects_relative_missing_empty_and_invalid_ca_files() {
+        let relative = OtelConfig {
+            tls_ca_file: Some("otlp-ca.pem".to_string()),
+            ..OtelConfig::default()
+        };
+        assert!(matches!(OtlpTlsCaBundle::load(&relative), Err(TelemetryError::OtlpTlsCaPathNotAbsolute)));
+
+        let missing_directory = tempfile::tempdir().expect("create missing CA directory");
+        let missing = OtelConfig {
+            tls_ca_file: Some(missing_directory.path().join("otlp-ca.pem").display().to_string()),
+            ..OtelConfig::default()
+        };
+        assert!(matches!(OtlpTlsCaBundle::load(&missing), Err(TelemetryError::OtlpTlsCaRead(_))));
+
+        let empty = tempfile::NamedTempFile::new().expect("create empty CA file");
+        assert!(matches!(
+            OtlpTlsCaBundle::load(&config_with_tls_ca_file(empty.path())),
+            Err(TelemetryError::OtlpTlsCaEmpty)
+        ));
+
+        let invalid = tempfile::NamedTempFile::new().expect("create invalid CA file");
+        std::fs::write(invalid.path(), b"not a PEM certificate").expect("write invalid CA file");
+        assert!(matches!(
+            OtlpTlsCaBundle::load(&config_with_tls_ca_file(invalid.path())),
+            Err(TelemetryError::OtlpTlsCaInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn otlp_http_client_trusts_the_configured_ca_and_rejects_another_ca() {
+        let (endpoint, ca_pem, trusted_server) = spawn_test_tls_server().await;
+        let trusted_file = tempfile::NamedTempFile::new().expect("create trusted CA file");
+        std::fs::write(trusted_file.path(), ca_pem).expect("write trusted CA file");
+        let trusted_bundle = load_tls_ca_bundle(trusted_file.path());
+        let trusted_client =
+            build_otlp_http_client(Some(&trusted_bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("build trusted client")
+                .expect("custom CA should build a client");
+        assert_eq!(
+            trusted_client
+                .get(&endpoint)
+                .send()
+                .await
+                .expect("configured CA should complete TLS handshake")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert!(trusted_server.await.expect("trusted TLS server task"));
+
+        let (endpoint, _ca_pem, untrusted_server) = spawn_test_tls_server().await;
+        let wrong_ca =
+            rcgen::generate_simple_self_signed(vec!["wrong.test".to_string()]).expect("generate unrelated CA certificate");
+        let untrusted_file = tempfile::NamedTempFile::new().expect("create unrelated CA file");
+        std::fs::write(untrusted_file.path(), wrong_ca.cert.pem()).expect("write unrelated CA file");
+        let untrusted_bundle = load_tls_ca_bundle(untrusted_file.path());
+        let untrusted_client =
+            build_otlp_http_client(Some(&untrusted_bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("build untrusted client")
+                .expect("custom CA should build a client");
+        assert!(untrusted_client.get(&endpoint).send().await.is_err());
+        assert!(!untrusted_server.await.expect("untrusted TLS server task"));
+    }
+
+    #[test]
+    fn otlp_http_client_is_not_built_without_a_custom_ca_file() {
+        assert!(
+            build_otlp_http_client(None, None, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("no CA file keeps the default client")
+                .is_none()
+        );
+    }
 
     #[derive(Clone)]
     struct TestWriter(Arc<Mutex<Vec<u8>>>);

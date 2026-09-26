@@ -31,6 +31,11 @@ require_absent() {
   fi
 }
 
+require_line "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "cross builds must keep matrix features"
+require_line "$build_workflow" "              cargo build --release --target \${{ matrix.target }} \"\${FEATURE_ARGS[@]}\" -p rustfs --bin \"\$binary\"" "native builds must keep matrix features"
+require_absent "$build_workflow" "              cargo zigbuild --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "cross builds must not drop matrix features"
+require_absent "$build_workflow" "              cargo build --release --target \${{ matrix.target }} -p rustfs --bin \"\$binary\"" "native builds must not drop matrix features"
+
 extract_job_if() {
   local file="$1"
   local job="$2"
@@ -156,7 +161,7 @@ require_line "$release_script" "  gh api --method POST \"repos/\${GITHUB_REPOSIT
 require_line "$release_script" "    local create_args=(release create \"\$tag\" --title \"\$title\" --notes-file \"\$notes_file\" --latest=false --draft)" "draft release creation with a notes file"
 
 release_channel_block=$(awk '
-  $0 == "          if [[ \"\$BUILD_TYPE\" == \"release\" ]]; then" { in_block = 1 }
+  $0 == "          if [[ \"$BUILD_TYPE\" == \"release\" ]]; then" { in_block = 1 }
   in_block { print }
   in_block && $0 == "          fi" { exit }
 ' "$build_workflow")
@@ -198,8 +203,7 @@ IFS= read -r -d '' expected_docker_automatic_guard <<'EOF' || true
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main' &&
-       !contains(github.event.workflow_run.head_branch, '-preview'))
+       github.event.workflow_run.head_branch != 'main')
 EOF
 expected_docker_automatic_guard=${expected_docker_automatic_guard%$'\n'}
 require_job_if "$docker_workflow" "build-check" "$expected_docker_automatic_guard"
@@ -211,15 +215,7 @@ require_line "$docker_workflow" '          SOURCE_REVISION="$(git rev-parse HEAD
 require_line "$docker_workflow" '          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"' "Docker revision label"
 require_absent "$docker_workflow" 'org.opencontainers.image.revision=${{ github.sha }}' "Docker revision must not use the workflow branch SHA"
 
-docker_manual_guard=$(awk '
-  $0 == "              *-preview*)" { in_preview = 1 }
-  in_preview { print }
-  in_preview && $0 == "                ;;" { exit }
-' "$docker_workflow")
-for assignment in 'build_type="preview"' 'is_prerelease=true' 'should_build=false' 'should_push=false'; do
-  name="${assignment%%=*}"
-  require_assignment "$docker_manual_guard" "$name" "${assignment#*=}"
-done
+python3 scripts/test_docker_workflow.py
 
 IFS= read -r -d '' expected_helm_guard <<'EOF' || true
     if: |
@@ -233,6 +229,8 @@ IFS= read -r -d '' expected_helm_guard <<'EOF' || true
 EOF
 expected_helm_guard=${expected_helm_guard%$'\n'}
 require_job_if "$helm_workflow" "build-helm-package" "$expected_helm_guard"
+require_line "$helm_workflow" "          ref: \${{ github.event.workflow_run.head_sha || (startsWith(inputs.version, 'refs/tags/') && inputs.version || format('refs/tags/{0}', inputs.version)) }}" "Helm release source checkout"
+python3 scripts/test_helm_release_workflow.py
 
 assert_equal() {
   local expected="$1"

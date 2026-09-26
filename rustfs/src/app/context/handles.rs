@@ -167,6 +167,15 @@ impl NotifyInterface for NotifyHandle {
         runtime_sources::notify(args).await;
     }
 
+    async fn validate_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError> {
+        runtime_sources::validate_event_specific_rules(bucket_name, region, event_rules).await
+    }
+
     async fn add_event_specific_rules(
         &self,
         bucket_name: &str,

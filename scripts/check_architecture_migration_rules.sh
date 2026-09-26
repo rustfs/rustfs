@@ -2277,7 +2277,7 @@ fi
     rustfs/src/admin/router.rs \
     rustfs/src/admin/console.rs \
     rustfs/src/admin/handlers/heal.rs \
-    rustfs/src/admin/handlers/metrics.rs \
+    rustfs/src/admin/handlers/realtime.rs \
     rustfs/src/admin/handlers/object_zip_download.rs || true
 ) >"$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE"
 

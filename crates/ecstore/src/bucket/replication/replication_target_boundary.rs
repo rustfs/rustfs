@@ -52,6 +52,7 @@ pub use rustfs_replication::{VersionIdentityCapability, version_identity_capabil
 
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result};
+use super::replication_filemeta_boundary::metadata_keys;
 use super::replication_filemeta_boundary::{ReplicationAction, ReplicationStatusType, ReplicationType};
 use super::replication_storage_boundary::ObjectInfo;
 use super::replication_tagging_boundary::ReplicationTagFilter;
@@ -94,7 +95,7 @@ fn metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) -> Opti
 
 fn classify_replication_source_encryption(metadata: &HashMap<String, String>) -> ReplicationSourceEncryption {
     let is_ssec = replication_object_is_ssec_encrypted(metadata);
-    let sse = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION);
+    let sse = metadata_value(metadata, metadata_keys::SERVER_SIDE_ENCRYPTION);
     let kms_key_id = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
     let kms_context = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT);
 
@@ -576,6 +577,52 @@ mod tests {
     use std::sync::Arc;
     use time::Duration;
     use uuid::Uuid;
+
+    /// backlog#1735 A3b SSE key-case finding. Every RustFS writer persists the
+    /// SSE intent as lowercase `x-amz-server-side-encryption`
+    /// (`encryption_material_to_metadata`; header-derived keys come from a
+    /// lowercase `http::HeaderMap`). The mixed-case `X-Amz-Server-Side-Encryption`
+    /// spelling only appears in outbound replication user metadata, which the
+    /// S3 client re-lowercases on the wire. This reader has always matched
+    /// the key ASCII-case-insensitively; keep that, so the old lowercase bytes
+    /// and any title-case spelling both classify, while any non-case drift of
+    /// the key reads as "no SSE intent".
+    #[test]
+    fn replication_sse_classification_reads_pre_module_xlmeta_key() {
+        let metadata = super::super::replication_filemeta_boundary::pre_metadata_keys_fixture_metadata();
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+        assert_eq!(classify_replication_source_encryption(&metadata), ReplicationSourceEncryption::SseS3);
+
+        let sse_only = |key: String| HashMap::from([(key, "AES256".to_string())]);
+        let key = metadata_keys::SERVER_SIDE_ENCRYPTION;
+        for spelling in [
+            key.to_string(),
+            "X-Amz-Server-Side-Encryption".to_string(),
+            key.to_ascii_uppercase(),
+        ] {
+            assert_eq!(
+                classify_replication_source_encryption(&sse_only(spelling.clone())),
+                ReplicationSourceEncryption::SseS3,
+                "{spelling:?}"
+            );
+        }
+        for idx in 0..key.len() {
+            let mut bytes = key.as_bytes().to_vec();
+            bytes[idx] = if bytes[idx] == b'z' {
+                b'y'
+            } else if bytes[idx].is_ascii_alphabetic() {
+                b'z'
+            } else {
+                b'_'
+            };
+            let mutated = String::from_utf8(bytes).expect("ascii");
+            assert_eq!(
+                classify_replication_source_encryption(&sse_only(mutated.clone())),
+                ReplicationSourceEncryption::Plaintext,
+                "{mutated:?} must not read as the SSE key"
+            );
+        }
+    }
 
     /// Serialize an object-level checksum record the way
     /// `complete_multipart_upload` persists it for a **full-object** checksum:

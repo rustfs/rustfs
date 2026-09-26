@@ -73,11 +73,11 @@
             rustc = rustToolchain;
           };
 
-          clientVersion = "0.1.32";
+          clientVersion = "0.1.36";
 
           rustfs = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "1.0.0-rc.6";
+            version = "1.0.0";
 
             src = ./.;
 
@@ -115,11 +115,11 @@
           clientAssets = {
             "x86_64-linux" = {
               name = "rustfs-cli-linux-amd64-v${clientVersion}.tar.gz";
-              hash = "sha256-qwDZNwedy28ce0HTS7+q0OsL1PchhnLLy3wzZS0cRt8=";
+              hash = "sha256-SoEokRzK1Oe0gfJmNaTP0ewGRBIhBSbletLHSNNW87c=";
             };
             "aarch64-linux" = {
               name = "rustfs-cli-linux-arm64-v${clientVersion}.tar.gz";
-              hash = "sha256-1T1M9Q3lcy9IJo/n5eQezmbTaEgHVJbx1QFCaTX3BYY=";
+              hash = "sha256-bp3qesT4FWKt2eHjEga6YFnW9ZKa1O2SSYYiMoKzqpw=";
             };
           };
 

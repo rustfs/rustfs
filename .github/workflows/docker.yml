@@ -47,7 +47,7 @@ on:
         default: true
         type: boolean
       version:
-        description: "Version to build (latest for stable release, or specific version like v1.0.0, v1.0.0-alpha1)"
+        description: "Version to build (latest, v1.0.0, v1.0.0-alpha1, or v1.0.1-preview.1)"
         required: false
         default: "latest"
         type: string
@@ -82,9 +82,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main' &&
-       !contains(github.event.workflow_run.head_branch, '-preview'))
-    runs-on: ubuntu-latest
+       github.event.workflow_run.head_branch != 'main')
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -97,7 +96,7 @@ jobs:
       source_ref: ${{ steps.check.outputs.source_ref }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -197,7 +196,14 @@ jobs:
                   version="${version#v}"
                 fi
 
-                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                if [[ "$version" =~ -preview\.[0-9]+$ ]]; then
+                  build_type="preview"
+                  is_prerelease=true
+                  echo "🔍 Building Docker image for preview: $version (version tags only)"
+                elif [[ "$version" == *"-preview"* ]]; then
+                  echo "❌ Invalid preview tag: $version (expected suffix: -preview.<number>)" >&2
+                  exit 1
+                elif [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
                   # Pre-GA policy: prereleases update latest until the first stable tag exists.
@@ -249,11 +255,14 @@ jobs:
                 echo "🚀 Building with latest stable release version"
                 ;;
               *-preview*)
+                if [[ ! "$input_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-preview\.[0-9]+$ ]]; then
+                  echo "❌ Invalid preview version: $input_version" >&2
+                  exit 1
+                fi
                 build_type="preview"
                 is_prerelease=true
-                should_build=false
-                should_push=false
-                echo "⏭️  Preview tags do not publish Docker images"
+                version="${input_version#v}"
+                echo "🔍 Building with preview version: $version (version tags only)"
                 ;;
               # Prerelease versions (must match first, more specific)
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
@@ -343,7 +352,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           ref: ${{ needs.build-check.outputs.source_ref }}
@@ -492,7 +501,7 @@ jobs:
     name: Scan Docker Images
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: read
@@ -535,19 +544,67 @@ jobs:
           category: container-image-${{ matrix.variant }}
 
       - name: Upload container scan report
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: container-image-scan-${{ matrix.variant }}
           path: trivy-${{ matrix.variant }}.sarif
           if-no-files-found: error
           retention-days: 30
 
+  # Docker Hub's overview is a separate `full_description` field that
+  # `docker push` never touches, so it drifted from README.md and kept
+  # linking to pages that no longer exist (#7995). Republish it from the
+  # commit the images were built from, only when images were pushed.
+  sync-dockerhub-description:
+    name: Sync Docker Hub Description
+    needs: [ build-check, build-docker ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
+    runs-on: sm-standard-2
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build-check.outputs.source_ref }}
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: Sync Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.REGISTRY_DOCKERHUB }}
+          readme-filepath: ./README.md
+          # README.md links to docs/ and CONTRIBUTING.md by relative path;
+          # rewrite those to github.com URLs so they resolve on Docker Hub.
+          enable-url-completion: true
+
+      # Docker Hub caps `full_description` at 25,000 bytes and the action
+      # truncates to fit with only a warning, which would publish a README
+      # cut off mid-sentence. README.md is already near the cap, so read the
+      # published overview back and fail if it hit the limit.
+      - name: Check published description was not truncated
+        env:
+          REPOSITORY: ${{ env.REGISTRY_DOCKERHUB }}
+        run: |
+          limit=25000
+          published=$(curl -sSf "https://hub.docker.com/v2/repositories/${REPOSITORY}/" \
+            | jq -j '.full_description' | wc -c | tr -d ' ')
+          echo "Published overview: ${published} bytes (Docker Hub limit: ${limit})"
+          # Truncation lands within one UTF-8 character of the cap.
+          if [ "$published" -ge $((limit - 4)) ]; then
+            echo "::error file=README.md::Docker Hub overview was truncated at ${limit} bytes; trim README.md before the next release."
+            exit 1
+          fi
+
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Docker build completion summary
@@ -563,6 +620,10 @@ jobs:
           echo ""
 
           case "$BUILD_TYPE" in
+            "preview")
+              echo "🔍 Preview Docker image has been built with ${VERSION} tags"
+              echo "⏭️  Preview images do not update latest or prerelease channels"
+              ;;
             "release")
               echo "🚀 Release Docker image has been built with ${VERSION} tags"
               echo "✅ This image is ready for production use"

@@ -258,10 +258,11 @@ pub(crate) struct TableWarehouseIndexStateEntry {
     pub(super) state: TableCatalogEntryState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WarehouseIndexReservation {
     Created,
     AlreadyReserved,
+    Replaced(TableWarehouseIndexEntry),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

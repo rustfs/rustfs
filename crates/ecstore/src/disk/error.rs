@@ -35,10 +35,22 @@ pub(crate) struct TerminalReadError {
     source: DiskError,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DanglingDeleteGraceError {
     retry_after_secs: i64,
     grace_secs: i64,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("retired delete marker cleanup deferred: {0}")]
+struct RetiredMarkerDeferred(String);
+
+/// Marks a conditional-file write that failed before its publication rename.
+/// Callers may choose another owner only while this marker is preserved; every
+/// unmarked error remains commit-ambiguous and must fail closed.
+#[derive(Debug)]
+struct ConditionalFileNotCommittedError {
+    source: io::Error,
 }
 
 // DiskError == StorageErr
@@ -220,12 +232,27 @@ impl std::fmt::Display for DanglingDeleteGraceError {
 
 impl StdError for DanglingDeleteGraceError {}
 
-fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
+impl std::fmt::Display for ConditionalFileNotCommittedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for ConditionalFileNotCommittedError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn classify_internode_disk_error(error: &InternodeHttpError) -> Option<DiskError> {
     if error.is_remote_file_not_found() {
         return Some(DiskError::FileNotFound);
     }
     if error.is_remote_volume_not_found() {
         return Some(DiskError::VolumeNotFound);
+    }
+    if error.is_remote_file_corrupt() {
+        return Some(DiskError::FileCorrupt);
     }
     None
 }
@@ -291,6 +318,52 @@ impl DiskError {
             retry_after_secs,
             grace_secs,
         })
+    }
+
+    pub(crate) fn conditional_file_not_committed(source: io::Error) -> io::Error {
+        io::Error::new(source.kind(), ConditionalFileNotCommittedError { source })
+    }
+
+    /// Whether a local conditional-file replacement failed before the target
+    /// publication rename and therefore cannot have committed new owner bytes.
+    pub fn is_conditional_file_not_committed(&self) -> bool {
+        matches!(
+            self,
+            DiskError::Io(io_error)
+                if io_error
+                    .get_ref()
+                    .is_some_and(|source| source.downcast_ref::<ConditionalFileNotCommittedError>().is_some())
+        )
+    }
+
+    pub(crate) fn clone_dangling_delete_grace(error: &io::Error) -> Option<io::Error> {
+        let grace = error.get_ref()?.downcast_ref::<DanglingDeleteGraceError>()?;
+        Some(io::Error::new(error.kind(), grace.clone()))
+    }
+
+    pub(crate) fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        Self::other(RetiredMarkerDeferred(reason.into()))
+    }
+
+    pub fn io_error_is_retired_marker_deferred(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|source| source.is::<RetiredMarkerDeferred>())
+    }
+
+    pub(crate) fn clone_retired_marker_deferred(error: &io::Error) -> Option<io::Error> {
+        let deferred = error.get_ref()?.downcast_ref::<RetiredMarkerDeferred>()?;
+        Some(io::Error::other(deferred.clone()))
+    }
+
+    pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Io(error) => Self::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }
+    }
+
+    pub fn io_error_dangling_delete_retry_after(error: &io::Error) -> Option<std::time::Duration> {
+        let grace = error.get_ref()?.downcast_ref::<DanglingDeleteGraceError>()?;
+        u64::try_from(grace.retry_after_secs).ok().map(std::time::Duration::from_secs)
     }
 
     pub fn is_dangling_delete_grace(&self) -> bool {
@@ -456,13 +529,10 @@ fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorK
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
-            if error.is_remote_file_not_found() {
-                return DiskError::FileNotFound;
-            }
-            if error.is_remote_volume_not_found() {
-                return DiskError::VolumeNotFound;
-            }
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            && let Some(classified) = classify_internode_disk_error(error)
+        {
+            return classified;
         }
         let e = match e.downcast::<TerminalReadError>() {
             Ok(terminal_error) => {
@@ -471,7 +541,7 @@ impl From<std::io::Error> for DiskError {
                     && let Some(internode_error) = io_error
                         .get_ref()
                         .and_then(|source| source.downcast_ref::<InternodeHttpError>())
-                    && let Some(classified) = classify_internode_missing_error(internode_error)
+                    && let Some(classified) = classify_internode_disk_error(internode_error)
                 {
                     return classified;
                 }
@@ -627,13 +697,23 @@ impl From<tokio::task::JoinError> for DiskError {
 impl Clone for DiskError {
     fn clone(&self) -> Self {
         match self {
-            DiskError::Io(io_error) => DiskError::Io(
-                rustfs_rio::clone_internode_http_io_error(io_error)
-                    .and_then(std::io::Error::into_inner)
-                    // The helper derives a kind from the source; Clone must retain the original outer kind.
-                    .map(|source| std::io::Error::new(io_error.kind(), source))
-                    .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
+            DiskError::Io(io_error) if self.is_conditional_file_not_committed() => DiskError::Io(
+                DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
             ),
+            DiskError::Io(io_error) => {
+                if let Some(status) = io_error.get_ref().and_then(|source| source.downcast_ref::<RpcStatusError>()) {
+                    return DiskError::Io(io::Error::new(io_error.kind(), RpcStatusError(status.0.clone())));
+                }
+                DiskError::Io(
+                    Self::clone_dangling_delete_grace(io_error)
+                        .or_else(|| Self::clone_retired_marker_deferred(io_error))
+                        .or_else(|| rustfs_rio::clone_internode_http_io_error(io_error))
+                        .and_then(std::io::Error::into_inner)
+                        // The helper derives a kind from the source; Clone must retain the original outer kind.
+                        .map(|source| std::io::Error::new(io_error.kind(), source))
+                        .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
+                )
+            }
             DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             DiskError::Unexpected => DiskError::Unexpected,
             DiskError::CorruptedFormat => DiskError::CorruptedFormat,
@@ -821,6 +901,49 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn retired_marker_deferral_survives_disk_and_storage_clones() {
+        let original = DiskError::retired_marker_deferred("missing retirement record");
+        let disk = original.clone();
+        let storage = crate::error::StorageError::from(disk);
+        let cloned = storage.clone();
+        assert!(cloned.is_retired_marker_deferred());
+        assert!(crate::error::StorageError::from(original).is_retired_marker_deferred());
+        assert!(storage.is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::other(storage.to_string()).is_retired_marker_deferred());
+        assert!(!crate::error::StorageError::FileVersionNotFound.is_retired_marker_deferred());
+    }
+
+    #[test]
+    fn dangling_grace_retry_timing_survives_disk_and_storage_clones() {
+        let original = super::DiskError::dangling_delete_grace(21, 3600);
+        let disk = original.clone();
+        assert_eq!(disk.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        let storage: crate::error::StorageError = disk.into();
+        let cloned = storage.clone();
+        assert!(cloned.is_dangling_delete_grace());
+        assert_eq!(cloned.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(original.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(storage.dangling_delete_retry_after(), Some(std::time::Duration::from_secs(21)));
+        assert_eq!(super::DiskError::dangling_delete_grace(-1, 3600).dangling_delete_retry_after(), None);
+        assert_eq!(super::DiskError::FaultyDisk.dangling_delete_retry_after(), None);
+    }
+
+    #[test]
+    fn conditional_file_not_committed_marker_is_explicit_and_clone_safe() {
+        let marked = DiskError::from(DiskError::conditional_file_not_committed(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "staging rejected",
+        )));
+        assert!(marked.is_conditional_file_not_committed());
+        assert!(marked.is_conditional_file_not_committed());
+        assert!(!DiskError::Timeout.is_conditional_file_not_committed());
+        assert!(
+            !DiskError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "rename rejected"))
+                .is_conditional_file_not_committed()
+        );
+    }
+
+    #[test]
     fn terminal_read_error_preserves_kind_and_disk_classification() {
         let timeout = terminal_read_error_to_io(DiskError::Timeout);
         assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
@@ -840,6 +963,7 @@ mod tests {
         for (remote_error, expected) in [
             (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
             (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+            (rustfs_rio::new_test_remote_file_corrupt_http_io_error(), DiskError::FileCorrupt),
         ] {
             let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
             assert_eq!(DiskError::from(wrapped), expected);
@@ -1410,25 +1534,23 @@ mod tests {
     }
 
     #[test]
-    fn test_internode_missing_errors_preserve_disk_error_types() {
+    fn test_internode_disk_errors_preserve_disk_error_types() {
         let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
         let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let file_corrupt = DiskError::from(rustfs_rio::new_test_remote_file_corrupt_http_io_error());
         let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
             rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
         ));
 
         assert_eq!(file_missing, DiskError::FileNotFound);
         assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert_eq!(file_corrupt, DiskError::FileCorrupt);
         assert!(matches!(unmarked_server_error, DiskError::Io(_)));
-        for missing in [file_missing, volume_missing] {
-            assert_eq!(missing.clone(), missing);
+        for error in [file_missing, volume_missing, file_corrupt] {
+            assert_eq!(error.clone(), error);
             assert_eq!(
-                crate::disk::error_reduce::reduce_write_quorum_errs(
-                    &[Some(missing.clone()), Some(missing.clone()), None],
-                    &[],
-                    2
-                ),
-                Some(missing)
+                crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error.clone()), Some(error.clone()), None], &[], 2),
+                Some(error)
             );
         }
     }

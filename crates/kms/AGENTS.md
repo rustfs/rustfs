@@ -22,8 +22,9 @@ When changing key-management behavior, verify compatibility with:
 For local KMS end-to-end tests, keep proxy bypass settings:
 
 ```bash
+python3 scripts/e2e_binary.py build
 NO_PROXY=127.0.0.1,localhost HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
-cargo test --package e2e_test test_local_kms_end_to_end -- --nocapture --test-threads=1
+python3 scripts/e2e_binary.py run -- cargo test --package e2e_test test_local_kms_end_to_end -- --nocapture --test-threads=1
 ```
 
 ### Black-box behavior suite and the Vault lane

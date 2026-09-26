@@ -981,7 +981,7 @@ impl ScannerIOCache for SetDisks {
                     };
 
                     let mut cache = DataUsageCache::default();
-                    let revisions = match cache.load_with_revisions(store_clone_clone.clone(), &cache_name).await {
+                    let mut revisions = match cache.load_with_revisions(store_clone_clone.clone(), &cache_name).await {
                         Ok(revisions) => revisions,
                         Err(e) => {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
@@ -1145,6 +1145,7 @@ impl ScannerIOCache for SetDisks {
                     );
 
                     let before = cache.info.last_update;
+                    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
 
                     let scan_ctx = ctx_clone.child_token();
                     let scan = disk.clone().nsscanner_disk(
@@ -1156,11 +1157,13 @@ impl ScannerIOCache for SetDisks {
                         ScannerDiskScanOptions {
                             scan_mode,
                             prefix_scan_scope,
+                            checkpoint_tx: Some(checkpoint_tx),
                         },
                     );
                     tokio::pin!(scan);
                     let mut lock_watch = tokio::time::interval(SCANNER_CACHE_LOCK_POLL_INTERVAL);
                     lock_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut checkpoint_channel_closed = false;
                     let scan_result = loop {
                         tokio::select! {
                             result = &mut scan => break result,
@@ -1169,6 +1172,63 @@ impl ScannerIOCache for SetDisks {
                                     scan_ctx.cancel();
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner bucket cache lock was lost during bucket scan"));
+                                }
+                            }
+                            checkpoint = checkpoint_rx.recv(), if !checkpoint_channel_closed => {
+                                let Some(checkpoint) = checkpoint else {
+                                    checkpoint_channel_closed = true;
+                                    continue;
+                                };
+                                if cache_guard.is_lock_lost() {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(Error::other("scanner bucket cache lock was lost before checkpoint save"));
+                                }
+                                if ctx_clone.is_cancelled() {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(Error::other("scanner leader fence changed before checkpoint save"));
+                                }
+                                match persist_scanner_checkpoint(
+                                    store_clone_clone.clone(),
+                                    ScannerCheckpointPersistContext {
+                                        ctx: &ctx_clone,
+                                        expected_publication_epoch: expected_publication_epoch_clone,
+                                        cycle: want_cycle,
+                                        leader_epoch,
+                                    },
+                                    cache_name.as_str(),
+                                    &checkpoint,
+                                    &mut revisions,
+                                )
+                                .await
+                                {
+                                    ScannerCheckpointPersistResult::Saved => {
+                                        if cache_guard.is_lock_lost() || ctx_clone.is_cancelled() {
+                                            scan_ctx.cancel();
+                                            await_scanner_disk_shutdown(scan.as_mut()).await;
+                                            break Err(Error::other("scanner bucket cache fence changed after checkpoint save"));
+                                        }
+                                    }
+                                    ScannerCheckpointPersistResult::FenceChanged => {
+                                        scan_ctx.cancel();
+                                        await_scanner_disk_shutdown(scan.as_mut()).await;
+                                        break Err(Error::other("scanner bucket cache fence changed during checkpoint save"));
+                                    }
+                                    ScannerCheckpointPersistResult::Failed(error) => {
+                                        error!(
+                                            target: "rustfs::scanner::io",
+                                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                            component = LOG_COMPONENT_SCANNER,
+                                            subsystem = LOG_SUBSYSTEM_IO,
+                                            bucket = %bucket.name,
+                                            cache_name = %cache_name,
+                                            state = "periodic_checkpoint_save_failed",
+                                            error = %error,
+                                            "Scanner periodic checkpoint save failed"
+                                        );
+                                        checkpoint_channel_closed = true;
+                                    }
                                 }
                             }
                         }

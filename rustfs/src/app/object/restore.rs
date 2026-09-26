@@ -15,6 +15,7 @@
 //! RestoreObject path.
 
 use super::*;
+use rustfs_filemeta::RestoreStatus;
 
 // RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.
 const LEGACY_RESTORE_ORPHAN_GRACE: time::Duration = time::Duration::hours(24);
@@ -359,7 +360,7 @@ impl DefaultObjectUsecase {
                     X_AMZ_RESTORE.as_str().to_string(),
                     RestoreStatus {
                         is_restore_in_progress: Some(false),
-                        restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                        restore_expiry_date: Some(restore_expiry),
                     }
                     .to_string(),
                 );
@@ -368,7 +369,7 @@ impl DefaultObjectUsecase {
                     X_AMZ_RESTORE.as_str().to_string(),
                     RestoreStatus {
                         is_restore_in_progress: Some(true),
-                        restore_expiry_date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+                        restore_expiry_date: Some(OffsetDateTime::now_utc()),
                     }
                     .to_string(),
                 );

@@ -16,6 +16,7 @@
 
 use super::*;
 
+use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
@@ -1356,7 +1357,7 @@ impl DefaultObjectUsecase {
         };
         let committed = self.put_object_core(write, body, start_time).await?;
 
-        let raw_version = committed.obj_info.version_id.map(|v| v.to_string());
+        let raw_version = s3_response_version_id(committed.obj_info.version_id);
         let put_version = if committed.put_versioned { raw_version } else { None };
 
         let e_tag = committed.obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
@@ -1749,7 +1750,7 @@ impl DefaultObjectUsecase {
             let mut hrd =
                 HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1799,7 +1800,7 @@ impl DefaultObjectUsecase {
         };
 
         if size >= 0 {
-            if let Err(err) = reader.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
+            if let Err(err) = reader.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1867,7 +1868,7 @@ impl DefaultObjectUsecase {
 
         if let Some(material) = encryption_material {
             effective_sse = Some(material.server_side_encryption.clone());
-            effective_kms_key_id = material.kms_key_id.clone();
+            effective_kms_key_id = material.response_kms_key_id();
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
@@ -4187,7 +4188,7 @@ mod tests {
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
@@ -4268,7 +4269,7 @@ mod tests {
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, "archive.tar", &ObjectOptions::default())
             .await

@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
+use super::diagnostics::{CONNECT_DIAGNOSTIC_CAPABILITIES, DiagnosticCollectionPolicy, DiagnosticJobEnvelope};
+use super::environment::ENVIRONMENT_CAPABILITY;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
 use super::registration::CredentialValidationError;
@@ -82,7 +84,7 @@ pub(crate) struct PendingHeartbeat {
     protocol_version: String,
     request_id: String,
     agent_version: String,
-    capabilities: [String; 1],
+    capabilities: Vec<String>,
     sequence: u64,
     client_time: String,
     coarse_node_summary: CoarseNodeSummary,
@@ -92,7 +94,32 @@ impl PendingHeartbeat {
     fn is_valid(&self) -> bool {
         self.protocol_version == PROTOCOL_VERSION
             && self.agent_version == AGENT_VERSION
-            && self.capabilities[0] == "heartbeat"
+            && (self.capabilities == ["heartbeat"]
+                || self.capabilities == ["heartbeat", DiagnosticCollectionPolicy::policy_sync_capability()]
+                || self.capabilities
+                    == [
+                        "heartbeat",
+                        DiagnosticCollectionPolicy::policy_sync_capability(),
+                        ENVIRONMENT_CAPABILITY,
+                    ]
+                || self.capabilities
+                    == [
+                        "heartbeat",
+                        DiagnosticCollectionPolicy::policy_sync_capability(),
+                        ENVIRONMENT_CAPABILITY,
+                        "jobs",
+                        super::diagnostics::CPU_PROFILE_CAPABILITY,
+                    ]
+                || self.capabilities == heartbeat_capabilities(false)
+                || self.capabilities == heartbeat_capabilities(true)
+                // RUSTFS_COMPAT_TODO(connect-894) Remove after upgrades from the pre-service-memory capability set are unsupported.
+                // Preserve exact pending requests; never add the capability to a retry.
+                || [false, true].into_iter().any(|job_capable| {
+                    heartbeat_capabilities(job_capable)
+                        .iter()
+                        .filter(|capability| capability.as_str() != "profile.memory.service@1")
+                        .eq(self.capabilities.iter())
+                }))
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
             && is_exact_utc_seconds(&self.client_time)
@@ -108,13 +135,29 @@ struct HeartbeatResponse {
     accepted_version: String,
     #[serde(default)]
     capability_hints: Vec<String>,
+    #[serde(default)]
+    diagnostic_collection_policy: Option<DiagnosticCollectionPolicy>,
+    #[serde(default)]
+    diagnostic_job: Option<DiagnosticJobEnvelope>,
 }
 
 pub(crate) enum Delivery {
-    Accepted { server_time: String },
-    Retry { retry_after: Option<Duration> },
-    AuthenticationStopped { status: u16, reason: Option<String> },
-    Rejected { status: u16, reason: Option<String> },
+    Accepted {
+        server_time: String,
+        diagnostic_collection_policy: DiagnosticCollectionPolicy,
+        diagnostic_job: Option<Box<DiagnosticJobEnvelope>>,
+    },
+    Retry {
+        retry_after: Option<Duration>,
+    },
+    AuthenticationStopped {
+        status: u16,
+        reason: Option<String>,
+    },
+    Rejected {
+        status: u16,
+        reason: Option<String>,
+    },
 }
 
 pub(crate) struct HeartbeatSender {
@@ -143,8 +186,14 @@ impl HeartbeatSender {
                 {
                     return Err(HeartbeatError::Response);
                 }
+                let policy = accepted
+                    .diagnostic_collection_policy
+                    .unwrap_or_else(DiagnosticCollectionPolicy::stopped);
+                policy.validate().map_err(|_| HeartbeatError::Response)?;
                 Ok(Delivery::Accepted {
                     server_time: accepted.server_time,
+                    diagnostic_collection_policy: policy,
+                    diagnostic_job: accepted.diagnostic_job.map(Box::new),
                 })
             }
             TelemetryDelivery::Retry { retry_after } => Ok(Delivery::Retry { retry_after }),
@@ -157,6 +206,7 @@ impl HeartbeatSender {
 #[derive(Clone)]
 pub(crate) struct HeartbeatStateStore {
     path: PathBuf,
+    job_capable: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -167,8 +217,8 @@ struct HeartbeatState {
 }
 
 impl HeartbeatStateStore {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub(crate) fn new(path: PathBuf, job_capable: bool) -> Self {
+        Self { path, job_capable }
     }
 
     pub(crate) fn try_runtime_lock(&self) -> Result<fs::File, HeartbeatError> {
@@ -216,11 +266,12 @@ impl HeartbeatStateStore {
         if state.next_sequence > MAX_SEQUENCE {
             return Err(HeartbeatError::SequenceExhausted);
         }
+        let capabilities = heartbeat_capabilities(self.job_capable);
         let pending = PendingHeartbeat {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             request_id: Uuid::new_v4().to_string(),
             agent_version: AGENT_VERSION.to_owned(),
-            capabilities: ["heartbeat".to_owned()],
+            capabilities,
             sequence: state.next_sequence,
             client_time: now.to_rfc3339_opts(SecondsFormat::Secs, true),
             coarse_node_summary: summary,
@@ -278,6 +329,23 @@ impl HeartbeatStateStore {
         }
         result
     }
+}
+
+fn heartbeat_capabilities(job_capable: bool) -> Vec<String> {
+    let mut capabilities = vec![
+        "heartbeat".to_owned(),
+        DiagnosticCollectionPolicy::policy_sync_capability().to_owned(),
+        ENVIRONMENT_CAPABILITY.to_owned(),
+    ];
+    if job_capable {
+        capabilities.push("jobs".to_owned());
+    }
+    capabilities.extend(
+        CONNECT_DIAGNOSTIC_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned()),
+    );
+    capabilities
 }
 
 fn parent(path: &Path) -> Result<&Path, HeartbeatError> {
@@ -364,6 +432,16 @@ pub enum HeartbeatError {
     Endpoint,
     #[error("Connect heartbeat root CA configuration is invalid")]
     RootCertificate,
+    #[error("Connect heartbeat proxy configuration is invalid")]
+    ProxyConfiguration,
+    #[error("Connect proxy authentication failed; verify the configured proxy credential files")]
+    ProxyAuthentication,
+    #[error(
+        "Connect proxy connection failed; verify proxy availability, credentials, the proxy allow-list, and the Connect endpoint"
+    )]
+    ProxyRejected,
+    #[error("Connect TLS peer certificate validation failed; verify the endpoint and configured root CA")]
+    TlsPeer,
     #[error("Connect heartbeat schedule is invalid")]
     Schedule,
     #[error("RustFS is not registered with Connect")]
@@ -424,6 +502,10 @@ impl From<TelemetryError> for HeartbeatError {
         match error {
             TelemetryError::Endpoint => Self::Endpoint,
             TelemetryError::RootCertificate => Self::RootCertificate,
+            TelemetryError::ProxyConfiguration => Self::ProxyConfiguration,
+            TelemetryError::ProxyAuthentication => Self::ProxyAuthentication,
+            TelemetryError::ProxyRejected => Self::ProxyRejected,
+            TelemetryError::TlsPeer => Self::TlsPeer,
             TelemetryError::Schedule => Self::Schedule,
             TelemetryError::NotRegistered => Self::NotRegistered,
             TelemetryError::IdentityMissing => Self::IdentityMissing,

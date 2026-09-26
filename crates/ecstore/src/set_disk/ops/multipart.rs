@@ -29,23 +29,22 @@ use super::super::MetadataCacheInvalidationProbe;
 #[cfg(test)]
 use super::super::capacity_scope_from_disks;
 use super::super::{
-    AMZ_STORAGE_CLASS, Arc, Bytes, CompletePart, Cursor, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore,
-    EVENT_SET_DISK_MULTIPART, Error, FileInfo, GLOBAL_MIN_PART_SIZE, HashAlgorithm, HashMap, HashReader, HashSet,
-    HealChannelPriority, Instant, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, ListMultipartsInfo, ListPartsInfo,
-    MAX_PARTS_COUNT, MULTIPART_WRITE_QUORUM_RENAME_PART, MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
-    MULTIPART_WRITE_QUORUM_WRITER_SETUP, MultipartInfo, MultipartUploadResult, MultipartWriteQuorumContext, NamespaceLockFence,
-    OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectLockDiagGuard, ObjectOptions, ObjectPartInfo, OffsetDateTime, PartInfo,
-    PutObjReader, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY,
-    Result, SLASH_SEPARATOR, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID,
-    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
-    SmallWritePath, StorageError, Uuid, WriteLayout, check_object_lock_for_deletion_with_state,
-    classify_multipart_part_write_path, coding, complete_multipart_part_error, complete_multipart_part_error_result,
-    complete_part_checksum, completed_multipart_object_part, contains_key_str, create_bitrot_writer, debug, disk, error,
-    get_complete_multipart_md5, get_header_map, get_str, insert_str, is_err_object_not_found, is_err_version_not_found,
-    is_min_allowed_part_size, log_multipart_write_quorum_failure, parts_after_marker, path_join_buf,
-    record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
-    to_object_err, warn,
+    Arc, Bytes, CompletePart, Cursor, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore, EVENT_SET_DISK_MULTIPART, Error,
+    FileInfo, GLOBAL_MIN_PART_SIZE, HashAlgorithm, HashMap, HashReader, HashSet, HealChannelPriority, Instant,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, ListMultipartsInfo, ListPartsInfo, MAX_PARTS_COUNT,
+    MULTIPART_WRITE_QUORUM_RENAME_PART, MULTIPART_WRITE_QUORUM_UPLOAD_METADATA, MULTIPART_WRITE_QUORUM_WRITER_SETUP,
+    MultipartInfo, MultipartUploadResult, MultipartWriteQuorumContext, NamespaceLockFence, OBJECT_OP_IGNORED_ERRS, ObjectInfo,
+    ObjectLockDiagGuard, ObjectOptions, ObjectPartInfo, OffsetDateTime, PartInfo, PutObjReader, RUSTFS_META_MULTIPART_BUCKET,
+    RUSTFS_META_TMP_BUCKET, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, Result, SLASH_SEPARATOR,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError,
+    Uuid, WriteLayout, check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding,
+    complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, completed_multipart_object_part,
+    contains_key_str, create_bitrot_writer, debug, disk, error, get_complete_multipart_md5, get_header_map, get_str, insert_str,
+    is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure,
+    parts_after_marker, path_join_buf, record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    remove_header_map, resolve_write_layout, restore_commit_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 #[cfg(test)]
@@ -67,6 +66,7 @@ use crate::disk::DiskOption;
 use crate::disk::STORAGE_FORMAT_FILE;
 #[cfg(test)]
 use crate::disk::new_disk;
+use crate::erasure::coding::BitrotWriterWrapper;
 use crate::multipart_listing::paginate_multipart_listing;
 #[cfg(test)]
 use crate::object_api::ObjectLockConfigSnapshot;
@@ -78,9 +78,10 @@ use crate::storage_api_contracts::multipart::MultipartOperations;
 #[cfg(test)]
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::storage_api_contracts::object::ObjectOperations;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future::join_all, stream};
 #[cfg(test)]
 use http::HeaderMap;
+use rustfs_filemeta::metadata_keys;
 use rustfs_rio::EtagResolvable;
 use rustfs_rio::TryGetIndex;
 #[cfg(test)]
@@ -99,6 +100,49 @@ use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
+
+// The erasure-set width bounds fan-out. Await every opener so errors retain
+// their disk slots and every successful writer remains owned until quorum is checked.
+async fn create_part_writers(
+    disks: &[Option<DiskStore>],
+    path: &str,
+    length: i64,
+    shard_size: usize,
+) -> (Vec<Option<BitrotWriterWrapper>>, Vec<Option<DiskError>>) {
+    join_all(disks.iter().map(|disk| async move {
+        let Some(disk) = disk else {
+            return (None, Some(DiskError::DiskNotFound));
+        };
+        match create_bitrot_writer(
+            false,
+            Some(disk),
+            RUSTFS_META_TMP_BUCKET,
+            path,
+            length,
+            shard_size,
+            HashAlgorithm::HighwayHash256S,
+        )
+        .await
+        {
+            Ok(writer) => (Some(writer), None),
+            Err(err) => {
+                warn!(
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    disk = ?disk,
+                    state = "bitrot_writer_skipped",
+                    error = ?err,
+                    "Set disk multipart bitrot writer skipped"
+                );
+                (None, Some(err))
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .unzip()
+}
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
@@ -1542,45 +1586,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .map_err(Error::from)?);
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let mut writers = Vec::with_capacity(shuffle_disks.len());
-            let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
-                if let Some(disk) = disk_op {
-                    let writer = match create_bitrot_writer(
-                        false,
-                        Some(disk),
-                        RUSTFS_META_TMP_BUCKET,
-                        &tmp_part_path,
-                        erasure.shard_file_size(data.size()),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
-                    )
-                    .await
-                    {
-                        Ok(writer) => writer,
-                        Err(err) => {
-                            warn!(
-                                event = EVENT_SET_DISK_MULTIPART,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                disk = ?disk,
-                                state = "bitrot_writer_skipped",
-                                error = ?err,
-                                "Set disk multipart bitrot writer skipped"
-                            );
-                            errors.push(Some(err));
-                            writers.push(None);
-                            continue;
-                        }
-                    };
-
-                    writers.push(Some(writer));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    writers.push(None);
-                }
-            }
+            let (mut writers, errors) = create_part_writers(
+                &shuffle_disks,
+                &tmp_part_path,
+                erasure.shard_file_size(data.size()),
+                erasure.shard_size(),
+            )
+            .await;
 
             if let Some(stage_start) = writer_setup_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -1626,17 +1638,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             };
             let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let (reader, w_size) = match write_path {
-                SmallWritePath::SingleBlockNonInline => {
-                    Arc::clone(&erasure)
-                        .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
-                        .await?
-                }
-                SmallWritePath::PipelineBatchedLarge => {
-                    Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await?
-                }
-                SmallWritePath::Inline | SmallWritePath::Pipeline => Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await?,
+            let upload_suffix = rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY;
+            let protected_upload = rustfs_utils::http::get_consistent_str(&fi.metadata, upload_suffix) == Some("1");
+            if rustfs_utils::http::contains_key_str(&fi.metadata, upload_suffix) && !protected_upload {
+                return Err(DiskError::FileCorrupt.into());
+            }
+            use crate::erasure::coding::encode::IntegrityEncodeMode;
+            let mode = match write_path {
+                SmallWritePath::SingleBlockNonInline => IntegrityEncodeMode::SingleBlock(small_size_hint),
+                SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
+                SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let (reader, w_size, _, integrity) = Arc::clone(&erasure)
+                .encode_with_shard_integrity(stream, &mut writers, write_quorum, part_id, mode, protected_upload)
+                .await?;
 
             if let Some(stage_start) = encode_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -1674,6 +1689,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 )))?;
             }
 
+            let part_integrity = if let Some(integrity) = integrity {
+                Some(integrity.write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_part).await?)
+            } else { None };
+            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                return Err(Error::ErasureWriteQuorum);
+            }
+
             let index_op = data
                 .stream
                 .try_get_index()
@@ -1706,6 +1728,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 actual_size,
                 index: index_op,
                 checksums: if checksums.is_empty() { None } else { Some(checksums) },
+                integrity: part_integrity,
                 ..Default::default()
             };
 
@@ -1913,7 +1936,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // Extract storage class from metadata, default to STANDARD if not found
         let storage_class = fi
             .metadata
-            .get(AMZ_STORAGE_CLASS)
+            .get(metadata_keys::STORAGE_CLASS)
             .cloned()
             .unwrap_or_else(|| storageclass::STANDARD.to_string());
 
@@ -2065,6 +2088,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         crate::hp_guard!("SetDisks::new_multipart_upload");
+        let protect_upload = opts.shard_integrity_write_enabled();
         let storage_class_config = self.storage_class_config_snapshot();
         let mut _object_lock_guard = None;
 
@@ -2086,6 +2110,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let disks = disks.clone();
 
         let mut user_defined = opts.user_defined.clone();
+        rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
+        if protect_upload {
+            rustfs_utils::http::insert_str(
+                &mut user_defined,
+                rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY,
+                "1".to_owned(),
+            );
+        }
         rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
         if !opts.data_movement {
             rustfs_utils::http::remove_str(&mut user_defined, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD);
@@ -2103,10 +2135,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             user_defined.insert("etag".to_owned(), etag.clone());
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+        if let Some(sc) = user_defined.get(metadata_keys::STORAGE_CLASS)
             && sc == storageclass::STANDARD
         {
-            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+            let _ = user_defined.remove(metadata_keys::STORAGE_CLASS);
         }
 
         let WriteLayout {
@@ -2118,7 +2150,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             self.pool_index,
             disks.len(),
             self.default_parity_count,
-            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
             opts.max_parity,
         )?;
 
@@ -2160,10 +2192,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // TODO(backlog): detect content-type from part data when header is missing
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+        if let Some(sc) = user_defined.get(metadata_keys::STORAGE_CLASS)
             && sc == storageclass::STANDARD
         {
-            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+            let _ = user_defined.remove(metadata_keys::STORAGE_CLASS);
         }
 
         if let Some(checksum) = &opts.want_checksum {
@@ -2398,7 +2430,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica;
             if !authorized_inbound_replica {
                 fi.metadata
-                    .retain(|key, _| !key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS));
+                    .retain(|key, _| !key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS));
                 for suffix in [
                     rustfs_utils::http::SUFFIX_REPLICA_STATUS,
                     rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
@@ -2579,6 +2611,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 part.index.clone(),
                 part.checksums.clone(),
             );
+            let inserted = fi
+                .parts
+                .iter_mut()
+                .find(|entry| entry.number == part.number)
+                .ok_or(Error::FileCorrupt)?;
+            inserted.integrity.clone_from(&part.integrity);
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);
@@ -2587,16 +2625,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
-        let quota_context = reservation::begin(
-            &self.ctx,
-            bucket,
-            object,
-            opts.quota_admission,
-            opts.data_movement,
-            self.pool_index,
-            self.set_index,
-        )
-        .await?;
+        let quota_context = reservation::begin(&self.ctx, bucket, object, opts, self.pool_index, self.set_index).await?;
         let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
         let preserve_replication_ciphertext = opts.replication_request
             && contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
@@ -2948,6 +2977,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 Err(err) => return Err(err),
             }
         }
+
+        if rustfs_utils::http::contains_key_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+            && (rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
+                != Some("1")
+                || fi.parts.iter().any(|part| part.integrity.is_none()))
+        {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_UPLOAD_INTEGRITY);
+        fi.persist_shard_integrity()?;
 
         for meta in parts_metadatas.iter_mut() {
             if meta.has_valid_erasure_geometry() {
@@ -3566,6 +3605,82 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[tokio::test]
+    async fn multipart_writer_setup_opens_disks_concurrently_and_preserves_error_slots() {
+        use crate::cluster::rpc::internode_data_transport::{
+            InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, WalkDirStreamRequest,
+            WriteStreamRequest,
+        };
+        use crate::cluster::rpc::remote_disk::RemoteDisk;
+        use crate::disk::{Disk, FileReader, FileWriter};
+
+        #[derive(Debug)]
+        struct BarrierTransport {
+            barrier: Arc<tokio::sync::Barrier>,
+            fail: bool,
+        }
+        #[async_trait::async_trait]
+        impl InternodeDataTransport for BarrierTransport {
+            async fn open_read(&self, _: ReadStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not read")
+            }
+            async fn open_walk_dir(&self, _: WalkDirStreamRequest) -> disk::error::Result<FileReader> {
+                unreachable!("writer setup must not list")
+            }
+            async fn open_write(&self, request: WriteStreamRequest) -> disk::error::Result<FileWriter> {
+                assert_eq!(request.volume, RUSTFS_META_TMP_BUCKET);
+                assert_eq!(request.path, "upload/part.1");
+                self.barrier.wait().await;
+                if self.fail {
+                    Err(DiskError::FileAccessDenied)
+                } else {
+                    Ok(Box::new(tokio::io::sink()))
+                }
+            }
+            fn name(&self) -> &'static str {
+                "multipart-writer-test"
+            }
+            fn capabilities(&self) -> InternodeDataTransportCapabilities {
+                InternodeDataTransportCapabilities::tcp_http()
+            }
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut disks = Vec::new();
+        for i in 0..3 {
+            let endpoint = Endpoint {
+                url: url::Url::parse(&format!("http://multipart-test.invalid:9000/disk{i}")).expect("endpoint"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i,
+            };
+            let disk = RemoteDisk::new(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+                Arc::new(BarrierTransport {
+                    barrier: Arc::clone(&barrier),
+                    fail: i == 1,
+                }),
+            )
+            .await
+            .expect("remote disk");
+            disks.push(Some(Arc::new(Disk::Remote(Box::new(disk)))));
+        }
+        disks.insert(1, None);
+        // A serial opener cannot cross the barrier. The timeout only bounds failures;
+        // the assertion depends on all three independent openers making progress.
+        let (writers, errors) =
+            tokio::time::timeout(Duration::from_secs(10), create_part_writers(&disks, "upload/part.1", 1024, 256))
+                .await
+                .expect("all disk openers must be polled concurrently");
+        assert_eq!(writers.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, false, true]);
+        assert_eq!(errors, [None, Some(DiskError::DiskNotFound), Some(DiskError::FileAccessDenied), None]);
+    }
 
     #[test]
     fn multipart_bucket_incarnation_metadata_is_consistent_and_non_nil() {
@@ -5355,7 +5470,16 @@ mod tests {
             upload_path,
             upload_meta.data_dir.expect("multipart upload should have a data directory")
         );
-        let retry_meta = Bytes::from_static(b"interrupted retry metadata");
+        let retry_meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: 23,
+                etag: "interrupted-retry".to_owned(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("valid legacy retry metadata"),
+        );
 
         for (index, disk) in disk_stores.iter().enumerate().take(3) {
             let retry_path = format!("{}/part.1", Uuid::new_v4());
@@ -5423,7 +5547,16 @@ mod tests {
                 &src_path,
                 RUSTFS_META_MULTIPART_BUCKET,
                 &dst_path,
-                Bytes::from_static(b"retry metadata"),
+                Bytes::from(
+                    ObjectPartInfo {
+                        number: 1,
+                        size: 9,
+                        etag: "retry".to_owned(),
+                        ..Default::default()
+                    }
+                    .marshal_msg()
+                    .expect("valid legacy part metadata"),
+                ),
                 3,
                 None,
             )
@@ -5765,6 +5898,61 @@ mod tests {
             leftovers.is_empty(),
             "failed multipart upload part must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn capped_staging_queue_does_not_poll_the_part_reader() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-staging-body-demand";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut options = ObjectOptions::default();
+        insert_str(&mut options.user_defined, "max-total-object-size", "1024".to_owned());
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &options)
+            .await
+            .expect("capped upload");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        let semaphore = capped_multipart_staging_semaphore(&upload_path);
+        let held = Arc::clone(&semaphore).acquire_owned().await.expect("hold staging permit");
+        let owners = Arc::strong_count(&semaphore);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = Arc::clone(&polls);
+        let stream = futures::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(vec![7; 512]))]).inspect(move |_| {
+            body_polls.fetch_add(1, Ordering::Relaxed);
+        });
+        let input = tokio_util::io::StreamReader::new(stream);
+        let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let task = tokio::spawn(async move {
+            set_disks
+                .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&semaphore) == owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("part must reach the actual staging semaphore");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::resume();
+        assert_eq!(polls.load(Ordering::Relaxed), 0, "staging admission must not create read demand");
+        assert!(!task.is_finished());
+        drop(held);
+        let part = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("staging permit released")
+            .expect("part task")
+            .expect("queued part");
+        assert_eq!(part.size, 512);
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        drop(semaphore);
+        remove_capped_multipart_staging_semaphore(&upload_path);
     }
 
     #[tokio::test]
@@ -8728,8 +8916,7 @@ mod tests {
                 rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
                 "foreign-replica-time".to_string(),
             );
-            create_replication_metadata
-                .insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            create_replication_metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), "REPLICA".to_string());
             let (upload_id, parts) = stage_upload_with_create_opts(
                 &set_disks,
                 bucket,
@@ -8800,7 +8987,7 @@ mod tests {
                 completed
                     .user_defined
                     .iter()
-                    .filter(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS))
                     .all(|(_, value)| value != "REPLICA")
             );
 
@@ -8856,7 +9043,7 @@ mod tests {
                 rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
                 "authorized-inbound-time".to_string(),
             );
-            inbound_replica_metadata.insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            inbound_replica_metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), "REPLICA".to_string());
             let (upload_id, parts) = stage_upload_with_create_opts(
                 &set_disks,
                 bucket,
@@ -8897,7 +9084,7 @@ mod tests {
                 inbound
                     .user_defined
                     .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .find(|(key, _)| key.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS))
                     .map(|(_, value)| value.as_str()),
                 Some("REPLICA")
             );

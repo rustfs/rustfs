@@ -19,6 +19,7 @@ use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecis
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
+use crate::app::trailer_adapter::trailer_source;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 
@@ -2140,7 +2141,7 @@ impl DefaultObjectUsecase {
         let mut archive_reader =
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
-        if let Err(err) = archive_reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+        if let Err(err) = archive_reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
             return Err(ApiError::from(err).into());
         }
 
@@ -2503,7 +2504,7 @@ impl DefaultObjectUsecase {
                 .await
             ) {
                 effective_sse = Some(material.server_side_encryption.clone());
-                effective_kms_key_id = material.kms_key_id.clone();
+                effective_kms_key_id = material.response_kms_key_id();
                 write_plan = write_plan.with_encryption(material.write_encryption(None));
                 let encryption_metadata = extract_try!(encryption_material_to_metadata(&material));
                 metadata.extend(encryption_metadata.clone());
@@ -2744,6 +2745,15 @@ mod tests {
     impl crate::runtime_sources::NotifyInterface for RecordingNotify {
         async fn notify(&self, args: rustfs_notify::EventArgs) {
             let _ = self.events.send(args.version_id);
+        }
+
+        async fn validate_event_specific_rules(
+            &self,
+            _bucket_name: &str,
+            _region: &str,
+            _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
+        ) -> Result<(), rustfs_notify::NotificationError> {
+            Ok(())
         }
 
         async fn add_event_specific_rules(

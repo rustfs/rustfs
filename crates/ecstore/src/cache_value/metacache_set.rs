@@ -23,7 +23,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     task::{Context, Poll},
     time::Duration,
 };
@@ -41,6 +41,11 @@ const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub(crate) type PartialResultFn = Box<
+    dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = disk::error::Result<()>> + Send>>
+        + Send
+        + 'static,
+>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Clone, Default)]
@@ -222,11 +227,15 @@ pub struct ListPathRawOptions {
     pub filter_prefix: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
+    /// Deliver every replica to the partial callback, including matching headers.
+    pub preserve_replica_metadata: bool,
     pub report_not_found: bool,
     pub per_disk_limit: i32,
     pub skip_walkdir_total_timeout: bool,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
+    /// Shared terminal state for bounded producer walks.
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
@@ -254,11 +263,13 @@ impl Clone for ListPathRawOptions {
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
+            preserve_replica_metadata: self.preserve_replica_metadata,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
             walkdir_timeout: self.walkdir_timeout,
             walkdir_stall_timeout: self.walkdir_stall_timeout,
+            producer_limit_reached: self.producer_limit_reached.clone(),
             #[cfg(test)]
             test_reader_behaviors: self.test_reader_behaviors.clone(),
             #[cfg(test)]
@@ -284,6 +295,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         skip_total_timeout: opts.skip_walkdir_total_timeout,
         timeout_ms: opts.walkdir_timeout.map(duration_millis),
         stall_timeout_ms: opts.walkdir_stall_timeout.map(duration_millis),
+        producer_limit_reached: opts.producer_limit_reached.clone(),
         ..Default::default()
     }
 }
@@ -291,7 +303,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, None).await
+    list_path_raw_inner(rx, opts, None, None).await
 }
 
 pub(crate) async fn list_path_raw_with_claim_tracker(
@@ -301,13 +313,25 @@ pub(crate) async fn list_path_raw_with_claim_tracker(
 ) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
-    list_path_raw_inner(rx, opts, Some(claim_tracker)).await
+    list_path_raw_inner(rx, opts, Some(claim_tracker), None).await
+}
+
+pub(crate) async fn list_path_raw_with_partial_result(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+    claim_tracker: FallbackClaimTracker,
+    partial_result: PartialResultFn,
+) -> disk::error::Result<()> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
+    list_path_raw_inner(rx, opts, Some(claim_tracker), Some(partial_result)).await
 }
 
 async fn list_path_raw_inner(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     fallback_claim_tracker: Option<FallbackClaimTracker>,
+    partial_result: Option<PartialResultFn>,
 ) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
         return Err(DiskError::ErasureReadQuorum);
@@ -918,7 +942,7 @@ async fn list_path_raw_inner(
                 break;
             }
 
-            if agree == readers.len() {
+            if agree == readers.len() && !opts.preserve_replica_metadata {
                 for r in readers.iter_mut() {
                     let _ = r.skip(1).await;
                 }
@@ -944,7 +968,13 @@ async fn list_path_raw_inner(
                 }
             }
 
-            if let Some(partial_fn) = opts.partial.as_ref() {
+            if let Some(partial_fn) = partial_result.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = revjob_rx.cancelled() => return Ok(()),
+                    result = partial_fn(MetaCacheEntries(top_entries), &errs) => result?,
+                }
+            } else if let Some(partial_fn) = opts.partial.as_ref() {
                 tokio::select! {
                     biased;
                     _ = revjob_rx.cancelled() => return Ok(()),
@@ -1583,6 +1613,39 @@ mod tests {
         timeout(Duration::from_secs(1), stopped.notified())
             .await
             .expect("aborting the listing should drop the blocked producer");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_propagates_partial_callback_failure() {
+        let first = MetaCacheEntry {
+            name: "bucket/object-a".to_string(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let second = MetaCacheEntry {
+            name: "bucket/object-b".to_string(),
+            metadata: vec![2],
+            ..Default::default()
+        };
+
+        let err = list_path_raw_with_partial_result(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![first]),
+                    TestReaderBehavior::Entries(vec![second]),
+                ],
+                ..Default::default()
+            },
+            FallbackClaimTracker::default(),
+            Box::new(move |_, _| Box::pin(async { Err(DiskError::ErasureReadQuorum) })),
+        )
+        .await
+        .expect_err("a resolution failure after reader advancement must fail the listing");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[tokio::test]

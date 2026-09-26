@@ -13,6 +13,7 @@
 // limitations under the License.
 /// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
 pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
     let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
@@ -21,6 +22,118 @@ pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCac
 
 pub(crate) fn scanner_cache_lock_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
+#[derive(Debug)]
+pub(crate) enum ScannerCheckpointPersistResult {
+    Saved,
+    FenceChanged,
+    Failed(StorageError),
+}
+
+pub(crate) struct ScannerCheckpointPersistContext<'a> {
+    pub(crate) ctx: &'a CancellationToken,
+    pub(crate) expected_publication_epoch: u64,
+    pub(crate) cycle: u64,
+    pub(crate) leader_epoch: u64,
+}
+
+const CHECKPOINT_FOREGROUND_QUIET_WAIT: Duration = Duration::from_secs(1);
+
+async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
+    let deadline = tokio::time::Instant::now() + CHECKPOINT_FOREGROUND_QUIET_WAIT;
+    loop {
+        if crate::workload_admission::foreground_workload_activity() == 0 {
+            return true;
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+
+        let backoff = Duration::from_millis(
+            crate::workload_admission::foreground_workload_activity()
+                .saturating_mul(10)
+                .min(250),
+        )
+        .max(Duration::from_millis(10))
+        .min(remaining);
+        tokio::select! {
+            _ = ctx.cancelled() => return false,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+    }
+}
+
+/// Persist one bounded checkpoint and refresh its CAS revisions.
+///
+/// Local and remote workers share the same publication/leader fencing and
+/// revision-refresh contract; only their lock/cancellation handling remains
+/// at the caller because those guards have different concrete types.
+pub(crate) async fn persist_scanner_checkpoint<S>(
+    store: Arc<S>,
+    context: ScannerCheckpointPersistContext<'_>,
+    cache_name: &str,
+    checkpoint: &DataUsageCache,
+    revisions: &mut DataUsageCacheRevisions,
+) -> ScannerCheckpointPersistResult
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let foreground_quiet = wait_for_checkpoint_foreground_quiet(context.ctx).await;
+    if !foreground_quiet && context.ctx.is_cancelled() {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+    if !foreground_quiet {
+        debug!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            cache_name,
+            state = "checkpoint_foreground_wait_expired",
+            "Scanner checkpoint foreground quiet wait expired; preserving bounded progress"
+        );
+    }
+
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+        .await
+        .is_err()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+    if scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    if let Err(error) = checkpoint
+        .save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch)
+        .await
+    {
+        return ScannerCheckpointPersistResult::Failed(error);
+    }
+
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+        .await
+        .is_err()
+        || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+            .await
+            .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    match DataUsageCache::read_revisions(store, cache_name).await {
+        Ok(next_revisions) => {
+            *revisions = next_revisions;
+            ScannerCheckpointPersistResult::Saved
+        }
+        Err(error) => ScannerCheckpointPersistResult::Failed(error),
+    }
 }
 
 #[derive(Debug)]
@@ -320,6 +433,13 @@ impl ScannerPublicationExpectation {
 
     pub(crate) fn same_candidate(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
+        Self {
+            candidate: Arc::new((candidate_digest, coverage_digest)),
+        }
     }
 }
 

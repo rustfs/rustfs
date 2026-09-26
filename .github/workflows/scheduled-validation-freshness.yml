@@ -29,6 +29,9 @@ concurrency:
 jobs:
   check-freshness:
     name: Check scheduled validation freshness
+    # Stay on GitHub-hosted runners: this monitor must keep running when the
+    # self-hosted sm-standard-* pool is down, which is exactly when the
+    # scheduled validations it watches stall.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -36,7 +39,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Check latest scheduled runs
@@ -54,5 +57,5 @@ jobs:
         if: failure()
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
           details-file: ${{ runner.temp }}/scheduled-validation-freshness.md

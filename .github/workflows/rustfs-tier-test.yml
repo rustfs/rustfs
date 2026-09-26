@@ -1,6 +1,12 @@
 name: RustFS Tier Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       rustfs_version:
@@ -39,7 +45,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
@@ -61,9 +67,14 @@ env:
 jobs:
   tier-test:
     runs-on: smoke-testing
-    timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    timeout-minutes: 60
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout chain tooling
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
       - name: Initialize run evidence directory
         id: evidence
         run: |
@@ -76,27 +87,24 @@ jobs:
           test -d "${TIER_ARTIFACTS_DIR}"
           test ! -L "${TIER_ARTIFACTS_DIR}"
 
-      # auto-testing is private: clone it with the dedicated PF token (not
-      # GITHUB_TOKEN) and retry transient GitHub/network failures.
-      - name: Checkout auto-testing scripts (with retry)
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Prepare pinned RustFS CLI
+        timeout-minutes: 5
         id: rc
         run: |
           set -euo pipefail
@@ -209,6 +217,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
@@ -229,6 +238,7 @@ jobs:
           done
 
       - name: Ensure MQTT broker + clients
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           if ! command -v mosquitto_sub >/dev/null 2>&1; then
@@ -258,6 +268,9 @@ jobs:
 
       - name: Run tier suite
         id: test
+        timeout-minutes: 45
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
         continue-on-error: true
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
@@ -299,6 +312,8 @@ jobs:
           mv "${TMP_FILE}" "${RESULT_FILE}"
 
       - name: Generate report
+        id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
@@ -343,6 +358,20 @@ jobs:
               echo "Structured report generation failed before producing output (exit ${CASE_GATE_RC})."
             } > "${CASE_TABLE}"
           fi
+          # The tier case table carries a "## Case Summary" bullet list
+          # (Total/PASS/FAIL/...); parse the counts from there. Fall back to
+          # the case-ID table rows if the bullets are absent.
+          CASES_FAIL="$(grep -m1 -E '^- FAIL: [0-9]+' "${CASE_TABLE}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+          if [ -n "${CASES_FAIL}" ]; then
+            CASES_PASS="$(grep -m1 -E '^- PASS: [0-9]+' "${CASE_TABLE}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+            CASES_PASS=$(( ${CASES_PASS:-0} + 0 ))
+          else
+            CASES_TOTAL="$(grep -cE '^\| [A-Za-z0-9_.-]+ \| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
+            CASES_FAIL="$(grep -cE '^\| [A-Za-z0-9_.-]+ \| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
+            CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
+            CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
+          fi
+          CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
           {
             echo "# RustFS tier test report"
             echo ""
@@ -355,6 +384,8 @@ jobs:
             echo ""
             cat "${CASE_TABLE}"
             echo ""
+            echo "- Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed (failing cases are tracked in rustfs/backlog)"
+            echo ""
             echo "## Log tail"
             echo '```text'
             tail -n 200 "${LOG_FILE}" || true
@@ -363,6 +394,7 @@ jobs:
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -395,6 +427,7 @@ jobs:
           rm -f "${B64_FILE}"
 
       - name: Verify required tier evidence
+        timeout-minutes: 2
         id: evidence_verify
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
@@ -425,14 +458,16 @@ jobs:
           [ "${failed}" -eq 0 ]
 
       - name: Upload report and logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-tier-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.TIER_ARTIFACTS_DIR }}/
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: always()
         run: |
           set -euo pipefail
@@ -454,6 +489,7 @@ jobs:
           done
 
       - name: Cleanup pinned RustFS CLI
+        timeout-minutes: 2
         if: always()
         run: |
           set -euo pipefail
@@ -496,7 +532,8 @@ jobs:
           [ "${failed}" -eq 0 ]
 
       - name: File failure issue in rustfs/backlog
-        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled' || steps.evidence_verify.outcome == 'failure' || steps.evidence_verify.outcome == 'cancelled' || steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled') }}
+        timeout-minutes: 2
+        if: ${{ always() && (steps.evidence.outcome != 'success' || steps.test.outcome == 'cancelled' || steps.evidence_verify.outcome == 'failure' || steps.evidence_verify.outcome == 'cancelled' || (steps.gate.outcome == 'failure' && steps.test.outcome != 'failure') || steps.gate.outcome == 'cancelled') }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
@@ -515,10 +552,10 @@ jobs:
             echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT})"
           EXISTING="$(gh issue list -R rustfs/backlog --state all \
             --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
+            --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number")"
           if [ -n "${EXISTING}" ]; then
             echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
             exit 0
@@ -564,6 +601,68 @@ jobs:
             gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
           fi
           echo "filed backlog issue for suite ${SUITE}"
+
+      - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
+        # Case-level issue management complements the infrastructure failure report:
+        # - dedups by signal: failing cases are matched against open backlog
+        #   issues by label (category + case ID); covered cases become a
+        #   comment on the existing issue, only uncovered cases file a new one
+        # - labels new issues (functional-test, category, case IDs, env)
+        # - closes fixed issues after a fully green run
+        # - never files or closes on cancelled runs
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          VERIFY_OUTCOME: ${{ steps.evidence_verify.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          SUITE: 'tier'
+          SUITE_LABEL: 'Tier'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
+            exit 0
+          fi
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found in auto-testing checkout; skipping"
+            exit 0
+          fi
+          if [ ! -d "${TIER_ARTIFACTS_DIR}" ] || [ -L "${TIER_ARTIFACTS_DIR}" ]; then
+            echo "tier evidence directory is missing or unsafe; skipping backlog issue management" >&2
+            exit 1
+          fi
+          OUTCOME="${TEST_OUTCOME}"
+          if [ "${OUTCOME}" != "cancelled" ] && { [ "${VERIFY_OUTCOME}" != "success" ] || [ "${GATE_OUTCOME}" != "success" ]; }; then
+            OUTCOME=failure
+          fi
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          PACKAGE_SOURCE=""
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
+            --outcome "${OUTCOME}" \
+            --report "${TIER_ARTIFACTS_DIR}/rustfs-tier-cases.md" \
+            --report-file "${TIER_ARTIFACTS_DIR}/rustfs-tier-report.md" \
+            --log "${TIER_ARTIFACTS_DIR}/rustfs-tier.log" \
+            --run-url "${RUN_URL}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${{ github.event_name }}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --date "$(date -u +%Y-%m-%d)"
 
       - name: "Continue functional chain (next: Storage engine)"
         # Only chain-triggered runs forward to the next suite; standalone
@@ -619,3 +718,24 @@ jobs:
         run: |
           echo "RustFS tier suite failed"
           echo "See the uploaded report and log artifacts for details."
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite tier
+          --report "${TIER_ARTIFACTS_DIR}/rustfs-tier-cases.md"
+          --output "${RUNNER_TEMP}/chain-tier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/tier.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-chain-tier-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-tier-${{ github.run_id }}-${{ github.run_attempt }}/tier.json
+          if-no-files-found: error

@@ -90,13 +90,13 @@ jobs:
             cache_key: e2e-multipart-layout-baseline
             test: rc5_baseline_replicates_multipart_layouts
             artifact: multipart-layout-baseline
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -125,20 +125,19 @@ jobs:
 
       - name: Build current RustFS binary
         run: |
-          cargo build --locked -p rustfs --bin rustfs
-          : > target/debug/rustfs.features
+          python3 scripts/e2e_binary.py build
 
       - name: Run upgrade compatibility test
         env:
           RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
         run: |
-          cargo test --locked -p e2e_test \
+          python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test \
             "upgrade_compatibility_test::${{ matrix.test }}" \
             -- --ignored --exact --nocapture
 
       - name: Upload scanner/heal G09 evidence
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}-g09-evidence-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence/${{ matrix.artifact }}
@@ -147,7 +146,7 @@ jobs:
 
       - name: Upload server logs
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}-server-logs-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-logs

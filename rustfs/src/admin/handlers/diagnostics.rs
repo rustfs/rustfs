@@ -47,13 +47,20 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
 pub(crate) const CLIENT_DEVNULL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const CLIENT_DEVNULL_MAX_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const CLIENT_DEVNULL_MAX_CONCURRENCY: usize = 4;
+pub(crate) const CLIENT_DEVNULL_SOURCE_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const NETWORK_PROBE_MAX_CONCURRENCY: usize = 1;
+pub(crate) use crate::storage::storage_api::ecstore_rpc::{
+    MAX_NETWORK_PROBE_BYTES as NETWORK_PROBE_MAX_BYTES, MAX_NETWORK_PROBE_DURATION as NETWORK_PROBE_MAX_DURATION,
+};
 static CLIENT_DEVNULL_ADMISSION: Semaphore = Semaphore::const_new(CLIENT_DEVNULL_MAX_CONCURRENCY);
+static NETWORK_PROBE_ADMISSION: Semaphore = Semaphore::const_new(NETWORK_PROBE_MAX_CONCURRENCY);
 
 /// Cap on how many locks a single `top/locks` response enumerates, matching the
 /// MinIO default page size and bounding response size on busy clusters.
@@ -123,6 +130,11 @@ pub fn register_diagnostics_route(r: &mut S3Router<AdminOperation>) -> std::io::
         Method::POST,
         format!("{ADMIN_PREFIX}/v3/speedtest/client/devnull").as_str(),
         AdminOperation(&SpeedtestClientDevnullHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/speedtest/client/devnull").as_str(),
+        AdminOperation(&SpeedtestClientSourceHandler {}),
     )?;
 
     Ok(())
@@ -806,6 +818,17 @@ struct DriveSpeedtestEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct NetworkSpeedtestEntry {
+    peer_alias: String,
+    outcome: &'static str,
+    reason: &'static str,
+    transferred_bytes: u64,
+    duration_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SpeedtestResponse {
     kind: &'static str,
     /// `true` when the reported numbers come from a real measurement/observation
@@ -821,6 +844,8 @@ struct SpeedtestResponse {
     aggregate_write_throughput_bytes_per_sec: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     drives: Vec<DriveSpeedtestEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    peers: Vec<NetworkSpeedtestEntry>,
     /// Bytes drained by the net/devnull probe and how long it took.
     #[serde(skip_serializing_if = "Option::is_none")]
     rx_bytes: Option<u64>,
@@ -861,6 +886,7 @@ async fn run_drive_speedtest() -> S3Result<SpeedtestResponse> {
         aggregate_read_throughput_bytes_per_sec: Some(agg_read),
         aggregate_write_throughput_bytes_per_sec: Some(agg_write),
         drives,
+        peers: Vec::new(),
         rx_bytes: None,
         duration_secs: None,
     })
@@ -879,25 +905,109 @@ fn object_speedtest_unsupported() -> SpeedtestResponse {
         aggregate_read_throughput_bytes_per_sec: None,
         aggregate_write_throughput_bytes_per_sec: None,
         drives: Vec::new(),
+        peers: Vec::new(),
         rx_bytes: None,
         duration_secs: None,
     }
 }
 
-fn net_speedtest_single_node() -> SpeedtestResponse {
+async fn run_network_speedtest() -> SpeedtestResponse {
+    use crate::storage::storage_api::ecstore_rpc::{NetworkPeerProbeClient, NetworkPeerProbeError};
+
+    let Some(endpoint_pools) = crate::runtime_sources::current_endpoints_handle() else {
+        return unavailable_network_speedtest("cluster topology is not initialized");
+    };
+    let client = NetworkPeerProbeClient::from_endpoint_pools(&endpoint_pools);
+    let targets = client.targets();
+    if targets.is_empty() {
+        return unavailable_network_speedtest("the current topology has no remote peers");
+    }
+    let peer_count = u64::try_from(targets.len()).unwrap_or(u64::MAX);
+    let traffic_bytes = NETWORK_PROBE_MAX_BYTES.checked_div(peer_count).unwrap_or(0);
+    if traffic_bytes == 0 {
+        return unavailable_network_speedtest("the current topology exceeds the probe traffic budget");
+    }
+    let Ok(_permit) = NETWORK_PROBE_ADMISSION.try_acquire() else {
+        return unavailable_network_speedtest("another inter-node network probe is already running");
+    };
+
+    let started = std::time::Instant::now();
+    let cancel = CancellationToken::new();
+    let mut peers = Vec::with_capacity(targets.len());
+    let mut transferred_bytes = 0_u64;
+    for target in targets {
+        let remaining = NETWORK_PROBE_MAX_DURATION.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            peers.push(network_speedtest_failure(target.alias, NetworkPeerProbeError::TimedOut, Duration::ZERO));
+            continue;
+        }
+        let peer_started = std::time::Instant::now();
+        match client.probe(&target.alias, traffic_bytes, remaining, &cancel).await {
+            Ok(measurement) => {
+                transferred_bytes = transferred_bytes.saturating_add(measurement.transferred_bytes);
+                peers.push(NetworkSpeedtestEntry {
+                    peer_alias: target.alias,
+                    outcome: "SUCCEEDED",
+                    reason: "COMPLETE",
+                    transferred_bytes: measurement.transferred_bytes,
+                    duration_secs: measurement.duration.as_secs_f64(),
+                    latency_micros: u64::try_from(measurement.latency.as_micros()).ok(),
+                });
+            }
+            Err(error) => peers.push(network_speedtest_failure(target.alias, error, peer_started.elapsed())),
+        }
+    }
+    let elapsed = started.elapsed().min(NETWORK_PROBE_MAX_DURATION);
+    let successful = peers.iter().filter(|peer| peer.outcome == "SUCCEEDED").count();
+    let throughput = (successful > 0 && !elapsed.is_zero()).then(|| transferred_bytes as f64 / elapsed.as_secs_f64());
+    SpeedtestResponse {
+        kind: "net",
+        measured: successful > 0,
+        capability_note: (successful != peers.len()).then(|| "one or more inter-node probes failed".to_string()),
+        aggregate_read_throughput_bytes_per_sec: None,
+        aggregate_write_throughput_bytes_per_sec: throughput,
+        drives: Vec::new(),
+        peers,
+        rx_bytes: None,
+        duration_secs: Some(elapsed.as_secs_f64()),
+    }
+}
+
+fn unavailable_network_speedtest(reason: &str) -> SpeedtestResponse {
     SpeedtestResponse {
         kind: "net",
         measured: false,
-        capability_note: Some(
-            "network speedtest measures inter-node bandwidth; a distributed peer-perf harness is not yet wired. See \
-             /v3/site-replication/netperf for the site-to-site variant"
-                .to_string(),
-        ),
+        capability_note: Some(reason.to_owned()),
         aggregate_read_throughput_bytes_per_sec: None,
         aggregate_write_throughput_bytes_per_sec: None,
         drives: Vec::new(),
+        peers: Vec::new(),
         rx_bytes: None,
         duration_secs: None,
+    }
+}
+
+fn network_speedtest_failure(
+    peer_alias: String,
+    error: crate::storage::storage_api::ecstore_rpc::NetworkPeerProbeError,
+    duration: Duration,
+) -> NetworkSpeedtestEntry {
+    use crate::storage::storage_api::ecstore_rpc::NetworkPeerProbeError;
+    let reason = match error {
+        NetworkPeerProbeError::UnknownPeer => "UNKNOWN_PEER",
+        NetworkPeerProbeError::LimitExceeded => "LIMIT_EXCEEDED",
+        NetworkPeerProbeError::Cancelled => "CANCELLED",
+        NetworkPeerProbeError::Unreachable => "UNREACHABLE",
+        NetworkPeerProbeError::TimedOut => "TIMED_OUT",
+        NetworkPeerProbeError::ProtocolFailure => "PROTOCOL_FAILURE",
+    };
+    NetworkSpeedtestEntry {
+        peer_alias,
+        outcome: "FAILED",
+        reason,
+        transferred_bytes: 0,
+        duration_secs: duration.as_secs_f64(),
+        latency_micros: None,
     }
 }
 
@@ -915,7 +1025,7 @@ impl Operation for SpeedtestHandler {
         let response = match kind {
             SpeedtestKind::Drive => run_drive_speedtest().await?,
             SpeedtestKind::Object => object_speedtest_unsupported(),
-            SpeedtestKind::Net => net_speedtest_single_node(),
+            SpeedtestKind::Net => run_network_speedtest().await,
             SpeedtestKind::Site => SpeedtestResponse {
                 kind: "site",
                 measured: false,
@@ -925,6 +1035,7 @@ impl Operation for SpeedtestHandler {
                 aggregate_read_throughput_bytes_per_sec: None,
                 aggregate_write_throughput_bytes_per_sec: None,
                 drives: Vec::new(),
+                peers: Vec::new(),
                 rx_bytes: None,
                 duration_secs: None,
             },
@@ -939,6 +1050,23 @@ impl Operation for SpeedtestHandler {
 /// received and how long it took, giving a genuine one-way upload throughput
 /// number (mirrors MinIO's `ClientDevNull`).
 pub struct SpeedtestClientDevnullHandler {}
+
+/// `GET /v3/speedtest/client/devnull?bytes=N` — bounded generated download.
+pub struct SpeedtestClientSourceHandler {}
+
+fn client_source_bytes(uri: &Uri) -> S3Result<usize> {
+    let bytes = query_value(uri, "bytes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| s3_error!(InvalidRequest, "client speedtest requires a positive bytes parameter"))?;
+    if bytes == 0 || bytes > CLIENT_DEVNULL_SOURCE_MAX_BYTES {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "client speedtest download exceeds the {}-byte limit",
+            CLIENT_DEVNULL_SOURCE_MAX_BYTES
+        ));
+    }
+    usize::try_from(bytes).map_err(|_| s3_error!(EntityTooLarge, "client speedtest download exceeds platform limits"))
+}
 
 fn validate_client_devnull_content_length(headers: &HeaderMap) -> S3Result<()> {
     let Some(content_length) = headers.get(CONTENT_LENGTH) else {
@@ -1022,10 +1150,22 @@ impl Operation for SpeedtestClientDevnullHandler {
                 0.0
             }),
             drives: Vec::new(),
+            peers: Vec::new(),
             rx_bytes: Some(total),
             duration_secs: Some(elapsed.as_secs_f64()),
         };
         json_response(StatusCode::OK, &response)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for SpeedtestClientSourceHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize(&req, AdminAction::HealthInfoAdminAction).await?;
+        let bytes = client_source_bytes(&req.uri)?;
+        let _permit = acquire_client_devnull_permit()?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(vec![0_u8; bytes]))))
     }
 }
 
@@ -1180,6 +1320,32 @@ mod tests {
     }
 
     #[test]
+    fn client_source_requires_a_bounded_positive_size() {
+        let valid = format!("/rustfs/admin/v3/speedtest/client/devnull?bytes={CLIENT_DEVNULL_SOURCE_MAX_BYTES}")
+            .parse::<Uri>()
+            .expect("valid URI");
+        assert_eq!(
+            client_source_bytes(&valid).expect("size at the limit should succeed"),
+            usize::try_from(CLIENT_DEVNULL_SOURCE_MAX_BYTES).expect("source limit fits usize")
+        );
+
+        for invalid in [
+            "/rustfs/admin/v3/speedtest/client/devnull",
+            "/rustfs/admin/v3/speedtest/client/devnull?bytes=0",
+            "/rustfs/admin/v3/speedtest/client/devnull?bytes=invalid",
+        ] {
+            let uri = invalid.parse::<Uri>().expect("valid URI");
+            assert!(client_source_bytes(&uri).is_err(), "{invalid} must fail");
+        }
+
+        let oversized = format!("/rustfs/admin/v3/speedtest/client/devnull?bytes={}", CLIENT_DEVNULL_SOURCE_MAX_BYTES + 1)
+            .parse::<Uri>()
+            .expect("valid URI");
+        let err = client_source_bytes(&oversized).expect_err("oversized source request must fail");
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+    }
+
+    #[test]
     fn client_devnull_rejects_invalid_content_length() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
@@ -1212,6 +1378,28 @@ mod tests {
 
         drop(permits);
         let _permit = acquire_client_devnull_permit().expect("released admission slots must be reusable");
+    }
+
+    #[test]
+    fn network_probe_admission_fails_fast_and_recovers() {
+        let permit = NETWORK_PROBE_ADMISSION.try_acquire().expect("network probe admission slot");
+        assert!(NETWORK_PROBE_ADMISSION.try_acquire().is_err());
+        drop(permit);
+        let _permit = NETWORK_PROBE_ADMISSION.try_acquire().expect("released network probe slot");
+    }
+
+    #[test]
+    fn network_probe_failure_keeps_peer_attribution_and_elapsed_time() {
+        let failure = network_speedtest_failure(
+            "peer-2".to_owned(),
+            crate::storage::storage_api::ecstore_rpc::NetworkPeerProbeError::TimedOut,
+            Duration::from_millis(25),
+        );
+        assert_eq!(failure.peer_alias, "peer-2");
+        assert_eq!(failure.outcome, "FAILED");
+        assert_eq!(failure.reason, "TIMED_OUT");
+        assert_eq!(failure.transferred_bytes, 0);
+        assert_eq!(failure.duration_secs, 0.025);
     }
 
     #[test]

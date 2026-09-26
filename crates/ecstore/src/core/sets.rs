@@ -324,6 +324,15 @@ impl Sets {
         &self.ctx
     }
 
+    /// Keep simulated peers' metadata ownership separate while sharing disks and lock clients.
+    #[cfg(test)]
+    pub(crate) fn set_instance_ctx_for_test(&mut self, ctx: Arc<InstanceContext>) {
+        for set in &mut self.disk_set {
+            Arc::make_mut(set).set_instance_ctx_for_test(Arc::clone(&ctx));
+        }
+        self.ctx = ctx;
+    }
+
     async fn monitor_and_connect_endpoints_task(sets: Weak<Sets>, mut rx: Receiver<()>) {
         let startup_delay = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(startup_delay);
@@ -785,10 +794,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
 
         let put_opts = ObjectOptions {
             user_defined: dst_opts.user_defined.clone(),
+            shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
+            quota_admission: dst_opts.quota_admission,
             ..Default::default()
         };
 
@@ -1473,6 +1484,29 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
         ctx,
     });
     (temp_dirs, sets)
+}
+
+impl Sets {
+    pub(crate) async fn heal_object_with_absence(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        proof: crate::set_disk::AbsenceProofRequest<'_>,
+    ) -> Result<(HealResultItem, Option<Error>, Option<crate::set_disk::HealedObjectAbsence>)> {
+        let mut absence = None;
+        let (item, error) = self
+            .get_disks_for_heal_object(object, opts)?
+            .heal_object_with_retirement(bucket, object, version_id, opts, &mut absence, proof)
+            .await?;
+        // A caller-owned lock does not expose its lease to this boundary.
+        // Keep cleanup unverified when that lease cannot be checked here.
+        if opts.no_lock {
+            absence = None;
+        }
+        Ok((item, error, absence))
+    }
 }
 
 #[cfg(test)]

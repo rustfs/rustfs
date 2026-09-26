@@ -82,18 +82,16 @@ use rustfs_config::{
     ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
+use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
+    is_restored_object_on_disk,
 };
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    Timestamp,
-};
-use s3s::header::X_AMZ_RESTORE;
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -517,20 +515,26 @@ impl ExpiryStats {
         Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
     }
 
+    // The pending and active gauges are balanced by design: every increment
+    // has exactly one matching decrement. They must not saturate at zero on
+    // update, because a worker can dequeue (and decrement) before the
+    // enqueuing side has recorded its increment. Clamping that transient -1
+    // to 0 turns the later +1 into a phantom task that never drains
+    // (rustfs#7921). Readers clamp negative snapshots instead.
     fn increment_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, 1);
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, -1);
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, 1);
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, -1);
+        self.active_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_workers(&self) {
@@ -779,7 +783,7 @@ fn free_version_physical_topology_generation(api: &ECStore) -> String {
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+pub(crate) fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
     if candidate.transitioned_object.tier != expected.transitioned_object.tier
         || candidate.transitioned_object.name != expected.transitioned_object.name
     {
@@ -822,7 +826,7 @@ async fn scan_exact_free_version_targets(
     let mut targets = Vec::new();
     for pool in &api.pools {
         for set in &pool.disk_set {
-            let versions = match set.load_file_info_versions_exact(&oi.bucket, &oi.name).await {
+            let versions = match set.load_file_info_versions_for_tier_cleanup(&oi.bucket, &oi.name).await {
                 Ok(Some(versions)) => versions,
                 Ok(None) => continue,
                 Err(err) if is_err_strict_volume_not_found(&err) => continue,
@@ -1076,9 +1080,13 @@ impl ExpiryState {
     }
 
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        // Account for the task before a worker can observe it. The worker
+        // decrements on dequeue, so incrementing after `try_send` would let a
+        // fast dequeue run the gauge through zero first.
+        self.stats.increment_pending_tasks();
         let queued = wrkr.try_send(Some(task)).is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
+        if !queued {
+            self.stats.decrement_pending_tasks();
         }
         queued
     }
@@ -1446,11 +1454,14 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
         return false;
     };
 
+    // Same ordering rule as `ExpiryState::send_expiry_task`: count first, so
+    // a worker that dequeues immediately cannot decrement before this
+    // increment lands.
+    stats.increment_pending_tasks();
     let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
     if !queued {
+        stats.decrement_pending_tasks();
         stats.increment_missed_freevers_tasks();
-    } else {
-        stats.increment_pending_tasks();
     }
     stats.record_scanner_expiry_state();
     queued
@@ -3759,11 +3770,8 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(api) = runtime_sources::object_store_handle() else {
-        return;
-    };
-    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
             observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
@@ -5174,10 +5182,10 @@ pub async fn put_restore_opts(
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
-        X_AMZ_RESTORE.as_str().to_string(),
+        metadata_keys::RESTORE.to_string(),
         RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+            restore_expiry_date: Some(restore_expiry),
         }
         .to_string(),
     );
@@ -5190,6 +5198,7 @@ pub async fn put_restore_opts(
         // Restore writes stored (possibly encrypted) bytes, so the writer's
         // computed MD5 is not the object's public plaintext ETag.
         preserve_etag: oi.etag.clone(),
+        shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         //expires:           oi.expires,
         ..Default::default()
     })
@@ -5912,6 +5921,7 @@ mod tests {
     use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
+    use rustfs_filemeta::metadata_keys;
     use rustfs_filemeta::{FileInfo, FileMeta};
     #[cfg(feature = "test-util")]
     use rustfs_s3_client::transition_api::ReaderImpl;
@@ -5921,7 +5931,6 @@ mod tests {
         NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
         OutputLocation, RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
-    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -7574,6 +7583,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiry_pending_gauge_survives_dequeue_landing_before_enqueue_accounting() {
+        // A worker may dequeue and decrement before the enqueuing side records
+        // its increment. The gauge must return to zero afterwards instead of
+        // clamping the transient -1 away and reporting a phantom pending task
+        // that no idle check can ever drain (rustfs#7921).
+        let state = ExpiryState::new();
+        let stats = Arc::clone(&state.read().await.stats);
+
+        stats.decrement_pending_tasks();
+        stats.increment_pending_tasks();
+        assert_eq!(stats.pending_tasks(), 0);
+        assert_eq!(state.read().await.pending_tasks(), 0);
+
+        stats.decrement_active_tasks();
+        stats.increment_active_tasks();
+        assert_eq!(stats.active_tasks(), 0);
+        assert_eq!(state.read().await.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(state.read().await.enqueue_free_version(oi.clone()));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+
+        // The single-slot queue is full for both enqueue paths.
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone()).await);
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
+
+        assert!(!state.read().await.enqueue_free_version(oi));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 2);
+
+        // Draining the one real task returns the gauge to zero.
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver.lock().await.recv().await.expect("queued task");
+        assert!(task.is_some());
+        state.read().await.stats.decrement_pending_tasks();
+        assert_eq!(state.read().await.pending_tasks(), 0);
+    }
+
+    #[tokio::test]
     async fn enqueue_recovered_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
         let oi = ObjectInfo {
@@ -8098,6 +8166,75 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_overwrite_cleanup_retains_a_minority_live_remote_reference() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("overwrite-minority-{}", Uuid::new_v4());
+        let object = "still-referenced";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity.clone())).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list persisted cleanup owner");
+        let owner = page.items.into_iter().find(|oi| oi.bucket == bucket).expect("seeded owner");
+        backend
+            .set_put_remote_version(Some(owner.transitioned_object.version_id.clone()))
+            .await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        lease
+            .put(
+                &owner.transitioned_object.name,
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"old")),
+                3,
+            )
+            .await
+            .expect("seed referenced remote bytes");
+        drop(lease);
+        let path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let cleanup_metadata = fs::read(&path).await.expect("save completed replica");
+        let mut live = FileInfo::new(object, 2, 2);
+        live.volume = bucket.clone();
+        live.erasure.index = 1;
+        live.data_dir = Some(Uuid::new_v4());
+        live.mod_time = Some(OffsetDateTime::now_utc());
+        live.size = 3;
+        live.add_object_part(1, "149603e6c03516362a8da23f624db945".to_string(), 3, live.mod_time, 3, None, None);
+        live.transition_status = TRANSITION_COMPLETE.to_string();
+        live.transition_tier = "WARM".to_string();
+        live.transitioned_objname = owner.transitioned_object.name.clone();
+        live.transition_version = Some(owner.transitioned_object.version_id.clone());
+        live.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::insert_str(&mut live.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity);
+        let mut old_metadata = FileMeta::new();
+        old_metadata.add_version(live).expect("prepare minority live source");
+        fs::write(&path, old_metadata.marshal_msg().expect("encode live source"))
+            .await
+            .expect("model one replica retained by an interrupted overwrite");
+
+        let err = super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+            .await
+            .expect_err("quorum free versions cannot erase a minority live reference");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&owner.transitioned_object.name).await);
+
+        fs::write(&path, cleanup_metadata)
+            .await
+            .expect("complete replica convergence");
+        assert!(
+            super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+                .await
+                .expect("converged cleanup can delete the exact remote owner")
+        );
+        assert_eq!(backend.remove_count().await, 1);
+        assert!(!backend.contains(&owner.transitioned_object.name).await);
     }
 
     #[cfg(feature = "test-util")]
@@ -12173,7 +12310,7 @@ mod tests {
                 "locked historical null",
                 ObjectInfo {
                     user_defined: Arc::new(HashMap::from([(
-                        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
                         "ON".to_string(),
                     )])),
                     ..historical_null.clone()
@@ -12621,9 +12758,8 @@ mod tests {
             .await
             .expect_err("malformed Object Lock metadata must reject lifecycle config resolution");
         assert!(
-            exact_error
-                .to_string()
-                .contains("persisted bucket Object Lock configuration is invalid")
+            crate::bucket::metadata::is_unreadable_config_error(&exact_error),
+            "malformed Object Lock metadata must surface as the typed unreadable-config refusal: {exact_error}"
         );
 
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
@@ -12636,7 +12772,8 @@ mod tests {
                 .push((event, state, reason));
         });
 
-        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &object_info, LcEventSrc::S3PutObject, &ObjectOptions::default())
+            .await;
 
         assert!(
             observed.lock().expect("observed events should not poison").contains(&(
@@ -12952,7 +13089,7 @@ mod tests {
         let lc = latest_expiration_lifecycle();
         let object = current_object_with_metadata(
             ReplicationStatusType::Completed,
-            HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+            HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
         );
 
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
@@ -12970,10 +13107,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
 
@@ -12995,10 +13132,10 @@ mod tests {
             ReplicationStatusType::Completed,
             HashMap::from([
                 (
-                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
                     ObjectLockRetentionMode::COMPLIANCE.to_string(),
                 ),
-                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
         object.transitioned_object.status = TRANSITION_COMPLETE.to_string();

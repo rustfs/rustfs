@@ -80,6 +80,147 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn write_local_metadata_at_incarnation(
+        self: &Arc<Self>,
+        disk_ref: &str,
+        target: (&str, &str),
+        fi: FileInfo,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        let disk_ref = disk_ref.to_owned();
+        let path = target.1.to_owned();
+        self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
+            let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
+            let _owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            disk.write_metadata("", &volume, &path, fi).await.map_err(Into::into)
+        })
+        .await
+        .map_err(|error| DiskError::other(error.to_string()))
+    }
+
+    pub async fn delete_local_path_at_incarnation(
+        self: &Arc<Self>,
+        disk_ref: &str,
+        target: (&str, &str),
+        opts: DeleteOptions,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        let disk_ref = disk_ref.to_owned();
+        let path = target.1.to_owned();
+        self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
+            let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
+            let owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let scope = super::bucket_heal_scope(&volume).ok_or_else(|| StorageError::other("missing bucket heal scope"))?;
+            scope.check()?;
+            disk.delete_with_namespace_owner(&volume, &path, opts, Some(Arc::new((scope, owner))))
+                .await
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(|error| DiskError::other(error.to_string()))
+    }
+
+    pub async fn delete_local_version_at_incarnation(
+        &self,
+        disk_ref: &str,
+        target: (&str, &str),
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        if expected.is_nil() || opts.undo_write || self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::other("invalid incarnation-bound heal deletion"));
+        }
+        let fence = Arc::new(
+            self.acquire_bucket_incarnation_fence(target.0, expected)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?,
+        );
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if fence.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        disk.delete_version_with_namespace_owner(target.0, target.1, fi, force_del_marker, opts, Some(Arc::new((fence, owner))))
+            .await
+    }
+
+    /// Target-side admission for an incarnation-bound heal rename. The physical
+    /// namespace operations retain the lifecycle owner after RPC cancellation.
+    pub async fn rename_local_data_at_incarnation(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        expected: Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        if expected.is_nil() || self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::other(
+                "incarnation-bound rename requires namespace locking and a non-nil identity",
+            ));
+        }
+        let bucket = if destination.0 == RUSTFS_META_BUCKET {
+            super::heal::bucket_metadata_owner(destination.1).ok_or(DiskError::FileAccessDenied)?
+        } else {
+            destination.0
+        };
+        let guard = Arc::new(
+            self.acquire_bucket_incarnation_fence(bucket, expected)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?,
+        );
+        if guard.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        let transaction = if destination.0 == RUSTFS_META_BUCKET {
+            // The receiver must retain the config fence after an RPC timeout.
+            // A delayed request must also reject a newer config in the same
+            // bucket incarnation before publishing its older repair payload.
+            let transaction = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?;
+            let (current, _) = self
+                .get_pool_info_for_delete_marker(
+                    destination.0,
+                    destination.1,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?;
+            let current = current.object_info;
+            if transaction.is_lock_lost()
+                || guard.is_lock_lost()
+                || fi.mod_time.is_none()
+                || current.mod_time != fi.mod_time
+                || current.data_dir != fi.data_dir
+                || current.size != fi.size
+                || current.etag != fi.get_etag()
+            {
+                return Err(DiskError::FileAccessDenied);
+            }
+            Some(transaction)
+        } else {
+            None
+        };
+        rename_local_data_with_ctx(
+            &self.ctx,
+            disk_ref,
+            source,
+            fi,
+            destination,
+            RenameDataGuards {
+                external_guard: Some(Arc::new((guard, transaction))),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Execute on this instance's active local disk through the physical owner.
     pub async fn rename_local_data(
         &self,

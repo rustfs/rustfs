@@ -30,6 +30,9 @@ pub const ENV_OBS_ENDPOINT_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_TIMEOUT_M
 pub const ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS";
 pub const ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS";
 pub const ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS";
+/// Absolute path to a PEM bundle whose certificates are added to the system
+/// trust roots used by OTLP/HTTP exporters.
+pub const ENV_OBS_TLS_CA_FILE: &str = "RUSTFS_OBS_TLS_CA_FILE";
 pub const ENV_OBS_PROFILING_ENDPOINT: &str = "RUSTFS_OBS_PROFILING_ENDPOINT";
 pub const ENV_OBS_USE_STDOUT: &str = "RUSTFS_OBS_USE_STDOUT";
 pub const ENV_OBS_SAMPLE_RATIO: &str = "RUSTFS_OBS_SAMPLE_RATIO";
@@ -54,6 +57,13 @@ pub const ENV_OBS_LOG_DIRECTORY: &str = "RUSTFS_OBS_LOG_DIRECTORY";
 pub const ENV_OBS_LOG_FILENAME: &str = "RUSTFS_OBS_LOG_FILENAME";
 pub const ENV_OBS_LOG_ROTATION_TIME: &str = "RUSTFS_OBS_LOG_ROTATION_TIME";
 pub const ENV_OBS_LOG_KEEP_FILES: &str = "RUSTFS_OBS_LOG_KEEP_FILES";
+
+/// Span lifecycle events emitted by the JSON log layers (`none`|`close`|`full`).
+///
+/// Defaults to `none`: a record per span lifecycle multiplies log volume on
+/// object hot paths, and emitting the ancestor span list on every record
+/// produced multi-megabyte lines that journald truncated (backlog#2642).
+pub const ENV_OBS_LOG_SPAN_EVENTS: &str = "RUSTFS_OBS_LOG_SPAN_EVENTS";
 
 /// Log cleanup related configurations
 pub const ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES: &str = "RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES";
@@ -99,6 +109,8 @@ pub const DEFAULT_OBS_LOG_DRY_RUN: bool = false;
 pub const DEFAULT_OBS_LOG_MATCH_MODE_PREFIX: &str = "prefix";
 pub const DEFAULT_OBS_LOG_MATCH_MODE: &str = "suffix";
 
+pub const DEFAULT_OBS_LOG_SPAN_EVENTS: &str = "none";
+
 /// Default values for observability configuration
 // ### Supported Environment Values
 // - `production` - Secure file-only logging
@@ -141,6 +153,7 @@ mod tests {
         assert_eq!(ENV_OBS_LOG_FILENAME, "RUSTFS_OBS_LOG_FILENAME");
         assert_eq!(ENV_OBS_LOG_ROTATION_TIME, "RUSTFS_OBS_LOG_ROTATION_TIME");
         assert_eq!(ENV_OBS_LOG_KEEP_FILES, "RUSTFS_OBS_LOG_KEEP_FILES");
+        assert_eq!(ENV_OBS_LOG_SPAN_EVENTS, "RUSTFS_OBS_LOG_SPAN_EVENTS");
         assert_eq!(ENV_OBS_TRACES_EXPORT_ENABLED, "RUSTFS_OBS_TRACES_EXPORT_ENABLED");
         assert_eq!(ENV_OBS_METRICS_EXPORT_ENABLED, "RUSTFS_OBS_METRICS_EXPORT_ENABLED");
         assert_eq!(ENV_OBS_LOGS_EXPORT_ENABLED, "RUSTFS_OBS_LOGS_EXPORT_ENABLED");
@@ -178,6 +191,7 @@ mod tests {
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP, "gzip");
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_ZSTD, "zstd");
         assert_eq!(DEFAULT_OBS_LOG_MATCH_MODE_PREFIX, "prefix");
+        assert_eq!(DEFAULT_OBS_LOG_SPAN_EVENTS, "none");
         assert_eq!(DEFAULT_OBS_LOG_MATCH_MODE, "suffix");
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, "zstd");
     }

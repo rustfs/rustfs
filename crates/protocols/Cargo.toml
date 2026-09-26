@@ -102,7 +102,7 @@ swift = [
     "dep:hex-simd",
     "dep:ipnetwork",
     "dep:rustfs-trusted-proxies",
-    "dep:astral-tokio-tar",
+    "dep:rustfs-tokio-tar",
     "dep:base64-simd",
     "dep:async-compression",
 ]
@@ -167,7 +167,7 @@ sha1 = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 ipnetwork = { workspace = true, optional = true }
 rustfs-trusted-proxies = { workspace = true, optional = true }
-astral-tokio-tar = { workspace = true, optional = true }
+rustfs-tokio-tar = { workspace = true, optional = true }
 base64-simd = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
 

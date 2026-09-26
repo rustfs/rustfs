@@ -32,6 +32,19 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
+/// Encode a resolved object version identity for an S3 response. Storage
+/// distinguishes a null version from an unversioned object by returning a nil
+/// UUID instead of None.
+pub(crate) fn s3_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+    version_id.map(|id| {
+        if id.is_nil() {
+            NULL_VERSION_ID.to_owned()
+        } else {
+            id.to_string()
+        }
+    })
+}
+
 fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
     let code = if version_id.is_some() {
         S3ErrorCode::MethodNotAllowed
@@ -372,8 +385,9 @@ pub(super) fn resolve_bucket_default_sse(
 ///   bucket whose metadata document is absent — `ConfigNotFound`, so a cold
 ///   cache and a missing bucket are never turned into a refusal, and the write
 ///   still fails later with its own `NoSuchBucket`;
-/// * blob present but unparseable — deterministic, so retrying cannot help;
-///   surfaces as `InternalError` until an operator repairs or removes it;
+/// * blob present but unparseable — the typed unreadable-config refusal,
+///   surfaced as `ServiceUnavailable` naming the bucket and config until an
+///   operator repairs or removes it (rustfs/backlog#1734);
 /// * the metadata read itself failed (namespace lock, quorum, disk, an
 ///   uninitialized metadata system) — transient, and the typed error maps to
 ///   the retryable `ServiceUnavailable`.
@@ -465,7 +479,7 @@ mod bucket_default_sse_lookup_tests {
         let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
             .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
     }
 
     #[test]
@@ -659,7 +673,10 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
         return None;
     }
 
-    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    // `x-amz-expiration` is a date-valued S3 response header and therefore uses
+    // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
+    // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
+    let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
@@ -695,10 +712,21 @@ pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Tim
 }
 
 pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
+    format_http_date(expires)
+}
+
+/// Render a date-valued S3 response header (`Expires`, `x-amz-expiration`) as
+/// HTTP-date: RFC 1123 with a literal `GMT` zone, e.g.
+/// `Fri, 23 Dec 2012 00:00:00 GMT`.
+///
+/// Interoperability depends on this shape. `x-amz-expiration` in particular is
+/// parsed with an RFC 822 parser by the AWS SDKs, which rejects an RFC 3339
+/// value such as `2026-10-02T00:00:00Z` and then discards the whole header.
+pub(super) fn format_http_date(timestamp: &Timestamp) -> S3Result<String> {
     let mut formatted = Vec::new();
-    expires
+    timestamp
         .format(TimestampFormat::HttpDate, &mut formatted)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: {e}"))))?;
     Ok(String::from_utf8_lossy(&formatted).into_owned())
 }
 
@@ -943,7 +971,7 @@ impl DefaultObjectUsecase {
 pub(crate) async fn object_lock_checks_required(bucket: &str) -> bool {
     get_bucket_metadata(bucket)
         .await
-        .map_or(true, |metadata| metadata.object_locking())
+        .map_or(true, |metadata| metadata.object_lock_checks_required())
 }
 
 pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
@@ -1100,6 +1128,15 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
+        let version = Uuid::parse_str("9341ae04-d4ce-468c-a4e1-6501d58cd6b7").unwrap();
+
+        assert_eq!(s3_response_version_id(None), None);
+        assert_eq!(s3_response_version_id(Some(Uuid::nil())).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(s3_response_version_id(Some(version)), Some(version.to_string()));
+    }
 
     #[test]
     fn delete_marker_read_headers_round_trip_uuid_and_null_errors() {
@@ -1412,9 +1449,10 @@ mod tests {
 
     #[test]
     fn resolve_bucket_default_sse_falls_back_to_aes256_for_an_unknown_algorithm() {
-        // Reachable only through corrupt or hand-edited bucket metadata;
-        // PutBucketEncryption rejects unknown algorithms. All three call sites
-        // now share this single decision (backlog#1826).
+        // PutBucketEncryption refuses unknown algorithms, so this is reachable
+        // only through a configuration stored before that check or through
+        // hand-edited bucket metadata. All three call sites share this single
+        // decision (backlog#1826).
         let config = bucket_sse_config_with("garbage", None);
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
@@ -1849,9 +1887,10 @@ mod tests {
             storage_class: String::new(),
         };
 
-        let expiry_date = expire_time.format(&Rfc3339).unwrap();
-        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
-        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+        // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
+        // RFC 822 parser, so `2026-10-02T00:00:00Z` loses the metadata.
+        let expected = "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"rule-1\"";
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected.to_string()));
     }
 
     #[test]

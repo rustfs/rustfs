@@ -16,6 +16,12 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use rustfs_storage_api as storage_contracts;
+
+pub(crate) mod integrity {
+    pub(crate) use crate::storage::storage_api::ecstore_integrity::{
+        IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
 use time::OffsetDateTime;
 
 mod ecstore_bucket {
@@ -535,7 +541,7 @@ pub(crate) mod replication {
         OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS,
         REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION,
         REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, assign_site_replication_rule_priorities,
-        merge_incoming_replication_config, replication_target_arn_deployment_id,
+        merge_incoming_replication_config, replication_target_arn_deployment_id, site_replication_rule_deployment_id,
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;

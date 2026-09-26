@@ -33,7 +33,8 @@ use rcgen::{
 };
 use rustfs::connect::{
     ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, DeviceIdentity, HeartbeatConfig,
-    HeartbeatError, HeartbeatSchedule, HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
+    HeartbeatError, HeartbeatSchedule, HeartbeatStatus, IdentityStore, ProxyConfig, RegistrationToken, TokenError,
+    spawn_heartbeat_runtime,
 };
 #[cfg(target_os = "linux")]
 use rustfs::connect::{InventorySchedule, InventorySnapshot, InventoryStatus, spawn_inventory_runtime};
@@ -44,7 +45,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -211,6 +213,117 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxyObservation {
+    authority: String,
+    authenticated: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ProxyBehavior {
+    Forward,
+    RejectAuthentication,
+    InterruptTunnel,
+}
+
+struct TestProxy {
+    endpoint: String,
+    observations: Arc<Mutex<Vec<ProxyObservation>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn proxy(allowed_authority: &str, username: &str, password: &str, behavior: ProxyBehavior) -> TestProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let address = listener.local_addr().expect("proxy address");
+    let allowed_authority = allowed_authority.to_owned();
+    let expected_auth = format!("Basic {}", BASE64_STANDARD.encode_to_string(format!("{username}:{password}")));
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let captured = observations.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let allowed_authority = allowed_authority.clone();
+            let expected_auth = expected_auth.clone();
+            let observations = captured.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::with_capacity(1024);
+                let mut byte = [0_u8; 1];
+                while request.len() < 8192 && !request.ends_with(b"\r\n\r\n") {
+                    if inbound.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let Ok(request) = std::str::from_utf8(&request) else {
+                    return;
+                };
+                let mut lines = request.split("\r\n");
+                let Some(authority) = lines
+                    .next()
+                    .and_then(|line| line.strip_prefix("CONNECT "))
+                    .and_then(|line| line.strip_suffix(" HTTP/1.1"))
+                else {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let authenticated = lines.any(|line| {
+                    line.strip_prefix("Proxy-Authorization: ")
+                        .or_else(|| line.strip_prefix("proxy-authorization: "))
+                        == Some(expected_auth.as_str())
+                });
+                observations.lock().expect("proxy observations").push(ProxyObservation {
+                    authority: authority.to_owned(),
+                    authenticated,
+                });
+                if matches!(behavior, ProxyBehavior::RejectAuthentication) || !authenticated {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if authority != allowed_authority {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                let Ok(mut outbound) = TcpStream::connect(&allowed_authority).await else {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                };
+                if inbound
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .is_err()
+                    || matches!(behavior, ProxyBehavior::InterruptTunnel)
+                {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    TestProxy {
+        endpoint: format!("http://{address}"),
+        observations,
+        task,
+    }
+}
+
+fn endpoint_authority(endpoint: &str) -> String {
+    let url = reqwest::Url::parse(endpoint).expect("endpoint URL");
+    format!("{}:{}", url.host_str().expect("endpoint host"), url.port().expect("endpoint port"))
 }
 
 async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
@@ -485,8 +598,203 @@ fn client(server: &TestServer, pki: &TestPki, timeout: Duration) -> ConnectClien
         endpoint: &server.endpoint,
         root_ca_pem: pki.root_pem.as_bytes(),
         timeout,
+        proxy: None,
     })
     .expect("build Connect client")
+}
+
+fn client_with_proxy(endpoint: &str, pki: &TestPki, proxy: &ProxyConfig, timeout: Duration) -> ConnectClient {
+    ConnectClient::new(ConnectConfig {
+        endpoint,
+        root_ca_pem: pki.root_pem.as_bytes(),
+        timeout,
+        proxy: Some(proxy),
+    })
+    .expect("build proxied Connect client")
+}
+
+#[tokio::test]
+async fn explicit_proxy_carries_registration_rotation_and_heartbeat_with_mtls() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pki = TestPki::new();
+    let next = stage_next_identity(&temp);
+    let (identity_store, credential_store) = stores(&temp);
+    let current = identity_store.load_or_create().expect("current identity");
+    let registered = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 0x31);
+    let (rotated, _) = rotation_response(&pki, &next, 0x32);
+    let server = server(
+        &pki,
+        vec![
+            Reply::Json(StatusCode::CREATED, registered.clone()),
+            Reply::VerifiedRotation {
+                response: rotated,
+                current_public_key: current.public_key_der(),
+                current_certificate_fingerprint: certificate_fingerprint(
+                    registered["certificate"].as_str().expect("registered certificate"),
+                ),
+                device_name: registered["name"].as_str().expect("device name").to_owned(),
+            },
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-09-13T01:02:03Z")),
+        ],
+    )
+    .await;
+    let authority = endpoint_authority(&server.endpoint);
+    let proxy_server = proxy(&authority, "proxy-user", "proxy-password", ProxyBehavior::Forward).await;
+    let proxy_config = ProxyConfig::new(&proxy_server.endpoint, None)
+        .expect("proxy URL")
+        .with_basic_auth("proxy-user", "proxy-password")
+        .expect("proxy authentication");
+    let client = client_with_proxy(&server.endpoint, &pki, &proxy_config, Duration::from_secs(2));
+
+    let credential = client
+        .register(&identity_store, &credential_store, &token())
+        .await
+        .expect("registration through proxy");
+    let due = credential.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS;
+    client
+        .rotate_if_due(&identity_store, &credential_store, due)
+        .await
+        .expect("rotation through proxy")
+        .expect("rotation due");
+
+    let mut config = HeartbeatConfig::new(
+        &server.endpoint,
+        pki.root_pem.as_bytes(),
+        identity_store,
+        credential_store,
+        temp.path().join("heartbeat/state.json"),
+    );
+    config.proxy = Some(proxy_config);
+    config.schedule = HeartbeatSchedule {
+        cadence: Duration::from_secs(30),
+        jitter: Duration::ZERO,
+        timeout: Duration::from_secs(2),
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(80),
+    };
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("heartbeat runtime")
+        .expect("configured heartbeat runtime");
+    let mut status = runtime.status();
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    assert_eq!(
+        server.paths.lock().expect("paths").as_slice(),
+        [
+            "/agent/registrationTokens:exchange",
+            "/agent/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92:rotateCredential",
+            "/agent/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/heartbeats",
+        ]
+    );
+    let certificates = server.client_certificates.lock().expect("client certificates");
+    assert_eq!(certificates.len(), 3);
+    assert!(certificates[0].is_none(), "registration is the unauthenticated bootstrap operation");
+    assert!(certificates[1].is_some(), "rotation must retain mTLS through CONNECT");
+    assert!(certificates[2].is_some(), "telemetry must retain mTLS through CONNECT");
+    drop(certificates);
+    let observations = proxy_server.observations.lock().expect("proxy observations");
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| { observation.authority == authority && observation.authenticated })
+    );
+}
+
+#[tokio::test]
+async fn proxy_bypass_preserves_direct_connectivity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pki = TestPki::new();
+    let (identity_store, credential_store) = stores(&temp);
+    let identity = identity_store.load_or_create().expect("identity");
+    let server = server(
+        &pki,
+        vec![Reply::Json(
+            StatusCode::CREATED,
+            pki.credential(&identity, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 0x33),
+        )],
+    )
+    .await;
+    let proxy_server = proxy(
+        &endpoint_authority(&server.endpoint),
+        "proxy-user",
+        "proxy-password",
+        ProxyBehavior::RejectAuthentication,
+    )
+    .await;
+    let proxy_config = ProxyConfig::new(&proxy_server.endpoint, Some("localhost"))
+        .expect("proxy URL")
+        .with_basic_auth("wrong-user", "wrong-password")
+        .expect("proxy authentication");
+
+    client_with_proxy(&server.endpoint, &pki, &proxy_config, Duration::from_secs(2))
+        .register(&identity_store, &credential_store, &token())
+        .await
+        .expect("bypassed direct registration");
+    assert!(proxy_server.observations.lock().expect("proxy observations").is_empty());
+}
+
+#[tokio::test]
+async fn proxy_failures_are_actionable_and_redacted() {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![]).await;
+    let authority = endpoint_authority(&server.endpoint);
+    let cases = [
+        (ProxyBehavior::RejectAuthentication, "credentials"),
+        (ProxyBehavior::InterruptTunnel, "availability"),
+    ];
+    for (behavior, expected) in cases {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (identity_store, credential_store) = stores(&temp);
+        let proxy_server = proxy(&authority, "secret-user", "secret-password", behavior).await;
+        let proxy_config = ProxyConfig::new(&proxy_server.endpoint, None)
+            .expect("proxy URL")
+            .with_basic_auth("secret-user", "secret-password")
+            .expect("proxy authentication");
+        let error = client_with_proxy(&server.endpoint, &pki, &proxy_config, Duration::from_millis(300))
+            .register(&identity_store, &credential_store, &token())
+            .await
+            .expect_err("proxy failure");
+        let diagnostic = error.to_string().to_ascii_lowercase();
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(!diagnostic.contains("secret-user"));
+        assert!(!diagnostic.contains("secret-password"));
+    }
+}
+
+#[tokio::test]
+async fn proxy_preserves_endpoint_allow_list_and_tls_roots() {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![]).await;
+    let authority = endpoint_authority(&server.endpoint);
+    let proxy_server = proxy(&authority, "proxy-user", "proxy-password", ProxyBehavior::Forward).await;
+    let proxy_config = ProxyConfig::new(&proxy_server.endpoint, None)
+        .expect("proxy URL")
+        .with_basic_auth("proxy-user", "proxy-password")
+        .expect("proxy authentication");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (identity_store, credential_store) = stores(&temp);
+    let wrong_target = server.endpoint.replace(&authority, "localhost:9");
+    let error = client_with_proxy(&wrong_target, &pki, &proxy_config, Duration::from_millis(300))
+        .register(&identity_store, &credential_store, &token())
+        .await
+        .expect_err("unapproved CONNECT target");
+    assert!(matches!(error, ClientError::ProxyRejected));
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (identity_store, credential_store) = stores(&temp);
+    let untrusted = TestPki::new();
+    let error = client_with_proxy(&server.endpoint, &untrusted, &proxy_config, Duration::from_millis(300))
+        .register(&identity_store, &credential_store, &token())
+        .await
+        .expect_err("untrusted Connect certificate");
+    assert!(matches!(error, ClientError::TlsPeer));
 }
 
 fn due_runtime_config(

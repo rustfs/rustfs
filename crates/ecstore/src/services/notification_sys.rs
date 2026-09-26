@@ -42,6 +42,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -61,6 +62,14 @@ const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
+/// Fallback poll cadence while startup has not yet published the notification
+/// system. IAM finalization starts the probe before `init_notification_runtime`
+/// runs, so the first pass always fails closed; waiting a full probe interval
+/// there left a single node without its durable quota capability for ten
+/// seconds after `/health` reported ok (rustfs/rustfs#8014). Publication wakes
+/// the probe immediately through `NOTIFICATION_SYS_PUBLISHED`; this bound only
+/// covers a wakeup that races the availability check.
+const REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL: Duration = Duration::from_millis(100);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 const TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION: u32 = 3;
 const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
@@ -338,6 +347,9 @@ static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock
 static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+/// Signalled once `GLOBAL_NOTIFICATION_SYS` is published so the fleet probe can
+/// run its first real pass without waiting for the bootstrap poll.
+static NOTIFICATION_SYS_PUBLISHED: Notify = Notify::const_new();
 static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
@@ -366,6 +378,24 @@ fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCap
 
 fn transition_transaction_compaction_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn all_fleet_capability_proof_slots() -> [&'static std::sync::RwLock<FleetCapabilityProofState>; 7] {
+    [
+        remote_version_state_fleet_proof_slot(),
+        cross_pool_fence_fleet_proof_slot(),
+        tier_delete_journal_fleet_proof_slot(),
+        decommission_target_fence_fleet_proof_slot(),
+        legacy_transition_state_reconcile_fleet_proof_slot(),
+        ilm_recovery_export_fleet_proof_slot(),
+        transition_transaction_compaction_fleet_proof_slot(),
+    ]
+}
+
+fn revoke_all_fleet_capability_proofs() {
+    for slot in all_fleet_capability_proof_slots() {
+        revoke_fleet_capability_proof(slot);
+    }
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -451,6 +481,20 @@ pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersion
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(RemoteVersionStateFleetProofToken)
+}
+
+pub(crate) fn acquire_remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    let requested = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+    );
+    (requested && fleet_confirmed)
+        .then(acquire_remote_version_state_fleet_proof)
+        .flatten()
 }
 
 fn acquire_fleet_capability_proof_from(
@@ -1212,15 +1256,7 @@ fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, pe
 pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.clone()).is_err() {
         if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() != Some(&topology_fingerprint) {
-            for slot in [
-                remote_version_state_fleet_proof_slot(),
-                cross_pool_fence_fleet_proof_slot(),
-                tier_delete_journal_fleet_proof_slot(),
-                decommission_target_fence_fleet_proof_slot(),
-                legacy_transition_state_reconcile_fleet_proof_slot(),
-                ilm_recovery_export_fleet_proof_slot(),
-                transition_transaction_compaction_fleet_proof_slot(),
-            ] {
+            for slot in all_fleet_capability_proof_slots() {
                 mark_fleet_capability_topology_conflict(slot);
             }
         }
@@ -1228,53 +1264,59 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     }
 
     tokio::spawn(async move {
+        let mut notification_sys_unavailable_logged = false;
         loop {
-            let notification_sys = get_global_notification_sys();
-            let remote_version_state_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out"))),
-                    None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
+            let Some(notification_sys) = get_global_notification_sys() else {
+                // Startup publishes the notification system after this probe
+                // is started. Stay failed closed, but retry on the bootstrap
+                // cadence so a single node gains its capabilities as soon as
+                // the system appears instead of one full probe interval later.
+                revoke_all_fleet_capability_proofs();
+                if !notification_sys_unavailable_logged {
+                    notification_sys_unavailable_logged = true;
+                    debug!(
+                        event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        state = "waiting_for_notification_system",
+                        "notification capability probe"
+                    );
                 }
+                let _ = timeout(REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL, NOTIFICATION_SYS_PUBLISHED.notified()).await;
+                continue;
+            };
+            notification_sys_unavailable_logged = false;
+            let remote_version_state_probe = async {
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out")))
             };
             let cross_pool_fence_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
-                    None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out")))
             };
             let recovery_export_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out"))),
-                    None => Err(Error::other("ILM recovery export fleet capability notification system is unavailable")),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out")))
             };
             let transition_transaction_compaction_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out"))),
-                    None => Err(Error::other(
-                        "transition transaction compaction fleet capability notification system is unavailable",
-                    )),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out")))
             };
             let (result, fence_probe, recovery_export_result, transition_transaction_compaction_result) = tokio::join!(
                 remote_version_state_probe,
@@ -1299,13 +1341,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .topology_conflict;
             if topology_conflict {
-                revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
-                revoke_fleet_capability_proof(cross_pool_fence_fleet_proof_slot());
-                revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
-                revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
-                revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
-                revoke_fleet_capability_proof(ilm_recovery_export_fleet_proof_slot());
-                revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
+                revoke_all_fleet_capability_proofs();
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -1428,9 +1464,11 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
-    let _ = GLOBAL_NOTIFICATION_SYS
-        .set(Arc::new(NotificationSys::new(eps).await))
-        .map_err(|_| Error::other("init notification_sys fail"));
+    if GLOBAL_NOTIFICATION_SYS.set(Arc::new(NotificationSys::new(eps).await)).is_ok() {
+        // `notify_one` stores a permit, so a probe that checks availability
+        // just before this publication still wakes without losing the signal.
+        NOTIFICATION_SYS_PUBLISHED.notify_one();
+    }
     Ok(())
 }
 
@@ -3903,6 +3941,49 @@ mod tests {
             num_objects: 1,
         });
         stats
+    }
+
+    /// rustfs/rustfs#8014: IAM finalization starts the fleet probe before the
+    /// notification system is published. The first probe therefore fails
+    /// closed, and a single node used to wait a full probe interval before the
+    /// durable quota capability appeared, even though `/health` was already
+    /// reporting ok. The probe must retry promptly while it waits for startup
+    /// to publish the notification system.
+    #[tokio::test]
+    async fn fleet_probe_publishes_promptly_once_the_notification_system_appears() {
+        if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().is_some() || GLOBAL_NOTIFICATION_SYS.get().is_some() {
+            // Process-wide state was bound by another test in this binary. The
+            // startup ordering under test needs a fresh process; nextest
+            // (the authoritative runner) always provides one.
+            eprintln!("skipping: fleet probe globals already bound in this process");
+            return;
+        }
+
+        // Share the fingerprint every other proof-installing test in this crate
+        // binds, so the plain `cargo test` fallback cannot see two topologies.
+        start_remote_version_state_fleet_probe("object-transaction-fencing-test".to_string());
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            acquire_cross_pool_fence_fleet_proof().is_none(),
+            "no capability proof may exist before the notification system is published"
+        );
+
+        let published_at = Instant::now();
+        new_global_notification_sys(EndpointServerPools::default())
+            .await
+            .expect("single-node notification system initializes");
+
+        let observed = timeout(Duration::from_secs(2), async {
+            while acquire_cross_pool_fence_fleet_proof().is_none() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "single-node cross-pool fence proof should publish within 2s of the notification system, waited {:?}",
+            published_at.elapsed()
+        );
     }
 
     #[test]

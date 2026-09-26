@@ -396,8 +396,23 @@ impl StorageError {
         )
     }
 
+    pub fn dangling_delete_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Io(error) => DiskError::io_error_dangling_delete_retry_after(error),
+            _ => None,
+        }
+    }
+
     pub fn is_dangling_delete_grace(&self) -> bool {
         matches!(self, StorageError::Io(io_error) if DiskError::io_error_is_dangling_delete_grace(io_error))
+    }
+
+    pub fn is_retired_marker_deferred(&self) -> bool {
+        matches!(self, StorageError::Io(error) if DiskError::io_error_is_retired_marker_deferred(error))
+    }
+
+    pub fn retired_marker_deferred(reason: impl Into<String>) -> Self {
+        DiskError::retired_marker_deferred(reason).into()
     }
 }
 
@@ -608,6 +623,11 @@ impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
             StorageError::Io(e) => {
+                if let Some(error) =
+                    DiskError::clone_dangling_delete_grace(e).or_else(|| DiskError::clone_retired_marker_deferred(e))
+                {
+                    return StorageError::Io(error);
+                }
                 if let Some(context) = self.pool_metadata_failure() {
                     Self::Io(std::io::Error::new(
                         e.kind(),
@@ -616,6 +636,10 @@ impl Clone for StorageError {
                             source: Box::new(context.clone()),
                         },
                     ))
+                } else if let Some(refusal) = crate::bucket::metadata::unreadable_config_refusal(self) {
+                    // Keep the refusal typed so a cloned error still maps to
+                    // its retryable S3 response (rustfs/backlog#1734).
+                    StorageError::Io(std::io::Error::new(e.kind(), refusal.clone()))
                 } else {
                     StorageError::Io(std::io::Error::new(e.kind(), e.to_string()))
                 }

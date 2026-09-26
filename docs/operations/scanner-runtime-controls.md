@@ -178,12 +178,27 @@ The reset does not delete metadata files by hand and does not publish an authori
 |---|---|
 | data movement | wait for decommission or rebalance to leave the scanner metadata path, then retry |
 | invalid scanner cycle state | run `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}` first |
+| scanner leader lock is busy | retry with an async recovery intent or wait for the current leader to restart/release the lock |
+
+When a running scanner leader already holds `leader.lock`, submit a durable async recovery intent instead of repeatedly calling the synchronous reset:
+
+```json
+{
+  "mode": "full-rebuild",
+  "async": true,
+  "idempotency_key": "<stable-operator-request-id>"
+}
+```
+
+The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
+
+A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must run as a full scan until an authoritative usage snapshot replaces the marker.
 
 ## Cleanup With The Scanner Disabled
 
 With `RUSTFS_SCANNER_ENABLED=false`, startup makes one controlled attempt to finish a previously persisted cycle reset whose validated recovery marker is already `cleanup-pending`. This is metadata cleanup only: it does not start the ordinary scanner loop, scan namespaces, accept a new reset request, or automatically perform a usage-state `full-rebuild`. Missing, merely `blocked`, unknown-version, unknown-phase, or corrupt markers do not authorize an automatic reset.
 
-The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. The v3 reset routes remain synchronous and return their existing successful HTTP 200 responses; no asynchronous HTTP 202 acceptance is introduced.
+The attempt uses the existing leader lock and revalidates the observed marker revision and phase after acquiring it. A busy leader or data-movement pause leaves the marker intact and is reported through `cycle_recovery.state` and `cycle_recovery.reason` in the existing scanner status response. There is no automatic retry loop while disabled. After resolving the blocker, explicitly retry `POST /v3/scanner/cycle-state/reset` with `{"mode":"full-rescan"}`, or restart to make another controlled attempt. Cycle-state reset remains a synchronous HTTP 200 operation; usage-state reset also supports the async recovery-intent form described above.
 
 The startup probe is cancellation-aware and uses the existing cache persistence I/O timeout. Shutdown waits only for the existing server shutdown timeout. If the cleanup task cannot join in that window, the `scanner_cleanup_not_joined` warning means completion is unconfirmed, not drained. The task is not force-aborted or force-unlocked while its runtime remains alive; it retains its existing namespace/admission guards, and durable marker/fence state remains authoritative. Inspect status before retrying. This does not establish a hard deadline for an unresponsive storage operation or prove that I/O has drained when the process or runtime subsequently exits. Task-ownership timeout tests are not storage fsync, commit-tail, or process-crash durability evidence.
 
@@ -277,13 +292,13 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 |---|---|---|
 | `RUSTFS_HEAL_ENABLED` (deprecated alias `RUSTFS_ENABLE_HEAL`) | `true` (`heal_enabled_from_env`, `rustfs/src/module_switches.rs`) | Master switch for the background heal manager. |
 | `RUSTFS_HEAL_AUTO_HEAL_ENABLE` | `true` (`DEFAULT_HEAL_AUTO_HEAL_ENABLE`) | Enables automatic healing of detected issues; `false` leaves healing to manual admin requests. |
-| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. |
+| `RUSTFS_HEAL_QUEUE_SIZE` | `10000` (`DEFAULT_HEAL_QUEUE_SIZE`) | Heal request queue capacity. The manager reserves at least one slot per Scanner/ReadRepair/AutoHeal source, or 10% for larger queues, so sustained normal-priority MRF or internal background work cannot consume every slot. |
 | `RUSTFS_HEAL_INTERVAL_SECS` | `10` (`DEFAULT_HEAL_INTERVAL_SECS`) | Heal manager polling interval. |
 | `RUSTFS_HEAL_TASK_TIMEOUT_SECS` | `300` (`DEFAULT_HEAL_TASK_TIMEOUT_SECS`) | Per-task timeout. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_HEALS` | `4` (`DEFAULT_HEAL_MAX_CONCURRENT_HEALS`) | Global concurrent heal task limit. |
 | `RUSTFS_HEAL_MAX_CONCURRENT_PER_SET` | `1` (`DEFAULT_HEAL_MAX_CONCURRENT_PER_SET`) | Per-erasure-set limit; effective value is `min(global, per_set)`, each floored at `1`. |
 | `RUSTFS_HEAL_LOW_PRIORITY_MERGE_ENABLE` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE`) | Merge duplicate low-priority requests with the same dedup key. |
-| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests when the queue is full. |
+| `RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL` | `true` (`DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL`) | Drop, rather than block on, low-priority requests only after the reserved best-effort capacity is occupied and the queue is actually full. |
 | `RUSTFS_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE` | `true` (`DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE`) | Notify-driven scheduler wakeups. |
 | `RUSTFS_HEAL_SET_BULKHEAD_ENABLE` | `true` (`DEFAULT_HEAL_SET_BULKHEAD_ENABLE`) | Per-set bulkhead scheduling. |
 | `RUSTFS_HEAL_PAGE_PARALLEL_ENABLE` | `true` (`DEFAULT_HEAL_PAGE_PARALLEL_ENABLE`) | Page-level parallel object healing during erasure-set repair. |
@@ -292,12 +307,24 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running admin pacing; zero disables this class. |
 | `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running admin waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
-| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` dedups an admin heal start that overlaps a running or queued heal; `minio_error` returns a typed already-running / overlapping-paths rejection like madmin. |
+| `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` reuses the token of an equivalent active, queued, or retrying admin heal; incompatible same-target starts and intersecting admin scopes return `already_running` / `overlapping_paths`. Durable-only owners reject until recovered or replaced with `forceStart`. `minio_error` also rejects equivalent starts and preserves overlap rejection against background tasks. |
 | `RUSTFS_HEAL_MRF_ENABLE` | `true` (`DEFAULT_HEAL_MRF_ENABLE`) | MRF intent pipeline: error paths deliver repair intents to the heal runtime and unconsumed intents replay from the durable journal after restart. |
 | `RUSTFS_HEAL_MRF_QUEUE_SIZE` | `100000` (`DEFAULT_HEAL_MRF_QUEUE_SIZE`) | MRF in-memory queue capacity. |
 | `RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES` | `8388608` (`DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES`, 8 MiB) | MRF journal size at which compaction runs. |
 | `RUSTFS_HEAL_MRF_REPLAY_BATCH` | `256` (`DEFAULT_HEAL_MRF_REPLAY_BATCH`) | Intents per replay push round. |
 | `RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS` | `3600` (`DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS`, `crates/ecstore/src/set_disk/core/io_primitives.rs`) | A recently modified object is never deleted as dangling inside this window; `0` disables the grace window. |
+
+The heal scheduler preserves priority ordering for urgent, high, and ordinary
+work, but applies a bounded fairness quantum to a continuously refilled MRF
+normal backlog: after four MRF/normal dispatches, a runnable Scanner,
+ReadRepair, or AutoHeal request gets a service opportunity. This protects
+integrity progress without weakening durable MRF admission or receipt
+requirements. Queue capacities from 4 through 9 reserve three slots, one per
+best-effort source, while still leaving one slot for MRF; capacities below 4
+cannot isolate all work classes and
+should only be used for diagnostic tests. Normal-priority non-best-effort submissions are deferred at the
+reserve boundary; high and urgent requests, including admin or MRF recovery,
+retain their priority and may use that space.
 
 ### Admin heal start, retries, and budgets
 
@@ -341,7 +368,11 @@ Rediscovery and admission observations update the recorded result but do not pos
 |---|---|---|
 | Scanner corrupt metadata | Metadata kind with no invented version/set; an existing pending-cache hint remains available for bounded retries. | Cache publication is separate from MRF ingress. Its age/count limits mean it is not an irrevocable repair-obligation ledger. |
 | Read decode failure | Decode kind, available version and erasure-set scope; a later failing read can rediscover the repair. | Nonblocking ingress and in-memory read-repair admission do not acknowledge durable acceptance. |
-| Partial write | Partial-write kind, available version and erasure-set scope; an in-memory heal request is the fast path. | The caller's documented restart-survival requirement is not fulfilled by ignoring the ingress result or by removing the unaccepted journal record at manager admission. Verified durable ownership remains pending. |
+| Partial write | Partial-write kind, version and erasure-set scope; each committed write receives a fresh responsibility lease. PUT rename convergence, partial delete-marker creation, and explicit partial-write producers use the durable MRF channel. | A successful durable-admission receipt follows committed checkpoint publication. The record remains after manager admission and retries until an exact verified storage receipt discharges it. Restart re-arms retained records even when the target is still offline. |
+
+With MRF enabled, a partial commit waits up to ten seconds for its checkpoint receipt. Fully converged writes do not enter this path or add MRF journal writes. The consumer batches available submissions and uses the existing count/byte budgets; an offline member or exhausted hint retry count does not evict an admitted partial-write obligation. New responsibility for the same unversioned object invalidates the previous lease, and a task that already started cannot accept that new responsibility as a merged proof target.
+
+Disabled/unavailable delivery, full queues, invalid identities, persistence failures and receipt timeouts are not durable admission. An already committed object is not rolled back: the producer falls back to the existing in-memory Heal channel. When MRF is enabled, a failed admission attempt also records `mrf_durable_admission_failed`. An admission timeout does not cancel a record already retained by the consumer. These failure cases therefore do not promise that every successful S3 response has a durable repair obligation. Early-ACK PUTs can also return before their rename tail settles; the tail submits responsibility when its final outcome requires repair. The MRF switch is independent of automatic disk scanning, so returning members can be repaired with scanner and auto-heal disabled.
 
 Legacy notices carry only bucket/object/version, not a verified storage disposition, incarnation, scope, or durable responsibility generation. They are drained without clearing hints. Terminal callbacks release only their exact node-local ingress lease so rediscovery remains possible; lease generations are not durable successor receipts. Pending migration staging is not activated, and this change does not enable durable tombstones or garbage collection. Positive cleanup requires a storage-owner receipt with the complete responsibility identity and validated commit/fence evidence; neither task status nor the bounded diagnostic outcome window supplies it.
 
@@ -450,7 +481,7 @@ Read this snapshot before changing scanner controls: `blocked_source` with `life
 
 ## Reading Distributed Metrics
 
-`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/metrics` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
+`/rustfs/admin/v3/scanner/status` and `/rustfs/admin/v3/realtime` report the node that handles the HTTP request; the metrics endpoint does not fan out to peers. In distributed deployments, query every node explicitly and keep `by-host=true` so each response includes that node's host view:
 
 ```bash
 for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
@@ -462,7 +493,7 @@ for endpoint in http://node-a:9000 http://node-b:9000 http://node-c:9000; do
     --access_key "$RUSTFS_ACCESS_KEY" \
     --secret_key "$RUSTFS_SECRET_KEY" \
     --request GET \
-    "${endpoint}/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" \
+    "${endpoint}/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" \
     > "artifacts/scanner-metrics.${node}.$(date -u +%Y%m%dT%H%M%SZ).ndjson"
 done
 ```

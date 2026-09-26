@@ -16,6 +16,7 @@
 
 pub mod bandwidth;
 pub mod bucket_target_sys;
+pub mod config_parse_mode;
 pub mod durability;
 pub mod error;
 pub mod lifecycle;
@@ -30,6 +31,7 @@ pub mod policy_sys;
 pub mod quota;
 pub mod remote_s3_client;
 pub mod replication;
+pub(crate) mod retirement;
 pub mod sealed_credentials;
 pub mod tagging;
 pub mod target;

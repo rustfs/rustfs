@@ -36,18 +36,13 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Temporary tokio-tar fork pinned to the reviewed parser limits,
-    # cancellation safety, and error-fusing change while Snowball is
-    # prototyped against tar-codec and Swift retains its current reader.
-    # owner: cxymds  review: 2026-10
-    "https://github.com/cxymds/tokio-tar.git",
-    # Official s3s repository. Temporarily pinned to the merged generic REST
-    # SigV4 payload-checksum fix until it is available in a crates.io release.
+    # Official s3s repository; the application consumes the 0.17.0 crates.io
+    # releases for s3s and s3s-sigv4.
     # owner: marshawcoco  review: 2026-10
-    "https://github.com/s3s-project/s3s.git",
+    # "https://github.com/s3s-project/s3s.git",
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/rustfs/s3s.git",
+    # "https://github.com/rustfs/s3s.git",
 ]
 
 [bans]

@@ -15,7 +15,8 @@
 use crate::config::storageclass::STANDARD;
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use regex::Regex;
-use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS};
+use rustfs_filemeta::metadata_keys;
+use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use std::collections::HashMap;
 use std::io::{Error, Result};
 use std::sync::LazyLock;
@@ -32,8 +33,8 @@ pub fn clean_metadata(metadata: &mut HashMap<String, String>) {
 }
 
 pub fn remove_standard_storage_class(metadata: &mut HashMap<String, String>) {
-    if metadata.get(AMZ_STORAGE_CLASS) == Some(&STANDARD.to_string()) {
-        metadata.remove(AMZ_STORAGE_CLASS);
+    if metadata.get(metadata_keys::STORAGE_CLASS) == Some(&STANDARD.to_string()) {
+        metadata.remove(metadata_keys::STORAGE_CLASS);
     }
 }
 

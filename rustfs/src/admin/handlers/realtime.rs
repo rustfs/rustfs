@@ -14,7 +14,7 @@
 
 //! Console realtime metrics API.
 //!
-//! This preserves the console's fixed `/admin/v3/metrics` contract while
+//! This preserves the console's fixed `/admin/v3/realtime` contract while
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn metrics_params_default_to_single_sample() {
-        let uri: Uri = "/rustfs/admin/v3/metrics".parse().unwrap();
+        let uri: Uri = "/rustfs/admin/v3/realtime".parse().unwrap();
         let mp = extract_metrics_init_params(&uri);
 
         assert_eq!(resolve_sample_count(&mp), DEFAULT_METRICS_SAMPLES);
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn metrics_params_treat_zero_as_single_sample() {
-        let uri: Uri = "/rustfs/admin/v3/metrics?n=0".parse().unwrap();
+        let uri: Uri = "/rustfs/admin/v3/realtime?n=0".parse().unwrap();
         let mp = extract_metrics_init_params(&uri);
 
         assert_eq!(resolve_sample_count(&mp), DEFAULT_METRICS_SAMPLES);
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn metrics_params_cap_samples_to_safety_limit() {
-        let uri: Uri = "/rustfs/admin/v3/metrics?n=9999".parse().unwrap();
+        let uri: Uri = "/rustfs/admin/v3/realtime?n=9999".parse().unwrap();
         let mp = extract_metrics_init_params(&uri);
 
         assert_eq!(resolve_sample_count(&mp), MAX_METRICS_SAMPLES);
@@ -332,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_handler_rejects_missing_credentials() {
         let result = MetricsHandler {}
-            .call(build_metrics_request("/rustfs/admin/v3/metrics"), Params::new())
+            .call(build_metrics_request("/rustfs/admin/v3/realtime"), Params::new())
             .await;
         let err = match result {
             Ok(_) => panic!("metrics handler must reject unauthenticated requests"),

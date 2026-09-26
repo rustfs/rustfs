@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 
 use crate::{
     FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
@@ -131,35 +130,52 @@ impl LocalClient {
         self.manager.clone().unwrap_or_else(crate::get_global_lock_manager)
     }
 
-    /// Get the shard index for a given lock ID
-    fn get_shard_index(&self, lock_id: &LockId) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        lock_id.hash(&mut hasher);
-        (hasher.finish() as usize) & self.shard_mask
+    /// Guard entries for one resource share a shard so expiration checks do not
+    /// need to take every shard's write lock on the acquisition hot path.
+    fn get_resource_shard_index(&self, resource: &crate::ObjectKey) -> usize {
+        resource.shard_index(self.shard_mask)
     }
 
     /// Get the shard for a given lock ID
     fn get_shard(&self, lock_id: &LockId) -> &Arc<RwLock<HashMap<LockId, LocalGuardEntry>>> {
-        let index = self.get_shard_index(lock_id);
+        let index = self.get_resource_shard_index(&lock_id.resource);
         &self.guard_storage[index]
     }
 
     async fn reclaim_expired_guards_for_resource(&self, resource: &crate::ObjectKey) -> usize {
-        let expired_entries = Self::extract_expired_guards(&self.guard_storage, Some(resource)).await;
+        let shard = &self.guard_storage[self.get_resource_shard_index(resource)];
+        let has_expired = {
+            let guards = shard.read().await;
+            guards
+                .iter()
+                .any(|(lock_id, entry)| &lock_id.resource == resource && entry.is_expired())
+        };
+        if !has_expired {
+            return 0;
+        }
+
+        let expired_entries = {
+            let mut guards = shard.write().await;
+            guards
+                .extract_if(|lock_id, entry| &lock_id.resource == resource && entry.is_expired())
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
         Self::release_reclaimed_guards(expired_entries, Some(resource))
     }
 
-    async fn extract_expired_guards(storage: &GuardStorage, resource: Option<&crate::ObjectKey>) -> Vec<LocalGuardEntry> {
+    async fn extract_expired_guards(storage: &GuardStorage) -> Vec<LocalGuardEntry> {
         let mut expired_entries = Vec::new();
         for shard in storage.iter() {
+            let has_expired = {
+                let guards = shard.read().await;
+                guards.values().any(LocalGuardEntry::is_expired)
+            };
+            if !has_expired {
+                continue;
+            }
             let mut guards = shard.write().await;
-            expired_entries.extend(
-                guards
-                    .extract_if(|lock_id, entry| {
-                        resource.is_none_or(|resource| &lock_id.resource == resource) && entry.is_expired()
-                    })
-                    .map(|(_, entry)| entry),
-            );
+            expired_entries.extend(guards.extract_if(|_, entry| entry.is_expired()).map(|(_, entry)| entry));
         }
         expired_entries
     }
@@ -197,7 +213,7 @@ impl LocalClient {
                 let Some(storage) = storage.upgrade() else {
                     break;
                 };
-                let expired_entries = Self::extract_expired_guards(&storage, None).await;
+                let expired_entries = Self::extract_expired_guards(&storage).await;
                 Self::release_reclaimed_guards(expired_entries, None);
             }
         });
@@ -214,11 +230,24 @@ impl Default for LocalClient {
 impl LockClient for LocalClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         self.ensure_reaper();
-        let lock_manager = self.get_lock_manager();
-        let reclaimed_before_acquire = self.reclaim_expired_guards_for_resource(&request.resource).await;
+        if request.lock_id.resource != request.resource {
+            return Ok(LockResponse::failure(
+                "Lock id resource does not match the requested resource",
+                Duration::ZERO,
+            ));
+        }
         let acquire_deadline = Instant::now()
             .checked_add(request.acquire_timeout)
             .unwrap_or_else(Instant::now);
+        let lock_manager = self.get_lock_manager();
+        let initial_remaining = acquire_deadline.saturating_duration_since(Instant::now());
+        let reclaimed_before_acquire = if initial_remaining.is_zero() {
+            0
+        } else {
+            timeout(initial_remaining, self.reclaim_expired_guards_for_resource(&request.resource))
+                .await
+                .unwrap_or(0)
+        };
 
         let build_lock_request = |acquire_timeout| match request.lock_type {
             LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
@@ -262,7 +291,11 @@ impl LockClient for LocalClient {
                     return Ok(LockResponse::success(lock_info, Duration::ZERO));
                 }
                 Err(crate::fast_lock::LockResult::Timeout) => {
-                    if !retried_after_reclaim && self.reclaim_expired_guards_for_resource(&request.resource).await > 0 {
+                    if !retried_after_reclaim {
+                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
+                        }
                         retried_after_reclaim = true;
                         continue;
                     }
@@ -272,7 +305,11 @@ impl LockClient for LocalClient {
                     current_owner,
                     current_mode,
                 }) => {
-                    if !retried_after_reclaim && self.reclaim_expired_guards_for_resource(&request.resource).await > 0 {
+                    if !retried_after_reclaim {
+                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
+                        }
                         retried_after_reclaim = true;
                         continue;
                     }
@@ -290,8 +327,11 @@ impl LockClient for LocalClient {
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
         let shard = self.get_shard(lock_id);
-        let mut guards = shard.write().await;
-        if let Some(guard) = guards.remove(lock_id) {
+        let guard = {
+            let mut guards = shard.write().await;
+            guards.remove(lock_id)
+        };
+        if let Some(guard) = guard {
             // Guard automatically releases the lock when dropped
             drop(guard.guard);
             Ok(true)
@@ -416,6 +456,88 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("lock guard was not reaped before test deadline");
+    }
+
+    #[tokio::test]
+    async fn acquire_does_not_wait_on_unrelated_guard_shards() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "resource-shard-hot-path");
+        let target_shard = client.get_resource_shard_index(&resource);
+
+        let mut unrelated_writes = Vec::new();
+        for (index, shard) in client.guard_storage.iter().enumerate() {
+            if index != target_shard {
+                unrelated_writes.push(shard.write().await);
+            }
+        }
+
+        let lock_request = request(resource, "owner", Duration::from_secs(30));
+        let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&lock_request))
+            .await
+            .expect("an acquire must not sweep unrelated guard shards")
+            .expect("local acquire should return a response");
+        assert!(response.success);
+
+        drop(unrelated_writes);
+        assert!(client.release(&lock_request.lock_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reclaim_expired_guard_only_writes_the_resource_shard() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "resource-shard-expired");
+        let target_shard = client.get_resource_shard_index(&resource);
+        let expired = request(resource.clone(), "expired-owner", Duration::ZERO);
+        assert!(client.acquire_lock(&expired).await.unwrap().success);
+
+        let mut unrelated_writes = Vec::new();
+        for (index, shard) in client.guard_storage.iter().enumerate() {
+            if index != target_shard {
+                unrelated_writes.push(shard.write().await);
+            }
+        }
+
+        let replacement = request(resource, "replacement-owner", Duration::from_secs(30));
+        let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&replacement))
+            .await
+            .expect("expired guard reclaim must only write the resource shard")
+            .expect("local acquire should return a response");
+        assert!(response.success);
+
+        drop(unrelated_writes);
+        assert!(client.release(&replacement.lock_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn acquire_deadline_includes_resource_shard_reclaim_wait() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "resource-shard-deadline");
+        let target_shard = client.get_resource_shard_index(&resource);
+        let _target_write = client.guard_storage[target_shard].write().await;
+        let lock_request = request(resource, "owner", Duration::from_secs(30)).with_acquire_timeout(Duration::from_millis(10));
+
+        let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&lock_request))
+            .await
+            .expect("acquire should return after its reclaim budget expires")
+            .expect("local acquire should return a response");
+        assert!(!response.success);
+    }
+
+    #[tokio::test]
+    async fn acquire_rejects_a_lock_id_for_another_resource() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let mut lock_request = request(crate::ObjectKey::new("bucket", "requested"), "owner", Duration::from_secs(30));
+        lock_request.lock_id.resource = crate::ObjectKey::new("bucket", "other");
+
+        let response = client.acquire_lock(&lock_request).await.unwrap();
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("does not match"));
     }
 
     #[tokio::test(flavor = "current_thread")]

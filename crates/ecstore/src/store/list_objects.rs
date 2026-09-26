@@ -20,12 +20,15 @@ fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
     err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
 }
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_matches;
 use crate::bucket::metadata_sys::{
     get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
 };
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
-use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
+use crate::cache_value::metacache_set::{
+    FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
+};
 use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
@@ -63,14 +66,14 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
@@ -91,6 +94,30 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
+
+/// Build the versioned listing options used by recursive object walks.
+///
+/// `list_path_result` normally derives these scan bounds before dispatching to
+/// a disk. Versioned walks call `list_path` directly, so they must establish the
+/// same base directory and child-prefix filter at this boundary.
+fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOptions) -> ListPathOptions {
+    let mut list_options = ListPathOptions {
+        bucket,
+        prefix: prefix.to_owned(),
+        marker: opts.marker.clone(),
+        limit: i32::try_from(opts.limit).unwrap_or(i32::MAX),
+        ask_disks: opts.ask_disks.clone(),
+        incl_deleted: true,
+        recursive: true,
+        versioned: true,
+        walkdir_timeout: opts.walkdir_timeout,
+        walkdir_stall_timeout: opts.walkdir_stall_timeout,
+        ..Default::default()
+    };
+    list_options.base_dir = base_dir_from_prefix(prefix);
+    list_options.set_filter();
+    list_options
+}
 
 struct ListObjectVersionsInput<'a> {
     bucket: &'a str,
@@ -314,6 +341,18 @@ pub struct ListPathOptions {
     pub cursor_generation: Option<String>,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
+    /// Shared by the collector and raw producers to preserve bounded-walk
+    /// completion when filtering removes all entries from a batch.
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
+}
+
+fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool> {
+    let state = options
+        .producer_limit_reached
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    options.producer_limit_reached = Some(state.clone());
+    state
 }
 
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
@@ -2215,7 +2254,7 @@ fn list_objects_paginate(
         }
     }
 
-    if !is_truncated && disk_has_more {
+    if !is_truncated && disk_has_more && !include_version_id {
         let visible_count = objects.len() + prefixes.len();
         let should_truncate = if delimiter.is_none() {
             visible_count > 0
@@ -2603,20 +2642,74 @@ struct ListingSupplementOptions {
     walkdir_stall_timeout: Option<Duration>,
 }
 
+struct ListingReconciler {
+    set: SetDisks,
+    primary_disks: Arc<Vec<DiskStore>>,
+    fallback_disks: Arc<Vec<DiskStore>>,
+}
+
+impl ListingReconciler {
+    async fn read_after_namespace_barrier(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> std::result::Result<(MetaCacheEntries, usize), DiskError> {
+        let disks = self
+            .primary_disks
+            .iter()
+            .chain(self.fallback_disks.iter())
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>();
+
+        self.set
+            .read_listing_metadata_after_namespace_barrier(&disks, bucket, object)
+            .await
+            .map_err(|_| DiskError::ErasureReadQuorum)
+    }
+}
+
 struct ListingSupplement {
     options: ListingSupplementOptions,
     fallback_disks: Arc<Vec<DiskStore>>,
     claim_tracker: FallbackClaimTracker,
     entries: Option<Arc<OnceCell<FallbackListingEntries>>>,
+    reconciler: Option<ListingReconciler>,
 }
 
 impl ListingSupplement {
+    #[cfg(test)]
     fn new(
         options: ListingSupplementOptions,
         fallback_disks: Arc<Vec<DiskStore>>,
         claim_tracker: FallbackClaimTracker,
     ) -> Arc<Self> {
-        let entries = if options.per_disk_limit > 0 {
+        Self::new_inner(options, fallback_disks, claim_tracker, None)
+    }
+
+    fn new_with_reconciler(
+        options: ListingSupplementOptions,
+        fallback_disks: Arc<Vec<DiskStore>>,
+        claim_tracker: FallbackClaimTracker,
+        set: SetDisks,
+        primary_disks: Arc<Vec<DiskStore>>,
+    ) -> Arc<Self> {
+        let reconciler = ListingReconciler {
+            set,
+            primary_disks,
+            fallback_disks: fallback_disks.clone(),
+        };
+
+        Self::new_inner(options, fallback_disks, claim_tracker, Some(reconciler))
+    }
+
+    fn new_inner(
+        options: ListingSupplementOptions,
+        fallback_disks: Arc<Vec<DiskStore>>,
+        claim_tracker: FallbackClaimTracker,
+        reconciler: Option<ListingReconciler>,
+    ) -> Arc<Self> {
+        let entries: Option<Arc<OnceCell<FallbackListingEntries>>> = if options.per_disk_limit > 0 {
             Some(Arc::new(OnceCell::new()))
         } else {
             None
@@ -2627,11 +2720,32 @@ impl ListingSupplement {
             fallback_disks,
             claim_tracker,
             entries,
+            reconciler,
         })
     }
 
     fn is_empty(&self) -> bool {
         self.fallback_disks.is_empty()
+    }
+
+    async fn reconcile_object(
+        &self,
+        object: &str,
+        resolver: MetadataResolutionParams,
+        enforce_write_quorum: bool,
+    ) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
+        let Some(reconciler) = &self.reconciler else {
+            return Ok(None);
+        };
+        let (entries, confirmed_absent) = reconciler.read_after_namespace_barrier(&self.options.bucket, object).await?;
+        if let Some(entry) = resolve_listing_entries(entries, resolver.clone(), enforce_write_quorum) {
+            return Ok(Some(entry));
+        }
+        if confirmed_absent >= resolver.obj_quorum {
+            return Ok(None);
+        }
+
+        Err(DiskError::ErasureReadQuorum)
     }
 
     async fn entries_for(&self, object: &str) -> Vec<Option<MetaCacheEntry>> {
@@ -2871,11 +2985,25 @@ fn cached_entry_needs_supplement(
     false
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ListingSupplementTarget {
+    Directory(String),
+    Object(String),
+}
+
+impl ListingSupplementTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::Directory(name) | Self::Object(name) => name,
+        }
+    }
+}
+
 fn listing_entries_supplement_target(
     entries: &MetaCacheEntries,
     resolver: &MetadataResolutionParams,
     enforce_write_quorum: bool,
-) -> Option<String> {
+) -> Option<ListingSupplementTarget> {
     if !enforce_write_quorum {
         return None;
     }
@@ -2890,7 +3018,7 @@ fn listing_entries_supplement_target(
         // A committed child may have some of its directory copies only on
         // fallback disks, just like object metadata in a partial primary sample.
         if directory_copies < resolver.dir_quorum {
-            return Some(directory.name.clone());
+            return Some(ListingSupplementTarget::Directory(directory.name.clone()));
         }
     }
 
@@ -2921,14 +3049,14 @@ fn listing_entries_supplement_target(
         // A split primary sample can fall back to an older version even when a
         // newer version reaches write quorum only after the fallback disks join.
         if entries_disagree {
-            return Some(entry.name.clone());
+            return Some(ListingSupplementTarget::Object(entry.name.clone()));
         }
 
         let mut entry = entry.clone();
         if let Ok(cached) = entry.xl_meta()
             && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
         {
-            return Some(entry.name);
+            return Some(ListingSupplementTarget::Object(entry.name));
         }
     }
 
@@ -2940,16 +3068,22 @@ async fn resolve_listing_entries_with_supplement(
     resolver: MetadataResolutionParams,
     enforce_write_quorum: bool,
     supplement: Arc<ListingSupplement>,
-) -> Option<MetaCacheEntry> {
-    if !supplement.is_empty()
-        && let Some(object) = listing_entries_supplement_target(&entries, &resolver, enforce_write_quorum)
-    {
+) -> std::result::Result<Option<MetaCacheEntry>, DiskError> {
+    if let Some(target) = listing_entries_supplement_target(&entries, &resolver, enforce_write_quorum) {
         let mut candidates = entries.0;
-        candidates.extend(supplement.entries_for(&object).await);
-        return resolve_listing_entries(MetaCacheEntries(candidates), resolver, enforce_write_quorum);
+        if !supplement.is_empty() {
+            candidates.extend(supplement.entries_for(target.name()).await);
+        }
+        if let Some(entry) = resolve_listing_entries(MetaCacheEntries(candidates), resolver.clone(), enforce_write_quorum) {
+            return Ok(Some(entry));
+        }
+        return match target {
+            ListingSupplementTarget::Directory(_) => Ok(None),
+            ListingSupplementTarget::Object(object) => supplement.reconcile_object(&object, resolver, enforce_write_quorum).await,
+        };
     }
 
-    resolve_listing_entries(entries, resolver, enforce_write_quorum)
+    Ok(resolve_listing_entries(entries, resolver, enforce_write_quorum))
 }
 
 async fn resolve_agreed_listing_entry_with_supplement(
@@ -3902,7 +4036,7 @@ impl ECStore {
                 )
                 .await
             {
-                Ok(res) if !res.delete_marker => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
@@ -4182,6 +4316,7 @@ impl ECStore {
         // cancel channel
         let cancel = CancellationToken::new();
         let _cancel_guard = cancel.clone().drop_guard();
+        ensure_producer_limit_state(&mut o);
 
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
@@ -4331,6 +4466,7 @@ impl ECStore {
             "store list_merged started"
         );
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
 
         let mut inputs = Vec::new();
@@ -4346,16 +4482,10 @@ impl ECStore {
             }
         }
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, sender);
 
         let results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
 
         let mut all_at_eof = true;
 
@@ -4422,6 +4552,7 @@ impl ECStore {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -4478,6 +4609,7 @@ impl ECStore {
                         }
                     };
                     let fallback_disks = Arc::new(fallback_disks);
+                    let disks = Arc::new(disks);
                     let claim_tracker = FallbackClaimTracker::default();
 
                     let obj_quorum = latest_listing_object_quorum(
@@ -4519,7 +4651,7 @@ impl ECStore {
 
                     let tx1 = sender.clone();
                     let tx2 = sender.clone();
-                    let supplement = ListingSupplement::new(
+                    let supplement = ListingSupplement::new_with_reconciler(
                         ListingSupplementOptions {
                             bucket: bucket.to_owned(),
                             path: path.clone(),
@@ -4535,11 +4667,13 @@ impl ECStore {
                         },
                         fallback_disks.clone(),
                         claim_tracker.clone(),
+                        set.as_ref().clone(),
+                        disks.clone(),
                     );
                     let agreed_supplement = supplement.clone();
                     let partial_supplement = supplement;
 
-                    list_path_raw_with_claim_tracker(
+                    list_path_raw_with_partial_result(
                         rx_clone,
                         ListPathRawOptions {
                             disks: disks.iter().cloned().map(Some).collect(),
@@ -4598,30 +4732,31 @@ impl ECStore {
                                     }
                                 })
                             })),
-                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                                Box::pin({
-                                    let value = tx2.clone();
-                                    let resolver = partial_resolver.clone();
-                                    let supplement = partial_supplement.clone();
-                                    async move {
-                                        if let Some(entry) = resolve_listing_entries_with_supplement(
-                                            entries,
-                                            resolver,
-                                            enforce_write_quorum,
-                                            supplement,
-                                        )
-                                        .await
-                                            && let Err(err) = value.send(entry).await
-                                        {
-                                            error!("list_path send fail {:?}", err);
-                                        }
-                                    }
-                                })
-                            })),
                             finished: None,
                             ..Default::default()
                         },
                         claim_tracker,
+                        Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                            Box::pin({
+                                let value = tx2.clone();
+                                let resolver = partial_resolver.clone();
+                                let supplement = partial_supplement.clone();
+                                async move {
+                                    if let Some(entry) = resolve_listing_entries_with_supplement(
+                                        entries,
+                                        resolver,
+                                        enforce_write_quorum,
+                                        supplement,
+                                    )
+                                    .await?
+                                        && let Err(err) = value.send(entry).await
+                                    {
+                                        error!("list_path send fail {:?}", err);
+                                    }
+                                    Ok(())
+                                }
+                            })
+                        }),
                     )
                     .await
                 });
@@ -4783,17 +4918,11 @@ impl ECStore {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
@@ -4931,6 +5060,15 @@ async fn gather_results(
         }
     }
 
+    // A producer can close its stream after exhausting its own scan budget
+    // before this collector reaches its output limit.  In that case the input
+    // channel closing is not authoritative EOF: the caller must advertise a
+    // continuation page even when every remaining entry was filtered out.
+    let producer_limit_reached = opts
+        .producer_limit_reached
+        .as_ref()
+        .is_some_and(|reached| reached.load(Ordering::Acquire));
+
     // finish not full, return eof
     let filtered = scanned_entries.saturating_sub(candidate_entries);
     if let Some(started) = gather_started {
@@ -4967,7 +5105,7 @@ async fn gather_results(
                 o: MetaCacheEntries(entries),
                 ..Default::default()
             }),
-            err: Some(rustfs_filemeta::Error::Unexpected),
+            err: (!producer_limit_reached).then_some(rustfs_filemeta::Error::Unexpected),
         })
         .await
         .is_err()
@@ -5068,6 +5206,130 @@ async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEn
     }
 }
 
+/// Each input has already been resolved inside its own erasure set. This is a
+/// union of version histories, never a quorum vote between unrelated pools.
+fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
+    let name = first.name.clone();
+    let mut versions: HashMap<(Option<Uuid>, bool), (FileMetaShallowVersion, ObjectInfo)> = HashMap::new();
+    for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
+        let meta = match entry.cached.take() {
+            Some(meta) => meta,
+            None => FileMeta::load(&entry.metadata).map_err(|_| Error::FileCorrupt)?,
+        };
+        if meta.versions.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+        for version in meta.versions {
+            let parsed = version.parse_version_meta().map_err(|_| Error::FileCorrupt)?;
+            if !parsed.valid() || parsed.version_type != version.header.version_type {
+                return Err(Error::FileCorrupt);
+            }
+            let fi = parsed.into_fileinfo("", &name, true).map_err(|_| Error::FileCorrupt)?;
+            let version_id = fi.version_id.filter(|id| !id.is_nil());
+            if version_id != version.header.version_id.filter(|id| !id.is_nil())
+                || fi.mod_time != version.header.mod_time
+                || fi.tier_free_version() != version.header.free_version()
+            {
+                return Err(Error::FileCorrupt);
+            }
+            let info = ObjectInfo::from_file_info(&fi, "", &name, true);
+            let identity = (version_id, version.header.free_version());
+            match versions.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((version, info));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let (previous, previous_info) = slot.get();
+                    // Suspended and unversioned writes replace the one null
+                    // slot. Distinct UUID versions never supersede each other.
+                    if version_id.is_none() && info.mod_time != previous_info.mod_time {
+                        if info.mod_time > previous_info.mod_time {
+                            slot.insert((version, info));
+                        }
+                        continue;
+                    }
+                    let equivalent = if info.delete_marker && previous_info.delete_marker {
+                        super::object::is_equivalent_data_movement_delete_marker(&info, previous_info)
+                    } else {
+                        crate::data_movement::is_equivalent_data_movement_object_identity(&info, previous_info, true, true)
+                    };
+                    if !equivalent {
+                        return Err(Error::FileCorrupt);
+                    }
+                    // Equivalent migrated copies can have different coding or
+                    // data directories. Choose a stable representation without
+                    // making input order part of the S3 version order.
+                    if version.meta < previous.meta {
+                        slot.insert((version, info));
+                    }
+                }
+            }
+        }
+    }
+    let mut live_remote_references = HashMap::<String, HashMap<String, Vec<ObjectInfo>>>::new();
+    for (_, info) in versions.values() {
+        if !info.transitioned_object.free_version && info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE {
+            live_remote_references
+                .entry(info.transitioned_object.tier.clone())
+                .or_default()
+                .entry(info.transitioned_object.name.clone())
+                .or_default()
+                .push(info.clone());
+        }
+    }
+    // Keep cleanup durable in its source xl.meta, but do not expose it to a
+    // merged recovery walk while another physical pool still owns the tuple.
+    versions.retain(|_, (_, info)| {
+        !info.transitioned_object.free_version
+            || !live_remote_references
+                .get(info.transitioned_object.tier.as_str())
+                .and_then(|by_name| by_name.get(info.transitioned_object.name.as_str()))
+                .is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|live| free_version_remote_tuple_matches(info, live).unwrap_or(false))
+                })
+    });
+    let mut merged = FileMeta::new();
+    merged.versions = versions.into_values().map(|(version, _)| version).collect();
+    merged.versions.sort_by(|a, b| {
+        if a.header.sorts_before(&b.header) {
+            std::cmp::Ordering::Less
+        } else if b.header.sorts_before(&a.header) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let metadata = merged.marshal_msg()?;
+    *first = MetaCacheEntry {
+        name,
+        metadata,
+        cached: Some(merged),
+        reusable: true,
+    };
+    Ok(())
+}
+
+/// `rx` is private to the producers. Cancelling it on a merge error must not
+/// cancel the request token, which would suppress that error at the API edge.
+fn spawn_listing_merge(
+    rx: CancellationToken,
+    inputs: Vec<Receiver<MetaCacheEntry>>,
+    sender: Sender<MetaCacheEntry>,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(
+        async move {
+            let result = merge_entry_channels(rx.clone(), inputs, sender, 1).await;
+            if result.is_err() {
+                rx.cancel();
+            }
+            result
+        }
+        .instrument(tracing::Span::current()),
+    )
+}
+
 async fn merge_entry_channels(
     rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
@@ -5133,6 +5395,7 @@ async fn merge_entry_channels(
     // after anything greater has been emitted).
     let mut last_emitted = String::new();
     let mut group: Vec<Box<MergeHead>> = Vec::new();
+    let mut object_entries: Vec<MetaCacheEntry> = Vec::new();
     let mut refill: Vec<usize> = Vec::with_capacity(in_channels.len());
 
     while let Some(Reverse(first)) = heap.pop() {
@@ -5150,7 +5413,7 @@ async fn merge_entry_channels(
         // Resolve the same-name group to one winner (heads arrive in ascending
         // channel order):
         //  - prefix dir vs prefix dir: the first (lowest channel) wins;
-        //  - object vs object: the later channel wins (legacy authority rule);
+        //  - object vs object: merge the independently resolved version stacks;
         //  - object vs prefix dir: same-name means both end with the separator,
         //    i.e. the object is an explicit "directory marker" for the same S3
         //    key — it shadows the prefix dir so the key does not surface as
@@ -5168,9 +5431,25 @@ async fn merge_entry_channels(
                 if dir_winner.is_none() {
                     dir_winner = Some(head);
                 }
+            } else if let Some(winner) = object_winner.as_ref() {
+                // Key-only candidates carry no version metadata and cannot
+                // replace a resolved stack or contribute a quorum vote.
+                if head.entry.is_object() {
+                    if winner.entry.is_object() {
+                        object_entries.push(head.entry);
+                    } else {
+                        object_winner = Some(head);
+                    }
+                }
             } else {
                 object_winner = Some(head);
             }
+        }
+
+        if !object_entries.is_empty()
+            && let Some(winner) = object_winner.as_mut()
+        {
+            merge_object_entry_versions(&mut winner.entry, object_entries.drain(..))?;
         }
 
         if let Some(head) = object_winner.or(dir_winner)
@@ -5267,7 +5546,7 @@ impl Sets {
                 )
                 .await
             {
-                Ok(res) if !res.delete_marker => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
@@ -5477,6 +5756,7 @@ impl Sets {
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
+        ensure_producer_limit_state(&mut o);
         let sets = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
@@ -5605,6 +5885,7 @@ impl Sets {
             "sets list_merged started"
         );
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -5617,16 +5898,10 @@ impl Sets {
             futures.push(async move { set.list_path(rx_clone, opts, send).await });
         }
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                    error!("merge_entry_channels err {:?}", err);
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, sender);
 
         let results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut all_at_eof = true;
         let mut errs = Vec::new();
         for result in results {
@@ -5677,6 +5952,7 @@ impl Sets {
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
 
+        let rx = rx.child_token();
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -5730,6 +6006,7 @@ impl Sets {
                     Vec::new()
                 };
                 let fallback_disks = Arc::new(fallback_disks);
+                let disks = Arc::new(disks);
                 let claim_tracker = FallbackClaimTracker::default();
 
                 let obj_quorum = latest_listing_object_quorum(
@@ -5765,7 +6042,7 @@ impl Sets {
 
                 let tx1 = sender.clone();
                 let tx2 = sender.clone();
-                let supplement = ListingSupplement::new(
+                let supplement = ListingSupplement::new_with_reconciler(
                     ListingSupplementOptions {
                         bucket: bucket.to_owned(),
                         path: path.clone(),
@@ -5781,11 +6058,13 @@ impl Sets {
                     },
                     fallback_disks.clone(),
                     claim_tracker.clone(),
+                    set.as_ref().clone(),
+                    disks.clone(),
                 );
                 let agreed_supplement = supplement.clone();
                 let partial_supplement = supplement;
 
-                list_path_raw_with_claim_tracker(
+                list_path_raw_with_partial_result(
                     rx_clone,
                     ListPathRawOptions {
                         disks: disks.iter().cloned().map(Some).collect(),
@@ -5844,30 +6123,27 @@ impl Sets {
                                 }
                             })
                         })),
-                        partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                            Box::pin({
-                                let value = tx2.clone();
-                                let resolver = partial_resolver.clone();
-                                let supplement = partial_supplement.clone();
-                                async move {
-                                    if let Some(entry) = resolve_listing_entries_with_supplement(
-                                        entries,
-                                        resolver,
-                                        enforce_write_quorum,
-                                        supplement,
-                                    )
-                                    .await
-                                        && let Err(err) = value.send(entry).await
-                                    {
-                                        error!("list_path send fail {:?}", err);
-                                    }
-                                }
-                            })
-                        })),
                         finished: None,
                         ..Default::default()
                     },
                     claim_tracker,
+                    Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                        Box::pin({
+                            let value = tx2.clone();
+                            let resolver = partial_resolver.clone();
+                            let supplement = partial_supplement.clone();
+                            async move {
+                                if let Some(entry) =
+                                    resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement)
+                                        .await?
+                                    && let Err(err) = value.send(entry).await
+                                {
+                                    error!("list_path send fail {:?}", err);
+                                }
+                                Ok(())
+                            }
+                        })
+                    }),
                 )
                 .await
             });
@@ -6007,17 +6283,11 @@ impl Sets {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(
-            async move {
-                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
-                    error!("merge_entry_channels err {:?}", err)
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
+        merge_task.await.map_err(Error::from)??;
         let mut errs = Vec::new();
         for walk_result in walk_results {
             match walk_result {
@@ -6190,12 +6460,13 @@ impl SetDisks {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
+                Ok(_) => {}
                 Err(err) => {
                     if is_err_bucket_not_found(&err) {
                         return Err(err);
@@ -6465,26 +6736,8 @@ impl SetDisks {
             .instrument(tracing::Span::current()),
         );
 
-        let limit = i32::try_from(opts.limit).unwrap_or(i32::MAX);
-        let list_result = self
-            .list_path(
-                rx,
-                ListPathOptions {
-                    bucket: bucket_name_for_list,
-                    prefix: prefix.to_owned(),
-                    marker: opts.marker.clone(),
-                    limit,
-                    ask_disks: opts.ask_disks.clone(),
-                    incl_deleted: true,
-                    recursive: true,
-                    versioned: true,
-                    walkdir_timeout: opts.walkdir_timeout,
-                    walkdir_stall_timeout: opts.walkdir_stall_timeout,
-                    ..Default::default()
-                },
-                entry_tx,
-            )
-            .await;
+        let list_options = recursive_walk_list_path_options(bucket_name_for_list, prefix, &opts);
+        let list_result = self.list_path(rx, list_options, entry_tx).await;
 
         let _ = result_task.await;
 
@@ -6547,6 +6800,7 @@ impl SetDisks {
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
+        ensure_producer_limit_state(&mut o);
         let set = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
@@ -6664,7 +6918,74 @@ impl SetDisks {
         Ok(result)
     }
 
+    async fn list_versions_authoritatively(
+        &self,
+        rx: CancellationToken,
+        opts: ListPathOptions,
+        sender: Sender<MetaCacheEntry>,
+    ) -> Result<()> {
+        let (disks, _, _) = self.get_online_disks_with_healing_and_info(true).await;
+        let disk_count = self.set_drive_count;
+        let parity = self.default_parity_count;
+        let read_quorum = if parity == 0 { disk_count } else { disk_count.div_ceil(2) };
+        if disk_count == 0 || disks.len() < read_quorum {
+            return Err(DiskError::ErasureReadQuorum.into());
+        }
+        let first_error = Arc::new(tokio::sync::Mutex::new(None));
+        let error_sink = Arc::clone(&first_error);
+        let bucket = opts.bucket.clone();
+        let cancel = rx.clone();
+        let result = list_path_raw_with_claim_tracker(
+            rx,
+            ListPathRawOptions {
+                disks: disks.into_iter().map(Some).collect(),
+                bucket: opts.bucket,
+                path: opts.base_dir,
+                recursive: opts.recursive,
+                incl_deleted: true,
+                skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
+                filter_prefix: opts.filter_prefix,
+                forward_to: opts.marker,
+                min_disks: read_quorum,
+                preserve_replica_metadata: true,
+                // A reader's local page may be consumed by stale entries. Only
+                // the resolved, merged page may stop the authoritative walk.
+                per_disk_limit: 0,
+                skip_walkdir_total_timeout: true,
+                walkdir_timeout: opts.walkdir_timeout,
+                walkdir_stall_timeout: opts.walkdir_stall_timeout,
+                partial: Some(Box::new(move |entries, errors| {
+                    let resolved = Self::resolve_listed_versions(&bucket, entries, errors, disk_count, parity);
+                    let sender = sender.clone();
+                    let cancel = cancel.clone();
+                    let first_error = Arc::clone(&error_sink);
+                    Box::pin(async move {
+                        match resolved {
+                            Ok(Some(entry)) => {
+                                let _ = send_or_cancel(&cancel, &sender, entry).await;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                first_error.lock().await.get_or_insert(error);
+                            }
+                        }
+                    })
+                })),
+                ..Default::default()
+            },
+            FallbackClaimTracker::default(),
+        )
+        .await;
+        if let Some(error) = first_error.lock().await.take() {
+            return Err(error.into());
+        }
+        result.map_err(Into::into)
+    }
+
     pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+        if opts.versioned {
+            return self.list_versions_authoritatively(rx, opts, sender).await;
+        }
         let list_path_started = std::time::Instant::now();
 
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
@@ -6714,6 +7035,7 @@ impl SetDisks {
             fallback_disks = disks.split_off(asked_disks);
         }
         let fallback_disks = Arc::new(fallback_disks);
+        let disks = Arc::new(disks);
         let claim_tracker = FallbackClaimTracker::default();
 
         let bucket = opts.bucket.clone();
@@ -6764,7 +7086,7 @@ impl SetDisks {
         let tx2 = sender.clone();
         let cancel_for_send1 = rx.clone();
         let cancel_for_send2 = rx.clone();
-        let supplement = ListingSupplement::new(
+        let supplement = ListingSupplement::new_with_reconciler(
             ListingSupplementOptions {
                 bucket: bucket.clone(),
                 path: opts.base_dir.clone(),
@@ -6780,11 +7102,13 @@ impl SetDisks {
             },
             fallback_disks.clone(),
             claim_tracker.clone(),
+            self.clone(),
+            disks.clone(),
         );
         let agreed_supplement = supplement.clone();
         let partial_supplement = supplement;
 
-        let result = list_path_raw_with_claim_tracker(
+        let result = list_path_raw_with_partial_result(
             rx,
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
@@ -6798,6 +7122,7 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
+                producer_limit_reached: opts.producer_limit_reached.clone(),
                 // A foreground listing is bounded by lack of drive progress (the walk
                 // stall timeout) and by the page limit, never by how long a healthy
                 // walk takes — a large prefix on slow media is not a fault (#4644).
@@ -6847,31 +7172,32 @@ impl SetDisks {
                         }
                     })
                 })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                    Box::pin({
-                        let value = tx2.clone();
-                        let resolver = partial_resolver.clone();
-                        let cancel_token = cancel_for_send2.clone();
-                        let supplement = partial_supplement.clone();
-                        async move {
-                            if cancel_token.is_cancelled() {
-                                return;
-                            }
-
-                            if let Some(entry) =
-                                resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await
-                                && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
-                                && !cancel_token.is_cancelled()
-                            {
-                                error!("list_path send fail {:?}", err);
-                            }
-                        }
-                    })
-                })),
                 finished: None,
                 ..Default::default()
             },
             claim_tracker,
+            Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                Box::pin({
+                    let value = tx2.clone();
+                    let resolver = partial_resolver.clone();
+                    let cancel_token = cancel_for_send2.clone();
+                    let supplement = partial_supplement.clone();
+                    async move {
+                        if cancel_token.is_cancelled() {
+                            return Ok(());
+                        }
+
+                        if let Some(entry) =
+                            resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await?
+                            && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
+                            && !cancel_token.is_cancelled()
+                        {
+                            error!("list_path send fail {:?}", err);
+                        }
+                        Ok(())
+                    }
+                })
+            }),
         )
         .await;
 
@@ -6987,11 +7313,11 @@ mod test {
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexHealth, ListObjectsIndexProviderKind,
         ListObjectsIndexProviderState, ListObjectsInfo, ListPathOptions, ListPathRawOptions, ListSourceMode,
-        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
-        NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER,
-        PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
-        PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex,
-        PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
+        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, ListingSupplementTarget, MAX_OBJECT_LIST,
+        NamespaceMutationJournalBackend, NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus,
+        PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER, PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER,
+        PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER,
+        PersistentKeyOnlyIndex, PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
         cached_entry_needs_supplement, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
         enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
@@ -7008,28 +7334,50 @@ mod test {
         normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
         parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
         persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
-        persistent_key_only_index_health, persistent_key_only_index_matches_provider,
+        persistent_key_only_index_health, persistent_key_only_index_matches_provider, recursive_walk_list_path_options,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
         resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, select_list_index_provider_source_mode,
         select_list_index_source_mode, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
         walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
     };
+    use crate::bucket::replication::ReplicationState;
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
-    use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
-    use crate::error::StorageError;
+    use crate::disk::{DeleteOptions, DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
+    use crate::error::{Result, StorageError};
     use crate::object_api::ObjectInfo;
+    use crate::set_disk::{SetDisks, hermetic_set_disks_isolated};
+    use bytes::Bytes;
     use rustfs_filemeta::{
         FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
         ObjectPartInfo, VersionType,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn recursive_walk_list_options_scope_scan_to_requested_prefix() {
+        let options =
+            recursive_walk_list_path_options("bucket".to_owned(), "photos/2026/000001.jpg", &super::WalkOptions::default());
+
+        assert_eq!(options.base_dir, "photos/2026/");
+        assert_eq!(options.filter_prefix.as_deref(), Some("000001.jpg"));
+
+        let directory_options =
+            recursive_walk_list_path_options("bucket".to_owned(), "photos/2026/", &super::WalkOptions::default());
+        assert_eq!(directory_options.base_dir, "photos/2026/");
+        assert_eq!(directory_options.filter_prefix, None);
+
+        let object_options = recursive_walk_list_path_options("bucket".to_owned(), "object.jpg", &super::WalkOptions::default());
+        assert_eq!(object_options.base_dir, "");
+        assert_eq!(object_options.filter_prefix.as_deref(), Some("object.jpg"));
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {
@@ -7122,14 +7470,133 @@ mod test {
 
     fn test_object_meta_entry(name: &str) -> MetaCacheEntry {
         let mut meta = FileMeta::new();
-        meta.add_version(FileInfo {
-            volume: "bucket".to_owned(),
-            name: name.to_owned(),
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), "etag".to_string());
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(Uuid::from_u128(0x1234));
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
             size: 1,
-            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.metadata = metadata;
+        meta.add_version(fi).expect("test metadata should accept object version");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_unversioned_object_meta_entry(
+        name: &str,
+        mod_time: time::OffsetDateTime,
+        etag: &str,
+        data_dir: Uuid,
+    ) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(data_dir);
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), etag.to_string());
+        meta.add_version(fi).expect("test metadata should accept unversioned object");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+        let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut meta = FileMeta::new();
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(data_dir);
+        fi.volume = bucket.to_owned();
+        fi.name = name.to_owned();
+        fi.version_id = Some(version_id);
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), "pending-purge-etag".to_string());
+
+        meta.add_version(fi)
+            .expect("test metadata should accept pending-purge object version");
+        meta.delete_version(&FileInfo {
+            volume: bucket.to_owned(),
+            name: name.to_owned(),
+            version_id: Some(version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: crate::bucket::replication::version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
             ..Default::default()
         })
-        .expect("test metadata should accept object version");
+        .expect("version purge status should be persisted");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        (
+            MetaCacheEntry {
+                name: name.to_owned(),
+                metadata,
+                cached: Some(meta),
+                reusable: false,
+            },
+            data_dir,
+        )
+    }
+
+    fn test_null_version_meta_entry(name: &str, mod_time: time::OffsetDateTime) -> MetaCacheEntry {
+        let mut fi = FileInfo::new(name, 2, 2);
+        fi.erasure.index = 1;
+        fi.data_dir = Some(Uuid::from_u128(0x5678));
+        fi.volume = "bucket".to_owned();
+        fi.name = name.to_owned();
+        fi.version_id = None;
+        fi.versioned = false;
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.mod_time = Some(mod_time);
+        fi.metadata.insert("etag".to_string(), "null-etag".to_string());
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test metadata should accept null object version");
         let metadata = meta.marshal_msg().expect("test metadata should marshal");
 
         MetaCacheEntry {
@@ -7282,6 +7749,8 @@ mod test {
             metadata.insert("etag".to_string(), (*etag).to_string());
 
             let mut fi = FileInfo::new(name, *data_blocks, *parity_blocks);
+            fi.erasure.index = 1;
+            fi.data_dir = Some(Uuid::from_u128(0x1234));
             fi.volume = "bucket".to_owned();
             fi.name = name.to_owned();
             let version_idx = u128::try_from(idx + 1).expect("test version index should fit u128");
@@ -7332,6 +7801,47 @@ mod test {
 
         MetaCacheEntry {
             name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_transitioned_meta_entry(name: &str, remote_object: &str, delete_source: bool) -> MetaCacheEntry {
+        let mut source = FileInfo::new(name, 2, 2);
+        source.volume = "bucket".to_string();
+        source.name = name.to_string();
+        source.version_id = Some(Uuid::from_u128(1));
+        source.versioned = true;
+        source.size = 1;
+        source.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        source.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        source.transition_tier = "WARM".to_string();
+        source.transitioned_objname = remote_object.to_string();
+        source.transition_version = Some("remote-version".to_string());
+        source.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "00".repeat(32),
+        );
+
+        let mut meta = FileMeta::new();
+        meta.add_version(source.clone())
+            .expect("test metadata should accept transitioned source");
+        if delete_source {
+            let mut delete = FileInfo {
+                name: name.to_string(),
+                version_id: source.version_id,
+                ..Default::default()
+            };
+            delete.set_tier_free_version_id(&Uuid::from_u128(2).to_string());
+            meta.delete_version(&delete)
+                .expect("transitioned delete should create a free-version owner");
+        }
+        let metadata = meta.marshal_msg().expect("test transitioned metadata should marshal");
+        MetaCacheEntry {
+            name: name.to_string(),
             metadata,
             cached: Some(meta),
             reusable: false,
@@ -7505,7 +8015,7 @@ mod test {
                 };
                 let entry = match kind {
                     "deletes" => test_delete_marker_meta_entry(&name, mod_time),
-                    "null" => test_object_meta_entry(&name),
+                    "null" => test_null_version_meta_entry(&name, mod_time),
                     "mixed" => test_object_with_delete_marker_meta_entry(&name, mod_time, mod_time + time::Duration::SECOND),
                     _ => test_object_meta_entry_with_erasure_versions(&name, &[(mod_time, "etag", 2, 2)]),
                 };
@@ -7581,7 +8091,11 @@ mod test {
                     }
                     .expect("version page should list successfully");
                     let page_size = usize::try_from(max_keys).expect("nonnegative page size");
-                    assert_eq!(result.objects.len() + result.prefixes.len(), (10 - page * page_size).min(page_size));
+                    assert_eq!(
+                        result.objects.len() + result.prefixes.len(),
+                        (10 - page * page_size).min(page_size),
+                        "{kind}, layer {layer}, max_keys {max_keys}, page {page}"
+                    );
                     let has_more = page + 1 < expected_pages;
                     assert_eq!(result.is_truncated, has_more, "{kind}, layer {layer}, max_keys {max_keys}, page {page}");
                     assert_eq!(
@@ -7857,6 +8371,45 @@ mod test {
         assert_eq!(state, GatherResultsState::ConsumerGone);
         // The eof branch never cancels; the wrapper's ConsumerGone arm does.
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_preserves_bounded_producer_after_filtering() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let producer_limit_reached = Arc::new(AtomicBool::new(true));
+
+        entry_tx
+            .send(test_meta_entry("outside-prefix"))
+            .await
+            .expect("filtered test entry should be queued");
+        drop(entry_tx);
+
+        let handle = tokio::spawn(gather_results(
+            cancel,
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                prefix: "requested/".to_owned(),
+                limit: 8,
+                incl_deleted: true,
+                producer_limit_reached: Some(producer_limit_reached),
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = result_rx.recv().await.expect("bounded producer result should be delivered");
+        assert!(result.entries.expect("entries should be present").entries().is_empty());
+        assert!(result.err.is_none(), "bounded producer must not be reported as EOF");
+        assert_eq!(
+            handle
+                .await
+                .expect("gather task should not panic")
+                .expect("gather should succeed"),
+            GatherResultsState::InputClosed
+        );
     }
 
     /// A-1 guard (rustfs/backlog#1306): pin that a *successful* send is never
@@ -9085,6 +9638,59 @@ mod test {
     }
 
     #[tokio::test]
+    async fn list_objects_hides_pending_version_purge_across_walk_and_exact_prefix() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "pending-purge-listing-bucket";
+        let object = "spilo/_permtest";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+
+        let (entry, data_dir) = test_pending_version_purge_meta_entry(bucket, object);
+        for dir in &dirs {
+            let object_dir = dir.path().join(bucket).join(object);
+            tokio::fs::create_dir_all(object_dir.join(data_dir.to_string()))
+                .await
+                .expect("pending-purge object data directory should be created");
+            tokio::fs::write(object_dir.join(data_dir.to_string()).join("part.1"), b"x")
+                .await
+                .expect("pending-purge object part should be written");
+            tokio::fs::write(object_dir.join(STORAGE_FORMAT_FILE), &entry.metadata)
+                .await
+                .expect("pending-purge metadata should be written");
+        }
+
+        let recursive = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive listing should succeed");
+        assert!(
+            recursive.objects.is_empty(),
+            "recursive ListObjectsV2 should hide pending version-purge entries"
+        );
+        assert!(
+            recursive.prefixes.is_empty(),
+            "recursive ListObjectsV2 should not synthesize prefixes from hidden entries"
+        );
+
+        let exact = store
+            .list_objects_generic(bucket, object, None, None, 1, false)
+            .await
+            .expect("exact-prefix listing should succeed");
+        assert!(
+            exact.objects.is_empty(),
+            "exact-prefix max_keys=1 shortcut should hide pending version-purge entries"
+        );
+        assert!(exact.prefixes.is_empty());
+    }
+
+    #[tokio::test]
     async fn empty_delimiter_listing_hides_and_purges_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -9133,6 +9739,131 @@ mod test {
             assert!(
                 !dir.path().join(bucket).join("metrics").join("2026").exists(),
                 "the empty delimiter listing should reclaim the committed delete residue under it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_delimiter_listing_of_residue_ancestor_hides_and_purges_whole_tree() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-ancestor-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let data_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(data_dir.to_string());
+            tokio::fs::create_dir_all(&residue)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(residue.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+        }
+
+        // Browsing an ancestor of the deleted key must not show the empty
+        // date folders, and the empty result reclaims the whole residue tree
+        // in one pass instead of one level per listing.
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty(), "ancestors of delete residue must not surface as prefixes");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("metrics").exists(),
+                "the empty delimiter listing should reclaim the committed delete residue tree under it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_delimiter_listing_of_mixed_residue_ancestor_reclaims_only_committed_subtree() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-mixed-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let committed_dir = uuid::Uuid::new_v4();
+        let unmarked_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let committed = dir
+                .path()
+                .join(bucket)
+                .join("metrics/cpu/2026/08/28/22/a.parquet")
+                .join(committed_dir.to_string());
+            tokio::fs::create_dir_all(&committed)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(committed.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                committed.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+
+            // Residue left by a build that never wrote delete markers, or a
+            // PUT still streaming its parts: indistinguishable, so never purged.
+            let unmarked = dir
+                .path()
+                .join(bucket)
+                .join("metrics/kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                .join(unmarked_dir.to_string());
+            tokio::fs::create_dir_all(&unmarked)
+                .await
+                .expect("unmarked residue should be created");
+            tokio::fs::write(unmarked.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "metrics/", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty(), "neither residue subtree may surface as a prefix");
+        for dir in &dirs {
+            let metrics = dir.path().join(bucket).join("metrics");
+            assert!(
+                !metrics.join("cpu").exists(),
+                "the committed subtree must be reclaimed even though a sibling subtree is blocked"
+            );
+            assert!(
+                metrics
+                    .join("kubelet/2026/08/28/23/74992556388248657933757.parquet")
+                    .join(unmarked_dir.to_string())
+                    .join("part.1")
+                    .exists(),
+                "residue without a committed marker must survive the purge"
             );
         }
     }
@@ -9428,6 +10159,168 @@ mod test {
     }
 
     #[test]
+    fn version_listing_rejects_stale_markers_at_full_set_read_quorum() {
+        let marker = test_delete_marker_meta_entry(
+            "marker.bin",
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
+        );
+        let sampled = MetaCacheEntries((0..8).map(|slot| (slot < 4).then(|| marker.clone())).collect());
+        assert!(
+            resolve_listing_entries(sampled, list_metadata_resolution_params("bucket".into(), 4, 12, true, 0), false).is_some(),
+            "the former sampled resolver accepts the four stale replicas"
+        );
+        for copies in [1, 4, 7, 8, 9, 16] {
+            let entries = MetaCacheEntries((0..16).map(|slot| (slot < copies).then(|| marker.clone())).collect());
+            let resolved = SetDisks::resolve_listed_versions("bucket", entries, &vec![None; 16], 16, 4)
+                .expect("known marker replicas and exact absence must be decidable");
+            assert_eq!(resolved.is_some(), copies >= 8, "marker copies: {copies}");
+        }
+    }
+
+    #[test]
+    fn version_listing_checks_history_after_a_quorum_marker() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let mut marker = test_delete_marker_meta_entry("history.bin", time + time::Duration::seconds(1));
+        let history = test_object_meta_entry_with_erasure_versions("history.bin", &[(time, "old", 12, 4)]);
+        marker
+            .cached
+            .as_mut()
+            .expect("marker fixture")
+            .versions
+            .extend(history.cached.expect("history fixture").versions);
+        marker.metadata = marker
+            .cached
+            .as_ref()
+            .expect("combined fixture")
+            .marshal_msg()
+            .expect("encode history");
+        for copies in [8, 11, 12, 16] {
+            let entries = MetaCacheEntries((0..16).map(|slot| (slot < copies).then(|| marker.clone())).collect());
+            let resolved = SetDisks::resolve_listed_versions("bucket", entries, &vec![None; 16], 16, 4)
+                .expect("known history must resolve")
+                .expect("marker has read quorum");
+            let versions = resolved.file_info_versions("bucket").expect("read selected history").versions;
+            assert!(versions[0].deleted, "marker must remain latest");
+            assert_eq!(versions.len(), if copies >= 12 { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn version_listing_preserves_metadata_uncertainty() {
+        let marker = test_delete_marker_meta_entry(
+            "marker.bin",
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
+        );
+        let entries = MetaCacheEntries(vec![Some(marker); 4]);
+        assert!(matches!(
+            SetDisks::resolve_listed_versions("bucket", entries, &vec![None; 4], 16, 4),
+            Err(DiskError::ErasureReadQuorum)
+        ));
+    }
+
+    #[test]
+    fn version_listing_tolerates_corrupt_replicas_only_with_version_quorum() {
+        let entry = test_object_meta_entry_with_erasure_versions(
+            "readable.bin",
+            &[(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(), "current", 12, 4)],
+        );
+        let corrupt = MetaCacheEntry {
+            name: entry.name.clone(),
+            metadata: vec![0xff],
+            ..Default::default()
+        };
+        for copies in [11, 12, 15] {
+            let entries = MetaCacheEntries(
+                (0..16)
+                    .map(|slot| Some(if slot < copies { entry.clone() } else { corrupt.clone() }))
+                    .collect(),
+            );
+            let resolved = SetDisks::resolve_listed_versions("bucket", entries, &vec![None; 16], 16, 4);
+            if copies >= 12 {
+                assert!(resolved.unwrap().is_some(), "a readable version must tolerate corrupt replicas");
+            } else {
+                assert!(resolved.is_err(), "corruption cannot establish the missing version's absence");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn version_listing_does_not_expose_four_stale_marker_replicas() {
+        let bucket = "version-list-stale-marker";
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(16, 4).await;
+        let marker = test_delete_marker_meta_entry(
+            "marker.bin",
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time"),
+        );
+        let current = test_object_meta_entry_with_erasure_versions(
+            "new.bin",
+            &[(
+                time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time")
+                    + time::Duration::seconds(1),
+                "new",
+                12,
+                4,
+            )],
+        );
+        for (slot, dir) in dirs.iter().enumerate() {
+            let current_dir = dir.path().join(bucket).join("new.bin");
+            tokio::fs::create_dir_all(&current_dir)
+                .await
+                .expect("create current object directory");
+            tokio::fs::write(current_dir.join("xl.meta"), &current.metadata)
+                .await
+                .expect("persist current version");
+            if slot < 4 {
+                let stale_dir = dir.path().join(bucket).join("marker.bin");
+                tokio::fs::create_dir_all(&stale_dir)
+                    .await
+                    .expect("create stale marker directory");
+                tokio::fs::write(stale_dir.join("xl.meta"), &marker.metadata)
+                    .await
+                    .expect("persist stale marker");
+            }
+        }
+        for quorum_mode in ["disk", "reduced", "optimal", "strict"] {
+            let (sender, mut receiver) = mpsc::channel(1);
+            let walk = set.list_path(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: bucket.to_string(),
+                    versioned: true,
+                    incl_deleted: true,
+                    recursive: true,
+                    ask_disks: quorum_mode.to_string(),
+                    limit: 100,
+                    ..Default::default()
+                },
+                sender,
+            );
+            let drain = async {
+                let mut names = Vec::new();
+                while let Some(entry) = receiver.recv().await {
+                    if !entry.is_dir() {
+                        names.push(entry.name);
+                    }
+                }
+                names
+            };
+            let (result, names) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+                .await
+                .expect("native listing must terminate");
+            result.expect("all drives are readable");
+            assert_eq!(names, ["new.bin"], "version authority cannot depend on {quorum_mode} sampling");
+        }
+        for dir in dirs.iter().take(4) {
+            assert_eq!(
+                tokio::fs::read(dir.path().join(bucket).join("marker.bin/xl.meta"))
+                    .await
+                    .expect("listing must preserve unresolved physical marker"),
+                marker.metadata
+            );
+        }
+    }
+
+    #[test]
     fn list_metadata_resolution_params_keeps_all_versions_for_version_listing() {
         let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, true, 0);
 
@@ -9565,7 +10458,10 @@ mod test {
         ]);
         let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false, 0);
 
-        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+        assert_eq!(
+            listing_entries_supplement_target(&entries, &resolver, true),
+            Some(ListingSupplementTarget::Object("object".to_string()))
+        );
         assert_eq!(listing_entries_supplement_target(&entries, &resolver, false), None);
 
         let mut primary = resolve_listing_entries(MetaCacheEntries(entries.0.clone()), resolver.clone(), true)
@@ -9618,8 +10514,85 @@ mod test {
 
         let mut supplemented = resolve_listing_entries_with_supplement(entries, resolver, true, supplement)
             .await
+            .expect("supplemented metadata should not remain ambiguous")
             .expect("the supplemented sample should resolve the committed delete marker");
         assert!(supplemented.is_latest_delete_marker());
+    }
+
+    #[tokio::test]
+    async fn latest_listing_fails_closed_for_unversioned_two_by_two_metadata_split() {
+        async fn collect_listing(set: &Arc<SetDisks>, bucket: &str) -> (crate::error::Result<()>, Vec<String>) {
+            let (sender, mut receiver) = mpsc::channel(4);
+            let walk = set.list_path(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: bucket.to_string(),
+                    recursive: true,
+                    ask_disks: "optimal".to_string(),
+                    limit: 100,
+                    ..Default::default()
+                },
+                sender,
+            );
+            let drain = async {
+                let mut names = Vec::new();
+                while let Some(entry) = receiver.recv().await {
+                    if !entry.is_dir() {
+                        names.push(entry.name);
+                    }
+                }
+                names
+            };
+
+            tokio::join!(walk, drain)
+        }
+
+        let bucket = "list-two-by-two-overwrite";
+        let object = "object";
+        let old_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old = test_unversioned_object_meta_entry(object, old_mod_time, "old-etag", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry(object, new_mod_time, "new-etag", Uuid::from_u128(2));
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        for (index, disk) in disks.iter().enumerate() {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+            let metadata = if index < 2 { &old.metadata } else { &new.metadata };
+            disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::copy_from_slice(metadata))
+                .await
+                .expect("split metadata should be written");
+        }
+
+        let (split_result, split_names) = collect_listing(&set, bucket).await;
+        assert!(
+            matches!(split_result, Err(StorageError::ErasureReadQuorum)),
+            "an unresolved 2+2 generation must fail the listing, got {split_result:?}"
+        );
+        assert!(split_names.is_empty(), "an unresolved key must not be emitted from either generation");
+
+        disks[0]
+            .write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::copy_from_slice(&new.metadata))
+            .await
+            .expect("third new-generation copy should be written");
+        let (committed_result, committed_names) = collect_listing(&set, bucket).await;
+        committed_result.expect("a 3+1 committed generation should list successfully");
+        assert_eq!(committed_names, [object.to_string()]);
+
+        for disk in disks.iter().skip(1) {
+            disk.delete(
+                bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("quorum deletion should remove the object copy");
+        }
+        let (deleted_result, deleted_names) = collect_listing(&set, bucket).await;
+        deleted_result.expect("a quorum-deleted object should remain a successful empty listing");
+        assert!(deleted_names.is_empty(), "one stale copy must not resurrect a quorum-deleted object");
     }
 
     #[tokio::test]
@@ -9678,7 +10651,8 @@ mod test {
             primary.extend([None, None, None, None]);
             let entry =
                 resolve_listing_entries_with_supplement(MetaCacheEntries(primary), resolver.clone(), true, supplement.clone())
-                    .await;
+                    .await
+                    .expect("directory supplementation should not fail");
             assert_eq!(
                 entry.map(|entry| entry.name),
                 (fallback_copies == 4).then_some(prefix),
@@ -9701,7 +10675,10 @@ mod test {
             Some(deleted.clone()),
         ]);
 
-        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+        assert_eq!(
+            listing_entries_supplement_target(&entries, &resolver, true),
+            Some(ListingSupplementTarget::Object("object".to_string()))
+        );
 
         let mut resolved = resolve_listing_entries(
             MetaCacheEntries(vec![
@@ -9866,7 +10843,9 @@ mod test {
                         let entry = match resolve_agreed_listing_entry(entry, 5, resolver, true) {
                             ListingEntryResolution::Resolved(entry) => entry,
                             ListingEntryResolution::NeedsSupplement(_, Some(entry)) => entry,
-                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => return,
+                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => {
+                                return;
+                            }
                         };
                         let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
                         seen.lock().expect("seen mutex poisoned").push((
@@ -10399,7 +11378,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn merge_entry_channels_documents_candidate_metadata_authority_risk() {
+    async fn merge_entry_channels_preserves_cross_pool_delete_marker_versions() {
         let (tx_a, rx_a) = mpsc::channel(4);
         let (tx_b, rx_b) = mpsc::channel(4);
         let (tx_c, rx_c) = mpsc::channel(4);
@@ -10428,9 +11407,13 @@ mod test {
             .expect("merged entry should be present");
         assert_eq!(merged.name, "obj-a");
         assert!(
-            !merged.is_latest_delete_marker(),
-            "current merge consumes candidate metadata bytes; future index-backed strong modes must live-verify metadata instead"
+            merged.is_latest_delete_marker(),
+            "a newer marker must remain current across independently resolved pools"
         );
+        let versions = merged.file_info_versions("bucket").expect("merged versions should decode");
+        assert_eq!(versions.versions.len(), 2, "retain the historical object and deduplicate the marker");
+        assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+        assert!(!versions.versions[1].deleted && !versions.versions[1].is_latest);
         assert!(
             matches!(timeout(Duration::from_secs(1), out_rx.recv()).await, Ok(None)),
             "merge should not emit a duplicate entry for the same key"
@@ -10440,6 +11423,276 @@ mod test {
             .await
             .expect("merge task should not panic")
             .expect("merge task should succeed");
+    }
+
+    fn rewrite_test_version(mut entry: MetaCacheEntry, change: impl FnOnce(&mut FileMetaVersion)) -> MetaCacheEntry {
+        let meta = entry.cached.as_mut().expect("test metadata should be decoded");
+        assert_eq!(meta.versions.len(), 1);
+        let mut version = meta.versions[0].parse_version_meta().expect("test version should decode");
+        change(&mut version);
+        meta.versions[0] = version.try_into().expect("test version should encode");
+        entry.metadata = meta.marshal_msg().expect("test metadata should encode");
+        entry
+    }
+
+    async fn merge_test_object_entries(entries: Vec<MetaCacheEntry>) -> Result<MetaCacheEntry> {
+        let mut inputs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (sender, receiver) = mpsc::channel(1);
+            sender.send(entry).await.expect("fixture entry should queue");
+            inputs.push(receiver);
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task = tokio::spawn(merge_entry_channels(CancellationToken::new(), inputs, sender, 1));
+        let entry = receiver.recv().await;
+        task.await.expect("merge must not panic")?;
+        Ok(entry.expect("a valid same-key group must produce an entry"))
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_orders_complete_histories_independently_of_pool_order() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let first = test_object_meta_entry_with_erasure_versions("key", &[(time, "first", 4, 2)]);
+        let second = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "second", 4, 2)]),
+            |version| version.object.as_mut().expect("object version").version_id = Some(Uuid::from_u128(2)),
+        );
+        let marker = test_delete_marker_meta_entry("key", time + time::Duration::seconds(1));
+        let inputs = [first, second, marker];
+        let mut expected = None;
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let entry = merge_test_object_entries(order.map(|index| inputs[index].clone()).to_vec())
+                .await
+                .expect("disjoint version chains should merge");
+            let versions = entry.file_info_versions("bucket").expect("merged versions should decode");
+            assert_eq!(versions.versions.len(), 3);
+            assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+            assert!(
+                versions.versions[1..]
+                    .iter()
+                    .all(|version| !version.deleted && !version.is_latest)
+            );
+            assert!(versions.versions.iter().all(|version| version.num_versions == 3));
+            let identities = versions.versions.iter().map(|version| version.version_id).collect::<Vec<_>>();
+            assert!(identities.contains(&Some(Uuid::from_u128(1))));
+            assert!(identities.contains(&Some(Uuid::from_u128(2))));
+            if let Some(expected) = &expected {
+                assert_eq!(&identities, expected, "equal-time versions must have stable pagination order");
+            } else {
+                expected = Some(identities);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_key_only_candidates_do_not_override_version_metadata() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let marker = test_delete_marker_meta_entry("key", time);
+        for entries in [
+            vec![test_meta_entry("key"), marker.clone()],
+            vec![marker.clone(), test_meta_entry("key")],
+        ] {
+            let mut merged = merge_test_object_entries(entries)
+                .await
+                .expect("merge a name with resolved metadata");
+            assert!(merged.is_latest_delete_marker());
+            assert_eq!(merged.file_info_versions("bucket").expect("decode marker").versions.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_accepts_equivalent_migrated_coding_and_data_dirs() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let first = test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 4, 2)]);
+        let second = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 6, 2)]),
+            |version| version.object.as_mut().expect("object version").data_dir = Some(Uuid::from_u128(42)),
+        );
+        let forward = merge_test_object_entries(vec![first.clone(), second.clone()])
+            .await
+            .expect("valid migration copies");
+        let reverse = merge_test_object_entries(vec![second, first])
+            .await
+            .expect("reversed migration copies");
+        assert_eq!(forward.metadata, reverse.metadata, "representation must not depend on channel order");
+        let versions = forward.file_info_versions("bucket").expect("merged metadata should decode");
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].metadata.get("etag").map(String::as_str), Some("same-etag"));
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_defers_free_version_while_same_remote_source_is_live() {
+        let live = test_transitioned_meta_entry("key", "remote/shared", false);
+        let free = test_transitioned_meta_entry("key", "remote/shared", true);
+        for inputs in [vec![live.clone(), free.clone()], vec![free.clone(), live.clone()]] {
+            let merged = merge_test_object_entries(inputs)
+                .await
+                .expect("same remote source and cleanup owner should merge");
+            let versions = merged
+                .file_info_versions_with_free_versions("bucket")
+                .expect("merged transition history should decode");
+            assert_eq!(versions.versions.len(), 1);
+            assert!(versions.free_versions.is_empty(), "a live remote reference must defer cleanup discovery");
+        }
+
+        let unrelated = test_transitioned_meta_entry("key", "remote/other", false);
+        let merged = merge_test_object_entries(vec![free, unrelated])
+            .await
+            .expect("unrelated remote references should merge");
+        let versions = merged
+            .file_info_versions_with_free_versions("bucket")
+            .expect("merged transition history should decode");
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.free_versions.len(), 1, "an unrelated source must not suppress cleanup");
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_rejects_conflicting_version_identity_and_metadata() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let original = test_object_meta_entry_with_erasure_versions("key", &[(time, "original", 4, 2)]);
+        for key in [
+            "etag",
+            "x-amz-tagging",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+        ] {
+            let changed = rewrite_test_version(original.clone(), |version| {
+                version
+                    .object
+                    .as_mut()
+                    .expect("object version")
+                    .meta_user
+                    .insert(key.to_string(), "changed".to_string());
+            });
+            for pair in [[original.clone(), changed.clone()], [changed, original.clone()]] {
+                let err = merge_test_object_entries(pair.to_vec())
+                    .await
+                    .expect_err("conflicting copies must fail");
+                assert_eq!(err, StorageError::FileCorrupt, "conflict in {key} must not become arbitrary metadata");
+            }
+        }
+        let marker = rewrite_test_version(test_delete_marker_meta_entry("key", time), |version| {
+            version.delete_marker.as_mut().expect("delete marker").version_id = Some(Uuid::from_u128(1));
+        });
+        assert_eq!(
+            merge_test_object_entries(vec![original, marker])
+                .await
+                .expect_err("UUID type conflict"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_reconciles_null_overwrite_without_losing_uuid_history() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let history = test_object_meta_entry_with_erasure_versions("key", &[(time, "history", 4, 2)]);
+        let old_null = rewrite_test_version(history.clone(), |version| {
+            version.object.as_mut().expect("null object").version_id = None;
+        });
+        let marker = rewrite_test_version(test_delete_marker_meta_entry("key", time + time::Duration::seconds(1)), |version| {
+            version.delete_marker.as_mut().expect("null marker").version_id = Some(Uuid::nil());
+        });
+        for inputs in [
+            vec![old_null.clone(), marker.clone(), history.clone()],
+            vec![history, marker, old_null],
+        ] {
+            let entry = merge_test_object_entries(inputs)
+                .await
+                .expect("new null slot should replace old null slot");
+            let versions = entry.file_info_versions("bucket").expect("null versions should decode");
+            assert_eq!(versions.versions.len(), 2);
+            assert!(versions.versions[0].deleted && versions.versions[0].is_latest);
+            assert!(versions.versions[0].version_id.is_none_or(|id| id.is_nil()));
+            assert_eq!(versions.versions[1].version_id, Some(Uuid::from_u128(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_rejects_corrupt_version_headers_and_empty_stacks() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let original = test_object_meta_entry_with_erasure_versions("key", &[(time, "etag", 4, 2)]);
+        for empty in [false, true] {
+            let mut corrupt = original.clone();
+            let meta = corrupt.cached.as_mut().expect("fixture metadata");
+            if empty {
+                meta.versions.clear();
+            } else {
+                meta.versions[0].header.version_id = Some(Uuid::from_u128(99));
+            }
+            corrupt.metadata = meta.marshal_msg().expect("encode corrupt fixture");
+            assert_eq!(
+                merge_test_object_entries(vec![original.clone(), corrupt])
+                    .await
+                    .expect_err("corrupt candidate must fail"),
+                StorageError::FileCorrupt
+            );
+        }
+        let mut malformed = original.clone();
+        malformed.cached = None;
+        malformed.metadata = vec![0xff];
+        assert_eq!(
+            merge_test_object_entries(vec![original, malformed])
+                .await
+                .expect_err("malformed metadata must fail"),
+            StorageError::FileCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_does_not_combine_subquorum_markers_across_erasure_sets() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let old = test_object_meta_entry_with_erasure_versions("key", &[(time, "history", 4, 2)]);
+        let marked = test_object_with_delete_marker_meta_entry("key", time, time + time::Duration::seconds(1));
+        let mut inputs = Vec::new();
+        for marker_copies in [1, 2] {
+            let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 3, true, 0);
+            let copies = (0..3)
+                .map(|index| Some(if index < marker_copies { marked.clone() } else { old.clone() }))
+                .collect();
+            let entry = resolve_listing_entries(MetaCacheEntries(copies), resolver, false)
+                .expect("each set independently retains its quorum-backed history");
+            inputs.push(entry);
+        }
+        let merged = merge_test_object_entries(inputs).await.expect("merge resolved histories");
+        let versions = merged.file_info_versions("bucket").expect("decode merged history");
+        assert_eq!(
+            versions.versions.len(),
+            1,
+            "three marker copies across two EC domains do not form a quorum"
+        );
+        assert!(!versions.versions[0].deleted);
+    }
+
+    #[tokio::test]
+    async fn listing_merge_preserves_error_after_partial_output_without_cancelling_request() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let (first_tx, first_rx) = mpsc::channel(2);
+        let (second_tx, second_rx) = mpsc::channel(1);
+        first_tx.send(test_meta_entry("a/")).await.expect("queue preceding prefix");
+        first_tx
+            .send(test_object_meta_entry_with_erasure_versions("b", &[(time, "one", 4, 2)]))
+            .await
+            .expect("queue first copy");
+        second_tx
+            .send(test_object_meta_entry_with_erasure_versions("b", &[(time, "two", 4, 2)]))
+            .await
+            .expect("queue conflicting copy");
+        drop(first_tx);
+        drop(second_tx);
+        let request = CancellationToken::new();
+        let workers = request.child_token();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task = super::spawn_listing_merge(workers.clone(), vec![first_rx, second_rx], sender);
+        assert_eq!(receiver.recv().await.expect("preceding result should arrive").name, "a/");
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(
+            task.await
+                .expect("merge task must not panic")
+                .expect_err("conflict must propagate"),
+            StorageError::FileCorrupt
+        );
+        assert!(workers.is_cancelled(), "failed merge must stop the disk producers");
+        assert!(!request.is_cancelled(), "the API must still observe the merge error");
     }
 
     #[tokio::test]

@@ -607,9 +607,16 @@ impl DefaultObjectUsecase {
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
-        if let Some(replacement_metadata) = replacement_metadata {
+        if let Some(mut replacement_metadata) = replacement_metadata {
+            // S3 defaults an object's content type to `binary/octet-stream` when none is
+            // supplied. REPLACE must apply that same default instead of leaving
+            // content-type unset.
+            if !replacement_metadata.contains_key("content-type") {
+                replacement_metadata.insert("content-type".to_string(), "binary/octet-stream".to_string());
+            }
+            let effective_content_type = replacement_metadata.get("content-type").cloned();
             user_defined = replacement_metadata;
-            src_info.content_type = content_type.clone();
+            src_info.content_type = effective_content_type;
             src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
             src_info.expires = expires_timestamp.map(OffsetDateTime::from);
         } else if metadata_directive.is_some() || website_redirect_location.is_some() {
@@ -693,7 +700,7 @@ impl DefaultObjectUsecase {
 
         if let Some(material) = sse_encryption(encryption_request).await? {
             effective_sse = Some(material.server_side_encryption.clone());
-            effective_kms_key_id = material.kms_key_id.clone();
+            effective_kms_key_id = material.response_kms_key_id();
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
@@ -826,7 +833,7 @@ impl DefaultObjectUsecase {
             S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
         })??;
 
-        let raw_dest_version = oi.version_id.map(|v| v.to_string());
+        let raw_dest_version = s3_response_version_id(oi.version_id);
         let dest_version = if dest_versioned { raw_dest_version } else { None };
 
         // Echo the source version that was copied via x-amz-copy-source-version-id (issue #4976).
@@ -1328,6 +1335,78 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_renders_null_directory_destination_version() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("directory copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-null-dir-version-{}", Uuid::new_v4());
+        let source = "source.bin";
+        let destination = "directory/";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned directory copy test bucket should be created");
+
+        let mut source_reader = PutObjReader::from_vec(b"copy source".to_vec());
+        store
+            .put_object(
+                &bucket,
+                source,
+                &mut source_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("copy source should be written");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: source.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(destination.to_string())
+            .build()
+            .expect("directory copy input should build");
+        let response = DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect("copying to a directory marker should succeed");
+
+        assert_eq!(
+            response.output.version_id.as_deref(),
+            Some(NULL_VERSION_ID),
+            "CopyObject must expose the null destination version without leaking the internal nil UUID"
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("directory copy test bucket should be removed");
+    }
+
+    #[tokio::test]
     async fn execute_copy_object_allows_self_copy_of_null_version() {
         // A "null" source version id is a restore of the null version, not a no-op self-copy.
         let input = CopyObjectInput::builder()
@@ -1429,7 +1508,7 @@ mod tests {
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the copy");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, destination, &ObjectOptions::default())
             .await

@@ -36,6 +36,10 @@ pub(crate) mod inspect {
 }
 
 pub(crate) mod cluster {
+    pub(crate) mod network_probe {
+        pub(crate) use crate::storage::storage_api::ecstore_rpc::{NetworkPeerProbeClient, NetworkPeerProbeError};
+    }
+
     pub(crate) mod contract {
         pub(crate) mod capability {
             #[cfg(test)]
@@ -83,6 +87,11 @@ pub(crate) mod error {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::UnreadableBucketConfig;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
+        is_unreadable_config_error, unreadable_config_refusal,
+    };
     pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataError;
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataFailure;
@@ -153,7 +162,7 @@ pub(crate) mod server {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
             Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
-            gen_signature_headers, gen_tonic_signature_headers,
+            gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers, verify_tonic_boot_epoch_response,
         };
 
         pub(crate) mod ecfs {
@@ -326,6 +335,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,
             process_topic_configurations,

@@ -37,7 +37,7 @@ mod tests {
     #[test]
     fn is_object_locked_by_metadata_preserves_object_lock_parser_behavior() {
         let mut user_defined = HashMap::new();
-        user_defined.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+        user_defined.insert(rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
 
         assert!(is_object_locked_by_metadata(&user_defined, false));
         assert!(!is_object_locked_by_metadata(&user_defined, true));

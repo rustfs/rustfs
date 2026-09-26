@@ -189,6 +189,7 @@ mod tests {
     use crate::admin::handlers::target_descriptor::admin_target_spec_from_builtin;
     use crate::admin::runtime_sources::{IamInterface, KmsInterface};
     use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::admin::storage_api::error::StorageError;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::server_config::KVS;
     use rustfs_config::{ENABLE_KEY, EnableState, SCANNER_CYCLE, SCANNER_SUB_SYS, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
@@ -231,11 +232,17 @@ mod tests {
             let mut poll = tokio::time::interval(Duration::from_millis(10));
             loop {
                 poll.tick().await;
-                let config = read_admin_config_without_migrate(store.clone())
-                    .await
-                    .expect("read persisted server config");
-                if config.0.get(subsystem).is_some_and(|targets| targets.contains_key(target)) {
-                    return;
+                match read_admin_config_without_migrate(store.clone()).await {
+                    Ok(config) => {
+                        if config.0.get(subsystem).is_some_and(|targets| targets.contains_key(target)) {
+                            return;
+                        }
+                    }
+                    Err(StorageError::Lock(rustfs_lock::LockError::Timeout { .. })) => {
+                        // The writer may still be committing the config snapshot. Retry after
+                        // the object lock is released instead of failing the polling helper.
+                    }
+                    Err(error) => panic!("read persisted server config: {error}"),
                 }
             }
         })

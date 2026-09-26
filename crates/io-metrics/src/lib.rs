@@ -292,6 +292,7 @@ pub use process_lock_metrics::{
     snapshot_process_platform_stats,
 };
 pub use s3_api_metrics::{S3OperationMetricSnapshot, init_s3_metrics, record_s3_op, s3_op_metrics_snapshot};
+pub use s3_http_metrics::{S3HttpCompletionObserver, S3HttpCompletionObserverEnabled, install_s3_http_completion_observer};
 pub use sampler::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform,
     snapshot_process_resource, snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,

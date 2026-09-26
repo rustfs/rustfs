@@ -93,7 +93,7 @@ jobs:
       UPGRADE_SOURCE_SHA256: 7c789386bf85278f865b8e0d359bf4edb84d5aa408cc3fa54a18c25ca74cd6e7
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -151,8 +151,7 @@ jobs:
 
       - name: Build rustfs binary
         run: |
-          cargo build -p rustfs --bins
-          : > target/debug/rustfs.features
+          python3 scripts/e2e_binary.py build --bins
 
       - name: Verify distributed e2e membership
         env:
@@ -168,14 +167,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${FILTER}" ]; then
-            cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+            python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
           else
-            cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
+            python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
           fi
 
       - name: Upload distributed e2e diagnostics
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-distributed-${{ github.run_number }}
           path: |
@@ -201,16 +200,16 @@ jobs:
     name: Alert on scheduled failure
     needs: [distributed]
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

@@ -70,7 +70,12 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -372,6 +377,14 @@ impl DiskAPI for Disk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Disk::Local(local_disk) = self {
+                return local_disk
+                    .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, Some(scope))
+                    .await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
@@ -577,6 +590,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+            Disk::Remote(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
@@ -620,6 +640,12 @@ impl DiskAPI for Disk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Self::Local(disk) = self {
+                return disk.delete_with_namespace_owner(volume, path, opt, Some(scope)).await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete(volume, path, opt).await,
             Disk::Remote(remote_disk) => remote_disk.delete(volume, path, opt).await,
@@ -799,7 +825,13 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
+            return self
+                .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+                .await;
+        };
+        scope.check()?;
+        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, Some(scope))
             .await
     }
 
@@ -952,6 +984,14 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
         }
     }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_offline_for_test(),
+            Disk::Remote(remote_disk) => remote_disk.force_offline_for_test(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1021,6 +1061,13 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
+        }
+    }
+
+    pub async fn acquire_replacement_execution_lease(&self) -> Result<std::sync::Arc<local::ReplacementExecutionLease>> {
+        match self {
+            Self::Local(disk) => disk.get_disk().acquire_replacement_execution_lease().await,
+            Self::Remote(_) => Err(DiskError::other("replacement execution requires a local target")),
         }
     }
 }
@@ -1175,6 +1222,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_file_durable(&self, _src_volume: &str, _src_path: &str, _dst_volume: &str, _dst_path: &str) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn prepare_part_transaction(
         &self,
@@ -1434,6 +1484,12 @@ pub struct WalkDirOptions {
     // Override the remote stream stall timeout for long background walks.
     #[serde(default)]
     pub stall_timeout_ms: Option<u64>,
+
+    /// In-process completion state for bounded local walks. This is skipped
+    /// from RPC serialization; remote peers retain the legacy natural-EOF
+    /// behavior until they support an explicit capability.
+    #[serde(skip)]
+    pub producer_limit_reached: Option<Arc<AtomicBool>>,
 }
 
 impl WalkDirOptions {
@@ -1508,6 +1564,10 @@ pub struct DeleteOptions {
     #[serde(default)]
     pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+    /// Full marker precondition checked under the actual metadata mutation lease.
+    /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1753,6 +1813,7 @@ mod tests {
             skip_total_timeout: false,
             timeout_ms: Some(10_000),
             stall_timeout_ms: Some(20_000),
+            producer_limit_reached: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
@@ -1796,6 +1857,7 @@ mod tests {
             undo_write: true,
             undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
+            expected_delete_marker: None,
         };
 
         assert!(opts.recursive);

@@ -264,6 +264,8 @@ fn config(temp: &tempfile::TempDir, pki: &TestPki, server: &TestServer) -> Heart
             initial_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(80),
         },
+        proxy: None,
+        diagnostic_job_signer: None,
     }
 }
 

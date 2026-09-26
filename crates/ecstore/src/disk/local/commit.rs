@@ -345,7 +345,13 @@ impl LocalDisk {
             let data_dir = fi.data_dir.unwrap_or_default();
             fi.parts
                 .iter()
-                .map(|part| format!("{dst_path}/{data_dir}/part.{}", part.number))
+                .flat_map(|part| {
+                    std::iter::once(format!("{dst_path}/{data_dir}/part.{}", part.number)).chain(
+                        part.integrity
+                            .as_ref()
+                            .map(|integrity| format!("{dst_path}/{data_dir}/{}", integrity.file_name())),
+                    )
+                })
                 .collect()
         };
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;

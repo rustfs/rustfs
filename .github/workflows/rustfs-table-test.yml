@@ -1,0 +1,360 @@
+name: RustFS Table Test
+
+on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
+        required: false
+        type: string
+      rustfs_version:
+        description: 'RustFS release tag to test (leave empty to use the latest nightly deb)'
+        required: false
+        type: string
+      skip_smoke:
+        description: 'Skip the PyIceberg end-to-end case (TBL-101)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: rustfs-shared-functional-tests-v2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES || 'vm000 vm001 vm002 vm003' }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER || 'azureuser' }}
+  RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || 'http://rustfs-node1:9000' }}
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  table-test:
+    name: table-test
+    runs-on: smoke-testing
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository (for report parser)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize functional evidence
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          FUNCTIONAL_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-table-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${FUNCTIONAL_ARTIFACTS_DIR}" "${FUNCTIONAL_ARTIFACTS_DIR}-scratch"
+          {
+            printf 'FUNCTIONAL_ARTIFACTS_DIR=%s\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'LOG_FILE=%s/suite.log\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'REPORT_FILE=%s/report.md\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        timeout-minutes: 5
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Show environment
+        run: |
+          set -euo pipefail
+          echo "nodes: ${RUSTFS_NODES}"
+          echo "endpoint: ${RUSTFS_API_ENDPOINT}"
+          aws --version
+          python3 --version
+
+      - name: Cleanup environment (before)
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for node in ${RUSTFS_NODES}; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            ' || echo "pre-cleanup failed on ${node} (continuing)"
+          done
+
+      - name: Stage verified candidate package
+        id: chain_package
+        if: ${{ inputs.chain_manifest != '' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py prepare
+
+      - name: Run table suite
+        id: test
+        timeout-minutes: 45
+        # Standalone case failures are reported by the backlog manager.
+        # Chain evidence separately requires complete passing cases.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          chmod +x auto-testing/rustfs-table-test.sh
+          PACKAGE_URL='${{ steps.chain_package.outputs.package_url || inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          SMOKE_PATH="${GITHUB_WORKSPACE:-$PWD}/scripts/table-catalog/pyiceberg_smoke.py"
+          ARGS=(-y --smoke-script "${SMOKE_PATH}")
+          if [ '${{ inputs.skip_smoke }}' = 'true' ]; then
+            ARGS+=(--skip-smoke)
+          fi
+          if [ -n "${PACKAGE_URL}" ]; then
+            ARGS+=(--package-url "${PACKAGE_URL}")
+          elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
+            ARGS+=(--package-url "https://github.com/rustfs/rustfs/releases/download/${RUSTFS_VERSION}/rustfs-linux-x86_64-gnu-v${RUSTFS_VERSION}.deb")
+          else
+            ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./auto-testing/rustfs-table-test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
+
+      - name: Generate report
+        timeout-minutes: 2
+        id: chain_report
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          CASE_TABLE="${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
+          CASE_RESULT=success
+          python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}" || CASE_RESULT=failure
+          RESULT=failure
+          if [ '${{ steps.test.outcome }}' = 'success' ] && [ "${CASE_RESULT}" = 'success' ]; then
+            RESULT=success
+          fi
+
+          # Product gate: failing cases keep the run green — they are reported
+          # below and tracked in rustfs/backlog. Only harness/environment
+          # breakdowns (the suite never reached case level, or a wholesale
+          # failure with zero passes) turn the workflow red.
+          CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
+          CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
+          CASES_PASS=$(( CASES_TOTAL - CASES_FAIL ))
+          HARNESS_OK=0
+          if [ '${{ steps.test.outcome }}' = 'success' ]; then
+            HARNESS_OK=1
+          elif [ '${{ steps.test.outcome }}' = 'failure' ] && [ "${CASES_TOTAL}" -gt 0 ] && [ "${CASES_PASS}" -ge 1 ]; then
+            HARNESS_OK=1
+          fi
+          {
+            echo "# RustFS S3 Tables (Iceberg REST Catalog) test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Test Step Outcome: ${RESULT}"
+            echo "- Suite Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            if [ -s "${CASE_TABLE}" ]; then
+              cat "${CASE_TABLE}"
+              echo ""
+            fi
+            echo "- Product result: ${CASES_PASS} passed, ${CASES_FAIL} failed (failing cases are tracked in rustfs/backlog)"
+            echo ""
+            if [ -s "${CASE_TABLE}" ]; then
+              echo "## Log tail"
+              echo '```text'
+              tail -n 200 "${LOG_FILE}" 2>/dev/null || true
+              echo '```'
+            else
+              echo "The suite or evidence validation failed. See this run's artifact for partial case results and suite.log."
+            fi
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+          # Red only for harness/environment breakdowns; case failures stay green.
+          [ "${HARNESS_OK}" = "1" ]
+
+      - name: Upload functional report to dashboard
+        timeout-minutes: 2
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: ${{ env.REPORT_FILE }}
+          SUITE: table
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+          echo "dashboard updated: ${REPORT_PATH}"
+
+      - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
+        # Replaces the old per-run failure filing. One entry point that:
+        # - dedups by signal: failing cases are matched against open backlog
+        #   issues by label (category + case ID); covered cases become a
+        #   comment on the existing issue, only uncovered cases file a new one
+        # - labels new issues (functional-test, category, case IDs, env)
+        # - closes fixed issues after a fully green run
+        # - never files or closes on cancelled runs
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
+            exit 0
+          fi
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found; skipping backlog issue management"
+            exit 0
+          fi
+          PACKAGE_URL='${{ inputs.package_url }}'
+          PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          if [ -n "${PACKAGE_URL}" ]; then PACKAGE_SOURCE="${PACKAGE_URL}"; fi
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --outcome "${{ steps.test.outcome }}" \
+            --suite table --category table --suite-label "S3 Tables" \
+            --outcome '${{ steps.test.outcome }}' \
+            --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${GITHUB_EVENT_NAME}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --report-file "${REPORT_FILE}" \
+            --log "${LOG_FILE}" \
+            --date "$(date -u +%Y-%m-%d)"
+
+      - name: Upload report and logs
+        timeout-minutes: 2
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-table-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/report.md
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/cases.md
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/suite.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Cleanup environment (after)
+        timeout-minutes: 5
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for node in ${RUSTFS_NODES}; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -f /etc/default/rustfs
+            ' || echo "cleanup failed on ${node} (continuing)"
+          done
+
+      - name: "Continue functional chain (next: Performance)"
+        # Only chain-triggered runs forward to the next suite; standalone
+        # workflow_dispatch runs stop after their own cleanup.
+        if: ${{ always() && github.event_name == 'repository_dispatch' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
+            exit 1
+          fi
+          echo "Dispatching next functional suite: Performance"
+          gh api --method POST repos/rustfs/rustfs/dispatches \
+            -f event_type='rustfs-chain-performance' \
+            -F 'client_payload[from_suite]=table'
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "RustFS table test workflow failed (harness/environment breakdown); see logs and report artifact."
+
+      - name: Remove verified candidate package
+        if: ${{ always() && inputs.chain_manifest != '' && steps.chain.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/prepare_functional_package.py cleanup
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite table
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
+          --output "${RUNNER_TEMP}/chain-table-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/table.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-chain-table-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-table-${{ github.run_id }}-${{ github.run_attempt }}/table.json
+          if-no-files-found: error

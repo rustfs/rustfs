@@ -39,7 +39,7 @@ pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
 /// Accepted but not honoured; see [`ENV_RUNTIME_DIAL9_S3_BUCKET`].
 pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
 // Note: there are deliberately no task-dump knobs. dial9 only captures task
-// dumps for futures spawned through `dial9_tokio_telemetry::spawn`, and RustFS
+// dumps for futures spawned through `dial9::spawn`, and RustFS
 // spawns with `tokio::spawn` throughout, so the switch could never do anything.
 // Measured: 0 dumps via tokio::spawn vs 14709 via dial9::spawn on an identical
 // workload. See rustfs/backlog#1157 (D9-16).

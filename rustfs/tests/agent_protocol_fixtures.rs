@@ -24,6 +24,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use rustfs::connect::CONNECT_DIAGNOSTIC_CAPABILITIES;
 use sha2::{Digest as _, Sha256};
 
 fn fixture_root() -> PathBuf {
@@ -34,21 +35,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The registry is closed at eight sets; a ninth is a protocol change, not a
+#[test]
+fn heartbeat_producer_capabilities_match_the_frozen_contract() {
+    let fixture: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture_root().join("heartbeat/producer-capabilities.json")).expect("read producer capabilities fixture"),
+    )
+    .expect("producer capabilities fixture parses");
+    let producer = fixture["producerCapabilities"]
+        .as_array()
+        .expect("producerCapabilities is an array")
+        .iter()
+        .map(|value| value.as_str().expect("producer capability is a string"))
+        .collect::<Vec<_>>();
+    assert_eq!(producer, CONNECT_DIAGNOSTIC_CAPABILITIES);
+
+    let mut expected_heartbeat = vec!["heartbeat", "diagnostics.policy.v1", "inventory.environment@1"];
+    expected_heartbeat.extend(producer);
+    let heartbeat = fixture["heartbeatCapabilities"]
+        .as_array()
+        .expect("heartbeatCapabilities is an array")
+        .iter()
+        .map(|value| value.as_str().expect("heartbeat capability is a string"))
+        .collect::<Vec<_>>();
+    assert_eq!(heartbeat, expected_heartbeat);
+}
+
+/// The registry is closed; adding another set is a protocol change, not a
 /// fixture change. Mirrors `EXPECTED_SETS` in Connect's checker.
-const EXPECTED_SETS: [&str; 8] = [
+const EXPECTED_SETS: [&str; 13] = [
     "auth",
     "version",
     "registration",
     "heartbeat",
     "inventory",
+    "object-performance",
+    "network-performance",
+    "site-replication-performance",
+    "telemetry",
+    "diagnostic-scheduler",
     "offline-enrollment",
     "bundle",
     "redaction",
 ];
 
 #[test]
-fn agent_protocol_fixtures_registry_is_the_frozen_eight_sets() {
+fn agent_protocol_fixtures_registry_is_the_frozen_sets() {
     let registry: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture_root().join("fixture-sets.json")).expect("read fixture-sets.json"))
             .expect("fixture-sets.json parses");

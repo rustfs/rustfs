@@ -22,9 +22,10 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -54,13 +55,14 @@ use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
-    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
-    DeleteVersionRequest, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest,
-    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
-    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-    WriteMetadataRequest, node_service_client::NodeServiceClient,
+    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
+    CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+    DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
+    MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest,
+    ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -148,6 +150,18 @@ fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result
         return Err(Error::other("remote snapshot lease protocol is incompatible"));
     }
     SnapshotLeaseToken::from_slice(&response.token)
+}
+
+fn conditional_file_update_from_wire(outcome: i32) -> Result<ConditionalFileUpdate> {
+    match CompareAndUpdateFileOutcome::try_from(outcome) {
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated) => Ok(ConditionalFileUpdate::Updated),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing) => Ok(ConditionalFileUpdate::Missing),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch) => Ok(ConditionalFileUpdate::Mismatch),
+        Ok(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified) => {
+            Err(Error::other("unspecified compare-and-update-file outcome"))
+        }
+        Err(_) => Err(Error::other("invalid compare-and-update-file outcome")),
+    }
 }
 
 /// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
@@ -844,6 +858,44 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    async fn rename_file_with_durability(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        durable: bool,
+    ) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(RenameFileRequest {
+                    durable,
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+
+                let response = client.rename_file(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                if durable && !response.durability_applied {
+                    return Err(DiskError::MethodNotAllowed);
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
@@ -1116,6 +1168,11 @@ impl RemoteDisk {
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        self.health.force_offline_for_test();
     }
 
     /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
@@ -1798,7 +1855,7 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
-    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
+    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/CompareAndUpdateFile/ReadMultiple/BatchReadVersion).
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
@@ -2084,6 +2141,9 @@ impl RemoteDisk {
                 let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope_for_object(dst_volume, dst_path)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2096,7 +2156,8 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2104,7 +2165,13 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
                 }
 
-                let response = client.rename_data(request).await?.into_inner();
+                let response = if incarnation_bound {
+                    // Older peers return Unimplemented before mutation; never downgrade.
+                    client.rename_data_at_incarnation(request).await?
+                } else {
+                    client.rename_data(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2154,6 +2221,9 @@ impl RemoteDisk {
                 let options = serde_json::to_string(&opt)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2163,7 +2233,7 @@ impl RemoteDisk {
                         .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
-                if scanner_publication_lease_token.is_some() {
+                if scanner_publication_lease_token.is_some() || !request.get_ref().bucket_incarnation_id.is_empty() {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("delete request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2171,7 +2241,12 @@ impl RemoteDisk {
                     attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
                 }
 
-                let response = client.delete(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    client.delete(request).await?
+                } else {
+                    client.delete_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2466,11 +2541,15 @@ impl DiskAPI for RemoteDisk {
                 // JSON + msgpack until its fallback counter has read zero across a release window.
                 let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let opts_bin = encode_msgpack(&opts)?;
+                let conditional_marker = opts.expected_delete_marker.is_some();
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteVersionRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2481,9 +2560,24 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
+                if incarnation_bound {
+                    let body = canonical_body.map_err(|_| Error::other("delete-version body length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
+                }
 
-                let response = client.delete_version(request).await?.into_inner();
+                // The marker-specific method rejects older peers; its body digest
+                // also binds any incarnation, so neither precondition can be lost.
+                let response = if conditional_marker {
+                    client.delete_retired_marker(request).await?
+                } else if incarnation_bound {
+                    client.delete_version_at_incarnation(request).await?
+                } else {
+                    client.delete_version(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -2751,6 +2845,9 @@ impl DiskAPI for RemoteDisk {
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(WriteMetadataRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(volume)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2758,9 +2855,15 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
-
-                let response = client.write_metadata(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
+                    client.write_metadata(request).await?
+                } else {
+                    let body = canonical_body.map_err(|_| Error::other("write metadata request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                    client.write_metadata_at_incarnation(request).await?
+                }
+                .into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -3401,30 +3504,13 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(RenameFileRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                });
-                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, false)
+            .await
+    }
 
-                let response = client.rename_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        self.rename_file_with_durability(src_volume, src_path, dst_volume, dst_path, true)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -3749,6 +3835,58 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        self.execute_with_timeout(
+            || async {
+                let data_len = expected
+                    .as_ref()
+                    .map_or(0, Bytes::len)
+                    .saturating_add(replacement.as_ref().map_or(0, Bytes::len));
+                let disk = self.disk_ref().await;
+                let mut client = self.get_bulk_client().await.inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })?;
+                let mut request = Request::new(CompareAndUpdateFileRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    expected,
+                    replacement,
+                });
+                let canonical_body = rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "compare_and_update_file")?;
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_request();
+                let response = match client.compare_and_update_file(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                        return Err(err.into());
+                    }
+                };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_sent_bytes(data_len);
+
+                if !response.success {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                conditional_file_update_from_wire(response.outcome).inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_compare_and_update_file_error();
+                })
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         trace!(
@@ -3867,6 +4005,17 @@ mod tests {
     static INIT: Once = Once::new();
 
     #[test]
+    fn compare_and_update_wire_outcome_fails_closed() {
+        assert_eq!(
+            conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated as i32)
+                .expect("updated outcome"),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(conditional_file_update_from_wire(CompareAndUpdateFileOutcome::CompareAndUpdateFileUnspecified as i32).is_err());
+        assert!(conditional_file_update_from_wire(i32::MAX).is_err());
+    }
+
+    #[test]
     fn request_compat_send_sites_keep_manifest_json_encoders() {
         // Rolling-upgrade contract (rustfs-protos compat manifest): every
         // dual-write request field must keep producing its JSON side with the
@@ -3885,6 +4034,49 @@ mod tests {
                 send_site.json_encoder
             );
         }
+    }
+
+    #[test]
+    fn retired_marker_options_preserve_legacy_positional_wire_shape() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct LegacyDeleteOptions {
+            recursive: bool,
+            immediate: bool,
+            undo_write: bool,
+            undo_delete: bool,
+            old_data_dir: Option<Uuid>,
+        }
+        let legacy = LegacyDeleteOptions {
+            recursive: false,
+            immediate: false,
+            undo_write: false,
+            undo_delete: false,
+            old_data_dir: None,
+        };
+        let original = encode_msgpack(&legacy).unwrap();
+        let current = encode_msgpack(&DeleteOptions::default()).unwrap();
+        assert_eq!(current, original, "ordinary deletes must retain the older peer's positional payload");
+        assert_eq!(rmp_serde::from_slice::<LegacyDeleteOptions>(&current).unwrap(), legacy);
+        assert!(
+            rmp_serde::from_slice::<DeleteOptions>(&original)
+                .unwrap()
+                .expected_delete_marker
+                .is_none()
+        );
+        let mut marker = FileInfo {
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(::time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker.set_delete_marker_incarnation(Uuid::new_v4());
+        let marker = rustfs_filemeta::MetaDeleteMarker::from(marker);
+        let options = DeleteOptions {
+            expected_delete_marker: Some(marker.clone()),
+            ..Default::default()
+        };
+        let decoded: DeleteOptions = rmp_serde::from_slice(&encode_msgpack(&options).unwrap()).unwrap();
+        assert_eq!(decoded.expected_delete_marker, Some(marker));
     }
 
     #[test]
@@ -4116,6 +4308,13 @@ mod tests {
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
+        next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestFormatReadGate {
+        entered: tokio::sync::Notify,
+        release: CancellationToken,
     }
 
     impl AuthenticatedReadPeer {
@@ -4127,7 +4326,14 @@ mod tests {
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
+                next_format_read_gate: Arc::default(),
             }
+        }
+
+        fn pause_next_format_read(&self) -> Arc<TestFormatReadGate> {
+            let gate = Arc::new(TestFormatReadGate::default());
+            *self.next_format_read_gate.lock().expect("format gate lock poisoned") = Some(Arc::clone(&gate));
+            gate
         }
 
         fn disk_info_calls(&self) -> u32 {
@@ -4237,6 +4443,11 @@ mod tests {
                                 let disk = request.disk;
                                 peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
                                 let data = if is_format_read {
+                                    let gate = peer.next_format_read_gate.lock().expect("format gate lock poisoned").take();
+                                    if let Some(gate) = gate {
+                                        gate.entered.notify_one();
+                                        gate.release.cancelled().await;
+                                    }
                                     peer.format_data.clone()
                                 } else {
                                     peer.object_read_all_disks
@@ -6936,6 +7147,319 @@ mod tests {
         )
         .await;
 
+        peer.stop().await;
+    }
+
+    async fn missing_read_set(peer: &TestGrpcPeer, format: crate::layout::format::FormatV3) -> Arc<crate::set_disk::SetDisks> {
+        let count = format.erasure.sets[0].len();
+        let endpoints = (0..count)
+            .map(|index| Endpoint {
+                url: url::Url::parse(&format!("{}/data/rustfs{index}", peer.addr)).expect("endpoint should parse"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i32::try_from(index).expect("fixture index fits"),
+            })
+            .collect();
+        crate::set_disk::SetDisks::new(
+            "missing-read-test".to_string(),
+            Arc::new(tokio::sync::RwLock::new(vec![None; count])),
+            count,
+            0,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reconnect_before_periodic_monitor_and_coalesce() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut format = crate::layout::format::FormatV3::new(1, 1);
+        let disk_id = format.erasure.sets[0][0];
+        format.erasure.this = disk_id;
+        let Some(peer) = TestGrpcPeer::spawn(
+            Bytes::from(format.to_json().expect("format should serialize")),
+            Bytes::from_static(b"startup-recovered-data"),
+        )
+        .await
+        else {
+            panic!("authenticated regression peer is required");
+        };
+        let set = missing_read_set(&peer, format).await;
+        let snapshots = futures::future::join_all((0..8).map(|_| set.get_disks_for_data_read())).await;
+        let disk = snapshots[0][0]
+            .as_ref()
+            .expect("a ready peer must be usable before the periodic reconnect");
+        for snapshot in &snapshots {
+            assert!(Arc::ptr_eq(
+                disk,
+                snapshot[0]
+                    .as_ref()
+                    .expect("every waiting read should observe the same handle")
+            ));
+        }
+        assert_eq!(peer.peer.read_all_calls(), 1, "concurrent requests must share the format probe");
+        assert_eq!(disk.get_disk_id().await.expect("disk identity should be available"), Some(disk_id));
+        let raw = disk
+            .read_all("bucket", "object")
+            .await
+            .expect("reconnected handle should read data");
+        assert_eq!(raw, Bytes::from_static(b"startup-recovered-data"));
+        assert_eq!(peer.peer.object_read_all_disks(), vec![disk_id.to_string()]);
+        let healthy = set.get_disks_for_data_read().await;
+        assert!(Arc::ptr_eq(disk, healthy[0].as_ref().expect("healthy handle must remain registered")));
+        assert_eq!(peer.peer.read_all_calls(), 2, "healthy reads must not re-probe the format");
+        disk.close().await.expect("reconnected disk should close");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reject_foreign_format_and_back_off() {
+        runtime_sources::ensure_test_rpc_secret();
+        let reference = crate::layout::format::FormatV3::new(1, 1);
+        let mut foreign = reference.clone();
+        foreign.id = Uuid::new_v4();
+        foreign.erasure.this = reference.erasure.sets[0][0];
+        let Some(peer) = TestGrpcPeer::spawn(
+            Bytes::from(foreign.to_json().expect("foreign format should serialize")),
+            Bytes::from_static(b"foreign-data"),
+        )
+        .await
+        else {
+            panic!("authenticated regression peer is required");
+        };
+        let set = missing_read_set(&peer, reference).await;
+        assert!(
+            set.get_disks_for_data_read().await[0].is_none(),
+            "a matching disk ID cannot authorize a foreign deployment"
+        );
+        assert_eq!(peer.peer.read_all_calls(), 1, "the foreign format must actually be inspected");
+        assert!(set.get_disks_for_data_read().await[0].is_none());
+        assert_eq!(peer.peer.read_all_calls(), 1, "failed probes must not repeat on every degraded GET");
+        assert!(peer.peer.object_read_all_disks().is_empty(), "foreign object data must never be read");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_reject_wrong_slot_and_invalid_formats() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 2);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let mut nil = reference.clone();
+        nil.erasure.this = Uuid::nil();
+        let mut unknown = reference.clone();
+        unknown.erasure.this = Uuid::new_v4();
+        let mut future = reference.clone();
+        future.erasure.version = crate::layout::format::FormatErasureVersion::Unknown;
+        for (name, payload, first_accepted) in [
+            ("duplicate slot zero", reference.to_json().expect("format should serialize"), true),
+            ("nil drive", nil.to_json().expect("nil format should serialize"), false),
+            ("unknown drive", unknown.to_json().expect("unknown format should serialize"), false),
+            ("future version", future.to_json().expect("future format should serialize"), false),
+            ("malformed", "not-json".to_string(), false),
+        ] {
+            let peer = TestGrpcPeer::spawn(Bytes::from(payload), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference.clone()).await;
+            let disks = set.get_disks_for_data_read().await;
+            assert_eq!(disks[0].is_some(), first_accepted, "{name}: slot zero identity decision");
+            assert!(disks[1].is_none(), "{name}: a peer cannot claim another topology slot");
+            assert_eq!(peer.peer.read_all_calls(), 2, "{name}: both missing slots must be probed");
+            assert!(peer.peer.object_read_all_disks().is_empty(), "{name}: no object payload may be read");
+            for disk in disks.into_iter().flatten() {
+                disk.close().await.expect("accepted disk should close");
+            }
+            peer.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_do_not_claim_local_or_misconfigured_endpoints() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        for (local, pool, set_index, disk_index) in [(true, 0, 0, 0), (false, -1, 0, 0), (false, 0, 1, 0), (false, 0, 0, 1)] {
+            let mut set = missing_read_set(&peer, reference.clone()).await;
+            let endpoint = &mut Arc::get_mut(&mut set)
+                .expect("fixture set must be uniquely owned")
+                .set_endpoints[0];
+            endpoint.is_local = local;
+            endpoint.pool_idx = pool;
+            endpoint.set_idx = set_index;
+            endpoint.disk_idx = disk_index;
+            assert!(set.get_disks_for_data_read().await[0].is_none());
+        }
+        assert_eq!(peer.peer.read_all_calls(), 0, "invalid endpoint ownership must fail before I/O");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_preserve_concurrently_published_handles() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        for reader_first in [false, true] {
+            let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference.clone()).await;
+            let gate = peer.peer.pause_next_format_read();
+            let pending_set = Arc::clone(&set);
+            let pending = tokio::spawn(async move {
+                if reader_first {
+                    pending_set.get_disks_for_data_read().await;
+                } else {
+                    pending_set.renew_disk(&pending_set.set_endpoints[0]).await;
+                }
+            });
+            time::timeout(Duration::from_secs(2), gate.entered.notified())
+                .await
+                .expect("the first reconnect must reach the format barrier");
+            if reader_first {
+                set.renew_disk(&set.set_endpoints[0]).await;
+            } else {
+                set.get_disks_for_data_read().await;
+            }
+            let published = set.disks.read().await[0]
+                .clone()
+                .expect("the competing reconnect must publish");
+            gate.release.cancel();
+            pending.await.expect("paused reconnect must complete");
+            assert!(
+                Arc::ptr_eq(&published, set.disks.read().await[0].as_ref().expect("published slot must remain")),
+                "neither reconnect may replace a handle published while its format I/O was pending"
+            );
+            published.close().await.expect("published disk should close");
+            peer.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe, internode_metrics)]
+    async fn missing_read_disks_expired_waiter_does_not_start_another_probe() {
+        // Disable cooldown so this independently proves deadline admission,
+        // rather than passing only because the leader has just finished.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("0"))], async {
+            runtime_sources::ensure_test_rpc_secret();
+            let mut reference = crate::layout::format::FormatV3::new(1, 1);
+            reference.erasure.this = reference.erasure.sets[0][0];
+            let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+                .await
+                .expect("authenticated regression peer is required");
+            let set = missing_read_set(&peer, reference).await;
+            let gate = peer.peer.pause_next_format_read();
+            let mut leader = Box::pin(set.get_disks_for_data_read());
+            time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = gate.entered.notified() => {}
+                    _ = &mut leader => panic!("leader must remain blocked in its format RPC"),
+                }
+            })
+            .await
+            .expect("leader must reach the format barrier");
+            time::pause();
+            let mut waiter = Box::pin(set.get_disks_for_data_read());
+            assert!(futures::poll!(&mut waiter).is_pending(), "waiter must queue behind the leader");
+            let requests_before =
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total;
+
+            time::advance(crate::disk::disk_store::get_drive_active_check_timeout()).await;
+            assert!(leader.await[0].is_none(), "expired leader must not publish a disk");
+            assert!(waiter.await[0].is_none(), "expired waiter must not publish a disk");
+            time::resume();
+
+            // Count client dispatches, not server arrivals: a cancelled RPC can still
+            // be buffered in the transport when the expired waiter returns.
+            assert_eq!(
+                crate::cluster::rpc::runtime_sources::internode_metrics_snapshot_for_test().outgoing_requests_total,
+                requests_before,
+                "an expired waiter must not dispatch another format RPC after the leader releases the lock"
+            );
+            gate.release.cancel();
+            peer.stop().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_timeout_releases_singleflight_and_allows_retry() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let gate = peer.peer.pause_next_format_read();
+        let deadline = crate::disk::disk_store::get_drive_active_check_timeout();
+        let snapshots = time::timeout(
+            deadline + Duration::from_secs(2),
+            futures::future::join_all((0..4).map(|_| set.get_disks_for_data_read())),
+        )
+        .await
+        .expect("all waiting requests must respect the bounded probe deadline");
+        assert!(snapshots.iter().all(|snapshot| snapshot[0].is_none()));
+        assert_eq!(peer.peer.read_all_calls(), 1, "only one format RPC may remain stalled");
+        gate.release.cancel();
+        time::pause();
+        time::advance(crate::disk::health_state::get_drive_returning_probe_interval()).await;
+        time::resume();
+        let disks = set.get_disks_for_data_read().await;
+        let disk = disks[0]
+            .as_ref()
+            .expect("a timed-out probe must not prevent a later read from reconnecting");
+        assert_eq!(peer.peer.read_all_calls(), 2, "retry must validate the format again");
+        disk.close().await.expect("reconnected disk should close");
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn missing_read_disks_cancellation_leaves_no_published_handle() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(Bytes::from(reference.to_json().expect("format should serialize")), Bytes::new())
+            .await
+            .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let gate = peer.peer.pause_next_format_read();
+        let pending_set = Arc::clone(&set);
+        let pending = tokio::spawn(async move { pending_set.get_disks_for_data_read().await });
+        time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("probe must reach the format barrier");
+        // Cancellation can happen after the start-based cooldown has elapsed.
+        // It must still cool down before another caller probes the same peer.
+        time::pause();
+        time::advance(crate::disk::health_state::get_drive_returning_probe_interval()).await;
+        time::resume();
+        pending.abort();
+        assert!(pending.await.expect_err("probe must be cancelled").is_cancelled());
+        assert!(
+            set.disks.read().await[0].is_none(),
+            "cancelled format I/O must not publish an unvalidated handle"
+        );
+        let waiting = time::timeout(Duration::from_secs(1), set.get_disks_for_data_read())
+            .await
+            .expect("cancelled probe must release the singleflight lock");
+        assert!(waiting[0].is_none(), "retry cooldown must still apply after cancellation");
+        assert_eq!(peer.peer.read_all_calls(), 1);
+        gate.release.cancel();
         peer.stop().await;
     }
 

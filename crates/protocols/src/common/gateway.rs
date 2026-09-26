@@ -150,10 +150,10 @@ pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Act
             S3Action::HeadObject => true,   // SIZE command
 
             // Multipart operations
-            S3Action::CreateMultipartUpload => false,
-            S3Action::UploadPart => false,
-            S3Action::CompleteMultipartUpload => false,
-            S3Action::AbortMultipartUpload => false,
+            S3Action::CreateMultipartUpload => true,
+            S3Action::UploadPart => true,
+            S3Action::CompleteMultipartUpload => true,
+            S3Action::AbortMultipartUpload => true,
             S3Action::ListMultipartUploads => false,
             S3Action::ListParts => false,
 

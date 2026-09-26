@@ -43,7 +43,7 @@ spec:
               service:
                 name: {{ include "rustfs.fullname" $ }}-svc
                 port:
-                  name: console
+                  name: {{ .servicePort | default "console" }}
           {{- end }}
     {{- end }}
 {{- end }}

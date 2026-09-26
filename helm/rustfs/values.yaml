@@ -335,10 +335,16 @@ ingress:
   customAnnotations: # Deprecated: use ingress.annotations instead
     {}
   hosts:
-    - host: example.rustfs.com
+    - host: console.rustfs.com
       paths:
         - path: /
           pathType: Prefix
+          servicePort: console
+    - host: endpoint.rustfs.com
+      paths:
+        - path: /
+          pathType: Prefix
+          servicePort: endpoint
   tls:
     enabled: false # Enable tls and access rustfs via https.
 

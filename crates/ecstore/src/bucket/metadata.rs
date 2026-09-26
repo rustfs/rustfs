@@ -275,6 +275,141 @@ pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
 pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
 
+/// Refusal to act on a stored sub-configuration whose bytes exist but cannot
+/// be parsed. Carried inside [`Error::other`] so callers can tell it apart
+/// from a storage fault with [`is_unreadable_config_error`].
+#[derive(Debug, Clone)]
+pub struct UnreadableBucketConfig {
+    pub bucket: String,
+    pub config_file: String,
+    /// Length of the stored bytes that failed to parse.
+    pub raw_len: usize,
+}
+
+impl std::fmt::Display for UnreadableBucketConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "persisted bucket configuration {} ({} bytes) for bucket {} cannot be parsed; back up the stored bytes (rustfs inspect bucket-meta), then replace or delete the configuration",
+            self.config_file, self.raw_len, self.bucket
+        )
+    }
+}
+
+impl std::error::Error for UnreadableBucketConfig {}
+
+pub fn is_unreadable_config_error(err: &Error) -> bool {
+    unreadable_config_refusal(err).is_some()
+}
+
+pub fn unreadable_config_refusal(err: &Error) -> Option<&UnreadableBucketConfig> {
+    match err {
+        Error::Io(io) => io.get_ref().and_then(|inner| inner.downcast_ref::<UnreadableBucketConfig>()),
+        _ => None,
+    }
+}
+
+pub(crate) fn unreadable_config_error(bucket: &str, config_file: &str, raw_len: usize) -> Error {
+    Error::other(UnreadableBucketConfig {
+        bucket: bucket.to_string(),
+        config_file: config_file.to_string(),
+        raw_len,
+    })
+}
+
+/// Stored state of one sub-configuration as left by
+/// [`BucketMetadata::parse_all_configs`]: a parse failure keeps the raw bytes
+/// and leaves the typed field `None`, which is kept distinct from "no bytes".
+///
+/// Deliberately has no `Option` conversion or defaulting accessor: folding
+/// `Unreadable` into `Absent` is exactly the failure this type exists to stop.
+#[derive(Debug)]
+pub enum ConfigState<'a, T> {
+    /// No bytes are stored.
+    Absent,
+    /// The stored bytes parsed.
+    Valid(&'a T),
+    /// Bytes are stored but could not be parsed.
+    Unreadable { raw_len: usize },
+}
+
+impl<'a, T> ConfigState<'a, T> {
+    pub fn of(raw: &[u8], parsed: &'a Option<T>) -> Self {
+        match parsed {
+            Some(config) => Self::Valid(config),
+            None if raw.is_empty() => Self::Absent,
+            None => Self::Unreadable { raw_len: raw.len() },
+        }
+    }
+
+    /// `Ok(None)` when absent; a typed [`UnreadableBucketConfig`] refusal
+    /// when the stored bytes cannot be parsed.
+    pub fn require(self, bucket: &str, config_file: &str) -> Result<Option<&'a T>> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Valid(config) => Ok(Some(config)),
+            Self::Unreadable { raw_len } => Err(unreadable_config_error(bucket, config_file, raw_len)),
+        }
+    }
+}
+
+/// The XML sub-configurations whose parse failure is retained as
+/// [`ConfigState::Unreadable`].
+pub const XML_BUCKET_CONFIG_FILES: [&str; 13] = [
+    BUCKET_NOTIFICATION_CONFIG,
+    BUCKET_LIFECYCLE_CONFIG,
+    OBJECT_LOCK_CONFIG,
+    BUCKET_VERSIONING_CONFIG,
+    BUCKET_SSECONFIG,
+    BUCKET_TAGGING_CONFIG,
+    BUCKET_REPLICATION_CONFIG,
+    BUCKET_CORS_CONFIG,
+    BUCKET_LOGGING_CONFIG,
+    BUCKET_WEBSITE_CONFIG,
+    BUCKET_ACCELERATE_CONFIG,
+    BUCKET_REQUEST_PAYMENT_CONFIG,
+    BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG,
+];
+
+impl BucketMetadata {
+    /// Whether the stored XML sub-configuration `config_file` has bytes that
+    /// cannot be parsed. Non-XML config files report `false`: they carry their
+    /// own unreadable handling (policy, quota, bucket targets).
+    pub fn xml_config_unreadable(&self, config_file: &str) -> bool {
+        self.xml_config_unreadable_len(config_file).is_some()
+    }
+
+    /// Length of the stored bytes of XML sub-configuration `config_file` when
+    /// they cannot be parsed; `None` when it is absent, readable, or not an
+    /// XML config.
+    pub fn xml_config_unreadable_len(&self, config_file: &str) -> Option<usize> {
+        fn unreadable<T>(raw: &[u8], parsed: &Option<T>) -> Option<usize> {
+            match ConfigState::of(raw, parsed) {
+                ConfigState::Unreadable { raw_len } => Some(raw_len),
+                ConfigState::Absent | ConfigState::Valid(_) => None,
+            }
+        }
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => unreadable(&self.notification_config_xml, &self.notification_config),
+            BUCKET_LIFECYCLE_CONFIG => unreadable(&self.lifecycle_config_xml, &self.lifecycle_config),
+            OBJECT_LOCK_CONFIG => unreadable(&self.object_lock_config_xml, &self.object_lock_config),
+            BUCKET_VERSIONING_CONFIG => unreadable(&self.versioning_config_xml, &self.versioning_config),
+            BUCKET_SSECONFIG => unreadable(&self.encryption_config_xml, &self.sse_config),
+            BUCKET_TAGGING_CONFIG => unreadable(&self.tagging_config_xml, &self.tagging_config),
+            BUCKET_REPLICATION_CONFIG => unreadable(&self.replication_config_xml, &self.replication_config),
+            BUCKET_CORS_CONFIG => unreadable(&self.cors_config_xml, &self.cors_config),
+            BUCKET_LOGGING_CONFIG => unreadable(&self.logging_config_xml, &self.logging_config),
+            BUCKET_WEBSITE_CONFIG => unreadable(&self.website_config_xml, &self.website_config),
+            BUCKET_ACCELERATE_CONFIG => unreadable(&self.accelerate_config_xml, &self.accelerate_config),
+            BUCKET_REQUEST_PAYMENT_CONFIG => unreadable(&self.request_payment_config_xml, &self.request_payment_config),
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => {
+                unreadable(&self.public_access_block_config_xml, &self.public_access_block_config)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub fn table_catalog_path_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     let mut output = String::with_capacity(digest.len() * 2);
@@ -471,6 +606,13 @@ impl BucketMetadata {
 
     pub fn object_locking(&self) -> bool {
         self.lock_enabled || self.object_lock_config.as_ref().is_some_and(|v| v.enabled())
+    }
+
+    /// Whether an operation that may skip Object Lock checks must keep them.
+    /// Stored lock bytes that cannot be parsed leave the lock state unknown,
+    /// which must not be read as "no Object Lock".
+    pub fn object_lock_checks_required(&self) -> bool {
+        self.object_locking() || self.xml_config_unreadable(OBJECT_LOCK_CONFIG)
     }
 
     pub fn table_bucket_enabled(&self) -> bool {
@@ -985,17 +1127,25 @@ impl BucketMetadata {
     /// |---|---|
     /// | policy | Fails closed: `get_bucket_policy` re-parses the raw JSON and propagates the error; `get_bucket_policy_raw` returns the stored bytes. |
     /// | object lock | Fails closed in `object_lock_config_state_from_authoritative_metadata`; a retention decision may never be taken on a guess. |
-    /// | versioning | Fails closed in `get_versioning_config`; guessing Unversioned would make delete markers and version ids diverge from what is on disk. |
+    /// | versioning | Fails closed in `get_versioning_config` and the delete-time snapshot; guessing Unversioned would make delete markers and version ids diverge from what is on disk. Object writes lay out versions through `BucketVersioningSys::get_for_write`, which refuses in strict mode and, in the default permissive mode, keeps the historical unversioned write (see `config_parse_mode`). |
     /// | replication | Fails closed in `get_replication_config`. |
     /// | bucket targets | Fails closed in `get_bucket_targets_config`, and `sync_bucket_target_sys` marks the bucket unreadable in `BucketTargetSys` instead of publishing an empty target set (rustfs/backlog#2282). |
     /// | encryption | Fails closed in `get_sse_config`: degrading to "no default encryption" stores plaintext objects the operator required to be encrypted. |
     /// | public access block | Fails closed in `get_public_access_block_config`: degrading grants the anonymous access the operator asked to block. |
     /// | quota | Fails closed in `get_quota_config`; the enforcement path in `quota::checker` already re-parses the raw JSON and refuses on error. |
-    /// | lifecycle | Safe to degrade: no rules means no expiration and no transition, so nothing is deleted or moved on the strength of an unreadable rule set. The bucket keeps serving reads and writes. |
-    /// | notification | Safe to degrade: events are an outbound side channel; no consumer draws a durability or authorization conclusion from their absence. |
-    /// | tagging | Safe to degrade: bucket tags are cost-allocation labels here; object-level tag conditions come from object metadata, not this blob. |
-    /// | CORS | Safe to degrade: an absent CORS configuration rejects cross-origin browser requests, which is already the restrictive direction. |
-    /// | logging, website, accelerate, request payment, bucket ACL | Safe to degrade: each only shapes an optional response or an optional side channel, and none of them authorizes an action or decides whether data is retained. |
+    /// | lifecycle | `get_lifecycle_config` fails closed, so GetBucketLifecycle reports the fault instead of NoSuchLifecycleConfiguration. ILM, scanner and expiry-header consumers still degrade to "no rules": nothing is deleted or moved on the strength of an unreadable rule set, and the bucket keeps serving reads and writes. |
+    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup leaves that one bucket's rules unchanged instead of clearing them; other buckets are unaffected. |
+    /// | tagging, CORS, logging, website, accelerate, request payment | The getter fails closed so the matching GET API reports the fault instead of "not configured". Per-request consumers (CORS response headers) still degrade to "not configured", which is the restrictive direction. |
+    /// | bucket ACL | Safe to degrade: it only shapes an optional response. |
+    ///
+    /// Independently of the table, `update_config_with` refuses a
+    /// read-modify-write of an unreadable XML config before its mutate step
+    /// runs, so the unreadable bytes are never replaced by a rewrite that saw
+    /// them as absent. Other configs of the same bucket stay writable.
+    ///
+    /// Every unreadable XML config found here is counted in
+    /// `rustfs_bucket_metadata_parse_failed_total`, reflected in
+    /// `rustfs_bucket_metadata_unparsable_current`, and logged at error level.
     pub(super) fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(
@@ -1239,6 +1389,14 @@ impl BucketMetadata {
             );
         }
 
+        if !self.name.is_empty() {
+            let unreadable: Vec<(&'static str, usize)> = XML_BUCKET_CONFIG_FILES
+                .iter()
+                .filter_map(|config| self.xml_config_unreadable_len(config).map(|raw_len| (*config, raw_len)))
+                .collect();
+            super::config_parse_mode::record_bucket_config_parse_state(&self.name, &unreadable);
+        }
+
         Ok(())
     }
 }
@@ -1306,9 +1464,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
                 "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
             )));
         }
-    } else if incarnation.is_some() {
-        return Err(Error::other("bucket incarnation sidecar exists without bucket metadata"));
     }
+    // A sidecar without `.metadata.bin` is the window between the two legacy
+    // migration writes (rustfs/rustfs#8003): the sidecar lands first, and a
+    // crash or lost namespace lease before the metadata write leaves the
+    // bucket in this state on every node. Report it as not persisted so the
+    // migration runs again; the writers adopt the stored incarnation instead
+    // of minting a new one, so the sidecar keeps its authority.
 
     bm.default_timestamps();
 
@@ -1355,6 +1517,18 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// rustfs/backlog#1734: `StorageError::clone` rebuilds I/O errors from
+    /// their text. The unreadable-config refusal must stay typed across that
+    /// clone, or a cloned error stops mapping to its retryable S3 response.
+    #[test]
+    fn unreadable_config_refusal_survives_storage_error_clone() {
+        let err = unreadable_config_error("b", BUCKET_TAGGING_CONFIG, 7);
+        let cloned = err.clone();
+        assert!(is_unreadable_config_error(&cloned), "clone lost the typed refusal: {cloned}");
+        assert_eq!(unreadable_config_refusal(&cloned).map(|r| r.raw_len), Some(7));
+        assert!(is_unreadable_config_error(&err));
+    }
 
     /// Decode a whitespace-tolerant hex fixture into bytes.
     fn decode_hex(s: &str) -> Vec<u8> {

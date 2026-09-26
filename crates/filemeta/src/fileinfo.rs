@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::metadata_keys;
 use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_COMPLETE, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
@@ -22,8 +23,6 @@ use rustfs_utils::http::{
     contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
     starts_with_ignore_ascii_case,
 };
-use s3s::dto::{RestoreStatus, Timestamp};
-use s3s::header::X_AMZ_RESTORE;
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,7 @@ use uuid::Uuid;
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
-const MAX_ERASURE_SHARDS: usize = 16;
+pub(crate) const MAX_ERASURE_SHARDS: usize = 16;
 const MAX_FILEINFO_PARTS: usize = 10_000;
 const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
 const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
@@ -57,7 +56,7 @@ const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
 const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
     pub etag: String,
     pub number: usize,
@@ -69,6 +68,28 @@ pub struct ObjectPartInfo {
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub integrity: Option<crate::shard_integrity::PartIntegrity>,
+}
+
+impl Serialize for ObjectPartInfo {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Named fields let release readers ignore optional extensions. Appending
+        // a ninth element to the old positional array makes those readers fail.
+        let mut map = serializer.serialize_map(Some(8 + usize::from(self.integrity.is_some())))?;
+        map.serialize_entry("etag", &self.etag)?;
+        map.serialize_entry("number", &self.number)?;
+        map.serialize_entry("size", &self.size)?;
+        map.serialize_entry("actual_size", &self.actual_size)?;
+        map.serialize_entry("mod_time", &self.mod_time)?;
+        map.serialize_entry("index", &self.index)?;
+        map.serialize_entry("checksums", &self.checksums)?;
+        map.serialize_entry("error", &self.error)?;
+        if let Some(integrity) = &self.integrity {
+            map.serialize_entry("integrity", integrity)?;
+        }
+        map.end()
+    }
 }
 
 impl ObjectPartInfo {
@@ -285,6 +306,9 @@ pub struct FileInfo {
     pub versioned: bool,
     /// True when version meta was parsed via rmp_serde fallback (legacy format).
     pub uses_legacy_checksum: bool,
+    /// Transient PUT intent for the cleanup owner of a replaced tiered null version.
+    /// Named-map RPC readers may ignore this field; xl.meta never persists it.
+    pub overwrite_tier_free_version_id: Option<Uuid>,
 }
 
 /// Metadata keys whose values carry sealed encryption material (KEK-wrapped DEK,
@@ -367,6 +391,7 @@ impl std::fmt::Debug for FileInfo {
             checksum,
             versioned,
             uses_legacy_checksum,
+            overwrite_tier_free_version_id,
         } = self;
         f.debug_struct("FileInfo")
             .field("volume", volume)
@@ -399,6 +424,7 @@ impl std::fmt::Debug for FileInfo {
             .field("checksum", &ElidedBytes(checksum))
             .field("versioned", versioned)
             .field("uses_legacy_checksum", uses_legacy_checksum)
+            .field("overwrite_tier_free_version_id", overwrite_tier_free_version_id)
             .finish()
     }
 }
@@ -438,6 +464,8 @@ struct FileInfoMapDef {
     checksum: Option<Bytes>,
     versioned: bool,
     uses_legacy_checksum: bool,
+    #[serde(default)]
+    overwrite_tier_free_version_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +506,7 @@ const FILE_INFO_FIELDS: &[&str] = &[
     "checksum",
     "versioned",
     "uses_legacy_checksum",
+    "overwrite_tier_free_version_id",
 ];
 
 impl Serialize for FileInfo {
@@ -485,7 +514,8 @@ impl Serialize for FileInfo {
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(FILE_INFO_FIELDS.len()))?;
+        let mut map = serializer
+            .serialize_map(Some(FILE_INFO_FIELDS.len() - usize::from(self.overwrite_tier_free_version_id.is_none())))?;
         map.serialize_entry("volume", &self.volume)?;
         map.serialize_entry("name", &self.name)?;
         map.serialize_entry("version_id", &self.version_id)?;
@@ -516,6 +546,9 @@ impl Serialize for FileInfo {
         map.serialize_entry("checksum", &self.checksum)?;
         map.serialize_entry("versioned", &self.versioned)?;
         map.serialize_entry("uses_legacy_checksum", &self.uses_legacy_checksum)?;
+        if let Some(id) = self.overwrite_tier_free_version_id {
+            map.serialize_entry("overwrite_tier_free_version_id", &id)?;
+        }
         map.end()
     }
 }
@@ -635,11 +668,16 @@ impl<'de> Deserialize<'de> for FileInfo {
                     checksum,
                     versioned,
                     uses_legacy_checksum,
+                    overwrite_tier_free_version_id: None,
                 })
             }
         }
 
-        deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)
+        let mut file = deserializer.deserialize_struct("FileInfo", FILE_INFO_FIELDS, FileInfoVisitor)?;
+        if !file.parts.is_empty() {
+            file.hydrate_shard_integrity().map_err(de::Error::custom)?;
+        }
+        Ok(file)
     }
 }
 
@@ -1090,6 +1128,7 @@ impl FileInfo {
             index,
             checksums,
             error: None,
+            integrity: None,
         };
 
         for p in self.parts.iter_mut() {
@@ -1178,6 +1217,27 @@ impl FileInfo {
 
     pub fn set_object_transaction_epoch(&mut self, epoch: Uuid) {
         insert_str(&mut self.metadata, SUFFIX_OBJECT_TRANSACTION_EPOCH, epoch.to_string());
+    }
+
+    /// Bind a newly created delete marker to the destination bucket generation.
+    pub fn set_delete_marker_incarnation(&mut self, incarnation: Uuid) {
+        if self.deleted && !incarnation.is_nil() {
+            insert_str(
+                &mut self.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+                incarnation.to_string(),
+            );
+        }
+    }
+
+    /// Legacy, malformed, or conflicting stamps cannot authorize marker cleanup.
+    pub fn delete_marker_incarnation(&self) -> Option<Uuid> {
+        if !self.deleted || self.tier_free_version() {
+            return None;
+        }
+        get_consistent_str(&self.metadata, rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|id| !id.is_nil())
     }
 
     pub fn object_transaction_epoch(&self) -> Result<Option<Uuid>> {
@@ -1359,6 +1419,18 @@ pub struct FilesInfo {
     pub is_truncated: bool,
 }
 
+/// Parsed restore status of a restored object: the value persisted under
+/// [`metadata_keys::RESTORE`]. filemeta owns this type so the persisted format
+/// does not depend on an HTTP library DTO (backlog#1735 A3c); the field names
+/// match the former `s3s::dto::RestoreStatus` so the rendered bytes are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreStatus {
+    /// `ongoing-request`; `None` reads as not in progress.
+    pub is_restore_in_progress: Option<bool>,
+    /// `expiry-date`; required to render a finished restore.
+    pub restore_expiry_date: Option<OffsetDateTime>,
+}
+
 pub trait RestoreStatusOps {
     fn expiry(&self) -> Option<OffsetDateTime>;
     fn on_going(&self) -> bool;
@@ -1372,7 +1444,7 @@ impl RestoreStatusOps for RestoreStatus {
         if self.on_going() {
             return None;
         }
-        self.restore_expiry_date.clone().map(OffsetDateTime::from)
+        self.restore_expiry_date
     }
 
     fn on_going(&self) -> bool {
@@ -1398,9 +1470,7 @@ impl RestoreStatusOps for RestoreStatus {
         }
         format!(
             "ongoing-request=\"false\", expiry-date=\"{}\"",
-            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
-                .format(&Rfc3339)
-                .unwrap()
+            self.restore_expiry_date.unwrap().format(&Rfc3339).unwrap()
         )
     }
 
@@ -1410,9 +1480,7 @@ impl RestoreStatusOps for RestoreStatus {
         }
         format!(
             "ongoing-request=\"false\", expiry-date=\"{}\"",
-            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
-                .format(&RFC1123)
-                .unwrap()
+            self.restore_expiry_date.unwrap().format(&RFC1123).unwrap()
         )
     }
 }
@@ -1473,7 +1541,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             let expiry = parse_restore_expiry_date(expiry_tokens[1].trim_matches('"'))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
-                restore_expiry_date: Some(Timestamp::from(expiry)),
+                restore_expiry_date: Some(expiry),
             });
         }
         _ => (),
@@ -1482,7 +1550,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+    if let Some(restore_hdr) = meta.get(metadata_keys::RESTORE)
         && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
     {
         return restore_status.on_disk();
@@ -2172,6 +2240,7 @@ mod tests {
                 index,
                 checksums,
                 error,
+                integrity: None,
             })
     }
 
@@ -2262,6 +2331,7 @@ mod tests {
                     checksum,
                     versioned,
                     uses_legacy_checksum,
+                    overwrite_tier_free_version_id: None,
                 }
             })
     }
@@ -2379,6 +2449,7 @@ mod tests {
                         .collect(),
                 ),
                 error: Some("part-error".to_string()),
+                integrity: None,
             }],
             erasure: ErasureInfo {
                 algorithm: "erasure-algorithm".to_string(),
@@ -2407,6 +2478,7 @@ mod tests {
             checksum: Some(Bytes::from_static(b"combined-checksum")),
             versioned: false,
             uses_legacy_checksum: true,
+            overwrite_tier_free_version_id: None,
         }
     }
 
@@ -2545,12 +2617,15 @@ mod tests {
 
     #[test]
     fn fileinfo_serializes_as_map_readable_by_beta11_and_beta12_shapes() {
-        let expected = positional_compat_file_info();
+        let mut expected = positional_compat_file_info();
+        expected.overwrite_tier_free_version_id = Some(Uuid::new_v4());
         let encoded = expected.marshal_msg().expect("current FileInfo map should encode");
         let mut cursor = encoded.as_slice();
         let field_count = usize::try_from(rmp::decode::read_map_len(&mut cursor).expect("FileInfo should start with a map"))
             .expect("FileInfo map field count should fit usize");
         assert_eq!(field_count, FILE_INFO_FIELDS.len());
+        let current = FileInfo::unmarshal(&encoded).expect("current reader preserves the transient PUT intent");
+        assert_eq!(current.overwrite_tier_free_version_id, expected.overwrite_tier_free_version_id);
 
         let beta11: Beta11MapProbe = rmp_serde::from_slice(&encoded).expect("beta.11 field shape should read current map");
         assert_eq!(beta11.volume, expected.volume);
@@ -2568,6 +2643,31 @@ mod tests {
             rmp_serde::from_slice(&nested_encoded).expect("beta.11 field shape should read nested current map");
         assert_eq!(nested_beta11.file_info.volume, expected.volume);
         assert_eq!(nested_beta11.file_info.expire_restored, expected.expire_restored);
+    }
+
+    #[test]
+    fn fileinfo_defaults_missing_put_intent_without_extending_legacy_arrays() {
+        let expected = positional_compat_file_info();
+        let encoded = expected.marshal_msg().expect("ordinary FileInfo map should encode");
+        let mut cursor = encoded.as_slice();
+        assert_eq!(
+            rmp::decode::read_map_len(&mut cursor).expect("FileInfo map header") as usize,
+            FILE_INFO_FIELDS.len() - 1
+        );
+        assert!(
+            FileInfo::unmarshal(&encoded)
+                .expect("map without PUT intent")
+                .overwrite_tier_free_version_id
+                .is_none()
+        );
+        for fixture in [BETA11_FILEINFO_FIXTURE, BETA12_FILEINFO_FIXTURE] {
+            assert!(
+                FileInfo::unmarshal(fixture)
+                    .expect("historical positional array")
+                    .overwrite_tier_free_version_id
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -2740,12 +2840,53 @@ mod tests {
     fn restore_status_round_trips_through_both_formats() {
         let status = RestoreStatus {
             is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(Timestamp::from(datetime!(2030-06-15 07:08:09 UTC))),
+            restore_expiry_date: Some(datetime!(2030-06-15 07:08:09 UTC)),
         };
         for rendered in [RestoreStatusOps::to_string(&status), status.to_string2()] {
             let parsed = parse_restore_obj_status(&rendered).unwrap_or_else(|e| panic!("{rendered} must parse: {e}"));
             assert_eq!(parsed.expiry(), Some(datetime!(2030-06-15 07:08:09 UTC)), "{rendered}");
         }
+    }
+
+    /// backlog#1735 A3c: filemeta's own `RestoreStatus` must persist the same
+    /// bytes the s3s DTO did. The restore value in the pre-`metadata_keys`
+    /// fixture was rendered by the s3s-backed writer; parsing and rendering it
+    /// again must reproduce it exactly.
+    #[test]
+    fn restore_status_rerenders_pre_module_fixture_bytes() {
+        let fi = crate::FileMeta::load(&crate::test_data::create_pre_metadata_keys_xlmeta().expect("decode fixture hex"))
+            .expect("load fixture xl.meta")
+            .into_fileinfo("bucket", "object", "0b1e5a3a-1735-4a3a-8000-00000000a3a0", false, false, false)
+            .expect("fixture version to FileInfo");
+        let stored = fi.metadata.get(metadata_keys::RESTORE).expect("fixture restore value");
+        assert_eq!(stored, "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"");
+
+        let parsed = parse_restore_obj_status(stored).expect("fixture restore value parses");
+        assert_eq!(
+            parsed,
+            RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(datetime!(9999-01-01 00:00:00 UTC)),
+            }
+        );
+        assert_eq!(RestoreStatusOps::to_string(&parsed), *stored);
+        assert_eq!(
+            parsed.to_string2(),
+            "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\""
+        );
+
+        let ongoing = RestoreStatus {
+            is_restore_in_progress: Some(true),
+            restore_expiry_date: Some(datetime!(2030-06-15 07:08:09 UTC)),
+        };
+        assert_eq!(RestoreStatusOps::to_string(&ongoing), "ongoing-request=\"true\"");
+        assert_eq!(
+            parse_restore_obj_status("ongoing-request=\"true\"").expect("in-progress form parses"),
+            RestoreStatus {
+                is_restore_in_progress: Some(true),
+                restore_expiry_date: None,
+            }
+        );
     }
 
     /// A restored object migrated from MinIO must still be recognised as
@@ -2756,7 +2897,7 @@ mod tests {
     fn minio_restored_object_is_recognised_as_on_disk() {
         let mut meta = HashMap::new();
         meta.insert(
-            X_AMZ_RESTORE.as_str().to_string(),
+            metadata_keys::RESTORE.to_string(),
             "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\"".to_string(),
         );
         assert!(is_restored_object_on_disk(&meta));

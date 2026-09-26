@@ -23,6 +23,7 @@ use crate::disk::DiskOption;
 use crate::disk::endpoint::Endpoint;
 #[cfg(test)]
 use crate::disk::new_disk;
+use rustfs_filemeta::metadata_keys;
 use rustfs_utils::http;
 use sha2::Digest;
 
@@ -34,6 +35,114 @@ struct FileInfoIdentityGroup {
 }
 
 impl SetDisks {
+    /// Resolve each listed version using the same metadata authority as an exact read.
+    pub(crate) fn resolve_listed_versions(
+        bucket: &str,
+        entries: rustfs_filemeta::MetaCacheEntries,
+        read_errors: &[Option<DiskError>],
+        disk_count: usize,
+        default_parity: usize,
+    ) -> disk::error::Result<Option<rustfs_filemeta::MetaCacheEntry>> {
+        use rustfs_filemeta::{FileMeta, MetaCacheEntry};
+
+        if disk_count == 0 || entries.0.len() > disk_count || entries.0.len() != read_errors.len() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+        let Some(first) = entries.0.iter().flatten().next() else {
+            return Ok(None);
+        };
+        let name = first.name.clone();
+        if first.is_dir() {
+            let quorum = if default_parity == 0 {
+                disk_count
+            } else {
+                disk_count.div_ceil(2)
+            };
+            let matches = entries
+                .0
+                .iter()
+                .flatten()
+                .filter(|entry| entry.is_dir() && entry.name == name)
+                .count();
+            return Ok((matches >= quorum).then(|| first.clone()));
+        }
+
+        let mut versions = HashMap::<Option<Uuid>, Vec<FileInfo>>::new();
+        let mut missing = vec![Some(DiskError::DiskNotFound); disk_count];
+        for (slot, (entry, error)) in entries.0.into_iter().zip(read_errors).enumerate() {
+            missing[slot] = error.clone().or(Some(DiskError::FileVersionNotFound));
+            let Some(entry) = entry else { continue };
+            if error.is_some() {
+                continue;
+            }
+            if entry.is_dir() || entry.name != name {
+                missing[slot] = Some(DiskError::FileCorrupt);
+                continue;
+            }
+            let decoded = match entry.file_info_versions_with_free_versions(bucket) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    missing[slot] = Some(error.into());
+                    continue;
+                }
+            };
+            let decoded = decoded.versions.into_iter().chain(decoded.free_versions).collect::<Vec<_>>();
+            let mut seen = HashSet::new();
+            if decoded
+                .iter()
+                .any(|info| !file_info_is_valid_for_metadata(info) || !seen.insert(info.version_id))
+            {
+                missing[slot] = Some(DiskError::FileCorrupt);
+                continue;
+            }
+            for info in decoded {
+                let version_id = info.version_id;
+                versions
+                    .entry(version_id)
+                    .or_insert_with(|| vec![FileInfo::default(); disk_count])[slot] = info;
+            }
+        }
+        let complete = missing.iter().all(|error| {
+            matches!(
+                error,
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+            )
+        });
+        let mut metadata = FileMeta::new();
+        for parts in versions.into_values() {
+            let errors = parts
+                .iter()
+                .zip(&missing)
+                .map(|(info, error)| {
+                    if file_info_is_valid_for_metadata(info) {
+                        None
+                    } else {
+                        error.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let read_quorum = match Self::object_quorum_from_meta(&parts, &errors, default_parity) {
+                Ok((quorum, _)) => usize::try_from(quorum).map_err(|_| DiskError::FileCorrupt)?,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) if complete => continue,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => return Err(DiskError::ErasureReadQuorum),
+                Err(DiskError::ErasureReadQuorum) if complete => continue,
+                Err(error) => return Err(error),
+            };
+            let mod_time = Self::common_time(&Self::list_object_modtimes(&parts, &errors), read_quorum);
+            let selected = Self::pick_valid_fileinfo(&parts, mod_time, None, read_quorum)?;
+            metadata.add_version(selected)?;
+        }
+        if metadata.versions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(MetaCacheEntry {
+            name,
+            metadata: metadata.marshal_msg()?,
+            cached: Some(metadata),
+            reusable: false,
+        }))
+    }
+
     pub(super) fn all_not_found_metadata(errs: &[Option<DiskError>]) -> bool {
         !errs.is_empty()
             && errs.iter().all(|err| match err {
@@ -302,7 +411,13 @@ impl SetDisks {
         default_parity_count: usize,
     ) -> disk::error::Result<(i32, i32)> {
         if Self::all_not_found_metadata(errs) {
-            return Err(DiskError::FileNotFound);
+            // Preserve explicit-version absence from the disk replies before
+            // the object/API error boundary assigns the S3 error code.
+            return Err(if errs.iter().any(|err| matches!(err, Some(DiskError::FileVersionNotFound))) {
+                DiskError::FileVersionNotFound
+            } else {
+                DiskError::FileNotFound
+            });
         }
 
         let expected_rquorum = if default_parity_count == 0 {
@@ -488,6 +603,7 @@ impl SetDisks {
     }
 
     pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_shard_integrity().map_err(DiskError::from)?;
         fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
         for part in &fi.parts {
             let Some(checksums) = part.checksums.as_ref() else {
@@ -586,7 +702,7 @@ impl SetDisks {
     }
 
     fn is_replication_quorum_metadata_key(name: &str) -> bool {
-        if name.eq_ignore_ascii_case(http::AMZ_BUCKET_REPLICATION_STATUS) {
+        if name.eq_ignore_ascii_case(metadata_keys::REPLICATION_STATUS) {
             return true;
         }
 

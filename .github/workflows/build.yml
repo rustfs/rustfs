@@ -88,7 +88,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -98,7 +98,7 @@ jobs:
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -172,7 +172,7 @@ jobs:
   prepare-platform-matrix:
     name: Prepare Platform Matrix
     needs: build-check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -207,12 +207,12 @@ jobs:
           fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -257,7 +257,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -406,12 +406,25 @@ jobs:
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            # All cross targets in the matrix are Linux; zigbuild handles them.
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin rustfs
-          else
-            cargo build --release --target ${{ matrix.target }} -p rustfs --bin rustfs
+          BINARY_NAMES=(rustfs)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_NAMES+=(rustfs-cli)
           fi
+          FEATURE_ARGS=()
+          if [[ -n "${{ matrix.features }}" ]]; then
+            FEATURE_ARGS=(--features "${{ matrix.features }}")
+          fi
+
+          # Build one binary at a time so release LTO links cannot exhaust a
+          # self-hosted runner by running concurrently.
+          for binary in "${BINARY_NAMES[@]}"; do
+            if [[ "${{ matrix.cross }}" == "true" ]]; then
+              # All cross targets in the matrix are Linux; zigbuild handles them.
+              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+            else
+              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+            fi
+          done
 
       - name: Create release package
         id: package
@@ -498,16 +511,23 @@ jobs:
             BINARY_NAME="rustfs"
           fi
 
-          # Verify the binary exists before packaging
-          if [[ ! -f "$BINARY_NAME" ]]; then
-            echo "❌ Binary $BINARY_NAME not found in $(pwd)"
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              dir
-            else
-              ls -la
-            fi
-            exit 1
+          BINARY_FILES=("$BINARY_NAME")
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            BINARY_FILES+=("rustfs-cli")
           fi
+
+          # Verify the binaries exist before packaging
+          for binary in "${BINARY_FILES[@]}"; do
+            if [[ ! -f "$binary" ]]; then
+              echo "❌ Binary $binary not found in $(pwd)"
+              if [[ "${{ matrix.platform }}" == "windows" ]]; then
+                dir
+              else
+                ls -la
+              fi
+              exit 1
+            fi
+          done
 
           # Universal packaging function
           package_zip() {
@@ -526,8 +546,12 @@ jobs:
           }
 
           # Create the zip package
-          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
-          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          echo "Start packaging: ${BINARY_FILES[*]} -> ../../../${PACKAGE_NAME}.zip"
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            zip "../../../${PACKAGE_NAME}.zip" "${BINARY_FILES[@]}"
+          else
+            package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+          fi
 
           cd ../../..
 
@@ -601,6 +625,28 @@ jobs:
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
+      - name: Verify packaged Linux CLI
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_file="${{ steps.package.outputs.package_file }}"
+          archive_members="$(unzip -Z1 "$package_file" | sort)"
+          expected_members=$'rustfs\nrustfs-cli'
+          if [[ "$archive_members" != "$expected_members" ]]; then
+            echo "Linux package must contain exactly rustfs and rustfs-cli" >&2
+            printf '%s\n' "$archive_members" >&2
+            exit 1
+          fi
+
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            cli_dir="$(mktemp -d)"
+            trap 'rm -rf "$cli_dir"' EXIT
+            unzip -q "$package_file" rustfs-cli -d "$cli_dir"
+            "$cli_dir/rustfs-cli" --help >/dev/null
+          fi
+
       - name: Verify packaged console
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
@@ -656,7 +702,7 @@ jobs:
           exit 1
 
       - name: Upload to GitHub artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.package_name }}
           path: "rustfs-*.zip"
@@ -724,7 +770,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Build completion summary
@@ -772,9 +818,7 @@ jobs:
 
           echo ""
           echo "🐳 Docker Images:"
-          if [[ "$BUILD_TYPE" == "preview" ]]; then
-            echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
+          if [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
@@ -787,7 +831,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -796,7 +840,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -848,19 +892,19 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ./artifacts
           pattern: rustfs-*
@@ -942,7 +986,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Update latest.json
@@ -1002,7 +1046,7 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1040,7 +1084,7 @@ jobs:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1088,16 +1132,16 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

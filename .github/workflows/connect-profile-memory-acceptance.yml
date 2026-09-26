@@ -1,0 +1,201 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+
+name: Connect service memory profile acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful main-branch Build and Release run ID
+        required: true
+        type: string
+      artifact_id:
+        description: Linux x86_64 GNU artifact from that run
+        required: true
+        type: string
+      source_sha:
+        description: Exact RustFS source commit
+        required: true
+        type: string
+      artifact_digest:
+        description: GitHub artifact digest including sha256 prefix
+        required: true
+        type: string
+      binary_sha256:
+        description: Independently verified rustfs binary SHA-256
+        required: true
+        type: string
+      connect_sha:
+        description: Exact Connect memory acceptance harness commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  profile-memory:
+    name: Verify signed service memory profile over mTLS
+    runs-on: sm-standard-2
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact RustFS source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: rustfs-source
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Checkout exact Connect harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/connect
+          path: connect-harness
+          persist-credentials: false
+          ref: ${{ inputs.connect_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: connect-harness/web/package-lock.json
+
+      - name: Verify official source and artifact identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          CONNECT_SHA: ${{ inputs.connect_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == rustfs/rustfs ]]
+          [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$CONNECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ $(git -C rustfs-source rev-parse HEAD) == "$SOURCE_SHA" ]]
+          [[ $(git -C connect-harness rev-parse HEAD) == "$CONNECT_SHA" ]]
+          [[ $(git -C rustfs-source remote get-url origin) == https://github.com/rustfs/rustfs ]]
+          [[ $(git -C connect-harness remote get-url origin) == https://github.com/rustfs/connect ]]
+          run=$(gh api "repos/rustfs/rustfs/actions/runs/${BUILD_RUN_ID}")
+          jq -e --arg source "$SOURCE_SHA" '
+            .head_sha == $source and .head_branch == "main"
+            and .head_repository.full_name == "rustfs/rustfs"
+            and .name == "Build and Release" and .path == ".github/workflows/build.yml"
+            and .status == "completed" and .conclusion == "success"
+          ' <<<"$run" >/dev/null
+          jobs=$(gh api --paginate --slurp "repos/rustfs/rustfs/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
+          jq -e '
+            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu, [a-z0-9-]+, x86_64-unknown-linux-gnu, false, linux, pyroscope\\)$"))] as $matches
+            | ($matches | length) == 1 and $matches[0].conclusion == "success"
+          ' <<<"$jobs" >/dev/null
+          artifact=$(gh api "repos/rustfs/rustfs/actions/artifacts/${ARTIFACT_ID}")
+          jq -e --argjson run "$BUILD_RUN_ID" --arg source "$SOURCE_SHA" --arg digest "$ARTIFACT_DIGEST" '
+            .workflow_run.id == $run and .workflow_run.head_sha == $source
+            and .name == ("rustfs-linux-x86_64-gnu-dev-" + $source[0:7])
+            and .digest == $digest and .expired == false
+            and (.expires_at | fromdateiso8601) > now
+            and .size_in_bytes > 0 and .size_in_bytes <= 2147483648
+          ' <<<"$artifact" >/dev/null
+          jq -r '.expires_at' <<<"$artifact" > artifact-expires-at
+          gh api "repos/rustfs/rustfs/actions/artifacts/${ARTIFACT_ID}/zip" > official-artifact.zip
+          [[ $(stat --format=%s official-artifact.zip) == $(jq -r '.size_in_bytes' <<<"$artifact") ]]
+          printf '%s  official-artifact.zip\n' "${ARTIFACT_DIGEST#sha256:}" | sha256sum --check --strict
+
+      - name: Extract only the verified official service binary
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io
+          import os
+          import pathlib
+          import shutil
+          import stat
+          import zipfile
+
+          def regular(entry):
+              mode = entry.external_attr >> 16
+              return not entry.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG)
+
+          package = f"rustfs-linux-x86_64-gnu-dev-{os.environ['SOURCE_SHA'][:7]}.zip"
+          with zipfile.ZipFile('official-artifact.zip') as outer:
+              entries = outer.infolist()
+              assert 1 <= len(entries) <= 16
+              assert len({entry.filename for entry in entries}) == len(entries)
+              assert all(regular(entry) and pathlib.PurePosixPath(entry.filename).name == entry.filename for entry in entries)
+              assert sum(entry.file_size for entry in entries) <= 2147483648
+              assert outer.testzip() is None
+              with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
+                  entries = inner.infolist()
+                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli'} and len(entries) == 2
+                  assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
+                  assert inner.testzip() is None
+                  pathlib.Path('binary').mkdir()
+                  with inner.open('rustfs') as source, open('binary/rustfs', 'xb') as destination:
+                      shutil.copyfileobj(source, destination)
+          PY
+          chmod 0755 binary/rustfs
+          printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
+          file binary/rustfs | grep -Eq 'ELF 64-bit LSB.*x86-64'
+
+      - name: Run the real service job under S3 workload
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git -C connect-harness diff --exit-code
+          printf '%s\n' "$SOURCE_SHA" >connect-harness/tests/e2e/connected/rustfs-ref
+          changed=$(git -C connect-harness diff --name-only)
+          [[ -z "$changed" || "$changed" == tests/e2e/connected/rustfs-ref ]]
+          npm --prefix connect-harness/web ci
+          connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
+          make -C connect-harness e2e-connected-dispatch-check
+          (cd connect-harness && ./tests/connectivity/profile-memory-evidence.test.sh)
+          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+            RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
+            CONNECT_E2E_PROFILE_MEMORY_EVIDENCE="$GITHUB_WORKSPACE/profile-memory-evidence.json" \
+            make -C connect-harness e2e-connected E2E_SCENARIO=profile-memory
+
+      - name: Bind and validate sanitized evidence
+        shell: bash
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          CONNECT_SHA: ${{ inputs.connect_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          jq -e --arg connect "$CONNECT_SHA" --arg source "$SOURCE_SHA" --arg binary "$BINARY_SHA256" '
+            .provenance.connectSha == $connect and .provenance.sourceSha == $source
+            and .provenance.binarySha256 == $binary
+          ' profile-memory-evidence.json >/dev/null
+          jq --arg run "$GITHUB_RUN_ID" --arg build "$BUILD_RUN_ID" \
+            --arg artifact "$ARTIFACT_ID" --arg digest "$ARTIFACT_DIGEST" \
+            --arg expiry "$(cat artifact-expires-at)" '
+            .provenance += {workflowRunId:$run,buildRunId:$build,artifactId:$artifact,artifactDigest:$digest,artifactExpiresAt:$expiry}
+          ' profile-memory-evidence.json > profile-memory-evidence.bound.json
+          mv profile-memory-evidence.bound.json profile-memory-evidence.json
+          node connect-harness/tests/connectivity/profile-memory-evidence.mjs profile-memory-evidence.json --bound
+
+      - name: Upload only verified sanitized evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: connect-profile-memory-evidence-${{ github.run_id }}
+          path: profile-memory-evidence.json
+          retention-days: 14
+          if-no-files-found: error

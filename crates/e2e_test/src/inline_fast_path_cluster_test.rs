@@ -929,7 +929,13 @@ async fn assert_case(
         case.label
     );
     assert_storage_layout(cluster, bucket, &key, version_id.as_deref(), case.stored_inline)?;
-    Ok((key, body, put.e_tag().map(str::to_owned), version_id))
+    // A suspended PUT omits the response version, but reads identify the
+    // stored null version explicitly.
+    let read_version_id = match state {
+        VersionState::Suspended => Some("null".to_owned()),
+        _ => version_id,
+    };
+    Ok((key, body, put.e_tag().map(str::to_owned), read_version_id))
 }
 
 async fn get_and_assert(
@@ -1788,6 +1794,8 @@ async fn four_node_inline_fallback_controls() -> TestResult {
     configure_reader_metric_cluster(&mut cluster, &collector);
     let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", &sse_master_key);
+    // Inspect every disk only after the PUT rename fanout has drained.
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
     cluster.start().await?;
 
     let bucket = "inline-fallback-controls";
@@ -1839,6 +1847,10 @@ async fn four_node_inline_fallback_controls() -> TestResult {
         ),
     )
     .await?;
+    // 16 KiB of plaintext is 8 KiB per data shard on EC 2+2, inside the inline
+    // budget: an SSE-S3 PUT is admitted inline by its plaintext size even though
+    // the ciphertext length is unknown up front (backlog#2393 STOR-115).
+    assert_storage_layout(&cluster, bucket, encrypted_key, None, true)?;
 
     Ok(())
 }
@@ -1851,6 +1863,8 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    // Inspect every disk only after the PUT rename fanout has drained.
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
     cluster.start().await?;
 
     let bucket = "inline-compressed-fallback";
@@ -1871,6 +1885,33 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
         ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, put.e_tag(), None), LEGACY_DUPLEX, COMPRESSED),
     )
     .await?;
+    // 64 KiB of plaintext is 32 KiB per data shard on EC 2+2, inside the inline
+    // budget: a compressed PUT is admitted inline by its plaintext size even
+    // though its stored size is unknown up front (backlog#2393 STOR-115).
+    assert_storage_layout(&cluster, bucket, key, None, true)?;
+
+    // A server-side copy onto another compressible key re-compresses the
+    // decompressed source stream and lands inline the same way (STOR-125).
+    let copy_key = "compressed/copy.txt";
+    let copy = client
+        .copy_object()
+        .bucket(bucket)
+        .key(copy_key)
+        .copy_source(format!("{bucket}/{key}"))
+        .send()
+        .await?;
+    let copy_etag = copy.copy_object_result().and_then(|result| result.e_tag()).map(str::to_owned);
+    assert_reader_path(
+        &collector,
+        &client,
+        ReaderPathExpectation::for_class(
+            ReaderObject::new(bucket, copy_key, &body, copy_etag.as_deref(), None),
+            LEGACY_DUPLEX,
+            COMPRESSED,
+        ),
+    )
+    .await?;
+    assert_storage_layout(&cluster, bucket, copy_key, None, true)?;
 
     Ok(())
 }

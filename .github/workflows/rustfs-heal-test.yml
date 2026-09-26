@@ -1,6 +1,12 @@
 name: RustFS Heal Test
 
 on:
+  workflow_call:
+    inputs:
+      chain_manifest:
+        description: Verified candidate and chain attempt from the chain driver
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       package_url:
@@ -35,7 +41,7 @@ permissions:
 # Only one test at a time: both this and the pool-expansion workflow mutate
 # the same test environment, so they share one concurrency group.
 concurrency:
-  group: rustfs-shared-functional-tests
+  group: rustfs-shared-functional-tests-v2
   cancel-in-progress: false
 
 defaults:
@@ -54,11 +60,16 @@ env:
 jobs:
   heal-test:
     runs-on: smoke-testing
-    timeout-minutes: 480
+    timeout-minutes: 60
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout chain tooling
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
       - name: Initialize functional evidence
         id: evidence
         run: |
@@ -74,25 +85,21 @@ jobs:
             printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
           } >> "${GITHUB_ENV}"
 
-      # auto-testing is private: clone it with the dedicated PF token (not
-      # GITHUB_TOKEN) and retry transient GitHub/network failures.
-      - name: Checkout auto-testing scripts (with retry)
+      - name: Bind functional candidate
+        id: chain
+        if: ${{ inputs.chain_manifest != '' }}
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          rm -rf auto-testing
-          for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
-            fi
-            rm -rf auto-testing
-            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
-          done
-          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
-          exit 1
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+        run: python3 scripts/functional_chain_evidence.py consume
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.chain.outputs.testing_sha || 'main' }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -103,6 +110,7 @@ jobs:
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
+        timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
           set -euo pipefail
@@ -122,6 +130,7 @@ jobs:
           done
 
       - name: Install RustFS package & start cluster
+        timeout-minutes: 5
         run: |
           ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
@@ -132,6 +141,7 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Preflight checks
+        timeout-minutes: 5
         run: |
           ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
@@ -142,7 +152,11 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
+        timeout-minutes: 45
         id: test
+        # Case failures keep the run green: the report and the backlog
+        # issue manager carry the product signal.
+        continue-on-error: true
         run: |
           ./auto-testing/rustfs_heal_test.sh \
             --steps "3,4,5,6,7" -y \
@@ -152,6 +166,8 @@ jobs:
             --log-file "${LOG_FILE}"
 
       - name: Generate report
+        id: chain_report
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -224,6 +240,20 @@ jobs:
           if [ '${{ steps.test.outcome }}' = 'success' ] && [ "${CASE_RESULT}" = 'success' ]; then
             RESULT=success
           fi
+
+          # Product gate: failing steps keep the run green — they are reported
+          # below and tracked in rustfs/backlog. Only harness/environment
+          # breakdowns turn the workflow red.
+          STEPS_TOTAL="$(grep -cE '^\[HEAL-STEP\]' "${LOG_FILE}" 2>/dev/null || true)"
+          STEPS_FAIL="$(grep -cE '^\[HEAL-STEP\].* FAIL$' "${LOG_FILE}" 2>/dev/null || true)"
+          STEPS_TOTAL=$(( ${STEPS_TOTAL:-0} + 0 )); STEPS_FAIL=$(( ${STEPS_FAIL:-0} + 0 ))
+          STEPS_PASS=$(( STEPS_TOTAL - STEPS_FAIL ))
+          HARNESS_OK=0
+          if [ '${{ steps.test.outcome }}' = 'success' ]; then
+            HARNESS_OK=1
+          elif [ '${{ steps.test.outcome }}' = 'failure' ] && [ "${STEPS_TOTAL}" -gt 0 ] && [ "${STEPS_PASS}" -ge 1 ]; then
+            HARNESS_OK=1
+          fi
           {
             echo "# RustFS heal test report"
             echo ""
@@ -235,21 +265,27 @@ jobs:
             echo "- Test Step Outcome: ${RESULT}"
             echo "- Suite Step Outcome: ${{ steps.test.outcome }}"
             echo ""
-            if [ "${RESULT}" = "success" ]; then
+            if [ -s "${STEPS_TABLE}" ]; then
               cat "${STEPS_TABLE}"
               echo ""
+            fi
+            echo "- Product result: ${STEPS_PASS} passed, ${STEPS_FAIL} failed (failing steps are tracked in rustfs/backlog)"
+            echo ""
+            if [ -s "${STEPS_TABLE}" ]; then
               echo "## Log tail"
               echo '```text'
-              tail -n 200 "${LOG_FILE}"
+              tail -n 200 "${LOG_FILE}" 2>/dev/null || true
               echo '```'
             else
               echo "The suite or evidence validation failed. See this run's artifact for partial step results and suite.log."
             fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
-          [ "${RESULT}" = "success" ]
+          # Red only for harness/environment breakdowns; step failures stay green.
+          [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
@@ -280,69 +316,57 @@ jobs:
           fi
           rm -f "${B64_FILE}"
 
-      - name: File failure issue in rustfs/backlog
-        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
+      - name: Manage backlog issues (dedup / label / auto-close)
+        timeout-minutes: 2
+        # Replaces the old per-run failure filing. One entry point that:
+        # - dedups by signal: failing cases are matched against open backlog
+        #   issues by label (category + case ID); covered cases become a
+        #   comment on the existing issue, only uncovered cases file a new one
+        # - labels new issues (functional-test, category, case IDs, env)
+        # - closes fixed issues after a fully green run
+        # - never files or closes on cancelled runs
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           SUITE: 'heal'
           SUITE_LABEL: 'Heal'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue management"
             exit 0
           fi
-          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
-          EXISTING="$(gh issue list -R rustfs/backlog --state all \
-            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
-            --json number --jq '.[].number' || true)"
-          if [ -n "${EXISTING}" ]; then
-            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+          if [ ! -f auto-testing/scripts/issue_manager.py ]; then
+            echo "issue_manager.py not found in auto-testing checkout; skipping"
             exit 0
           fi
-          redact() {
-            sed -E \
-              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
-              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
-              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
-          }
-          BODY_FILE="$(mktemp)"
-          {
-            echo "The **${SUITE_LABEL}** functional suite failed."
-            echo ""
-            echo "- Suite: \`${SUITE}\`"
-            echo "- Run: ${RUN_URL}"
-            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
-            echo "- Workflow Commit: ${GITHUB_SHA}"
-            echo "- Trigger: ${GITHUB_EVENT_NAME}"
-            echo "- Date: $(date -u +%Y-%m-%d)"
-            echo ""
-            echo "## Report (errors and symptoms)"
-            echo ""
-            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
-              redact < "${REPORT_FILE}"
-            elif [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${LOG_FILE:-}" ]; then
-              echo "(report file missing; log tail below)"
-              echo ""
-              tail -n 200 "${LOG_FILE}" | redact
-            else
-              echo "(no report or log file was produced)"
-            fi
-          } | head -c 55000 > "${BODY_FILE}"
-          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
-          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test; then
-            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          PACKAGE_URL='${{ inputs.package_url }}'
+          PACKAGE_SOURCE=""
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          echo "filed backlog issue for suite ${SUITE}"
+          python3 auto-testing/scripts/issue_manager.py handle \
+            --repo rustfs/backlog \
+            --suite "${SUITE}" --category "${SUITE}" --suite-label "${SUITE_LABEL}" \
+            --outcome "${{ steps.test.outcome }}" \
+            --report-file "${REPORT_FILE}" \
+            --log "${LOG_FILE}" \
+            --run-url "${RUN_URL}/attempts/${GITHUB_RUN_ATTEMPT}#summary" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --attempt "${GITHUB_RUN_ATTEMPT}" \
+            --commit "${GITHUB_SHA}" \
+            --trigger "${{ github.event_name }}" \
+            --package-source "${PACKAGE_SOURCE}" \
+            --date "$(date -u +%Y-%m-%d)"
 
       - name: Upload test logs
+        timeout-minutes: 2
         if: ${{ always() && steps.evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-heal-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -353,6 +377,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        timeout-minutes: 5
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
           set -euo pipefail
@@ -426,3 +451,24 @@ jobs:
           echo "RustFS heal test failed"
           echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
           echo "See the uploaded log artifact for details."
+
+      - name: Record chain evidence
+        id: chain_record
+        if: ${{ always() && inputs.chain_manifest != '' && steps.evidence.outcome == 'success' }}
+        env:
+          CHAIN_MANIFEST: ${{ inputs.chain_manifest }}
+          CHAIN_JOB_STATUS: ${{ job.status }}
+          CHAIN_TEST_OUTCOME: ${{ steps.test.outcome }}
+          CHAIN_REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: >-
+          python3 scripts/functional_chain_evidence.py record --suite heal
+          --report "${FUNCTIONAL_ARTIFACTS_DIR}/steps.md"
+          --output "${RUNNER_TEMP}/chain-heal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/heal.json"
+
+      - name: Upload chain evidence
+        if: ${{ always() && steps.chain_record.outputs.written == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-chain-heal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chain-heal-${{ github.run_id }}-${{ github.run_attempt }}/heal.json
+          if-no-files-found: error

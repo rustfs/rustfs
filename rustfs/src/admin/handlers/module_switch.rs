@@ -26,7 +26,7 @@ use crate::server::{
     apply_audit_module_switch_for_context, current_module_switch_snapshot, mark_event_notifier_reconciled,
     mark_event_notifier_unreconciled, refresh_audit_module_enabled, refresh_notify_module_enabled,
     refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store, save_persisted_module_switches_to,
-    validate_module_switch_update,
+    validate_module_switch_update, with_notify_runtime_reconcile_lock,
 };
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -138,48 +138,53 @@ async fn refresh_module_switch_snapshot() -> S3Result<ModuleSwitchSnapshot> {
 async fn apply_module_switch_update(context: Arc<AppContext>, switches: PersistedModuleSwitches) -> S3Result<()> {
     preflight_dynamic_config_reload_for_context(Some(context.as_ref()), MODULE_SWITCHES_SIGNAL_SUBSYSTEM).await?;
     let store = context.object_store();
-    mark_event_notifier_unreconciled();
-    let notification_system = rustfs_notify::ensure_live_events();
-    if switches.notify_enabled {
-        notification_system
-            .reload_persisted_config_from_store(store.clone())
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "Failed to load notification config for module switch update");
-                s3_error!(InternalError, "failed to load notification config")
-            })?;
-    }
+    let mut failures = with_notify_runtime_reconcile_lock(async {
+        mark_event_notifier_unreconciled();
+        let notification_system = rustfs_notify::ensure_live_events();
+        if switches.notify_enabled {
+            notification_system
+                .reload_persisted_config_from_store(store.clone())
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "Failed to load notification config for module switch update");
+                    s3_error!(InternalError, "failed to load notification config")
+                })?;
+        }
 
-    let transition_system = notification_system.clone();
-    let notify_transition = save_persisted_module_switches_to(store.clone(), switches, move || {
-        let enabled = refresh_notify_module_enabled();
-        transition_system.publish_targets_enabled(enabled, None)
+        let transition_system = notification_system.clone();
+        let notify_transition = save_persisted_module_switches_to(store.clone(), switches, move || {
+            let enabled = refresh_notify_module_enabled();
+            transition_system.publish_targets_enabled(enabled, None)
+        })
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "Failed to save module switches");
+            s3_error!(InternalError, "failed to save module switches")
+        })?;
+
+        let mut failures = Vec::new();
+        let mut notify_converged = true;
+        if let Err(err) = notify_transition.wait().await {
+            tracing::warn!(error = %err, "Local notification runtime failed to apply module switch update");
+            notify_converged = false;
+            failures.push("local notify");
+        }
+        if !switches.notify_enabled
+            && let Err(err) = notification_system.reload_persisted_config_from_store(store).await
+        {
+            tracing::warn!(error = %err, "Local notification config cache failed to reload after module disable");
+            notify_converged = false;
+            failures.push("local notify config cache");
+        }
+        if notify_converged && notification_system.runtime_lifecycle_is_converged() {
+            mark_event_notifier_reconciled();
+        } else if notify_converged {
+            failures.push("local notify convergence");
+        }
+
+        Ok::<_, s3s::S3Error>(failures)
     })
-    .await
-    .map_err(|err| {
-        tracing::warn!(error = %err, "Failed to save module switches");
-        s3_error!(InternalError, "failed to save module switches")
-    })?;
-
-    let mut failures = Vec::new();
-    let mut notify_converged = true;
-    if let Err(err) = notify_transition.wait().await {
-        tracing::warn!(error = %err, "Local notification runtime failed to apply module switch update");
-        notify_converged = false;
-        failures.push("local notify");
-    }
-    if !switches.notify_enabled
-        && let Err(err) = notification_system.reload_persisted_config_from_store(store).await
-    {
-        tracing::warn!(error = %err, "Local notification config cache failed to reload after module disable");
-        notify_converged = false;
-        failures.push("local notify config cache");
-    }
-    if notify_converged && notification_system.runtime_lifecycle_is_converged() {
-        mark_event_notifier_reconciled();
-    } else if notify_converged {
-        failures.push("local notify convergence");
-    }
+    .await?;
 
     if apply_audit_module_switch_for_context(Some(context.as_ref())).await.is_err() {
         tracing::warn!(reason = "apply_failed", "Local audit runtime failed to apply module switch update");

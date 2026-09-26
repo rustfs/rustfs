@@ -48,12 +48,16 @@ rustfs-config = { workspace = true, features = ["constants"] }
 byteorder = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
-s3s = { workspace = true, features = ["minio"] }
 regex.workspace = true
 arc-swap.workspace = true
+sha2.workspace = true
+base64-simd.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+# The metacache tests use tokio::time; s3s used to enable the feature via
+# feature unification before filemeta dropped it (backlog#1735 A3c).
+tokio = { workspace = true, features = ["time"] }
 tempfile = { workspace = true }
 proptest = "1"
 

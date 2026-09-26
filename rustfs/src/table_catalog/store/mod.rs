@@ -21,6 +21,8 @@ mod strong;
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
+pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
+#[cfg(test)]
 pub(super) use strong::{
     STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
     StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,
@@ -243,6 +245,26 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
+    /// Checks whether an active table already owns any part of the candidate warehouse location.
+    ///
+    /// This is a preflight for clients that write data before catalog registration. Registration
+    /// remains the authoritative atomic check for concurrent creators.
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        let candidate_prefix = table_warehouse_object_prefix(candidate)?;
+        for existing in self.list_all_tables(&candidate.table_bucket).await? {
+            if existing.state != TableCatalogEntryState::Active || existing.table_id == candidate.table_id {
+                continue;
+            }
+            let existing_prefix = table_warehouse_object_prefix(&existing)?;
+            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -280,6 +302,24 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         object: &str,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         scan_table_data_plane_resource_for_object(self, table_bucket, object).await
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
+            return Ok(None);
+        }
+        let Some(table_bucket_entry) = self.get_table_bucket(table_bucket).await? else {
+            return Ok(None);
+        };
+        if table_bucket_entry.state != TableCatalogEntryState::Active {
+            return Ok(None);
+        }
+        let entries = self.list_all_tables(table_bucket).await?;
+        table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)
     }
 
     /// Atomically advances a validated table metadata pointer.
@@ -1222,6 +1262,13 @@ where
         }
     }
 
+    async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.ensure_table_warehouse_location_available(candidate).await,
+            Self::DurableStrong(store) => store.ensure_table_warehouse_location_available(candidate).await,
+        }
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -1272,6 +1319,17 @@ where
         match self {
             Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
             Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
+        }
+    }
+
+    async fn resolve_table_metadata_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self {
+            Self::ObjectBacked(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
+            Self::DurableStrong(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
         }
     }
 

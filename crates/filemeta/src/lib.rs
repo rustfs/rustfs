@@ -20,6 +20,7 @@ mod filemeta_inline;
 mod metacache;
 mod replication;
 
+pub mod metadata_keys;
 pub mod test_data;
 
 pub use error::*;
@@ -28,3 +29,4 @@ pub use filemeta::*;
 pub use filemeta_inline::*;
 pub use metacache::*;
 pub use replication::*;
+pub mod shard_integrity;

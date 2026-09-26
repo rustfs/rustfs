@@ -19,7 +19,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    TableDataPlaneListAccess, authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
     prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
@@ -71,6 +71,7 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
     current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
@@ -91,7 +92,7 @@ use rustfs_policy::policy::{
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::{
     EventName,
-    arn::{ARN, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
@@ -117,7 +118,8 @@ use s3s::dto::{
     PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
     PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
-    ReplicationConfiguration, ServerSideEncryption, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
+    ReplicationConfiguration, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
+    VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -504,6 +506,46 @@ fn validate_notification_configuration_filters(notification_configuration: &Noti
         }
     }
     Ok(())
+}
+
+fn parse_notification_target_id(arn_str: &str) -> Result<TargetID, TargetIDError> {
+    ARN::parse(arn_str)
+        .map(|arn| arn.target_id)
+        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+}
+
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
+
+/// Builds the notify runtime rules for a bucket notification configuration
+/// without touching the store or the runtime rule state.
+fn build_notification_event_rules(
+    notification_configuration: &NotificationConfiguration,
+) -> S3Result<Vec<NotificationEventRule>> {
+    let mut event_rules = Vec::new();
+    let invalid_arn = |e: TargetIDError| {
+        S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid ARN in notification configuration: {e}"))
+    };
+
+    process_queue_configurations(
+        &mut event_rules,
+        notification_configuration.queue_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_topic_configurations(
+        &mut event_rules,
+        notification_configuration.topic_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+    process_lambda_configurations(
+        &mut event_rules,
+        notification_configuration.lambda_function_configurations.clone(),
+        parse_notification_target_id,
+    )
+    .map_err(invalid_arn)?;
+
+    Ok(event_rules)
 }
 
 fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
@@ -1913,9 +1955,11 @@ impl DefaultBucketUsecase {
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((cfg, _)) => cfg.rules,
-            Err(_) => {
+            Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
+            // An unreadable stored configuration is not an absent one.
+            Err(err) => return Err(ApiError::from(err).into()),
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
@@ -1939,17 +1983,24 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
-            warn!(
-                component = LOG_COMPONENT_APP,
-                subsystem = LOG_SUBSYSTEM_BUCKET,
-                event = "bucket_notification_config_load_failed",
-                bucket = %bucket,
-                error = ?err,
-                "Failed to load bucket notification configuration"
-            );
-            None
-        });
+        let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
+            Ok(config) => config,
+            // An unreadable config is not "no notifications configured".
+            Err(err) if crate::storage_api::error::is_unreadable_config_error(&err) => {
+                return Err(ApiError::from(err).into());
+            }
+            Err(err) => {
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_notification_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket notification configuration"
+                );
+                None
+            }
+        };
 
         if let Some(NotificationConfiguration {
             event_bridge_configuration,
@@ -2233,6 +2284,8 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
+        validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
+
         // When SSE-KMS is set without a specific key ID, populate the default
         // KMS key so that GetBucketEncryption responses include it. Clients like
         // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
@@ -2427,6 +2480,17 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let region = resolve_notification_region(self.global_region(), request_region);
+        let notify = current_notify_interface_for_context(self.context.as_deref());
+        let event_rules = build_notification_event_rules(&notification_configuration)?;
+
+        // Reject the request before the store write so a failure cannot leave a
+        // persisted configuration that the notify runtime refused to activate.
+        notify
+            .validate_event_specific_rules(&bucket, region.as_str(), &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
         let data = serialize_config(&notification_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -2434,40 +2498,10 @@ impl DefaultBucketUsecase {
 
         notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false).await;
 
-        let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = current_notify_interface_for_context(self.context.as_deref());
-        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
-        let parse_rules = async {
-            let mut event_rules = Vec::new();
-
-            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_lambda_configurations(
-                &mut event_rules,
-                notification_configuration.lambda_function_configurations.clone(),
-                |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                },
-            )?;
-
-            Ok::<_, TargetIDError>(event_rules)
-        };
-
-        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
-
-        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
-        let event_rules =
-            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
+        notify
+            .clear_bucket_notification_rules(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
         notify
             .add_event_specific_rules(&bucket, region.as_str(), &event_rules)
@@ -2780,6 +2814,7 @@ impl DefaultBucketUsecase {
         let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
 
         // The on-demand migration envelope is decoded whether or not this
         // bucket still merges: a token handed out under `list_through` must keep
@@ -2788,55 +2823,87 @@ impl DefaultBucketUsecase {
             prepare_odm_read_generation(&store, &mut req, &bucket).await;
         }
         let (merged_token, source_state) = if allow_list_through {
-            (
-                list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
-                list_through::list_through_state(&store, &bucket, &req, &params).await?,
-            )
+            let source_state = list_through::list_through_state(&store, &bucket, &req, &params).await?;
+            if table_list_access.is_some() {
+                if source_state.is_some() {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ServiceUnavailable,
+                        "protected table listings are unavailable while on-demand migration list-through is active".to_string(),
+                    ));
+                }
+                (None, None)
+            } else {
+                (
+                    list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
+                    source_state,
+                )
+            }
         } else {
             (None, None)
         };
-        let (object_infos, degraded) = match (source_state, merged_token.as_ref()) {
-            (None, Some(token)) if params.max_keys == 0 => {
-                // No source was consulted, so retain every unconsumed side and
-                // the original wire format without spending its progress budget.
-                let is_truncated = !token.local_done || !token.source_done;
-                (
-                    StorageListObjectsV2Info {
-                        is_truncated,
-                        next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
-                        ..Default::default()
-                    },
-                    false,
-                )
-            }
-            (None, None) => {
-                let infos = store
-                    .list_objects_v2(
-                        &bucket,
-                        &params.prefix,
-                        params.decoded_continuation_token.clone(),
-                        params.delimiter.clone(),
-                        params.max_keys,
-                        fetch_owner.unwrap_or_default(),
-                        params.start_after_for_query.clone(),
+        let (object_infos, degraded) = if let Some(access) = table_list_access.as_ref() {
+            (
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
                         incl_deleted,
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                (infos, false)
-            }
-            (state, token) => {
-                let outcome = list_through::merged_list_objects_v2(
-                    &store,
-                    state.as_ref(),
-                    &bucket,
-                    &params,
-                    fetch_owner.unwrap_or_default(),
-                    incl_deleted,
-                    token,
+                        opaque_cursor_supported: allow_list_through,
+                    },
                 )
-                .await?;
-                (outcome.info, outcome.degraded)
+                .await?,
+                false,
+            )
+        } else {
+            match (source_state, merged_token.as_ref()) {
+                (None, Some(token)) if params.max_keys == 0 => {
+                    // No source was consulted, so retain every unconsumed side and
+                    // the original wire format without spending its progress budget.
+                    let is_truncated = !token.local_done || !token.source_done;
+                    (
+                        StorageListObjectsV2Info {
+                            is_truncated,
+                            next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                }
+                (None, None) => {
+                    let infos = store
+                        .list_objects_v2(
+                            &bucket,
+                            &params.prefix,
+                            params.decoded_continuation_token.clone(),
+                            params.delimiter.clone(),
+                            params.max_keys,
+                            fetch_owner.unwrap_or_default(),
+                            params.start_after_for_query.clone(),
+                            incl_deleted,
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                    (infos, false)
+                }
+                (state, token) => {
+                    let outcome = list_through::merged_list_objects_v2(
+                        &store,
+                        state.as_ref(),
+                        &bucket,
+                        &params,
+                        fetch_owner.unwrap_or_default(),
+                        incl_deleted,
+                        token,
+                    )
+                    .await?;
+                    (outcome.info, outcome.degraded)
+                }
             }
         };
 
@@ -2885,19 +2952,38 @@ impl DefaultBucketUsecase {
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
-        let object_infos = store
-            .list_objects_v2(
-                &bucket,
-                &params.prefix,
-                params.decoded_continuation_token.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-                fetch_owner.unwrap_or_default(),
-                params.start_after_for_query.clone(),
-                incl_deleted,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_objects_v2(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        continuation_token: params.decoded_continuation_token.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                        start_after: params.start_after_for_query.as_deref(),
+                        incl_deleted,
+                        opaque_cursor_supported: true,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_objects_v2(
+                    &bucket,
+                    &params.prefix,
+                    params.decoded_continuation_token.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                    fetch_owner.unwrap_or_default(),
+                    params.start_after_for_query.clone(),
+                    incl_deleted,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output = build_list_objects_v2_metadata_output(
@@ -2916,6 +3002,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -2931,17 +3018,34 @@ impl DefaultBucketUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match table_list_access.as_ref() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
@@ -2967,17 +3071,34 @@ impl DefaultBucketUsecase {
         let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
-        let object_infos = store
-            .list_object_versions(
-                &bucket,
-                &params.prefix,
-                params.key_marker.clone(),
-                params.version_id_marker.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+            Some(access) => {
+                table_list_isolation::list_object_versions(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: &params.prefix,
+                        key_marker: params.key_marker.as_deref(),
+                        version_id_marker: params.version_id_marker.as_deref(),
+                        delimiter: params.delimiter.as_deref(),
+                        max_keys: params.max_keys,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_object_versions(
+                    &bucket,
+                    &params.prefix,
+                    params.key_marker.clone(),
+                    params.version_id_marker.clone(),
+                    params.delimiter.clone(),
+                    params.max_keys,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let output =
@@ -2989,12 +3110,56 @@ impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let request_marker = req.input.marker.clone();
+        let protected_table_list = req.extensions.get::<TableDataPlaneListAccess>().is_some();
         // V1 markers are object keys, so they cannot carry the opaque merged
         // pagination state used by V2 list-through.
-        let v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        let mut v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
+        if protected_table_list {
+            v2_resp.output.next_continuation_token = None;
+        }
 
         Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }
+}
+
+/// Refuse a default-encryption configuration the write path could not honour
+/// as written. `bucket_default_write_sse` falls back to AES256 for any
+/// algorithm it does not know, so storing one would make GetBucketEncryption
+/// advertise a scheme no object is encrypted under. s3s parses `SSEAlgorithm`
+/// as an open string, so the schema check has to happen here.
+fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfiguration) -> S3Result<()> {
+    if config.rules.is_empty() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::MalformedXML,
+            "ServerSideEncryptionConfiguration must contain at least one Rule".to_string(),
+        ));
+    }
+    for rule in &config.rules {
+        let Some(by_default) = rule.apply_server_side_encryption_by_default.as_ref() else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::MalformedXML,
+                "Rule must contain ApplyServerSideEncryptionByDefault".to_string(),
+            ));
+        };
+        let names_kms_key = by_default.kms_master_key_id.as_deref().is_some_and(|id| !id.is_empty());
+        match by_default.sse_algorithm.as_str() {
+            ServerSideEncryption::AWS_KMS => {}
+            ServerSideEncryption::AES256 if names_kms_key => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "KMSMasterKeyID can only be specified when SSEAlgorithm is aws:kms".to_string(),
+                ));
+            }
+            ServerSideEncryption::AES256 => {}
+            other => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    format!("SSEAlgorithm {other} is not supported; expected AES256 or aws:kms"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3005,7 +3170,8 @@ mod tests {
     use s3s::dto::{
         BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
         NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
-        ServerSideEncryptionConfiguration, Tag, Transition, TransitionStorageClass,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
+        TransitionStorageClass,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3018,6 +3184,59 @@ mod tests {
             .find(|snapshot| snapshot.op == op.as_str())
             .map(|snapshot| snapshot.total)
             .unwrap_or_default()
+    }
+
+    fn sse_config(rules: Vec<ServerSideEncryptionRule>) -> ServerSideEncryptionConfiguration {
+        ServerSideEncryptionConfiguration { rules }
+    }
+
+    fn sse_rule(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionRule {
+        ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from(algorithm.to_string()),
+                kms_master_key_id: kms_key_id.map(|id| id.to_string()),
+            }),
+            blocked_encryption_types: None,
+            bucket_key_enabled: None,
+        }
+    }
+
+    /// The stored configuration must be one the write path honours as written:
+    /// only AES256 and aws:kms exist, and a key id belongs to aws:kms alone.
+    #[test]
+    fn put_bucket_encryption_refuses_configurations_the_write_path_cannot_honour() {
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None)])).expect("AES256 is valid");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("aws:kms", Some("bucket-key"))]))
+            .expect("aws:kms with a key is valid");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("aws:kms", None)]))
+            .expect("aws:kms without a key is valid (the default key is filled in)");
+        validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", Some(""))]))
+            .expect("an empty key id on AES256 is how some clients spell 'none'");
+
+        let unknown = validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES128", None)]))
+            .expect_err("AES128 is not an algorithm this server encrypts with");
+        assert_eq!(*unknown.code(), S3ErrorCode::MalformedXML);
+
+        let misplaced = validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", Some("bucket-key"))]))
+            .expect_err("a key id only makes sense for aws:kms");
+        assert_eq!(*misplaced.code(), S3ErrorCode::InvalidArgument);
+
+        let empty = validate_bucket_encryption_configuration(&sse_config(Vec::new())).expect_err("no rule, no default");
+        assert_eq!(*empty.code(), S3ErrorCode::MalformedXML);
+
+        let bare_rule = validate_bucket_encryption_configuration(&sse_config(vec![ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: None,
+            blocked_encryption_types: None,
+            bucket_key_enabled: None,
+        }]))
+        .expect_err("a rule without ApplyServerSideEncryptionByDefault configures nothing");
+        assert_eq!(*bare_rule.code(), S3ErrorCode::MalformedXML);
+
+        // A second rule is checked too, so a malformed one cannot hide behind a valid first rule.
+        let second_bad =
+            validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None), sse_rule("garbage", None)]))
+                .expect_err("every rule is validated");
+        assert_eq!(*second_bad.code(), S3ErrorCode::MalformedXML);
     }
 
     #[tokio::test]
@@ -5033,9 +5252,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        // A well-formed rule, so the request reaches the store lookup instead
+        // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(ServerSideEncryptionConfiguration::default())
+            .server_side_encryption_configuration(sse_config(vec![sse_rule("AES256", None)]))
             .build()
             .unwrap();
 

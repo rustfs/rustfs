@@ -353,10 +353,10 @@ pub enum Admission {
     Full,
     DroppedQueueFull,
     DroppedPolicy,
-    /// HS-06: admin start rejected because the same target is already being
-    /// healed (RUSTFS_HEAL_OVERLAP_POLICY=minio_error only).
+    /// Admin start rejected because the same target is already owned and
+    /// cannot be merged under the selected overlap policy.
     DroppedAlreadyRunning,
-    /// HS-06: admin start rejected because its path overlaps an active heal.
+    /// Admin start rejected because its scope overlaps an existing owner.
     DroppedOverlappingPaths,
 }
 
@@ -860,6 +860,15 @@ mod tests {
             .insert("unknown".to_string(), serde_json::Value::Bool(true));
         let unknown = rmp_serde::to_vec_named(&unknown).unwrap();
         assert!(decode_envelope(&unknown).unwrap_err().contains("unknown field"));
+
+        let mut read_repair = serde_json::to_value(&envelope).expect("start envelope should serialize");
+        read_repair["command"]["request"]
+            .as_object_mut()
+            .expect("start request must be an object")
+            .insert("readRepair".to_string(), serde_json::Value::Bool(true));
+        let encoded = rmp_serde::to_vec_named(&read_repair).expect("invalid start fixture should encode");
+        let error = decode_envelope(&encoded).expect_err("RPC must reject an Admin readRepair field");
+        assert!(error.contains("unknown field") && error.contains("readRepair"), "{error}");
 
         let executable =
             Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 10_000, 20_000, 7)).unwrap();

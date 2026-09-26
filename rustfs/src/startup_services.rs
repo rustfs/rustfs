@@ -18,8 +18,8 @@ use crate::{
     config::Config,
     connect::{
         CoarseNodeSummary, HeartbeatConfig, HeartbeatError, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime,
-        InventorySchedule, InventorySnapshot, runtime::heartbeat_failure_reason, spawn_heartbeat_runtime,
-        spawn_inventory_runtime,
+        InventorySchedule, InventorySnapshot, LocalTraceCaptureRuntime, runtime::heartbeat_failure_reason,
+        spawn_heartbeat_runtime, spawn_inventory_runtime, spawn_local_trace_capture_runtime,
     },
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
@@ -38,10 +38,15 @@ use rustfs_common::GlobalReadiness;
 use std::{collections::BTreeSet, io::Result, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
+const EVENT_DRIVE_UNAVAILABLE: &str = "drive_unavailable";
+const LOG_COMPONENT_CONNECT: &str = "connect";
+const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
+
 pub(crate) struct StartupServiceRuntime {
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
     pub(crate) inventory: Option<InventoryRuntime>,
+    pub(crate) local_trace_capture: Option<LocalTraceCaptureRuntime>,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
     pub(crate) enable_scanner: bool,
 }
@@ -80,6 +85,12 @@ pub(crate) async fn init_startup_runtime_services(
     init_kms_system(config, store.clone()).await?;
 
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
+    let local_trace_capture = heartbeat_config
+        .as_ref()
+        .and_then(HeartbeatConfig::state_root)
+        .map(|state_root| spawn_local_trace_capture_runtime(state_root, &ctx))
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
     let inventory_drives = heartbeat_config
         .as_ref()
@@ -113,6 +124,7 @@ pub(crate) async fn init_startup_runtime_services(
         optional_runtimes,
         heartbeat,
         inventory,
+        local_trace_capture,
         iam_bootstrap,
         enable_scanner,
     })
@@ -173,7 +185,16 @@ fn inventory_snapshot(
     if info.disks.iter().any(|disk| !inventory_disk_is_healthy(disk)) {
         flags.push(InventoryFlag::ClusterDegraded);
     }
-    if info.disks.iter().any(inventory_disk_is_offline) {
+    let offline_drive_count = info.disks.iter().filter(|disk| inventory_disk_is_offline(disk)).count();
+    if offline_drive_count > 0 {
+        tracing::warn!(
+            target: "rustfs::connect::inventory",
+            event = EVENT_DRIVE_UNAVAILABLE,
+            component = LOG_COMPONENT_CONNECT,
+            subsystem = LOG_SUBSYSTEM_INVENTORY,
+            offline_drive_count,
+            "Connect inventory detected unavailable drives"
+        );
         flags.push(InventoryFlag::DriveOffline);
     }
     if info.disks.iter().any(|disk| disk.healing) {
@@ -494,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_capacity_uses_numeric_indices_without_logging_identifiers() {
+    fn inventory_logs_offline_drive_count_without_identifiers() {
         #[derive(Clone, Default)]
         struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -521,7 +542,7 @@ mod tests {
 
         const ENDPOINT_CANARY: &str = "https://inventory-endpoint-secret.invalid";
         const PATH_CANARY: &str = "/inventory/path/secret";
-        let mut first = disk("ok", Some("online"), 0);
+        let mut first = disk(rustfs_madmin::ITEM_OFFLINE, Some("offline"), 0);
         first.endpoint = ENDPOINT_CANARY.to_owned();
         first.drive_path = PATH_CANARY.to_owned();
         let mut second = disk("ok", Some("online"), 1);
@@ -551,10 +572,13 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            InventorySnapshot::current(1, 2, 1_000, 840, []).expect("expected inventory should encode")
+            InventorySnapshot::current(1, 2, 1_000, 840, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
+                .expect("expected inventory should encode")
         );
         let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
         let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("UTF-8 logs");
+        assert!(logs.contains("drive_unavailable"));
+        assert!(logs.contains("offline_drive_count=1"));
         for canary in [ENDPOINT_CANARY, PATH_CANARY, "second-secret", "/second/path"] {
             assert!(!encoded.contains(canary), "snapshot exposed {canary}");
             assert!(!logs.contains(canary), "logs exposed {canary}");

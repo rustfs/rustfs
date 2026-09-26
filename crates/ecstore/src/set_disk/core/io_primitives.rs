@@ -924,7 +924,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
     responses: &[Option<Vec<ObjectPartInfo>>],
     read_quorum: usize,
 ) -> disk::error::Result<ObjectPartInfo> {
-    let mut part_quorum: HashMap<(&str, usize, usize, i64), (usize, &ObjectPartInfo)> = HashMap::new();
+    let mut part_quorum = HashMap::new();
     let mut present_count = 0usize;
     let mut missing_count = 0usize;
     let mut transient_error_count = 0usize;
@@ -943,7 +943,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         if !parts[part_idx].etag.is_empty() {
             present_count += 1;
             let part = &parts[part_idx];
-            let key = (part.etag.as_str(), part.number, part.size, part.actual_size);
+            let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
             let (count, _) = part_quorum.entry(key).or_insert((0, part));
             *count += 1;
             continue;
@@ -1163,13 +1163,10 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) set_index: usize,
     pub(in crate::set_disk) part_number: Option<usize>,
     pub(in crate::set_disk) reason: &'static str,
-    /// Durable MRF journal intent to file alongside the read-repair request
-    /// (backlog#1894 axis A): the intent kind plus its native `Uuid`
-    /// version id (the submission's string form stays display-only). Bound
-    /// to the reservation — the intent is only delivered when this sighting
-    /// wins the dedup TTL, so a burst of reads failing on the same object
-    /// books exactly one journal record instead of one per retry. `None`
-    /// keeps the historical no-intent behavior.
+    /// Best-effort ingress for the durable MRF consumer. Its identity coalescer
+    /// is independent of the heal reservation: an earlier metadata repair must
+    /// not suppress newly observed payload damage, and rejected ingress must
+    /// remain retryable. Channel admission does not prove checkpoint commit.
     pub(in crate::set_disk) mrf_intent: Option<(rustfs_common::mrf_channel::MrfKind, Option<uuid::Uuid>)>,
 }
 
@@ -1224,6 +1221,27 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         mrf_intent,
     } = submission;
 
+    if let Some((kind, version_uuid)) = mrf_intent
+        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
+    {
+        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+        let ingress = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "mrf_ingress",
+            mrf_kind = ?kind,
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            result = ?ingress,
+            "Read-repair MRF ingress result"
+        );
+    }
+
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
@@ -1232,15 +1250,6 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         );
         return;
     };
-
-    // Reservation won: this sighting owns the repair records for the object,
-    // including the durable journal intent when the caller asked for one.
-    if let Some((kind, version_uuid)) = mrf_intent
-        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
-    {
-        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
-        let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
-    }
 
     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -1323,9 +1332,9 @@ pub(in crate::set_disk) struct BitrotReaderSetup {
     /// readers. The lockstep GET decode uses them to open a parity shard
     /// aligned to the stripe where a data shard failed (backlog#923).
     pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
-    /// Factories for a fresh, stripe-aligned parity reader. CopySource hedges
-    /// use these disposable readers so an abandoned hedge leaves the original
-    /// deferred reserve untouched.
+    /// Factories for fresh, stripe-aligned readers. CopySource uses disposable
+    /// parity readers; multi-stripe GETs can recover a previously hedged slot
+    /// when another disk subsequently fails.
     pub(in crate::set_disk) deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
@@ -1420,6 +1429,40 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 }
 
 impl BitrotReaderSetup {
+    pub(in crate::set_disk) fn bind_integrity(
+        &mut self,
+        expected: Option<&rustfs_filemeta::shard_integrity::PartIntegrity>,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        first_stripe: usize,
+    ) -> std::io::Result<()> {
+        use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+        let Some(expected) = expected else { return Ok(()) };
+        let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+        for (index, reader) in self.readers.iter_mut().enumerate() {
+            if let Some(reader) = reader {
+                let advanced = self.deferred_stripe_handles[index]
+                    .as_ref()
+                    .map(DeferredReaderStripeHandle::integrity_position);
+                reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first_stripe, advanced)?)?;
+            }
+            if let Some(reopen) = self.deferred_reopeners[index].take() {
+                let proof = Arc::clone(&proof);
+                self.deferred_reopeners[index] = Some(Arc::new(move |stripe| {
+                    let mut reader = reopen(stripe)?;
+                    let first = first_stripe.checked_add(stripe)?;
+                    reader
+                        .set_integrity(ShardVerifier::new(Arc::clone(&proof), index, first, None).ok()?)
+                        .ok()?;
+                    Some(reader)
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
@@ -1680,9 +1723,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // reopener. Otherwise a recovered slow data read can cancel and consume
     // the only parity reserve needed by a later degraded stripe.
     let demand_bound_lockstep = crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
+    let preserve_hedged_readers = !demand_bound_lockstep && read_length > shard_size;
 
     for idx in 0..disks.len() {
-        if setup.attempted[idx] {
+        if setup.attempted[idx] && (!preserve_hedged_readers || setup.readers[idx].is_none()) {
             continue;
         }
 
@@ -1694,7 +1738,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = demand_bound_lockstep.then(|| {
+        let reopener = (demand_bound_lockstep || preserve_hedged_readers).then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -1708,6 +1752,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 use_mmap_read,
             )
         });
+        setup.deferred_reopeners[idx] = reopener;
+        if setup.attempted[idx] {
+            continue;
+        }
         let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
@@ -1721,7 +1769,6 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             use_mmap_read,
         );
         setup.retain_deferred_reader(idx, reader, stripe_handle);
-        setup.deferred_reopeners[idx] = reopener;
     }
 
     // With the data-shards-only lockstep gate on (backlog#923), the GET decode
@@ -2443,15 +2490,15 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let bucket = bucket.to_string();
-        let part_meta_paths = part_meta_paths.to_vec();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let part_meta_paths: Arc<[String]> = Arc::from(part_meta_paths);
 
         let tasks: Vec<_> = disks
             .iter()
             .map(|disk| {
                 let disk = disk.clone();
-                let bucket = bucket.clone();
-                let part_meta_paths = part_meta_paths.clone();
+                let bucket = Arc::clone(&bucket);
+                let part_meta_paths = Arc::clone(&part_meta_paths);
 
                 async move {
                     if let Some(disk) = disk {
@@ -3077,6 +3124,23 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, false).await
+    }
+
+    pub(crate) async fn load_file_info_versions_for_tier_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        self.load_file_info_versions_for_cleanup(bucket, object, true).await
+    }
+
+    async fn load_file_info_versions_for_cleanup(
+        &self,
+        bucket: &str,
+        object: &str,
+        retain_unconfirmed_tier_references: bool,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
         let disk_object = rustfs_utils::path::encode_dir_object(object);
         let disks = self.get_disks_internal().await;
         if disks.is_empty() {
@@ -3152,12 +3216,24 @@ impl SetDisks {
             )));
         }
 
-        let file_info_versions = FileMeta {
+        let mut file_info_versions = FileMeta {
             versions,
             ..Default::default()
         }
         .get_all_file_info_versions(bucket, object, true)
         .map_err(decode_error)?;
+        if retain_unconfirmed_tier_references {
+            // A failed overwrite may leave its live source on a minority
+            // of disks. Preserve that reference even if quorum merging
+            // selects only the replacement and its cleanup owner.
+            file_info_versions.versions.extend(
+                transition_copies
+                    .into_values()
+                    .flatten()
+                    .map(|(version, _)| version)
+                    .filter(|version| !version.tier_free_version()),
+            );
+        }
 
         for file_info in file_info_versions
             .versions
@@ -3427,17 +3503,42 @@ fn dangling_delete_grace() -> time::Duration {
 /// Result of scanning one disk's copy of a directory prefix while deciding
 /// whether an orphan (metadata-less) directory tree can be safely purged.
 enum OrphanDirScan {
-    /// The subtree holds object metadata or uncommitted data, so it must not be
-    /// purged.
-    HasData,
-    /// The prefix contains only empty directories and/or UUID data directories
-    /// carrying a committed delete marker.
-    Purgeable {
-        empty_dirs: Vec<String>,
+    /// The prefix exists on this disk. `blocked` holds every directory that is
+    /// itself, or an ancestor of, object metadata or uncommitted data (closed
+    /// under taking parents, root included when anything under it is blocked);
+    /// `dirs` is the pre-order list of every directory reached that is not
+    /// blocked, and `committed_files` the erasure data and committed delete
+    /// markers found in the unblocked UUID data dirs among them.
+    Scanned {
+        blocked: HashSet<String>,
+        dirs: Vec<String>,
         committed_files: Vec<String>,
     },
+    /// A directory read failed for a reason other than absence, so nothing
+    /// under the prefix can be classified on this disk.
+    Unreadable,
     /// The prefix does not exist on this disk.
     Missing,
+}
+
+/// How long an orphan prefix whose purge scan met unpurgeable data is left
+/// alone before an empty listing scans it again.
+const ORPHAN_PURGE_BACKOFF: Duration = Duration::from_secs(60);
+/// Upper bound on remembered backoff entries; the oldest is dropped first.
+const ORPHAN_PURGE_BACKOFF_MAX_ENTRIES: usize = 4096;
+
+/// Mark `dir` and every ancestor up to and including `root` as blocked.
+fn block_orphan_dir_chain(blocked: &mut HashSet<String>, root: &str, dir: &str) {
+    let mut current = dir;
+    loop {
+        if !blocked.insert(current.to_owned()) || current == root {
+            return;
+        }
+        let Some((parent, _)) = current.rsplit_once(SLASH_SEPARATOR) else {
+            return;
+        };
+        current = parent;
+    }
 }
 
 fn is_safe_orphan_dir_entry(entry: &str) -> bool {
@@ -5669,6 +5770,8 @@ impl SetDisks {
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         self.recover_part_transaction(dst_object, write_quorum).await?;
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        let integrity = part.integrity.map(Arc::new);
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5682,12 +5785,39 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
             let dst_object = dst_object.clone();
             let meta = meta.clone();
+            let integrity = integrity.clone();
             async move {
                 let disk = disk?;
-                Some(
-                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
-                        .await,
-                )
+                let prepared = disk
+                    .prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                    .await;
+                if let Err(error) = prepared {
+                    return Some(Err(error));
+                }
+                if let Some(integrity) = integrity {
+                    let Some((directory, _)) = dst_object.rsplit_once('/') else {
+                        return Some(Err(DiskError::FileCorrupt));
+                    };
+                    let path = format!("{directory}/{}", integrity.file_name());
+                    // Older peers may return Ok from PreparePart without moving
+                    // the index. They must not enter the protected write quorum.
+                    let result = async {
+                        let mut reader = disk
+                            .read_file_stream(&dst_bucket, &path, 0, rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE)
+                            .await?;
+                        let mut header = [0; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header)
+                            .await
+                            .map_err(DiskError::from)?;
+                        if header != integrity.index_header() {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    return Some(result);
+                }
+                Some(Ok(()))
             }
         });
         let prepare_results = join_all(prepare_tasks).await;
@@ -5950,6 +6080,20 @@ impl SetDisks {
         data_errs_by_part: &HashMap<usize, Vec<usize>>,
         opts: ObjectOptions,
     ) -> disk::error::Result<FileInfo> {
+        self.delete_if_dangling_with_proof(bucket, object, meta_arr, errs, data_errs_by_part, opts)
+            .await
+            .map(|(metadata, _)| metadata)
+    }
+
+    pub(in crate::set_disk) async fn delete_if_dangling_with_proof(
+        &self,
+        bucket: &str,
+        object: &str,
+        meta_arr: &[FileInfo],
+        errs: &[Option<DiskError>],
+        data_errs_by_part: &HashMap<usize, Vec<usize>>,
+        opts: ObjectOptions,
+    ) -> disk::error::Result<(FileInfo, bool)> {
         let (m, can_heal) = is_object_dangling(meta_arr, errs, data_errs_by_part);
 
         if !can_heal {
@@ -6036,11 +6180,17 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut futures = Vec::with_capacity(disks.len());
-        for disk_op in disks.iter() {
+        for (disk_index, disk_op) in disks.iter().enumerate() {
+            #[cfg(not(test))]
+            let _ = disk_index;
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
             futures.push(async move {
+                #[cfg(test)]
+                if let Some(error) = crate::set_disk::ops::heal::injected_dangling_delete_error(&bucket, &object, disk_index) {
+                    return Err(error);
+                }
                 if let Some(disk) = disk_op {
                     disk.delete_version(&bucket, &object, fi, false, DeleteOptions::default())
                         .await
@@ -6051,6 +6201,7 @@ impl SetDisks {
         }
 
         let results = join_all(futures).await;
+        let mut all_deleted = !results.is_empty();
         let mut delete_errs = Vec::with_capacity(results.len());
         for (index, result) in results.into_iter().enumerate() {
             let key = format!("ddisk-{index}");
@@ -6064,6 +6215,7 @@ impl SetDisks {
                     delete_errs.push(None);
                 }
                 Err(e) => {
+                    all_deleted &= matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound);
                     tags.insert(key, e.to_string());
                     if already_absent || matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound) {
                         delete_errs.push(None);
@@ -6083,7 +6235,30 @@ impl SetDisks {
             return Err(err);
         }
 
-        Ok(m)
+        // Quorum success alone may leave the only stale replica behind. The
+        // proof uses the same disk snapshot as deletion and exact-version reads.
+        let absent = if all_deleted {
+            match Self::read_all_fileinfo(
+                &disks,
+                "",
+                bucket,
+                object,
+                opts.version_id.as_deref().unwrap_or(""),
+                false,
+                false,
+                false,
+            )
+            .await
+            {
+                Ok((_, after)) => after
+                    .iter()
+                    .all(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::FileVersionNotFound))),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        Ok((m, absent))
     }
 
     fn reduce_delete_prefix_results(results: Vec<disk::error::Result<()>>, write_quorum: usize) -> disk::error::Result<()> {
@@ -6170,9 +6345,12 @@ impl SetDisks {
         .await
     }
 
-    /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
-    /// directory subtree. Only empty directories and UUID data directories with
-    /// valid committed delete markers are purgeable; every child is still scanned.
+    /// Scan a single disk's copy of `prefix` and classify every directory
+    /// under it. Only empty directories and UUID data directories with valid
+    /// committed delete markers are purgeable; anything else blocks its whole
+    /// ancestor chain while sibling subtrees stay purgeable, so committed
+    /// residue is still reclaimed when it shares an ancestor with residue from
+    /// an older build that never wrote markers (#6898).
     async fn scan_orphan_dir(disk: &DiskStore, bucket: &str, prefix: &str) -> OrphanDirScan {
         let root = prefix.trim_end_matches(SLASH_SEPARATOR).to_string();
         let mut stack = vec![root.clone()];
@@ -6180,6 +6358,7 @@ impl SetDisks {
         // so reversing it yields a safe children-first removal order.
         let mut dirs: Vec<String> = Vec::new();
         let mut committed_files: Vec<String> = Vec::new();
+        let mut blocked: HashSet<String> = HashSet::new();
         let mut existed = false;
 
         while let Some(dir) = stack.pop() {
@@ -6194,16 +6373,18 @@ impl SetDisks {
                 }
                 // Classification must fail closed: committed residue is safe to
                 // remove only after every reachable child was inspected.
-                Err(_) => return OrphanDirScan::HasData,
+                Err(_) => return OrphanDirScan::Unreadable,
             };
 
             existed = true;
             let mut child_dirs = Vec::new();
             let mut files = Vec::new();
 
+            let mut has_data = false;
             for entry in entries {
                 if !is_safe_orphan_dir_entry(&entry) {
-                    return OrphanDirScan::HasData;
+                    has_data = true;
+                    break;
                 }
                 match entry.strip_suffix(SLASH_SEPARATOR) {
                     Some(child) => child_dirs.push(format!("{dir}{SLASH_SEPARATOR}{child}")),
@@ -6211,28 +6392,29 @@ impl SetDisks {
                 }
             }
 
-            if !files.is_empty() {
+            if !has_data && !files.is_empty() {
                 let data_dir_name = dir.rsplit(SLASH_SEPARATOR).next().unwrap_or_default();
                 let is_uuid_data_dir = Uuid::parse_str(data_dir_name).is_ok_and(|uuid| !uuid.is_nil());
                 let has_committed_delete = files.iter().any(|entry| is_committed_delete_marker(entry));
+                has_data = !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE);
+            }
 
-                if !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE) {
-                    return OrphanDirScan::HasData;
-                }
-
-                committed_files.extend(files.into_iter().map(|entry| path_join_buf(&[&dir, &entry])));
-                dirs.push(dir);
-                stack.extend(child_dirs);
+            if has_data {
+                // Nothing below a blocked directory is ever removed, so its
+                // children need no classification.
+                block_orphan_dir_chain(&mut blocked, &root, &dir);
                 continue;
             }
 
+            committed_files.extend(files.into_iter().map(|entry| format!("{dir}{SLASH_SEPARATOR}{entry}")));
             dirs.push(dir);
             stack.extend(child_dirs);
         }
 
         if existed {
-            OrphanDirScan::Purgeable {
-                empty_dirs: dirs,
+            OrphanDirScan::Scanned {
+                blocked,
+                dirs,
                 committed_files,
             }
         } else {
@@ -6327,43 +6509,101 @@ impl SetDisks {
     /// of this set (the caller should surface the original NotFound), and `Err` on
     /// a hard disk failure.
     pub(crate) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> disk::error::Result<bool> {
+        let backoff_key = format!("{bucket}{SLASH_SEPARATOR}{object}");
+        if self.orphan_purge_in_backoff(&backoff_key) {
+            return Ok(false);
+        }
+
         let disks = self.get_disks_internal().await;
 
-        // Phase 1: classify every online disk. Refuse to purge if ANY disk holds
-        // object data under the prefix, so a degraded/healable object is never
-        // destroyed.
-        let mut per_disk_dirs: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
-        let mut existed = false;
+        // Phase 1: classify every online disk. A directory that holds object
+        // data or uncommitted residue on ANY disk blocks itself and its
+        // ancestors on every disk, so a degraded/healable object is never
+        // destroyed; purgeable subtrees beside it are still reclaimed.
+        let mut per_disk: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
+        let mut blocked: HashSet<String> = HashSet::new();
         for (i, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else { continue };
             match Self::scan_orphan_dir(disk, bucket, object).await {
-                OrphanDirScan::HasData => return Ok(false),
-                OrphanDirScan::Purgeable {
-                    empty_dirs,
+                OrphanDirScan::Unreadable => return Ok(false),
+                OrphanDirScan::Scanned {
+                    blocked: disk_blocked,
+                    dirs,
                     committed_files,
                 } => {
-                    existed = true;
-                    per_disk_dirs.push((i, empty_dirs, committed_files));
+                    blocked.extend(disk_blocked);
+                    per_disk.push((i, dirs, committed_files));
                 }
                 OrphanDirScan::Missing => {}
             }
         }
-
-        if !existed {
-            return Ok(false);
+        if !blocked.is_empty() {
+            // Whatever is purgeable goes now; what blocks the rest will still
+            // block it on the next empty listing, so do not rescan for a while.
+            self.record_orphan_purge_backoff(backoff_key);
         }
 
-        // Phase 2: remove only the files classified as committed residue, then
-        // remove directories children-first. Every directory delete is
-        // non-recursive, so a directory that concurrently gained an object fails
-        // with DirectoryNotEmpty and is skipped — a racing PutObject is never
+        // Phase 2: remove only the files classified as committed residue in
+        // unblocked data dirs, then remove unblocked directories
+        // children-first. Every directory delete is non-recursive, so a
+        // directory that concurrently gained an object fails with
+        // DirectoryNotEmpty and is skipped — a racing PutObject is never
         // clobbered.
-        for (i, empty_dirs, committed_files) in per_disk_dirs {
+        let mut purged = false;
+        for (i, dirs, committed_files) in per_disk {
             let Some(disk) = disks[i].as_ref() else { continue };
-            Self::delete_purgeable_orphan_entries(disk, bucket, object, empty_dirs, committed_files).await;
+            let dirs = dirs.into_iter().filter(|dir| !blocked.contains(dir)).collect::<Vec<_>>();
+            let committed_files = committed_files
+                .into_iter()
+                .filter(|file| {
+                    file.rsplit_once(SLASH_SEPARATOR)
+                        .is_some_and(|(data_dir, _)| !blocked.contains(data_dir))
+                })
+                .collect::<Vec<_>>();
+            if dirs.is_empty() && committed_files.is_empty() {
+                continue;
+            }
+            purged = true;
+            Self::delete_purgeable_orphan_entries(disk, bucket, object, dirs, committed_files).await;
         }
 
-        Ok(true)
+        Ok(purged)
+    }
+
+    fn orphan_purge_in_backoff(&self, key: &str) -> bool {
+        let backoff = self
+            .orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        backoff
+            .get(key)
+            .is_some_and(|scanned_at| scanned_at.elapsed() < ORPHAN_PURGE_BACKOFF)
+    }
+
+    fn record_orphan_purge_backoff(&self, key: String) {
+        let mut backoff = self
+            .orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        backoff.retain(|_, scanned_at| now.duration_since(*scanned_at) < ORPHAN_PURGE_BACKOFF);
+        if backoff.len() >= ORPHAN_PURGE_BACKOFF_MAX_ENTRIES
+            && let Some(oldest) = backoff
+                .iter()
+                .min_by_key(|(_, scanned_at)| **scanned_at)
+                .map(|(key, _)| key.clone())
+        {
+            backoff.remove(&oldest);
+        }
+        backoff.insert(key, now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_orphan_purge_backoff(&self) {
+        self.orphan_purge_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Reclaim orphaned physical data directories under `bucket/object` that no
@@ -7480,13 +7720,15 @@ mod tests {
             .await
             .expect("committed delete marker should be written");
 
-        let OrphanDirScan::Purgeable {
-            empty_dirs,
+        let OrphanDirScan::Scanned {
+            blocked,
+            dirs: empty_dirs,
             committed_files,
         } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
         else {
             panic!("committed residue should be classified as purgeable");
         };
+        assert!(blocked.is_empty(), "committed residue alone blocks nothing");
 
         let nested_object = residue.join("nested");
         tokio::fs::create_dir_all(&nested_object)
@@ -7528,13 +7770,15 @@ mod tests {
             .await
             .expect("committed delete marker should be written");
 
-        let OrphanDirScan::Purgeable {
-            empty_dirs,
+        let OrphanDirScan::Scanned {
+            blocked,
+            dirs: empty_dirs,
             committed_files,
         } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
         else {
             panic!("committed residue should be classified as purgeable");
         };
+        assert!(blocked.is_empty(), "committed residue alone blocks nothing");
         tokio::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o555))
             .await
             .expect("residue directory should become read-only");
@@ -12215,6 +12459,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_unreadable_disk_despite_metadata_quorum() {
+        let bucket = "tier-unreadable-disk";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        for index in 1..=3 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            fi.erasure.index = index;
+            disk.write_metadata(bucket, bucket, object, fi.clone())
+                .await
+                .expect("seed metadata quorum");
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        disks.push(None);
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's unreadable-replica fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "unreadable replica may still reference the old remote object"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_overwrite_cleanup_rejects_minority_metadata_in_an_absent_set() {
+        let bucket = "tier-minority-metadata";
+        let object = "object";
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        for index in 1..=4 {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            if index == 1 {
+                let mut fi = metadata_test_fileinfo(object);
+                fi.mod_time = Some(OffsetDateTime::now_utc());
+                disk.write_metadata(bucket, bucket, object, fi)
+                    .await
+                    .expect("seed minority metadata");
+            }
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        let set = io_primitives_test_set(disks, 2).await;
+        assert!(
+            set.load_file_info_versions_exact(bucket, object).await.is_err(),
+            "exact reads must preserve release's minority-ownership fence"
+        );
+        assert!(
+            set.load_file_info_versions_for_tier_cleanup(bucket, object).await.is_err(),
+            "absence on a majority cannot prove this physical set has no remote reference"
+        );
+    }
+
+    #[tokio::test]
     async fn load_file_info_versions_exact_returns_versions_from_read_quorum() {
         let bucket = "exact-versions-bucket";
         let object = "exact-object";
@@ -12668,7 +12970,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn mrf_intent_is_filed_once_per_read_repair_reservation() {
+    async fn mrf_ingress_is_coalesced_independently_of_read_repair_reservations() {
         // Serial: owns the process-global MRF channel for this test binary
         // (same key as the other channel-owning tests above).
         let bucket = format!("mrf-intent-bucket-{}", Uuid::new_v4());
@@ -12689,8 +12991,13 @@ mod tests {
             }
         }
 
-        // First sighting wins the reservation: the journal intent is filed
-        // synchronously before the admission task is spawned.
+        // An earlier metadata/missing-shard admission has no payload MRF intent.
+        let mut metadata_submission = intent_submission(&bucket, &object);
+        metadata_submission.mrf_intent = None;
+        submit_read_repair_heal_with_submitter(metadata_submission, accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+
+        // Newly observed corruption must reach MRF despite that reservation.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         let first = receiver.try_recv().expect("first sighting must file exactly one MRF intent");
         assert_eq!(*first.bucket, bucket);
@@ -12700,6 +13007,20 @@ mod tests {
         // second journal record.
         submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
         assert!(receiver.try_recv().is_err(), "duplicate sighting must not file another MRF intent");
+
+        let retry_object = format!("retry-object-{}", Uuid::new_v4());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err());
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(true);
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &retry_object), accepted_read_repair_submitter).await;
+        let retried = receiver
+            .try_recv()
+            .expect("a heal reservation cannot suppress a previously rejected MRF intent");
+        assert_eq!(*retried.object, retry_object);
+        rustfs_common::mrf_channel::release_mrf_intent(&first);
+        rustfs_common::mrf_channel::release_mrf_intent(&retried);
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(false);
     }
 
     #[tokio::test]
