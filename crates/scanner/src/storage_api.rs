@@ -342,6 +342,17 @@ pub(crate) mod scanner_io {
     pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::{
+        bucket::{
+            lifecycle::bucket_lifecycle_ops::init_background_expiry, metadata::BUCKET_LIFECYCLE_CONFIG,
+            metadata_sys::update as update_bucket_metadata,
+        },
+        data_usage::{
+            apply_bucket_usage_memory_overlay, record_bucket_object_delete_memory, record_bucket_object_write_memory,
+            replace_bucket_usage_memory_from_info,
+        },
+    };
 }
 
 pub(crate) type ScannerBucketListing = EcstoreScannerBucketListing;

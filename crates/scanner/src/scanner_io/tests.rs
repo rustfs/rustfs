@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 mod scoped_entry_fallback;
 mod service_cohort;
+mod usage_expiration;
 
 #[derive(Clone)]
 struct FixedWorkloadProvider {
