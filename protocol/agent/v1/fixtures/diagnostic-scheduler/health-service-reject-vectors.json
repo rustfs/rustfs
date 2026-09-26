@@ -1,0 +1,20 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "diagnostic-scheduler",
+  "fixture": "health-service-reject-vectors",
+  "baseFixture": "health-service-accept-vectors.json",
+  "vectors": [
+    { "id": "health-service.job.old-node-capability", "base": "health-service.job.explicit-freshness", "path": "/requiredCapabilities/0", "replacement": "health.check@1", "reason": "UNSUPPORTED_TOOL" },
+    { "id": "health-service.job.missing-capability", "base": "health-service.job.explicit-freshness", "path": "/requiredCapabilities", "replacement": [], "reason": "UNSUPPORTED_TOOL" },
+    { "id": "health-service.job.missing-freshness-policy", "base": "health-service.job.explicit-freshness", "path": "/parameters/maxEvidenceAgeSeconds", "remove": true, "reason": "LIMIT_EXCEEDED" },
+    { "id": "health-service.job.profile-parameter", "base": "health-service.job.explicit-freshness", "path": "/parameters/durationMillis", "replacement": 1000, "reason": "INVALID" },
+    { "id": "health-service.job.oversized-result-budget", "base": "health-service.job.explicit-freshness", "path": "/limits/maxOutputBytes", "replacement": 262145, "reason": "LIMIT_EXCEEDED" },
+    { "id": "health-service.job.wrong-target", "base": "health-service.job.explicit-freshness", "path": "/deviceName", "replacement": "organizations/018cc251-f400-7abc-8def-0123456789ab/clusters/018cc251-f400-7abc-8def-0123456789ac/clusterDevices/018cc251-f400-7abc-8def-0123456789ae", "reason": "TARGET_MISMATCH" },
+    { "id": "health-service.job.wrong-nonce", "base": "health-service.job.explicit-freshness", "path": "/nonce", "replacement": "invalid", "reason": "INVALID" },
+    { "id": "health-service.job.wrong-signature", "base": "health-service.job.explicit-freshness", "path": "/signature/value", "replacement": "invalid", "reason": "SIGNATURE_INVALID" },
+    { "id": "health-service.job.revoked-consent", "base": "health-service.job.explicit-freshness", "path": "/parameters/consentExpiresAt", "replacement": "2029-12-31T23:59:59Z", "reason": "EXPIRED" },
+    { "id": "health-service.result.raw-admin-data", "base": "health-service.result.current-partial-catalog", "path": "/data/rawAdmin", "replacement": { "endpoint": "forbidden" }, "reason": "UNKNOWN_FIELD" },
+    { "id": "health-service.result.missing-unsupported", "base": "health-service.result.current-partial-catalog", "path": "/data/unsupportedChecks/10", "remove": true, "reason": "INCOMPLETE_COVERAGE" },
+    { "id": "health-service.result.path-leak", "base": "health-service.result.current-partial-catalog", "path": "/data/observations/capacity/path", "replacement": "/customer/data", "reason": "UNKNOWN_FIELD" }
+  ]
+}

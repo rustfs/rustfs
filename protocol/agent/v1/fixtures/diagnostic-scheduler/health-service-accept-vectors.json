@@ -1,0 +1,123 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "diagnostic-scheduler",
+  "fixture": "health-service-accept-vectors",
+  "vectors": [
+    {
+      "id": "health-service.job.explicit-freshness",
+      "schema": "job-envelope.schema.json",
+      "value": {
+        "jobId": "018cc251-f400-7abc-8def-0123456789ab",
+        "protocolVersion": "v1",
+        "jobType": "health.check",
+        "schemaVersion": 1,
+        "organizationName": "organizations/018cc251-f400-7abc-8def-0123456789ab",
+        "clusterName": "organizations/018cc251-f400-7abc-8def-0123456789ab/clusters/018cc251-f400-7abc-8def-0123456789ac",
+        "deviceName": "organizations/018cc251-f400-7abc-8def-0123456789ab/clusters/018cc251-f400-7abc-8def-0123456789ac/clusterDevices/018cc251-f400-7abc-8def-0123456789ad",
+        "createTime": "2030-01-01T00:00:00Z",
+        "expireTime": "2030-01-01T00:00:30Z",
+        "nonce": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+        "requiredCapabilities": ["health.check.service@1"],
+        "authorization": {
+          "actorType": "BROWSER_USER",
+          "actorName": "users/018cc251-f400-7abc-8def-0123456789ab",
+          "requestId": "123e4567-e89b-42d3-a456-426614174001"
+        },
+        "limits": {
+          "timeoutSeconds": 30,
+          "maxOutputBytes": 262144,
+          "maxMemoryBytes": 67108864,
+          "maxCpuMillis": 5000
+        },
+        "parameters": {
+          "artifactUid": "018cc251-f400-7abc-8def-0123456789ae",
+          "consentUid": "018cc251-f400-7abc-8def-0123456789af",
+          "consentPolicyRevision": 1,
+          "consentExpiresAt": "2030-01-01T00:01:00Z",
+          "maxEvidenceAgeSeconds": 300
+        },
+        "signature": {
+          "algorithm": "Ed25519",
+          "keyId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      }
+    },
+    {
+      "id": "health-service.result.current-partial-catalog",
+      "schema": "health-service-result.schema.json",
+      "value": {
+        "schemaVersion": 1,
+        "runUid": "018cc251-f400-7abc-8def-0123456789ab",
+        "toolId": "health.check",
+        "capability": "health.check.service@1",
+        "outcome": "PARTIAL",
+        "reasonCode": "CATALOG_PARTIAL",
+        "durationMillis": 25,
+        "provenance": {
+          "repository": "rustfs/rustfs",
+          "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "executableSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "rustfsVersion": "1.0.0",
+          "osFamily": "LINUX",
+          "architecture": "x86_64",
+          "buildFeatures": []
+        },
+        "coverage": {
+          "requestedUnits": 13,
+          "completedUnits": 2,
+          "unsupportedUnits": 11,
+          "unit": "CHECK"
+        },
+        "data": {
+          "catalogVersion": 1,
+          "resourceAlias": "cluster-1",
+          "observations": {
+            "capacity": {
+              "source": "LIVE_DISK_PROBE",
+              "observedAt": "2030-01-01T00:00:00Z",
+              "freshness": "CURRENT",
+              "complete": true,
+              "totalBytes": 100,
+              "usedBytes": 50
+            },
+            "coarseFlags": {
+              "source": "LIVE_DISK_PROBE",
+              "observedAt": "2030-01-01T00:00:00Z",
+              "freshness": "CURRENT",
+              "complete": true,
+              "values": []
+            }
+          },
+          "checks": [
+            {
+              "checkId": "capacity.exhausted",
+              "outcome": "PASS",
+              "reasonCode": "CAPACITY_REMAINING",
+              "resourceAlias": "cluster-1"
+            },
+            {
+              "checkId": "cluster.reportedFlags",
+              "outcome": "PASS",
+              "reasonCode": "NO_COARSE_CONDITION_REPORTED",
+              "resourceAlias": "cluster-1"
+            }
+          ],
+          "unsupportedChecks": [
+            { "checkId": "memory.reportedPressure", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "tls.validity", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "cpu.sufficiency", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "swap.pressure", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "drive.health", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "inode.available", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "filesystem.compatibility", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "osKernel.compatibility", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "launch.permissions", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "version.consistency", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" },
+            { "checkId": "kubernetes.configuration", "reasonCode": "EVIDENCE_CONTRACT_UNAVAILABLE" }
+          ]
+        }
+      }
+    }
+  ]
+}

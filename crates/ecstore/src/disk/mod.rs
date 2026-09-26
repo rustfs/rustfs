@@ -1365,6 +1365,10 @@ pub struct DiskInfoOptions {
     pub disk_id: String,
     pub metrics: bool,
     pub noop: bool,
+    /// Bypass the ordinary one-second admin cache and return a positive
+    /// acknowledgement only after a fresh capacity syscall completes.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1389,6 +1393,10 @@ pub struct DiskInfo {
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
+    /// Older peers omit this field. Callers must treat an absent/false value as
+    /// cached or otherwise unproven capacity evidence.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1912,11 +1920,40 @@ mod tests {
             disk_id: "test-disk-id".to_string(),
             metrics: true,
             noop: false,
+            fresh_capacity: true,
         };
 
         assert_eq!(opts.disk_id, "test-disk-id");
         assert!(opts.metrics);
         assert!(!opts.noop);
+        assert!(opts.fresh_capacity);
+    }
+
+    #[test]
+    fn disk_info_fresh_capacity_ack_is_additive_for_old_peers() {
+        let old_options: DiskInfoOptions =
+            serde_json::from_str(r#"{"disk_id":"disk","metrics":false,"noop":false}"#).expect("old options");
+        assert!(!old_options.fresh_capacity);
+
+        let mut old_response_json = serde_json::to_value(DiskInfo {
+            total: 10,
+            free: 4,
+            used: 6,
+            ..Default::default()
+        })
+        .expect("response fixture");
+        old_response_json
+            .as_object_mut()
+            .expect("response object")
+            .remove("fresh_capacity");
+        let old_response: DiskInfo = serde_json::from_value(old_response_json).expect("old response");
+        assert!(!old_response.fresh_capacity);
+
+        let requested = DiskInfoOptions {
+            fresh_capacity: true,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(requested).expect("new options")["fresh_capacity"], true);
     }
 
     /// Test ReadMultipleReq structure

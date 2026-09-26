@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://connect.rustfs.com/schemas/agent/v1/job-envelope.schema.json",
+  "title": "RustFS Connect Agent Job Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "jobId",
+    "protocolVersion",
+    "jobType",
+    "schemaVersion",
+    "organizationName",
+    "clusterName",
+    "deviceName",
+    "createTime",
+    "expireTime",
+    "nonce",
+    "requiredCapabilities",
+    "authorization",
+    "limits",
+    "parameters",
+    "signature"
+  ],
+  "properties": {
+    "jobId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "protocolVersion": { "const": "v1" },
+    "jobType": { "enum": ["health.check", "profile.cpu", "profile.memory", "profile.threads", "performance.drive", "performance.network", "top.api", "top.locks", "top.rpc"] },
+    "schemaVersion": { "const": 1 },
+    "organizationName": { "type": "string", "pattern": "^organizations/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "clusterName": { "type": "string", "pattern": "^organizations/[0-9a-f-]{36}/clusters/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "deviceName": { "type": "string", "pattern": "^organizations/[0-9a-f-]{36}/clusters/[0-9a-f-]{36}/clusterDevices/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "createTime": { "type": "string", "format": "date-time" },
+    "expireTime": { "type": "string", "format": "date-time" },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "requiredCapabilities": {
+      "type": "array",
+      "prefixItems": [{ "enum": ["health.check.service@1", "profile.cpu@1", "profile.memory.service@1", "profile.threads@1", "performance.drive@1", "performance.network@1", "top.api@1", "top.locks@1", "top.rpc@1"] }],
+      "items": false,
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeoutSeconds", "maxOutputBytes", "maxMemoryBytes", "maxCpuMillis"],
+      "properties": {
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "maxOutputBytes": { "type": "integer", "minimum": 1, "maximum": 524288 },
+        "maxMemoryBytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+        "maxCpuMillis": { "type": "integer", "minimum": 1, "maximum": 30000 }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorType", "actorName", "requestId"],
+      "properties": {
+        "actorType": { "const": "BROWSER_USER" },
+        "actorName": { "type": "string", "pattern": "^users/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "requestId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactUid", "consentUid", "consentPolicyRevision", "consentExpiresAt"],
+      "properties": {
+        "artifactUid": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "consentUid": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "consentPolicyRevision": { "type": "integer", "minimum": 1 },
+        "consentExpiresAt": { "type": "string", "format": "date-time" },
+        "durationMillis": { "type": "integer", "minimum": 1, "maximum": 30000 },
+        "samplePeriodMicros": { "type": "integer", "minimum": 1, "maximum": 30000000 },
+        "maxEvidenceAgeSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "targetAlias": { "const": "drive-1" },
+        "scratchBytes": { "const": 524288 },
+        "blockBytes": { "const": 65536 },
+        "trafficBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "value"],
+      "properties": {
+        "algorithm": { "const": "Ed25519" },
+        "keyId": { "type": "string", "minLength": 1 },
+        "value": { "type": "string", "minLength": 43 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "jobType": { "const": "health.check" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "health.check.service@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "timeoutSeconds": { "const": 30 },
+              "maxOutputBytes": { "const": 262144 },
+              "maxMemoryBytes": { "const": 67108864 },
+              "maxCpuMillis": { "const": 5000 }
+            }
+          },
+          "parameters": {
+            "type": "object",
+            "required": ["maxEvidenceAgeSeconds"],
+            "not": {
+              "anyOf": [
+                { "required": ["durationMillis"] },
+                { "required": ["samplePeriodMicros"] },
+                { "required": ["targetAlias"] },
+                { "required": ["scratchBytes"] },
+                { "required": ["blockBytes"] },
+                { "required": ["trafficBytes"] }
+              ]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "required": ["durationMillis", "samplePeriodMicros"],
+            "not": { "required": ["maxEvidenceAgeSeconds"] }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "performance.drive" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "performance.drive@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "required": ["targetAlias", "scratchBytes", "blockBytes"],
+            "properties": {
+              "durationMillis": { "const": 5000 },
+              "targetAlias": { "const": "drive-1" },
+              "scratchBytes": { "const": 524288 },
+              "blockBytes": { "const": 65536 }
+            },
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "not": {
+              "anyOf": [
+                { "required": ["targetAlias"] },
+                { "required": ["scratchBytes"] },
+                { "required": ["blockBytes"] }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "performance.network" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "performance.network@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "required": ["trafficBytes"],
+            "properties": { "trafficBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "profile.cpu" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "profile.cpu@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "profile.memory" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "profile.memory.service@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "const": 67108864 }
+            }
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "profile.threads" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "profile.threads@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "top.api" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "top.api@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "top.rpc" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "top.rpc@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "top.locks" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "top.locks@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    }
+  ]
+}
