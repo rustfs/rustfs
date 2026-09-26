@@ -1188,6 +1188,14 @@ async fn run_mrf_consumer(
     // must be re-persisted by the next flush before replay can delete the
     // startup anchor.
     runtime.dirty = runtime.queue.depth() > 0 || runtime.partial_writes.depth() > 0;
+    // Publish the first successor immediately instead of waiting for the
+    // periodic tick. Replay is a crash-recovery boundary: a restarted process
+    // must establish its pending successor before any admission retry or
+    // cleanup can make progress. A failed publication leaves `dirty` set, so
+    // the normal timer path still retries it.
+    if runtime.dirty {
+        runtime.flush().await;
+    }
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
