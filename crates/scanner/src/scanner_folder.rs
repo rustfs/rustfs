@@ -1219,7 +1219,7 @@ impl FolderScanner {
     }
 
     fn maybe_send_checkpoint(&mut self) {
-        let Some(checkpoint_tx) = self.checkpoint_tx.as_ref() else { return };
+        let Some(checkpoint_tx) = self.checkpoint_tx.clone() else { return };
         let elapsed = self.last_checkpoint_at.elapsed();
         if self.new_cache.info.scan_progress.is_none()
             || elapsed < SCANNER_CHECKPOINT_MIN_INTERVAL
@@ -1231,6 +1231,15 @@ impl FolderScanner {
         if self.new_cache.root().is_none() && self.raw_enumeration_progress.is_empty() {
             return;
         }
+
+        // Reserve the bounded queue slot before cloning the growing cache.
+        // When persistence is slower than traversal, constructing snapshots
+        // that can only be rejected by a full channel creates repeated O(N)
+        // allocations without improving restart progress.
+        if checkpoint_tx.is_closed() {
+            return;
+        }
+        let Ok(permit) = checkpoint_tx.try_reserve() else { return };
 
         let mut snapshot = self.new_cache.clone();
         snapshot.info.last_update = Some(SystemTime::now());
@@ -1257,10 +1266,9 @@ impl FolderScanner {
         {
             return;
         }
-        if checkpoint_tx.try_send(snapshot).is_ok() {
-            self.last_checkpoint_objects = self.checkpoint_objects;
-            self.last_checkpoint_at = Instant::now();
-        }
+        permit.send(snapshot);
+        self.last_checkpoint_objects = self.checkpoint_objects;
+        self.last_checkpoint_at = Instant::now();
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {

@@ -1454,13 +1454,32 @@ fn bitrot_scan_cycle() -> Option<Duration> {
     resolve_scanner_runtime_config().bitrot_cycle
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerBitrotPolicy {
+    cycle: Option<Duration>,
+    deep_window_cycles: Option<u64>,
+}
+
+impl ScannerBitrotPolicy {
+    fn new(cycle: Option<Duration>, deep_scan_supported: bool, deep_window_cycles: u64) -> Self {
+        Self {
+            cycle,
+            deep_window_cycles: deep_scan_supported.then_some(deep_window_cycles),
+        }
+    }
+}
+
 fn get_cycle_scan_mode(
     current_cycle: u64,
     bitrot_start_cycle: u64,
     bitrot_start_time: Option<DateTime<Utc>>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> HealScanMode {
-    let Some(bitrot_cycle) = bitrot_cycle else {
+    let Some(bitrot_cycle) = policy.cycle else {
+        return HealScanMode::Normal;
+    };
+
+    let Some(deep_window_cycles) = policy.deep_window_cycles else {
         return HealScanMode::Normal;
     };
 
@@ -1468,7 +1487,7 @@ fn get_cycle_scan_mode(
         return HealScanMode::Deep;
     }
 
-    if current_cycle.saturating_sub(bitrot_start_cycle) < heal_object_select_prob() as u64 {
+    if current_cycle.saturating_sub(bitrot_start_cycle) < deep_window_cycles {
         return HealScanMode::Deep;
     }
 
@@ -1492,10 +1511,9 @@ fn background_heal_info_for_scan_start(
     current_cycle: u64,
     scan_mode: HealScanMode,
     now: DateTime<Utc>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> Option<BackgroundHealInfo> {
-    let reset_bitrot_start =
-        scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, bitrot_cycle);
+    let reset_bitrot_start = scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, policy);
     if info.current_scan_mode == scan_mode && !reset_bitrot_start {
         return None;
     }
@@ -1513,13 +1531,17 @@ fn should_reset_bitrot_start(
     info: &BackgroundHealInfo,
     current_cycle: u64,
     now: DateTime<Utc>,
-    bitrot_cycle: Option<Duration>,
+    policy: ScannerBitrotPolicy,
 ) -> bool {
     let Some(bitrot_start_time) = info.bitrot_start_time else {
         return true;
     };
 
-    let Some(bitrot_cycle) = bitrot_cycle else {
+    let Some(bitrot_cycle) = policy.cycle else {
+        return false;
+    };
+
+    let Some(deep_window_cycles) = policy.deep_window_cycles else {
         return false;
     };
 
@@ -1527,7 +1549,7 @@ fn should_reset_bitrot_start(
         return true;
     }
 
-    if current_cycle.saturating_sub(info.bitrot_start_cycle) < heal_object_select_prob() as u64 {
+    if current_cycle.saturating_sub(info.bitrot_start_cycle) < deep_window_cycles {
         return false;
     }
 
@@ -1782,12 +1804,17 @@ where
     }
     let mut background_heal_info = background_heal_read.info;
     let background_heal_epoch = background_heal_read.expected_epoch;
+    let bitrot_policy = ScannerBitrotPolicy::new(
+        configured_bitrot_cycle,
+        !storeapi.setup_is_erasure_sd().await,
+        heal_object_select_prob() as u64,
+    );
 
     let scan_mode = get_cycle_scan_mode(
         cycle_info.current,
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
-        configured_bitrot_cycle,
+        bitrot_policy,
     );
     info!(
         target: "rustfs::scanner",
@@ -1805,7 +1832,7 @@ where
         cycle_info.current,
         scan_mode,
         Utc::now(),
-        configured_bitrot_cycle,
+        bitrot_policy,
     ) {
         background_heal_info = new_heal_info.clone();
         save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
