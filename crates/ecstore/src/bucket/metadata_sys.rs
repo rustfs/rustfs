@@ -2551,9 +2551,9 @@ impl BucketMetadataSys {
         }
 
         if transaction_guard.is_lock_lost() || namespace_guard.is_lock_lost() {
-            return Err(Error::other(format!(
-                "bucket creation commitment fence was lost before publish: {bucket}"
-            )));
+            // Stable message: formatted per-bucket detail would split quorum
+            // error buckets (backlog#1845).
+            return Err(Error::other("bucket creation commitment fence was lost before publish"));
         }
         let metadata = Arc::new(metadata);
         let _publish_guard = self
