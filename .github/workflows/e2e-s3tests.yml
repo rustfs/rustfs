@@ -146,7 +146,7 @@ jobs:
     # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
     # See the header note (ci-1) for why the self-hosted sm-standard-4 label
     # was abandoned. Scheduled failures are handled by alert-on-failure below.
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false

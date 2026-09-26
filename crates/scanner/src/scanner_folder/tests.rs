@@ -410,6 +410,16 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
 
     scanner.maybe_send_checkpoint();
 
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL * 2;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
+    scanner.maybe_send_checkpoint();
+    assert_eq!(
+        scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL,
+        "a full checkpoint queue must reject before cloning or advancing progress"
+    );
+
     let checkpoint = checkpoint_rx.try_recv().expect("object threshold emits a bounded checkpoint");
     assert_eq!(checkpoint.info.name, "bucket");
     assert!(!checkpoint.info.snapshot_complete);
