@@ -35,6 +35,10 @@ pub(super) enum GetSizeFailureAction {
     HealMetadata { object: String },
 }
 
+fn is_scanner_owned_usage_observation(bucket: &str, object: &str) -> bool {
+    bucket == crate::RUSTFS_META_BUCKET && object == crate::data_usage_define::DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SizeResolutionReason {
     CompressedSizeUnknown,
@@ -1100,12 +1104,25 @@ impl ScannerItem {
     }
 
     pub(super) async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
-        let done_heal = Metrics::time(Metric::HealAbandonedObject);
         let object = if oi.name.is_empty() {
             self.object_path()
         } else {
             oi.name.clone()
         };
+        if is_scanner_owned_usage_observation(&self.bucket, &object) {
+            debug!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_HEAL_ADMISSION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                bucket = %self.bucket,
+                object = %object,
+                state = "skipped_internal_usage_observation",
+                "Scanner heal admission skipped internal usage observation"
+            );
+            return;
+        }
+        let done_heal = Metrics::time(Metric::HealAbandonedObject);
         debug!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_HEAL_ADMISSION,
@@ -1332,6 +1349,19 @@ pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, Scann
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_owned_usage_observation_matches_only_its_internal_path() {
+        let object = crate::data_usage_define::DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str();
+
+        assert!(is_scanner_owned_usage_observation(crate::RUSTFS_META_BUCKET, object));
+        assert!(!is_scanner_owned_usage_observation("bucket", object));
+        assert!(!is_scanner_owned_usage_observation(crate::RUSTFS_META_BUCKET, "buckets/.usage.v2.json"));
+        assert!(!is_scanner_owned_usage_observation(
+            crate::RUSTFS_META_BUCKET,
+            "buckets/.usage.observed.json.extra"
+        ));
+    }
 
     fn scanner_item_with_prefix(prefix: &str) -> ScannerItem {
         ScannerItem {
