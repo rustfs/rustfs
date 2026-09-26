@@ -410,6 +410,12 @@ impl Drop for ObjectLockDiagGuard {
         }
 
         let hold = self.acquired_at.elapsed();
+        if self.op == "put_object_commit" && self.mode == "write" && rustfs_io_metrics::put_stage_metrics_enabled() {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD,
+                hold.as_secs_f64() * 1000.0,
+            );
+        }
         record_object_lock_diag_hold_duration(self.op, self.mode, hold);
         let threshold = get_object_lock_diag_slow_hold_threshold();
         if hold >= threshold {

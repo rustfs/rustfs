@@ -19,6 +19,7 @@ use hyper::{Request, Response};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tower::Service;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -32,6 +33,13 @@ pub(crate) fn is_grpc_request<B>(req: &Request<B>) -> bool {
     matches!(
         (req.version(), req.headers().get(hyper::header::CONTENT_TYPE)),
         (hyper::Version::HTTP_2, Some(value)) if value.as_bytes().starts_with(b"application/grpc")
+    )
+}
+
+fn rename_data_grpc_stage(path: &str) -> bool {
+    matches!(
+        path,
+        "/node_service.NodeService/RenameData" | "/node_service.NodeService/RenameDataAtIncarnation"
     )
 }
 
@@ -71,8 +79,11 @@ where
     /// as a REST request
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         if is_grpc_request(&req) {
+            let observe_rename_data = rename_data_grpc_stage(req.uri().path());
             HybridFuture::Grpc {
                 grpc_future: self.grpc.call(req),
+                observe_rename_data,
+                service_future_started: rustfs_io_metrics::put_stage_timer(),
             }
         } else {
             HybridFuture::Rest {
@@ -93,7 +104,10 @@ pin_project! {
         },
         Grpc {
             #[pin]
-            grpc_body: GrpcBody
+            grpc_body: GrpcBody,
+            first_frame_started: Option<Instant>,
+            body_started: Option<Instant>,
+            first_frame_recorded: bool,
         },
     }
 }
@@ -123,21 +137,44 @@ where
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Rest { rest_body } => rest_body.is_end_stream(),
-            Self::Grpc { grpc_body } => grpc_body.is_end_stream(),
+            Self::Grpc { grpc_body, .. } => grpc_body.is_end_stream(),
         }
     }
 
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
             HybridBodyProj::Rest { rest_body } => rest_body.poll_frame(cx).map_err(Into::into),
-            HybridBodyProj::Grpc { grpc_body } => grpc_body.poll_frame(cx).map_err(Into::into),
+            HybridBodyProj::Grpc {
+                mut grpc_body,
+                first_frame_started,
+                body_started,
+                first_frame_recorded,
+            } => {
+                let poll = grpc_body.as_mut().poll_frame(cx).map_err(Into::into);
+                if !*first_frame_recorded && let Poll::Ready(_) = &poll {
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_TRANSPORT_FIRST_FRAME,
+                        first_frame_started.take(),
+                    );
+                    *first_frame_recorded = true;
+                }
+                let body_complete = matches!(&poll, Poll::Ready(None))
+                    || (matches!(&poll, Poll::Ready(Some(Ok(_)))) && grpc_body.as_ref().get_ref().is_end_stream());
+                if body_complete {
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_TRANSPORT_BODY_COMPLETE,
+                        body_started.take(),
+                    );
+                }
+                poll
+            }
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
             Self::Rest { rest_body } => rest_body.size_hint(),
-            Self::Grpc { grpc_body } => grpc_body.size_hint(),
+            Self::Grpc { grpc_body, .. } => grpc_body.size_hint(),
         }
     }
 }
@@ -154,6 +191,8 @@ pin_project! {
         Grpc {
             #[pin]
             grpc_future: GrpcFuture,
+            observe_rename_data: bool,
+            service_future_started: Option<Instant>,
         },
     }
 }
@@ -174,8 +213,27 @@ where
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
                 Poll::Pending => Poll::Pending,
             },
-            HybridFutureProj::Grpc { grpc_future } => match grpc_future.poll(cx) {
-                Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(|grpc_body| HybridBody::Grpc { grpc_body }))),
+            HybridFutureProj::Grpc {
+                grpc_future,
+                observe_rename_data,
+                service_future_started,
+            } => match grpc_future.poll(cx) {
+                Poll::Ready(Ok(res)) => {
+                    if *observe_rename_data {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_TRANSPORT_SERVICE_FUTURE,
+                            service_future_started.take(),
+                        );
+                    }
+                    let first_frame_started = (*observe_rename_data).then(Instant::now);
+                    let body_started = (*observe_rename_data).then(Instant::now);
+                    Poll::Ready(Ok(res.map(|grpc_body| HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded: !*observe_rename_data,
+                    })))
+                }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
                 Poll::Pending => Poll::Pending,
             },

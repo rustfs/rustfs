@@ -448,6 +448,11 @@ pub(crate) async fn begin(
     let snapshot_admission = opts.quota_admission;
     let data_movement = opts.data_movement;
     if crate::bucket::utils::is_meta_bucketname(bucket) {
+        let meta_bucket_fast_path_started = rustfs_io_metrics::put_stage_timer();
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
+            meta_bucket_fast_path_started,
+        );
         return Ok(QuotaContext {
             store: None,
             bucket: bucket.to_string(),
@@ -501,9 +506,20 @@ pub(crate) async fn begin(
         });
     }
 
+    let metadata_lock_started = rustfs_io_metrics::put_stage_timer();
     let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
+        metadata_lock_started,
+    );
+    let config_read_started = rustfs_io_metrics::put_stage_timer();
     let (quota, bucket_incarnation, quota_revision) =
         metadata_sys::get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONFIG_READ,
+        config_read_started,
+    );
+    let lock_lost_check_started = rustfs_io_metrics::put_stage_timer();
     if metadata_guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "quota_config",
@@ -513,6 +529,11 @@ pub(crate) async fn begin(
             achieved: 0,
         });
     }
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_LOCK_LOST_CHECK,
+        lock_lost_check_started,
+    );
+    let policy_evaluate_started = rustfs_io_metrics::put_stage_timer();
     if quota
         .as_ref()
         .is_some_and(|quota| quota.has_unsupported_reservation_protocol())
@@ -521,6 +542,11 @@ pub(crate) async fn begin(
         return Err(StorageError::PartMissingOrCorrupt);
     }
     let durable_quota = quota.as_ref().filter(|quota| quota.uses_durable_reservations());
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
+        policy_evaluate_started,
+    );
+    let capability_proof_started = rustfs_io_metrics::put_stage_timer();
     let capability_proof = if durable_quota.is_some() {
         Some(
             crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
@@ -529,7 +555,12 @@ pub(crate) async fn begin(
     } else {
         None
     };
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF,
+        capability_proof_started,
+    );
     let durable_quota_limit = durable_quota.and_then(|quota| quota.quota);
+    let snapshot_admission_started = rustfs_io_metrics::put_stage_timer();
     let snapshot_admission = match quota.as_ref().filter(|quota| !quota.uses_durable_reservations()) {
         Some(quota) => match (quota.quota, snapshot_admission) {
             (Some(limit), Some(admission)) if admission.quota_limit() == limit => Some(admission),
@@ -548,6 +579,10 @@ pub(crate) async fn begin(
         },
         None => None,
     };
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION,
+        snapshot_admission_started,
+    );
     let legacy_data_movement = durable_quota_limit.is_none()
         && quota.as_ref().and_then(|quota| quota.quota).is_some()
         && snapshot_admission.is_none()
@@ -559,11 +594,21 @@ pub(crate) async fn begin(
                 .then(|| quota.as_ref().and_then(|quota| quota.quota))
                 .flatten()
         });
+    let object_store_lookup_started = rustfs_io_metrics::put_stage_timer();
     let store = if durable_quota_limit.is_some() {
         Some(metadata_sys::object_store_in(ctx).await?)
     } else {
         None
     };
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP,
+        object_store_lookup_started,
+    );
+    let context_build_started = rustfs_io_metrics::put_stage_timer();
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD,
+        context_build_started,
+    );
     Ok(QuotaContext {
         store,
         bucket: bucket.to_string(),

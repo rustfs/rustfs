@@ -1721,6 +1721,7 @@ impl DefaultObjectUsecase {
             )?;
         }
 
+        let checksum_input_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut md5hex = match content_md5 {
             Some(PutObjectContentMd5::Base64(base64_md5)) => {
                 let md5 = base64_simd::STANDARD
@@ -1733,12 +1734,15 @@ impl DefaultObjectUsecase {
         };
 
         let mut sha256hex = get_content_sha256_with_query(headers, query);
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_checksum_input_prepare", checksum_input_stage_start);
 
         let mut write_plan = WritePlan::new();
         // Additional-checksum (XXHash3/64/128, SHA-512) values to echo on the PutObject
         // response (#1256); captured at want_checksum set points before opts is moved.
         let mut put_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
+        let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut reader = if should_compress {
+            let compressed_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
                 StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
@@ -1761,51 +1765,98 @@ impl DefaultObjectUsecase {
 
             size = HashReader::SIZE_PRESERVE_LAYER;
             write_plan = write_plan.with_compression(algorithm);
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                "app_reader_prepare_compressed",
+                compressed_reader_stage_start,
+            );
             hrd
         } else {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
+                let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let eager_body = read_zero_copy_put_body_exact(body, body_size as usize).await?;
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_body_eager_read_zero_copy", eager_read_stage_start);
                 rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
-                HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let reader =
+                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_hash_reader_setup_zero_copy",
+                    hash_reader_stage_start,
+                );
+                reader
             } else if use_empty_or_small_eager_put_path {
                 if (body_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
+                    let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_direct(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                     )
                     .await?;
-                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "app_body_eager_read_small_direct",
+                        eager_read_stage_start,
+                    );
+                    let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                    let reader = HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false)
+                        .map_err(ApiError::from)?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "app_hash_reader_setup_small_direct",
+                        hash_reader_stage_start,
+                    );
+                    reader
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
+                    let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_pooled(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                         pool.as_ref(),
                     )
                     .await?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "app_body_eager_read_small_pooled",
+                        eager_read_stage_start,
+                    );
+                    let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_reader = PooledBufferReader::new(eager_body, body_size as usize);
-                    HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                    let reader = HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false)
+                        .map_err(ApiError::from)?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "app_hash_reader_setup_small_pooled",
+                        hash_reader_stage_start,
+                    );
+                    reader
                 }
             } else {
+                let streaming_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
                     StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                 );
-                HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+                let reader =
+                    HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    "app_reader_prepare_streaming",
+                    streaming_reader_stage_start,
+                );
+                reader
             }
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_reader_prepare", reader_prepare_stage_start);
 
         if size >= 0 {
+            let checksum_setup_stage_start = put_stage_metrics_enabled.then(Instant::now);
             if let Err(err) = reader.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
             }
 
             opts.want_checksum = reader.checksum();
             put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
+            rustfs_io_metrics::record_put_object_stage_duration_from("app_reader_checksum_setup", checksum_setup_stage_start);
         }
         rustfs_io_metrics::record_put_object_path(put_path);
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);

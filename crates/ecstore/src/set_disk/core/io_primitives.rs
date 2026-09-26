@@ -4032,6 +4032,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     Submit: FnOnce(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
     SubmitFuture: Future<Output = ()> + Send,
 {
+    let tail_async_started = rustfs_io_metrics::put_stage_timer();
     let (needs_heal, tail_cleanup, tail_complete) = match tail_drain.await {
         Ok(Some(outcome)) => (outcome.convergence.needs_heal(), outcome.cleanup, true),
         Ok(None) => {
@@ -4060,6 +4061,10 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
             (true, Vec::new(), false)
         }
     };
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_ASYNC_WAIT,
+        tail_async_started,
+    );
     // A dropped sender means the request continuation was cancelled. Cleanup
     // must still run; only the explicit `false` used by the hard-crash harness
     // suppresses all in-process continuation work.
@@ -4388,6 +4393,11 @@ impl SetDisks {
                             let Some(disk) = disk else {
                                 return Err(DiskError::DiskNotFound);
                             };
+                            let disk_wait_location_stage = if disk.is_local() {
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
+                            } else {
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
+                            };
 
                             let is_delete_marker = file_info.is_canonical_delete_marker();
                             // Clone FileInfo and set erasure.index for this disk
@@ -4435,6 +4445,7 @@ impl SetDisks {
                                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
                                     duration_ms,
                                 );
+                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
                                 let position = if result.is_ok() {
                                     let rank = successful_rename_completion_rank
                                         .as_ref()
@@ -4476,6 +4487,7 @@ impl SetDisks {
                 let mut capacity_scope_generation = None;
                 let mut cleanup_at_snapshot = vec![false; disk_count];
 
+                let mut tail_after_quorum_started = None;
                 while let Some(joined) = tasks.join_next().await {
                     results_seen += 1;
                     match joined {
@@ -4520,8 +4532,13 @@ impl SetDisks {
                             let _ = commit_tx.send(snapshot_commit);
                         }
                         sent_commit = true;
+                        tail_after_quorum_started = rustfs_io_metrics::put_stage_timer();
                     }
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT,
+                    tail_after_quorum_started,
+                );
 
                 #[cfg(test)]
                 rollback_fault_injection::after_fanout(&fanout_dst_object);
@@ -4777,6 +4794,11 @@ impl SetDisks {
                             let Some(disk) = disk else {
                                 return Err(DiskError::DiskNotFound);
                             };
+                            let disk_wait_location_stage = if disk.is_local() {
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
+                            } else {
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
+                            };
 
                             let is_delete_marker = file_info.is_canonical_delete_marker();
                             let mut local_file_info;
@@ -4838,6 +4860,7 @@ impl SetDisks {
                                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
                                     duration_ms,
                                 );
+                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
                                 let position = if result.is_ok() {
                                     let rank = successful_rename_completion_rank
                                         .as_ref()
@@ -4875,7 +4898,12 @@ impl SetDisks {
         let mut old_current_sizes = vec![None; disk_count];
 
         let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
+        let sync_full_fanout_started = rustfs_io_metrics::put_stage_timer();
         let fanout_result = fanout.await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SYNC_FULL_FANOUT_WAIT,
+            sync_full_fanout_started,
+        );
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             quorum_wait_started,
