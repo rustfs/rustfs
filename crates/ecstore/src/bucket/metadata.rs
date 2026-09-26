@@ -18,9 +18,10 @@ use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
 use crate::bucket::utils::deserialize;
-use crate::config::com::{read_config, read_config_preserve_empty, save_config};
+use crate::config::com::{read_config, read_config_preserve_empty, save_config, save_config_with_opts};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
+use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -437,6 +438,7 @@ pub struct BucketMetadata {
     pub lock_enabled: bool, // While marked as unused, it may need to be retained
     pub bucket_incarnation_id: Uuid,
     pub(crate) bucket_incarnation_sidecar: bool,
+    pub(crate) bucket_creation_committed: bool,
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -511,6 +513,7 @@ impl Default for BucketMetadata {
             lock_enabled: Default::default(),
             bucket_incarnation_id: Uuid::nil(),
             bucket_incarnation_sidecar: false,
+            bucket_creation_committed: false,
             policy_config_json: Default::default(),
             notification_config_xml: Default::default(),
             lifecycle_config_xml: Default::default(),
@@ -592,6 +595,22 @@ impl BucketMetadata {
         let mut metadata = Self::new(name);
         metadata.durability_config_json = super::durability::new_bucket_durability_config_json();
         metadata
+    }
+
+    /// Whether this generation still needs its creation-commit proof.
+    ///
+    /// The proof is only ever written while the caller holds the bucket
+    /// metadata transaction fence; see
+    /// `BucketMetadataSys::migrate_bucket_creation_commit`.
+    ///
+    /// Metadata without an authoritative incarnation sidecar is owned by the
+    /// legacy migration path, which mints the sidecar first; it must not be
+    /// rewritten by this migration.
+    pub(crate) fn needs_bucket_creation_commit(&self) -> bool {
+        self.lock_enabled
+            && !self.bucket_creation_committed
+            && self.bucket_incarnation_sidecar
+            && !self.bucket_incarnation_id.is_nil()
     }
 
     pub fn save_file_path(&self) -> String {
@@ -733,6 +752,7 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketCreationCommitted" => self.bucket_creation_committed = read_msgp_bool(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -745,8 +765,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (21)
-        let map_len: u32 = 46;
+        // Map size: MinIO fields (25) + RustFS extensions (22)
+        let map_len: u32 = 47;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -827,6 +847,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
+        rmp::encode::write_str(wr, "BucketCreationCommitted")?;
+        rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
 
         Ok(())
     }
@@ -982,6 +1004,11 @@ impl BucketMetadata {
                 self.object_lock_config = None;
                 if !data.is_empty() {
                     self.lock_enabled = true;
+                    // Enabling Object Lock is only reachable for a bucket that
+                    // already exists: the caller validated physical presence and
+                    // holds the incarnation fence, so this generation is committed
+                    // and must never be mistaken for a pre-physical creation intent.
+                    self.bucket_creation_committed = true;
                 }
                 self.object_lock_config_xml = data;
                 self.object_lock_config_updated_at = updated;
@@ -1086,6 +1113,21 @@ impl BucketMetadata {
     /// server's bucket metadata lands in that server's `.rustfs.sys`, not the
     /// ambient (first) one. [`BucketMetadata::save`] keeps the ambient default.
     pub async fn save_with_store(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
+        self.save_with_store_completion(store, WriteCompletion::Quorum).await
+    }
+
+    /// Persist a committed creation record and drain the rename fan-out before
+    /// returning. A quorum ACK is insufficient here: later degraded reads may
+    /// have to reconstruct this record from any read quorum of surviving shards.
+    pub(crate) async fn save_with_store_committed(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
+        self.save_with_store_completion(store, WriteCompletion::TailDrained).await
+    }
+
+    async fn save_with_store_completion(
+        &mut self,
+        store: std::sync::Arc<crate::store::ECStore>,
+        write_completion: WriteCompletion,
+    ) -> Result<()> {
         self.parse_all_configs()?;
         let mut buf: Vec<u8> = vec![0; 4];
 
@@ -1099,7 +1141,17 @@ impl BucketMetadata {
 
         buf.extend_from_slice(&data);
 
-        save_config(store, self.save_file_path().as_str(), buf).await?;
+        save_config_with_opts(
+            store,
+            self.save_file_path().as_str(),
+            buf,
+            &crate::object_api::ObjectOptions {
+                max_parity: true,
+                write_completion,
+                ..Default::default()
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -1451,8 +1503,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
         }
     };
 
-    let incarnation = load_bucket_incarnation(api, bucket).await?;
+    let incarnation = load_bucket_incarnation(api.clone(), bucket).await?;
     if persisted {
+        if bm.name.is_empty() {
+            bm.name = bucket.to_string();
+        } else if bm.name != bucket {
+            return Err(Error::FileCorrupt);
+        }
         if let Some(incarnation) = incarnation {
             if !bm.bucket_incarnation_id.is_nil() && bm.bucket_incarnation_id != incarnation {
                 return Err(Error::other("bucket incarnation sidecar does not match bucket metadata"));
@@ -1622,6 +1679,7 @@ mod test {
         BucketMetadata::check_header(&body).expect("recovered body is a valid .metadata.bin");
         let mut bm = BucketMetadata::unmarshal(&body[4..]).expect("unmarshal recovered blob");
         assert_eq!(bm.name, "interop");
+        assert!(!bm.bucket_creation_committed, "legacy metadata must default to uncommitted");
         bm.parse_all_configs().expect("parse recovered configs");
         assert!(bm.lifecycle_config.is_some());
     }
@@ -1630,13 +1688,15 @@ mod test {
     async fn marshal_msg() {
         // write_time(OffsetDateTime::UNIX_EPOCH).unwrap();
 
-        let bm = BucketMetadata::new("dada");
+        let mut bm = BucketMetadata::new("dada");
+        bm.bucket_creation_committed = true;
 
         let buf = bm.marshal_msg().unwrap();
 
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+        assert!(new.bucket_creation_committed);
         assert!(!bm.bucket_incarnation_id.is_nil());
         assert_eq!(bm.bucket_incarnation_id, new.bucket_incarnation_id);
     }
