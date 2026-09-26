@@ -694,8 +694,7 @@ impl ECStore {
         let lock_newly_enabled = opts.lock_enabled && !meta.lock_enabled;
         if opts.lock_enabled {
             meta.lock_enabled = true;
-            meta.object_lock_config_xml =
-                crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)?;
+            meta.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)?;
             meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
@@ -2602,11 +2601,8 @@ mod tests {
             .await
             .expect("persist legacy-shaped metadata");
 
-        let lock_xml = crate::bucket::utils::serialize::<s3s::dto::ObjectLockConfiguration>(&s3s::dto::ObjectLockConfiguration {
-            object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-            rule: None,
-        })
-        .expect("serialize Object Lock configuration");
+        let lock_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)
+            .expect("serialize Object Lock configuration");
         metadata_sys::update_in(&store.ctx, &bucket, "object-lock.xml", lock_xml)
             .await
             .expect("enabling Object Lock on an existing bucket must succeed");
@@ -2653,11 +2649,7 @@ mod tests {
         // update lands on disk after the migrating node read its snapshot.
         let mut newer = stale.clone();
         newer.lock_enabled = true;
-        newer.object_lock_config_xml =
-            crate::bucket::utils::serialize::<s3s::dto::ObjectLockConfiguration>(&s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: None,
-            })
+        newer.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)
             .expect("serialize Object Lock configuration");
         newer
             .save_with_store(store.clone())
@@ -2701,11 +2693,7 @@ mod tests {
             .as_ref()
             .clone();
         stale.lock_enabled = true;
-        stale.object_lock_config_xml =
-            crate::bucket::utils::serialize::<s3s::dto::ObjectLockConfiguration>(&s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: None,
-            })
+        stale.object_lock_config_xml = crate::bucket::utils::serialize(&*crate::store::ENABLED_OBJECT_LOCK_CONFIG)
             .expect("serialize Object Lock configuration");
         stale.bucket_creation_committed = false;
         stale.save_with_store(store.clone()).await.expect("persist stale metadata");
