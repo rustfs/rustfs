@@ -44,7 +44,7 @@ permissions:
 jobs:
   forced-failure:
     name: Forced failure
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - name: Fail on purpose
@@ -58,7 +58,7 @@ jobs:
     # Mirrors the consumer wiring, minus the schedule-event guard (this
     # workflow is dispatch-only by design).
     if: always() && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

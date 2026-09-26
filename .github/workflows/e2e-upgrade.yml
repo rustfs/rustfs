@@ -90,7 +90,7 @@ jobs:
             cache_key: e2e-multipart-layout-baseline
             test: rc5_baseline_replicates_multipart_layouts
             artifact: multipart-layout-baseline
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

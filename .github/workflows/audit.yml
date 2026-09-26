@@ -77,7 +77,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -89,7 +89,7 @@ jobs:
   cargo-deny:
     name: Cargo Deny
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 20
     steps:
       - name: Checkout repository
@@ -132,7 +132,7 @@ jobs:
   workflow-pin-report:
     name: Workflow Pin Report
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     steps:
       - name: Checkout repository
@@ -169,7 +169,7 @@ jobs:
 
   dependency-review:
     name: Dependency Review
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
@@ -204,7 +204,7 @@ jobs:
     # open the Actions tab. Same ci-8 mechanism coverage.yml and
     # e2e-replication-nightly.yml already use.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read

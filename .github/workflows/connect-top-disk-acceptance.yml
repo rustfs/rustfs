@@ -45,7 +45,7 @@ permissions:
 jobs:
   top-disk:
     name: Verify native Linux x86_64 top.disk artifact
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     steps:
       - name: Checkout acceptance harness
