@@ -48,9 +48,10 @@ jobs:
       chart_version: ${{ steps.version.outputs.chart_version }}
 
     steps:
-      - name: Checkout helm chart repo
+      - name: Checkout release source
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: ${{ github.event.workflow_run.head_sha || (startsWith(inputs.version, 'refs/tags/') && inputs.version || format('refs/tags/{0}', inputs.version)) }}
           persist-credentials: false
 
       # Both inputs reach the shell through env rather than `${{ }}`
@@ -82,6 +83,40 @@ jobs:
           esac
 
           ./scripts/helm_chart_version.sh "$RAW_TAG"
+
+      # Docker and Helm share the binary-build trigger. Do not publish a chart
+      # until the image selected by its default appVersion is pullable.
+      - name: Wait for release image
+        timeout-minutes: 20
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+             [[ "$APP_VERSION" == *-preview* ]]; then
+            echo "Invalid deliverable image version: $APP_VERSION" >&2
+            exit 1
+          fi
+
+          for attempt in {1..60}; do
+            if token=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 20 \
+              'https://auth.docker.io/token?service=registry.docker.io&scope=repository:rustfs/rustfs:pull' \
+              | jq -er '.token // empty') &&
+              curl --fail --silent --show-error --head --connect-timeout 10 --max-time 20 \
+                --header "Authorization: Bearer $token" \
+                --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                "https://registry-1.docker.io/v2/rustfs/rustfs/manifests/$APP_VERSION" > /dev/null; then
+              echo "Release image is available: rustfs/rustfs:$APP_VERSION"
+              exit 0
+            fi
+            echo "Waiting for rustfs/rustfs:$APP_VERSION ($attempt/60)"
+            if (( attempt < 60 )); then
+              sleep 15
+            fi
+          done
+
+          echo "Release image is unavailable; refusing to publish Helm chart" >&2
+          exit 1
 
       - name: Replace chart version and app version
         env:
