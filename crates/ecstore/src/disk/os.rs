@@ -522,6 +522,10 @@ const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE: bool = false;
 const ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: &str = "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS";
 const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 0;
 const MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 1_000;
+const ENV_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS: &str =
+    "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS";
+const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS: u64 = 0;
+const MAX_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS: u64 = 1_000;
 #[cfg(not(test))]
 const MAX_DST_DIR_FSYNC_GROUPS: usize = 1024;
 #[cfg(test)]
@@ -552,10 +556,20 @@ fn file_fdatasync_group_commit_wait_duration(wait_micros: u64) -> Duration {
     Duration::from_micros(wait_micros.min(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS))
 }
 
+fn file_fdatasync_group_commit_follower_timeout_duration(timeout_micros: u64) -> Duration {
+    Duration::from_micros(timeout_micros.min(MAX_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS))
+}
+
 static FILE_FDATASYNC_GROUP_COMMIT_WAIT: LazyLock<Duration> = LazyLock::new(|| {
     file_fdatasync_group_commit_wait_duration(rustfs_utils::get_env_u64(
         ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
         DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
+    ))
+});
+static FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    file_fdatasync_group_commit_follower_timeout_duration(rustfs_utils::get_env_u64(
+        ENV_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS,
+        DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS,
     ))
 });
 
@@ -607,6 +621,7 @@ mod file_fdatasync_group_commit_override {
 
     static OVERRIDE: RwLock<Option<bool>> = RwLock::new(None);
     static WAIT_OVERRIDE_MICROS: RwLock<Option<u64>> = RwLock::new(None);
+    static FOLLOWER_TIMEOUT_OVERRIDE_MICROS: RwLock<Option<u64>> = RwLock::new(None);
     static SERIAL: Mutex<()> = Mutex::new(());
 
     pub(crate) fn get() -> Option<bool> {
@@ -621,6 +636,9 @@ mod file_fdatasync_group_commit_override {
         fn drop(&mut self) {
             *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
             *WAIT_OVERRIDE_MICROS.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
@@ -637,6 +655,18 @@ mod file_fdatasync_group_commit_override {
     pub(crate) fn wait_micros() -> Option<u64> {
         *WAIT_OVERRIDE_MICROS.read().unwrap_or_else(PoisonError::into_inner)
     }
+
+    pub(crate) fn set_follower_timeout_micros(timeout_micros: u64) {
+        *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(timeout_micros);
+    }
+
+    pub(crate) fn follower_timeout_micros() -> Option<u64> {
+        *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +677,11 @@ pub(crate) fn set_file_fdatasync_group_commit_for_test(enabled: bool) -> file_fd
 #[cfg(test)]
 fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
     file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
+}
+
+#[cfg(test)]
+fn set_file_fdatasync_group_commit_follower_timeout_for_test(timeout_micros: u64) {
+    file_fdatasync_group_commit_override::set_follower_timeout_micros(timeout_micros);
 }
 
 fn file_fdatasync_group_commit_enabled() -> bool {
@@ -665,6 +700,15 @@ fn file_fdatasync_group_commit_wait() -> Duration {
     }
 
     *FILE_FDATASYNC_GROUP_COMMIT_WAIT
+}
+
+fn file_fdatasync_group_commit_follower_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout_micros) = file_fdatasync_group_commit_override::follower_timeout_micros() {
+        return file_fdatasync_group_commit_follower_timeout_duration(timeout_micros);
+    }
+
+    *FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -1125,7 +1169,11 @@ impl FileFdatasyncGroupCommit {
         &self,
         disk_permits: Arc<Semaphore>,
         files: Vec<PathBuf>,
-    ) -> io::Result<(oneshot::Receiver<SharedFileFdatasyncResult>, Option<Arc<FileFdatasyncGroup>>)> {
+    ) -> io::Result<(
+        oneshot::Receiver<SharedFileFdatasyncResult>,
+        Option<Arc<FileFdatasyncGroup>>,
+        &'static str,
+    )> {
         if files.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1195,7 +1243,7 @@ impl FileFdatasyncGroupCommit {
         registry.total_files += file_count;
         drop(group_state);
         drop(registry);
-        Ok((result_rx, start_worker.then_some(group)))
+        Ok((result_rx, start_worker.then_some(group), wait_role))
     }
 
     fn complete_batch(&self, waiters: usize, files: usize) {
@@ -1306,12 +1354,29 @@ async fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) {
 }
 
 async fn sync_files_group_commit(files: Vec<PathBuf>, disk_permits: Arc<Semaphore>) -> io::Result<()> {
-    let (result_rx, worker) = FILE_FDATASYNC_GROUP_COMMIT.enqueue(disk_permits, files)?;
+    let fallback_files = files.clone();
+    let (result_rx, worker, wait_role) = FILE_FDATASYNC_GROUP_COMMIT.enqueue(disk_permits.clone(), files)?;
     if let Some(group) = worker {
         tokio::spawn(run_file_fdatasync_group_worker(group));
     }
 
-    match result_rx.await {
+    let follower_timeout = file_fdatasync_group_commit_follower_timeout();
+    let result = if wait_role == rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER && !follower_timeout.is_zero() {
+        match tokio::time::timeout(follower_timeout, result_rx).await {
+            Ok(result) => result,
+            Err(_) => {
+                rustfs_io_metrics::record_put_rename_fdatasync_group_wait(
+                    rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT,
+                    follower_timeout.as_secs_f64() * 1000.0,
+                );
+                return run_file_sync_blocking(disk_permits, move || sync_files(&fallback_files)).await;
+            }
+        }
+    } else {
+        result_rx.await
+    };
+
+    match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err.into_error()),
         Err(_) => Err(io::Error::other("file fdatasync group worker dropped the waiter")),
@@ -7398,6 +7463,71 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_follower_timeout_uses_independent_sync() {
+        use std::sync::mpsc;
+
+        let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(0);
+        set_file_fdatasync_group_commit_follower_timeout_for_test(1_000);
+        clear_file_fdatasync_group_commit_for_test();
+        let temp_dir = tempdir().expect("create temp dir");
+        let first_dir = temp_dir.path().join("first");
+        let second_dir = temp_dir.path().join("second");
+        std::fs::create_dir(&first_dir).expect("create first dir");
+        std::fs::create_dir(&second_dir).expect("create second dir");
+        std::fs::write(first_dir.join("part.1"), b"first").expect("write first part");
+        std::fs::write(second_dir.join("part.1"), b"second").expect("write second part");
+        let _probe = file_sync_probe::set_blocking(temp_dir.path());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_batch_tx, release_batch_rx) = mpsc::channel();
+        file_sync_probe::set_before_group_batch(move || {
+            entered_tx.send(()).expect("signal first file fdatasync group worker");
+            release_batch_rx.recv().expect("wait until follower timeout path is observed");
+        });
+
+        let limiter = file_sync_limiter();
+        let first_limiter = limiter.clone();
+        let first_path = first_dir.clone();
+        let first = tokio::spawn(async move { sync_dir_files_with_limiter(first_path, first_limiter).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("group worker hook waiter should run")
+            .expect("first file fdatasync group worker should start");
+
+        let second_limiter = limiter.clone();
+        let second_path = second_dir.clone();
+        let second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
+        file_sync_probe::wait_for_active(1).await;
+        file_sync_probe::release();
+        second
+            .await
+            .expect("join follower timeout file sync")
+            .expect("follower timeout independent sync must succeed");
+        assert!(
+            fsync_dir_recorder::was_fsynced(&second_dir),
+            "follower timeout path must still fsync the source directory"
+        );
+
+        release_batch_tx.send(()).expect("release original group batch hook");
+        first
+            .await
+            .expect("join leader grouped file sync")
+            .expect("leader grouped file sync must succeed");
+        assert!(
+            fsync_dir_recorder::was_fsynced(&first_dir),
+            "leader source directory must still be fsynced"
+        );
+        assert_eq!(
+            file_sync_probe::group_batches(),
+            vec![2],
+            "timed-out follower remains in the original best-effort group batch, but request completion is independent"
+        );
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
+        file_sync_probe::wait_for_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
     async fn file_fdatasync_group_commit_failure_fails_all_waiters_before_dir_fsync() {
         use std::sync::mpsc;
 
@@ -7473,7 +7603,7 @@ mod tests {
         let mut limiters = Vec::new();
         for index in 0..MAX_FILE_FDATASYNC_GROUPS {
             let limiter = Arc::new(Semaphore::new(1));
-            let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
+            let (result_rx, _worker, _wait_role) = FILE_FDATASYNC_GROUP_COMMIT
                 .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))])
                 .expect("group below cap should enqueue");
             limiters.push(limiter);
@@ -7501,7 +7631,7 @@ mod tests {
         let limiter = Arc::new(Semaphore::new(1));
         let mut receivers = Vec::new();
         for index in 0..MAX_FILE_FDATASYNC_WAITERS {
-            let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
+            let (result_rx, _worker, _wait_role) = FILE_FDATASYNC_GROUP_COMMIT
                 .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))])
                 .expect("waiter below cap should enqueue");
             receivers.push(result_rx);
@@ -7518,7 +7648,7 @@ mod tests {
 
         let mut receivers = Vec::new();
         let file_limit_limiter = Arc::new(Semaphore::new(1));
-        let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
+        let (result_rx, _worker, _wait_role) = FILE_FDATASYNC_GROUP_COMMIT
             .enqueue(
                 file_limit_limiter.clone(),
                 (0..MAX_FILE_FDATASYNC_BATCH_FILES)
