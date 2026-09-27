@@ -3804,6 +3804,10 @@ impl SetDisks {
         );
     }
 
+    fn needs_old_data_cleanup_receipt(old_data_dir: Uuid, committed_data_dir: Option<Uuid>, epoch: Option<Uuid>) -> bool {
+        epoch.is_some() && committed_data_dir != Some(old_data_dir)
+    }
+
     pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
         &self,
         disks: &[Option<DiskStore>],
@@ -3813,10 +3817,10 @@ impl SetDisks {
         committed_data_dir: Option<Uuid>,
         epoch: Option<Uuid>,
     ) {
-        let Some(epoch) = epoch else { return };
-        if committed_data_dir == Some(old_data_dir) {
+        if !Self::needs_old_data_cleanup_receipt(old_data_dir, committed_data_dir, epoch) {
             return;
         }
+        let Some(epoch) = epoch else { return };
         let receipt = OldDataCleanupReceipt::new(epoch, old_data_dir, committed_data_dir);
         let Ok(encoded) = receipt.encode() else {
             return;
@@ -5540,7 +5544,9 @@ impl SetDisks {
                 let rename_stage_elapsed = rename_stage_start.elapsed();
                 let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
 
-                if let Some(old_dir) = op_old_dir {
+                if let Some(old_dir) = op_old_dir
+                    && Self::needs_old_data_cleanup_receipt(old_dir, committed_data_dir, transaction_epoch)
+                {
                     rustfs_io_metrics::record_put_object_stage_duration(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_TRIGGERED,
                         1.0,
@@ -23694,5 +23700,21 @@ mod single_delete_namespace_owner_tests {
     #[serial_test::serial(capacity_dirty_scope)]
     async fn single_delete_failed_quorum_keeps_owner_until_physical_undo() {
         assert_single_delete_physical_owner("rollback").await;
+    }
+}
+
+#[cfg(test)]
+mod cleanup_receipt_admission_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_admission_skips_only_work_that_the_writer_would_skip() {
+        let old = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        assert!(!SetDisks::needs_old_data_cleanup_receipt(old, Some(current), None));
+        assert!(!SetDisks::needs_old_data_cleanup_receipt(old, Some(old), Some(epoch)));
+        assert!(SetDisks::needs_old_data_cleanup_receipt(old, Some(current), Some(epoch)));
+        assert!(SetDisks::needs_old_data_cleanup_receipt(old, None, Some(epoch)));
     }
 }
