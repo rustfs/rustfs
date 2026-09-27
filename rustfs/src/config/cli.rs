@@ -1043,6 +1043,10 @@ pub struct ConnectProfileOpts {
     #[arg(long = "thread-scope", value_enum)]
     pub thread_scope: Option<ConnectThreadProfileScope>,
 
+    /// SHA-256 of the enrolled offline public key; required for service runtime capture
+    #[arg(long = "offline-key-id")]
+    pub offline_key_id: Option<String>,
+
     /// Negotiated producer schema version
     #[arg(long = "schema-version", default_value_t = 1)]
     pub schema_version: u16,
