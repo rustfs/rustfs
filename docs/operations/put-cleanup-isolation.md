@@ -17,7 +17,7 @@ not disable healing or skip cleanup.
 | `RUSTFS_CLEANUP_DISK_WORKERS` | blocking threads (`4`) | Maximum active disk cleanup operations within that budget. |
 | `RUSTFS_CLEANUP_GC_WORKERS` | `1` | Maximum periodic disk scans producing GC steps. |
 | `RUSTFS_CLEANUP_BLOCKING_THREADS` | `4` | Maximum additional blocking threads on the cleanup runtime. |
-| `RUSTFS_CLEANUP_CPUS` | unset | Optional Linux CPU affinity mask, for example `4-5,8`. Applies to async and blocking threads. |
+| `RUSTFS_CLEANUP_CPUS` | `1-2` on Linux; unbound elsewhere | CPU affinity for cleanup async and blocking threads. Override with a CPU list such as `4-5,8`, or `none` to disable affinity while keeping isolation. |
 | `RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_ENABLE` | `false` | Use the existing bounded deferred queue before coordinator execution. Isolation also works without this queue. |
 | `RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_QUEUE_CAPACITY` | `1024` | Capacity of that existing queue; this is not the total admission budget. |
 
@@ -28,6 +28,12 @@ to the initiating thread's allowed CPU set. Non-Linux hosts reject explicit CPU
 masks. Configuration is read once at first use, including disk cleanup or GC;
 changes require a restart. Invalid configuration rejects new cleanup admission.
 PUT checks configuration before staging data.
+
+Isolation remains disabled by default. When enabling it on Linux, the default
+mask requires logical CPU IDs 1 and 2 to be available inside the process/container
+CPU set. On smaller or restricted CPU sets, configure permitted CPU IDs or `none`
+before enabling isolation. An unavailable default mask is an error; it does not
+silently select different CPUs. Configure each node separately.
 
 Do not combine isolation with cleanup counterfactuals
 `RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP`,
