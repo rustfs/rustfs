@@ -417,6 +417,11 @@ async fn force_delete_bucket(
     bucket: &str,
     header: &str,
 ) -> Result<(), Box<SdkError<aws_sdk_s3::operation::delete_bucket::DeleteBucketError>>> {
+    let header: &'static str = match header {
+        "x-rustfs-force-delete" => "x-rustfs-force-delete",
+        "x-minio-force-delete" => "x-minio-force-delete",
+        other => panic!("unexpected force-delete header {other}"),
+    };
     client
         .delete_bucket()
         .bucket(bucket)
