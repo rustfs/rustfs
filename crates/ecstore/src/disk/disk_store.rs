@@ -1859,7 +1859,9 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let action = if cleanup_runtime::enabled()? {
+        // Runtime initialization must not prevent control-plane release of
+        // reader tokens. Disk I/O entries still propagate configuration errors.
+        let action = if cleanup_runtime::enabled().unwrap_or(false) {
             TimeoutHealthAction::IgnoreFailure
         } else {
             TimeoutHealthAction::MarkFailure
@@ -2299,11 +2301,15 @@ impl DiskAPI for LocalDiskWrapper {
             "release_snapshot_lease",
             DiskMetricMutation::None,
             || async {
-                if !cleanup_runtime::enabled()? {
-                    return self.disk.release_snapshot_lease(volume, path, token).await;
-                }
                 if self.disk.release_snapshot_lease_without_cleanup(volume, path, token).await {
                     return Ok(());
+                }
+                if !cleanup_runtime::enabled().unwrap_or(false) {
+                    // The raw release removes the token before trying the
+                    // reclaim budget. Initialization failure therefore keeps
+                    // the cleanup intent and data, without leaking a reader
+                    // or falling back to unbudgeted filesystem deletion.
+                    return self.disk.release_snapshot_lease(volume, path, token).await;
                 }
                 let disk = self.disk.clone();
                 let volume = volume.to_owned();
@@ -2672,6 +2678,89 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_cleanup_config_does_not_leak_snapshot_readers() {
+        const CHILD: &str = "RUSTFS_CLEANUP_INVALID_LEASE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "disk::disk_store::tests::invalid_cleanup_config_does_not_leak_snapshot_readers",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_CLEANUP_ASYNC_THREADS", "0")
+                    .output()
+                    .expect("run with invalid cleanup configuration")
+            })
+            .await
+            .expect("child process task");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let volume = "invalid-cleanup-config";
+        let path = "object/data";
+        wrapper.make_volume(volume).await.expect("bucket");
+        wrapper
+            .write_all(volume, "object/data/part.1", Bytes::from_static(b"live shard"))
+            .await
+            .expect("write shard");
+        let token = wrapper.acquire_snapshot_lease(volume, path).await.expect("GET lease");
+        wrapper
+            .release_snapshot_lease(volume, path, token)
+            .await
+            .expect("control-only release must not depend on cleanup initialization");
+        assert!(matches!(
+            wrapper.renew_snapshot_lease(volume, path, token).await,
+            Err(DiskError::FileNotFound)
+        ));
+
+        let token = wrapper
+            .acquire_snapshot_lease(volume, path)
+            .await
+            .expect("reader of old data");
+        // Register reclaim intent directly; this only updates the lease
+        // registry while a reader is present and performs no filesystem I/O.
+        assert_eq!(
+            disk.delete_data_dir(
+                volume,
+                path,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer reclaim"),
+            DataDirDeleteStatus::Deferred
+        );
+        assert!(
+            wrapper.release_snapshot_lease(volume, path, token).await.is_err(),
+            "invalid configuration must still reject reclamation"
+        );
+        assert!(
+            matches!(wrapper.renew_snapshot_lease(volume, path, token).await, Err(DiskError::FileNotFound)),
+            "failed reclamation must not strand a reader token"
+        );
+        assert_eq!(
+            wrapper.read_all(volume, "object/data/part.1").await.expect("retained data"),
+            Bytes::from_static(b"live shard"),
+            "configuration failure must not fall back to unbudgeted deletion"
+        );
     }
 
     #[tokio::test]

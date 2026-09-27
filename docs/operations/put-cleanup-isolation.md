@@ -69,6 +69,9 @@ holds a lock. Existing cleanup error handling and receipt recovery still apply.
 
 Ordinary snapshot-lease release stays on the caller and only updates the in-memory
 registry. It does not allocate a cleanup task or wait for the cleanup scheduler.
+Invalid cleanup configuration also must not strand a reader token: release still
+updates the registry, while any deferred reclamation reports the initialization
+error and keeps both its intent and data. It does not fall back to unbudgeted I/O.
 If the last release triggers deferred old-data
 reclamation, that reclamation tries the same pending and active disk permits.
 Only this case dispatches an owned task to the cleanup runtime.
@@ -79,10 +82,13 @@ execution permits, since it can wait for mutations that already own them.
 
 An admitted request waits for disk execution capacity in the caller's existing
 future. Cancellation or timeout discards this unstarted operation and releases
-pending capacity; it cannot later start deleting a reused path. Once execution
-capacity is acquired, an owned job retains its permits and disk reference until
-the local operation completes. Cancelling or timing out its waiter does not free
-disk capacity while the started job still runs.
+pending capacity; it cannot later start deleting a reused path. After execution
+capacity is acquired, the worker also checks whether its result receiver closed
+before its first poll. A job cancelled while waiting for the runtime to schedule
+it is discarded when the worker polls it, releasing its permits without starting
+I/O. Once the worker starts the operation, the owned job retains its permits and
+disk reference until completion. Cancelling or timing out its waiter does not
+free disk capacity while that started job still runs.
 This also retains the disk's mount ownership during detached execution. Cleanup
 waiter timeouts include queue delay and do not by themselves mark a disk faulty;
 the existing active disk-health probe retains its timeout policy.

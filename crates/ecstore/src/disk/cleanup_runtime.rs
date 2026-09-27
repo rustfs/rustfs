@@ -404,12 +404,28 @@ impl CleanupRuntime {
             // can later delete a reused path after its caller released locks.
             execution.clone().acquire_owned().await.map_err(io::Error::other)?
         };
-        // Once execution starts, health/RPC deadlines belong to the waiter.
-        // The owned operation retains both permits through its blocking I/O.
-        runtime
-            .spawn(execute_disk(pending, Some(active), execution, started, future))
-            .await
-            .map_err(super::error::DiskError::other)?
+        // A permit does not mean the worker has polled this operation. Use
+        // the result receiver's lifetime to discard work cancelled during
+        // runtime scheduling, before its first poll can start filesystem I/O.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            if result_tx.is_closed() {
+                return;
+            }
+            // After the first poll, the owned job must retain both permits
+            // through I/O even if the waiter cancels and closes result_rx.
+            let result = execute_disk(pending, Some(active), execution, started, future).await;
+            let _ = result_tx.send(result);
+        });
+        match result_rx.await {
+            Ok(result) => result,
+            Err(err) => {
+                // Preserve a panic's JoinError rather than erasing its cause
+                // into a closed-channel error.
+                task.await.map_err(super::error::DiskError::other)?;
+                Err(super::error::DiskError::other(err))
+            }
+        }
     }
 
     fn try_disk_execution(&self) -> io::Result<DiskExecution> {
@@ -774,6 +790,72 @@ mod tests {
             .await
             .expect("later work must progress");
         assert!(!ran.load(Ordering::SeqCst), "cancelled queued deletion must never execute later");
+    }
+
+    #[tokio::test]
+    async fn cancelling_disk_work_before_worker_poll_preserves_reused_path() {
+        let runtime = Arc::new(CleanupRuntime::new(config(1, 1, 1)).expect("cleanup runtime"));
+        let (entered, entry) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let stalled = runtime.runtime.as_ref().expect("live runtime").spawn(async move {
+            entered.send(()).expect("worker entered");
+            released
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release stalled worker");
+        });
+        deadline(entry).await.expect("worker must stall before dispatch");
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let backup = dir.path().join("xl.meta.bkp");
+        std::fs::write(&backup, b"previous transaction").expect("old backup");
+        {
+            let path = backup.clone();
+            let deletion = runtime.disk_operation(
+                async move {
+                    tokio::fs::remove_file(path).await?;
+                    Ok(())
+                },
+                DiskAdmission::Request,
+            );
+            tokio::pin!(deletion);
+            assert!(futures::poll!(&mut deletion).is_pending());
+            assert_eq!(runtime.disk_execution.available_permits(), 1, "execution was admitted but not polled");
+        }
+        std::fs::write(&backup, b"next transaction").expect("reuse path after cancelled waiter");
+        release.send(()).expect("resume worker");
+        deadline(stalled).await.expect("worker resumed");
+        deadline(async {
+            while runtime.disk_admission.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(backup).expect("unstarted deletion must not execute after cancellation"),
+            b"next transaction"
+        );
+        assert_eq!(runtime.disk_execution.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn disk_task_panic_preserves_cause_and_releases_budget() {
+        async fn panicking_job() -> super::super::error::Result<()> {
+            panic!("injected cleanup panic");
+        }
+        let runtime = CleanupRuntime::new(config(1, 1, 1)).expect("cleanup runtime");
+        let error = deadline(runtime.disk_operation(panicking_job(), DiskAdmission::Request))
+            .await
+            .expect_err("worker panic must reach its caller");
+        let super::super::error::DiskError::Io(error) = error else {
+            panic!("worker panic must retain its I/O error source");
+        };
+        let cause = error
+            .get_ref()
+            .expect("panic source")
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("preserved JoinError");
+        assert!(cause.is_panic());
+        assert_eq!(runtime.disk_admission.available_permits(), 4);
+        assert_eq!(runtime.disk_execution.available_permits(), 2);
     }
 
     #[tokio::test]
