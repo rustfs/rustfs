@@ -675,8 +675,8 @@ fn unix_now() -> Result<i64> {
 async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     use crate::connect::{
         IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
-        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_disk, capture_top_locks,
-        capture_top_net, capture_top_rpc,
+        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_locks, capture_top_net,
+        capture_top_rpc,
     };
 
     let (tool_id, options) = match command {
@@ -692,6 +692,68 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Err(Error::other("connect_top_limits_invalid"));
     }
 
+    if tool_id == "top.disk" {
+        let offline_key_id = options
+            .offline_key_id
+            .ok_or_else(|| Error::other("--offline-key-id must select an existing offline identity"))?;
+        let input = crate::connect::diagnostics::LocalTopDiskRequest {
+            offline_key_id,
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            consent_expires_at_unix: options.consent_expires_at_unix,
+            acknowledge_l3: options.acknowledge_l3,
+            run_expires_at_unix: options.run_expires_at_unix,
+            window_millis: options.window_millis,
+            export_validity_seconds: options.export_validity_seconds,
+        };
+        let cancel = CancellationToken::new();
+        let capture = crate::connect::request_local_top_disk(&options.state_dir, input, &cancel);
+        tokio::pin!(capture);
+        let export = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return match capture.await {
+                    Err(error) => Err(Error::other(error)),
+                    Ok(_) => Err(Error::other("top disk collection cancelled")),
+                };
+            }
+            result = &mut capture => result.map_err(Error::other)?,
+        };
+        let writer_cancel = cancel.clone();
+        let mut writer = tokio::task::spawn_blocking(move || {
+            crate::connect::diagnostics::save_top_archive(
+                &options.output,
+                &export.artifact_uid,
+                &export.archive_bytes,
+                &export.archive_sha256,
+                &writer_cancel,
+            )
+        });
+        let receipt = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?; cancel.cancel();
+                writer.await.map_err(Error::other)?.map_err(Error::other)?
+            }
+            result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+        };
+        println!(
+            "artifact={} bytes={} sha256={}",
+            receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+        );
+        println!("upload=not-performed");
+        return Ok(());
+    }
+    if options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is only supported for top disk"));
+    }
     let identity = IdentityStore::new(options.state_dir.join("identity"))
         .load()
         .map_err(Error::other)?
@@ -723,10 +785,6 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     match tool_id {
         "top.api" => {
             let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.disk" => {
-            let result = await_top_capture(capture_top_disk(&request, &cancel), &cancel).await?;
             finish_top_capture(&request, result, &identity, options.output, &cancel).await
         }
         "top.locks" => {
