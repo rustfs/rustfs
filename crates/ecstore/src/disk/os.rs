@@ -670,6 +670,8 @@ fn file_fdatasync_group_commit_wait() -> Duration {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct DstDirFsyncGroupKey {
     canonical_path: PathBuf,
+    // A batch must execute in the same resource class as its producers.
+    isolated: bool,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -686,13 +688,17 @@ impl DstDirFsyncGroupKey {
             use std::os::unix::fs::MetadataExt;
             Ok(Self {
                 canonical_path,
+                isolated: FSYNC_ON_CURRENT_RUNTIME.get(),
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             })
         }
         #[cfg(not(unix))]
         {
-            Ok(Self { canonical_path })
+            Ok(Self {
+                canonical_path,
+                isolated: FSYNC_ON_CURRENT_RUNTIME.get(),
+            })
         }
     }
 }
@@ -1061,7 +1067,7 @@ fn clear_dst_dir_fsync_group_commit_for_test() {
     DST_DIR_FSYNC_GROUP_COMMIT.clear_for_test();
 }
 
-type FileFdatasyncGroupKey = usize;
+type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
@@ -1133,7 +1139,7 @@ impl FileFdatasyncGroupCommit {
             ));
         }
         let (result_tx, result_rx) = oneshot::channel();
-        let key = Arc::as_ptr(&disk_permits) as FileFdatasyncGroupKey;
+        let key = (Arc::as_ptr(&disk_permits) as usize, FSYNC_ON_CURRENT_RUNTIME.get());
         let mut registry = self.inner.lock();
         registry.groups.retain(|_, group| group.disk_permits.strong_count() > 0);
         if registry.total_waiters >= MAX_FILE_FDATASYNC_WAITERS {
@@ -1371,9 +1377,26 @@ static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(
     }
 });
 
+thread_local! {
+    static FSYNC_ON_CURRENT_RUNTIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called only when starting threads belonging to an isolated I/O runtime.
+/// Async and blocking threads use the same runtime's blocking budget for fsync.
+pub(crate) fn use_current_runtime_for_fsync() {
+    FSYNC_ON_CURRENT_RUNTIME.set(true);
+}
+
+pub(super) fn is_isolated_io_thread() -> bool {
+    FSYNC_ON_CURRENT_RUNTIME.get()
+}
+
 /// Spawn a blocking task on the fsync-dedicated runtime if configured,
 /// otherwise fall back to the main tokio blocking pool.
 fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
+    if FSYNC_ON_CURRENT_RUNTIME.get() {
+        return tokio::task::spawn_blocking(f);
+    }
     match FSYNC_RUNTIME.as_ref() {
         Some(rt) => rt.spawn_blocking(f),
         None => tokio::task::spawn_blocking(f),
@@ -4483,6 +4506,60 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn fsync_groups_do_not_mix_cleanup_and_foreground_workers() {
+        let dir = tempdir().unwrap();
+        let dst_groups = Arc::new(DstDirFsyncGroupCommit::default());
+        let file_groups = Arc::new(FileFdatasyncGroupCommit::default());
+        let disk_permits = Arc::new(Semaphore::new(1));
+        let (_, dst_worker) = dst_groups.enqueue_for_test(dir.path()).unwrap();
+        let (_, file_worker) = file_groups
+            .enqueue(disk_permits.clone(), vec![dir.path().join("one")])
+            .unwrap();
+        assert!(dst_worker.is_some());
+        assert!(file_worker.is_some());
+        let cleanup_dst_groups = dst_groups.clone();
+        let cleanup_file_groups = file_groups.clone();
+        std::thread::spawn(move || {
+            use_current_runtime_for_fsync();
+            let (_, dst_worker) = cleanup_dst_groups.enqueue_for_test(dir.path()).unwrap();
+            let (_, file_worker) = cleanup_file_groups
+                .enqueue(disk_permits, vec![dir.path().join("two")])
+                .unwrap();
+            assert!(dst_worker.is_some(), "cleanup must not join a foreground directory worker");
+            assert!(file_worker.is_some(), "cleanup must not join a foreground file worker");
+        })
+        .join()
+        .unwrap();
+        assert_eq!(dst_groups.inner.lock().groups.len(), 2);
+        assert_eq!(file_groups.inner.lock().groups.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn isolated_runtime_keeps_fsync_on_its_own_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("isolated-fsync-test")
+            .on_thread_start(use_current_runtime_for_fsync)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .spawn(async {
+                fsync_spawn_blocking(|| {
+                    assert_eq!(std::thread::current().name(), Some("isolated-fsync-test"));
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+        // A runtime cannot be dropped from another runtime's async context.
+        runtime.shutdown_background();
+        result.unwrap();
+        assert!(!FSYNC_ON_CURRENT_RUNTIME.get(), "the calling runtime must retain normal fsync routing");
+    }
 
     fn file_sync_limiter() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS))

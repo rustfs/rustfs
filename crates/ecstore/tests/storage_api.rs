@@ -62,3 +62,8 @@ pub(crate) mod minio_generated_read {
         DiskAPI, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
     };
 }
+
+pub(crate) mod cleanup_isolation {
+    pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{DeleteOptions, DiskError};
+}

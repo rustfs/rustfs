@@ -8,6 +8,9 @@ collection:
 
 ## Operations
 
+For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
+see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
+
 For the logical per-operation io_uring read cap, see
 [io_uring read chunk size](operations/io-uring-read-chunks.md).
 
