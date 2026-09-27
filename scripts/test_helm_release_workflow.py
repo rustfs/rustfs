@@ -113,6 +113,23 @@ sleep() {
         self.assertLess(gate, package)
         self.assertNotIn("continue-on-error", workflow[gate:package])
 
+    def test_upload_artifact_includes_chart_and_readme(self):
+        workflow = WORKFLOW.read_text()
+        copy_readme = workflow.index("cp helm/README.md helm/rustfs/")
+        upload = workflow.index("      - name: Upload helm package as artifact")
+        self.assertLess(copy_readme, upload)
+
+        publish = workflow.index("  publish-helm-package:", upload)
+        upload_step = workflow[upload:publish]
+        expected_path = "path: |\n            helm/rustfs/*.tgz\n            helm/rustfs/README.md\n"
+        self.assertIn(expected_path, upload_step)
+
+        download = workflow.index("      - name: Download helm package", publish)
+        push_step = workflow.index("      - name: Push helm package and index file", download)
+        download_step = workflow[download:push_step]
+        self.assertIn("name: helm-package", download_step)
+        self.assertIn("path: ./", download_step)
+
 
 if __name__ == "__main__":
     unittest.main()
