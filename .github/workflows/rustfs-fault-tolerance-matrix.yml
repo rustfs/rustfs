@@ -12,7 +12,7 @@
 #                        assert the expected outage
 #   M-<topo>EC<P>-rec    after restoring every node, reads/writes succeed
 #
-# 10 topologies x EC levels = 38 combinations, 320 cases. The full sweep runs
+# 9 topologies x EC levels = 36 combinations, 300 cases. The full sweep runs
 # 3-5 hours and is dispatched on demand (e.g. after a nightly chain goes
 # green), not nightly. Case ids and expectations come from product source
 # (default_parity_count, erasure set sizing) via rustfs/auto-testing.
@@ -32,7 +32,7 @@ on:
         default: main
         type: string
       matrix_topo:
-        description: 'Topology filter like 4x2; empty sweeps all ten topologies'
+        description: 'Topology filter like 4x2; empty sweeps all nine topologies'
         required: false
         default: ''
         type: string
@@ -174,12 +174,12 @@ jobs:
           } > "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
-          # An unfiltered sweep must land exactly 320 cases (38 topology x EC
+          # An unfiltered sweep must land exactly 300 cases (36 topology x EC
           # combinations at 2*(nodes+1) cases each); filtered sweeps are held
           # to internal consistency. Missing/harness-error rows always fail.
           EXPECTED_TOTAL=""
           if [ -z "${{ inputs.matrix_topo }}" ] && [ -z "${MATRIX_EC}" ]; then
-            EXPECTED_TOTAL=320
+            EXPECTED_TOTAL=300
           fi
           jq -e --arg testing_sha "${AUTO_TESTING_SHA}" --argjson expected_total "${EXPECTED_TOTAL:-null}" '
             .schema_version == 1 and

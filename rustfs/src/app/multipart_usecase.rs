@@ -1182,10 +1182,10 @@ impl DefaultMultipartUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
-        let upload_part_admission = match self
-            .concurrency_manager()
-            .admit_multipart_part(size)
-            .await
+        let admission_wait_started = rustfs_io_metrics::put_stage_timer();
+        let admission = self.concurrency_manager().admit_multipart_part(size).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_admission_wait", admission_wait_started);
+        let upload_part_admission = match admission
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
         {
             ForegroundWriteAdmission::Disabled => None,
@@ -1385,11 +1385,13 @@ impl DefaultMultipartUsecase {
         }
 
         let _upload_part_admission = upload_part_admission;
-        let info = store
+        let store_write_started = rustfs_io_metrics::put_stage_timer();
+        let result = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)?;
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_store_write", store_write_started);
         drop(_upload_part_admission);
+        let info = result.map_err(ApiError::from)?;
 
         let mut checksum_crc32 = input.checksum_crc32;
         let mut checksum_crc32c = input.checksum_crc32c;
