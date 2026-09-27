@@ -19536,7 +19536,7 @@ mod put_object_tmp_cleanup_tests {
                     .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
                     .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_MAX_PENDING", "1")
                     .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS", "1")
-                    .env_remove("RUSTFS_CLEANUP_CPUS")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
