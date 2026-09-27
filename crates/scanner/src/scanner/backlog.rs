@@ -639,9 +639,10 @@ impl From<ScannerCycleOutcome> for ScannerPauseBacklogCycleOutcome {
             ScannerCycleOutcome::CompletedWithPendingMaintenance => Self::PendingMaintenance,
             ScannerCycleOutcome::Partial => Self::Progressed,
             ScannerCycleOutcome::Deferred(super::ScannerCycleDeferReason::DataMovement) => Self::DataMovementDeferred,
-            ScannerCycleOutcome::Superseded | ScannerCycleOutcome::Deferred(_) | ScannerCycleOutcome::Failed => {
-                Self::RetryableFailure
-            }
+            ScannerCycleOutcome::Superseded
+            | ScannerCycleOutcome::Deferred(_)
+            | ScannerCycleOutcome::Failed
+            | ScannerCycleOutcome::StatePersistenceFailed => Self::RetryableFailure,
         }
     }
 }
