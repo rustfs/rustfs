@@ -402,6 +402,8 @@ jobs:
 
       - name: Build RustFS
         shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
@@ -418,13 +420,36 @@ jobs:
           # Build one binary at a time so release LTO links cannot exhaust a
           # self-hosted runner by running concurrently.
           for binary in "${BINARY_NAMES[@]}"; do
+            PROFILE_ARGS=()
+            if [[ "$binary" == "rustfs" && "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+              # The in-process profiler resolves names from the final executable.
+              # Retain function symbols without enabling DWARF source information.
+              PROFILE_ARGS=(--config 'profile.release.strip="none"')
+            fi
             if [[ "${{ matrix.cross }}" == "true" ]]; then
               # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
             else
-              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
+              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
             fi
           done
+
+      - name: Generate the CPU symbol catalog
+        if: endsWith(matrix.target, '-linux-gnu') && matrix.features == 'pyroscope'
+        shell: bash
+        run: |
+          cargo metadata --locked --format-version 1 --filter-platform '${{ matrix.target }}' \
+            --features rustfs/pyroscope > "$RUNNER_TEMP/cpu-catalog-metadata.json"
+          features=$(jq -ce '
+            (.packages[] | select(.name == "rustfs") | .id) as $id |
+            .resolve.nodes[] | select(.id == $id) | .features | map(select(. != "default")) | sort
+          ' "$RUNNER_TEMP/cpu-catalog-metadata.json")
+          release_dir="target/${{ matrix.target }}/release"
+          # These task-owned outputs may remain in a restored target cache.
+          rm -f "$release_dir/rustfs.cpu-symbol-catalog.json" "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+          cargo run --locked -p rustfs-connect-symbol-catalog -- \
+            "$release_dir/rustfs" "$(git rev-parse HEAD)" '${{ matrix.target }}' "$features" \
+            "$release_dir/rustfs.cpu-symbol-catalog.json" > "$release_dir/rustfs.cpu-symbol-catalog.sha256"
 
       - name: Create release package
         id: package
@@ -514,6 +539,10 @@ jobs:
           BINARY_FILES=("$BINARY_NAME")
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             BINARY_FILES+=("rustfs-cli")
+          fi
+
+          if [[ "$TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            BINARY_FILES+=(rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256)
           fi
 
           # Verify the binaries exist before packaging
