@@ -14,7 +14,7 @@
 
 //! Bounded process disk-I/O window backed by RustFS's existing process sampler.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,32 @@ use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopRe
 
 const TOOL_ID: &str = "top.disk";
 pub const TOP_DISK_CAPABILITY: &str = "top.disk@1";
+
+/// Closed local-service request: no process selector, paths, or supplied provenance.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LocalTopDiskRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l3: bool,
+    pub run_expires_at_unix: i64,
+    pub window_millis: u64,
+    pub export_validity_seconds: u64,
+}
+
+/// Archive received from the owner-only service socket.
+pub(crate) struct LocalTopDiskArchive {
+    pub artifact_uid: String,
+    pub archive_bytes: Vec<u8>,
+    pub archive_sha256: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskCounterSnapshot {
@@ -58,6 +84,11 @@ pub async fn capture_top_disk(
         let Some(_permit) = request.acquire(cancel).await? else {
             return request.cancelled(TOOL_ID);
         };
+        // A queued request may outlive its authorization while another capture owns the lease.
+        request.validate_capture(TOOL_ID)?;
+        if cancel.is_cancelled() {
+            return request.cancelled(TOOL_ID);
+        }
         let mut sampler = rustfs_io_metrics::ProcessSampler::new();
         let before = process_snapshot(&mut sampler)?;
         let started = Instant::now();
