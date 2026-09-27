@@ -426,7 +426,7 @@ async fn force_delete_bucket(
         .delete_bucket()
         .bucket(bucket)
         .customize()
-        .mutate_request(|request| {
+        .mutate_request(move |request| {
             request.headers_mut().insert(header, "true");
         })
         .send()
