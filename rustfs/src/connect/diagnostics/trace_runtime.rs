@@ -12,14 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Owner-only local transport between the telemetry CLI and the running server.
+//! Owner-only local transport between diagnostic CLI commands and the running server.
+//!
+//! Version 1 accepts only TRACE_RECORD and RUNTIME_PROFILE. Runtime requests select
+//! an existing offline key by SPKI digest; this is not proof of Connect enrollment.
+//! The receiver checks enrollment, target ownership and consent at import. The
+//! server owns provenance, nonce generation, capture and signing; the CLI receives
+//! only a bounded archive and saves it without uploading. No paths cross this IPC.
+//! The write half stays open during collection. EOF cancels the server collector;
+//! cancellation is acknowledged only after joining it and releasing its lease.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::profile_cpu::{
+    LocalProfileConsent, LocalRuntimeProfileRequest, MAX_ARCHIVE_BYTES, MAX_PROFILE_DURATION, ProfileCaptureRequest,
+    ProfileError, ProfileOutcome, ProfileReasonCode, ProfileTool, SignedProfileExport, encode_signed_profile_export,
+};
+use base64_simd::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -30,7 +44,8 @@ use super::{LocalTelemetryConsent, TelemetryProducerError, TraceRecordCapture, T
 
 const SOCKET_FILE: &str = "telemetry-record.sock";
 const PROTOCOL_VERSION: u16 = 1;
-const MAX_REQUEST_BYTES: u64 = 1_024;
+const MAX_REQUEST_BYTES: u64 = 8_192;
+const MAX_RUNTIME_RESPONSE_BYTES: u64 = (MAX_ARCHIVE_BYTES as u64).div_ceil(3) * 4 + 1_024;
 const MAX_RESPONSE_BYTES: u64 = 300_000;
 const MAX_CONNECTIONS: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,6 +64,10 @@ pub(crate) enum LocalTraceCaptureError {
     Io(#[source] io::Error),
     #[error(transparent)]
     Producer(#[from] TelemetryProducerError),
+    #[error("runtime profile request rejected: {0}")]
+    RuntimeProfile(String),
+    #[error("runtime profile cancellation was not acknowledged")]
+    CancellationUnconfirmed,
 }
 
 pub(crate) struct LocalTraceCaptureRuntime {
@@ -72,12 +91,23 @@ impl Drop for LocalTraceCaptureRuntime {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CaptureRequest {
-    protocol_version: u16,
-    consent_expires_at_unix: i64,
-    duration_millis: u64,
-    max_spans: usize,
+#[serde(
+    deny_unknown_fields,
+    tag = "operation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    rename_all_fields = "camelCase"
+)]
+enum CaptureRequest {
+    TraceRecord {
+        protocol_version: u16,
+        consent_expires_at_unix: i64,
+        duration_millis: u64,
+        max_spans: usize,
+    },
+    RuntimeProfile {
+        protocol_version: u16,
+        request: LocalRuntimeProfileRequest,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -124,10 +154,27 @@ impl From<ProducerErrorCode> for TelemetryProducerError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "status", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(
+    deny_unknown_fields,
+    tag = "status",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    rename_all_fields = "camelCase"
+)]
 enum CaptureResponse {
-    Ok { capture: TraceRecordCapture },
-    Error { code: ProducerErrorCode },
+    Ok {
+        capture: TraceRecordCapture,
+    },
+    Error {
+        code: ProducerErrorCode,
+    },
+    RuntimeOk {
+        archive_base64: String,
+        archive_sha256: String,
+        artifact_uid: String,
+    },
+    RuntimeError {
+        code: RuntimeErrorCode,
+    },
 }
 
 pub(crate) fn spawn_local_trace_capture_runtime(
@@ -140,8 +187,9 @@ pub(crate) fn spawn_local_trace_capture_runtime(
     let socket_identity = socket_identity(&socket_path, owner)?;
     let shutdown = parent_shutdown.child_token();
     let task_shutdown = shutdown.clone();
+    let state_root = state_root.to_path_buf();
     let task = tokio::spawn(async move {
-        run_listener(listener, owner, task_shutdown).await;
+        run_listener(listener, owner, state_root, task_shutdown).await;
         remove_own_socket(&socket_path, socket_identity);
     });
     Ok(LocalTraceCaptureRuntime {
@@ -164,8 +212,11 @@ pub(crate) async fn request_local_trace_capture(
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => LocalTraceCaptureError::RuntimeUnavailable,
         _ => LocalTraceCaptureError::Io(error),
     })?;
+    if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == owner) {
+        return Err(LocalTraceCaptureError::StateSecurity);
+    }
     let (reader, mut writer) = stream.into_split();
-    let request = CaptureRequest {
+    let request = CaptureRequest::TraceRecord {
         protocol_version: PROTOCOL_VERSION,
         consent_expires_at_unix,
         duration_millis: u64::try_from(limits.duration.as_millis()).map_err(|_| TelemetryProducerError::InvalidDuration)?,
@@ -173,7 +224,7 @@ pub(crate) async fn request_local_trace_capture(
     };
     let mut encoded = serde_json::to_vec(&request).map_err(|_| LocalTraceCaptureError::Protocol)?;
     encoded.push(b'\n');
-    if encoded.len() as u64 > MAX_REQUEST_BYTES {
+    if encoded.len() > 1_024 {
         return Err(LocalTraceCaptureError::Protocol);
     }
     writer.write_all(&encoded).await.map_err(LocalTraceCaptureError::Io)?;
@@ -198,10 +249,287 @@ pub(crate) async fn request_local_trace_capture(
     match response {
         CaptureResponse::Ok { capture } => Ok(capture),
         CaptureResponse::Error { code } => Err(TelemetryProducerError::from(code).into()),
+        _ => Err(LocalTraceCaptureError::Protocol),
     }
 }
 
-async fn run_listener(listener: UnixListener, owner: u32, shutdown: CancellationToken) {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RuntimeErrorCode {
+    InvalidRequest,
+    IdentityUnavailable,
+    ConsentRequired,
+    ConsentExpired,
+    Expired,
+    LimitExceeded,
+    Busy,
+    Cancelled,
+    TimedOut,
+    CollectionFailed,
+}
+
+impl From<ProfileError> for RuntimeErrorCode {
+    fn from(error: ProfileError) -> Self {
+        match error {
+            ProfileError::ConsentRequired => Self::ConsentRequired,
+            ProfileError::ConsentExpired => Self::ConsentExpired,
+            ProfileError::Expired => Self::Expired,
+            ProfileError::LimitExceeded => Self::LimitExceeded,
+            ProfileError::Busy => Self::Busy,
+            ProfileError::Cancelled => Self::Cancelled,
+            ProfileError::TimedOut => Self::TimedOut,
+            ProfileError::InvalidRequest | ProfileError::UnsupportedCapability | ProfileError::UnsupportedVersion => {
+                Self::InvalidRequest
+            }
+            _ => Self::CollectionFailed,
+        }
+    }
+}
+
+pub(crate) async fn request_local_runtime_profile(
+    state_root: &Path,
+    request: LocalRuntimeProfileRequest,
+    cancel: &CancellationToken,
+) -> Result<SignedProfileExport, LocalTraceCaptureError> {
+    let owner = private_state_owner(state_root)?;
+    let socket_path = state_root.join(SOCKET_FILE);
+    socket_identity(&socket_path, owner)?;
+    let stream = UnixStream::connect(&socket_path).await.map_err(LocalTraceCaptureError::Io)?;
+    if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == owner) {
+        return Err(LocalTraceCaptureError::StateSecurity);
+    }
+    let artifact_uid = request.artifact_uid.clone();
+    let message = CaptureRequest::RuntimeProfile {
+        protocol_version: PROTOCOL_VERSION,
+        request,
+    };
+    let mut bytes = serde_json::to_vec(&message).map_err(|_| LocalTraceCaptureError::Protocol)?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+        return Err(LocalTraceCaptureError::Protocol);
+    }
+    let (reader, mut writer) = stream.into_split();
+    tokio::time::timeout(REQUEST_TIMEOUT, writer.write_all(&bytes))
+        .await
+        .map_err(|_| LocalTraceCaptureError::Protocol)?
+        .map_err(LocalTraceCaptureError::Io)?;
+    // Keep the write half open: EOF is the server's cancellation signal.
+    let response = async {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_RUNTIME_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(LocalTraceCaptureError::Io)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_RUNTIME_RESPONSE_BYTES {
+            return Err(LocalTraceCaptureError::Protocol);
+        }
+        serde_json::from_slice::<CaptureResponse>(&bytes).map_err(|_| LocalTraceCaptureError::Protocol)
+    };
+    let response = tokio::time::timeout(MAX_PROFILE_DURATION + Duration::from_secs(5), response);
+    tokio::pin!(response);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            writer.shutdown().await.map_err(|_| LocalTraceCaptureError::CancellationUnconfirmed)?;
+            // The service closes the response only after the blocking collector has joined.
+            let acknowledged = matches!(tokio::time::timeout(Duration::from_secs(2), &mut response).await,
+                Ok(Ok(Ok(CaptureResponse::RuntimeError { .. } | CaptureResponse::RuntimeOk { .. }))));
+            if !acknowledged { return Err(LocalTraceCaptureError::CancellationUnconfirmed); }
+            return Err(LocalTraceCaptureError::RuntimeProfile("CANCELLED".to_owned()));
+        }
+        response = &mut response => response.map_err(|_| LocalTraceCaptureError::Protocol)??,
+    };
+    match response {
+        CaptureResponse::RuntimeOk {
+            archive_base64,
+            archive_sha256,
+            artifact_uid: returned_uid,
+        } => {
+            let archive_bytes = URL_SAFE_NO_PAD
+                .decode_to_vec(&archive_base64)
+                .map_err(|_| LocalTraceCaptureError::Protocol)?;
+            if archive_bytes.is_empty()
+                || archive_bytes.len() > MAX_ARCHIVE_BYTES
+                || returned_uid != artifact_uid
+                || URL_SAFE_NO_PAD.encode_to_string(&archive_bytes) != archive_base64
+                || hex_simd::encode_to_string(Sha256::digest(&archive_bytes), hex_simd::AsciiCase::Lower) != archive_sha256
+            {
+                return Err(LocalTraceCaptureError::Protocol);
+            }
+            Ok(SignedProfileExport {
+                artifact_uid,
+                tool: ProfileTool::Threads,
+                outcome: ProfileOutcome::Succeeded,
+                reason_code: ProfileReasonCode::Complete,
+                archive_bytes,
+                archive_sha256,
+            })
+        }
+        CaptureResponse::RuntimeError { code } => Err(LocalTraceCaptureError::RuntimeProfile(format!("{code:?}"))),
+        _ => Err(LocalTraceCaptureError::Protocol),
+    }
+}
+
+async fn handle_runtime_profile(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state_root: &Path,
+    protocol_version: u16,
+    request: LocalRuntimeProfileRequest,
+    shutdown: CancellationToken,
+) {
+    let cancel = shutdown.child_token();
+    let capture = capture_local_runtime_profile(state_root, protocol_version, request, &cancel);
+    tokio::pin!(capture);
+    let mut unexpected = [0_u8; 1];
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => { cancel.cancel(); let _ = capture.await; return; }
+        _ = reader.read(&mut unexpected) => { cancel.cancel(); let _ = capture.await; Err(RuntimeErrorCode::Cancelled) }
+        result = &mut capture => result,
+    };
+    let response = match result {
+        Ok(export) => CaptureResponse::RuntimeOk {
+            archive_base64: URL_SAFE_NO_PAD.encode_to_string(&export.archive_bytes),
+            archive_sha256: export.archive_sha256,
+            artifact_uid: export.artifact_uid,
+        },
+        Err(code) => CaptureResponse::RuntimeError { code },
+    };
+    if let Ok(bytes) = serde_json::to_vec(&response)
+        && bytes.len() as u64 <= MAX_RUNTIME_RESPONSE_BYTES
+    {
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            writer.write_all(&bytes).await?;
+            writer.shutdown().await
+        })
+        .await;
+    }
+}
+
+async fn capture_local_runtime_profile(
+    state_root: &Path,
+    protocol_version: u16,
+    input: LocalRuntimeProfileRequest,
+    cancel: &CancellationToken,
+) -> Result<SignedProfileExport, RuntimeErrorCode> {
+    use rand::{TryRng as _, rngs::SysRng};
+    if protocol_version != PROTOCOL_VERSION
+        || input.offline_key_id.len() != 64
+        || !input
+            .offline_key_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RuntimeErrorCode::InvalidRequest);
+    }
+    if cancel.is_cancelled() {
+        return Err(RuntimeErrorCode::Cancelled);
+    }
+    if !input.acknowledge_l3 || input.policy_revision == 0 {
+        return Err(RuntimeErrorCode::ConsentRequired);
+    }
+    let now = unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    if input.consent_expires_at_unix <= now || input.expires_at_unix > input.consent_expires_at_unix {
+        return Err(RuntimeErrorCode::ConsentExpired);
+    }
+    if input.expires_at_unix <= now || input.expires_at_unix.saturating_sub(now) > super::profile_cpu::MAX_VALIDITY_SECONDS {
+        return Err(RuntimeErrorCode::Expired);
+    }
+    if input.duration_millis == 0
+        || input.duration_millis > 30_000
+        || input.sample_period_micros == 0
+        || input.sample_period_micros > input.duration_millis * 1_000
+    {
+        return Err(RuntimeErrorCode::LimitExceeded);
+    }
+    if input.schema_version != 1 || input.capability != super::profile_cpu::THREAD_PROFILE_CAPABILITY {
+        return Err(RuntimeErrorCode::InvalidRequest);
+    }
+    let owner = private_state_owner(state_root).map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    let key_root = state_root.join("offline");
+    let key_directory = std::fs::symlink_metadata(&key_root).map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    // Existing offline enrollment creates this subdirectory with the process umask.
+    // The state root is 0700; require the child to remain owned and non-writable by others.
+    if !key_directory.is_dir()
+        || key_directory.file_type().is_symlink()
+        || key_directory.uid() != owner
+        || key_directory.permissions().mode() & 0o022 != 0
+    {
+        return Err(RuntimeErrorCode::IdentityUnavailable);
+    }
+    // IdentityStore::load follows symlinks; this IPC boundary must reject them before reading.
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = crate::connect::OfflineKeyStore::new(state_root).key_path();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    let metadata = file.metadata().map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.len() == 0
+        || metadata.len() > 4_096
+    {
+        return Err(RuntimeErrorCode::IdentityUnavailable);
+    }
+    let mut der = zeroize::Zeroizing::new(Vec::new());
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, 4_097), &mut der)
+        .map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    if der.len() > 4_096 {
+        return Err(RuntimeErrorCode::IdentityUnavailable);
+    }
+    let key = crate::connect::DeviceIdentity::from_pkcs8_der(&der).map_err(|_| RuntimeErrorCode::IdentityUnavailable)?;
+    if hex_simd::encode_to_string(Sha256::digest(key.public_key_der()), hex_simd::AsciiCase::Lower) != input.offline_key_id {
+        return Err(RuntimeErrorCode::IdentityUnavailable);
+    }
+    let provenance = super::job_delivery::executable_provenance()
+        .await
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let mut nonce = [0_u8; 32];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let request = ProfileCaptureRequest {
+        organization_name: input.organization_name,
+        cluster_name: input.cluster_name,
+        device_name: input.device_name,
+        run_uid: input.run_uid,
+        artifact_uid: input.artifact_uid,
+        schema_version: input.schema_version,
+        capability: input.capability,
+        consent: LocalProfileConsent {
+            consent_uid: input.consent_uid,
+            policy_revision: input.policy_revision,
+            expires_at_unix: input.consent_expires_at_unix,
+            confirmed: input.acknowledge_l3,
+        },
+        produced_at_unix: unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?,
+        expires_at_unix: input.expires_at_unix,
+        nonce,
+        duration: Duration::from_millis(input.duration_millis),
+        sample_period: Duration::from_micros(input.sample_period_micros),
+        provenance,
+    };
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let cancel = cancel.clone();
+    // Always await this task, including after disconnect, so the lease is released before acknowledgement.
+    tokio::task::spawn_blocking(move || {
+        let result = super::profile_threads::capture_runtime_profile(&request, &metrics, MAX_PROFILE_DURATION, &cancel)?;
+        if result.outcome() != ProfileOutcome::Succeeded {
+            return Err(ProfileError::CollectionFailed);
+        }
+        encode_signed_profile_export(&request, &result, &key, &cancel)
+    })
+    .await
+    .map_err(|_| RuntimeErrorCode::CollectionFailed)?
+    .map_err(RuntimeErrorCode::from)
+}
+
+async fn run_listener(listener: UnixListener, owner: u32, state_root: PathBuf, shutdown: CancellationToken) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -213,7 +541,7 @@ async fn run_listener(listener: UnixListener, owner: u32, shutdown: Cancellation
                     if connections.len() < MAX_CONNECTIONS
                         && stream.peer_cred().is_ok_and(|credentials| credentials.uid() == owner)
                     {
-                        connections.spawn(handle_connection(stream, shutdown.clone()));
+                        connections.spawn(handle_connection(stream, state_root.clone(), shutdown.clone()));
                     }
                 }
                 Err(_) => break,
@@ -223,7 +551,7 @@ async fn run_listener(listener: UnixListener, owner: u32, shutdown: Cancellation
     while connections.join_next().await.is_some() {}
 }
 
-async fn handle_connection(stream: UnixStream, shutdown: CancellationToken) {
+async fn handle_connection(stream: UnixStream, state_root: PathBuf, shutdown: CancellationToken) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let request = tokio::select! {
@@ -234,17 +562,31 @@ async fn handle_connection(stream: UnixStream, shutdown: CancellationToken) {
             Ok(Err(_)) | Err(_) => return,
         },
     };
+    let (protocol_version, consent_expires_at_unix, duration_millis, max_spans) = match request {
+        CaptureRequest::RuntimeProfile {
+            protocol_version,
+            request,
+        } => {
+            handle_runtime_profile(reader, writer, &state_root, protocol_version, request, shutdown).await;
+            return;
+        }
+        CaptureRequest::TraceRecord {
+            protocol_version,
+            consent_expires_at_unix,
+            duration_millis,
+            max_spans,
+        } => (protocol_version, consent_expires_at_unix, duration_millis, max_spans),
+    };
     let limits = TraceRecordLimits {
-        duration: Duration::from_millis(request.duration_millis),
-        max_spans: request.max_spans,
+        duration: Duration::from_millis(duration_millis),
+        max_spans,
     };
     let capture = async {
-        if request.protocol_version != PROTOCOL_VERSION {
+        if protocol_version != PROTOCOL_VERSION {
             return Err(TelemetryProducerError::SourceUnavailable);
         }
         limits.validate()?;
-        let remaining = request
-            .consent_expires_at_unix
+        let remaining = consent_expires_at_unix
             .checked_sub(unix_now().map_err(|_| TelemetryProducerError::ConsentExpired)?)
             .and_then(|seconds| u64::try_from(seconds).ok())
             .filter(|seconds| *seconds > 0)
@@ -294,7 +636,11 @@ async fn read_request(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -
     if bytes.is_empty() || bytes.len() as u64 > MAX_REQUEST_BYTES || bytes.pop() != Some(b'\n') {
         return Err(LocalTraceCaptureError::Protocol);
     }
-    serde_json::from_slice(&bytes).map_err(|_| LocalTraceCaptureError::Protocol)
+    let request = serde_json::from_slice(&bytes).map_err(|_| LocalTraceCaptureError::Protocol)?;
+    if matches!(request, CaptureRequest::TraceRecord { .. }) && bytes.len() + 1 > 1_024 {
+        return Err(LocalTraceCaptureError::Protocol);
+    }
+    Ok(request)
 }
 
 fn private_state_owner(path: &Path) -> Result<u32, LocalTraceCaptureError> {
@@ -522,5 +868,238 @@ mod tests {
         .await
         .expect("server capture stops after disconnect");
         runtime.shutdown().await;
+    }
+    use sha2::Digest as _;
+
+    fn runtime_request(state: &std::path::Path) -> (super::LocalRuntimeProfileRequest, crate::connect::DeviceIdentity) {
+        let key = crate::connect::OfflineKeyStore::new(state).load_or_create().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let organization = "organizations/019e3ae0-0000-7000-8000-000000000021";
+        let cluster = format!("{organization}/clusters/019e3ae0-0000-7000-8000-000000000022");
+        (
+            super::LocalRuntimeProfileRequest {
+                offline_key_id: hex_simd::encode_to_string(
+                    sha2::Sha256::digest(key.public_key_der()),
+                    hex_simd::AsciiCase::Lower,
+                ),
+                organization_name: organization.to_owned(),
+                cluster_name: cluster.clone(),
+                device_name: format!("{cluster}/clusterDevices/019e3ae0-0000-7000-8000-000000000023"),
+                run_uid: "019e3ae0-0000-7000-8000-000000000024".to_owned(),
+                artifact_uid: "019e3ae0-0000-7000-8000-000000000025".to_owned(),
+                schema_version: 1,
+                capability: "profile.threads@1".to_owned(),
+                consent_uid: "019e3ae0-0000-7000-8000-000000000026".to_owned(),
+                policy_revision: 1,
+                consent_expires_at_unix: now + 120,
+                acknowledge_l3: true,
+                expires_at_unix: now + 60,
+                duration_millis: 20,
+                sample_period_micros: 1000,
+            },
+            key,
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_runtime_profile_uses_server_workers_and_offline_signature() {
+        use std::io::Read as _;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, key) = runtime_request(state.path());
+        let state_root = state.path().to_path_buf();
+        let stop = CancellationToken::new();
+        let server_stop = stop.clone();
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let runtime = spawn_local_trace_capture_runtime(&state_root, &server_stop).unwrap();
+                    ready.send(()).unwrap();
+                    server_stop.cancelled().await;
+                    runtime.shutdown().await;
+                });
+        });
+        wait.await.unwrap();
+        let export = super::request_local_runtime_profile(state.path(), request.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+        stop.cancel();
+        server.join().unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
+        let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
+        assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+        assert_eq!(result["data"]["workerCount"], 2);
+        assert_eq!(result["data"]["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(result["provenance"]["sourceCommit"], crate::version::build::COMMIT_HASH);
+        let mut binary = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = binary.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let binary_hash = hasher.finalize();
+        assert_eq!(
+            result["provenance"]["executableSha256"],
+            hex_simd::encode_to_string(binary_hash, hex_simd::AsciiCase::Lower)
+        );
+        let mut envelope = Vec::new();
+        zip.by_name("envelope.json").unwrap().read_to_end(&mut envelope).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(metadata["classification"], "L3");
+        assert_eq!(metadata["deviceKeyId"], request.offline_key_id);
+        let signature: serde_json::Value = serde_json::from_reader(zip.by_name("envelope.sig").unwrap()).unwrap();
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope);
+        assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
+        assert!(!state.path().join("identity").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_runtime_profile_rejects_invalid_consent_identity_and_protocol() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, _) = runtime_request(state.path());
+        let cancel = CancellationToken::new();
+        let mut invalid = request.clone();
+        invalid.acknowledge_l3 = false;
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        let mut invalid = request.clone();
+        invalid.consent_expires_at_unix = 1;
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::ConsentExpired)
+        ));
+        let mut invalid = request.clone();
+        invalid.duration_millis = 30_001;
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::LimitExceeded)
+        ));
+        let mut invalid = request.clone();
+        invalid.offline_key_id = "0".repeat(64);
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+        let mut value = serde_json::to_value(&request).unwrap();
+        value["provenance"] = serde_json::json!({});
+        assert!(serde_json::from_value::<super::LocalRuntimeProfileRequest>(value).is_err());
+        assert!(serde_json::from_str::<super::CaptureRequest>(r#"{"operation":"TRACE_RECORD","protocolVersion":1,"protocolVersion":1,"consentExpiresAtUnix":1,"durationMillis":1,"maxSpans":1}"#).is_err());
+        let key_dir = state.path().join("offline");
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, request.clone(), &cancel).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = crate::connect::OfflineKeyStore::new(state.path()).key_path();
+        let real = state.path().join("original-key");
+        std::fs::rename(&path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, request.clone(), &cancel).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, request, &cancel).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_runtime_profile_cancellation_waits_for_lease_release() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut request, _) = runtime_request(state.path());
+        request.duration_millis = 5_000;
+        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let state_root = state.path().to_path_buf();
+        let task = tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if super::super::profile_cpu::CollectorLease::acquire().is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert!(matches!(task.await.unwrap(), Err(LocalTraceCaptureError::RuntimeProfile(code)) if code == "CANCELLED"));
+        let lease = super::super::profile_cpu::CollectorLease::acquire().expect("client cancellation joins collector");
+        drop(lease);
+        runtime.shutdown().await;
+    }
+    #[tokio::test]
+    #[serial]
+    async fn local_runtime_profile_does_not_claim_unacknowledged_cancellation() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, _) = runtime_request(state.path());
+        let owner = super::private_state_owner(state.path()).unwrap();
+        let listener = super::bind_listener(&state.path().join(super::SOCKET_FILE), owner).unwrap();
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let stop = CancellationToken::new();
+        let peer_stop = stop.clone();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            super::read_request(&mut reader).await.unwrap();
+            ready.send(()).unwrap();
+            peer_stop.cancelled().await;
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let state_root = state.path().to_path_buf();
+        let task = tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
+        received.await.unwrap();
+        cancel.cancel();
+        assert!(matches!(task.await.unwrap(), Err(LocalTraceCaptureError::CancellationUnconfirmed)));
+        stop.cancel();
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn local_capture_wire_keeps_separate_request_limits() {
+        use tokio::io::AsyncWriteExt as _;
+        for (size, accepted) in [(1_024, true), (1_025, false), (8_193, false)] {
+            let (mut sender, receiver) = tokio::net::UnixStream::pair().unwrap();
+            let mut bytes = serde_json::to_vec(&super::CaptureRequest::TraceRecord {
+                protocol_version: 1,
+                consent_expires_at_unix: 1,
+                duration_millis: 1,
+                max_spans: 1,
+            })
+            .unwrap();
+            bytes.resize(size - 1, b' ');
+            bytes.push(b'\n');
+            let writer = tokio::spawn(async move {
+                sender.write_all(&bytes).await.unwrap();
+            });
+            let (reader, _) = receiver.into_split();
+            let result = super::read_request(&mut tokio::io::BufReader::new(reader)).await;
+            assert_eq!(result.is_ok(), accepted, "wire size {size}");
+            writer.await.unwrap();
+        }
     }
 }

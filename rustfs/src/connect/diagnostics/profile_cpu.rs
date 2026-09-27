@@ -244,6 +244,27 @@ pub struct LocalProfileConsent {
     pub confirmed: bool,
 }
 
+/// Owner-authorized request for the running service, never a CLI process profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct LocalRuntimeProfileRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub schema_version: u16,
+    pub capability: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l3: bool,
+    pub expires_at_unix: i64,
+    pub duration_millis: u64,
+    pub sample_period_micros: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileCaptureRequest {
     pub organization_name: String,
