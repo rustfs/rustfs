@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -363,7 +363,32 @@ impl ThreadStateCount {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProfileData {
+    pub(super) scope: ThreadProfileScope,
+    pub(super) worker_count: usize,
+    pub(super) samples: [RuntimeProfileSample; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeProfileSample {
+    pub elapsed_micros: u64,
+    pub alive_task_count: u64,
+    pub global_queue_depth: u64,
+    pub workers: Vec<RuntimeWorkerSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeWorkerSample {
+    pub worker_index: usize,
+    pub busy_duration_micros: u64,
+    pub park_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ThreadProfileScope {
     TokioRuntime,
@@ -376,6 +401,7 @@ pub enum ProfileData {
     Cpu(CpuProfileData),
     Memory(MemoryProfileData),
     Threads(ThreadProfileData),
+    Runtime(RuntimeProfileData),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -419,6 +445,19 @@ impl ProfileResult {
             coverage: ProfileCoverage::complete_window(),
             data: Some(data),
         }
+    }
+
+    pub(super) fn runtime_succeeded(
+        request: &ProfileCaptureRequest,
+        duration: Duration,
+        data: RuntimeProfileData,
+    ) -> Result<Self, ProfileError> {
+        if duration > MAX_PROFILE_DURATION {
+            return Err(ProfileError::TimedOut);
+        }
+        let mut result = Self::succeeded(request, ProfileTool::Threads, duration, ProfileData::Runtime(data));
+        result.duration_millis = u64::try_from(duration.as_millis()).map_err(|_| ProfileError::LimitExceeded)?;
+        Ok(result)
     }
 
     #[cfg(all(

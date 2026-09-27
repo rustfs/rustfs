@@ -70,6 +70,7 @@
         "consentUid": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
         "consentPolicyRevision": { "type": "integer", "minimum": 1 },
         "consentExpiresAt": { "type": "string", "format": "date-time" },
+        "threadScope": { "enum": ["NATIVE_THREADS", "TOKIO_RUNTIME"] },
         "durationMillis": { "type": "integer", "minimum": 1, "maximum": 30000 },
         "samplePeriodMicros": { "type": "integer", "minimum": 1, "maximum": 30000000 },
         "maxEvidenceAgeSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
@@ -262,6 +263,7 @@
       "if": { "properties": { "jobType": { "const": "profile.threads" } } },
       "then": {
         "properties": {
+          "limits": { "properties": { "maxMemoryBytes": { "const": 67108864 }, "maxCpuMillis": { "const": 30000 } } },
           "requiredCapabilities": {
             "type": "array",
             "prefixItems": [{ "const": "profile.threads@1" }],
@@ -357,6 +359,11 @@
           }
         }
       }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "profile.threads" } } },
+      "then": { "properties": { "parameters": { "required": ["threadScope"] } } },
+      "else": { "properties": { "parameters": { "not": { "required": ["threadScope"] } } } }
     }
   ]
 }

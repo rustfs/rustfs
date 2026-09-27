@@ -17,8 +17,8 @@
 //! Linux native collection reads only the state byte from this process's
 //! `/proc/self/task/*/stat` records. Thread names, identifiers, stacks, paths,
 //! addresses, and raw procfs bytes cannot enter the exported result. Tokio
-//! runtime state remains explicitly unsupported because Dial9 does not expose
-//! the contract's RUNNABLE, WAITING, BLOCKED, and UNKNOWN counts.
+//! service metrics are collected only from an explicitly supplied runtime handle.
+//! Standalone exports cannot observe the server runtime and remain unsupported.
 
 #[cfg(target_os = "linux")]
 use std::fs::{self, File};
@@ -80,6 +80,134 @@ pub fn capture_thread_profile(
             ProfileData::Threads(data),
         ))
     }
+}
+
+/// The caller must supply the serving runtime's metrics before entering the blocking collector.
+pub(super) fn capture_runtime_profile(
+    request: &ProfileCaptureRequest,
+    metrics: &tokio::runtime::RuntimeMetrics,
+    timeout: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Result<ProfileResult, ProfileError> {
+    request.validate(ProfileTool::Threads, unix_now()?)?;
+    check_cancel(cancel)?;
+    #[cfg(not(target_has_atomic = "64"))]
+    {
+        let _ = (metrics, timeout);
+        return Ok(ProfileResult::unsupported(
+            request,
+            ProfileTool::Threads,
+            ProfileReasonCode::UnsupportedPlatform,
+        ));
+    }
+    #[cfg(target_has_atomic = "64")]
+    {
+        use super::profile_cpu::{CollectorLease, RuntimeProfileData};
+        use std::time::{Duration, Instant};
+        if timeout.is_zero() || timeout > super::profile_cpu::MAX_PROFILE_DURATION || request.duration > timeout {
+            return Err(ProfileError::LimitExceeded);
+        }
+        let _lease = CollectorLease::acquire()?;
+        let worker_count = metrics.num_workers();
+        validate_runtime_workers(worker_count)?;
+        let started = Instant::now();
+        let first = runtime_sample(metrics, worker_count, 0)?;
+        while started.elapsed() < request.duration {
+            check_cancel(cancel)?;
+            request.validate(ProfileTool::Threads, unix_now()?)?;
+            std::thread::sleep(
+                request
+                    .duration
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(10)),
+            );
+        }
+        let offset = u64::try_from(started.elapsed().as_micros()).map_err(|_| ProfileError::LimitExceeded)?;
+        let second = runtime_sample(metrics, worker_count, offset)?;
+        validate_runtime_counters(&first, &second)?;
+        check_cancel(cancel)?;
+        request.validate(ProfileTool::Threads, unix_now()?)?;
+        let elapsed = started.elapsed();
+        if elapsed > timeout {
+            return Err(ProfileError::TimedOut);
+        }
+        let result = ProfileResult::runtime_succeeded(
+            request,
+            elapsed,
+            RuntimeProfileData {
+                scope: ThreadProfileScope::TokioRuntime,
+                worker_count,
+                samples: [first, second],
+            },
+        )?;
+        if serde_json::to_vec(&result).map_err(|_| ProfileError::Encoding)?.len() > super::profile_cpu::MAX_RESULT_BYTES {
+            return Err(ProfileError::LimitExceeded);
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(target_has_atomic = "64")]
+fn validate_runtime_counters(
+    first: &super::profile_cpu::RuntimeProfileSample,
+    second: &super::profile_cpu::RuntimeProfileSample,
+) -> Result<(), ProfileError> {
+    if first.workers.len() != second.workers.len()
+        || first.workers.iter().zip(&second.workers).any(|(a, b)| {
+            a.worker_index != b.worker_index || b.busy_duration_micros < a.busy_duration_micros || b.park_count < a.park_count
+        })
+    {
+        return Err(ProfileError::CollectionFailed);
+    }
+    Ok(())
+}
+
+#[cfg(target_has_atomic = "64")]
+fn validate_runtime_workers(worker_count: usize) -> Result<(), ProfileError> {
+    // Each of the two snapshots includes one summary and one record per worker.
+    if worker_count == 0
+        || worker_count
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(2))
+            .is_none_or(|n| n > 1024)
+    {
+        return Err(ProfileError::LimitExceeded);
+    }
+    Ok(())
+}
+
+#[cfg(target_has_atomic = "64")]
+fn runtime_count(value: u128) -> Result<u64, ProfileError> {
+    if value > 9_007_199_254_740_991 {
+        return Err(ProfileError::LimitExceeded);
+    }
+    Ok(value as u64)
+}
+
+#[cfg(target_has_atomic = "64")]
+fn runtime_sample(
+    metrics: &tokio::runtime::RuntimeMetrics,
+    worker_count: usize,
+    elapsed_micros: u64,
+) -> Result<super::profile_cpu::RuntimeProfileSample, ProfileError> {
+    use super::profile_cpu::{RuntimeProfileSample, RuntimeWorkerSample};
+    if metrics.num_workers() != worker_count {
+        return Err(ProfileError::CollectionFailed);
+    }
+    let mut workers = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        workers.push(RuntimeWorkerSample {
+            worker_index,
+            busy_duration_micros: runtime_count(metrics.worker_total_busy_duration(worker_index).as_micros())?,
+            park_count: runtime_count(u128::from(metrics.worker_park_count(worker_index)))?,
+        });
+    }
+    Ok(RuntimeProfileSample {
+        elapsed_micros,
+        alive_task_count: runtime_count(metrics.num_alive_tasks() as u128)?,
+        global_queue_depth: runtime_count(metrics.global_queue_depth() as u128)?,
+        workers,
+    })
 }
 
 pub async fn export_thread_profile(
@@ -196,5 +324,47 @@ mod tests {
             assert_eq!(parse_proc_stat_state(raw).expect("valid proc stat"), expected);
         }
         assert!(matches!(parse_proc_stat_state(b"123 malformed"), Err(ProfileError::SourceUnavailable)));
+    }
+}
+
+#[cfg(all(test, target_has_atomic = "64"))]
+mod runtime_tests {
+    use super::*;
+    #[test]
+    fn runtime_counter_resets_fail_without_substituting_zero_deltas() {
+        use super::super::profile_cpu::{RuntimeProfileSample, RuntimeWorkerSample};
+        let first = RuntimeProfileSample {
+            elapsed_micros: 0,
+            alive_task_count: 1,
+            global_queue_depth: 2,
+            workers: vec![RuntimeWorkerSample {
+                worker_index: 0,
+                busy_duration_micros: 10,
+                park_count: 4,
+            }],
+        };
+        let mut second = first.clone();
+        second.alive_task_count = 0;
+        second.global_queue_depth = 3;
+        assert!(validate_runtime_counters(&first, &second).is_ok());
+        second.workers[0].busy_duration_micros = 9;
+        assert!(matches!(validate_runtime_counters(&first, &second), Err(ProfileError::CollectionFailed)));
+        second.workers[0].busy_duration_micros = 11;
+        second.workers[0].park_count = 3;
+        assert!(matches!(validate_runtime_counters(&first, &second), Err(ProfileError::CollectionFailed)));
+        second.workers.clear();
+        assert!(matches!(validate_runtime_counters(&first, &second), Err(ProfileError::CollectionFailed)));
+    }
+
+    #[test]
+    fn runtime_allocation_and_json_integer_bounds_are_exact() {
+        assert!(validate_runtime_workers(1).is_ok());
+        assert!(validate_runtime_workers(511).is_ok());
+        for workers in [0, 512, usize::MAX] {
+            assert!(matches!(validate_runtime_workers(workers), Err(ProfileError::LimitExceeded)));
+        }
+        assert_eq!(runtime_count(0).unwrap(), 0);
+        assert_eq!(runtime_count(9_007_199_254_740_991).unwrap(), 9_007_199_254_740_991);
+        assert!(matches!(runtime_count(9_007_199_254_740_992), Err(ProfileError::LimitExceeded)));
     }
 }
