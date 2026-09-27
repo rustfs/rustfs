@@ -38,7 +38,7 @@ permissions:
 jobs:
   health-service:
     name: Verify bounded health service over mTLS
-    runs-on: sm-standard-2
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
