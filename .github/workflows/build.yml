@@ -208,9 +208,9 @@ jobs:
 
           all='{"include":[
             {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":"","features":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
             {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
             {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
             {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
           ]}'
@@ -625,7 +625,7 @@ jobs:
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
-      - name: Verify packaged Linux CLI
+      - name: Verify packaged Linux binaries
         if: matrix.platform == 'linux'
         shell: bash
         run: |
@@ -640,15 +640,16 @@ jobs:
             exit 1
           fi
 
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-            cli_dir="$(mktemp -d)"
-            trap 'rm -rf "$cli_dir"' EXIT
-            unzip -q "$package_file" rustfs-cli -d "$cli_dir"
-            "$cli_dir/rustfs-cli" --help >/dev/null
-          fi
+          # Every Linux target builds natively, so executing the binaries here
+          # proves each artifact matches its runner architecture.
+          cli_dir="$(mktemp -d)"
+          trap 'rm -rf "$cli_dir"' EXIT
+          unzip -q "$package_file" rustfs rustfs-cli -d "$cli_dir"
+          "$cli_dir/rustfs" --version
+          "$cli_dir/rustfs-cli" --help >/dev/null
 
       - name: Verify packaged console
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
