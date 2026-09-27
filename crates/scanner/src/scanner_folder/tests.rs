@@ -28,6 +28,7 @@ use std::sync::Mutex;
 
 mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
+mod incremental_enumeration;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
