@@ -2780,7 +2780,7 @@ mod tests {
                     .env("RUSTFS_CLEANUP_DISK_MAX_PENDING", "1")
                     .env("RUSTFS_CLEANUP_DISK_WORKERS", "1")
                     .env("RUSTFS_CLEANUP_GC_WORKERS", "1")
-                    .env_remove("RUSTFS_CLEANUP_CPUS")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
                     .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
