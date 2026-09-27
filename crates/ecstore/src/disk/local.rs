@@ -5093,7 +5093,7 @@ pub struct LocalDisk {
     /// pathname is later covered by another mount.
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
-    mount_lease: std::fs::File,
+    mount_lease: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     mount_lease_mount_id: Option<u64>,
     /// Public path for callers that need the configured disk layout. Internal
@@ -5551,7 +5551,7 @@ impl LocalDisk {
             publication_root,
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease,
+            mount_lease: Arc::new(mount_lease),
             #[cfg(target_os = "linux")]
             mount_lease_mount_id,
             endpoint: ep.clone(),
@@ -5606,7 +5606,13 @@ impl LocalDisk {
 
         let io_root = disk.io_root.clone();
         let publication_root = disk.publication_root.clone();
-        tokio::spawn(Self::cleanup_deleted_objects_loop(io_root, publication_root, exit_rx));
+        tokio::spawn(Self::cleanup_deleted_objects_loop(
+            io_root,
+            publication_root,
+            #[cfg(target_os = "linux")]
+            disk.mount_lease.clone(),
+            exit_rx,
+        ));
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -5622,30 +5628,53 @@ impl LocalDisk {
     async fn cleanup_deleted_objects_loop(
         root: PathBuf,
         publication_root: os::PublicationRoot,
+        #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
         mut exit_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
+                    let root = root.clone();
+                    let publication_root = publication_root.clone();
+                    #[cfg(target_os = "linux")]
+                    let mount_lease = mount_lease.clone();
+                    if let Err(err) = super::cleanup_runtime::run_gc(move |budget| async move {
+                        // Queued/detached scans must keep /proc/self/fd paths
+                        // attached to the original mount after LocalDisk drops.
+                        #[cfg(target_os = "linux")]
+                        let _mount_lease = mount_lease;
+                        if let Err(err) = Self::cleanup_deleted_objects(root.clone(), &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "deleted_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root, &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "stale_tmp_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        Ok(())
+                    }).await {
                         error!(
                             event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "deleted_objects",
-                            state = "failed",
-                            error = ?err,
-                            "Disk local background cleanup failed"
-                        );
-                    }
-                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root).await {
-                        error!(
-                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "stale_tmp_objects",
+                            task = "cleanup_dispatch",
                             state = "failed",
                             error = ?err,
                             "Disk local background cleanup failed"
@@ -5736,93 +5765,121 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_stale_tmp_objects(root: PathBuf, publication_root: &os::PublicationRoot) -> Result<()> {
-        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY).await
+    async fn cleanup_stale_tmp_objects(
+        root: PathBuf,
+        publication_root: &os::PublicationRoot,
+        budget: &super::cleanup_runtime::GcBudget,
+    ) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY, budget).await
     }
 
     async fn cleanup_stale_tmp_objects_with_expiry(
         root: PathBuf,
         publication_root: &os::PublicationRoot,
         expiry: Duration,
+        budget: &super::cleanup_runtime::GcBudget,
     ) -> Result<()> {
         let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
-        let mut entries = match fs::read_dir(&tmp_path).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&tmp_path).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
-                continue;
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_stale_tmp_entry(entry, &root, publication_root, expiry).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
-
-            let file_type = entry.file_type().await?;
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let Some(age) = entry
-                .metadata()
-                .await?
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-            else {
-                continue;
-            };
-            if age <= expiry {
-                continue;
-            }
-
-            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
-            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET), publication_root).await?;
         }
 
         Ok(())
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    async fn cleanup_stale_tmp_entry(
+        entry: fs::DirEntry,
+        root: &Path,
+        publication_root: &os::PublicationRoot,
+        expiry: Duration,
+    ) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." || name == ".trash" || !entry.file_type().await?.is_dir() {
+            return Ok(());
+        }
+        let Some(age) = entry
+            .metadata()
+            .await?
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+        else {
+            return Ok(());
+        };
+        if age <= expiry {
+            return Ok(());
+        }
+        let target_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+        rename_all(entry.path(), target_path, Self::meta_path(root, RUSTFS_META_BUCKET), publication_root).await?;
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf, budget: &super::cleanup_runtime::GcBudget) -> Result<()> {
         let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
-        let mut entries = match fs::read_dir(&trash).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&trash).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." {
-                continue;
-            }
-
-            let file_type = entry.file_type().await?;
-
-            let path = trash.join(name);
-
-            if file_type.is_dir() {
-                if let Err(e) = tokio::fs::remove_dir_all(path).await
-                    && e.kind() != ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-            } else if let Err(e) = tokio::fs::remove_file(path).await
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(e.into());
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_trash_entry(entry, &trash).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
         }
 
         Ok(())
+    }
+
+    async fn cleanup_trash_entry(entry: fs::DirEntry, trash: &Path) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            return Ok(());
+        }
+        let path = trash.join(name);
+        let result = if entry.file_type().await?.is_dir() {
+            fs::remove_dir_all(path).await
+        } else {
+            fs::remove_file(path).await
+        };
+        match result {
+            Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
+            _ => Ok(()),
+        }
     }
 
     fn is_valid_volname(volname: &str) -> bool {
@@ -6133,6 +6190,36 @@ impl LocalDisk {
         .await?;
 
         Ok(())
+    }
+
+    /// Keep the common GET completion on its caller. Only a last-reader
+    /// release with pending reclamation needs an owned cleanup task. Leave
+    /// that token untouched so the slow path owns the complete transition.
+    pub(in crate::disk) async fn release_snapshot_lease_without_cleanup(
+        &self,
+        volume: &str,
+        path: &str,
+        token: SnapshotLeaseToken,
+    ) -> bool {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+        };
+        let mut registry = self.snapshot_leases.lock().await;
+        let Some(entry) = registry.entries.get_mut(&key) else {
+            return true;
+        };
+        if !entry.deleting
+            && entry.pending_delete.is_some()
+            && (entry.tokens.is_empty() || (entry.tokens.len() == 1 && entry.tokens.contains(&token)))
+        {
+            return false;
+        }
+        entry.tokens.remove(&token);
+        if entry.tokens.is_empty() && !entry.deleting {
+            registry.entries.remove(&key);
+        }
+        true
     }
 
     async fn delete_data_dir_with_namespace_owner(
@@ -10723,7 +10810,16 @@ impl DiskAPI for LocalDisk {
             entry.deleting = true;
             opts
         };
-        let result = self.delete_unleased(volume, path, &opts).await;
+        // Release the reader token even under saturation. A rejected reclaim
+        // retains pending_delete (and its on-disk receipt) for a later retry.
+        // Do not wait for execution while a releasing reader may own locks.
+        let result = match super::cleanup_runtime::try_disk_execution() {
+            Ok(permit) => {
+                let _permit = permit;
+                self.delete_unleased(volume, path, &opts).await
+            }
+            Err(err) => Err(err.into()),
+        };
         let mut registry = self.snapshot_leases.lock().await;
         match result {
             Ok(()) => {
@@ -12509,10 +12605,15 @@ mod test {
         disk.wait_for_startup_cleanup().await;
         assert_eq!(disk.startup_cleanup_ready.load(Ordering::Acquire), 1);
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().join("missing-root"), &publication_root, Duration::ZERO)
-            .await
-            .expect("missing tmp path should be a cleanup no-op");
-        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"))
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().join("missing-root"),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("missing tmp path should be a cleanup no-op");
+        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("missing trash path should be a cleanup no-op");
 
@@ -12525,9 +12626,14 @@ mod test {
         fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
         backdate_mtime(&stale_dir, Duration::from_secs(10));
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("stale tmp directory should move to trash");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("stale tmp directory should move to trash");
         assert!(!stale_dir.exists(), "stale tmp directory should be moved away");
         assert!(live_file.exists(), "plain tmp files should be ignored by stale dir cleanup");
 
@@ -12537,7 +12643,7 @@ mod test {
         fs::create_dir_all(trash_root.join("trash-dir"))
             .await
             .expect("trash dir should be created");
-        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf())
+        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf(), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("trash cleanup should remove files and directories");
         assert!(
@@ -18199,9 +18305,14 @@ mod test {
         // Backdate after the write above: creating stale/data refreshes the
         // scanned tmp/stale directory's mtime.
         backdate_mtime(&tmp.join("stale"), Duration::from_secs(10));
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(!tmp.join("stale").exists());
         assert!(trash.exists());
@@ -18228,15 +18339,58 @@ mod test {
         fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
         fs::write(&regular_file, b"keep").await.expect("operation should succeed");
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::from_secs(60))
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::from_secs(60),
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(tmp.join("fresh").exists());
         assert!(regular_file.exists());
 
         let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
         assert!(entries.next_entry().await.expect("operation should succeed").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn background_cleanup_keeps_mount_lease_after_disk_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let root = disk.io_root.clone();
+        let trash_entry = LocalDisk::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join("detached-gc");
+        fs::create_dir_all(&trash_entry).await.unwrap();
+        fs::write(trash_entry.join("part.1"), b"garbage").await.unwrap();
+        let live_file = root.join("keep");
+        fs::write(&live_file, b"live").await.unwrap();
+        let (exit, exited) = tokio::sync::broadcast::channel(1);
+        tokio::time::pause();
+        let cleanup = tokio::spawn(LocalDisk::cleanup_deleted_objects_loop(
+            root.clone(),
+            disk.publication_root.clone(),
+            disk.mount_lease.clone(),
+            exited,
+        ));
+        tokio::task::yield_now().await;
+        drop(disk);
+        tokio::task::yield_now().await;
+        assert!(live_file.exists(), "the GC owner must retain the original /proc/self/fd root");
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(20), async {
+            while trash_entry.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached cleanup must finish against the pinned mount");
+        assert_eq!(fs::read(&live_file).await.unwrap(), b"live");
+        exit.send(()).unwrap();
+        timeout(Duration::from_secs(20), cleanup).await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -21869,9 +22023,14 @@ mod test {
             Bytes::from_static(b"later")
         );
 
-        disk.release_snapshot_lease(volume, &data_dir, renewed)
-            .await
-            .expect("renewed lease release should succeed");
+        assert!(
+            disk.release_snapshot_lease_without_cleanup(volume, &data_dir, renewed).await,
+            "a non-final reader release must not dispatch cleanup"
+        );
+        assert!(
+            !disk.release_snapshot_lease_without_cleanup(volume, &data_dir, second).await,
+            "the final reader must retain its token for owned deferred reclamation"
+        );
         assert!(
             disk.read_all(volume, &first_part).await.is_ok(),
             "one remaining lease must keep the data directory"

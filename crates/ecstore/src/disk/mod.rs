@@ -14,6 +14,7 @@
 
 // #730: disk abstractions still carry staged health and direct-I/O migration paths.
 
+pub(crate) mod cleanup_runtime;
 pub mod disk_store;
 pub mod endpoint;
 pub mod error;

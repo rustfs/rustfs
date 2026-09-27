@@ -20,6 +20,7 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use crate::core::pools::DecommissionCapacityAdmission;
+use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
@@ -885,7 +886,6 @@ async fn acquire_single_tier_delete_lease(opts: &ObjectOptions, source: &ObjectI
     Ok(Some(lease))
 }
 
-const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
 
@@ -3686,6 +3686,19 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
 }
 
 impl SetDisks {
+    /// Failure cleanup stays awaited, but shares the same execution budget as
+    /// successful PUT continuations when isolation is enabled.
+    async fn delete_put_tmp_with_budget(&self, tmp_dir: &str, reservation: &Option<cleanup_runtime::Reservation>) -> Result<()> {
+        if reservation.is_none() {
+            return self.delete_all(RUSTFS_META_TMP_BUCKET, tmp_dir).await;
+        }
+        let set = self.clone();
+        let tmp_dir = tmp_dir.to_owned();
+        cleanup_runtime::spawn(reservation.clone(), async move { set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await })
+            .await
+            .map_err(Error::other)?
+    }
+
     pub(in crate::set_disk) async fn cleanup_rename_tail(
         &self,
         targets: Vec<RenameTailCleanup>,
@@ -3981,6 +3994,23 @@ impl SetDisks {
             .scanner_publication_commit_scope
             .clone()
             .map(ScannerPublicationCommitScopeGuard::new);
+        // Reserve before staging. Some callers already hold external locks,
+        // so admission must not wait for another PUT to release its budget.
+        // Commit/cleanup owners retain clones across cancellation and early ACK.
+        if opts
+            .put_object_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(StorageError::OperationCanceled);
+        }
+        let cleanup_reservation = cleanup_runtime::reserve().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                StorageError::SlowDown
+            } else {
+                Error::other(err)
+            }
+        })?;
         let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
@@ -4931,6 +4961,7 @@ impl SetDisks {
             let commit_tier_free_version_receipt_sink = opts.tier_free_version_receipt_sink.clone();
             let commit_skip_free_version = opts.skip_free_version;
             let request_cancellation = operation_cancellation.clone();
+            let commit_cleanup_reservation = cleanup_reservation.clone();
             tmp_cleanup_owned = true;
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE,
@@ -5129,7 +5160,10 @@ impl SetDisks {
                         quota_mutation_fence,
                     )
                     .await;
-                    if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                    if let Err(cleanup_err) = commit_set
+                        .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
+                        .await
+                    {
                         warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
                     } else if issue3031_diag_enabled() {
                         warn!(
@@ -5287,6 +5321,7 @@ impl SetDisks {
                         let fence_object = commit_object.clone();
                         let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
                         rename_guard_release = Some(guard_release_tx);
+                        let cleanup_reservation = commit_cleanup_reservation.clone();
                         tokio::spawn(finish_rename_tail_heal(
                             rename_tail_drain,
                             guard_release_rx,
@@ -5321,7 +5356,7 @@ impl SetDisks {
                                 drop(object_lock_guard);
                                 drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
-                                async move {
+                                cleanup_runtime::run(cleanup_reservation, async move {
                                     let zero_target_cleanup = targets.is_empty();
                                     rustfs_io_metrics::record_put_object_stage_duration(
                                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
@@ -5370,7 +5405,7 @@ impl SetDisks {
                                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
                                         guard_drop_started,
                                     );
-                                }
+                                })
                             },
                             |request| async move { heal_set.submit_rename_tail_heal(request).await },
                         ));
@@ -5427,7 +5462,10 @@ impl SetDisks {
                             // rollback backup for recovery; cleanup is unsafe.
                             return Err(err.into());
                         }
-                        if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                        if let Err(cleanup_err) = commit_set
+                            .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
+                            .await
+                        {
                             warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
                         } else if issue3031_diag_enabled() {
                             warn!(
@@ -5508,16 +5546,36 @@ impl SetDisks {
                         1.0,
                     );
                     let cleanup_receipt_started = rustfs_io_metrics::put_stage_timer();
-                    commit_set
-                        .persist_old_data_cleanup_receipts(
-                            &cleanup_disks,
-                            &commit_bucket,
-                            &commit_object,
-                            old_dir,
-                            committed_data_dir,
-                            transaction_epoch,
-                        )
+                    if commit_cleanup_reservation.is_none() {
+                        commit_set
+                            .persist_old_data_cleanup_receipts(
+                                &cleanup_disks,
+                                &commit_bucket,
+                                &commit_object,
+                                old_dir,
+                                committed_data_dir,
+                                transaction_epoch,
+                            )
+                            .await;
+                    } else {
+                        let cleanup_set = commit_set.clone();
+                        let receipt_disks = cleanup_disks.clone();
+                        let receipt_bucket = commit_bucket.clone();
+                        let receipt_object = commit_object.clone();
+                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                            cleanup_set
+                                .persist_old_data_cleanup_receipts(
+                                    &receipt_disks,
+                                    &receipt_bucket,
+                                    &receipt_object,
+                                    old_dir,
+                                    committed_data_dir,
+                                    transaction_epoch,
+                                )
+                                .await;
+                        })
                         .await;
+                    }
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT,
                         cleanup_receipt_started,
@@ -5582,16 +5640,41 @@ impl SetDisks {
                     // here must not negate an already-committed, durable write, so we
                     // deliberately do NOT `?`-propagate it into a 503. On residue the
                     // report path emits the leak metric and enqueues a heal.
-                    let cleanup = commit_set
-                        .commit_rename_data_dir_and_mark_capacity(
-                            &cleanup_disks,
-                            &commit_bucket,
-                            &commit_object,
-                            &old_dir.to_string(),
-                            &committed_dir,
-                            write_quorum,
-                        )
+                    if commit_cleanup_reservation.is_none() {
+                        let cleanup = commit_set
+                            .commit_rename_data_dir_and_mark_capacity(
+                                &cleanup_disks,
+                                &commit_bucket,
+                                &commit_object,
+                                &old_dir.to_string(),
+                                &committed_dir,
+                                write_quorum,
+                            )
+                            .await;
+                        commit_set
+                            .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
+                            .await;
+                    } else {
+                        let cleanup_set = commit_set.clone();
+                        let cleanup_bucket = commit_bucket.clone();
+                        let cleanup_object = commit_object.clone();
+                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                            let cleanup = cleanup_set
+                                .commit_rename_data_dir_and_mark_capacity(
+                                    &cleanup_disks,
+                                    &cleanup_bucket,
+                                    &cleanup_object,
+                                    &old_dir.to_string(),
+                                    &committed_dir,
+                                    write_quorum,
+                                )
+                                .await;
+                            cleanup_set
+                                .report_old_data_dir_cleanup(&cleanup_bucket, &cleanup_object, &old_dir.to_string(), &cleanup)
+                                .await;
+                        })
                         .await;
+                    }
                     let cleanup_elapsed = cleanup_stage_start.elapsed();
                     let cleanup_ms = cleanup_elapsed.as_millis() as u64;
                     cleanup_stage_ms = Some(cleanup_ms);
@@ -5599,9 +5682,6 @@ impl SetDisks {
                         "set_disk_old_data_cleanup",
                         duration_millis_f64(cleanup_elapsed),
                     );
-                    commit_set
-                        .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
-                        .await;
                     if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                         warn!(
                             event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
@@ -5681,7 +5761,7 @@ impl SetDisks {
                 if !tail_owns_tmp_cleanup {
                     let cleanup_set = commit_set.clone();
                     let cleanup_tmp_dir = commit_tmp_dir.clone();
-                    tokio::spawn(async move {
+                    cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {
                         if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
                             warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
                         } else if issue3031_diag_enabled() {
@@ -5837,7 +5917,7 @@ impl SetDisks {
             // entry is reclaimed by cleanup_stale_tmp_objects (24h expiry,
             // 5-minute background loop).
             let set_disks = self.clone();
-            tokio::spawn(async move {
+            cleanup_runtime::spawn(cleanup_reservation.clone(), async move {
                 if let Err(err) = set_disks.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
                     warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
                 } else if issue3031_diag_enabled() {
@@ -5852,7 +5932,7 @@ impl SetDisks {
             // Failure path (quorum loss / rollback): keep the cleanup inline so
             // a failed PUT never returns while its tmp shards are still on disk
             // (state-residue hardening tracked by backlog#864 / backlog#898).
-            if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+            if let Err(err) = self.delete_put_tmp_with_budget(&tmp_dir, &cleanup_reservation).await {
                 warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
             } else if issue3031_diag_enabled() {
                 warn!(
@@ -19439,6 +19519,73 @@ mod put_object_tmp_cleanup_tests {
             expected.is_subset(&marked),
             "tmp cleanup must mark the recovered disk it actually mutated"
         );
+    }
+
+    #[tokio::test]
+    async fn put_cleanup_admission_rejects_before_staging_with_an_external_lock() {
+        const CHILD: &str = "RUSTFS_CLEANUP_ADMISSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "set_disk::ops::object::put_object_tmp_cleanup_tests::put_cleanup_admission_rejects_before_staging_with_an_external_lock",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_MAX_PENDING", "1")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS", "1")
+                    .env_remove("RUSTFS_CLEANUP_CPUS")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "cleanup-admission-bucket";
+        let object = "externally-locked";
+        for disk in &disks {
+            disk.make_volume(bucket).await.unwrap();
+        }
+        let occupied = cleanup_runtime::reserve().unwrap().expect("isolation enabled in child");
+        let external_lock = set.acquire_write_lock_diag("admission_test", bucket, object).await.unwrap();
+        let mut reader = PutObjReader::from_vec(vec![7u8; TEST_OBJECT_SIZE]);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), set.put_object(bucket, object, &mut reader, &opts))
+            .await
+            .expect("admission must not wait while the caller owns locks");
+        assert!(matches!(result, Err(StorageError::SlowDown)));
+        assert!(non_trash_tmp_entries(&dirs).await.is_empty(), "rejection must not stage shards");
+        drop(external_lock);
+        drop(occupied);
+        let mut reader = PutObjReader::from_vec(vec![9u8; TEST_OBJECT_SIZE]);
+        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .unwrap();
+        wait_for_tmp_workspace_to_drain(&dirs, "admitted PUT must eventually clean staging").await;
+        let mut actual = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        actual.stream.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, vec![9u8; TEST_OBJECT_SIZE]);
     }
 
     #[tokio::test]
