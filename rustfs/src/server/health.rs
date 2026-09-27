@@ -355,11 +355,12 @@ pub(crate) fn build_health_response_parts(
             kms_ready,
             include_dependency_details,
         });
-        if let Some(details) = readiness_report.and_then(|report| report.storage_details)
+        if let Some(details) = readiness_report.and_then(|report| report.storage_details.as_ref())
             && payload.get("details").is_some()
         {
             payload["details"]["storage"]["readQuorum"] = json!(details.read_quorum_ready);
             payload["details"]["storage"]["writeQuorum"] = json!(details.write_quorum_ready);
+            payload["details"]["storage"]["unavailableDrives"] = json!(details.unavailable_drives);
             payload["details"]["poolMetadata"] = json!({
                 "ready": details.pool_metadata_write_ready,
                 "status": if details.pool_metadata_write_ready { "writable" } else { "unavailable" },
@@ -473,6 +474,7 @@ mod tests {
                     read_quorum_ready: read_quorum,
                     write_quorum_ready: write_quorum,
                     pool_metadata_write_ready: metadata_ready,
+                    ..Default::default()
                 });
                 let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs", None, None);
                 let expected_ready = write_quorum && metadata_ready && lock_ready;
@@ -511,12 +513,43 @@ mod tests {
 
     #[test]
     #[serial]
+    fn node_storage_details_explain_excluded_drives_without_exposing_endpoints() {
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
+            let mut report = ready_report();
+            report.readiness.storage_ready = false;
+            report.storage_details = Some(crate::shared_types::StorageReadinessDetails {
+                pool_metadata_write_ready: true,
+                unavailable_drives: vec![crate::shared_types::UnavailableReadinessDrive {
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 2,
+                    runtime_state: "suspect".to_string(),
+                    host_online: true,
+                }],
+                ..Default::default()
+            });
+            let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs", None, None);
+            assert_eq!(parts.status_code, StatusCode::SERVICE_UNAVAILABLE);
+            let payload = parts.payload.expect("readiness GET body");
+            assert_eq!(
+                payload["details"]["storage"]["unavailableDrives"],
+                json!([{
+                    "poolIndex": 0, "setIndex": 1, "diskIndex": 2,
+                    "runtimeState": "suspect", "hostOnline": true,
+                }])
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn node_storage_details_do_not_expand_minimal_or_liveness_payloads() {
         let mut report = ready_report();
         report.storage_details = Some(crate::shared_types::StorageReadinessDetails {
             read_quorum_ready: true,
             write_quorum_ready: true,
             pool_metadata_write_ready: true,
+            ..Default::default()
         });
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
             let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs", None, None);
