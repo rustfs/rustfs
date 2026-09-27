@@ -2430,6 +2430,99 @@ mod tests {
         restore_set_disks(&store, set, offline).await;
     }
 
+    /// EC 2+2 with two disks offline still has object read quorum and has lost
+    /// write quorum. A node that has not cached the bucket must still serve
+    /// HEAD bucket, GET, HEAD object, and List; a write must fail.
+    #[tokio::test]
+    #[serial]
+    async fn cold_bucket_reads_succeed_below_write_quorum() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("cold-read-quorum-{}", Uuid::new_v4().simple());
+        let object = "seed-object";
+        let body = b"cold bucket reads must survive lost write quorum".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("healthy namespace should accept bucket creation");
+        store
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &ObjectOptions::default())
+            .await
+            .expect("healthy erasure set should accept the seed object");
+
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_err(),
+            "the replacement metadata system must start without this bucket"
+        );
+        let set = &store.pools[0].disk_set[0];
+        let lock = set
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("seed namespace lock should resolve");
+        drop(
+            lock.get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("seed physical fanout must finish before taking disks offline"),
+        );
+        let offline = take_set_disks_offline(&store, set, &[0, 1]).await;
+
+        let info = store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("HEAD bucket must succeed at read quorum before the bucket is cached");
+        assert_eq!(info.name, bucket);
+
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, Default::default(), &ObjectOptions::default())
+            .await
+            .expect("GET must succeed for a bucket that was not loaded at startup");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("quorum read should reconstruct the body");
+        assert_eq!(restored, body);
+        drop(reader);
+
+        let object_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("HEAD object must succeed at read quorum");
+        assert_eq!(object_info.name, object);
+        assert_eq!(object_info.size, i64::try_from(body.len()).expect("body length fits i64"));
+
+        let listed = store
+            .clone()
+            .list_objects_v2(&bucket, "", None, None, 100, false, None, false)
+            .await
+            .expect("List must succeed at read quorum");
+        assert!(
+            listed.objects.iter().any(|item| item.name == object),
+            "list should include the seed object, got {:?}",
+            listed.objects.iter().map(|item| item.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            metadata_sys::get_in(&store.ctx, &bucket).await.is_ok(),
+            "the cold load should publish authoritative metadata"
+        );
+
+        let write_error = store
+            .put_object(&bucket, "rejected-object", &mut PutObjReader::from_vec(body), &ObjectOptions::default())
+            .await
+            .expect_err("writes must still fail without write quorum");
+        assert!(
+            matches!(
+                write_error,
+                StorageError::InsufficientWriteQuorum(_, _) | StorageError::ErasureWriteQuorum
+            ),
+            "writes must fail with a write-quorum error, got {write_error}"
+        );
+
+        restore_set_disks(&store, set, offline).await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn lazy_metadata_load_rejects_below_read_quorum() {
