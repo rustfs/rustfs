@@ -379,7 +379,7 @@ pub struct ConnectTopOpts {
 pub enum ConnectTopCommands {
     /// Capture API activity when an approved typed source is available
     Api(ConnectTopCaptureOpts),
-    /// Capture process disk I/O on supported platforms
+    /// Capture running service process disk I/O on supported platforms
     Disk(ConnectTopCaptureOpts),
     /// Capture lock activity when an approved typed source is available
     Locks(ConnectTopCaptureOpts),
@@ -391,6 +391,9 @@ pub enum ConnectTopCommands {
 
 #[derive(Args, Clone)]
 pub struct ConnectTopCaptureOpts {
+    /// Explicit existing offline identity pin, required for service disk capture
+    #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub offline_key_id: Option<String>,
     /// Directory containing an enrolled Connect device identity
     #[arg(long = "state-dir")]
     pub state_dir: PathBuf,
