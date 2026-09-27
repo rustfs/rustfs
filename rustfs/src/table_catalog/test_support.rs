@@ -304,7 +304,9 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
     manifest_avro_bytes_with_entry_sequences(&files)
 }
 
-pub(crate) fn manifest_avro_bytes_with_entry_sequences(files: &[(&str, i32, i32, i64, Option<i64>, Option<i64>)]) -> Vec<u8> {
+pub(crate) type ManifestEntryWithSequences<'a> = (&'a str, i32, i32, i64, Option<i64>, Option<i64>);
+
+pub(crate) fn manifest_avro_bytes_with_entry_sequences(files: &[ManifestEntryWithSequences<'_>]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
