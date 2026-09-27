@@ -27,7 +27,8 @@
 #   schedule and manual dispatch build the full platform matrix.
 #
 # Manual Parameters:
-# - build_docker: Build and push Docker images (default: true)
+# - publish: Publish binaries/releases for manual runs (default: false)
+# - build_docker: Advisory only; manual runs do not trigger Docker publishing
 # - platforms: Comma-separated platform IDs or 'all' (default: all)
 
 name: Build and Release
@@ -55,12 +56,16 @@ on:
     - cron: "13 1 * * 0" # Weekly on Sunday 01:13 UTC
   workflow_dispatch:
     inputs:
+      publish:
+        description: "Publish to download channels and GitHub Releases (false keeps only workflow artifacts)"
+        required: false
+        default: false
+        type: boolean
       build_docker:
         # Advisory only. docker.yml triggers on workflow_run and its job-level
         # condition requires the triggering event to be a tag push, so a manual
         # dispatch of this workflow never produces images regardless of this
-        # value. Kept because the summary step reports it; wiring it up would
-        # mean teaching docker.yml's version parser a second event shape.
+        # value. Publishing remains controlled by the explicit publish input.
         description: "Build and push Docker images after binary build (ignored: dispatch runs never reach docker.yml)"
         required: false
         default: true
@@ -92,6 +97,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      should_publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish == true }}
       build_type: ${{ steps.check.outputs.build_type }}
       version: ${{ steps.check.outputs.version }}
       short_sha: ${{ steps.check.outputs.short_sha }}
@@ -739,7 +745,7 @@ jobs:
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
       - name: Upload to Cloudflare R2
-        if: env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
+        if: needs.build-check.outputs.should_publish == 'true' && env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -827,61 +833,34 @@ jobs:
       - name: Build completion summary
         shell: bash
         env:
-          # dispatch input via env: free-form text must not be pasted into the
-          # script for bash to evaluate.
-          INPUT_BUILD_DOCKER: ${{ github.event.inputs.build_docker }}
+          SHOULD_PUBLISH: ${{ needs.build-check.outputs.should_publish }}
+          BUILD_TYPE: ${{ needs.build-check.outputs.build_type }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+          BUILD_STATUS: ${{ needs.build-rustfs.result }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
-          VERSION="${{ needs.build-check.outputs.version }}"
-
-          echo "🎉 Build completed successfully!"
-          echo "📦 Build type: $BUILD_TYPE"
-          echo "🔢 Version: $VERSION"
-          echo ""
-
-          # Check build status
-          BUILD_STATUS="${{ needs.build-rustfs.result }}"
-
-          echo "📊 Build Results:"
-          echo "  📦 All platforms: $BUILD_STATUS"
-          echo ""
-
-          case "$BUILD_TYPE" in
-            "preview")
-              echo "🔍 Preview artifacts are published in a GitHub prerelease"
-              echo "⏭️  Preview releases do not update latest channels"
-              ;;
-            "development")
-              echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
-              echo "⚠️  This is a development build - not suitable for production use"
-              ;;
-            "release")
-              echo "🚀 Release build artifacts have been uploaded to OSS release directory"
-              echo "✅ This build is ready for production use"
-              echo "🏷️  GitHub Release will be created in this workflow"
-              ;;
-            "prerelease")
-              echo "🧪 Prerelease build artifacts have been uploaded to OSS release directory"
-              echo "⚠️  This is a prerelease build - use with caution"
-              echo "🏷️  GitHub Release will be created in this workflow"
-              ;;
-          esac
-
-          echo ""
-          echo "🐳 Docker Images:"
-          if [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
-            echo "⏭️  Docker image build was skipped (binary only build)"
+          echo "Build type: $BUILD_TYPE"
+          echo "Version: $VERSION"
+          echo "Build result: $BUILD_STATUS"
+          if [[ "$SHOULD_PUBLISH" != "true" ]]; then
+            echo "Artifact-only run: no download channels or GitHub Releases are updated."
+            echo "Successful platform packages are available as workflow artifacts."
           elif [[ "$BUILD_STATUS" == "success" ]]; then
-            echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
+            echo "Publishing enabled; check the upload and release jobs for their results."
           else
-            echo "❌ Docker image build will be skipped due to build failure"
+            echo "Build incomplete; check individual platform jobs for any completed uploads."
+          fi
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* && "$BUILD_STATUS" == "success" ]]; then
+            echo "Docker publishing is eligible through the downstream workflow."
+          else
+            echo "This run does not trigger Docker publishing."
           fi
 
   # Create GitHub Release for every valid release tag, including previews
   create-release:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -942,7 +921,7 @@ jobs:
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -1036,7 +1015,7 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
@@ -1096,7 +1075,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -1134,7 +1113,7 @@ jobs:
   cleanup-preview-releases:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
