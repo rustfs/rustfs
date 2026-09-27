@@ -214,7 +214,9 @@ impl Config {
         let pending = positive_env(BUDGET, 1024)?;
         let blocking_threads = positive_env(BLOCKING_THREADS, 4)?;
         let cpus = match std::env::var(CPUS) {
+            Ok(value) if value.trim().eq_ignore_ascii_case("none") => Vec::new(),
             Ok(value) => parse_cpus(&value)?,
+            Err(std::env::VarError::NotPresent) if cfg!(target_os = "linux") => vec![1, 2],
             Err(std::env::VarError::NotPresent) => Vec::new(),
             Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidInput, err)),
         };
@@ -1017,39 +1019,54 @@ mod tests {
     fn defaults_bound_queue_waves_and_separate_threads_from_jobs() {
         const CHILD: &str = "RUSTFS_CLEANUP_DEFAULTS_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            let config = Config::from_env().expect("default configuration");
+            let mut config = Config::from_env().expect("default configuration");
+            let expected_cpus = match std::env::var(CPUS).as_deref() {
+                Ok("none") => Vec::new(),
+                Ok("3-4") => vec![3, 4],
+                _ if cfg!(target_os = "linux") => vec![1, 2],
+                _ => Vec::new(),
+            };
+            assert_eq!(config.cpus, expected_cpus);
             assert_eq!(config.workers, 64);
             assert!(config.async_threads <= 2);
             assert_eq!(config.blocking_threads, 4);
             assert_eq!(config.disk_workers, 4);
             assert_eq!(config.disk_pending, 64);
+            // Queue/thread defaults are independent of the host's CPU mask.
+            // The integration test exercises actual default/custom affinity.
+            config.cpus.clear();
             config.validate().expect("defaults must be internally consistent");
             let threads = config.async_threads;
             let runtime = CleanupRuntime::new(config).expect("runtime with many logical jobs");
             assert_eq!(runtime.runtime.as_ref().expect("live runtime").metrics().num_workers(), threads);
             return;
         }
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "disk::cleanup_runtime::tests::defaults_bound_queue_waves_and_separate_threads_from_jobs",
-            ])
-            .env(CHILD, "1")
-            .env(WORKERS, "64")
-            .env(BUDGET, "1024")
-            .env(GC_WORKERS, "1")
-            .env_remove(ASYNC_THREADS)
-            .env_remove(BLOCKING_THREADS)
-            .env_remove(DISK_WORKERS)
-            .env_remove(DISK_PENDING)
-            .env_remove(CPUS)
-            .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
-            .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
-            .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
-            .output()
-            .expect("run defaults test in a fresh process");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        for cpus in [None, Some("3-4"), Some("none")] {
+            let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "disk::cleanup_runtime::tests::defaults_bound_queue_waves_and_separate_threads_from_jobs",
+                ])
+                .env(CHILD, "1")
+                .env(WORKERS, "64")
+                .env(BUDGET, "1024")
+                .env(GC_WORKERS, "1")
+                .env_remove(ASYNC_THREADS)
+                .env_remove(BLOCKING_THREADS)
+                .env_remove(DISK_WORKERS)
+                .env_remove(DISK_PENDING)
+                .env_remove(CPUS)
+                .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP");
+            if let Some(cpus) = cpus {
+                command.env(CPUS, cpus);
+            }
+            let output = command.output().expect("run defaults test in a fresh process");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[tokio::test]
