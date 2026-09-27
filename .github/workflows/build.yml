@@ -726,12 +726,33 @@ jobs:
           fi
 
           # The self-hosted Linux runners do not ship the aws CLI (GitHub-hosted
-          # images did). Install it on demand so R2 uploads survive a fresh runner
-          # instead of hard-failing here.
+          # images did). Install the official CLI bundle on demand so R2 uploads
+          # survive a fresh runner without relying on a distro package.
           if ! command -v aws >/dev/null 2>&1; then
             echo "aws CLI not found on runner; installing..."
             if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y awscli
+              aws_arch="$(uname -m)"
+              case "$aws_arch" in
+                x86_64) aws_arch="x86_64" ;;
+                aarch64|arm64) aws_arch="aarch64" ;;
+                *)
+                  echo "❌ Unsupported Linux architecture for AWS CLI: $aws_arch"
+                  exit 1
+                  ;;
+              esac
+
+              aws_install_root="${RUNNER_TEMP:-$PWD}/aws-cli"
+              rm -rf "$aws_install_root"
+              mkdir -p "$aws_install_root"
+              curl --fail --location --retry 3 \
+                "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" \
+                --output "$aws_install_root/awscliv2.zip"
+              unzip -q "$aws_install_root/awscliv2.zip" -d "$aws_install_root"
+              "$aws_install_root/aws/install" \
+                --install-dir "$aws_install_root/aws-cli" \
+                --bin-dir "$aws_install_root/bin"
+              export PATH="$aws_install_root/bin:$PATH"
+              aws --version
             elif command -v brew >/dev/null 2>&1; then
               brew install awscli
             else
