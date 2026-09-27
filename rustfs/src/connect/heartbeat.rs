@@ -112,13 +112,15 @@ impl PendingHeartbeat {
                     ]
                 || self.capabilities == heartbeat_capabilities(false)
                 || self.capabilities == heartbeat_capabilities(true)
-                // RUSTFS_COMPAT_TODO(connect-894) Remove after upgrades from the pre-service-memory capability set are unsupported.
-                // Preserve exact pending requests; never add the capability to a retry.
+                // RUSTFS_COMPAT_TODO(connect-894) Remove after upgrades from the pre-service-memory and pre-health-service releases are unsupported.
+                // Preserve exact pending requests; never add capabilities to a retry.
                 || [false, true].into_iter().any(|job_capable| {
-                    heartbeat_capabilities(job_capable)
-                        .iter()
-                        .filter(|capability| capability.as_str() != "profile.memory.service@1")
-                        .eq(self.capabilities.iter())
+                    let previous = pre_health_service_heartbeat_capabilities(job_capable);
+                    self.capabilities == previous
+                        || previous
+                            .iter()
+                            .filter(|capability| capability.as_str() != "profile.memory.service@1")
+                            .eq(self.capabilities.iter())
                 }))
             && self.sequence <= MAX_SEQUENCE
             && self.coarse_node_summary.is_valid()
@@ -344,6 +346,44 @@ fn heartbeat_capabilities(job_capable: bool) -> Vec<String> {
         CONNECT_DIAGNOSTIC_CAPABILITIES
             .iter()
             .map(|capability| (*capability).to_owned()),
+    );
+    capabilities
+}
+
+fn pre_health_service_heartbeat_capabilities(job_capable: bool) -> Vec<String> {
+    // Freeze the historical advertisement: additions to the current list must
+    // not invalidate a persisted request from a supported earlier release.
+    let mut capabilities = vec![
+        "heartbeat".to_owned(),
+        "diagnostics.policy.v1".to_owned(),
+        "inventory.environment@1".to_owned(),
+    ];
+    if job_capable {
+        capabilities.push("jobs".to_owned());
+    }
+    capabilities.extend(
+        [
+            "performance.client@1",
+            "performance.drive@1",
+            "performance.network@1",
+            "performance.object@1",
+            "performance.siteReplication@1",
+            "logs.capture@1",
+            "profile.cpu@1",
+            "profile.memory@1",
+            "profile.memory.service@1",
+            "profile.threads@1",
+            "telemetry.record@1",
+            "telemetry.otlp@1",
+            "telemetry.replay@1",
+            "top.api@1",
+            "top.disk@1",
+            "top.locks@1",
+            "top.net@1",
+            "top.rpc@1",
+            "inspect.object@1",
+        ]
+        .map(str::to_owned),
     );
     capabilities
 }

@@ -323,11 +323,14 @@ async fn wait_for(
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("status channel");
+            status
+                .changed()
+                .await
+                .unwrap_or_else(|error| panic!("heartbeat status channel closed: {error}; last status: {:?}", *status.borrow()));
         }
     })
     .await
-    .expect("heartbeat status timeout")
+    .unwrap_or_else(|error| panic!("heartbeat status timeout: {error}; last status: {:?}", *status.borrow()))
 }
 
 async fn assert_credential_failure(config: HeartbeatConfig, server: &TestServer, expected: &str) {
@@ -536,6 +539,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "heartbeat",
             "diagnostics.policy.v1",
             "inventory.environment@1",
+            "health.check.service@1",
             "performance.client@1",
             "performance.drive@1",
             "performance.network@1",
@@ -633,7 +637,13 @@ async fn restart_replays_pending_request_then_advances_sequence() {
         }
     })
     .await
-    .expect("two heartbeats");
+    .unwrap_or_else(|error| {
+        panic!(
+            "two heartbeats: {error}; last status: {:?}; received: {}",
+            *runtime.status().borrow(),
+            second_server.seen.lock().expect("seen lock").len()
+        )
+    });
     runtime.shutdown().await;
 
     let seen = second_server.seen.lock().expect("seen lock");
@@ -684,71 +694,105 @@ fn pending_heartbeat_with_capabilities(capabilities: &[&str]) -> Value {
     })
 }
 
+fn pre_health_service_capabilities(job_capable: bool) -> Vec<&'static str> {
+    let mut capabilities = pre_service_memory_capabilities(job_capable);
+    let memory = capabilities
+        .iter()
+        .position(|capability| *capability == "profile.memory@1")
+        .expect("memory capability");
+    capabilities.insert(memory + 1, "profile.memory.service@1");
+    capabilities
+}
+
+async fn assert_pending_capabilities_replay(capabilities: &[&str]) {
+    let pki = TestPki::new();
+    let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shutdown = CancellationToken::new();
+    let config = config(&temp, &pki, &server);
+    fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
+    let pending = pending_heartbeat_with_capabilities(capabilities);
+    let state = json!({"nextSequence": 0, "pending": pending});
+    fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
+    private_mode(&config.state_path);
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+        .expect("start runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+    let seen = server.seen.lock().expect("seen lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], pending);
+}
+
 #[tokio::test]
 async fn restart_replays_exact_pre_service_memory_capabilities_with_and_without_jobs() {
     for job_capable in [false, true] {
-        let pki = TestPki::new();
-        let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
-        let temp = tempfile::tempdir().expect("tempdir");
-        let shutdown = CancellationToken::new();
-        let config = config(&temp, &pki, &server);
-        fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
-        let pending = pending_heartbeat_with_capabilities(&pre_service_memory_capabilities(job_capable));
-        let state = json!({"nextSequence": 0, "pending": pending});
-        fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
-        private_mode(&config.state_path);
-        let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
-            .expect("start runtime")
-            .expect("configured runtime");
-        let mut status = runtime.status();
-        assert!(matches!(
-            wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
-            HeartbeatStatus::Online { .. }
-        ));
-        runtime.shutdown().await;
-        let seen = server.seen.lock().expect("seen lock");
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0], pending);
+        assert_pending_capabilities_replay(&pre_service_memory_capabilities(job_capable)).await;
     }
 }
 
 #[tokio::test]
-async fn pre_service_memory_compatibility_does_not_accept_changed_capabilities() {
+async fn restart_replays_exact_pre_health_service_capabilities_with_and_without_jobs() {
     for job_capable in [false, true] {
-        for mutation in ["unknown", "missing", "duplicate", "reordered"] {
-            let pki = TestPki::new();
-            let server = server(&pki, vec![]).await;
-            let temp = tempfile::tempdir().expect("tempdir");
-            let shutdown = CancellationToken::new();
-            let config = config(&temp, &pki, &server);
-            fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
-            let mut capabilities = pre_service_memory_capabilities(job_capable);
-            match mutation {
-                "unknown" => capabilities.push("shell.exec@1"),
-                "missing" => {
-                    capabilities.pop();
+        assert_pending_capabilities_replay(&pre_health_service_capabilities(job_capable)).await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_compatibility_does_not_accept_changed_capabilities() {
+    for job_capable in [false, true] {
+        for original in [
+            pre_service_memory_capabilities(job_capable),
+            pre_health_service_capabilities(job_capable),
+        ] {
+            for mutation in ["unknown", "missing", "duplicate", "reordered", "unsupported-hybrid"] {
+                let pki = TestPki::new();
+                let server = server(&pki, vec![]).await;
+                let temp = tempfile::tempdir().expect("tempdir");
+                let shutdown = CancellationToken::new();
+                let config = config(&temp, &pki, &server);
+                fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
+                let mut capabilities = original.clone();
+                match mutation {
+                    "unknown" => capabilities.push("shell.exec@1"),
+                    "missing" => {
+                        capabilities.pop();
+                    }
+                    "duplicate" => capabilities.push("profile.memory@1"),
+                    "reordered" => capabilities.swap(5, 6),
+                    "unsupported-hybrid" => {
+                        capabilities.retain(|capability| *capability != "profile.memory.service@1");
+                        let first_diagnostic = capabilities
+                            .iter()
+                            .position(|capability| *capability == "performance.client@1")
+                            .expect("first diagnostic capability");
+                        capabilities.insert(first_diagnostic, "health.check.service@1");
+                    }
+                    _ => unreachable!(),
                 }
-                "duplicate" => capabilities.push("profile.memory@1"),
-                "reordered" => capabilities.swap(5, 6),
-                _ => unreachable!(),
+                let state = json!({"nextSequence": 0, "pending": pending_heartbeat_with_capabilities(&capabilities)});
+                fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON"))
+                    .expect("write heartbeat state");
+                private_mode(&config.state_path);
+                let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
+                    .expect("start runtime")
+                    .expect("configured runtime");
+                let mut status = runtime.status();
+                assert!(
+                    matches!(
+                        wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+                        HeartbeatStatus::Failed { reason } if reason.contains("violates the protocol invariants")
+                    ),
+                    "accepted altered persisted capabilities: {mutation}, jobs={job_capable}"
+                );
+                assert!(server.seen.lock().expect("seen lock").is_empty());
+                runtime.shutdown().await;
             }
-            let state = json!({"nextSequence": 0, "pending": pending_heartbeat_with_capabilities(&capabilities)});
-            fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON"))
-                .expect("write heartbeat state");
-            private_mode(&config.state_path);
-            let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, summary)
-                .expect("start runtime")
-                .expect("configured runtime");
-            let mut status = runtime.status();
-            assert!(
-                matches!(
-                    wait_for(&mut status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
-                    HeartbeatStatus::Failed { reason } if reason.contains("violates the protocol invariants")
-                ),
-                "accepted altered persisted capabilities: {mutation}, jobs={job_capable}"
-            );
-            assert!(server.seen.lock().expect("seen lock").is_empty());
-            runtime.shutdown().await;
         }
     }
 }

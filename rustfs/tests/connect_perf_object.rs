@@ -612,7 +612,12 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .expect("CLI task")
         .expect("run production rustfs binary");
 
-    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("tool=performance.object outcome=SUCCEEDED reason=COMPLETE\n"));
     assert!(stdout.contains("upload=not-performed\n"));
