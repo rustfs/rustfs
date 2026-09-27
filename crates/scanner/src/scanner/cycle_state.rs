@@ -3835,8 +3835,29 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                 );
                 return false;
             };
-            save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
-                .await
+            let save = save_config_with_preconditions(
+                storeapi.clone(),
+                &DATA_USAGE_BLOOM_NAME_PATH,
+                buf.clone(),
+                revision.preconditions(),
+            );
+            #[cfg(test)]
+            let injected_failure = tests::cycle_persist_failure::take_failure(leader_epoch);
+            #[cfg(test)]
+            let save = async {
+                if injected_failure == Some(false) {
+                    return Err(EcstoreError::other("injected scanner state write failure"));
+                }
+                save.await
+            };
+            let result = save.await;
+            #[cfg(test)]
+            let result = if injected_failure == Some(true) && result.is_ok() {
+                Err(EcstoreError::other("injected scanner state post-commit failure"))
+            } else {
+                result
+            };
+            result
         };
         match save_result {
             Ok(object_info) => {
