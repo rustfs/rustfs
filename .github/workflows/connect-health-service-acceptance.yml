@@ -38,7 +38,7 @@ permissions:
 jobs:
   health-service:
     name: Verify bounded health service over mTLS
-    runs-on: sm-standard-2
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
@@ -177,11 +177,13 @@ jobs:
                   assert inner.testzip() is None
                   pathlib.Path('binary').mkdir()
                   with inner.open('rustfs') as source, open('binary/rustfs', 'xb') as destination:
+                      header = source.read(20)
+                      assert header[:7] == b'\x7fELF\x02\x01\x01' and header[18:20] == b'\x3e\x00', 'Expected a little-endian ELF64 x86-64 binary'
+                      destination.write(header)
                       shutil.copyfileobj(source, destination)
           PY
           chmod 0755 binary/rustfs
           printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
-          file binary/rustfs | grep -Eq 'ELF 64-bit LSB.*x86-64'
 
       - name: Run the real health service job
         shell: bash
