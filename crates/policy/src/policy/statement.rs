@@ -247,7 +247,10 @@ impl Statement {
     /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
     /// [`Statement::is_allowed`] (including the KMS resource path). Does not evaluate conditions.
     pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+        let deny = matches!(self.effect, Effect::Deny);
+        if (!self.actions.is_match_for_effect(&args.action, deny) && !self.actions.is_empty())
+            || self.not_actions.is_match_for_effect(&args.action, deny)
+        {
             return false;
         }
 
@@ -423,7 +426,10 @@ impl BPStatement {
             return false;
         }
 
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+        let deny = matches!(self.effect, Effect::Deny);
+        if (!self.actions.is_match_for_effect(&args.action, deny) && !self.actions.is_empty())
+            || self.not_actions.is_match_for_effect(&args.action, deny)
+        {
             return false;
         }
 
