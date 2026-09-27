@@ -649,7 +649,8 @@ fn legacy_capabilities(job_capable: bool, service_memory: bool) -> Vec<&'static 
     if job_capable {
         capabilities.push("jobs");
     }
-    // Freeze historical releases independently of today's advertisement.
+    capabilities.push("health.check.service@1");
+    // Freeze the preceding release, independently of today's advertisement.
     capabilities.extend([
         "performance.client@1",
         "performance.drive@1",
