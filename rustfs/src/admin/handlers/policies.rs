@@ -1271,4 +1271,24 @@ mod tests {
 
         assert!(!production.contains("check_key_valid(get_session_token"));
     }
+
+    #[test]
+    fn info_canned_policy_maps_iam_errors_to_s3_errors() {
+        let production = include_str!("policies.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let body = source_block(production, "impl Operation for InfoCannedPolicy");
+
+        let lookup = body
+            .find("info_policy(")
+            .expect("InfoCannedPolicy should look the policy up through the IAM store");
+        let tail = &body[lookup..];
+        let end = tail.find("?;").unwrap_or(tail.len());
+
+        assert!(
+            tail[..end].contains("iam_error_to_s3_error(e)"),
+            "a missing policy must map through iam_error_to_s3_error (404 NoSuchResource) instead of 500 InternalError"
+        );
+    }
 }
