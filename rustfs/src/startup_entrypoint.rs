@@ -1481,7 +1481,6 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
             ),
         };
 
-
         {
             let capture = async {
                 match options.tool {
