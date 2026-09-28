@@ -49,7 +49,7 @@ permissions:
 jobs:
   top-disk:
     name: Verify native top.disk service job over mTLS
-    runs-on: dind-sm-standard-2
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
