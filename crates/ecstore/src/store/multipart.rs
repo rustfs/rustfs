@@ -993,10 +993,32 @@ impl ECStore {
                 .await;
         }
 
-        let pool_idx = self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await?;
-        let pool = self.pools[pool_idx].clone();
-        pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
-            .await
+        match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {
+            Ok(pool_idx) => {
+                self.pools[pool_idx]
+                    .clone()
+                    .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+                    .await
+            }
+            // The staging upload is already gone. The completed object lives on
+            // the pool that published it; other pools answer InvalidUploadID.
+            Err(err) if is_err_invalid_upload_id(&err) => {
+                let mut missing = err;
+                for pool_idx in self.existing_multipart_pool_order().await {
+                    match self.pools[pool_idx]
+                        .clone()
+                        .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
+                        .await
+                    {
+                        Ok(info) => return Ok(info),
+                        Err(err) if is_err_invalid_upload_id(&err) => missing = err,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(missing)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[cfg(all(test, feature = "test-util"))]

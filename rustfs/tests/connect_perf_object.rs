@@ -614,7 +614,7 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
 
     assert!(
         result.status.success(),
-        "stdout: {}; stderr: {}",
+        "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );

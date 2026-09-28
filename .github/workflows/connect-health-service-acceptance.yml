@@ -38,7 +38,7 @@ permissions:
 jobs:
   health-service:
     name: Verify bounded health service over mTLS
-    runs-on: sm-standard-2
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
@@ -60,7 +60,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.22.2
+          node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
 
@@ -172,16 +172,18 @@ jobs:
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
-                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli'} and len(entries) == 2
+                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'} and len(entries) == 4
                   assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
                   assert inner.testzip() is None
                   pathlib.Path('binary').mkdir()
                   with inner.open('rustfs') as source, open('binary/rustfs', 'xb') as destination:
+                      header = source.read(20)
+                      assert header[:7] == b'\x7fELF\x02\x01\x01' and header[18:20] == b'\x3e\x00', 'Expected a little-endian ELF64 x86-64 binary'
+                      destination.write(header)
                       shutil.copyfileobj(source, destination)
           PY
           chmod 0755 binary/rustfs
           printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
-          file binary/rustfs | grep -Eq 'ELF 64-bit LSB.*x86-64'
 
       - name: Run the real health service job
         shell: bash

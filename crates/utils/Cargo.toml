@@ -91,6 +91,6 @@ crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake2", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
 os = ["dep:rustix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
-http = ["dep:convert_case", "dep:http", "dep:regex"]
+http = ["dep:convert_case", "dep:http", "dep:regex", "string"]
 obj = ["http"] # object storage features
 full = ["ip", "net", "egress", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "http", "obj"]  # all features

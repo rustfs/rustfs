@@ -132,16 +132,17 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
-# The real object probe includes bucket creation and cleanup in its short
-# measurement budget. Keep competing storage fixtures outside that budget.
+# Inventory delivery and real drive/object probes include durable filesystem IO
+# in short deadlines. Reserve capacity so unrelated storage fixtures cannot
+# exhaust those budgets. Keep the deadlines and assertions unchanged.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
-# Reserve capacity for these short real TLS/fsync probes (rustfs#8129).
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
 # Their existing deadlines, assertions, and retry policy remain in force.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & ((binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_pre_service_memory_capabilities_with_and_without_jobs|restart_replays_exact_pre_health_service_capabilities_with_and_without_jobs)$/)) | (binary(connect_inventory) & test(/^connect_inventory_(disconnect_retries_without_resampling|restart_replays_the_pending_request_and_then_skips_unchanged_inventory|retries_an_incomplete_sample_before_delivery|revoked_device_stops_without_retrying)$/)) | (binary(connect_perf_drive) & test(/^(real_local_write_read_is_measured_and_scratch_is_removed|successful_result_has_signed_bounded_private_offline_export)$/)))'
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test across nextest's
@@ -340,13 +341,13 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)'
+filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
-# Reserve capacity for these short real TLS/fsync probes (rustfs#8129).
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
 # Their existing deadlines, assertions, and retry policy remain in force.
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & ((binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_pre_service_memory_capabilities_with_and_without_jobs|restart_replays_exact_pre_health_service_capabilities_with_and_without_jobs)$/)) | (binary(connect_inventory) & test(/^connect_inventory_(disconnect_retries_without_resampling|restart_replays_the_pending_request_and_then_skips_unchanged_inventory|retries_an_incomplete_sample_before_delivery|revoked_device_stops_without_retrying)$/)) | (binary(connect_perf_drive) & test(/^(real_local_write_read_is_measured_and_scratch_is_removed|successful_result_has_signed_bounded_private_offline_export)$/)))'
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test under the ci profile

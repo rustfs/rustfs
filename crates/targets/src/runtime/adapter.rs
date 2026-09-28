@@ -41,12 +41,20 @@ static STORE_OPEN_POOL: LazyLock<Result<rayon::ThreadPool, rayon::ThreadPoolBuil
         .build()
 });
 
+enum StoreOpenFailure {
+    Error(String),
+    Panicked,
+}
+
 enum StoreOpenOutcome<E>
 where
     E: PluginEvent,
 {
     Accepted(SharedTarget<E>),
-    Rejected { panicked: bool, target: SharedTarget<E> },
+    Rejected {
+        failure: StoreOpenFailure,
+        target: SharedTarget<E>,
+    },
 }
 
 fn open_target_store<E>(target: SharedTarget<E>) -> StoreOpenOutcome<E>
@@ -55,8 +63,14 @@ where
 {
     match catch_unwind(AssertUnwindSafe(|| target.store().map(|store| store.open()))) {
         Ok(None | Some(Ok(()))) => StoreOpenOutcome::Accepted(target),
-        Ok(Some(Err(_))) => StoreOpenOutcome::Rejected { panicked: false, target },
-        Err(_) => StoreOpenOutcome::Rejected { panicked: true, target },
+        Ok(Some(Err(error))) => StoreOpenOutcome::Rejected {
+            failure: StoreOpenFailure::Error(error.to_string()),
+            target,
+        },
+        Err(_) => StoreOpenOutcome::Rejected {
+            failure: StoreOpenFailure::Panicked,
+            target,
+        },
     }
 }
 
@@ -215,23 +229,27 @@ where
         for outcome in outcomes {
             match outcome {
                 StoreOpenOutcome::Accepted(target) => accepted.push(target),
-                StoreOpenOutcome::Rejected { panicked, target } => {
-                    if panicked {
-                        tracing::error!(
-                            target_id = %target.id(),
-                            reason = "store_open_panicked",
-                            "Target queue store panicked while opening during runtime handoff"
-                        );
-                    } else {
-                        tracing::error!(
-                            target_id = %target.id(),
-                            reason = "store_open_failed",
-                            "Failed to open target queue store during runtime handoff"
-                        );
-                    }
-                    failures.push(TargetActivationFailure {
-                        detail: format!("{}: queue store open failed", target.id()),
-                    });
+                StoreOpenOutcome::Rejected { failure, target } => {
+                    let detail = match failure {
+                        StoreOpenFailure::Error(error) => {
+                            tracing::error!(
+                                target_id = %target.id(),
+                                error = %error,
+                                reason = "store_open_failed",
+                                "Failed to open target queue store during runtime handoff"
+                            );
+                            format!("{}: queue store open failed: {error}", target.id())
+                        }
+                        StoreOpenFailure::Panicked => {
+                            tracing::error!(
+                                target_id = %target.id(),
+                                reason = "store_open_panicked",
+                                "Target queue store panicked while opening during runtime handoff"
+                            );
+                            format!("{}: queue store open failed", target.id())
+                        }
+                    };
+                    failures.push(TargetActivationFailure { detail });
                     rejected.push(target);
                 }
             }
@@ -717,10 +735,18 @@ mod tests {
         )));
         let observer = target.clone();
 
-        let activation = adapter.activate_with_replay(vec![Box::new(target)]).await;
-
-        assert!(activation.targets.is_empty());
-        assert!(activation.replay_workers.is_empty());
+        let prepared = adapter.prepare_targets(vec![Box::new(target)]).await;
+        let (opened, rejected) = adapter.open_prepared_stores(prepared);
+        assert!(opened.targets.is_empty());
+        let failure = rejected
+            .failure_summary()
+            .expect("a rejected target should retain the store error");
+        assert!(failure.contains(invalid_base.to_string_lossy().as_ref()));
+        assert!(failure.contains("queue store open failed:"));
+        adapter
+            .close_prepared(rejected)
+            .await
+            .expect("a rejected target should close cleanly");
         assert_eq!(observer.close_call_count(), 1);
     }
 

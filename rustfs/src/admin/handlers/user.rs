@@ -510,25 +510,18 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query temporary user state: {e}"))
-        })?;
+        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(iam_error_to_s3_error)?;
 
         if is_temp {
             return Err(s3_error!(InvalidArgument, "cannot remove a temporary user"));
         }
 
-        let (is_service_account, _) = iam_store.is_service_account(ak).await.map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query service account state: {e}"))
-        })?;
+        let (is_service_account, _) = iam_store.is_service_account(ak).await.map_err(iam_error_to_s3_error)?;
         if is_service_account {
             return Err(s3_error!(InvalidArgument, "cannot remove a service account"));
         }
 
-        iam_store
-            .delete_user(ak, true)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to delete user: {e}")))?;
+        iam_store.delete_user(ak, true).await.map_err(iam_error_to_s3_error)?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -1440,6 +1433,27 @@ mod tests {
     fn add_user_operation_maps_create_errors() {
         let mapper_call = concat!("map_err(map_add_user_", "create_error)");
         assert!(include_str!("user.rs").contains(mapper_call));
+    }
+
+    #[test]
+    fn remove_user_maps_iam_errors_to_s3_errors() {
+        let production = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let body = source_block(production, "impl Operation for RemoveUser");
+
+        for call in ["is_temp_user(ak)", "is_service_account(ak)", "delete_user(ak, true)"] {
+            let start = body
+                .find(call)
+                .unwrap_or_else(|| panic!("RemoveUser should call {call} through the IAM store"));
+            let tail = &body[start..];
+            let end = tail.find("?;").unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("iam_error_to_s3_error"),
+                "{call} must map through iam_error_to_s3_error so a missing user is 404 NoSuchResource, not 500 InternalError"
+            );
+        }
     }
 
     #[test]

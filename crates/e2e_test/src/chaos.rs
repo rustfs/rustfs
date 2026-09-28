@@ -384,17 +384,17 @@ pub(crate) fn is_cluster_heal_coordination_unavailable(error: &(dyn std::error::
     message.contains("500 Internal Server Error") && message.contains("cluster heal coordination unavailable")
 }
 
-/// Wait for the restarted cluster to admit the first root heal request.
+/// Wait for the restarted cluster to admit a root heal request and return its response.
 pub(crate) async fn start_root_heal_when_control_ready(
     heal_url: &str,
     heal_body: &str,
     access_key: &str,
     secret_key: &str,
-) -> ChaosResult<()> {
+) -> ChaosResult<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
         match signed_admin_post(heal_url, Some(heal_body), access_key, secret_key).await {
-            Ok(_) => return Ok(()),
+            Ok(body) => return Ok(body),
             Err(error) if is_cluster_heal_coordination_unavailable(error.as_ref()) && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
