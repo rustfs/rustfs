@@ -1480,7 +1480,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                 enabled_build_features(),
             ),
         };
-        
+
         {
             let capture = async {
                 match options.tool {
