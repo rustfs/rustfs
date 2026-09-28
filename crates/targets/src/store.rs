@@ -85,6 +85,34 @@ const FAILED_STORE_MAX_ENTRIES: usize = 10_000;
 /// time, which is the instant the entry entered the failed store.
 const FAILED_STORE_TTL: Duration = Duration::from_secs(72 * 60 * 60);
 
+#[derive(Debug)]
+struct IoErrorWithPath {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for IoErrorWithPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for IoErrorWithPath {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn io_error_with_path(path: &Path, error: std::io::Error) -> StoreError {
+    StoreError::Io(std::io::Error::new(
+        error.kind(),
+        IoErrorWithPath {
+            path: path.to_owned(),
+            source: error,
+        },
+    ))
+}
+
 /// Writes payload to a temp file in the same directory, flushes the file to disk, then atomically
 /// renames it onto final_path.
 ///
@@ -741,9 +769,9 @@ where
             .fs_guard
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on store filesystem".to_string()))?;
-        std::fs::create_dir_all(&self.directory).map_err(StoreError::Io)?;
+        std::fs::create_dir_all(&self.directory).map_err(|error| io_error_with_path(&self.directory, error))?;
 
-        let dir_entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
+        let dir_entries = std::fs::read_dir(&self.directory).map_err(|error| io_error_with_path(&self.directory, error))?;
         let mut entries_map = self
             .entries
             .write()
@@ -751,8 +779,9 @@ where
         self.pending_entries.store(0, Ordering::SeqCst);
         entries_map.clear();
         for entry in dir_entries {
-            let entry = entry.map_err(StoreError::Io)?;
-            let metadata = entry.metadata().map_err(StoreError::Io)?;
+            let entry = entry.map_err(|error| io_error_with_path(&self.directory, error))?;
+            let entry_path = entry.path();
+            let metadata = entry.metadata().map_err(|error| io_error_with_path(&entry_path, error))?;
             if !metadata.is_file() {
                 continue;
             }
@@ -780,7 +809,7 @@ where
                 continue;
             }
 
-            let modified = metadata.modified().map_err(StoreError::Io)?;
+            let modified = metadata.modified().map_err(|error| io_error_with_path(&entry_path, error))?;
             let unix_nano = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
             entries_map.insert(file_name, unix_nano);
         }
@@ -1228,6 +1257,25 @@ mod tests {
 
     fn temp_store_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn io_error_with_path_preserves_path_and_source_chain() {
+        let error = io_error_with_path(
+            Path::new("/data/.rustfs/events/webhook-primary"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(error.to_string().contains("/data/.rustfs/events/webhook-primary"));
+        let wrapped = std::error::Error::source(&error).expect("store error should expose its I/O error");
+        let original = std::error::Error::source(wrapped).expect("path wrapper should expose the original I/O error");
+        assert_eq!(
+            original
+                .downcast_ref::<std::io::Error>()
+                .expect("source should remain an I/O error")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
