@@ -5267,6 +5267,71 @@ mod tests {
         assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
     }
 
+    /// A peer that sends part of a shard and then stops must not pin the stripe
+    /// for the full read timeout. The other EC 2+2 shards already hold a
+    /// decode-plus-verification quorum, so the lockstep hedge retires the
+    /// stalled reader and the stripe completes.
+    #[tokio::test]
+    async fn test_lockstep_hedges_shard_that_stops_mid_read() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::PartialThenPending {
+                    data: vec![0xab],
+                    emitted: false,
+                },
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            NUM_SHARDS * BLOCK_SIZE,
+            None,
+            vec![ShardReadCost::Unknown; 4],
+            Duration::from_secs(60),
+            true,
+        );
+
+        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("a shard that stops mid-read must be hedged instead of waiting out the 60s read timeout");
+
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn lockstep_reopens_hedged_shard_after_later_peer_loss() {
         const DATA_SHARDS: usize = 2;

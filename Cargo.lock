@@ -7221,7 +7221,10 @@ version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
+ "crc32fast",
  "flate2",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
  "memchr",
  "ruzstd",
 ]
@@ -9695,6 +9698,18 @@ dependencies = [
  "hotpath",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustfs-connect-symbol-catalog"
+version = "1.0.1"
+dependencies = [
+ "hex-simd",
+ "object 0.39.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "symbolic-demangle",
 ]
 
 [[package]]

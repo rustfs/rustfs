@@ -58,7 +58,7 @@ const PROTOCOL_VERSION: &str = "v1";
 const SIGNATURE_ALGORITHM: &str = "ES256";
 const SIGNATURE_DOMAIN: &[u8] = b"rustfs-diagnostic-envelope-v1";
 const MAX_ENVELOPE_BYTES: usize = 16_384;
-const MAX_ARCHIVE_BYTES: usize = 524_288;
+pub(crate) const MAX_ARCHIVE_BYTES: usize = 524_288;
 const MAX_DECOMPRESSED_BYTES: usize = 278_528;
 pub const MAX_TOP_EXPORT_VALIDITY: Duration = Duration::from_secs(2_592_000);
 const TOP_CAPTURE_WORKING_SET_BYTES: u64 = 1_048_576;
@@ -636,15 +636,25 @@ pub fn save_signed_top_export(
     export: &SignedTopExport,
     cancel: &CancellationToken,
 ) -> Result<SavedTopExport, TopCaptureError> {
+    save_top_archive(output, &export.artifact_uid, &export.archive_bytes, &export.archive_sha256, cancel)
+}
+
+pub(crate) fn save_top_archive(
+    output: &Path,
+    artifact_uid: &str,
+    archive_bytes: &[u8],
+    archive_sha256: &str,
+    cancel: &CancellationToken,
+) -> Result<SavedTopExport, TopCaptureError> {
     if cancel.is_cancelled() {
         return Err(TopCaptureError::Cancelled);
     }
-    if !is_uuid_v7(&export.artifact_uid) {
+    if !is_uuid_v7(artifact_uid) {
         return Err(TopCaptureError::Scope);
     }
-    if export.archive_bytes.is_empty()
-        || export.archive_bytes.len() > MAX_ARCHIVE_BYTES
-        || hex_lower(&Sha256::digest(&export.archive_bytes)) != export.archive_sha256
+    if archive_bytes.is_empty()
+        || archive_bytes.len() > MAX_ARCHIVE_BYTES
+        || hex_lower(&Sha256::digest(archive_bytes)) != archive_sha256
     {
         return Err(TopCaptureError::Result);
     }
@@ -653,7 +663,7 @@ pub fn save_signed_top_export(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let filename = output.file_name().ok_or(TopCaptureError::Scope)?.to_string_lossy();
-    let temporary = parent.join(format!(".{filename}.{}.partial", export.artifact_uid));
+    let temporary = parent.join(format!(".{filename}.{}.partial", artifact_uid));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -663,7 +673,7 @@ pub fn save_signed_top_export(
     }
     let mut file = options.open(&temporary).map_err(map_create_error)?;
     let result = (|| {
-        file.write_all(&export.archive_bytes).map_err(io_error)?;
+        file.write_all(archive_bytes).map_err(io_error)?;
         if cancel.is_cancelled() {
             return Err(TopCaptureError::Cancelled);
         }
@@ -680,9 +690,9 @@ pub fn save_signed_top_export(
             return Err(TopCaptureError::DurabilityAfterCommit(error.kind()));
         }
         Ok(SavedTopExport {
-            artifact_uid: export.artifact_uid.clone(),
-            archive_size_bytes: export.archive_bytes.len() as u64,
-            archive_sha256: export.archive_sha256.clone(),
+            artifact_uid: artifact_uid.to_owned(),
+            archive_size_bytes: archive_bytes.len() as u64,
+            archive_sha256: archive_sha256.to_owned(),
         })
     })();
     if result.is_err() {
@@ -1002,6 +1012,29 @@ mod tests {
     use rustfs_io_metrics::{record_s3_op, s3_http_metrics::S3HttpRequestGuard};
     use rustfs_s3_ops::S3Operation;
     use serial_test::serial;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn queued_disk_capture_rechecks_expiry_before_sampling() {
+        let mut request = capture_request(Duration::from_secs(2));
+        request.scope.consent.tool_id = "top.disk".to_owned();
+        request.scope.run_expires_at_unix = OffsetDateTime::now_utc().unix_timestamp() + 3;
+        let cancel = CancellationToken::new();
+        let permit = request.acquire(&cancel).await.unwrap().unwrap();
+        let capture = super::super::top_disk::capture_top_disk(&request, &cancel);
+        tokio::pin!(capture);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut capture).await.is_err());
+        while OffsetDateTime::now_utc().unix_timestamp() < request.scope.run_expires_at_unix {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(permit);
+        // The old path sampled first and waited the entire two-second window.
+        let result = tokio::time::timeout(Duration::from_millis(500), capture)
+            .await
+            .expect("expired queued capture must not start its sampling window");
+        assert!(matches!(result, Err(TopCaptureError::Expired)));
+    }
 
     fn capture_request(window: Duration) -> TopCaptureRequest {
         let organization_uid = Uuid::now_v7();

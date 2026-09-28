@@ -1065,7 +1065,26 @@ impl HttpReader {
         }
 
         let request_started = Instant::now();
-        let resp = request.send().await.map_err(|e| {
+        // `send()` resolves at the response headers, before the body stall timer
+        // in `poll_read` can run. A restarted peer (or a pooled connection left
+        // half-open when its pod network namespace disappeared) accepts the TCP
+        // connection and then never sends headers. Without this bound the shard
+        // open waits out kernel retransmits, long after the client has given up
+        // on the GET. The body stall budget is the same deadline: a header
+        // black hole is the same failure as a body that stops mid-shard.
+        let send_result = match stall_timeout {
+            Some(stall_timeout) => match time::timeout(stall_timeout, request.send()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_stall_timeout(track_internode_metrics, internode_operation);
+                    record_internode_error(track_internode_metrics, internode_operation);
+                    return Err(body_stalled_error(stall_timeout));
+                }
+            },
+            None => request.send().await,
+        };
+        let resp = send_result.map_err(|e| {
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
@@ -2670,6 +2689,52 @@ mod tests {
         assert_eq!(stalled.timeout, Duration::from_millis(20));
 
         handle.abort();
+    }
+
+    /// A peer that accepts the connection and then never sends response headers.
+    /// This is the restarted-pod case: the pooled TCP connection stays open, so
+    /// connect timeout does not fire, and the body stall timer has not started
+    /// because `send()` has not returned. The open itself must fail as
+    /// `BodyStalled` inside the stall budget.
+    #[tokio::test]
+    async fn http_reader_header_stall_fails_open_within_stall_budget() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let app = Router::new().route(
+            "/hang-headers",
+            axum::routing::get(|| async {
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }),
+        );
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/hang-headers");
+        let stall = Duration::from_millis(50);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(stall)),
+        )
+        .await
+        .expect("header stall must fail the open instead of hanging until the test deadline");
+        let err = match opened {
+            Ok(_reader) => panic!("a peer that never sends headers must fail the reader open"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("header stall should retain the typed body-stalled source");
+        assert_eq!(stalled.timeout, stall);
+
+        server_handle.abort();
     }
 
     #[tokio::test]
