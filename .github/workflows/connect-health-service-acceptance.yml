@@ -38,7 +38,7 @@ permissions:
 jobs:
   health-service:
     name: Verify bounded health service over mTLS
-    runs-on: dind-sm-standard-2
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
@@ -172,7 +172,7 @@ jobs:
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
-                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli'} and len(entries) == 2
+                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'} and len(entries) == 4
                   assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
                   assert inner.testzip() is None
                   pathlib.Path('binary').mkdir()
