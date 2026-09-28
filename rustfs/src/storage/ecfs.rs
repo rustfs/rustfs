@@ -35,7 +35,7 @@ use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
-use crate::storage::website_config::validate_website_configuration;
+use crate::storage::validate_website_configuration;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
@@ -2041,7 +2041,7 @@ mod tests {
         FS, SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
     };
     use crate::storage::access::ReqInfo;
-    use crate::storage::website_config::validate_website_configuration;
+    use crate::storage::validate_website_configuration;
     use http::Method;
     use http::StatusCode;
     use s3s::dto::{

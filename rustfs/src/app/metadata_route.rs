@@ -16,10 +16,10 @@
 
 use super::bucket_usecase::DefaultBucketUsecase;
 use super::object_usecase::DefaultObjectUsecase;
-use crate::app::context::ServerContextSlot;
+use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::{ReqInfo, authorize_request, req_info_mut};
-use crate::storage::{get_bucket_website_config_for_store, website_config::validate_website_configuration};
+use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use http::header::HOST;
@@ -170,7 +170,7 @@ async fn call_website(
 
     let store = server_ctx
         .installed_object_store()
-        .ok_or_else(|| s3_error!(InternalError, "website object store unavailable"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "website object store unavailable"))?;
     let config = match get_bucket_website_config_for_store(&store, &target.bucket).await {
         Ok(config) => config,
         Err(crate::storage::StorageError::ConfigNotFound) => {
@@ -290,7 +290,12 @@ async fn website_get_object(
         original
             .headers
             .get(name)
-            .map(|value| value.to_str().map(str::to_owned).map_err(|_| s3_error!(InvalidArgument)))
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+            })
             .transpose()
     };
     let input = if apply_conditions {
@@ -298,23 +303,31 @@ async fn website_get_object(
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             range: header(http::header::RANGE)?
-                .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidRange)))
+                .map(|value| Range::parse(&value).map_err(|_| S3Error::new(S3ErrorCode::InvalidRange)))
                 .transpose()?,
             if_match: original
                 .headers
                 .get(http::header::IF_MATCH)
-                .map(|value| ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| s3_error!(InvalidArgument)))
+                .map(|value| {
+                    ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+                })
                 .transpose()?,
             if_none_match: original
                 .headers
                 .get(http::header::IF_NONE_MATCH)
-                .map(|value| ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| s3_error!(InvalidArgument)))
+                .map(|value| {
+                    ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+                })
                 .transpose()?,
             if_modified_since: header(http::header::IF_MODIFIED_SINCE)?
-                .map(|value| Timestamp::parse(TimestampFormat::HttpDate, &value).map_err(|_| s3_error!(InvalidArgument)))
+                .map(|value| {
+                    Timestamp::parse(TimestampFormat::HttpDate, &value).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+                })
                 .transpose()?,
             if_unmodified_since: header(http::header::IF_UNMODIFIED_SINCE)?
-                .map(|value| Timestamp::parse(TimestampFormat::HttpDate, &value).map_err(|_| s3_error!(InvalidArgument)))
+                .map(|value| {
+                    Timestamp::parse(TimestampFormat::HttpDate, &value).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+                })
                 .transpose()?,
             ..Default::default()
         }
@@ -354,7 +367,7 @@ async fn website_get_object(
     let req_info = request
         .extensions
         .get_mut::<ReqInfo>()
-        .ok_or_else(|| s3_error!(InternalError, "website request info missing"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "website request info missing"))?;
     req_info.bucket = Some(bucket.to_owned());
     req_info.object = Some(key.to_owned());
     req_info.cred = None;
@@ -401,7 +414,7 @@ async fn website_head_redirect(
     let req_info = request
         .extensions
         .get_mut::<ReqInfo>()
-        .ok_or_else(|| s3_error!(InternalError, "website request info missing"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "website request info missing"))?;
     req_info.bucket = Some(bucket.to_owned());
     req_info.object = Some(key.to_owned());
     req_info.cred = None;
@@ -512,7 +525,8 @@ fn website_location(location: String, status: StatusCode) -> S3Result<S3Response
     response.status = Some(status);
     response.headers.insert(
         http::header::LOCATION,
-        HeaderValue::try_from(location).map_err(|_| s3_error!(InternalError, "invalid website redirect location"))?,
+        HeaderValue::try_from(location)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid website redirect location"))?,
     );
     Ok(response)
 }

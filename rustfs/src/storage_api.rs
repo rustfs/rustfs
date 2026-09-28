@@ -175,7 +175,7 @@ pub(crate) mod server {
                 host: Option<s3s::host::MultiDomain>,
                 website_domains: Vec<String>,
                 website_scheme: &'static str,
-                server_ctx: std::sync::Arc<crate::app::context::ServerContextSlot>,
+                server_ctx: std::sync::Arc<super::ServerContextSlot>,
             ) -> impl s3s::route::S3Route
             where
                 A: s3s::route::S3Route,
