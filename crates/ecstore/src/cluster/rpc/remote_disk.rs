@@ -993,7 +993,19 @@ impl RemoteDisk {
         // internode transport failure classified as retryable can be safely re-dialed. The
         // classifier is direction-agnostic — it inspects the InternodeHttpError kind — so it is
         // reused here from the write path.
-        err.is_retryable_internode_write_failure()
+        if err.is_retryable_internode_write_failure() {
+            return true;
+        }
+        // Header wait uses the body stall budget. That error is `BodyStalled`, not an
+        // `InternodeHttpError`, and the open has not consumed a shard byte yet.
+        matches!(
+            err,
+            DiskError::Io(error)
+                if error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<rustfs_rio::BodyStalled>())
+                    .is_some()
+        )
     }
 
     pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
@@ -1102,7 +1114,14 @@ impl RemoteDisk {
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
-            match self.data_transport.open_read(request.clone()).await {
+            // The second attempt bypasses the pool. The first failure is often a
+            // stale kept-alive connection to a peer that just restarted.
+            let opened = if attempt == 1 {
+                self.data_transport.open_read(request.clone()).await
+            } else {
+                self.data_transport.open_read_fresh(request.clone()).await
+            };
+            match opened {
                 Ok(reader) => {
                     if attempt > 1
                         && let Some(classification) = last_retry_classification
@@ -1138,7 +1157,12 @@ impl RemoteDisk {
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
-            match self.data_transport.open_read_chunks(request.clone()).await {
+            let opened = if attempt == 1 {
+                self.data_transport.open_read_chunks(request.clone()).await
+            } else {
+                self.data_transport.open_read_chunks_fresh(request.clone()).await
+            };
+            match opened {
                 Ok(reader) => {
                     if attempt > 1
                         && let Some(classification) = last_retry_classification
@@ -7727,6 +7751,25 @@ mod tests {
             .expect("retryable open_read error should recover");
 
         assert_eq!(transport.calls().len(), 2, "read_file_stream should retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_read_file_stream_retries_header_stall_on_fresh_connection() {
+        let stall = rustfs_rio::BodyStalled {
+            timeout: Duration::from_millis(50),
+        };
+        let transport = RetryingOpenReadInternodeDataTransport::with_steps(vec![
+            OpenWriteTestStep::Error(DiskError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, stall))),
+            OpenWriteTestStep::Success,
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        let _reader = remote_disk
+            .read_file_stream("bucket", "object/part.1", 0, 4096)
+            .await
+            .expect("a header stall must be retried once before the shard is failed");
+
+        assert_eq!(transport.calls().len(), 2, "header stall should re-dial exactly once");
     }
 
     #[tokio::test]

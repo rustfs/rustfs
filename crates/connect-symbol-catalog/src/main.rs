@@ -12,8 +12,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 const MAX_BINARY_BYTES: u64 = 1_073_741_824;
-const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SYMBOLS: usize = 100_000;
+const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SYMBOLS: usize = 200_000;
 const NORMALIZATION: &str = "pyroscope-2.1.1-symbolic-demangle-13.9.0";
 
 #[derive(Serialize)]
@@ -174,6 +174,29 @@ mod tests {
         bytes
     }
 
+    fn bulk_executable(count: usize, suffix_len: usize) -> Vec<u8> {
+        let mut object =
+            object::write::Object::new(object::BinaryFormat::Elf, object::Architecture::X86_64, object::Endianness::Little);
+        let section = object.section_id(object::write::StandardSection::Text);
+        object.append_section_data(section, &[0xc3], 1);
+        let suffix = "x".repeat(suffix_len);
+        for index in 0..count {
+            object.add_symbol(object::write::Symbol {
+                name: format!("rustfs::profile::function_{index:06}_{suffix}").into_bytes(),
+                value: 0,
+                size: 1,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(section),
+                flags: object::SymbolFlags::None,
+            });
+        }
+        let mut binary = object.write().expect("write bulk ELF fixture");
+        binary[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        binary
+    }
+
     #[test]
     fn catalog_binds_the_exact_executable_and_normalizes_function_names() {
         let binary = executable();
@@ -224,5 +247,38 @@ mod tests {
         assert!(symbol_name(b"secret\nname").is_none());
         assert!(symbol_name(&vec![b'x'; 4097]).is_none());
         assert!(catalog(b"not ELF", &"a".repeat(40), "x86_64-unknown-linux-gnu", vec!["pyroscope".into()]).is_err());
+    }
+
+    #[test]
+    fn release_sized_catalog_retains_all_function_names() {
+        let binary = bulk_executable(110_000, 160);
+        let encoded = catalog(&binary, &"a".repeat(40), "x86_64-unknown-linux-gnu", vec!["pyroscope".into()])
+            .expect("retain complete bounded symbol catalog");
+        assert!(encoded.len() > 16 * 1024 * 1024);
+        assert!(encoded.len() <= MAX_CATALOG_BYTES);
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("catalog JSON");
+        assert_eq!(value["symbols"].as_array().expect("symbol array").len(), 110_000);
+    }
+
+    #[test]
+    fn catalogs_over_either_resource_limit_are_refused() {
+        let source = "a".repeat(40);
+        let too_many = catalog(
+            &bulk_executable(MAX_SYMBOLS + 1, 0),
+            &source,
+            "x86_64-unknown-linux-gnu",
+            vec!["pyroscope".into()],
+        )
+        .expect_err("too many function names must be refused");
+        assert!(too_many.to_string().contains("reviewed symbol limit"));
+
+        let too_large = catalog(
+            &bulk_executable(10_000, 3_500),
+            &source,
+            "x86_64-unknown-linux-gnu",
+            vec!["pyroscope".into()],
+        )
+        .expect_err("oversized catalog must be refused");
+        assert!(too_large.to_string().contains("byte limit"));
     }
 }
