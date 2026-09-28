@@ -76,7 +76,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.22.2
+          node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
 
@@ -107,7 +107,7 @@ jobs:
           [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
           [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
 
-          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-4, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
           jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e --arg name "$expected_job" '
             [.[].jobs[] | select(.name == $name)] as $matches

@@ -24,7 +24,7 @@
   "properties": {
     "jobId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
     "protocolVersion": { "const": "v1" },
-    "jobType": { "enum": ["health.check", "profile.cpu", "profile.memory", "profile.threads", "performance.drive", "performance.network", "top.api", "top.locks", "top.rpc"] },
+    "jobType": { "enum": ["health.check", "profile.cpu", "profile.memory", "profile.threads", "performance.drive", "performance.network", "top.api", "top.disk", "top.locks", "top.rpc"] },
     "schemaVersion": { "const": 1 },
     "organizationName": { "type": "string", "pattern": "^organizations/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
     "clusterName": { "type": "string", "pattern": "^organizations/[0-9a-f-]{36}/clusters/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
@@ -34,7 +34,7 @@
     "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
     "requiredCapabilities": {
       "type": "array",
-      "prefixItems": [{ "enum": ["health.check.service@1", "profile.cpu@1", "profile.memory.service@1", "profile.threads@1", "performance.drive@1", "performance.network@1", "top.api@1", "top.locks@1", "top.rpc@1"] }],
+      "prefixItems": [{ "enum": ["health.check.service@1", "profile.cpu@1", "profile.memory.service@1", "profile.threads@1", "performance.drive@1", "performance.network@1", "top.api@1", "top.disk@1", "top.locks@1", "top.rpc@1"] }],
       "items": false,
       "minItems": 1,
       "maxItems": 1,
@@ -296,6 +296,35 @@
           "limits": {
             "type": "object",
             "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+          },
+          "parameters": {
+            "type": "object",
+            "not": {
+              "type": "object",
+              "properties": { "trafficBytes": true },
+              "required": ["trafficBytes"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "jobType": { "const": "top.disk" } } },
+      "then": {
+        "properties": {
+          "requiredCapabilities": {
+            "type": "array",
+            "prefixItems": [{ "const": "top.disk@1" }],
+            "items": false,
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "type": "integer", "minimum": 1048576 }
+            }
           },
           "parameters": {
             "type": "object",
