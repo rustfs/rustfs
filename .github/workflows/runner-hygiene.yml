@@ -66,7 +66,7 @@ jobs:
     # scheduled runs file a tracking issue, manual dispatch stays quiet so
     # debugging never produces a spurious alert.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

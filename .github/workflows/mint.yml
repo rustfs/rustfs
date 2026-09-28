@@ -258,7 +258,7 @@ jobs:
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

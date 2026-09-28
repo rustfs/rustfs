@@ -95,7 +95,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (needs.oidc-keycloak-live.result == 'failure' || needs.oidc-keycloak-live.result == 'cancelled')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
