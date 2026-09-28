@@ -403,12 +403,22 @@ class WorkflowTimeoutTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
-                self.assertIn("    timeout-minutes: 60", job)
+                job_timeout = 360 if suite == "pool-expand" else 60
+                self.assertIn(f"    timeout-minutes: {job_timeout}", job)
                 steps = named_steps(job)
                 primary = [step for step in steps.values() if any(
                     line in ("        id: test", "        id: pool_test") for line in step)]
                 self.assertEqual(len(primary), 1)
-                self.assertIn("        timeout-minutes: 45", primary[0])
+                if suite == "pool-expand":
+                    self.assertIn("        timeout-minutes: ${{ inputs.pool_timeout_minutes || 240 }}", primary[0])
+                    for event in ("workflow_call", "workflow_dispatch"):
+                        event_block = yaml_block(source.splitlines(), event, 2)
+                        timeout_input = yaml_block(event_block, "pool_timeout_minutes", 6)
+                        self.assertIsNotNone(timeout_input, event)
+                        self.assertIn("        default: '240'", timeout_input)
+                        self.assertIn("        required: false", timeout_input)
+                else:
+                    self.assertIn("        timeout-minutes: 45", primary[0])
                 cleanup = "Cleanup environment"
                 for phase in ("before", "after"):
                     self.assertIn("        timeout-minutes: 5", steps[f"{cleanup} ({phase})"])
