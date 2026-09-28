@@ -1562,12 +1562,14 @@ impl OidcSys {
         (policies, groups)
     }
 
-    /// Policy names produced only by the groups claim in claim-based mode.
+    /// Policy names produced only by the canonical groups in claim-based mode: the groups claim
+    /// plus the roles claim values that `extract_canonical_group_values` merges into it.
     ///
-    /// Directory-backed providers emit groups that can never have a matching policy (for example
-    /// `DOMAIN\Domain Users`), so the session binding may ignore these names when no such policy
-    /// exists. Names from a fixed role policy or a dedicated policy claim are never included, so
-    /// those configurations keep requiring every policy to resolve.
+    /// Identity providers emit built-in groups and roles that can never have a matching policy
+    /// (for example `DOMAIN\Domain Users` or Keycloak's `offline_access`), so the session binding
+    /// may ignore these names when no such policy exists. Names from a fixed role policy or a
+    /// dedicated policy claim are never included, so those configurations keep requiring every
+    /// policy to resolve.
     pub fn group_claim_policy_names(&self, provider_id: &str, claims: &OidcClaims) -> Vec<String> {
         let Some(config) = self.configs.get(provider_id) else {
             return Vec::new();
@@ -4624,6 +4626,27 @@ mod tests {
             vec!["oidc-EXAMPLE\\Domain Users", "oidc-admins"]
         );
         assert!(sys.group_claim_policy_names("missing-provider", &claims).is_empty());
+    }
+
+    #[test]
+    fn group_claim_policy_names_include_merged_roles_claim_values() {
+        let mut config = test_config("keycloak");
+        config.roles_claim = "roles".to_string();
+        let raw = HashMap::from([
+            ("groups".to_string(), serde_json::json!(["readonly"])),
+            ("roles".to_string(), serde_json::json!(["offline_access", "default-roles-corp"])),
+        ]);
+        let claims = OidcClaims {
+            groups: extract_canonical_group_values(&raw, &config.groups_claim, &config.roles_claim),
+            raw,
+            ..Default::default()
+        };
+        let sys = make_test_sys(vec![config]);
+
+        assert_eq!(
+            sys.group_claim_policy_names("keycloak", &claims),
+            vec!["default-roles-corp", "offline_access", "readonly"]
+        );
     }
 
     #[test]

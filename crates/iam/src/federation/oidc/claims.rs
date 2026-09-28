@@ -137,6 +137,7 @@ mod tests {
         assert_eq!(authorization.claims.groups, ["source-ops", "source-developers", "source-ops"]);
         assert_eq!(authorization.claims.raw, raw);
         assert_eq!(authorization.policies, ["mapped-source-developers", "mapped-source-ops"]);
+        assert_eq!(authorization.group_claim_policies, ["mapped-source-developers", "mapped-source-ops"]);
         assert_eq!(authorization.groups, ["source-developers", "source-ops"]);
         assert_eq!(authorization.roles_claim_key.as_deref(), Some("roles"));
         assert_eq!(authorization.roles, ["reader", "admin"]);

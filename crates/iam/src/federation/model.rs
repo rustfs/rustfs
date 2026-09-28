@@ -47,8 +47,9 @@ pub struct FederatedAuthorization {
     pub provider_id: String,
     pub claims: FederatedClaims,
     pub policies: Vec<String>,
-    /// Subset of `policies` derived only from the groups claim; these may be ignored when no
-    /// policy of that name exists. Everything else in `policies` must resolve.
+    /// Subset of `policies` derived only from the groups claim (including merged roles claim
+    /// values); these may be ignored when no policy of that name exists. Everything else in
+    /// `policies` must resolve.
     pub group_claim_policies: Vec<String>,
     pub groups: Vec<String>,
     pub roles_claim_key: Option<String>,
