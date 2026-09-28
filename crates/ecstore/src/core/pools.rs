@@ -19542,7 +19542,10 @@ mod tests {
             .await
             .expect("second-node activation should not panic")
             .expect_err("the second reservation must observe and reject the committed first reservation");
-        assert!(err.to_string().contains("requires 60 bytes, but 40 bytes are available"));
+        assert!(
+            err.to_string().contains("requires 60 bytes, but 40 bytes are available"),
+            "the second reservation must report the committed capacity rejection, got {err:?}"
+        );
 
         let mut persisted = PoolMeta::default();
         persisted

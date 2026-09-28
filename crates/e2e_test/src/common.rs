@@ -22,6 +22,7 @@
 //! - Common test constants and utilities
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use http::header::{CONTENT_TYPE, HOST};
@@ -1577,6 +1578,7 @@ impl RustFSTestClusterEnvironment {
     /// retries up to 120 times with a 1-second interval between attempts.
     async fn wait_for_node_service_ready(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.create_s3_client(node_idx)?;
+        let mut last_error = None;
 
         for attempt in 0..120 {
             match client.list_buckets().send().await {
@@ -1584,13 +1586,36 @@ impl RustFSTestClusterEnvironment {
                     info!("Cluster node {} service ready after {} attempts", node_idx, attempt + 1);
                     return Ok(());
                 }
-                Err(_) => {
+                Err(err) => {
+                    last_error = Some(err);
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         }
 
-        Err(format!("Cluster node {} service failed to become ready", node_idx).into())
+        let last_error = last_error.as_ref().map(|err| {
+            // SDK Display reports only the category. Do not expose raw response bodies or headers.
+            let service_code = err.as_service_error().and_then(|error| error.code()).filter(|code| {
+                matches!(
+                    *code,
+                    "ServiceUnavailable"
+                        | "ServerNotInitialized"
+                        | "InternalError"
+                        | "AccessDenied"
+                        | "InvalidAccessKeyId"
+                        | "SignatureDoesNotMatch"
+                )
+            });
+            format!(
+                "{err}; http_status={:?}; service_code={service_code:?}",
+                err.raw_response().map(|response| response.status().as_u16())
+            )
+        });
+        Err(format!(
+            "Cluster node {node_idx} service failed to become ready; last ListBuckets error={last_error:?}; capture_log_path={:?}",
+            self.node_capture_log_paths[node_idx]
+        )
+        .into())
     }
 
     /// Create an S3 client configured to communicate with a specific cluster node.
