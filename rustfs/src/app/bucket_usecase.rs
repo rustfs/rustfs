@@ -95,9 +95,8 @@ use rustfs_targets::{
     arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
+use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
-use rustfs_utils::string::parse_bool;
 use s3s::dto::{
     BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
     CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
@@ -1455,11 +1454,10 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let force_str = get_header(&req.headers, SUFFIX_FORCE_DELETE)
-            .map(|v| v.into_owned())
-            .unwrap_or_default();
-
-        let force = parse_bool(&force_str).unwrap_or_default();
+        let force = match force_delete_header(&req.headers) {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")),
+        };
 
         if force {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;

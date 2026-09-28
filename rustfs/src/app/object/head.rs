@@ -104,6 +104,7 @@ pub(super) fn odm_head_output(head: SourceHead) -> S3Result<HeadObjectOutput> {
         e_tag: head.etag.as_deref().map(to_s3s_etag),
         last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
         metadata: (!head.user_metadata.is_empty()).then_some(head.user_metadata),
+        website_redirect_location: head.website_redirect_location,
         ..Default::default()
     })
 }
@@ -286,6 +287,7 @@ impl DefaultObjectUsecase {
             storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
             expiration: remote.expiration,
             restore: remote.restore,
+            website_redirect_location: remote.website_redirect_location,
             checksum_crc32: remote.checksum_crc32,
             checksum_crc32c: remote.checksum_crc32_c,
             checksum_crc64nvme: remote.checksum_crc64_nvme,
@@ -777,6 +779,7 @@ mod tests {
             content_language: Some("en".to_string()),
             cache_control: Some("max-age=60".to_string()),
             expires: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+            website_redirect_location: None,
             user_metadata: HashMap::from([("owner".to_string(), "alice".to_string())]),
             version_id: Some("v1".to_string()),
             storage_class: Some("STANDARD_IA".to_string()),

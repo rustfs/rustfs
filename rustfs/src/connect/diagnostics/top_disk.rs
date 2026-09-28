@@ -93,6 +93,9 @@ pub async fn capture_top_disk(
             return request.cancelled(TOOL_ID);
         }
         let after = process_snapshot(&mut sampler)?;
+        // Report the authorized window, as Top API does. The timer can only
+        // overshoot it, and validate_capture already bounded it by the limit;
+        // measuring the sleep would reject a capture that ran as requested.
         let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
         evaluate_disk_window(request, before, after, window_millis)
     }
