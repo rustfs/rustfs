@@ -91,7 +91,8 @@ jobs:
   pool-expansion-test:
     name: Pool expansion / decommission test
     runs-on: smoke-testing
-    timeout-minutes: 60
+    # Leave setup and finalizer headroom beyond the default 240-minute test.
+    timeout-minutes: 360
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     env:
       RUSTFS_POOL_ADMIN_ENDPOINT: ${{ secrets.RUSTFS_POOL_ADMIN_ENDPOINT || vars.RUSTFS_POOL_ADMIN_ENDPOINT || 'http://rustfs-node1:9000' }}
@@ -585,8 +586,9 @@ jobs:
           # A runner-level kill (step timeout) truncates the suite without a
           # FAIL verdict or an [ERROR] line, so require every expected
           # [POOL-STEP] marker to be present with PASS - missing markers mean
-          # the run was truncated, not green. This holds for standalone
-          # dispatches too; the chain driver relies on the same markers.
+          # the run was truncated, not green. This also closes the gap for
+          # standalone dispatches, where the chain driver's evidence
+          # validation does not run.
           last_step=6
           if [ "${{ inputs.pools || '3' }}" = "3" ]; then
             last_step=8
