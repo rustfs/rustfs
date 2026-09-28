@@ -377,10 +377,15 @@ enum ClusterHealthProbeKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LockQuorumStatus {
+    /// Exclusive-lock quorum. Cluster write probes and startup publication use this.
     pub ready: bool,
+    /// Shared-lock quorum. Node `/health/ready` uses this so a readable survivor
+    /// stays in the Service after exclusive locks are no longer obtainable.
+    pub read_ready: bool,
     pub connected_clients: usize,
     pub total_clients: usize,
     pub required_quorum: usize,
+    pub required_read_quorum: usize,
 }
 
 const DISK_STATE_OK: &str = "ok";
@@ -637,6 +642,20 @@ fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize)
     pool_erasure_layout(info, pool_idx, set_drive_count).map(|(data_drives, _)| data_drives)
 }
 
+/// Exclusive namespace locks use a strict majority of lock clients.
+fn exclusive_lock_quorum(total_clients: usize) -> usize {
+    if total_clients > 1 { (total_clients / 2) + 1 } else { 1 }
+}
+
+/// Shared namespace locks use the same client threshold as `DistributedLock::read_quorum`.
+fn shared_lock_quorum(total_clients: usize) -> usize {
+    if total_clients > 1 {
+        total_clients - (total_clients / 2)
+    } else {
+        1
+    }
+}
+
 fn configured_readiness_topology(info: &StorageInfo) -> Option<(&[usize], &[usize])> {
     if info.backend.total_sets.is_empty()
         || info.backend.total_sets.len() != info.backend.drives_per_set.len()
@@ -843,6 +862,27 @@ fn dependency_readiness_report_from_write_status(
     }
 }
 
+/// `/health/ready` reports whether this process can serve reads. Write quorum,
+/// the pool-metadata writer, and exclusive locks stay on `/minio/health/cluster`.
+fn apply_node_service_readiness(
+    mut storage: StorageWriteReadinessStatus,
+    mut details: StorageReadinessDetails,
+    lock_read_ready: bool,
+    iam_ready: bool,
+    peer_health_ready: bool,
+) -> (DependencyReadiness, StorageWriteReadinessStatus, StorageReadinessDetails) {
+    details.pool_metadata_write_ready = storage.ready;
+    storage.ready = details.read_quorum_ready;
+    storage.pool_metadata_reason = None;
+    let readiness = DependencyReadiness {
+        storage_ready: storage.ready,
+        iam_ready,
+        lock_quorum_ready: lock_read_ready,
+        peer_health_ready,
+    };
+    (readiness, storage, details)
+}
+
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::current_iam_ready();
     let storage = if let Some(cached) = load_cached_storage_readiness().await {
@@ -881,7 +921,6 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     if let Some(store) = runtime_sources::current_object_store_handle() {
         let pool_metadata_status = store.pool_meta_write_status().await;
         storage = apply_node_pool_metadata_timeout_policy(pool_metadata_write_readiness(pool_metadata_status), Instant::now());
-        details.pool_metadata_write_ready = storage.ready;
         match node_storage_snapshot(store.as_ref(), &lock_observation.online_hosts).await {
             Ok((info, unavailable_drives)) => {
                 details.unavailable_drives = unavailable_drives;
@@ -892,13 +931,14 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
             Err(_) => {}
         }
     }
-    storage.ready &= details.write_quorum_ready;
-    let readiness = DependencyReadiness {
-        storage_ready: storage.ready,
-        iam_ready: runtime_sources::current_iam_ready(),
-        lock_quorum_ready: lock_observation.status.ready,
-        peer_health_ready: collect_peer_health_readiness(),
-    };
+    // The HTTP layer still returns 503 until startup publishes `FullReady`.
+    let (readiness, storage, details) = apply_node_service_readiness(
+        storage,
+        details,
+        lock_observation.status.read_ready,
+        runtime_sources::current_iam_ready(),
+        collect_peer_health_readiness(),
+    );
     let mut report = dependency_readiness_report_from_write_status(readiness, storage);
     report.storage_details = Some(details);
     if storage_check_timed_out {
@@ -1121,17 +1161,16 @@ fn set_lock_quorum_status(online_hosts: &HashSet<String>, set_endpoints: &[Endpo
     }
 
     let connected_clients = total_clients.iter().filter(|host| online_hosts.contains(*host)).count();
-    let required_quorum = if total_clients_len > 1 {
-        (total_clients_len / 2) + 1
-    } else {
-        1
-    };
+    let required_quorum = exclusive_lock_quorum(total_clients_len);
+    let required_read_quorum = shared_lock_quorum(total_clients_len);
 
     LockQuorumStatus {
         ready: connected_clients >= required_quorum,
+        read_ready: connected_clients >= required_read_quorum,
         connected_clients,
         total_clients: total_clients_len,
         required_quorum,
+        required_read_quorum,
     }
 }
 
@@ -1139,6 +1178,10 @@ fn aggregate_lock_quorum_status(pool_endpoints: &EndpointServerPools, online_hos
     let mut connected_clients = 0usize;
     let mut total_clients = 0usize;
     let mut required_quorum = 0usize;
+    let mut required_read_quorum = 0usize;
+    let mut write_ready = true;
+    let mut read_ready = true;
+    let mut saw_set = false;
 
     for pool in pool_endpoints.as_ref() {
         for set_idx in 0..pool.set_count {
@@ -1155,29 +1198,26 @@ fn aggregate_lock_quorum_status(pool_endpoints: &EndpointServerPools, online_hos
                 return LockQuorumStatus::default();
             }
 
+            saw_set = true;
             connected_clients += status.connected_clients;
             total_clients += status.total_clients;
             required_quorum += status.required_quorum;
-
-            if !status.ready {
-                return LockQuorumStatus {
-                    ready: false,
-                    connected_clients,
-                    total_clients,
-                    required_quorum,
-                };
-            }
+            required_read_quorum += status.required_read_quorum;
+            write_ready &= status.ready;
+            read_ready &= status.read_ready;
         }
     }
 
-    if total_clients == 0 {
+    if !saw_set {
         LockQuorumStatus::default()
     } else {
         LockQuorumStatus {
-            ready: true,
+            ready: write_ready,
+            read_ready,
             connected_clients,
             total_clients,
             required_quorum,
+            required_read_quorum,
         }
     }
 }
@@ -1191,9 +1231,11 @@ async fn collect_lock_quorum_observation_uncached() -> LockQuorumObservation {
         return LockQuorumObservation {
             status: LockQuorumStatus {
                 ready: true,
+                read_ready: true,
                 connected_clients: 1,
                 total_clients: 1,
                 required_quorum: 1,
+                required_read_quorum: 1,
             },
             online_hosts: HashSet::new(),
         };
@@ -2297,9 +2339,11 @@ mod tests {
         );
 
         assert!(status.ready);
+        assert!(status.read_ready);
         assert_eq!(status.connected_clients, 4);
         assert_eq!(status.total_clients, 4);
         assert_eq!(status.required_quorum, 4);
+        assert_eq!(status.required_read_quorum, 2);
     }
 
     #[test]
@@ -2347,6 +2391,86 @@ mod tests {
             aggregate_lock_quorum_status(&pools, &["node1:9000"].into_iter().map(str::to_string).collect::<HashSet<_>>());
 
         assert!(!status.ready);
+        assert!(!status.read_ready);
+    }
+
+    #[test]
+    fn node_service_readiness_follows_read_quorum_not_write_or_pool_metadata() {
+        let blocked = StorageWriteReadinessStatus {
+            ready: false,
+            pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetaWriteBlocked),
+        };
+        let (readiness, storage, details) = apply_node_service_readiness(
+            blocked,
+            StorageReadinessDetails {
+                read_quorum_ready: true,
+                write_quorum_ready: false,
+                pool_metadata_write_ready: true,
+            },
+            true,
+            true,
+            true,
+        );
+        assert!(readiness.storage_ready);
+        assert!(readiness.lock_quorum_ready);
+        assert!(!details.write_quorum_ready);
+        assert!(!details.pool_metadata_write_ready);
+        assert!(storage.pool_metadata_reason.is_none());
+        let report = dependency_readiness_report_from_write_status(readiness, storage);
+        assert!(
+            report.degraded_reasons.is_empty(),
+            "a readable node must stay ready when write quorum and the metadata writer are lost, got {:?}",
+            report.degraded_reasons
+        );
+
+        let (readiness, storage, _) = apply_node_service_readiness(
+            StorageWriteReadinessStatus {
+                ready: true,
+                pool_metadata_reason: None,
+            },
+            StorageReadinessDetails {
+                read_quorum_ready: false,
+                write_quorum_ready: false,
+                pool_metadata_write_ready: false,
+            },
+            false,
+            true,
+            true,
+        );
+        assert_eq!(
+            dependency_readiness_report_from_write_status(readiness, storage).degraded_reasons,
+            vec![ReadinessDegradedReason::StorageAndLockUnavailable]
+        );
+    }
+
+    #[test]
+    fn shared_lock_quorum_stays_ready_when_two_of_four_clients_remain() {
+        let endpoints = (0..4)
+            .map(|disk_idx| Endpoint {
+                url: url::Url::parse(&format!("http://node{disk_idx}:9000/data")).expect("valid test endpoint"),
+                is_local: disk_idx == 0,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx,
+            })
+            .collect::<Vec<_>>();
+        let online = ["node0:9000", "node1:9000"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let status = set_lock_quorum_status(&online, &endpoints);
+
+        assert_eq!(status.total_clients, 4);
+        assert_eq!(status.connected_clients, 2);
+        assert_eq!(status.required_quorum, 3);
+        assert_eq!(status.required_read_quorum, 2);
+        assert!(!status.ready, "exclusive locks need three of four clients");
+        assert!(status.read_ready, "shared locks remain available at two of four clients");
+
+        let one = ["node0:9000"].into_iter().map(str::to_string).collect::<HashSet<_>>();
+        let below_read = set_lock_quorum_status(&one, &endpoints);
+        assert!(!below_read.ready);
+        assert!(!below_read.read_ready);
     }
 
     #[test]
@@ -2671,9 +2795,11 @@ mod tests {
             let observation = LockQuorumObservation {
                 status: LockQuorumStatus {
                     ready: true,
+                    read_ready: true,
                     connected_clients: 2,
                     total_clients: 3,
                     required_quorum: 2,
+                    required_read_quorum: 2,
                 },
                 online_hosts: HashSet::from(["node-a:9000".to_owned(), "node-b:9000".to_owned()]),
             };
