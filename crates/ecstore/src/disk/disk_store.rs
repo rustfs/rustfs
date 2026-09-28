@@ -1236,6 +1236,17 @@ impl DiskHealthTracker {
                 record_drive_recovery_class(classify_drive_recovery(duration));
             }
             self.offline_since_unix_secs.store(0, Ordering::Release);
+            info!(
+                event = EVENT_DISK_RECOVERY_PROBE_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                endpoint = %endpoint,
+                state = "recovered",
+                previous_state = current.as_str(),
+                runtime_state = next.as_str(),
+                reason,
+                "Disk recovered"
+            );
         } else if let Some(duration) = self.offline_duration() {
             record_drive_offline_duration(endpoint, duration);
         }

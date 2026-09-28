@@ -309,6 +309,7 @@ pub(super) fn native_source_head(
         content_language: header_string(headers, "content-language"),
         cache_control: header_string(headers, "cache-control"),
         expires: header_string(headers, "expires"),
+        website_redirect_location: header_string(headers, "x-amz-website-redirect-location"),
         user_metadata,
         version_id: fields.version_id,
         storage_class: fields.storage_class,
