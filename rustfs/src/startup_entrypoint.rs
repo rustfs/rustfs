@@ -675,8 +675,8 @@ fn unix_now() -> Result<i64> {
 async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     use crate::connect::{
         IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
-        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_disk, capture_top_locks,
-        capture_top_net, capture_top_rpc,
+        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_locks, capture_top_net,
+        capture_top_rpc,
     };
 
     let (tool_id, options) = match command {
@@ -692,6 +692,68 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Err(Error::other("connect_top_limits_invalid"));
     }
 
+    if tool_id == "top.disk" {
+        let offline_key_id = options
+            .offline_key_id
+            .ok_or_else(|| Error::other("--offline-key-id must select an existing offline identity"))?;
+        let input = crate::connect::diagnostics::LocalTopDiskRequest {
+            offline_key_id,
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            consent_expires_at_unix: options.consent_expires_at_unix,
+            acknowledge_l3: options.acknowledge_l3,
+            run_expires_at_unix: options.run_expires_at_unix,
+            window_millis: options.window_millis,
+            export_validity_seconds: options.export_validity_seconds,
+        };
+        let cancel = CancellationToken::new();
+        let capture = crate::connect::request_local_top_disk(&options.state_dir, input, &cancel);
+        tokio::pin!(capture);
+        let export = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return match capture.await {
+                    Err(error) => Err(Error::other(error)),
+                    Ok(_) => Err(Error::other("top disk collection cancelled")),
+                };
+            }
+            result = &mut capture => result.map_err(Error::other)?,
+        };
+        let writer_cancel = cancel.clone();
+        let mut writer = tokio::task::spawn_blocking(move || {
+            crate::connect::diagnostics::save_top_archive(
+                &options.output,
+                &export.artifact_uid,
+                &export.archive_bytes,
+                &export.archive_sha256,
+                &writer_cancel,
+            )
+        });
+        let receipt = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?; cancel.cancel();
+                writer.await.map_err(Error::other)?.map_err(Error::other)?
+            }
+            result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+        };
+        println!(
+            "artifact={} bytes={} sha256={}",
+            receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+        );
+        println!("upload=not-performed");
+        return Ok(());
+    }
+    if options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is only supported for top disk"));
+    }
     let identity = IdentityStore::new(options.state_dir.join("identity"))
         .load()
         .map_err(Error::other)?
@@ -723,10 +785,6 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     match tool_id {
         "top.api" => {
             let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.disk" => {
-            let result = await_top_capture(capture_top_disk(&request, &cancel), &cancel).await?;
             finish_top_capture(&request, result, &identity, options.output, &cancel).await
         }
         "top.locks" => {
@@ -1343,81 +1401,124 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     };
     use rand::{TryRng as _, rngs::SysRng};
 
-    let key = IdentityStore::new(options.state_dir.join("identity"))
-        .load()
-        .map_err(Error::other)?
-        .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
-    let executable_sha256 = hash_current_executable()?;
-    let produced_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(Error::other)
-        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
-    let mut nonce = [0_u8; 32];
-    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
-    let request = ProfileCaptureRequest {
-        organization_name: options.organization,
-        cluster_name: options.cluster,
-        device_name: options.device,
-        run_uid: options.run_uid,
-        artifact_uid: options.artifact_uid,
-        schema_version: options.schema_version,
-        capability: options.capability,
-        consent: LocalProfileConsent {
+    let runtime_scope =
+        options.tool == ConnectProfileTool::Threads && options.thread_scope == Some(ConnectThreadProfileScope::TokioRuntime);
+    if !runtime_scope && options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is valid only for a service runtime profile"));
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let export = if runtime_scope {
+        let offline_key_id = options
+            .offline_key_id
+            .ok_or_else(|| Error::other("--offline-key-id must explicitly select an existing offline identity"))?;
+        let input = crate::connect::diagnostics::LocalRuntimeProfileRequest {
+            offline_key_id,
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            schema_version: options.schema_version,
+            capability: options.capability,
             consent_uid: options.consent_uid,
             policy_revision: options.policy_revision,
-            expires_at_unix: options.consent_expires_at_unix,
-            confirmed: options.acknowledge_l3,
-        },
-        produced_at_unix,
-        expires_at_unix: options.expires_at_unix,
-        nonce,
-        duration: Duration::from_millis(options.duration_millis),
-        sample_period: Duration::from_micros(options.sample_period_micros),
-        provenance: ProfileProvenance::new(
-            crate::version::build::COMMIT_HASH,
-            executable_sha256,
-            env!("CARGO_PKG_VERSION"),
-            enabled_build_features(),
-        ),
-    };
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let export = {
-        let capture = async {
-            match options.tool {
-                ConnectProfileTool::Cpu => {
-                    if options.thread_scope.is_some() {
-                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
-                    }
-                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
-                }
-                ConnectProfileTool::Memory => {
-                    if options.thread_scope.is_some() {
-                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
-                    }
-                    export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
-                }
-                ConnectProfileTool::Threads => {
-                    let scope = match options.thread_scope {
-                        Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
-                        Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
-                        None => return Err(Error::other("--thread-scope is required for the threads profile")),
-                    };
-                    export_thread_profile(&request, scope, &key, &cancel)
-                        .await
-                        .map_err(Error::other)
-                }
-            }
+            consent_expires_at_unix: options.consent_expires_at_unix,
+            acknowledge_l3: options.acknowledge_l3,
+            expires_at_unix: options.expires_at_unix,
+            duration_millis: options.duration_millis,
+            sample_period_micros: options.sample_period_micros,
         };
+        let capture = crate::connect::request_local_runtime_profile(&options.state_dir, input, &cancel);
         tokio::pin!(capture);
         tokio::select! {
             biased;
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(Error::other)?;
                 cancel.cancel();
-                return Err(Error::other("profile collection cancelled"));
+                return match capture.await {
+                    Err(error) => Err(Error::other(error)),
+                    Ok(_) => Err(Error::other("profile collection cancelled")),
+                };
             }
-            result = capture.as_mut() => result?,
+            result = &mut capture => result.map_err(Error::other)?,
         }
+    } else {
+        let key = IdentityStore::new(options.state_dir.join("identity"))
+            .load()
+            .map_err(Error::other)?
+            .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
+        let executable_sha256 = hash_current_executable()?;
+        let produced_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(Error::other)
+            .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+        let mut nonce = [0_u8; 32];
+        SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+        let request = ProfileCaptureRequest {
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            schema_version: options.schema_version,
+            capability: options.capability,
+            consent: LocalProfileConsent {
+                consent_uid: options.consent_uid,
+                policy_revision: options.policy_revision,
+                expires_at_unix: options.consent_expires_at_unix,
+                confirmed: options.acknowledge_l3,
+            },
+            produced_at_unix,
+            expires_at_unix: options.expires_at_unix,
+            nonce,
+            duration: Duration::from_millis(options.duration_millis),
+            sample_period: Duration::from_micros(options.sample_period_micros),
+            provenance: ProfileProvenance::new(
+                crate::version::build::COMMIT_HASH,
+                executable_sha256,
+                env!("CARGO_PKG_VERSION"),
+                enabled_build_features(),
+            ),
+        };
+        let export = {
+            let capture = async {
+                match options.tool {
+                    ConnectProfileTool::Cpu => {
+                        if options.thread_scope.is_some() {
+                            return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                        }
+                        export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
+                    }
+                    ConnectProfileTool::Memory => {
+                        if options.thread_scope.is_some() {
+                            return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                        }
+                        export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
+                    }
+                    ConnectProfileTool::Threads => {
+                        let scope = match options.thread_scope {
+                            Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
+                            Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
+                            None => return Err(Error::other("--thread-scope is required for the threads profile")),
+                        };
+                        export_thread_profile(&request, scope, &key, &cancel)
+                            .await
+                            .map_err(Error::other)
+                    }
+                }
+            };
+            tokio::pin!(capture);
+            tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    return Err(Error::other("profile collection cancelled"));
+                }
+                result = capture.as_mut() => result?,
+            }
+        };
+        export
     };
     let tool = export.tool;
     let outcome = export.outcome;

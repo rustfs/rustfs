@@ -120,6 +120,12 @@ pub struct DiagnosticJobParameters {
     pub duration_millis: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sample_period_micros: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_thread_scope"
+    )]
+    pub thread_scope: Option<ThreadProfileScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_evidence_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +136,10 @@ pub struct DiagnosticJobParameters {
     pub scratch_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_bytes: Option<u64>,
+}
+
+fn deserialize_thread_scope<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<ThreadProfileScope>, D::Error> {
+    ThreadProfileScope::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -382,6 +392,9 @@ impl DiagnosticJobEnvelope {
 
     fn validate(&self, target: &DiagnosticJobTarget, now: DateTime<Utc>) -> Result<(), DiagnosticJobError> {
         let kind = self.kind()?;
+        if (kind == DiagnosticJobKind::ProfileThreads) != self.parameters.thread_scope.is_some() {
+            return Err(DiagnosticJobError::Invalid);
+        }
         if self.protocol_version != PROTOCOL_VERSION || self.schema_version != PROFILE_SCHEMA_VERSION {
             return Err(DiagnosticJobError::Unsupported);
         }
@@ -452,6 +465,11 @@ impl DiagnosticJobEnvelope {
         }
         if kind == DiagnosticJobKind::TopApi
             && (self.limits.max_cpu_millis > MAX_TOP_API_CPU_MILLIS || self.limits.max_memory_bytes < MIN_TOP_API_MEMORY_BYTES)
+        {
+            return Err(DiagnosticJobError::LimitExceeded);
+        }
+        if kind == DiagnosticJobKind::ProfileThreads
+            && (self.limits.max_memory_bytes != MAX_MEMORY_BYTES || self.limits.max_cpu_millis != MAX_CPU_MILLIS)
         {
             return Err(DiagnosticJobError::LimitExceeded);
         }
@@ -948,10 +966,16 @@ async fn execute_profile_threads_job(
         sample_period: Duration::from_micros(envelope.parameters.sample_period_micros),
         provenance,
     };
+    let scope = envelope.parameters.thread_scope.ok_or(DiagnosticJobError::Invalid)?;
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let timeout = Duration::from_secs(envelope.limits.timeout_seconds);
     let owned_request = request.clone();
     let owned_cancel = cancel.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        capture_thread_profile(&owned_request, ThreadProfileScope::NativeThreads, &owned_cancel)
+    let result = tokio::task::spawn_blocking(move || match scope {
+        ThreadProfileScope::NativeThreads => capture_thread_profile(&owned_request, scope, &owned_cancel),
+        ThreadProfileScope::TokioRuntime => {
+            super::profile_threads::capture_runtime_profile(&owned_request, &metrics, timeout, &owned_cancel)
+        }
     })
     .await
     .map_err(|_| DiagnosticJobError::CollectionFailed)?
@@ -1340,6 +1364,7 @@ mod tests {
                 max_cpu_millis: 30_000,
             },
             parameters: DiagnosticJobParameters {
+                thread_scope: None,
                 artifact_uid: "018cc251-f400-7abc-8def-0123456789ae".to_owned(),
                 consent_uid: "018cc251-f400-7abc-8def-0123456789af".to_owned(),
                 consent_policy_revision: 1,
@@ -1528,6 +1553,7 @@ mod tests {
     fn accepts_only_the_thread_profile_capability_pair() {
         let mut threads = envelope();
         threads.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        threads.parameters.thread_scope = Some(ThreadProfileScope::NativeThreads);
         threads.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
         let (threads, signer) = signed_envelope(threads);
         signer
@@ -1542,39 +1568,81 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn executes_thread_profile_jobs_against_the_service_process() {
-        let now = Utc::now();
-        let mut envelope = envelope();
-        envelope.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
-        envelope.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
-        envelope.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        envelope.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        envelope.parameters.consent_expires_at =
-            (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let execution = execute_diagnostic_job(
-            VerifiedDiagnosticJob {
-                envelope,
-                nonce: [7_u8; 32],
-            },
-            &DeviceIdentity::generate(),
-            ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("native thread profile job should execute");
+    #[test]
+    fn thread_scope_is_required_and_forbidden_on_other_jobs() {
+        let now = "2030-01-01T00:00:10Z".parse().unwrap();
+        let mut job = envelope();
+        job.parameters.thread_scope = Some(ThreadProfileScope::TokioRuntime);
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::Invalid));
+        job.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+        job.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+        assert!(job.validate(&target(&job), now).is_ok());
+        job.limits.max_memory_bytes = 1;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::LimitExceeded));
+        job.limits.max_memory_bytes = MAX_MEMORY_BYTES;
+        job.parameters.duration_millis = 1;
+        job.parameters.sample_period_micros = 1;
+        job.limits.max_cpu_millis = 1;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::LimitExceeded));
+        job.limits.max_cpu_millis = MAX_CPU_MILLIS;
+        job.parameters.thread_scope = None;
+        assert_eq!(job.validate(&target(&job), now), Err(DiagnosticJobError::Invalid));
+        let mut json = serde_json::to_value(&job).unwrap();
+        json["parameters"]["threadScope"] = serde_json::json!("ALL_THREADS");
+        assert!(serde_json::from_value::<DiagnosticJobEnvelope>(json.clone()).is_err());
+        json["parameters"]["threadScope"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<DiagnosticJobEnvelope>(json).is_err());
+        job.parameters.thread_scope = Some(ThreadProfileScope::TokioRuntime);
+        let (mut signed, signer) = signed_envelope(job);
+        signed.parameters.thread_scope = Some(ThreadProfileScope::NativeThreads);
+        assert!(signer.verify(&signed, &target(&signed), now).is_err());
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(execution.outcome, "SUCCEEDED");
-            assert_eq!(execution.reason, "COMPLETE");
-            assert!(execution.artifact_bytes.is_some_and(|bytes| !bytes.is_empty()));
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert_eq!(execution.outcome, "UNSUPPORTED");
-            assert_eq!(execution.reason, "UNSUPPORTED_PLATFORM");
-            assert!(execution.artifact_bytes.is_none());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executes_thread_profile_jobs_against_the_service_process() {
+        for scope in [ThreadProfileScope::NativeThreads, ThreadProfileScope::TokioRuntime] {
+            let now = Utc::now();
+            let mut envelope = envelope();
+            envelope.job_type = PROFILE_THREADS_JOB_TYPE.to_owned();
+            envelope.parameters.thread_scope = Some(scope);
+            envelope.required_capabilities = vec![THREAD_PROFILE_CAPABILITY.to_owned()];
+            envelope.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            envelope.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            envelope.parameters.consent_expires_at =
+                (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let execution = execute_diagnostic_job(
+                VerifiedDiagnosticJob {
+                    envelope,
+                    nonce: [7_u8; 32],
+                },
+                &DeviceIdentity::generate(),
+                ProfileProvenance::new("a".repeat(40), "b".repeat(64), "1.0.0", vec![]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("thread profile job should execute");
+
+            let supported = match scope {
+                ThreadProfileScope::NativeThreads => cfg!(target_os = "linux"),
+                ThreadProfileScope::TokioRuntime => cfg!(target_has_atomic = "64"),
+            };
+            if supported {
+                assert_eq!(execution.outcome, "SUCCEEDED");
+                assert_eq!(execution.reason, "COMPLETE");
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(execution.artifact_bytes.unwrap())).unwrap();
+                let result: serde_json::Value = serde_json::from_reader(archive.by_name("result.json").unwrap()).unwrap();
+                assert_eq!(result["data"]["scope"], serde_json::to_value(scope).unwrap());
+                if scope == ThreadProfileScope::TokioRuntime {
+                    assert_eq!(result["data"]["workerCount"], 2);
+                    assert_eq!(result["data"]["samples"].as_array().unwrap().len(), 2);
+                }
+                let envelope: serde_json::Value = serde_json::from_reader(archive.by_name("envelope.json").unwrap()).unwrap();
+                assert_eq!(envelope["classification"], "L3");
+            } else {
+                assert_eq!(execution.outcome, "UNSUPPORTED");
+                assert_eq!(execution.reason, "UNSUPPORTED_PLATFORM");
+                assert!(execution.artifact_bytes.is_none());
+            }
         }
     }
 
