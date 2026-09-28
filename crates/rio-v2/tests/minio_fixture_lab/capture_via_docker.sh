@@ -49,7 +49,8 @@ echo ">> building ${IMAGE}"
 docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" "${build_args[@]}" "${SCRIPT_DIR}"
 
 echo ">> capturing fixtures into ${FIXTURE_REL}"
-docker run --rm -v "${REPO_ROOT}:/repo" "${IMAGE}" \
+# The host reader initializes disk metadata inside the captured fixture tree.
+docker run --rm --user "$(id -u):$(id -g)" -v "${REPO_ROOT}:/repo" "${IMAGE}" \
   python3 "/repo/${LAB_REL}/lab.py" capture-matrix \
     --root "/repo/${FIXTURE_REL}" \
     --work-root /tmp/minio-lab-work \
