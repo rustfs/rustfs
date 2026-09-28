@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Connect top.disk service-job acceptance
+name: Connect top.disk proxy service-job acceptance
 
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ on:
         required: true
         type: string
       connect_sha:
-        description: Exact Connect top.disk service-job acceptance harness commit
+        description: Exact Connect top.disk proxy service-job acceptance harness commit
         required: true
         type: string
 
@@ -48,7 +48,7 @@ permissions:
 
 jobs:
   top-disk:
-    name: Verify native top.disk service job over mTLS
+    name: Verify native top.disk service job through authenticated proxy
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -197,7 +197,7 @@ jobs:
           chmod 0755 binary/rustfs
           printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
 
-      - name: Run the real top.disk service job
+      - name: Run the real top.disk service job through proxy
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -215,8 +215,8 @@ jobs:
           make -C connect-harness e2e-connected-dispatch-check
           RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
-            CONNECT_E2E_TOP_DISK_EVIDENCE="$GITHUB_WORKSPACE/top-disk-service-job-evidence.json" \
-            make -C connect-harness e2e-connected E2E_SCENARIO=top-disk
+            CONNECT_E2E_TOP_DISK_PROXY_EVIDENCE="$GITHUB_WORKSPACE/top-disk-proxy-service-job-evidence.json" \
+            make -C connect-harness e2e-connected E2E_SCENARIO=top-disk-proxy
 
       - name: Bind and validate sanitized evidence
         shell: bash
@@ -230,22 +230,36 @@ jobs:
         run: |
           set -euo pipefail
           jq -e --arg source "$SOURCE_SHA" --arg binary "$BINARY_SHA256" --arg artifact "$ARTIFACT_ID" '
-            .status == "PASS" and .officialArtifactId == $artifact and .producerSource == $source and .producerSha256 == $binary
-            and .result.provenance.sourceCommit == $source
-            and .result.provenance.executableSha256 == $binary
-          ' top-disk-service-job-evidence.json >/dev/null
+            .scenario == "top-disk-proxy" and .topDisk.status == "PASS"
+            and .topDisk.officialArtifactId == $artifact and .topDisk.producerSource == $source
+            and .topDisk.producerSha256 == $binary
+            and .topDisk.result.provenance.sourceCommit == $source
+            and .topDisk.result.provenance.executableSha256 == $binary
+            and .topology.agentsInternalOnly == true and .topology.proxyOnlyBridge == true
+            and .topology.proxyCredentialsFromFiles == true
+            and .probes.direct.connectStatus == "000"
+            and .probes.noAuthentication.connectStatus == "407"
+            and .probes.deniedTarget.connectStatus == "403"
+            and .probes.wrongCa.connectStatus == "200" and .probes.wrongCa.exitCode == 60
+            and .probes.approved.connectStatus == "200" and .probes.approved.exitCode == 0
+            and .proxyLogCounts.approvedTunnels >= 3
+            and .ingress.jobFetchObserved == true
+            and .ingress.bundleReservationObserved == true
+            and .ingress.boundBundleCompletionObserved == true
+            and .ingress.jobResultObserved == true
+          ' top-disk-proxy-service-job-evidence.json >/dev/null
           jq --arg run "$GITHUB_RUN_ID" --arg build "$BUILD_RUN_ID" \
             --arg artifact "$ARTIFACT_ID" --arg digest "$ARTIFACT_DIGEST" \
             --arg connect "$CONNECT_SHA" --arg source "$SOURCE_SHA" --arg binary "$BINARY_SHA256" \
             --arg expiry "$(cat artifact-expires-at)" '
             . + {workflowRunId:$run,buildRunId:$build,artifactId:$artifact,artifactDigest:$digest,artifactExpiresAt:$expiry,connectSha:$connect,sourceSha:$source,binarySha256:$binary}
-          ' top-disk-service-job-evidence.json > top-disk-service-job-evidence.bound.json
-          mv top-disk-service-job-evidence.bound.json top-disk-service-job-evidence.json
+          ' top-disk-proxy-service-job-evidence.json > top-disk-proxy-service-job-evidence.bound.json
+          mv top-disk-proxy-service-job-evidence.bound.json top-disk-proxy-service-job-evidence.json
 
       - name: Upload only verified sanitized evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: connect-top-disk-service-job-evidence-${{ github.run_id }}
-          path: top-disk-service-job-evidence.json
+          name: connect-top-disk-proxy-service-job-evidence-${{ github.run_id }}
+          path: top-disk-proxy-service-job-evidence.json
           retention-days: 14
           if-no-files-found: error
