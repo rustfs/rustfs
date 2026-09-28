@@ -131,6 +131,7 @@ pub use perf_site_replication::{
     SiteReplicationTargetResult, measure_site_replication, read_protected_site_replication_credential,
     save_signed_site_replication_export, sign_site_replication_export, validate_site_replication_limits,
 };
+pub(crate) use profile_cpu::LocalRuntimeProfileRequest;
 pub use profile_cpu::{
     CPU_PROFILE_CAPABILITY, LocalProfileConsent, MAX_PROFILE_DURATION, MEMORY_PROFILE_CAPABILITY, PROFILE_SCHEMA_VERSION,
     ProfileCaptureRequest, ProfileData, ProfileError, ProfileOutcome, ProfileProvenance, ProfileReasonCode, ProfileResult,
@@ -171,5 +172,9 @@ pub use trace_record::{
 };
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
 pub(crate) use trace_runtime::{
-    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_runtime_profile, request_local_top_disk,
+    request_local_trace_capture, spawn_local_trace_capture_runtime,
 };
+
+pub(crate) use top_api::save_top_archive;
+pub(crate) use top_disk::LocalTopDiskRequest;

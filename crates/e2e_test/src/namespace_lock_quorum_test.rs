@@ -462,7 +462,10 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
         }
         let write_ready = survivors >= 3;
         let read_quorum = survivors >= 2;
-        let expected_status = if write_ready { 200 } else { 503 };
+        // `/health/ready` keeps a node that can still serve reads in the Service.
+        let node_ready = read_quorum;
+        let node_status = if node_ready { 200 } else { 503 };
+        let cluster_status = if write_ready { 200 } else { 503 };
         for (idx, client) in clients.iter().enumerate().take(survivors) {
             let url = &cluster.nodes[idx].url;
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -472,27 +475,27 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
                 let response = http.get(format!("{url}/health/ready")).send().await?;
                 let status = response.status().as_u16();
                 let payload: serde_json::Value = response.json().await?;
-                if status == expected_status
-                    && payload["ready"] == write_ready
-                    && payload["details"]["storage"]["ready"] == write_ready
+                if status == node_status
+                    && payload["ready"] == node_ready
+                    && payload["details"]["storage"]["ready"] == node_ready
                     && payload["details"]["storage"]["readQuorum"] == read_quorum
                     && payload["details"]["storage"]["writeQuorum"] == write_ready
                     && payload["details"]["poolMetadata"]["ready"] == true
                     && payload["details"]["iam"]["ready"] == true
-                    && payload["details"]["lock"]["ready"] == write_ready
+                    && payload["details"]["lock"]["ready"] == read_quorum
                 {
                     break payload;
                 }
                 assert!(Instant::now() < deadline, "node {idx}, survivors={survivors}: HTTP {status}, {payload}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             };
-            assert_eq!(payload["details"]["storage"]["readinessScope"], "write_quorum_and_pool_metadata");
+            assert_eq!(payload["details"]["storage"]["readinessScope"], "read_quorum");
             assert_eq!(payload["details"]["storage"]["source"], "local_runtime");
             assert_eq!(
                 payload["details"]["storage"]["status"],
-                if write_ready { "connected" } else { "disconnected" }
+                if node_ready { "connected" } else { "disconnected" }
             );
-            if !write_ready {
+            if !node_ready {
                 assert!(
                     payload["degradedReasons"]
                         .as_array()
@@ -504,10 +507,10 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
 
             for path in ["/health/ready", "/minio/health/ready"] {
                 let head = http.head(format!("{url}{path}")).send().await?;
-                assert_eq!(head.status().as_u16(), expected_status, "HEAD {path}, survivors={survivors}");
+                assert_eq!(head.status().as_u16(), node_status, "HEAD {path}, survivors={survivors}");
                 assert!(head.bytes().await?.is_empty());
                 let response = http.get(format!("{url}{path}")).send().await?;
-                assert_eq!(response.status().as_u16(), expected_status);
+                assert_eq!(response.status().as_u16(), node_status);
                 let body: serde_json::Value = response.json().await?;
                 assert_eq!(body["details"]["storage"], payload["details"]["storage"]);
                 assert_eq!(body["details"]["poolMetadata"], payload["details"]["poolMetadata"]);
@@ -526,7 +529,7 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
                     let response = http.get(format!("{url}{path}")).send().await?;
                     let status = response.status().as_u16();
                     let body: serde_json::Value = response.json().await?;
-                    if status == expected_status
+                    if status == cluster_status
                         && body["details"]["storage"]["ready"] == storage_ready
                         && body["details"]["lock"]["ready"] == write_ready
                     {
@@ -559,11 +562,12 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
             let get = client.get_object().bucket(BUCKET).key(seed_key).send().await;
             let get_status = match get {
                 Ok(object) => {
+                    assert!(read_quorum, "GET must fail once read quorum is lost");
                     assert_eq!(object.body.collect().await?.into_bytes().as_ref(), seed_body);
                     200
                 }
                 Err(error) => {
-                    assert!(!write_ready, "GET must succeed on a ready cluster: {error:?}");
+                    assert!(!read_quorum, "GET must succeed while read quorum holds: {error:?}");
                     let status = error
                         .raw_response()
                         .expect("GET should have an HTTP response")
@@ -576,11 +580,12 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
             let list = client.list_objects_v2().bucket(BUCKET).send().await;
             let list_status = match list {
                 Ok(result) => {
+                    assert!(read_quorum, "listing must fail once read quorum is lost");
                     assert!(result.contents().iter().any(|object| object.key() == Some(seed_key)));
                     200
                 }
                 Err(error) => {
-                    assert!(!write_ready, "listing must succeed on a ready cluster: {error:?}");
+                    assert!(!read_quorum, "listing must succeed while read quorum holds: {error:?}");
                     let status = error
                         .raw_response()
                         .expect("LIST should have an HTTP response")

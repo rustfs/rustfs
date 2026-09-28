@@ -40,6 +40,8 @@ pub(crate) enum ScannerCycleOutcome {
     Superseded,
     Deferred(ScannerCycleDeferReason),
     Failed,
+    // The write may have committed; reload and reclaim before dispatching again.
+    StatePersistenceFailed,
 }
 
 pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(

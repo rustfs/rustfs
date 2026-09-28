@@ -17,6 +17,14 @@ name: Connect profile.threads service-job acceptance
 on:
   workflow_dispatch:
     inputs:
+      thread_scope:
+        description: Thread profile scope
+        required: true
+        type: choice
+        default: native
+        options:
+          - native
+          - runtime
       build_run_id:
         description: Main-branch Build and Release workflow run ID
         required: true
@@ -48,7 +56,7 @@ permissions:
 
 jobs:
   profile-threads:
-    name: Verify native Linux x86_64 profile.threads service job
+    name: Verify Linux x86_64 profile.threads service job
     runs-on: sm-standard-2
     timeout-minutes: 45
     steps:
@@ -76,7 +84,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.22.2
+          node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
 
@@ -107,7 +115,7 @@ jobs:
           [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
           [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
 
-          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-4, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
           jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e --arg name "$expected_job" '
             [.[].jobs[] | select(.name == $name)] as $matches
@@ -148,8 +156,14 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          THREAD_SCOPE: ${{ inputs.thread_scope }}
         run: |
           set -euo pipefail
+          case "$THREAD_SCOPE" in
+            native) export CONNECT_E2E_THREAD_SCOPE=NATIVE_THREADS ;;
+            runtime) export CONNECT_E2E_THREAD_SCOPE=TOKIO_RUNTIME ;;
+            *) exit 1 ;;
+          esac
           printf '%s\n' "$SOURCE_SHA" >connect-harness/tests/e2e/connected/rustfs-ref
           npm --prefix connect-harness/web ci
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
@@ -168,6 +182,7 @@ jobs:
           ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
           CONNECT_SHA: ${{ inputs.connect_sha }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          THREAD_SCOPE: ${{ inputs.thread_scope }}
         run: |
           set -euo pipefail
           jq \
@@ -177,7 +192,8 @@ jobs:
             --arg artifactDigest "$ARTIFACT_DIGEST" \
             --arg connectSha "$CONNECT_SHA" \
             --arg sourceSha "$SOURCE_SHA" \
-            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha}' \
+            --arg requestedThreadScope "$THREAD_SCOPE" \
+            '. + {workflowRunId: $workflowRunId, buildRunId: $buildRunId, artifactId: $artifactId, artifactDigest: $artifactDigest, connectSha: $connectSha, sourceSha: $sourceSha, requestedThreadScope: $requestedThreadScope}' \
             profile-threads-service-job-evidence.json >profile-threads-service-job-evidence.bound.json
           mv profile-threads-service-job-evidence.bound.json profile-threads-service-job-evidence.json
 
