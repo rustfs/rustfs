@@ -492,8 +492,8 @@ pub(crate) mod ecstore_error {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
     pub(crate) use rustfs_ecstore::api::error::{
-        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_invalid_upload_id,
+        is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -2016,6 +2016,10 @@ pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
+}
+
+pub(crate) fn is_err_invalid_upload_id(err: &Error) -> bool {
+    ecstore_error::is_err_invalid_upload_id(err)
 }
 
 pub(crate) fn is_err_object_not_found(err: &Error) -> bool {

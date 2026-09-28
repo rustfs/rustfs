@@ -1799,7 +1799,8 @@ mod tests {
         let (mut client_token, mut task_status_url) = if background_rejoin_heal_evidence {
             (String::new(), String::new())
         } else {
-            let heal_start_body = signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+            let heal_start_body =
+                start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key).await?;
             let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
                 .map_err(|err| format!("heal start response is not JSON ({err}): {heal_start_body}"))?;
             let client_token = heal_start["clientToken"]
@@ -2140,7 +2141,8 @@ mod tests {
                     && status["summary"].as_str() == Some("failed")
                 {
                     let heal_start_body =
-                        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+                        start_root_heal_when_control_ready(&heal_url, heal_body, &cluster.access_key, &cluster.secret_key)
+                            .await?;
                     let heal_start: serde_json::Value = serde_json::from_str(&heal_start_body)
                         .map_err(|err| format!("recovery heal start response is not JSON ({err}): {heal_start_body}"))?;
                     client_token = heal_start["clientToken"]
