@@ -51,34 +51,40 @@ enum OidcPolicyRejection {
     /// Existing policies that session claims cannot carry. Dropping them could remove an explicit
     /// Deny and broaden access, so the login fails closed.
     Unsupported(Vec<String>),
-    /// Names that must resolve (IAM mapping, role policy, dedicated policy claim) but do not.
+    /// Names that must resolve but do not: absent names from an IAM mapping, role policy, or
+    /// dedicated policy claim, and existing policies that failed to resolve.
     Unresolved(Vec<String>),
     /// No mapped name resolves to a usable policy.
     Empty,
 }
 
-/// Only names from `ignorable_policy_names` (groups-claim values) may be skipped, and only when no
-/// policy of that name exists; directory providers emit groups such as `DOMAIN\Domain Users` that
-/// never map. Every other name must resolve to an existing policy with a claim-safe name, so the
-/// signed `policy` claim keeps listing only resolvable names for request-time evaluation and site
-/// replication receivers.
+/// Only names from `ignorable_policy_names` (groups-claim values) may be skipped, and only when
+/// storage confirmed that no such policy exists (`missing_policy_names`); directory providers emit
+/// groups such as `DOMAIN\Domain Users` that never map. Every other name must resolve to an
+/// existing policy with a claim-safe name, so the signed `policy` claim keeps listing only
+/// resolvable names for request-time evaluation and site replication receivers.
 fn select_oidc_policies(
     selected_policy_names: &[String],
     ignorable_policy_names: &[String],
     resolved_policy_names: &[String],
-    existing_unsafe_policy_names: &[String],
+    missing_policy_names: &[String],
 ) -> Result<OidcPolicySelection, OidcPolicyRejection> {
     let mut usable = Vec::new();
     let mut ignored = Vec::new();
     let mut unsupported = Vec::new();
     let mut unresolved = Vec::new();
     for policy_name in selected_policy_names {
-        let bucket = if is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name) {
+        let is_safe = is_safe_claim_policy_name(policy_name);
+        let bucket = if is_safe && resolved_policy_names.contains(policy_name) {
             &mut usable
-        } else if existing_unsafe_policy_names.contains(policy_name) {
+        } else if missing_policy_names.contains(policy_name) {
+            if ignorable_policy_names.contains(policy_name) {
+                &mut ignored
+            } else {
+                &mut unresolved
+            }
+        } else if !is_safe {
             &mut unsupported
-        } else if ignorable_policy_names.contains(policy_name) {
-            &mut ignored
         } else {
             &mut unresolved
         };
@@ -326,25 +332,37 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             mapped_policy_names if !mapped_policy_names.is_empty() => (mapped_policy_names, &[][..]),
             _ => (authorization.policies.clone(), authorization.group_claim_policies.as_slice()),
         };
-        let (safe_policy_names, unsafe_policy_names): (Vec<String>, Vec<String>) = selected_policy_names
-            .iter()
-            .cloned()
-            .partition(|policy_name| is_safe_claim_policy_name(policy_name));
-        // Unsafe names come from the identity provider and must not reach storage-backed policy
-        // loading; the in-memory policy cache is enough to tell an existing policy apart.
-        let mut existing_unsafe_policy_names = Vec::new();
-        for policy_name in unsafe_policy_names {
-            if iam_store.get_policy_doc(&policy_name).await.is_ok() {
-                existing_unsafe_policy_names.push(policy_name);
+        // A name may be skipped only after storage confirms the policy is absent. A failed lookup
+        // must not be mistaken for absence, or an unreadable Deny policy would be dropped from the
+        // signed session and could not be restored at request time.
+        let mut missing_policy_names = Vec::new();
+        for policy_name in &selected_policy_names {
+            let exists = iam_store.policy_exists(policy_name).await.map_err(|err| {
+                warn!(
+                    provider_id = %authorization.provider_id,
+                    parent_user = %parent_user,
+                    policy = %policy_name,
+                    error = %err,
+                    "OIDC STS policy lookup failed"
+                );
+                FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string())
+            })?;
+            if !exists {
+                missing_policy_names.push(policy_name.clone());
             }
         }
-        let resolved_policy_mapping = iam_store.current_policies(&safe_policy_names.join(",")).await;
+        let existing_safe_policy_names: Vec<&str> = selected_policy_names
+            .iter()
+            .filter(|policy_name| is_safe_claim_policy_name(policy_name) && !missing_policy_names.contains(policy_name))
+            .map(String::as_str)
+            .collect();
+        let resolved_policy_mapping = iam_store.current_policies(&existing_safe_policy_names.join(",")).await;
         let resolved_policy_names = MappedPolicy::new(&resolved_policy_mapping).to_slice();
         let selection = select_oidc_policies(
             &selected_policy_names,
             ignorable_policy_names,
             &resolved_policy_names,
-            &existing_unsafe_policy_names,
+            &missing_policy_names,
         )
         .map_err(|rejection| match rejection {
             OidcPolicyRejection::Unsupported(policy_names) => {
@@ -408,10 +426,13 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+    use crate::admin::runtime_sources::{AppContext, current_object_store_handle, publish_test_app_context};
     use hmac::{Hmac, KeyInit, Mac};
     use rustfs_iam::federation::{FederatedAuthorization, FederatedClaims};
-    use rustfs_iam::store::{Store, UserType, object::IAM_CONFIG_PREFIX};
+    use rustfs_iam::store::{
+        Store, UserType,
+        object::{IAM_CONFIG_POLICIES_PREFIX, IAM_CONFIG_PREFIX},
+    };
     use rustfs_kms::KmsServiceManager;
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::{
@@ -788,22 +809,34 @@ mod tests {
         );
         // Role policies, IAM mappings, and dedicated policy claims are not ignorable.
         assert_eq!(
-            select_oidc_policies(&names(&["readonly", "missing"]), &[], &names(&["readonly"]), &[]),
+            select_oidc_policies(&names(&["readonly", "missing"]), &[], &names(&["readonly"]), &names(&["missing"])),
             Err(OidcPolicyRejection::Unresolved(names(&["missing"])))
         );
         assert_eq!(select_oidc_policies(&[], &[], &[], &[]), Err(OidcPolicyRejection::Empty));
     }
 
     #[test]
-    fn oidc_policy_selection_ignores_unmapped_group_claim_values() {
+    fn oidc_policy_selection_ignores_confirmed_missing_group_claim_values() {
         let groups = names(&["EXAMPLE\\Domain Users", "readonly", "unmapped-group"]);
+        let missing = names(&["EXAMPLE\\Domain Users", "unmapped-group"]);
         assert_eq!(
-            select_oidc_policies(&groups, &groups, &names(&["readonly"]), &[]),
+            select_oidc_policies(&groups, &groups, &names(&["readonly"]), &missing),
             selection(&["readonly"], &["EXAMPLE\\Domain Users", "unmapped-group"])
         );
         assert_eq!(
-            select_oidc_policies(&names(&["unmapped-group"]), &names(&["unmapped-group"]), &[], &[]),
+            select_oidc_policies(&names(&["unmapped-group"]), &names(&["unmapped-group"]), &[], &names(&["unmapped-group"])),
             Err(OidcPolicyRejection::Empty)
+        );
+    }
+
+    #[test]
+    fn oidc_policy_selection_keeps_existing_group_policies_that_failed_to_resolve() {
+        // A group policy that exists but did not resolve (e.g. its load failed) must not be
+        // skipped: it could be an explicit Deny.
+        let groups = names(&["readwrite", "team-deny"]);
+        assert_eq!(
+            select_oidc_policies(&groups, &groups, &names(&["readwrite"]), &[]),
+            Err(OidcPolicyRejection::Unresolved(names(&["team-deny"])))
         );
     }
 
@@ -812,7 +845,7 @@ mod tests {
         // Dropping an existing Deny policy would broaden access, even when it came from a group.
         let groups = names(&["readwrite", "team+deny"]);
         assert_eq!(
-            select_oidc_policies(&groups, &groups, &names(&["readwrite"]), &names(&["team+deny"])),
+            select_oidc_policies(&groups, &groups, &names(&["readwrite"]), &[]),
             Err(OidcPolicyRejection::Unsupported(names(&["team+deny"])))
         );
     }
@@ -822,11 +855,11 @@ mod tests {
         // A crafted group must not smuggle in another policy through the comma-joined mapping.
         let groups = names(&["team,consoleAdmin"]);
         assert_eq!(
-            select_oidc_policies(&groups, &groups, &names(&["consoleAdmin"]), &[]),
+            select_oidc_policies(&groups, &groups, &names(&["consoleAdmin"]), &groups),
             Err(OidcPolicyRejection::Empty)
         );
         assert_eq!(
-            select_oidc_policies(&groups, &[], &names(&["consoleAdmin"]), &[]),
+            select_oidc_policies(&groups, &[], &names(&["consoleAdmin"]), &groups),
             Err(OidcPolicyRejection::Unresolved(groups))
         );
     }
@@ -921,6 +954,33 @@ mod tests {
             .await
             .expect_err("an existing policy must not be dropped because its name is unsupported");
         assert_binding_rejected(error, OIDC_POLICY_UNSUPPORTED_MESSAGE);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_fails_closed_when_an_uncached_group_policy_cannot_be_loaded() {
+        ready_test_iam().await;
+        // An existing (possibly Deny) policy that is not in this node's cache and whose stored
+        // document cannot be loaded must not be mistaken for an unmapped group and dropped.
+        let unreadable_policy = "group-deny-unreadable";
+        let object_store = current_object_store_handle().expect("test object store should be published");
+        ObjectStore::new(object_store)
+            .save_iam_config(
+                "not-a-policy-document",
+                format!("{}{unreadable_policy}/policy.json", *IAM_CONFIG_POLICIES_PREFIX),
+            )
+            .await
+            .expect("store an unreadable policy document");
+        let transaction = group_claim_transaction("binding-unreadable-policy-subject", &["readonly", unreadable_policy]);
+
+        let error = DefaultFederatedSessionBinding
+            .bind(&transaction)
+            .await
+            .expect_err("a group policy whose lookup fails must reject the login");
+        assert!(
+            matches!(error, FederatedSessionBindingError::Internal(_)),
+            "expected an internal lookup failure, got {error:?}"
+        );
     }
 
     #[tokio::test]
