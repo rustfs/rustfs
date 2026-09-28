@@ -35,33 +35,65 @@ pub(crate) struct DefaultFederatedSessionBinding;
 // Legacy receivers reject an empty parsed mapping; current receivers ignore it when the virtual-parent marker is present.
 const OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY: &str = " ";
 
-/// Mapped OIDC policy names split by whether they can be carried in the issued session.
-#[derive(Debug, Default, PartialEq, Eq)]
+const OIDC_POLICY_UNRESOLVED_MESSAGE: &str = "OIDC policy mapping did not resolve to current policies";
+const OIDC_POLICY_UNSUPPORTED_MESSAGE: &str =
+    "OIDC policy mapping includes policies whose names are not allowed in session claims";
+
+/// Mapped OIDC policy names that can be issued, plus the unmapped group names that were skipped.
+#[derive(Debug, PartialEq, Eq)]
 struct OidcPolicySelection {
-    /// Safe names that resolve to a current policy; these become the session `policy` claim.
     usable: Vec<String>,
-    /// Names without a current policy, e.g. directory groups such as `DOMAIN\Domain Users`.
-    missing: Vec<String>,
-    /// Names of existing policies that session claims cannot carry (see `is_safe_claim_policy_name`).
-    unsupported: Vec<String>,
+    ignored: Vec<String>,
 }
 
-/// Identity providers such as Active Directory emit groups that never have a matching policy, so
-/// unmapped names are dropped instead of failing the login; the caller still rejects a login when
-/// no policy is usable. Only resolved names are kept so every name in the signed `policy` claim
-/// continues to resolve for request-time evaluation and site replication receivers.
-fn select_oidc_policies(selected_policy_names: &[String], resolved_policy_mapping: &str) -> OidcPolicySelection {
-    let resolved_policy_names = MappedPolicy::new(resolved_policy_mapping).to_slice();
-    let mut selection = OidcPolicySelection::default();
+#[derive(Debug, PartialEq, Eq)]
+enum OidcPolicyRejection {
+    /// Existing policies that session claims cannot carry. Dropping them could remove an explicit
+    /// Deny and broaden access, so the login fails closed.
+    Unsupported(Vec<String>),
+    /// Names that must resolve (IAM mapping, role policy, dedicated policy claim) but do not.
+    Unresolved(Vec<String>),
+    /// No mapped name resolves to a usable policy.
+    Empty,
+}
+
+/// Only names from `ignorable_policy_names` (groups-claim values) may be skipped, and only when no
+/// policy of that name exists; directory providers emit groups such as `DOMAIN\Domain Users` that
+/// never map. Every other name must resolve to an existing policy with a claim-safe name, so the
+/// signed `policy` claim keeps listing only resolvable names for request-time evaluation and site
+/// replication receivers.
+fn select_oidc_policies(
+    selected_policy_names: &[String],
+    ignorable_policy_names: &[String],
+    resolved_policy_names: &[String],
+    existing_unsafe_policy_names: &[String],
+) -> Result<OidcPolicySelection, OidcPolicyRejection> {
+    let mut usable = Vec::new();
+    let mut ignored = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut unresolved = Vec::new();
     for policy_name in selected_policy_names {
-        let bucket = match (resolved_policy_names.contains(policy_name), is_safe_claim_policy_name(policy_name)) {
-            (true, true) => &mut selection.usable,
-            (true, false) => &mut selection.unsupported,
-            (false, _) => &mut selection.missing,
+        let bucket = if is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name) {
+            &mut usable
+        } else if existing_unsafe_policy_names.contains(policy_name) {
+            &mut unsupported
+        } else if ignorable_policy_names.contains(policy_name) {
+            &mut ignored
+        } else {
+            &mut unresolved
         };
         bucket.push(policy_name.clone());
     }
-    selection
+
+    if !unsupported.is_empty() {
+        Err(OidcPolicyRejection::Unsupported(unsupported))
+    } else if !unresolved.is_empty() {
+        Err(OidcPolicyRejection::Unresolved(unresolved))
+    } else if usable.is_empty() {
+        Err(OidcPolicyRejection::Empty)
+    } else {
+        Ok(OidcPolicySelection { usable, ignored })
+    }
 }
 
 fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap<String, Value> {
@@ -286,39 +318,64 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         let parent_user = authorization.oidc_virtual_parent().ok_or_else(|| {
             FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
         })?;
-        let selected_policy_names = match iam_store
+        let (selected_policy_names, ignorable_policy_names) = match iam_store
             .sts_policy_db_get(&parent_user, &Some(authorization.groups.clone()))
             .await
             .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?
         {
-            mapped_policy_names if !mapped_policy_names.is_empty() => mapped_policy_names,
-            _ => authorization.policies.clone(),
+            mapped_policy_names if !mapped_policy_names.is_empty() => (mapped_policy_names, &[][..]),
+            _ => (authorization.policies.clone(), authorization.group_claim_policies.as_slice()),
         };
-        let selected_policy_mapping = selected_policy_names.join(",");
-        let resolved_policy_mapping = iam_store.current_policies(&selected_policy_mapping).await;
-        let selection = select_oidc_policies(&selected_policy_names, &resolved_policy_mapping);
-        if !selection.unsupported.is_empty() {
-            warn!(
-                provider_id = %authorization.provider_id,
-                parent_user = %parent_user,
-                unsupported_policy_count = selection.unsupported.len(),
-                unsupported_policies = ?selection.unsupported,
-                "OIDC STS ignoring existing policies whose names are not allowed in session claims"
-            );
+        let (safe_policy_names, unsafe_policy_names): (Vec<String>, Vec<String>) = selected_policy_names
+            .iter()
+            .cloned()
+            .partition(|policy_name| is_safe_claim_policy_name(policy_name));
+        // Unsafe names come from the identity provider and must not reach storage-backed policy
+        // loading; the in-memory policy cache is enough to tell an existing policy apart.
+        let mut existing_unsafe_policy_names = Vec::new();
+        for policy_name in unsafe_policy_names {
+            if iam_store.get_policy_doc(&policy_name).await.is_ok() {
+                existing_unsafe_policy_names.push(policy_name);
+            }
         }
-        if !selection.missing.is_empty() {
+        let resolved_policy_mapping = iam_store.current_policies(&safe_policy_names.join(",")).await;
+        let resolved_policy_names = MappedPolicy::new(&resolved_policy_mapping).to_slice();
+        let selection = select_oidc_policies(
+            &selected_policy_names,
+            ignorable_policy_names,
+            &resolved_policy_names,
+            &existing_unsafe_policy_names,
+        )
+        .map_err(|rejection| match rejection {
+            OidcPolicyRejection::Unsupported(policy_names) => {
+                warn!(
+                    provider_id = %authorization.provider_id,
+                    parent_user = %parent_user,
+                    unsupported_policies = ?policy_names,
+                    "OIDC STS rejected existing policies whose names are not allowed in session claims"
+                );
+                FederatedSessionBindingError::InvalidRequest(OIDC_POLICY_UNSUPPORTED_MESSAGE.to_string())
+            }
+            OidcPolicyRejection::Unresolved(policy_names) => {
+                debug!(
+                    provider_id = %authorization.provider_id,
+                    parent_user = %parent_user,
+                    unresolved_policies = ?policy_names,
+                    "OIDC STS rejected required policies without a current policy"
+                );
+                FederatedSessionBindingError::InvalidRequest(OIDC_POLICY_UNRESOLVED_MESSAGE.to_string())
+            }
+            OidcPolicyRejection::Empty => {
+                FederatedSessionBindingError::InvalidRequest(OIDC_POLICY_UNRESOLVED_MESSAGE.to_string())
+            }
+        })?;
+        if !selection.ignored.is_empty() {
             debug!(
                 provider_id = %authorization.provider_id,
                 parent_user = %parent_user,
-                missing_policy_count = selection.missing.len(),
-                missing_policies = ?selection.missing,
-                "OIDC STS ignoring mapped names without a current policy"
+                ignored_group_policies = ?selection.ignored,
+                "OIDC STS ignoring group claim values without a matching policy"
             );
-        }
-        if selection.usable.is_empty() {
-            return Err(FederatedSessionBindingError::InvalidRequest(
-                "OIDC policy mapping did not resolve to current policies".to_string(),
-            ));
         }
         let selected_policy_names = selection.usable;
 
@@ -358,7 +415,7 @@ mod tests {
     use rustfs_kms::KmsServiceManager;
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::{
-        Args,
+        Args, Policy,
         action::{Action, S3Action},
     };
     use serial_test::serial;
@@ -380,6 +437,7 @@ mod tests {
                     ]),
                 },
                 policies: vec!["readwrite".to_string()],
+                group_claim_policies: Vec::new(),
                 groups: vec!["devs".to_string()],
                 roles_claim_key: Some("roles".to_string()),
                 roles: vec!["admin".to_string(), "reader".to_string()],
@@ -715,53 +773,88 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    fn selection(usable: &[&str], ignored: &[&str]) -> Result<OidcPolicySelection, OidcPolicyRejection> {
+        Ok(OidcPolicySelection {
+            usable: names(usable),
+            ignored: names(ignored),
+        })
+    }
+
     #[test]
-    fn oidc_policy_selection_keeps_only_resolved_safe_names() {
+    fn oidc_policy_selection_requires_non_group_names_to_resolve() {
         assert_eq!(
-            select_oidc_policies(&names(&["readonly"]), "readonly"),
-            OidcPolicySelection {
-                usable: names(&["readonly"]),
-                ..Default::default()
-            }
+            select_oidc_policies(&names(&["readonly"]), &[], &names(&["readonly"]), &[]),
+            selection(&["readonly"], &[])
+        );
+        // Role policies, IAM mappings, and dedicated policy claims are not ignorable.
+        assert_eq!(
+            select_oidc_policies(&names(&["readonly", "missing"]), &[], &names(&["readonly"]), &[]),
+            Err(OidcPolicyRejection::Unresolved(names(&["missing"])))
+        );
+        assert_eq!(select_oidc_policies(&[], &[], &[], &[]), Err(OidcPolicyRejection::Empty));
+    }
+
+    #[test]
+    fn oidc_policy_selection_ignores_unmapped_group_claim_values() {
+        let groups = names(&["EXAMPLE\\Domain Users", "readonly", "unmapped-group"]);
+        assert_eq!(
+            select_oidc_policies(&groups, &groups, &names(&["readonly"]), &[]),
+            selection(&["readonly"], &["EXAMPLE\\Domain Users", "unmapped-group"])
         );
         assert_eq!(
-            select_oidc_policies(&names(&["readonly", "missing"]), "readonly"),
-            OidcPolicySelection {
-                usable: names(&["readonly"]),
-                missing: names(&["missing"]),
-                ..Default::default()
-            }
+            select_oidc_policies(&names(&["unmapped-group"]), &names(&["unmapped-group"]), &[], &[]),
+            Err(OidcPolicyRejection::Empty)
         );
-        assert_eq!(select_oidc_policies(&[], ""), OidcPolicySelection::default());
+    }
+
+    #[test]
+    fn oidc_policy_selection_rejects_existing_policies_with_unsupported_names() {
+        // Dropping an existing Deny policy would broaden access, even when it came from a group.
+        let groups = names(&["readwrite", "team+deny"]);
         assert_eq!(
-            select_oidc_policies(&names(&["team+readonly"]), "team+readonly"),
-            OidcPolicySelection {
-                unsupported: names(&["team+readonly"]),
-                ..Default::default()
-            }
+            select_oidc_policies(&groups, &groups, &names(&["readwrite"]), &names(&["team+deny"])),
+            Err(OidcPolicyRejection::Unsupported(names(&["team+deny"])))
         );
     }
 
     #[test]
     fn oidc_policy_selection_never_splits_names_containing_commas() {
-        // Policy mappings are comma-joined before resolution, so a crafted group must not smuggle in another policy.
+        // A crafted group must not smuggle in another policy through the comma-joined mapping.
+        let groups = names(&["team,consoleAdmin"]);
         assert_eq!(
-            select_oidc_policies(&names(&["team,consoleAdmin"]), "consoleAdmin"),
-            OidcPolicySelection {
-                missing: names(&["team,consoleAdmin"]),
-                ..Default::default()
-            }
+            select_oidc_policies(&groups, &groups, &names(&["consoleAdmin"]), &[]),
+            Err(OidcPolicyRejection::Empty)
         );
+        assert_eq!(
+            select_oidc_policies(&groups, &[], &names(&["consoleAdmin"]), &[]),
+            Err(OidcPolicyRejection::Unresolved(groups))
+        );
+    }
+
+    fn group_claim_transaction(subject: &str, groups: &[&str]) -> FederatedSessionTransaction {
+        let mut transaction = transaction();
+        transaction.authorization.claims.sub = subject.to_string();
+        transaction.authorization.groups = names(groups);
+        transaction.authorization.policies = names(groups);
+        transaction.authorization.group_claim_policies = names(groups);
+        transaction
+    }
+
+    fn assert_binding_rejected(error: FederatedSessionBindingError, expected_message: &str) {
+        match error {
+            FederatedSessionBindingError::InvalidRequest(message) => assert_eq!(message, expected_message),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     #[serial]
     async fn binding_ignores_unmapped_directory_groups() {
         let iam = ready_test_iam().await;
-        let mut transaction = transaction();
-        transaction.authorization.claims.sub = "binding-unmapped-groups-subject".to_string();
-        transaction.authorization.groups = names(&["EXAMPLE\\Domain Users", "readonly", "unmapped-group"]);
-        transaction.authorization.policies = transaction.authorization.groups.clone();
+        let transaction = group_claim_transaction(
+            "binding-unmapped-groups-subject",
+            &["EXAMPLE\\Domain Users", "readonly", "unmapped-group"],
+        );
 
         let credentials = DefaultFederatedSessionBinding
             .bind(&transaction)
@@ -800,15 +893,80 @@ mod tests {
     #[serial]
     async fn binding_rejects_login_when_no_group_maps_to_a_policy() {
         ready_test_iam().await;
-        let mut transaction = transaction();
-        transaction.authorization.claims.sub = "binding-no-mapped-groups-subject".to_string();
-        transaction.authorization.groups = names(&["EXAMPLE\\Domain Users", "unmapped-group"]);
-        transaction.authorization.policies = transaction.authorization.groups.clone();
+        let transaction =
+            group_claim_transaction("binding-no-mapped-groups-subject", &["EXAMPLE\\Domain Users", "unmapped-group"]);
 
         let error = DefaultFederatedSessionBinding
             .bind(&transaction)
             .await
             .expect_err("login must fail when no group maps to a policy");
-        assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
+        assert_binding_rejected(error, OIDC_POLICY_UNRESOLVED_MESSAGE);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_rejects_group_mapped_to_existing_policy_with_unsupported_name() {
+        let iam = ready_test_iam().await;
+        let deny_policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("deny policy should parse");
+        iam.set_policy("team+deny", deny_policy)
+            .await
+            .expect("store policy with a claim-unsafe name");
+        let transaction = group_claim_transaction("binding-unsupported-policy-subject", &["readwrite", "team+deny"]);
+
+        let error = DefaultFederatedSessionBinding
+            .bind(&transaction)
+            .await
+            .expect_err("an existing policy must not be dropped because its name is unsupported");
+        assert_binding_rejected(error, OIDC_POLICY_UNSUPPORTED_MESSAGE);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_keeps_role_policy_strict() {
+        ready_test_iam().await;
+        let mut transaction = transaction();
+        transaction.authorization.claims.sub = "binding-strict-role-policy-subject".to_string();
+        transaction.authorization.policies = names(&["readonly", "missing-role-policy"]);
+        transaction.authorization.group_claim_policies = Vec::new();
+
+        let error = DefaultFederatedSessionBinding
+            .bind(&transaction)
+            .await
+            .expect_err("a configured role policy that does not exist must still reject the login");
+        assert_binding_rejected(error, OIDC_POLICY_UNRESOLVED_MESSAGE);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_keeps_explicit_iam_mapping_strict() {
+        let iam = ready_test_iam().await;
+        // Every groups-claim value is ignorable, so only the IAM mapping can cause the rejection.
+        let transaction = group_claim_transaction("binding-strict-iam-mapping-subject", &["readonly", "unmapped-group"]);
+        let parent = transaction
+            .authorization
+            .oidc_virtual_parent()
+            .expect("test authorization should have a virtual parent");
+        let temporary_policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("temporary policy should parse");
+        iam.set_policy("mapped-then-deleted", temporary_policy)
+            .await
+            .expect("store temporary policy");
+        iam.policy_db_set(&parent, UserType::Sts, false, "readonly,mapped-then-deleted")
+            .await
+            .expect("store STS policy mapping");
+        iam.delete_policy("mapped-then-deleted", true)
+            .await
+            .expect("delete mapped policy");
+
+        let error = DefaultFederatedSessionBinding
+            .bind(&transaction)
+            .await
+            .expect_err("an explicit IAM mapping to a missing policy must still reject the login");
+        assert_binding_rejected(error, OIDC_POLICY_UNRESOLVED_MESSAGE);
     }
 }

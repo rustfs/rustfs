@@ -37,6 +37,7 @@ fn string_list_claim(claims: &OidcClaims, claim_name: &str) -> Vec<String> {
 
 pub(super) fn authorization(oidc: &OidcSys, provider_id: String, claims: OidcClaims) -> FederatedAuthorization {
     let (policies, groups) = oidc.map_claims_to_policies(&provider_id, &claims);
+    let group_claim_policies = oidc.group_claim_policy_names(&provider_id, &claims);
     let roles_claim_key = roles_claim_key(oidc, &provider_id);
     let roles = roles_claim_key
         .as_deref()
@@ -53,6 +54,7 @@ pub(super) fn authorization(oidc: &OidcSys, provider_id: String, claims: OidcCla
             raw: claims.raw,
         },
         policies,
+        group_claim_policies,
         groups,
         roles_claim_key,
         roles,
