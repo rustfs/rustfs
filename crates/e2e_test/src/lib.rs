@@ -272,6 +272,8 @@ mod storage_class_capability_test;
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
+#[cfg(test)]
+mod website_hosting_test;
 
 // Multipart control API auth regression tests
 #[cfg(test)]
