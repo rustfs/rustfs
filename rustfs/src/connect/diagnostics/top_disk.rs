@@ -15,8 +15,6 @@
 //! Bounded process disk-I/O window backed by RustFS's existing process sampler.
 
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "linux")]
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
@@ -91,12 +89,15 @@ pub async fn capture_top_disk(
         }
         let mut sampler = rustfs_io_metrics::ProcessSampler::new();
         let before = process_snapshot(&mut sampler)?;
-        let started = Instant::now();
         if !request.wait_window(TOOL_ID, cancel).await? {
             return request.cancelled(TOOL_ID);
         }
         let after = process_snapshot(&mut sampler)?;
-        evaluate_disk_window(request, before, after, elapsed_millis(started.elapsed()))
+        // Report the authorized window, as Top API does. The timer can only
+        // overshoot it, and validate_capture already bounded it by the limit;
+        // measuring the sleep would reject a capture that ran as requested.
+        let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
+        evaluate_disk_window(request, before, after, window_millis)
     }
 }
 
@@ -153,9 +154,4 @@ fn process_snapshot(sampler: &mut rustfs_io_metrics::ProcessSampler) -> Result<D
         write_bytes: snapshot.io_write_bytes,
         io_count,
     })
-}
-
-#[cfg(target_os = "linux")]
-fn elapsed_millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1)
 }
