@@ -24,15 +24,14 @@ Use the automated path when you want the lab to:
 
 ## Networks without Docker Hub access
 
-`capture_via_docker.sh` pulls its two base images from Docker Hub by default. Where that registry is unreachable, point the build at mirrors carrying the same content — quay.io publishes the MinIO releases and public.ecr.aws mirrors the official Python images:
+`capture_via_docker.sh` extracts MinIO from the official GitHub release package after verifying its pinned SHA256. The Dockerfile selects the matching amd64, arm64, or ppc64le package; the MinIO release remains `RELEASE.2025-09-07T16-13-09Z`. Python comes from Docker Hub by default. Where that registry is unreachable, public.ecr.aws mirrors the official Python images:
 
 ```bash
-MINIO_LAB_MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
 MINIO_LAB_PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim \
 ./capture_via_docker.sh
 ```
 
-Pin the MinIO tag to the same release the Dockerfile names; an unpinned `:latest` captures whatever format that day's build writes, which is not what the interop tests were validated against.
+`MINIO_LAB_MINIO_IMAGE` can override the package stage with an accessible image containing the same MinIO release at `/usr/bin/minio`. Pin that image to the same release; an unpinned `:latest` captures whatever format that day's build writes, which is not what the interop tests were validated against.
 
 ## Layout
 

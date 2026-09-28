@@ -311,4 +311,233 @@ mod tests {
 
         env.stop_server();
     }
+
+    async fn collect_prefix_pages(
+        client: &Client,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: i32,
+        start_after: Option<&str>,
+    ) -> (Vec<aws_sdk_s3::types::Object>, Vec<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut token = None;
+        let mut seen_tokens = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let page = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .set_delimiter(delimiter.map(ToOwned::to_owned))
+                .max_keys(max_keys)
+                .set_start_after(start_after.map(ToOwned::to_owned))
+                .set_continuation_token(token)
+                .send()
+                .await
+                .expect("prefix pagination request should succeed");
+            let count = page.contents().len() + page.common_prefixes().len();
+            assert!(count <= usize::try_from(max_keys).expect("positive page size"));
+            assert_eq!(page.key_count(), Some(i32::try_from(count).expect("small page")));
+            objects.extend_from_slice(page.contents());
+            prefixes.extend(
+                page.common_prefixes()
+                    .iter()
+                    .map(|item| item.prefix().expect("CommonPrefix must contain a prefix").to_owned()),
+            );
+            if page.is_truncated() == Some(false) {
+                assert!(page.next_continuation_token().is_none(), "final page must not have a next token");
+                return (objects, prefixes);
+            }
+            assert_eq!(page.is_truncated(), Some(true));
+            let next = page.next_continuation_token().expect("truncated page requires a token");
+            assert!(!next.is_empty());
+            assert!(seen_tokens.insert(next.to_owned()), "continuation token must advance");
+            token = Some(next.to_owned());
+        }
+        panic!("prefix pagination exceeded its finite page budget");
+    }
+
+    fn object_keys(objects: &[aws_sdk_s3::types::Object]) -> Vec<&str> {
+        objects
+            .iter()
+            .map(|object| object.key().expect("listed object must have a key"))
+            .collect()
+    }
+
+    /// Issue #8175: the prefix object must occur once, including across page boundaries.
+    #[tokio::test]
+    async fn test_list_objects_v2_prefix_marker_pagination() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
+        env.start_rustfs_server(vec![]).await.expect("start RustFS");
+        let client = create_s3_client(&env);
+        let bucket = "test-prefix-marker-pagination";
+        create_bucket(&client, bucket).await.expect("create bucket");
+        let mut expected = vec!["content/".to_owned()];
+        expected.extend((0..25).map(|index| format!("content/0123456789abcdef0123456789abcdef/{index:03}")));
+        for key in &expected {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(if key == "content/" { b"" } else { b"x" }))
+                .send()
+                .await
+                .expect("create prefix fixture");
+        }
+        for max_keys in [1000, 1, 2] {
+            let (objects, prefixes) = collect_prefix_pages(&client, bucket, "content/", None, max_keys, None).await;
+            assert_eq!(object_keys(&objects), expected, "all keys must appear once at MaxKeys={max_keys}");
+            assert!(prefixes.is_empty());
+        }
+        let (objects, prefixes) = collect_prefix_pages(&client, bucket, "content/", None, 1, Some("content/")).await;
+        assert_eq!(object_keys(&objects), expected[1..]);
+        assert!(prefixes.is_empty());
+
+        // V1 shares the storage listing path but resumes with a key marker.
+        let mut marker = Some("content/".to_owned());
+        let mut v1_keys = Vec::new();
+        let mut finished = false;
+        for _ in 0..32 {
+            let page = client
+                .list_objects()
+                .bucket(bucket)
+                .prefix("content/")
+                .max_keys(1)
+                .set_marker(marker.clone())
+                .send()
+                .await
+                .expect("list V1 continuation page");
+            assert!(page.contents().len() <= 1);
+            let keys = object_keys(page.contents());
+            v1_keys.extend(keys.iter().map(|key| (*key).to_owned()));
+            if page.is_truncated() == Some(false) {
+                finished = true;
+                break;
+            }
+            assert_eq!(page.is_truncated(), Some(true));
+            let next = page
+                .next_marker()
+                .or_else(|| keys.last().copied())
+                .expect("V1 page must advance");
+            assert!(marker.as_deref().is_none_or(|previous| next > previous));
+            marker = Some(next.to_owned());
+        }
+        assert!(finished, "V1 pagination must terminate");
+        assert_eq!(v1_keys, expected[1..]);
+        env.stop_server();
+    }
+
+    /// An exact prefix match does not establish EOF, including for ordinary keys.
+    #[tokio::test]
+    async fn test_list_objects_v2_exact_prefix_pagination_boundaries() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
+        env.start_rustfs_server(vec![]).await.expect("start RustFS");
+        let client = create_s3_client(&env);
+        let bucket = "test-exact-prefix-boundaries";
+        create_bucket(&client, bucket).await.expect("create bucket");
+        for key in [
+            "a",
+            "ab",
+            "solo/",
+            "marker/",
+            "marker/file",
+            "marker/subdir/",
+            "marker/subdir/file",
+        ] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b""))
+                .send()
+                .await
+                .expect("create boundary fixture");
+        }
+        let (objects, prefixes) = collect_prefix_pages(&client, bucket, "a", None, 1, None).await;
+        assert_eq!(object_keys(&objects), vec!["a", "ab"]);
+        assert!(prefixes.is_empty());
+        let first = client
+            .list_objects()
+            .bucket(bucket)
+            .prefix("a")
+            .max_keys(1)
+            .send()
+            .await
+            .expect("list V1 exact-prefix first page");
+        assert_eq!(object_keys(first.contents()), vec!["a"]);
+        assert_eq!(first.is_truncated(), Some(true));
+        let last = client
+            .list_objects()
+            .bucket(bucket)
+            .prefix("a")
+            .max_keys(1)
+            .marker(first.next_marker().unwrap_or("a"))
+            .send()
+            .await
+            .expect("list V1 exact-prefix final page");
+        assert_eq!(object_keys(last.contents()), vec!["ab"]);
+        assert_eq!(last.is_truncated(), Some(false));
+
+        let solo = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("solo/")
+            .max_keys(1)
+            .send()
+            .await
+            .expect("list isolated marker");
+        assert_eq!(object_keys(solo.contents()), vec!["solo/"]);
+        assert_eq!(solo.is_truncated(), Some(false));
+        assert!(solo.next_continuation_token().is_none());
+        let (objects, prefixes) = collect_prefix_pages(&client, bucket, "marker/", Some("/"), 1, None).await;
+        assert_eq!(object_keys(&objects), vec!["marker/", "marker/file"]);
+        assert_eq!(prefixes, vec!["marker/subdir/"]);
+        env.stop_server();
+    }
+
+    /// A directory marker must retain its own metadata when a same-named object exists.
+    #[tokio::test]
+    async fn test_list_objects_v2_prefix_marker_preserves_metadata() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
+        env.start_rustfs_server(vec![]).await.expect("start RustFS");
+        let client = create_s3_client(&env);
+        let bucket = "test-prefix-marker-metadata";
+        create_bucket(&client, bucket).await.expect("create bucket");
+        let plain = client
+            .put_object()
+            .bucket(bucket)
+            .key("content")
+            .body(ByteStream::from_static(b"plain object body"))
+            .send()
+            .await
+            .expect("put plain object");
+        let directory = client
+            .put_object()
+            .bucket(bucket)
+            .key("content/")
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .expect("put directory marker");
+        assert_ne!(plain.e_tag(), directory.e_tag(), "fixture ETags must distinguish the objects");
+        for max_keys in [1, 1000] {
+            let (objects, prefixes) = collect_prefix_pages(&client, bucket, "content/", None, max_keys, None).await;
+            assert_eq!(object_keys(&objects), vec!["content/"]);
+            assert!(prefixes.is_empty());
+            assert_eq!(objects[0].size(), Some(0));
+            assert_eq!(objects[0].e_tag(), directory.e_tag());
+            let (objects, prefixes) = collect_prefix_pages(&client, bucket, "content", None, max_keys, None).await;
+            assert_eq!(object_keys(&objects), vec!["content", "content/"]);
+            assert!(prefixes.is_empty());
+            assert_eq!(objects[0].size(), Some(17));
+            assert_eq!(objects[0].e_tag(), plain.e_tag());
+            assert_eq!(objects[1].size(), Some(0));
+            assert_eq!(objects[1].e_tag(), directory.e_tag());
+        }
+        env.stop_server();
+    }
 }

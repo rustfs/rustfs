@@ -7194,13 +7194,30 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     assert!(source_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
     assert!(target_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
 
+    let source_deployment_id = source_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == source_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("source site missing from its own replication info")?;
+    let target_deployment_id = target_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("target site missing from its own replication info")?;
     let target_status =
         wait_for_site_replication_status(&target_env, "peer-state=true", |status| status.peer_states.len() == 2).await?;
     let current_updated_at = target_status
         .peer_states
-        .values()
-        .find_map(|state| state.updated_at)
+        .get(&target_deployment_id)
+        .and_then(|state| state.updated_at)
         .ok_or("missing target site replication updated_at")?;
+    let source_updated_at = target_status
+        .peer_states
+        .get(&source_deployment_id)
+        .and_then(|state| state.updated_at)
+        .ok_or("missing source site replication updated_at")?;
 
     let mut stale_peers = BTreeMap::new();
     for peer in target_info.sites {
@@ -7244,16 +7261,23 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     .await?;
     assert!(target_after_fresh.sites.iter().all(|peer| peer.replicate_ilm_expiry));
 
+    // State edits apply only to the addressed site; status reports each site's own state.
     let target_status_after_fresh = wait_for_site_replication_status(&target_env, "peer-state=true", |status| {
         status.peer_states.len() == 2
-            && status.peer_states.values().all(|state| {
-                state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
+            && status.peer_states.get(&target_deployment_id).is_some_and(|state| {
+                state.updated_at == Some(fresh_updated_at)
+                    && state.peers.len() == 2
+                    && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
             })
     })
     .await?;
-    assert!(target_status_after_fresh.peer_states.values().all(|state| {
-        state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
-    }));
+    let source_state_after_fresh = target_status_after_fresh
+        .peer_states
+        .get(&source_deployment_id)
+        .ok_or("missing source site replication state after target edit")?;
+    assert_eq!(source_state_after_fresh.updated_at, Some(source_updated_at));
+    assert_eq!(source_state_after_fresh.peers.len(), 2);
+    assert!(source_state_after_fresh.peers.values().all(|peer| !peer.replicate_ilm_expiry));
 
     let source_after_fresh = site_replication_info(&source_env).await?;
     assert!(source_after_fresh.sites.iter().all(|peer| !peer.replicate_ilm_expiry));

@@ -1161,7 +1161,8 @@ async fn execute_top_disk_job(
             },
         },
         limits: TopCaptureLimits {
-            max_duration_millis: envelope.parameters.duration_millis,
+            // Measured sampling time includes scheduling overhead within the signed job timeout.
+            max_duration_millis: envelope.limits.timeout_seconds * 1_000,
             max_working_memory_bytes: envelope.limits.max_memory_bytes,
             max_cpu_millis: envelope.limits.max_cpu_millis,
             ..TopCaptureLimits::default()
@@ -1796,7 +1797,7 @@ mod tests {
     async fn top_disk_job_collects_service_io_and_preserves_signed_nonce() {
         let now = Utc::now();
         let mut top = disk_envelope();
-        top.parameters.duration_millis = 200;
+        top.parameters.duration_millis = 1_000;
         top.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         top.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         top.parameters.consent_expires_at =
@@ -1830,6 +1831,10 @@ mod tests {
             let result: serde_json::Value = serde_json::from_reader(archive.by_name("result.json").unwrap()).unwrap();
             assert_eq!(result["toolId"], "top.disk");
             assert_eq!(result["data"]["resourceAlias"], "resource-1");
+            let duration_millis = result["durationMillis"].as_u64().unwrap();
+            assert!(duration_millis >= top.parameters.duration_millis);
+            assert!(duration_millis <= top.limits.timeout_seconds * 1_000);
+            assert_eq!(result["data"]["windowMillis"], duration_millis);
             assert!(result["data"]["writeBytes"].as_u64().unwrap() >= 65_536);
             assert!(result["data"]["ioCount"].as_u64().unwrap() > 0);
             use std::io::Read as _;

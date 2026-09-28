@@ -35,6 +35,7 @@ use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
+use crate::storage::validate_website_configuration;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
@@ -1512,6 +1513,8 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
+        validate_website_configuration(&req.input.website_configuration)?;
+
         let website_config = serialize(&req.input.website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
@@ -2038,11 +2041,47 @@ mod tests {
         FS, SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
     };
     use crate::storage::access::ReqInfo;
+    use crate::storage::validate_website_configuration;
     use http::Method;
     use http::StatusCode;
-    use s3s::dto::{DeleteBucketReplicationInput, PutBucketReplicationInput, ReplicationConfiguration};
+    use s3s::dto::{
+        Condition, DeleteBucketReplicationInput, IndexDocument, PutBucketReplicationInput, Redirect, ReplicationConfiguration,
+        RoutingRule, WebsiteConfiguration,
+    };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn website_config_rejects_missing_index_and_invalid_redirect_rules() {
+        assert!(validate_website_configuration(&WebsiteConfiguration::default()).is_err());
+        let config = WebsiteConfiguration {
+            index_document: Some(IndexDocument {
+                suffix: "index.html".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_website_configuration(&config).is_ok());
+        let mut bad = config;
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition::default()),
+            redirect: Redirect {
+                host_name: Some("other.test".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition {
+                key_prefix_equals: Some("old/".to_owned()),
+                ..Default::default()
+            }),
+            redirect: Redirect {
+                protocol: Some("ftp".to_owned().into()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+    }
 
     fn replication_config_edit_request<T>(input: T, is_owner: bool) -> S3Request<T> {
         let mut req = S3Request {

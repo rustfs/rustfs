@@ -69,10 +69,9 @@ env:
 jobs:
   minio-source:
     name: MinIO source (read-through, list-through, backfill)
-    # Skip on forks: needs this repository's runners and is not a contributor
-    # gate.
+    # Keep this scheduled interoperability lane scoped to the upstream repo.
     if: github.repository == 'rustfs/rustfs'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       NO_PROXY: 127.0.0.1,localhost
@@ -108,11 +107,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/odm-interop/minio
+          docker build -t rustfs-odm-interop-minio \
+            -f crates/rio-v2/tests/minio_fixture_lab/Dockerfile \
+            crates/rio-v2/tests/minio_fixture_lab
           docker run -d --name rustfs-odm-interop-minio \
+            --entrypoint /usr/local/bin/minio \
             -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
             -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
             -p 9100:9000 \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            rustfs-odm-interop-minio server /data
           for _ in $(seq 1 120); do
             curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1 && break
             sleep 1
@@ -300,7 +303,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

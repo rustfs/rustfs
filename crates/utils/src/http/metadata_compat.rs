@@ -70,6 +70,9 @@ pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
 pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
+/// Upload ID of the multipart completion that published this object version.
+/// A retried CompleteMultipartUpload matches it after the staging directory is gone.
+pub const SUFFIX_MULTIPART_UPLOAD_ID: &str = "multipart-upload-id";
 pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
 /// Active rebalance run id mirrored onto `rebalance.bin` object metadata.
 pub const SUFFIX_REBALANCE_RUN_ID: &str = "rebalance-run-id";

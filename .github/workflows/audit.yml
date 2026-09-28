@@ -204,7 +204,7 @@ jobs:
     # open the Actions tab. Same ci-8 mechanism coverage.yml and
     # e2e-replication-nightly.yml already use.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
