@@ -1,42 +1,47 @@
 {{- if .Values.gatewayApi.enabled }}
+{{- $routes := list (dict "name" "route" "hostname" .Values.gatewayApi.hostname "port" .Values.service.console.port) }}
+{{- with .Values.gatewayApi.endpointHostname }}
+{{- if eq . $.Values.gatewayApi.hostname }}
+{{- fail "gatewayApi.endpointHostname must differ from gatewayApi.hostname" }}
+{{- end }}
+{{- $routes = append $routes (dict "name" "endpoint-route" "hostname" . "port" $.Values.service.endpoint.port) }}
+{{- end }}
+{{- range $routes }}
+{{- if eq .name "endpoint-route" }}
+---
+{{- end }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: {{ include "rustfs.fullname" . }}-route
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "rustfs.fullname" $ }}-{{ .name }}
+  namespace: {{ $.Release.Namespace }}
   annotations:
-    {{- if eq .Values.gatewayApi.gatewayClass "contour" }}
+    {{- if and (eq $.Values.gatewayApi.gatewayClass "contour") (eq .name "route") }}
     projectcontour.io/upstream-hash-policy: "cookie"
     {{- end }}
 spec:
   parentRefs:
-    {{- if .Values.gatewayApi.existingGateway.name }}
-    - name: {{ .Values.gatewayApi.existingGateway.name }}
-      {{- if .Values.gatewayApi.existingGateway.namespace }}
-      namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
+    {{- if $.Values.gatewayApi.existingGateway.name }}
+    - name: {{ $.Values.gatewayApi.existingGateway.name }}
+      {{- if $.Values.gatewayApi.existingGateway.namespace }}
+      namespace: {{ $.Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
-      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
+      sectionName: {{ $.Values.gatewayApi.listeners.https.name | default "websecure"}}
     {{- else }}
     - name: {{ include "rustfs.fullname" $ }}-gateway
-      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
+      sectionName: {{ $.Values.gatewayApi.listeners.https.name | default "websecure"}}
     {{- end }}
   hostnames:
-    - {{ .Values.gatewayApi.hostname }}
+    - {{ .hostname | quote }}
   rules:
     - matches:
         - path:
             type: PathPrefix
             value: /
       backendRefs:
-        {{- if eq .Values.gatewayApi.gatewayClass "traefik" }}
-        - name: {{ include "rustfs.fullname" . }}-sticky-svc
-          port: {{ .Values.service.console.port }}
-          kind: TraefikService
-          group: traefik.io
-        {{- else }}
         - name: {{ include "rustfs.fullname" $ }}-svc
-          port: {{ .Values.service.console.port }}
-        {{- end }}
+          port: {{ .port }}
+{{- end }}
 {{- if .Values.gatewayApi.httpToHttpsRedirect }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
