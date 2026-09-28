@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "linux")]
 use zip::ZipArchive;
 
-static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn request() -> ProfileCaptureRequest {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64;
@@ -88,7 +88,7 @@ async fn tokio_thread_scope_remains_explicitly_unsupported() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn native_thread_scope_exports_bounded_redacted_state_counts() {
-    let _capture = CAPTURE_LOCK.lock().unwrap();
+    let _capture = CAPTURE_LOCK.lock().await;
     let key = connect::DeviceIdentity::generate();
     let result = capture_thread_profile(&request(), ThreadProfileScope::NativeThreads, &CancellationToken::new())
         .expect("native thread result");
@@ -126,7 +126,7 @@ async fn native_thread_scope_exports_bounded_redacted_state_counts() {
 #[cfg(target_os = "linux")]
 #[test]
 fn native_thread_scope_honors_the_monotonic_deadline() {
-    let _capture = CAPTURE_LOCK.lock().unwrap();
+    let _capture = CAPTURE_LOCK.blocking_lock();
     let mut expired = request();
     expired.duration = Duration::from_nanos(1);
     expired.sample_period = Duration::from_nanos(1);
@@ -166,7 +166,7 @@ fn thread_profile_rejects_wrong_negotiation_and_cancellation() {
 #[cfg(target_has_atomic = "64")]
 #[test]
 fn service_runtime_profile_observes_the_supplied_two_worker_runtime() {
-    let _capture = CAPTURE_LOCK.lock().unwrap();
+    let _capture = CAPTURE_LOCK.blocking_lock();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
