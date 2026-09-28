@@ -2061,7 +2061,7 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_website_configuration(&config).is_ok());
-        let mut bad = config.clone();
+        let mut bad = config;
         bad.routing_rules = Some(vec![RoutingRule {
             condition: Some(Condition::default()),
             redirect: Redirect {
