@@ -1796,7 +1796,7 @@ mod tests {
     async fn top_disk_job_collects_service_io_and_preserves_signed_nonce() {
         let now = Utc::now();
         let mut top = disk_envelope();
-        top.parameters.duration_millis = 200;
+        top.parameters.duration_millis = 1_000;
         top.create_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         top.expire_time = (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         top.parameters.consent_expires_at =

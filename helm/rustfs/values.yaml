@@ -381,7 +381,8 @@ gatewayApi:
       port: 443
       # Service port that terminates TLS on the backend; defaults to the console port.
       backendPort: null
-  hostname: example.rustfs.com
+  hostname: example.rustfs.com # Console hostname.
+  endpointHostname: "" # Optional separate hostname for the S3 endpoint.
   httpToHttpsRedirect: true
   existingGateway:
     name: ""
