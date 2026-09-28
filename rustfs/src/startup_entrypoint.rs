@@ -1480,7 +1480,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                 enabled_build_features(),
             ),
         };
-        let export = {
+        {
             let capture = async {
                 match options.tool {
                     ConnectProfileTool::Cpu => {
@@ -1517,8 +1517,7 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
                 }
                 result = capture.as_mut() => result?,
             }
-        };
-        export
+        }
     };
     let tool = export.tool;
     let outcome = export.outcome;
