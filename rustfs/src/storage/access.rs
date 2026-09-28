@@ -125,7 +125,7 @@ pub(crate) fn recursive_force_delete_has_authenticated_caller(
 }
 
 fn invalid_force_delete_header() -> S3Error {
-    s3_error!(InvalidRequest, "Invalid force-delete header value")
+    S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")
 }
 
 #[derive(Clone, Debug)]
@@ -2272,11 +2272,11 @@ impl S3Access for FS {
         // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
         // including the value `false`. Only a parsed `true` later skips the
         // emptiness check. `s3:*` does not grant this action.
-        match force_delete_header(&req.headers).map_err(|_| invalid_force_delete_header())? {
-            Some(_) => {
-                authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
-            }
-            None => {}
+        if force_delete_header(&req.headers)
+            .map_err(|_| invalid_force_delete_header())?
+            .is_some()
+        {
+            authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
         Ok(())
     }

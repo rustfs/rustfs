@@ -1456,7 +1456,7 @@ impl DefaultBucketUsecase {
 
         let force = match force_delete_header(&req.headers) {
             Ok(value) => value.unwrap_or(false),
-            Err(_) => return Err(s3_error!(InvalidRequest, "Invalid force-delete header value")),
+            Err(_) => return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")),
         };
 
         if force {

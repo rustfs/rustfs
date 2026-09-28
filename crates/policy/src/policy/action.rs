@@ -78,6 +78,22 @@ impl ActionSet {
 
         false
     }
+
+    /// Whether a statement with this `Action` list and `not_actions` as its
+    /// `NotAction` list covers `action`.
+    ///
+    /// `NotAction` always uses plain wildcard matching, so `NotAction: "s3:*"`
+    /// still excludes force-delete. An Allow grants force-delete only when its
+    /// `Action` list names it: an Allow built from `NotAction` alone never does.
+    pub fn statement_covers(&self, not_actions: &ActionSet, action: &Action, deny: bool) -> bool {
+        if not_actions.is_match_for_effect(action, true) {
+            return false;
+        }
+        if self.is_empty() {
+            return deny || !action_requires_explicit_grant(action);
+        }
+        self.is_match_for_effect(action, deny)
+    }
 }
 
 impl Deref for ActionSet {

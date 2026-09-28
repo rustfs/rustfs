@@ -3405,6 +3405,70 @@ mod test {
         assert!(!allows(&wildcard_deny, "s3:DeleteObject").await);
     }
 
+    #[tokio::test]
+    async fn not_action_allow_does_not_grant_force_delete() {
+        for not_action in ["s3:*", "s3:GetObject"] {
+            let iam = Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("NotAction policy parses");
+            let bucket: BucketPolicy = serde_json::from_str(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["*"]}},"NotAction":["{not_action}"],"Resource":["arn:aws:s3:::bucket","arn:aws:s3:::bucket/*"]}}]}}"#
+            ))
+            .expect("NotAction bucket policy parses");
+
+            for action in ["s3:ForceDeleteObject", "s3:ForceDeleteBucket"] {
+                assert!(!allows(&iam, action).await, "IAM NotAction {not_action} must not grant {action}");
+                assert!(
+                    !bucket_allows(&bucket, action).await,
+                    "bucket NotAction {not_action} must not grant {action}"
+                );
+            }
+        }
+
+        // NotAction still grants ordinary actions it does not exclude.
+        let iam = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3:GetObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("NotAction policy parses");
+        assert!(allows(&iam, "s3:DeleteObject").await);
+
+        // Deny + NotAction keeps plain wildcard semantics: s3:* excludes
+        // force-delete, a narrower exclusion still denies it.
+        let deny_all_but = |not_action: &str| {
+            Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[
+                        {{"Effect":"Allow","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]}},
+                        {{"Effect":"Deny","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}
+                    ]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("deny NotAction policy parses")
+        };
+        assert!(allows(&deny_all_but("s3:*"), "s3:ForceDeleteObject").await);
+        assert!(!allows(&deny_all_but("s3:GetObject"), "s3:ForceDeleteObject").await);
+    }
+
+    async fn bucket_allows(policy: &BucketPolicy, action: &str) -> bool {
+        let conditions = HashMap::new();
+        policy
+            .is_allowed(&BucketPolicyArgs {
+                account: "user",
+                groups: &None,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "folder/a",
+            })
+            .await
+    }
+
     async fn allows(policy: &Policy, action: &str) -> bool {
         let conditions = HashMap::new();
         let claims = HashMap::new();
