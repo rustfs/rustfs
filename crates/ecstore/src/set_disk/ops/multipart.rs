@@ -3108,7 +3108,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // on the object is what lets a retried CompleteMultipartUpload return this
         // version instead of NoSuchUpload. insert_str writes both internal prefixes;
         // a later conflicting pair fails closed in the replay matcher.
-        if !upload_id.is_empty() {
+        // Internal migration must preserve the source completion identity rather
+        // than replace it (or invent one) with the temporary transfer upload id.
+        if !opts.data_movement && !upload_id.is_empty() {
             insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID, upload_id.to_owned());
         }
 
@@ -5115,6 +5117,10 @@ mod tests {
             )
             .await
             .expect("completed data movement object should be readable");
+        assert!(
+            !rustfs_utils::http::contains_key_str(&completed.user_defined, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID),
+            "migration of a source without a completion identity must not invent one"
+        );
         assert!(!rustfs_utils::http::contains_key_str(
             &completed.user_defined,
             rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD

@@ -2678,7 +2678,7 @@ async fn read_repair_object_heal_sets_read_repair_option() {
     assert!(!opts[0].no_lock);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
     let storage = Arc::new(MockStorage {
         block_heal_object: Mutex::new(true),
@@ -2687,31 +2687,23 @@ async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
     let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     request.source = HealRequestSource::ReadRepair;
     request.options.timeout = Some(Duration::from_millis(1));
-    let task = Arc::new(HealTask::from_request(request, storage.clone()));
-    let execution = tokio::spawn({
-        let task = task.clone();
-        async move { task.execute().await }
-    });
+    let task = HealTask::from_request(request, storage.clone());
+    // Isolate the storage boundary from preflight's separately enforced budget.
+    let execution = task.heal_object("bucket", "object", None);
+    tokio::pin!(execution);
+    assert!(futures::poll!(&mut execution).is_pending());
+    assert!(storage.object_heal_opts.lock().expect("heal options")[0].read_repair);
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if !storage.object_heal_opts.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("read-repair object heal should start");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!execution.is_finished(), "read repair must not be failed by the flat task timeout");
-
-    execution.abort();
-    assert!(execution.await.is_err(), "aborted mock execution should not join successfully");
-    assert!(storage.object_heal_opts.lock().unwrap()[0].read_repair);
+    *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_millis(2));
+    assert!(matches!(task.remaining_timeout().await, Err(Error::TaskTimeout)));
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(
+        futures::poll!(&mut execution).is_pending(),
+        "read repair must remain in storage after the flat task budget expires"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_read_repair_object_heal_still_uses_flat_timeout() {
     let storage = Arc::new(MockStorage {
         block_heal_object: Mutex::new(true),
@@ -2719,13 +2711,26 @@ async fn non_read_repair_object_heal_still_uses_flat_timeout() {
     });
     let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
     request.options.timeout = Some(Duration::from_millis(1));
-    let task = HealTask::from_request(request, storage);
+    let task = HealTask::from_request(request, storage.clone());
+    let execution = task.heal_object("bucket", "object", None);
+    tokio::pin!(execution);
+    assert!(futures::poll!(&mut execution).is_pending());
+    assert!(!storage.object_heal_opts.lock().expect("heal options")[0].read_repair);
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(matches!(futures::poll!(&mut execution), std::task::Poll::Ready(Err(Error::TaskTimeout))));
+}
 
-    let result = tokio::time::timeout(Duration::from_secs(1), task.execute())
-        .await
-        .expect("flat timeout should finish the task");
+#[tokio::test]
+async fn read_repair_preflight_still_rejects_an_expired_task_budget() {
+    let storage = Arc::new(MockStorage::default());
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::ReadRepair;
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = HealTask::from_request(request, storage.clone());
+    *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_millis(2));
 
-    assert!(matches!(result, Err(Error::TaskTimeout)));
+    assert!(matches!(task.heal_object("bucket", "object", None).await, Err(Error::TaskTimeout)));
+    assert!(storage.object_heal_opts.lock().expect("heal options").is_empty());
 }
 
 async fn make_resume_disk(temp: &TempDir) -> DiskStore {

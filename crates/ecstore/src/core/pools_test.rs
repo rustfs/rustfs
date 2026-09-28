@@ -2321,6 +2321,18 @@ mod decommission_lock_order_tests {
             .expect("the multipart target must publish before capacity progress save");
         assert!(published.is_multipart(), "published target must retain multipart identity");
         assert_eq!(published.version_id.map(|version| version.to_string()), Some(source_version.clone()));
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert_eq!(
+                published
+                    .user_defined
+                    .get(&format!("{prefix}{}", rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)),
+                Some(&source_upload.upload_id),
+                "migration must preserve the source completion identity under both internal prefixes"
+            );
+        }
         let mut published_reader = lossy_store.pools[2]
             .get_object_reader(
                 &bucket,
