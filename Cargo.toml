@@ -160,7 +160,7 @@ pulsar = { default-features = false, version = "6.9.0" }
 lapin = { default-features = false, version = "4.12.0" }
 hyper = { version = "1.11.1" }
 hyper-rustls = { default-features = false, version = "0.27.10" }
-hyper-util = { version = "0.1.20" }
+hyper-util = { version = "0.1.21" }
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
@@ -172,7 +172,7 @@ socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.1" }
 tokio-rustls = { default-features = false, version = "0.26.5" }
 tokio-stream = { version = "0.1.19" }
-tokio-test = "0.4.5"
+tokio-test = "0.4.6"
 tokio-util = { version = "0.7.19" }
 tonic = { version = "0.14.6" }
 tonic-prost = { version = "0.14.6" }
@@ -245,13 +245,13 @@ atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.12.0" }
 aws-credential-types = { version = "1.3.0" }
-aws-sdk-kms = { default-features = false, version = "1.121.0" }
-aws-sdk-s3 = { default-features = false, version = "1.149.0" }
-aws-sdk-sts = { default-features = false, version = "1.117.0" }
+aws-sdk-kms = { default-features = false, version = "1.122.0" }
+aws-sdk-s3 = { default-features = false, version = "1.150.0" }
+aws-sdk-sts = { default-features = false, version = "1.118.0" }
 aws-smithy-async = { version = "1.3.0" }
 aws-smithy-http-client = { default-features = false, version = "1.4.2" }
-aws-smithy-runtime-api = { version = "1.17.0" }
-aws-smithy-types = { version = "1.8.0" }
+aws-smithy-runtime-api = { version = "1.18.0" }
+aws-smithy-types = { version = "1.8.1" }
 base64-simd = "0.8.0"
 brotli = "9.0.0"
 clap = { version = "4.6.7" }
@@ -269,8 +269,8 @@ enumset = "1.1.14"
 faster-hex = "1.0.0"
 flate2 = "1.1.10"
 glob = "0.3.4"
-google-cloud-storage = "1.18.0"
-google-cloud-auth = "1.16.0"
+google-cloud-storage = "1.19.0"
+google-cloud-auth = "1.17.0"
 hashbrown = { version = "0.17.1" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
@@ -309,7 +309,7 @@ rustfs-erasure-codec = { version = "9.0.0" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
-redis = { version = "1.7.0" }
+redis = { version = "1.7.1" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.5" }
 rust-embed = { version = "8.12.0" }
@@ -318,8 +318,8 @@ s3s = { version = "0.17.0", features = ["minio"] }
 s3s-sigv4 = "0.17.0"
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
-siphasher = "1.0.3"
-smallvec = { version = "1.16.1" }
+siphasher = "1.0.4"
+smallvec = { version = "1.16.2" }
 compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.3.0" }
@@ -363,9 +363,9 @@ opentelemetry-stdout = { version = "0.33.0" }
 pyroscope = { version = "2.1.1" }
 
 # FTP and SFTP
-libunftp = { version = "0.23.0" }
+libunftp = { version = "0.23.1" }
 unftp-core = "0.1.0"
-suppaftp = { version = "12.0.1" }
+suppaftp = { version = "12.1.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 russh = { version = "0.63.3" }
 russh-sftp = "3.0.0"
@@ -376,7 +376,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.6" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.26.0", default-features = false }
+hotpath = { version = "0.26.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
