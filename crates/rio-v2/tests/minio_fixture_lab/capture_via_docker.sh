@@ -34,9 +34,9 @@ if [ "${cases[0]}" != "all" ]; then
   done
 fi
 
-# Base images are overridable so a network without Docker Hub access can point
-# them at a mirror (see the Dockerfile header). Unset by default, which keeps the
-# Dockerfile's Docker Hub defaults for CI.
+# The Dockerfile defaults to a checksum-pinned MinIO release package and a
+# Python base image. Overrides can select accessible images carrying the same
+# content (see the Dockerfile header).
 build_args=()
 if [ -n "${MINIO_LAB_MINIO_IMAGE:-}" ]; then
   build_args+=(--build-arg "MINIO_IMAGE=${MINIO_LAB_MINIO_IMAGE}")
