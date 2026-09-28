@@ -428,6 +428,14 @@ impl DiskError {
         }
     }
 
+    /// Whether an internode RPC was cancelled, without classifying the peer as offline.
+    pub fn io_error_is_rpc_cancelled(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RpcStatusError>())
+            .is_some_and(|error| error.status().code() == tonic::Code::Cancelled)
+    }
+
     pub fn internode_http_error_kind(&self) -> Option<InternodeHttpErrorKind> {
         match self {
             DiskError::Io(io_error) => io_error

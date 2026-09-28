@@ -2254,6 +2254,8 @@ mod resume_loop_tests {
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
+        RpcCancelled(u32),
+        Cancelled,
         Timeout,
     }
 
@@ -2456,14 +2458,27 @@ mod resume_loop_tests {
                 .unwrap()
                 .push((object.to_string(), version_id.map(str::to_string)));
             let key = compose_key(object, version_id);
-            let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
+            let outcome = {
+                let mut outcomes = self.outcomes.lock().unwrap();
+                let outcome = outcomes.get(&key).cloned().unwrap_or(HealOutcome::Ok);
+                if let HealOutcome::RpcCancelled(remaining) = &outcome {
+                    outcomes.insert(key.clone(), HealOutcome::RpcCancelled(remaining.saturating_sub(1)));
+                }
+                outcome
+            };
             match outcome {
-                HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
+                HealOutcome::Ok | HealOutcome::RpcCancelled(0) => {
+                    Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None))
+                }
                 HealOutcome::FileNotFound => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileNotFound)))),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
                 HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
+                HealOutcome::RpcCancelled(_) => {
+                    Err(Error::Storage(EcstoreError::from(tonic::Status::cancelled("injected peer cancellation"))))
+                }
+                HealOutcome::Cancelled => Err(Error::TaskCancelled),
                 HealOutcome::Timeout => Err(Error::TaskTimeout),
             }
         }
