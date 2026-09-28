@@ -1144,6 +1144,42 @@ mod tests {
     use tokio::io::{AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::oneshot;
 
+    #[test]
+    fn bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides() {
+        const CHILD_CASE: &str = "RUSTFS_TEST_BYTESMUT_INGEST_SELECTOR_CASE";
+        if let Ok(case) = std::env::var(CHILD_CASE) {
+            let expected = match case.as_str() {
+                "default" | "true" => true,
+                "false" => false,
+                _ => panic!("unexpected ingest selector case: {case}"),
+            };
+            assert_eq!(use_bytesmut_ingest(), expected, "ingest selector case: {case}");
+            return;
+        }
+
+        // Each selector probe needs a fresh OnceLock and an isolated environment.
+        for case in ["default", "true", "false"] {
+            let mut child = std::process::Command::new(std::env::current_exe().expect("ingest selector test executable"));
+            child.args([
+                "--exact",
+                "erasure::coding::encode::tests::bytesmut_ingest_selector_defaults_to_owned_and_honors_overrides",
+                "--nocapture",
+            ]);
+            child.env(CHILD_CASE, case);
+            child.env_remove(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST);
+            if case != "default" {
+                child.env(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, case);
+            }
+            let output = child.output().expect("start isolated ingest selector test");
+            assert!(
+                output.status.success(),
+                "ingest selector case {case} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
     struct PendingReader {
         entered: Option<oneshot::Sender<()>>,
         dropped: Option<oneshot::Sender<()>>,
