@@ -76,7 +76,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.22.2
+          node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
 
