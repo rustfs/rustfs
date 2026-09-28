@@ -338,6 +338,7 @@ fn pre_health_heartbeat_capabilities(job_capable: bool) -> Vec<String> {
         "heartbeat",
         "diagnostics.policy.v1",
         "inventory.environment@1",
+        "health.check.service@1",
         "performance.client@1",
         "performance.drive@1",
         "performance.network@1",
