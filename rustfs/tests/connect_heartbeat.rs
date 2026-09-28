@@ -536,6 +536,7 @@ async fn sends_only_l0_fields_and_accepts_additive_response_fields() {
             "heartbeat",
             "diagnostics.policy.v1",
             "inventory.environment@1",
+            "health.check.service@1",
             "performance.client@1",
             "performance.drive@1",
             "performance.network@1",
@@ -648,6 +649,7 @@ fn pre_service_memory_capabilities(job_capable: bool) -> Vec<&'static str> {
     if job_capable {
         capabilities.push("jobs");
     }
+    capabilities.push("health.check.service@1");
     // Freeze the preceding release, independently of today's advertisement.
     capabilities.extend([
         "performance.client@1",

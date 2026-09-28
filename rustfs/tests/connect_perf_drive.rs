@@ -85,7 +85,17 @@ async fn real_local_write_read_is_measured_and_scratch_is_removed() {
         .await
         .expect("real drive benchmark");
 
-    assert_eq!(measurement.result.outcome(), DriveOutcome::Succeeded);
+    assert_eq!(
+        measurement.result.outcome(),
+        DriveOutcome::Succeeded,
+        "drive measurement: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        measurement.result.reason_code(),
+        measurement.target.reason_code,
+        measurement.target.duration_millis,
+        measurement.target.read_bytes,
+        measurement.target.write_bytes,
+        measurement.target.io_count,
+    );
     assert_eq!(measurement.result.reason_code(), DriveReasonCode::Complete);
     let data = measurement.result.data().expect("aggregate data");
     assert_eq!(data.read_bytes, 32_768);
@@ -335,6 +345,17 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("drive measurement");
+    assert_eq!(
+        measurement.result.outcome(),
+        DriveOutcome::Succeeded,
+        "drive measurement before signed export: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        measurement.result.reason_code(),
+        measurement.target.reason_code,
+        measurement.target.duration_millis,
+        measurement.target.read_bytes,
+        measurement.target.write_bytes,
+        measurement.target.io_count,
+    );
     let identity = connect::DeviceIdentity::generate();
     let export = sign_drive_export(&request, &measurement, &identity, &CancellationToken::new()).expect("signed export");
     assert!(export.result_json.len() <= perf_drive::MAX_RESULT_BYTES);

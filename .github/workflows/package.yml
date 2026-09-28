@@ -77,7 +77,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch != 'main')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
@@ -229,7 +229,7 @@ jobs:
   package:
     name: Package (${{ matrix.arch }}-${{ matrix.libc }})
     needs: resolve
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     strategy:
       fail-fast: false

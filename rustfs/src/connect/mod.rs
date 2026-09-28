@@ -87,6 +87,13 @@ pub use diagnostics::{
     DiagnosticJobParameters, DiagnosticJobTarget, TrustedDiagnosticJobSigner, VerifiedDiagnosticJob, execute_diagnostic_job,
 };
 pub use diagnostics::{
+    HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome,
+    HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
+    MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
+    sign_health_export,
+};
+pub use diagnostics::{
     LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,
     MAX_NETWORK_DURATION, MAX_NETWORK_ENVELOPE_BYTES, MAX_NETWORK_OPERATIONS, MAX_NETWORK_PEERS, MAX_NETWORK_RESULT_BYTES,
     MAX_NETWORK_TRAFFIC_BYTES, NETWORK_CAPABILITY, NETWORK_SCHEMA_VERSION, NETWORK_TOOL_ID, NetworkCoverage,
@@ -122,7 +129,8 @@ pub use diagnostics::{
     evaluate_network_window, save_signed_top_export, sign_top_export,
 };
 pub(crate) use diagnostics::{
-    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_trace_capture, spawn_local_trace_capture_runtime,
+    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_runtime_profile, request_local_top_disk,
+    request_local_trace_capture, spawn_local_trace_capture_runtime,
 };
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError, EnvironmentExportRequest,
