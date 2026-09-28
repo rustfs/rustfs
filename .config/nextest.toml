@@ -107,6 +107,16 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the replacement bucket metadata heal test. It builds a real-disk
+# hermetic erasure set, writes bucket metadata, then asserts byte-identical
+# xl.meta readback after a rejected delayed repair. Under parallel load,
+# concurrent ecstore tests mutate the process-wide disk registry and alter
+# the serialized timestamp/disk-identity fields, flipping the assertion.
+# Preventive serialization only, no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the metadata-cache generation-retirement pair. Both carry
 # #[serial(metadata_cache_invalidation_probe)] — a no-op across nextest's
 # process boundary — and assert get_object_metadata_cache generation
@@ -325,6 +335,11 @@ test-group = 'ecstore-serial-flaky'
 # retries, just serialized real-disk heal IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the replacement bucket metadata heal test under the ci profile too.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the metadata-cache generation-retirement pair under the ci
