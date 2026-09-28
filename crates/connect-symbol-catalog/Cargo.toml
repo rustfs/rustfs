@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 hex-simd.workspace = true
-object = { version = "=0.40.0", default-features = false, features = ["read", "std", "elf"] }
+object = { workspace = true, features = ["read", "std", "elf"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -16,7 +16,7 @@ sha2.workspace = true
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"] }
 
 [dev-dependencies]
-object = { version = "=0.40.0", default-features = false, features = ["write", "elf"] }
+object = { workspace = true, features = ["write", "elf"] }
 
 [lints]
 workspace = true

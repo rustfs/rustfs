@@ -293,6 +293,7 @@ moka = { version = "0.12.16" }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.13.0"
+object = { version = "=0.40.0", default-features = false }
 parking_lot = "0.12.5"
 path-absolutize = "4.0.1"
 percent-encoding = "2.3.2"
