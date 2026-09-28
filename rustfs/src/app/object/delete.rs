@@ -619,16 +619,22 @@ impl DefaultObjectUsecase {
 
         // Phase 1 (serial): derive storage options from the request-scoped
         // configuration after every candidate has passed authorization.
+        // DeleteObjects names each key explicitly. The force-delete header is a
+        // DeleteObject/DeleteBucket extension and must not change this batch,
+        // including by rejecting a non-boolean value.
+        let mut batch_headers = req.headers.clone();
+        batch_headers.remove("x-rustfs-force-delete");
+        batch_headers.remove("x-minio-force-delete");
         let mut prepared_deletes: Vec<PreparedDelete> = Vec::with_capacity(authorized_deletes.len());
         for authorized in authorized_deletes {
             let AuthorizedDelete { idx, object } = authorized;
 
-            let metadata = extract_metadata(&req.headers);
+            let metadata = extract_metadata(&batch_headers);
             let opts: ObjectOptions = del_opts_with_versioning(
                 &bucket,
                 &object.object_name,
                 object.version_id.map(|f| f.to_string()),
-                &req.headers,
+                &batch_headers,
                 metadata,
                 version_cfg,
                 false,
@@ -933,6 +939,10 @@ impl DefaultObjectUsecase {
             .get(AMZ_BUCKET_REPLICATION_STATUS)
             .map(|v| v.to_str().unwrap_or_default() == ReplicationStatusType::Replica.as_str())
             .unwrap_or_default();
+        let force_header = match rustfs_utils::http::force_delete_header(&req.headers) {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")),
+        };
 
         if replica {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
@@ -944,6 +954,12 @@ impl DefaultObjectUsecase {
                 S3ErrorCode::AccessDenied,
                 "Recursive force-delete requires an authenticated caller",
             ));
+        }
+        // The access layer checks the same action. Repeat it here so a direct
+        // usecase call cannot skip the dedicated permission. Root bypasses IAM.
+        // A caller-supplied REPLICA header does not.
+        if force_header && !req_info_ref(&req).is_ok_and(|info| info.is_owner) {
+            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
         }
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
@@ -960,9 +976,7 @@ impl DefaultObjectUsecase {
         // Lock order is bucket lifecycle, then object/commit locks in storage.
         // Keep this guard alive through the physical delete: a preflight without
         // writer exclusion could authorize one subtree and delete a newer one.
-        let recursive_delete_guard = if rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_FORCE_DELETE)
-            .is_some_and(|value| value == "true")
-        {
+        let recursive_delete_guard = if force_header {
             Some(
                 store
                     .lock_bucket_for_recursive_delete(&bucket)
