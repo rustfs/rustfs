@@ -3732,6 +3732,10 @@ impl DefaultObjectUsecase {
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
+            website_redirect_location: req
+                .extensions
+                .get::<crate::app::metadata_route::WebsiteRead>()
+                .and_then(|_| info.user_defined.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned()),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -3843,6 +3847,7 @@ impl DefaultObjectUsecase {
             storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
             expiration: remote.expiration,
             restore: remote.restore,
+            website_redirect_location: remote.website_redirect_location,
             checksum_crc32: remote.checksum_crc32,
             checksum_crc32c: remote.checksum_crc32_c,
             checksum_crc64nvme: remote.checksum_crc64_nvme,
@@ -4070,7 +4075,10 @@ impl DefaultObjectUsecase {
         {
             // Active-active replication lag window: proxy the GET to a
             // replication target (backlog#1675 P1-5).
-            if let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+            if let Some(mut output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
+                    output.website_redirect_location = None;
+                }
                 lifecycle.finish_ok();
                 let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
                 inject_accept_ranges_header(&mut response.headers);
@@ -4086,7 +4094,10 @@ impl DefaultObjectUsecase {
                 .await
             {
                 None => {}
-                Some(OdmGetOutcome::Respond(Ok(output))) => {
+                Some(OdmGetOutcome::Respond(Ok(mut output))) => {
+                    if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
+                        output.website_redirect_location = None;
+                    }
                     lifecycle.finish_ok();
                     let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, *output).await;
                     inject_accept_ranges_header(&mut response.headers);
@@ -4628,6 +4639,7 @@ fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<
         e_tag: head.etag.as_deref().map(to_s3s_etag),
         last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
         metadata: (!head.user_metadata.is_empty()).then(|| head.user_metadata.clone()),
+        website_redirect_location: head.website_redirect_location.clone(),
         ..Default::default()
     }
 }

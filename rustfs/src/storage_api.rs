@@ -170,11 +170,17 @@ pub(crate) mod server {
         }
 
         pub(crate) mod metadata_route {
-            pub(crate) fn with_metadata_route<A>(admin: A, host: Option<s3s::host::MultiDomain>) -> impl s3s::route::S3Route
+            pub(crate) fn with_metadata_route<A>(
+                admin: A,
+                host: Option<s3s::host::MultiDomain>,
+                website_domains: Vec<String>,
+                website_scheme: &'static str,
+                server_ctx: std::sync::Arc<crate::app::context::ServerContextSlot>,
+            ) -> impl s3s::route::S3Route
             where
                 A: s3s::route::S3Route,
             {
-                crate::app::metadata_route::with_metadata_route(admin, host)
+                crate::app::metadata_route::with_metadata_route(admin, host, website_domains, website_scheme, server_ctx)
             }
         }
 

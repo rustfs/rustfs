@@ -1787,6 +1787,16 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+pub(crate) async fn get_bucket_website_config_for_store(store: &ECStore, bucket: &str) -> Result<s3s::dto::WebsiteConfiguration> {
+    let metadata = store.get_bucket_metadata(bucket).await?;
+    match ecstore_bucket::metadata::ConfigState::of(&metadata.website_config_xml, &metadata.website_config)
+        .require(bucket, ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG)?
+    {
+        Some(config) => Ok(config.clone()),
+        None => Err(StorageError::ConfigNotFound),
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
