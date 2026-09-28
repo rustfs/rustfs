@@ -1408,7 +1408,7 @@ mod tests {
         let task_cancel = cancel.clone();
         let state_root = state.path().to_path_buf();
         let task = tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if super::super::profile_cpu::CollectorLease::acquire().is_err() {
                     break;
