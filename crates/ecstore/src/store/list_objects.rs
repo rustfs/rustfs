@@ -33,8 +33,7 @@ use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
 use crate::error::{
-    Error, Result, StorageError, is_all_disk_not_found, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found,
-    to_object_err,
+    Error, Result, StorageError, is_all_disk_not_found, is_all_not_found, is_all_volume_not_found, to_object_err,
 };
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
@@ -4023,32 +4022,6 @@ impl ECStore {
             return Ok(result);
         }
 
-        // Optimization: use get for single object lookup with exact prefix
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Err(err) if is_err_bucket_not_found(&err) => {
-                    return Err(err);
-                }
-                _ => {}
-            };
-        };
-
         let mut list_result = self
             .clone()
             .list_path(&opts)
@@ -5534,31 +5507,6 @@ impl Sets {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Err(err) if is_err_bucket_not_found(&err) => {
-                    return Err(err);
-                }
-                _ => {}
-            };
-        }
-
         let mut list_result = self
             .list_path(&opts)
             .await
@@ -6447,33 +6395,6 @@ impl SetDisks {
         // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
-
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
-            match self
-                .get_object_info(
-                    &opts.bucket,
-                    &opts.prefix,
-                    &ObjectOptions {
-                        no_lock: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) if !res.delete_marker && res.version_purge_status.is_empty() => {
-                    return Ok(ListObjectsInfo {
-                        objects: vec![res],
-                        ..Default::default()
-                    });
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
-                }
-            };
-        }
 
         let mut list_result = self
             .list_path_result(&opts)
@@ -9638,6 +9559,88 @@ mod test {
     }
 
     #[tokio::test]
+    async fn list_objects_exact_prefix_paginates_across_storage_layers() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "exact-prefix-pagination-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("exact-prefix pagination bucket should be created");
+        for name in ["a", "ab"] {
+            store.pools[0]
+                .put_object(
+                    bucket,
+                    name,
+                    &mut PutObjReader::from_vec(b"pagination fixture".to_vec()),
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pagination fixture object should be written");
+            let info = store
+                .get_object_info(
+                    bucket,
+                    name,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact-prefix fixture must be readable by object lookup");
+            assert!(!info.delete_marker && info.version_purge_status.is_empty());
+        }
+
+        for layer in 0..3 {
+            for (prefix, expected) in [("a", vec!["a", "ab"]), ("ab", vec!["ab"]), ("missing", vec![])] {
+                let mut marker = None;
+                for page in 0..expected.len().max(1) {
+                    let result = match layer {
+                        0 => {
+                            store
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                        1 => {
+                            store.pools[0]
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                        _ => {
+                            store.pools[0].disk_set[0]
+                                .clone()
+                                .list_objects_generic(bucket, prefix, marker.clone(), None, 1, false)
+                                .await
+                        }
+                    }
+                    .expect("exact-prefix page should list successfully");
+                    let names: Vec<_> = result.objects.iter().map(|object| object.name.as_str()).collect();
+                    let expected_page: Vec<_> = expected.get(page).copied().into_iter().collect();
+                    assert_eq!(names, expected_page, "layer {layer}, prefix {prefix}, page {page}");
+                    assert!(result.prefixes.is_empty(), "recursive listing should not return common prefixes");
+                    let has_more = page + 1 < expected.len();
+                    assert_eq!(result.is_truncated, has_more, "layer {layer}, prefix {prefix}, page {page}");
+                    assert_eq!(result.next_marker.is_some(), has_more, "only non-final pages should carry a marker");
+                    if has_more {
+                        assert_ne!(result.next_marker, marker, "pagination marker must advance");
+                    }
+                    marker = result.next_marker;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn list_objects_hides_pending_version_purge_across_walk_and_exact_prefix() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -9685,7 +9688,7 @@ mod test {
             .expect("exact-prefix listing should succeed");
         assert!(
             exact.objects.is_empty(),
-            "exact-prefix max_keys=1 shortcut should hide pending version-purge entries"
+            "exact-prefix max_keys=1 listing should hide pending version-purge entries"
         );
         assert!(exact.prefixes.is_empty());
     }

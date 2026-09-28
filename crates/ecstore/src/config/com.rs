@@ -3154,6 +3154,7 @@ mod tests {
                 version_purge_status: Default::default(),
                 replication_decision: String::new(),
                 checksum: None,
+                multipart_completion_replayed: false,
             }
         }
     }

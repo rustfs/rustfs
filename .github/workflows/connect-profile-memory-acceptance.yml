@@ -38,7 +38,7 @@ permissions:
 jobs:
   profile-memory:
     name: Verify signed service memory profile over mTLS
-    runs-on: sm-standard-2
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout exact RustFS source
@@ -63,6 +63,39 @@ jobs:
           node-version: 25.8.1
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
+
+      - name: Ensure GitHub CLI
+        shell: bash
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+
+          gh_version="2.101.0"
+          case "$(uname -m)" in
+            x86_64) gh_arch="amd64" ;;
+            aarch64|arm64) gh_arch="arm64" ;;
+            *)
+              echo "Unsupported Linux architecture for GitHub CLI: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          gh_install_root="${RUNNER_TEMP:-$PWD}/gh-cli"
+          rm -rf "$gh_install_root"
+          mkdir -p "$gh_install_root/bin"
+          archive="$gh_install_root/gh.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_${gh_arch}.tar.gz" \
+            --output "$archive"
+          tar -xzf "$archive" -C "$gh_install_root"
+          install -m 0755 \
+            "$gh_install_root/gh_${gh_version}_linux_${gh_arch}/bin/gh" \
+            "$gh_install_root/bin/gh"
+          echo "$gh_install_root/bin" >> "$GITHUB_PATH"
+          export PATH="$gh_install_root/bin:$PATH"
+          gh --version
 
       - name: Verify official source and artifact identity
         shell: bash
@@ -139,7 +172,8 @@ jobs:
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
-                  assert {entry.filename for entry in entries} == {'rustfs', 'rustfs-cli'} and len(entries) == 2
+                  expected = {'rustfs', 'rustfs-cli', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'}
+                  assert {entry.filename for entry in entries} == expected and len(entries) == len(expected)
                   assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
                   assert inner.testzip() is None
                   pathlib.Path('binary').mkdir()

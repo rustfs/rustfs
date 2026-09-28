@@ -40,7 +40,9 @@ use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
 };
-use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::storage_api::multipart_usecase::error::{
+    StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
+};
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
@@ -675,43 +677,39 @@ impl DefaultMultipartUsecase {
             }
         };
 
-        let multipart_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &opts)
-            .await
-            .map_err(ApiError::from)?;
+        // A lost Complete response retries the same upload id after staging is
+        // gone. `get_multipart_info` is NoSuchUpload in that case; completion
+        // below replays the committed object instead of failing the retry.
+        let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) if is_err_invalid_upload_id(&err) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
         // A ciphertext-passthrough session stores encrypted parts verbatim and
         // completes without the customer key (the replication client has none),
         // so the SSE-C completion check must be skipped for it.
-        if !contains_key_str(&multipart_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
-            EncryptionRequest {
-                bucket: &bucket,
-                key: &key,
-                server_side_encryption: None,
-                ssekms_key_id: None,
-                ssekms_context: None,
-                sse_customer_algorithm,
-                sse_customer_key,
-                sse_customer_key_md5,
-                content_size: 0,
-                principal: None,
+        if let Some(info) = multipart_info.as_ref() {
+            if !contains_key_str(&info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+                EncryptionRequest {
+                    bucket: &bucket,
+                    key: &key,
+                    server_side_encryption: None,
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: sse_customer_algorithm.clone(),
+                    sse_customer_key: sse_customer_key.clone(),
+                    sse_customer_key_md5: sse_customer_key_md5.clone(),
+                    content_size: 0,
+                    principal: None,
+                }
+                .validate_complete_multipart_ssec(&info.user_defined)?;
             }
-            .validate_complete_multipart_ssec(&multipart_info.user_defined)?;
+            validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
         }
-        validate_complete_multipart_checksum_type(&req.headers, &multipart_info.user_defined)?;
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
-        let server_side_encryption = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| ServerSideEncryption::from(s.clone()));
-        let ssekms_key_id = match server_side_encryption.as_ref() {
-            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => multipart_info
-                .user_defined
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .cloned(),
-            _ => None,
-        };
+        let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
 
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
@@ -735,38 +733,44 @@ impl DefaultMultipartUsecase {
         // at multipart-session creation. Configuration and matching targets
         // can change while parts are uploaded, so persist the exact decision's
         // generation and PENDING set atomically with the completed object and
-        // reuse the same decision for scheduling below.
-        let completion_replication_decision = must_replicate_object(
-            &bucket,
-            &key,
-            &multipart_info.user_defined,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            opts.clone(),
-        )
-        .await;
-        let mut completion_replication_metadata = HashMap::new();
-        if completion_replication_decision.replicate_any() {
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_GENERATION,
-                Uuid::new_v4().to_string(),
-            );
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_TIMESTAMP,
-                jiff::Zoned::now().to_string(),
-            );
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_STATUS,
-                completion_replication_decision.pending_status().unwrap_or_default(),
-            );
-        }
-        // `Some(empty)` deliberately means that completion re-evaluated the
-        // session as not admitted; storage removes stale Create-MPU admission
-        // metadata in the same final-object commit.
-        opts.eval_metadata = Some(completion_replication_metadata);
+        // reuse the same decision for scheduling below. A retry whose upload
+        // is already gone must not re-evaluate or rewrite that decision.
+        let completion_replication_decision = if let Some(user_defined) = upload_user_defined.as_ref() {
+            let completion_replication_decision = must_replicate_object(
+                &bucket,
+                &key,
+                user_defined,
+                "".to_string(),
+                opts.delete_marker_replication_status(),
+                opts.clone(),
+            )
+            .await;
+            let mut completion_replication_metadata = HashMap::new();
+            if completion_replication_decision.replicate_any() {
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_GENERATION,
+                    Uuid::new_v4().to_string(),
+                );
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_TIMESTAMP,
+                    jiff::Zoned::now().to_string(),
+                );
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_STATUS,
+                    completion_replication_decision.pending_status().unwrap_or_default(),
+                );
+            }
+            // `Some(empty)` deliberately means that completion re-evaluated the
+            // session as not admitted; storage removes stale Create-MPU admission
+            // metadata in the same final-object commit.
+            opts.eval_metadata = Some(completion_replication_metadata);
+            Some(completion_replication_decision)
+        } else {
+            None
+        };
 
         let complete_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -781,30 +785,38 @@ impl DefaultMultipartUsecase {
                     .await
                     .map_err(ApiError::from)?;
                 let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
+                // Staging reclaim on a replay can free bytes; the dirty mark is
+                // not a usage counter. Quota, replication, lifecycle, and the
+                // object-created scanner signal belong to the commit that
+                // published the object.
                 record_capacity_write(Some(capacity_scope_token)).await;
 
-                if quota_tracking {
-                    let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+                if !obj_info.multipart_completion_replayed {
+                    if quota_tracking {
+                        let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
 
-                    if versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        if versioned {
+                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                        } else {
+                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        }
                     }
+
+                    enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+
+                    if let Some(decision) = completion_replication_decision
+                        && decision.replicate_any()
+                    {
+                        warn!("need multipart replication");
+                        schedule_object_replication(obj_info.clone(), store, decision).await;
+                    }
+
+                    rustfs_scanner::record_dirty_usage_object_from_producer(
+                        &bucket,
+                        &key,
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                    );
                 }
-
-                enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
-
-                if completion_replication_decision.replicate_any() {
-                    warn!("need multipart replication");
-                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
-                }
-
-                rustfs_scanner::record_dirty_usage_object_from_producer(
-                    &bucket,
-                    &key,
-                    rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
-                );
                 Ok::<_, S3Error>(obj_info)
             }
         });
@@ -814,6 +826,42 @@ impl DefaultMultipartUsecase {
                 format!("complete multipart upload commit owner task failed: {err}"),
             )
         })??;
+
+        // The upload record is gone on a lost-response retry, so SSE-C is
+        // checked against the committed object instead of the staging metadata.
+        if upload_user_defined.is_none() && !contains_key_str(&obj_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+            EncryptionRequest {
+                bucket: &bucket,
+                key: &key,
+                server_side_encryption: None,
+                ssekms_key_id: None,
+                ssekms_context: None,
+                sse_customer_algorithm,
+                sse_customer_key,
+                sse_customer_key_md5,
+                content_size: 0,
+                principal: None,
+            }
+            .validate_complete_multipart_ssec(obj_info.user_defined.as_ref())?;
+        }
+
+        let encryption_metadata = upload_user_defined.as_ref().unwrap_or(obj_info.user_defined.as_ref());
+        let server_side_encryption = encryption_metadata
+            .get("x-amz-server-side-encryption")
+            .map(|s| ServerSideEncryption::from(s.clone()));
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => encryption_metadata
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .cloned(),
+            _ => None,
+        };
+        let ssec_algorithm = encryption_metadata
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .cloned();
+        let ssec_key_md5 = encryption_metadata
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .cloned();
+        let replayed = obj_info.multipart_completion_replayed;
 
         let mpu_version = if versioned {
             obj_info.version_id.map(|v| v.to_string())
@@ -862,25 +910,24 @@ impl DefaultMultipartUsecase {
 
         let mut response = S3Response::new(output);
         crate::app::object_usecase::inject_additional_checksum_headers(&mut response.headers, &complete_extra_checksum_headers);
-        if let Some(algorithm) = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-algorithm")
-        {
+        if let Some(algorithm) = ssec_algorithm.as_deref() {
             let value = HeaderValue::from_str(algorithm)
                 .map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C algorithm metadata"))?;
             response
                 .headers
                 .insert("x-amz-server-side-encryption-customer-algorithm", value);
         }
-        if let Some(key_md5) = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-key-md5")
-        {
+        if let Some(key_md5) = ssec_key_md5.as_deref() {
             let value =
                 HeaderValue::from_str(key_md5).map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C key metadata"))?;
             response
                 .headers
                 .insert("x-amz-server-side-encryption-customer-key-md5", value);
+        }
+        if replayed {
+            // The object-created event was emitted by the commit that published
+            // the version. The retry is still a successful API call.
+            helper = helper.suppress_event();
         }
         let result = Ok(response);
         let _ = helper.complete(&result);

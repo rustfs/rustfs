@@ -1444,6 +1444,10 @@ pub struct ObjectInfo {
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
     pub checksum: Option<Bytes>,
+    /// True when this `CompleteMultipartUpload` result is the object already
+    /// published by the same upload. Callers must not repeat quota, replication,
+    /// lifecycle, or object-created side effects for that response.
+    pub multipart_completion_replayed: bool,
 }
 
 impl Clone for ObjectInfo {
@@ -1484,6 +1488,7 @@ impl Clone for ObjectInfo {
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
+            multipart_completion_replayed: self.multipart_completion_replayed,
             expires: self.expires,
         }
     }

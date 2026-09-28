@@ -58,7 +58,7 @@ jobs:
     # Mirrors the consumer wiring, minus the schedule-event guard (this
     # workflow is dispatch-only by design).
     if: always() && contains(needs.*.result, 'failure')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

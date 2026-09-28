@@ -73,6 +73,84 @@ render_server_cert() {
     '
 }
 
+# Gateway routes must resolve to the rendered Kubernetes Service without Traefik CRDs.
+for gateway_class in traefik contour istio; do
+  for distributed in false true; do
+    standalone=true
+    if [[ "$distributed" == true ]]; then standalone=false; fi
+    gateway_output=$(render_chart \
+      --set "mode.distributed.enabled=$distributed" \
+      --set "mode.standalone.enabled=$standalone" \
+      --set gatewayApi.enabled=true \
+      --set "gatewayApi.gatewayClass=$gateway_class" \
+      --set fullnameOverride=gateway-test \
+      --set service.console.port=19001 \
+      --set service.endpoint.port=19000 \
+      --set gatewayApi.hostname=console.example.com \
+      --set gatewayApi.endpointHostname=s3.example.com \
+      --set gatewayApi.existingGateway.name=shared-gateway \
+      --set gatewayApi.existingGateway.namespace=gateway-system \
+      --set gatewayApi.listeners.https.name=https)
+    yq eval -e 'select(.kind == "Service" and .metadata.name == "gateway-test-svc") |
+      .metadata.namespace == "rustfs" and
+      .spec.ports[0].port == 19000 and .spec.ports[1].port == 19001' - <<<"$gateway_output" >/dev/null
+    for route in route endpoint-route; do
+      expected_port=19001
+      expected_host=console.example.com
+      if [[ "$route" == endpoint-route ]]; then
+        expected_port=19000
+        expected_host=s3.example.com
+      fi
+      ROUTE_NAME="gateway-test-$route" EXPECTED_PORT="$expected_port" EXPECTED_HOST="$expected_host" \
+        yq eval -e 'select(.kind == "HTTPRoute" and .metadata.name == strenv(ROUTE_NAME)) |
+          .metadata.namespace == "rustfs" and
+          .spec.hostnames[0] == strenv(EXPECTED_HOST) and
+          .spec.parentRefs[0].name == "shared-gateway" and
+          .spec.parentRefs[0].namespace == "gateway-system" and
+          .spec.parentRefs[0].sectionName == "https" and
+          .spec.rules[0].matches[0].path.type == "PathPrefix" and
+          .spec.rules[0].matches[0].path.value == "/" and
+          (.spec.rules[0].backendRefs | length) == 1 and
+          .spec.rules[0].backendRefs[0].name == "gateway-test-svc" and
+          .spec.rules[0].backendRefs[0].port == env(EXPECTED_PORT) and
+          (.spec.rules[0].backendRefs[0].kind // "Service") == "Service" and
+          (.spec.rules[0].backendRefs[0].group // "") == ""' - <<<"$gateway_output" >/dev/null
+    done
+    if grep -q 'kind: TraefikService' <<<"$gateway_output"; then
+      echo "Gateway API must not require a TraefikService CRD" >&2
+      exit 1
+    fi
+  done
+done
+
+gateway_default=$(render_chart --set gatewayApi.enabled=true)
+yq eval -e 'select(.kind == "HTTPRoute" and .metadata.name == "rustfs-route") |
+  .spec.rules[0].backendRefs[0].name == "rustfs-svc" and
+  .spec.rules[0].backendRefs[0].port == 9001 and
+  .spec.parentRefs[0].name == "rustfs-gateway" and
+  .spec.parentRefs[0].sectionName == "websecure"' - <<<"$gateway_default" >/dev/null
+if grep -q 'name: rustfs-endpoint-route' <<<"$gateway_default"; then
+  echo "The S3 route must be opt-in" >&2
+  exit 1
+fi
+
+gateway_no_redirect=$(render_chart --set gatewayApi.enabled=true --set gatewayApi.endpointHostname=s3.example.com --set gatewayApi.httpToHttpsRedirect=false)
+if grep -q 'type: RequestRedirect' <<<"$gateway_no_redirect"; then
+  echo "Disabling HTTPS redirects must suppress the redirect route" >&2
+  exit 1
+fi
+
+if render_chart --set gatewayApi.enabled=true --set gatewayApi.endpointHostname=example.rustfs.com >/dev/null 2>&1; then
+  echo "Console and S3 routes must not share a hostname" >&2
+  exit 1
+fi
+
+gateway_disabled=$(render_chart --set gatewayApi.endpointHostname=s3.example.com)
+if grep -q 'kind: HTTPRoute' <<<"$gateway_disabled"; then
+  echo "Disabling Gateway API must suppress all HTTP routes" >&2
+  exit 1
+fi
+
 recreate_output=$(render_standalone_deployment --set mode.standalone.strategy.type=Recreate)
 grep -q "type: Recreate" <<<"$recreate_output"
 if grep -q "rollingUpdate:" <<<"$recreate_output"; then

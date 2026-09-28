@@ -1041,7 +1041,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
