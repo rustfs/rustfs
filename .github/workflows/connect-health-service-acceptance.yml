@@ -1,7 +1,7 @@
 # Copyright 2026 RustFS Team
 # SPDX-License-Identifier: Apache-2.0
 
-name: Connect bounded health service acceptance
+name: Connect bounded health proxy acceptance
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   health-service:
-    name: Verify bounded health service over mTLS
+    name: Verify bounded health service through authenticated proxy
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -185,7 +185,7 @@ jobs:
           chmod 0755 binary/rustfs
           printf '%s  binary/rustfs\n' "$BINARY_SHA256" | sha256sum --check --strict
 
-      - name: Run the real health service job
+      - name: Run the real health service job through authenticated proxy
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -198,11 +198,11 @@ jobs:
           npm --prefix connect-harness/web ci
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
           make -C connect-harness e2e-connected-dispatch-check
-          (cd connect-harness && ./tests/connectivity/health-service-evidence.test.sh)
+          (cd connect-harness && ./tests/connectivity/health-proxy-evidence.test.sh)
           RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
-            CONNECT_E2E_HEALTH_SERVICE_EVIDENCE="$GITHUB_WORKSPACE/health-service-evidence.json" \
-            make -C connect-harness e2e-connected E2E_SCENARIO=health-service
+            CONNECT_E2E_HEALTH_PROXY_EVIDENCE="$GITHUB_WORKSPACE/health-proxy-evidence.json" \
+            make -C connect-harness e2e-connected E2E_SCENARIO=health-service-proxy
 
       - name: Bind and validate sanitized evidence
         shell: bash
@@ -216,21 +216,21 @@ jobs:
         run: |
           set -euo pipefail
           jq -e --arg connect "$CONNECT_SHA" --arg source "$SOURCE_SHA" --arg binary "$BINARY_SHA256" '
-            .provenance.connectSha == $connect and .provenance.sourceSha == $source
-            and .provenance.binarySha256 == $binary
-          ' health-service-evidence.json >/dev/null
+            .health.provenance.connectSha == $connect and .health.provenance.sourceSha == $source
+            and .health.provenance.binarySha256 == $binary
+          ' health-proxy-evidence.json >/dev/null
           jq --arg run "$GITHUB_RUN_ID" --arg build "$BUILD_RUN_ID" \
             --arg artifact "$ARTIFACT_ID" --arg digest "$ARTIFACT_DIGEST" \
             --arg expiry "$(cat artifact-expires-at)" '
-            .provenance += {workflowRunId:$run,buildRunId:$build,artifactId:$artifact,artifactDigest:$digest,artifactExpiresAt:$expiry}
-          ' health-service-evidence.json > health-service-evidence.bound.json
-          mv health-service-evidence.bound.json health-service-evidence.json
-          node connect-harness/tests/connectivity/health-service-evidence.mjs health-service-evidence.json --bound
+            .health.provenance += {workflowRunId:$run,buildRunId:$build,artifactId:$artifact,artifactDigest:$digest,artifactExpiresAt:$expiry}
+          ' health-proxy-evidence.json > health-proxy-evidence.bound.json
+          mv health-proxy-evidence.bound.json health-proxy-evidence.json
+          node connect-harness/tests/connectivity/health-proxy-evidence.mjs health-proxy-evidence.json --bound
 
       - name: Upload only verified sanitized evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: connect-health-service-evidence-${{ github.run_id }}
-          path: health-service-evidence.json
+          name: connect-health-proxy-evidence-${{ github.run_id }}
+          path: health-proxy-evidence.json
           retention-days: 14
           if-no-files-found: error
