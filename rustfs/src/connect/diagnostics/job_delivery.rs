@@ -385,7 +385,7 @@ fn target_and_identity(config: &HeartbeatConfig) -> Result<(DiagnosticJobTarget,
     ))
 }
 
-async fn executable_provenance() -> Result<ProfileProvenance, &'static str> {
+pub(super) async fn executable_provenance() -> Result<ProfileProvenance, &'static str> {
     let digest = tokio::task::spawn_blocking(hash_current_executable)
         .await
         .map_err(|_| "PROVENANCE_FAILED")?
