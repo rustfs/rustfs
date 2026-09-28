@@ -8822,10 +8822,9 @@ mod tests {
             ..Default::default()
         }];
 
-        assert_eq!(
+        assert!(
             completed_multipart_upload_matches(&metadata, &parts, false, upload_id, &requested, "bucket", "object")
-                .expect("quoted ETag must match the stored part"),
-            true
+                .expect("quoted ETag must match the stored part")
         );
         let wrong_etag = vec![CompletePart {
             part_num: 1,
@@ -8836,15 +8835,13 @@ mod tests {
             completed_multipart_upload_matches(&metadata, &parts, false, upload_id, &wrong_etag, "bucket", "object"),
             Err(StorageError::InvalidPart(1, _, _))
         ));
-        assert_eq!(
-            completed_multipart_upload_matches(&metadata, &parts, false, "other-upload", &requested, "bucket", "object")
-                .expect("a different upload id is not this completion"),
-            false
+        assert!(
+            !completed_multipart_upload_matches(&metadata, &parts, false, "other-upload", &requested, "bucket", "object")
+                .expect("a different upload id is not this completion")
         );
-        assert_eq!(
-            completed_multipart_upload_matches(&metadata, &parts, true, upload_id, &requested, "bucket", "object")
-                .expect("a delete marker is not the completed object"),
-            false
+        assert!(
+            !completed_multipart_upload_matches(&metadata, &parts, true, upload_id, &requested, "bucket", "object")
+                .expect("a delete marker is not the completed object")
         );
 
         metadata.insert(
