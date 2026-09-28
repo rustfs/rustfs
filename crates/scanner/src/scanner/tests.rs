@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+pub(super) mod cycle_persist_failure;
 mod quota_reset_preservation;
 
 mod recovery_control;

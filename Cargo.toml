@@ -20,6 +20,7 @@ members = [
     "crates/common", # Shared utilities and data structures
     "crates/data-usage", # Shared data usage models and algorithms
     "crates/config", # Configuration management
+    "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
     "crates/ecstore", # Erasure coding storage implementation
