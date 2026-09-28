@@ -19,7 +19,7 @@ use super::object_usecase::DefaultObjectUsecase;
 use crate::app::context::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::{ReqInfo, authorize_request, req_info_mut};
-use crate::storage::{ecfs::validate_website_configuration, get_bucket_website_config_for_store};
+use crate::storage::{get_bucket_website_config_for_store, website_config::validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use http::header::HOST;

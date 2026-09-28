@@ -42,6 +42,7 @@ pub(crate) mod scanner_dirty_journal;
 #[cfg(test)]
 mod sse_test;
 pub(crate) mod storage_api;
+pub(crate) mod website_config;
 
 pub(crate) use ecfs_extend::*;
 #[allow(unused_imports)]
