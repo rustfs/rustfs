@@ -69,10 +69,9 @@ env:
 jobs:
   minio-source:
     name: MinIO source (read-through, list-through, backfill)
-    # Skip on forks: needs this repository's runners and is not a contributor
-    # gate.
+    # Keep this scheduled interoperability lane scoped to the upstream repo.
     if: github.repository == 'rustfs/rustfs'
-    runs-on: dind-sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       NO_PROXY: 127.0.0.1,localhost
