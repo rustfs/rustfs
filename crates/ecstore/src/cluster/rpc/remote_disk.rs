@@ -1244,13 +1244,14 @@ impl RemoteDisk {
         {
             return;
         }
+        // Own the flag before spawning: shutdown can drop the task without polling it.
+        let lease = RecoveryMonitorLease {
+            active: Arc::clone(&active),
+        };
         let span = Self::recovery_monitor_span(&addr, &endpoint, handle_id);
         super::spawn_background_monitor(span, async move {
             #[cfg(test)]
             test_state.start_count.fetch_add(1, Ordering::AcqRel);
-            let lease = RecoveryMonitorLease {
-                active: Arc::clone(&active),
-            };
             Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
             #[cfg(test)]
             if let Some(hook) = test_state.teardown_hook.lock().await.take() {
@@ -1556,7 +1557,8 @@ impl RemoteDisk {
         };
 
         if evict_cached_connection {
-            evict_failed_connection(addr).await;
+            // Cache contention must not hold the recovery lease indefinitely.
+            let _ = timeout(get_drive_active_check_timeout(), evict_failed_connection(addr)).await;
         }
 
         result
@@ -1715,7 +1717,7 @@ impl RemoteDisk {
         if timeout_duration == Duration::ZERO {
             let operation_result = operation().await;
             if operation_result.is_ok() {
-                self.health.log_success();
+                self.health.record_operation_success(&self.endpoint, "operation_success");
             }
             self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                 .await;
@@ -1729,7 +1731,7 @@ impl RemoteDisk {
             Ok(operation_result) => {
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
-                    self.health.log_success();
+                    self.health.record_operation_success(&self.endpoint, "operation_success");
                 }
                 self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                     .await;
@@ -8202,6 +8204,97 @@ mod tests {
         // Test close operation (should succeed)
         let result = remote_disk.close().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn successful_operation_recovers_suspect_remote_disk_without_monitor() {
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-recovery:9000/data").expect("valid endpoint"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("create remote disk");
+
+        for duration in [Duration::ZERO, Duration::from_secs(1)] {
+            disk.health.mark_failure(&endpoint, "read_operation_deadline");
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert!(!disk.recovery_monitor_is_active());
+            let result = disk
+                .execute_with_timeout(|| async { Err::<(), _>(DiskError::FileNotFound) }, duration)
+                .await;
+            assert!(matches!(result, Err(DiskError::FileNotFound)));
+            assert_eq!(
+                disk.runtime_state(),
+                RuntimeDriveHealthState::Suspect,
+                "a failed operation must not restore readiness"
+            );
+
+            disk.execute_with_timeout(|| async { Ok(()) }, duration)
+                .await
+                .expect("successful disk RPC");
+            assert_eq!(
+                disk.runtime_state(),
+                RuntimeDriveHealthState::Online,
+                "successful traffic must restore readiness without a recovery monitor"
+            );
+            assert!(disk.offline_duration_secs().is_none());
+            assert_eq!(disk.health.waiting.load(Ordering::Acquire), 0);
+        }
+
+        disk.health.mark_offline(&endpoint, "test_offline");
+        let result = disk.execute_with_timeout(|| async { Ok(()) }, Duration::from_secs(1)).await;
+        assert!(
+            matches!(result, Err(DiskError::FaultyDisk)),
+            "offline handles still require recovery probes before data I/O"
+        );
+        assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Offline);
+    }
+
+    #[test]
+    fn recovery_monitor_releases_lease_when_dropped_before_first_poll() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-unpolled:9000/data").expect("valid endpoint"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let active = Arc::new(AtomicBool::new(false));
+        let start_count = Arc::new(AtomicU32::new(0));
+        {
+            let _guard = runtime.enter();
+            RemoteDisk::schedule_recovery_monitor(
+                "http://remote-unpolled:9000".to_string(),
+                endpoint,
+                Uuid::new_v4(),
+                Arc::new(DiskHealthTracker::new()),
+                CancellationToken::new(),
+                Arc::clone(&active),
+                RecoveryMonitorTestState {
+                    start_count: Arc::clone(&start_count),
+                    teardown_hook: Arc::new(tokio::sync::Mutex::new(None)),
+                },
+            );
+            assert!(active.load(Ordering::Acquire));
+        }
+        drop(runtime);
+        assert_eq!(start_count.load(Ordering::Acquire), 0, "task must never be polled");
+        assert!(!active.load(Ordering::Acquire), "dropping an unpolled monitor must release its lease");
     }
 
     #[tokio::test]

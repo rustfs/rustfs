@@ -85,11 +85,24 @@ pub struct DependencyReadinessReport {
     pub storage_details: Option<StorageReadinessDetails>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageReadinessDetails {
     pub read_quorum_ready: bool,
     pub write_quorum_ready: bool,
     pub pool_metadata_write_ready: bool,
+    pub unavailable_drives: Vec<UnavailableReadinessDrive>,
+}
+
+/// Node-local reasons for excluding an inventoried drive from readiness quorum.
+/// Use topology indices instead of exposing internal addresses or filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnavailableReadinessDrive {
+    pub pool_index: i32,
+    pub set_index: i32,
+    pub disk_index: i32,
+    pub runtime_state: String,
+    pub host_online: bool,
 }
 
 pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyObjectInfo {
