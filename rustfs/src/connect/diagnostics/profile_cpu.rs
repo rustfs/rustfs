@@ -817,7 +817,7 @@ mod local_cpu {
             }
         }
 
-        fn record_stack<'a>(&mut self, symbols: impl Iterator<Item = &'a str>, count: usize) -> Result<(), ProfileError> {
+        fn record_stack<'s>(&mut self, symbols: impl Iterator<Item = &'s str>, count: usize) -> Result<(), ProfileError> {
             self.stack_records = self.stack_records.checked_add(1).ok_or(ProfileError::LimitExceeded)?;
             let count = u64::try_from(count).map_err(|_| ProfileError::LimitExceeded)?;
             if self.stack_records > MAX_STACK_RECORDS {
