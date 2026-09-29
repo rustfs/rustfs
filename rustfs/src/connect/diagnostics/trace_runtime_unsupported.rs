@@ -50,6 +50,13 @@ pub(crate) async fn request_local_network(
     Err(LocalTraceCaptureError::RuntimeUnavailable)
 }
 
+pub(crate) fn load_selected_offline_key(
+    _state_root: &Path,
+    _offline_key_id: &str,
+) -> Result<crate::connect::DeviceIdentity, LocalTraceCaptureError> {
+    Err(LocalTraceCaptureError::RuntimeUnavailable)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum LocalTraceCaptureError {
     #[error("telemetry server runtime is unavailable")]

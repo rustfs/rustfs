@@ -94,9 +94,9 @@ pub use diagnostics::{
     save_signed_health_export, sign_health_export,
 };
 pub(crate) use diagnostics::{
-    LocalHealthRequest, LocalNetworkRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_health,
-    request_local_native_threads_profile, request_local_network, request_local_runtime_profile, request_local_top_api,
-    request_local_top_disk, request_local_top_locks, request_local_top_rpc, request_local_trace_capture,
+    LocalHealthRequest, LocalNetworkRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, load_selected_offline_key,
+    request_local_health, request_local_native_threads_profile, request_local_network, request_local_runtime_profile,
+    request_local_top_api, request_local_top_disk, request_local_top_locks, request_local_top_rpc, request_local_trace_capture,
     spawn_local_trace_capture_runtime,
 };
 pub use diagnostics::{

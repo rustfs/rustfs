@@ -613,6 +613,10 @@ pub struct ConnectClientPerformanceOpts {
     #[arg(long = "state-dir")]
     pub state_dir: PathBuf,
 
+    /// Select an existing separately enrolled offline key by its SPKI SHA-256 identifier
+    #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub offline_key_id: Option<String>,
+
     /// RustFS deployment endpoint
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub endpoint: String,
