@@ -718,6 +718,7 @@ pub struct FolderScanner {
 
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
+    failed_object_paths_seen: HashSet<String>,
 
     sleeper: DynamicSleeper,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -927,7 +928,7 @@ impl FolderScanner {
         into.add_child(child_hash);
     }
 
-    fn should_skip_failed(&self, path: &str) -> bool {
+    fn failed_retry_suppressed(&self, path: &str) -> bool {
         let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
             return false;
@@ -954,6 +955,35 @@ impl FolderScanner {
         if max_entries > 0 && self.new_cache.info.failed_objects.len() > max_entries {
             self.prune_failed_objects(now, ttl);
         }
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            self.failed_object_paths_seen.insert(path.to_string());
+        }
+    }
+
+    fn mark_failed_path_seen(&mut self, path: &str) -> bool {
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            return !self.failed_object_paths_seen.insert(path.to_string());
+        }
+        false
+    }
+
+    fn clear_failed_path(&mut self, path: &str) {
+        self.new_cache.info.failed_objects.remove(path);
+        self.failed_object_paths_seen.remove(path);
+    }
+
+    fn reconcile_failed_objects_after_full_scan(&mut self) {
+        let mixed_coverage = self
+            .new_cache
+            .info
+            .scan_progress
+            .is_some_and(|progress| progress.started_plan != progress.requested_plan);
+        if self.prefix_scan_scope.is_some() || self.resume_frontier.is_some() || self.coverage_gap || mixed_coverage {
+            return;
+        }
+
+        let seen = &self.failed_object_paths_seen;
+        self.new_cache.info.failed_objects.retain(|path, _| seen.contains(path));
     }
 
     fn prune_failed_objects_cache(&mut self) {
@@ -1795,12 +1825,14 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
-                // If this path is already known as failed, just skip it.
-                // We intentionally do NOT call `record_failed` or bump `failed_objects` here,
-                // because the failure was recorded when the original error occurred
-                // (e.g. in the get_size error branch below). This branch only accounts
-                // for subsequent skips of already-failed paths.
-                if self.should_skip_failed(&item.path) {
+                // Keep failed paths visible to this scan so repair success can
+                // clear stale failure state and a complete walk can discard
+                // paths that were removed since the previous cycle.
+                let repeated_failed_path = self.mark_failed_path_seen(&item.path);
+                if repeated_failed_path && self.failed_retry_suppressed(&item.path) {
+                    // A new FolderScanner starts with an empty seen set, so
+                    // cached paths are still rechecked once per cycle. Skip
+                    // duplicate listings within this same scanner pass.
                     self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                     continue;
                 }
@@ -1813,14 +1845,16 @@ impl FolderScanner {
                     Ok(sz) => sz,
                     Err(e) => {
                         let failure_action = classify_get_size_failure(&item, &e);
+                        let retry_suppressed = self.failed_retry_suppressed(&item.path);
 
                         if failure_action != GetSizeFailureAction::Skip {
                             self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
-                            // Track failed objects to prevent infinite retry loops
-                            into.failed_objects += 1;
-                            self.record_failed(&item.path);
+                            if !retry_suppressed {
+                                into.failed_objects += 1;
+                                self.record_failed(&item.path);
+                            }
 
-                            if should_log_failed_object(into.failed_objects) {
+                            if !retry_suppressed && should_log_failed_object(into.failed_objects) {
                                 if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
                                     error!(
                                         target: "rustfs::scanner::folder",
@@ -1850,9 +1884,13 @@ impl FolderScanner {
                                     );
                                 }
                             }
+                        } else {
+                            self.clear_failed_path(&item.path);
                         }
 
-                        if let GetSizeFailureAction::HealMetadata { object } = failure_action {
+                        if let GetSizeFailureAction::HealMetadata { object } = failure_action
+                            && !retry_suppressed
+                        {
                             // Single-flight (backlog#1894 axis A) — the
                             // recording mode and its guarantees are pinned by
                             // corrupt_metadata_recording below.
@@ -1901,6 +1939,7 @@ impl FolderScanner {
                     }
                 };
 
+                self.clear_failed_path(&item.path);
                 found_object_metadata = true;
 
                 item.transform_meta_dir();
@@ -1967,8 +2006,10 @@ impl FolderScanner {
                 self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                 found_object_metadata = true;
                 let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
+                self.mark_failed_path_seen(&metadata_path);
+                let retry_suppressed = self.failed_retry_suppressed(&metadata_path);
 
-                if !self.should_skip_failed(&metadata_path) {
+                if !retry_suppressed {
                     into.failed_objects = into.failed_objects.saturating_add(1);
                     self.record_failed(&metadata_path);
 
@@ -1985,7 +2026,9 @@ impl FolderScanner {
                             "Scanner found erasure object data without metadata"
                         );
                     }
+                }
 
+                if !retry_suppressed {
                     let (bucket, object) = path2_bucket_object_with_base_path(&self.root, &folder.name);
                     if !bucket.is_empty() && !object.is_empty() {
                         self.send_required_scanner_heal_request(
@@ -2769,6 +2812,7 @@ pub(crate) async fn scan_data_folder_scoped(
         prefix_scan_scope,
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
+        failed_object_paths_seen: HashSet::new(),
         sleeper,
         disks,
         disks_quorum,
@@ -2823,6 +2867,7 @@ pub(crate) async fn scan_data_folder_scoped(
         Ok(()) => {
             // Get the new cache and finalize it
             let coverage_gap = scanner.coverage_gap;
+            scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
