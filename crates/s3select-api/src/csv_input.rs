@@ -107,7 +107,7 @@ impl CsvInputNormalizer {
     fn record_len(&self, bytes: &[u8]) -> usize {
         if self.default_records && bytes.starts_with(b"\r\n") {
             2
-        } else if self.default_records && bytes.starts_with(b"\r") {
+        } else if self.default_records && self.field != b"\r" && bytes.starts_with(b"\r") {
             1
         } else if bytes.starts_with(&self.record) {
             self.record.len()
@@ -218,7 +218,7 @@ impl CsvInputNormalizer {
             }
             if self.allow_quoted_record_delimiter {
                 // Quoted delimiters do not end a logical record or reset its size limit.
-                if self.record_start {
+                if self.record_start && self.state != State::Comment {
                     self.record_bytes = 0;
                 } else {
                     self.record_bytes += pos - start;
@@ -385,6 +385,70 @@ mod tests {
             } else {
                 assert!(result.is_ok(), "a record of {size} bytes must be accepted: {result:?}");
                 assert!(normalizer.carry.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_count_comment_bytes_across_chunks() {
+        for size in [
+            MAX_SELECT_RECORD_BYTES - 1,
+            MAX_SELECT_RECORD_BYTES,
+            MAX_SELECT_RECORD_BYTES + 1,
+        ] {
+            for record in [None, Some("\r\n"), Some("^Y")] {
+                let delimiter = record.unwrap_or("\n");
+                for terminated in [false, true] {
+                    let csv = CsvSyntax {
+                        record,
+                        comment: Some(b'#'),
+                        allow_quoted_record_delimiter: true,
+                        ..Default::default()
+                    };
+                    let mut input = vec![b'x'; size];
+                    input[0] = b'#';
+                    if terminated {
+                        input.extend_from_slice(delimiter.as_bytes());
+                        input.extend_from_slice(b"#next");
+                        input.extend_from_slice(delimiter.as_bytes());
+                        input.extend_from_slice(b"value");
+                    }
+                    let mut normalizer = CsvInputNormalizer::new(&csv);
+                    let mut output = Vec::new();
+                    let result = input
+                        .chunks(64 * 1024)
+                        .try_for_each(|chunk| normalizer.convert(chunk, false).map(|bytes| output.extend(bytes)))
+                        .and_then(|()| normalizer.convert(b"", true).map(|bytes| output.extend(bytes)));
+                    if size > MAX_SELECT_RECORD_BYTES {
+                        assert_eq!(result, Err(SelectError::OverMaxRecordSize));
+                    } else {
+                        result.expect("comments within the logical-record limit must be accepted");
+                        assert_eq!(output, if terminated { b"\"value\"".as_slice() } else { b"" });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_preserve_carriage_return_fields() {
+        let csv = CsvSyntax {
+            field: Some("\r"),
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        for (input, expected) in [
+            ("a\rb\n", "\"a\",\"b\"\n"),
+            ("a\rb\r\n", "\"a\",\"b\"\n"),
+            ("\"a\rb\"\rtail\n", "\"a\rb\",\"tail\"\n"),
+            ("a\r", "\"a\",\"\""),
+        ] {
+            for size in 1..=input.len() {
+                assert_eq!(
+                    normalize_chunks(&csv, input.as_bytes(), size),
+                    expected.as_bytes(),
+                    "input={input:?}, chunk={size}"
+                );
             }
         }
     }

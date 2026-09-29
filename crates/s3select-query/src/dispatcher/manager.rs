@@ -1602,6 +1602,7 @@ mod tests {
             ("'", "\\", ";", "\n", "'a\\'\nb';tail\n", vec![vec!["a'\nb", "tail"]]),
             ("\"", "\"", ",", "\n", "\"a\"\"\nb\",tail", vec![vec!["a\"\nb", "tail"]]),
             ("\"", "\"", ",", "\n", "path\\,\"line\nbreak\"\n", vec![vec!["path\\", "line\nbreak"]]),
+            ("\"", "\"", "\r", "\n", "a\rb\n", vec![vec!["a", "b"]]),
         ];
         let env = snapshot_test_env().await;
         for (index, (quote, escape, field, record, data, expected)) in cases.into_iter().enumerate() {
@@ -1616,7 +1617,7 @@ mod tests {
                     csv.quote_character = Some(quote.to_owned());
                     csv.quote_escape_character = Some(escape.to_owned());
                     csv.field_delimiter = Some(field.to_owned());
-                    csv.record_delimiter = Some(record.to_owned());
+                    csv.record_delimiter = (field != "\r").then(|| record.to_owned());
                 }
                 let data = if header == FileHeaderInfo::NONE {
                     data.to_owned()
