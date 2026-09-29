@@ -348,6 +348,11 @@ fn local_top_export_is_private_no_clobber_cancel_safe_and_rejects_forged_artifac
 fn production_cli_exports_top_net_and_fails_closed_for_unavailable_and_invalid_runs() {
     let directory = tempfile::tempdir().expect("CLI directory");
     let state = directory.path().join("state");
+    let offline_identity = rustfs::connect::OfflineKeyStore::new(&state)
+        .load_or_create()
+        .expect("offline identity");
+    let offline_key_id =
+        hex_simd::encode_to_string(Sha256::digest(offline_identity.public_key_der()), hex_simd::AsciiCase::Lower);
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
         .load_or_create()
         .expect("enrolled identity");
@@ -414,12 +419,11 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_and_invalid_r
 
     // Service-backed captures require an explicit offline identity pin before
     // connecting to the server or emitting an export.
-    for (index, tool) in ["locks", "api", "rpc"].into_iter().enumerate() {
+    for (index, tool) in ["locks", "api", "rpc", "disk"].into_iter().enumerate() {
         let output = directory.path().join(format!("{tool}.zip"));
         let artifact_uid = format!("019e3ae0-0000-7000-8000-00000000003{}", index + 1);
-        let run = top_command(tool, &state, &output, &artifact_uid, 1, true)
-            .output()
-            .expect("run top command without an offline identity pin");
+        let mut command = top_command(tool, &state, &output, &artifact_uid, 1, true);
+        let run = command.output().expect("run top command without an offline identity pin");
         assert!(!run.status.success(), "{tool} must reject a missing offline identity pin");
         let stdout = String::from_utf8(run.stdout).expect("UTF-8 stdout");
         let stderr = String::from_utf8(run.stderr).expect("UTF-8 stderr");
@@ -428,6 +432,17 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_and_invalid_r
             stderr.contains("--offline-key-id must select an existing offline identity"),
             "{tool} stderr: {stderr}"
         );
+        assert!(!output.exists());
+
+        let unavailable = command
+            .args(["--offline-key-id", &offline_key_id])
+            .output()
+            .expect("run service capture without the server");
+        assert!(!unavailable.status.success(), "{tool} must reject an unavailable server");
+        let stdout = String::from_utf8(unavailable.stdout).expect("UTF-8 stdout");
+        let stderr = String::from_utf8(unavailable.stderr).expect("UTF-8 stderr");
+        assert!(stdout.is_empty(), "{tool} stdout: {stdout}");
+        assert!(stderr.contains("telemetry server runtime is unavailable"), "{tool} stderr: {stderr}");
         assert!(!output.exists());
     }
 
