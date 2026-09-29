@@ -105,7 +105,9 @@ impl CsvInputNormalizer {
     }
 
     fn record_len(&self, bytes: &[u8]) -> usize {
-        if self.default_records && bytes.starts_with(b"\r\n") {
+        if self.default_records && self.field == b"\r\n" && bytes.starts_with(&self.field) {
+            0
+        } else if self.default_records && bytes.starts_with(b"\r\n") {
             2
         } else if self.default_records && self.field != b"\r" && bytes.starts_with(b"\r") {
             1
@@ -442,6 +444,30 @@ mod tests {
             ("a\rb\r\n", "\"a\",\"b\"\n"),
             ("\"a\rb\"\rtail\n", "\"a\rb\",\"tail\"\n"),
             ("a\r", "\"a\",\"\""),
+        ] {
+            for size in 1..=input.len() {
+                assert_eq!(
+                    normalize_chunks(&csv, input.as_bytes(), size),
+                    expected.as_bytes(),
+                    "input={input:?}, chunk={size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_delimiters_preserve_crlf_fields() {
+        let csv = CsvSyntax {
+            field: Some("\r\n"),
+            comment: Some(b'#'),
+            allow_quoted_record_delimiter: true,
+            ..Default::default()
+        };
+        for (input, expected) in [
+            ("a\r\nb\n", "\"a\",\"b\"\n"),
+            ("\"a\r\nb\"\r\ntail\n", "\"a\r\nb\",\"tail\"\n"),
+            ("a\r\n", "\"a\",\"\""),
+            ("#skip\r\na\r\nb\n", "\"a\",\"b\"\n"),
         ] {
             for size in 1..=input.len() {
                 assert_eq!(
