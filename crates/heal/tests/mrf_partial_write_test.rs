@@ -90,6 +90,101 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
     );
 }
 
+#[tokio::test]
+async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptance() {
+    use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent};
+
+    temp_env::async_with_vars([("RUSTFS_HEAL_MRF_ENABLE", Some("true"))], async {
+        let root = tempfile::tempdir().expect("unbound lifecycle fixture directory");
+        let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+        env.make_bucket("unbound-lifecycle", false).await;
+        let manager = manager(&env);
+        manager.start().await.expect("manager should start");
+        mrf_queue::spawn_mrf_consumer(manager.clone());
+        persist_partial_write_intent(
+            "unbound-lifecycle",
+            "legacy.bin",
+            None,
+            MrfScope {
+                pool_index: 0,
+                set_index: 0,
+            },
+        )
+        .await
+        .expect("old-format intent should still be durably admitted");
+
+        assert!(
+            wait_until(|| async {
+                mrf_queue::list_legacy_responsibilities(None, 8).await.is_ok_and(|snapshot| {
+                    snapshot
+                        .responsibilities
+                        .iter()
+                        .any(|item| item.bucket == "unbound-lifecycle" && item.object == "legacy.bin")
+                })
+            })
+            .await,
+            "unbound old journal intent must become visible"
+        );
+        let snapshot = mrf_queue::list_legacy_responsibilities(None, 8)
+            .await
+            .expect("listing should be available");
+        let entry = snapshot
+            .responsibilities
+            .iter()
+            .find(|item| item.bucket == "unbound-lifecycle" && item.object == "legacy.bin")
+            .expect("visible generation-unknown entry");
+        assert_eq!(entry.status, "legacy_generation_unknown");
+        assert!(entry.source_bucket_incarnation_id.is_none());
+        assert!(
+            snapshot_contains("legacy.bin").await,
+            "generation uncertainty must preserve journal responsibility"
+        );
+        let operations = manager.operations_snapshot().await;
+        assert_eq!(
+            operations.queue_length, 0,
+            "unbound old intent must not be sent to the current bucket generation"
+        );
+
+        assert!(matches!(
+            mrf_queue::recheck_legacy_responsibility(entry.responsibility_id, entry.bucket_incarnation_id).await,
+            Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::InvalidAction(_))
+        ));
+        mrf_queue::accept_unverified_legacy_risk(
+            entry.responsibility_id,
+            entry.bucket_incarnation_id,
+            true,
+            false,
+            "integration-test-operator".to_string(),
+            "The old journal has no source bucket-generation binding".to_string(),
+            "TEST-ISSUE-2682-UNBOUND".to_string(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("unbound risk disposition requires explicit acknowledgment and must be durable");
+        assert!(
+            snapshot_contains("legacy.bin").await,
+            "risk acknowledgment must not delete the intent record"
+        );
+        let accepted = mrf_queue::list_legacy_responsibilities(None, 8)
+            .await
+            .expect("accepted status should be readable");
+        let accepted = accepted
+            .responsibilities
+            .iter()
+            .find(|item| item.responsibility_id == entry.responsibility_id)
+            .expect("accepted unbound generation remains visible");
+        assert_eq!(accepted.status, "operator_accepted_unverified");
+        assert!(
+            accepted
+                .accepted
+                .as_ref()
+                .is_some_and(|audit| audit.acknowledged_unknown_source_incarnation)
+        );
+        manager.stop().await.expect("manager should stop");
+    })
+    .await;
+}
+
 #[test]
 fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof() {
     const STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -110,7 +205,7 @@ fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof() {
 }
 
 async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inner() {
-    use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent};
+    use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent_with_incarnation};
 
     temp_env::async_with_vars([("RUSTFS_HEAL_MRF_ENABLE", Some("true"))], async {
         let root = tempfile::tempdir().expect("partial-write absence fixture directory");
@@ -128,11 +223,16 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
 
         let manager = manager(&env);
         mrf_queue::spawn_mrf_consumer(manager.clone());
+        let source_bucket_incarnation_id = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk("partial-absence")
+            .await
+            .expect("fixture bucket source incarnation");
         for (object, version_id) in [
             ("deleted-unversioned.bin", None),
             ("deleted-versioned.bin", Some(uuid::Uuid::new_v4())),
         ] {
-            persist_partial_write_intent(
+            persist_partial_write_intent_with_incarnation(
                 "partial-absence",
                 object,
                 version_id,
@@ -140,6 +240,7 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
                     pool_index: 0,
                     set_index: 0,
                 },
+                Some(source_bucket_incarnation_id),
             )
             .await
             .expect("durable partial-write responsibility must commit before scheduling");
@@ -563,9 +664,12 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
     mrf_queue::spawn_mrf_consumer(manager.clone());
     assert!(snapshot_contains("crash.bin").await, "restart must find durable responsibility");
     *set.disks.write().await = all.iter().cloned().map(Some).collect();
+    let healed = wait_until(|| async { replicas(&all, "partial-crash", "crash.bin", None, false).await == 4 }).await;
     assert!(
-        wait_until(|| async { replicas(&all, "partial-crash", "crash.bin", None, false).await == 4 }).await,
-        "replayed responsibility must heal the returning member"
+        healed,
+        "replayed responsibility must heal the returning member; manager={:?}; responsibility={:?}",
+        manager.operations_snapshot().await,
+        mrf_queue::list_legacy_responsibilities(None, 16).await
     );
     assert_payload(&env, "partial-crash", "crash.bin", None, b"durable partial write across SIGKILL").await;
     if protected {
@@ -594,10 +698,158 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
         while tokio::time::Instant::now() < retry_window {
             let snapshot = manager.operations_snapshot().await;
             assert_eq!(snapshot.queue_length, 0, "an unverified legacy result must not refill the manager queue");
-            assert_eq!(snapshot.active_tasks, 0, "a held intent must not stay active");
+            assert_eq!(
+                snapshot.active_tasks,
+                0,
+                "a held intent must not stay active; lifecycle state: {:?}",
+                mrf_queue::list_legacy_responsibilities(None, 32)
+                    .await
+                    .expect("lifecycle state should be inspectable")
+                    .responsibilities
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(snapshot_contains("crash.bin").await, "unverified legacy responsibility must remain");
+
+        let before = mrf_queue::list_legacy_responsibilities(None, 32)
+            .await
+            .expect("held lifecycle listing should be available");
+        let held = before
+            .responsibilities
+            .iter()
+            .find(|entry| entry.bucket == "partial-crash" && entry.object == "crash.bin")
+            .expect("legacy durable intent must be visible with its exact identity");
+        assert_eq!(held.status, "held_unverified_legacy");
+        assert_eq!(
+            held.source_bucket_incarnation_id,
+            Some(
+                env.ecstore.pools[0]
+                    .get_disks(0)
+                    .bucket_incarnation_id_from_disk("partial-crash")
+                    .await
+                    .expect("source bucket incarnation should remain stable")
+            ),
+            "the producer-bound bucket generation must survive journal replay"
+        );
+        let responsibility_id = held.responsibility_id;
+        let bucket_incarnation_id = held.bucket_incarnation_id;
+        let request_id = uuid::Uuid::new_v4();
+        mrf_queue::accept_unverified_legacy_risk(
+            responsibility_id,
+            bucket_incarnation_id,
+            true,
+            false,
+            "integration-test-operator".to_string(),
+            "The operator has accepted that legacy object identity cannot be proven automatically".to_string(),
+            "TEST-ISSUE-2682".to_string(),
+            request_id,
+        )
+        .await
+        .expect("explicit risk acceptance must persist before success");
+        assert!(snapshot_contains("crash.bin").await, "risk acceptance must retain the MRF responsibility");
+        let accepted = mrf_queue::list_legacy_responsibilities(None, 32)
+            .await
+            .expect("accepted lifecycle state should remain queryable");
+        let accepted = accepted
+            .responsibilities
+            .iter()
+            .find(|entry| entry.responsibility_id == responsibility_id)
+            .expect("accepted responsibility must remain visible");
+        assert_eq!(accepted.status, "operator_accepted_unverified");
+        assert_eq!(accepted.accepted.as_ref().map(|audit| audit.request_id), Some(request_id));
+        assert_eq!(
+            accepted.accepted.as_ref().map(|audit| audit.actor.as_str()),
+            Some("integration-test-operator")
+        );
+
+        manager
+            .stop()
+            .await
+            .expect("first manager should stop before restart verification");
+        let log = std::fs::File::create(root.path().join("lifecycle-restart.log")).expect("restart child log");
+        let mut child = Command::new(std::env::current_exe().expect("integration test executable"))
+            .args(["--exact", "mrf_legacy_lifecycle_restore_fixture", "--nocapture"])
+            .env("RUSTFS_TEST_MRF_LIFECYCLE_ROOT", root.path())
+            .env("RUSTFS_TEST_MRF_LIFECYCLE_ID", responsibility_id.to_string())
+            .stdout(Stdio::from(log.try_clone().expect("clone child log")))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("lifecycle restart fixture should start");
+        let restored = wait_until(|| async { root.path().join("lifecycle-restored").exists() }).await;
+        let status = child.wait().expect("lifecycle restart fixture should exit");
+        assert!(
+            restored && status.success(),
+            "operator-accepted state should survive process restart: {}",
+            std::fs::read_to_string(root.path().join("lifecycle-restart.log")).expect("read child evidence")
+        );
+        return;
     }
+    manager.stop().await.expect("restarted manager should stop");
+}
+
+#[test]
+fn mrf_legacy_lifecycle_restore_fixture() {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mrf-lifecycle-restore".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("lifecycle restore runtime should build");
+            runtime.block_on(mrf_legacy_lifecycle_restore_fixture_inner());
+        })
+        .expect("lifecycle restore thread should spawn")
+        .join()
+        .expect("lifecycle restore thread should finish");
+}
+
+async fn mrf_legacy_lifecycle_restore_fixture_inner() {
+    let Ok(root) = std::env::var("RUSTFS_TEST_MRF_LIFECYCLE_ROOT") else {
+        return;
+    };
+    let expected_id = std::env::var("RUSTFS_TEST_MRF_LIFECYCLE_ID")
+        .expect("lifecycle child responsibility ID")
+        .parse::<uuid::Uuid>()
+        .expect("valid lifecycle child responsibility ID");
+    let root = std::path::PathBuf::from(root);
+    let env = TestECStoreEnv::builder().base_dir(&root).build().await;
+    let manager = manager(&env);
+    manager.start().await.expect("restarted heal manager should start");
+    mrf_queue::spawn_mrf_consumer(manager.clone());
+    assert!(
+        wait_until(|| async {
+            mrf_queue::list_legacy_responsibilities(None, 32).await.is_ok_and(|snapshot| {
+                snapshot
+                    .responsibilities
+                    .iter()
+                    .any(|entry| entry.responsibility_id == expected_id)
+            })
+        })
+        .await,
+        "durable operator-accepted lifecycle state must replay"
+    );
+    let restored = mrf_queue::list_legacy_responsibilities(None, 32)
+        .await
+        .expect("restored lifecycle listing should be available");
+    let entry = restored
+        .responsibilities
+        .iter()
+        .find(|entry| entry.responsibility_id == expected_id)
+        .expect("restart listing matched the stable generation");
+    assert_eq!(entry.status, "operator_accepted_unverified");
+    assert_eq!(
+        entry.accepted.as_ref().map(|audit| audit.actor.as_str()),
+        Some("integration-test-operator")
+    );
+    assert!(
+        snapshot_contains("crash.bin").await,
+        "risk-accepted responsibility remains in the durable journal"
+    );
+    tokio::fs::write(root.join("lifecycle-restored"), b"restored")
+        .await
+        .expect("signal lifecycle restore");
     manager.stop().await.expect("restarted manager should stop");
 }
