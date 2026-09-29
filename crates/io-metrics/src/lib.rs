@@ -49,8 +49,9 @@
 #[macro_use]
 extern crate metrics;
 
+use std::collections::HashMap;
 use std::sync::{
-    Mutex,
+    LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -61,6 +62,25 @@ use std::sync::{
 /// Enabled only through an explicit runtime opt-in.
 static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static GET_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+static GET_STAGE_LOCAL_SUMMARY_ENABLED: AtomicBool = AtomicBool::new(false);
+static GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE: AtomicU64 = AtomicU64::new(64);
+static GET_STAGE_LOCAL_SUMMARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+type GetStageLocalSummaryKey = (&'static str, &'static str, &'static str, &'static str);
+
+/// Sampled local aggregate for one bounded GetObject stage label set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetStageLocalSummary {
+    pub path: &'static str,
+    pub stage: &'static str,
+    pub object_class: &'static str,
+    pub size_bucket: &'static str,
+    pub sampled_count: u64,
+    pub duration_nanoseconds: u64,
+}
+
+static GET_STAGE_LOCAL_SUMMARY: LazyLock<Mutex<HashMap<GetStageLocalSummaryKey, GetStageLocalSummary>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Global switch for all remaining (non GET/PUT-stage) metric emission in this
 /// crate's free `record_*` functions — I/O scheduler, bytes-pool, zero-copy,
@@ -85,6 +105,66 @@ pub fn set_put_stage_metrics_enabled(enabled: bool) {
 
 pub fn set_get_stage_metrics_enabled(enabled: bool) {
     GET_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_get_stage_local_summary_enabled(enabled: bool) {
+    GET_STAGE_LOCAL_SUMMARY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_get_stage_local_summary_sample_rate(sample_rate: u64) {
+    GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE.store(sample_rate.max(1), Ordering::Relaxed);
+}
+
+pub fn get_stage_local_summary_enabled() -> bool {
+    GET_STAGE_LOCAL_SUMMARY_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn get_stage_local_summary_sample_rate() -> u64 {
+    GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE.load(Ordering::Relaxed)
+}
+
+pub fn take_get_stage_local_summary() -> Vec<GetStageLocalSummary> {
+    let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
+        return Vec::new();
+    };
+    let mut rows = summary.drain().map(|(_, row)| row).collect::<Vec<_>>();
+    rows.sort_unstable_by_key(|row| (row.path, row.stage, row.object_class, row.size_bucket));
+    rows
+}
+
+fn record_get_stage_local_summary(
+    path: &'static str,
+    stage: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    duration_secs: f64,
+) {
+    let sample_rate = get_stage_local_summary_sample_rate();
+    if sample_rate > 1 && GET_STAGE_LOCAL_SUMMARY_SEQUENCE.fetch_add(1, Ordering::Relaxed) % sample_rate != 0 {
+        return;
+    }
+
+    let Ok(duration) = std::time::Duration::try_from_secs_f64(duration_secs) else {
+        return;
+    };
+    let Ok(duration_nanoseconds) = u64::try_from(duration.as_nanos()) else {
+        return;
+    };
+
+    let key = (path, stage, object_class, size_bucket);
+    let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
+        return;
+    };
+    let row = summary.entry(key).or_insert_with(|| GetStageLocalSummary {
+        path,
+        stage,
+        object_class,
+        size_bucket,
+        sampled_count: 0,
+        duration_nanoseconds: 0,
+    });
+    row.sampled_count = row.sampled_count.saturating_add(1);
+    row.duration_nanoseconds = row.duration_nanoseconds.saturating_add(duration_nanoseconds);
 }
 
 /// Enable or disable general (non GET/PUT-stage) metric emission.
@@ -964,6 +1044,10 @@ pub fn record_get_object_io_state(
 /// Record GetObject phase duration for the current read path.
 #[inline(always)]
 pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str, duration_secs: f64) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary(path, stage, "", "", duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -979,6 +1063,10 @@ pub fn record_get_object_stage_duration_by_size(
     size_bucket: &'static str,
     duration_secs: f64,
 ) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary(path, stage, object_class, size_bucket, duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -1872,6 +1960,10 @@ pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
 /// Record metadata phase duration with early-stop state label.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration_with_early_stop(duration_secs: f64, early_stop_active: &'static str) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("legacy_duplex", "metadata", early_stop_active, "", duration_secs);
+        return;
+    }
     if !get_stage_metrics_enabled() {
         return;
     }
