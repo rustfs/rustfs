@@ -93,6 +93,8 @@ pub(crate) enum LocalTraceCaptureError {
     Network(String),
     #[error("local diagnostic cancellation was not acknowledged")]
     CancellationUnconfirmed,
+    #[error("selected offline identity is unavailable or unsafe")]
+    OfflineIdentity,
 }
 
 pub(crate) struct LocalTraceCaptureRuntime {
@@ -1441,6 +1443,20 @@ fn load_offline_key(state_root: &Path, offline_key_id: &str) -> Result<crate::co
     Ok(key)
 }
 
+pub(crate) fn load_selected_offline_key(
+    state_root: &Path,
+    offline_key_id: &str,
+) -> Result<crate::connect::DeviceIdentity, LocalTraceCaptureError> {
+    if offline_key_id.len() != 64
+        || !offline_key_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(LocalTraceCaptureError::OfflineIdentity);
+    }
+    load_offline_key(state_root, offline_key_id).map_err(|_| LocalTraceCaptureError::OfflineIdentity)
+}
+
 async fn capture_local_runtime_profile(
     state_root: &Path,
     protocol_version: u16,
@@ -2098,6 +2114,48 @@ mod tests {
             duration_millis: 1_000,
             traffic_bytes: 65_536,
         }
+    }
+
+    #[test]
+    fn selected_offline_key_never_falls_back_or_follows_unsafe_state() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, key) = runtime_request(state.path());
+        let store = crate::connect::OfflineKeyStore::new(state.path());
+        assert_eq!(
+            super::load_selected_offline_key(state.path(), &request.offline_key_id)
+                .unwrap()
+                .public_key_der(),
+            key.public_key_der()
+        );
+        assert!(super::load_selected_offline_key(state.path(), &"0".repeat(64)).is_err());
+
+        let path = store.key_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::load_selected_offline_key(state.path(), &request.offline_key_id).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::load_selected_offline_key(state.path(), &request.offline_key_id).is_err());
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let target = state.path().join("key-target");
+        std::fs::rename(&path, &target).unwrap();
+        crate::connect::IdentityStore::new(state.path().join("identity"))
+            .load_or_create()
+            .unwrap();
+        assert!(super::load_selected_offline_key(state.path(), &request.offline_key_id).is_err());
+        symlink(&target, &path).unwrap();
+        assert!(super::load_selected_offline_key(state.path(), &request.offline_key_id).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&target, &path).unwrap();
+        std::fs::set_permissions(state.path().join("offline"), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::load_selected_offline_key(state.path(), &request.offline_key_id).is_err());
+        std::fs::set_permissions(state.path().join("offline"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked_root = state.path().join("linked-root");
+        symlink(state.path(), &linked_root).unwrap();
+        assert!(super::load_selected_offline_key(&linked_root, &request.offline_key_id).is_err());
     }
 
     #[tokio::test]

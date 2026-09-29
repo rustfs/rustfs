@@ -867,10 +867,14 @@ async fn execute_connect_client_performance(options: ConnectClientPerformanceOpt
 
     let duration = Duration::from_millis(options.duration_millis);
     validate_client_limits(duration, options.traffic_bytes).map_err(Error::other)?;
-    let key = IdentityStore::new(options.state_dir.join("identity"))
-        .load()
-        .map_err(Error::other)?
-        .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?;
+    let key = if let Some(offline_key_id) = options.offline_key_id.as_deref() {
+        crate::connect::load_selected_offline_key(&options.state_dir, offline_key_id).map_err(Error::other)?
+    } else {
+        IdentityStore::new(options.state_dir.join("identity"))
+            .load()
+            .map_err(Error::other)?
+            .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?
+    };
     let access_key = read_protected_client_credential(&options.access_key_file).map_err(Error::other)?;
     let secret_key = read_protected_client_credential(&options.secret_key_file).map_err(Error::other)?;
     let session_token = options
