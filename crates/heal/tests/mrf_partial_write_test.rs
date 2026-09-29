@@ -30,7 +30,8 @@ use tokio::io::AsyncReadExt;
 mod storage_api;
 use storage_api::endpoint_index::{EndpointServerPools, Endpoints, init_local_disks};
 use storage_api::integration::{
-    DiskAPI, DiskError, DiskStore, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
+    DiskAPI, DiskError, DiskStore, EcstoreStorageError, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
+    RUSTFS_META_BUCKET, ReadOptions,
 };
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
@@ -194,8 +195,7 @@ async fn degraded_deleted_partial_write_is_discharged_by_an_absence_proof_inner(
             assert!(
                 matches!(
                     &failed_put,
-                    rustfs_ecstore::api::error::StorageError::ErasureWriteQuorum
-                        | rustfs_ecstore::api::error::StorageError::InsufficientWriteQuorum(_, _)
+                    EcstoreStorageError::ErasureWriteQuorum | EcstoreStorageError::InsufficientWriteQuorum(_, _)
                 ),
                 "the rejected write must report a write-quorum failure: {failed_put:?}"
             );
