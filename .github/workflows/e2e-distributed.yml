@@ -38,6 +38,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - ".config/nextest.toml"
+      - ".config/e2e-distributed-selection.txt"
       - ".github/workflows/e2e-distributed.yml"
       - "crates/audit/**"
       - "crates/common/**"

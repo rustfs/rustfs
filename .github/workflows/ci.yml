@@ -47,12 +47,12 @@ permissions:
   contents: read
 
 # Concurrency groups are scoped per event so different triggers never cancel
-# each other: PR pushes cancel the previous run of that PR, main pushes keep
-# latest-wins semantics among themselves, and scheduled runs always complete
-# (a shared group used to let every merge kill the weekly scheduled run).
+# each other. PR pushes cancel superseded attempts; main and scheduled runs
+# finish so a busy merge stream cannot starve the complete baseline. For main,
+# GitHub retains one running run and replaces the pending run with the latest.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -128,7 +128,7 @@ jobs:
 
   test-and-lint:
     name: Workspace Test and Lint
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -146,11 +146,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # Every lane in this workflow reads its cache and none writes it.
-          # cache-warm.yml is the sole writer for all four keys: this workflow
-          # cancels superseded runs on main, and a cancelled run never reaches
-          # rust-cache's post step, so writing from here saved nothing (12 of 15
-          # consecutive main-push runs were cancelled). See rustfs/backlog#1600.
+          # Every lane reads its cache; cache-warm.yml remains the sole writer
+          # with the matching feature closure. Tests never compete to replace
+          # shared caches, including when a PR attempt is cancelled.
           cache-shared-key: ci-dev
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
@@ -222,18 +220,18 @@ jobs:
           trap './scripts/ci/resource_sampler.sh stop' EXIT
           set +e
           NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
-            cargo nextest run --profile ci --all --exclude e2e_test \
+            cargo nextest run --profile ci --all --exclude e2e_test --features rustfs-ecstore/test-util \
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/test-and-lint/nextest.log
           status=${PIPESTATUS[0]}
           if [[ "${status}" -eq 0 ]]; then
-            cargo nextest list --profile ci --all --exclude e2e_test --message-format json \
+            cargo nextest list --profile ci --all --exclude e2e_test --features rustfs-ecstore/test-util --message-format json \
               > artifacts/test-and-lint/core-test-listing.json \
               && python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json \
               && test -s target/nextest/ci/junit.xml || status=$?
           fi
           {
-            echo "command=cargo nextest run --profile ci --all --exclude e2e_test"
+            echo "command=cargo nextest run --profile ci --all --exclude e2e_test --features rustfs-ecstore/test-util"
             echo "exit_status=${status}"
             echo "finished_at=$(date --utc --iso-8601=seconds)"
             echo
@@ -281,21 +279,10 @@ jobs:
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
 
-      # Explicit gate for migration-critical suites. These tests already ran in
-      # the full nextest pass above; a single filtered nextest invocation keeps
-      # the named gate without rebuilding or re-running them one package at a time.
-      #
-      # The gate selects tests by name substring (data_movement / rebalance /
-      # decommission / source_cleanup / delete_marker), so renames can silently
-      # thin it. The script owns the filter expression and first verifies the
-      # selected-test count against the committed floor in
-      # .config/migration-gate-floor.txt before running the gate; renames or
-      # removals must update that file consciously (see the script header).
-      # Kept on the default profile (no --profile ci): a second --profile ci run
-      # would clobber target/nextest/ci/junit.xml, and none of these tests are
-      # quarantined so they gain nothing from the ci profile's retry overrides.
-      - name: Run rebalance/decommission migration proofs
-        run: ./scripts/check_migration_gate_count.sh
+      # Preserve the migration floor and require successful execution evidence
+      # from the workspace run, without compiling or executing its subset again.
+      - name: Verify rebalance/decommission migration proofs
+        run: ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
 
   # This gate builds into a fresh target directory to isolate the E2E root.
   # Give its cold build a separate budget from workspace tests and migration proofs.
@@ -574,7 +561,7 @@ jobs:
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 30
