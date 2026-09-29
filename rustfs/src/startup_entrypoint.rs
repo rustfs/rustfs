@@ -676,8 +676,7 @@ fn unix_now() -> Result<i64> {
 async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     use crate::connect::{
         IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
-        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_locks, capture_top_net,
-        capture_top_rpc,
+        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_net, capture_top_rpc,
     };
 
     let (tool_id, options) = match command {
@@ -693,11 +692,11 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Err(Error::other("connect_top_limits_invalid"));
     }
 
-    if tool_id == "top.disk" {
+    if matches!(tool_id, "top.disk" | "top.locks") {
         let offline_key_id = options
             .offline_key_id
             .ok_or_else(|| Error::other("--offline-key-id must select an existing offline identity"))?;
-        let input = crate::connect::diagnostics::LocalTopDiskRequest {
+        let input = crate::connect::diagnostics::LocalTopRequest {
             offline_key_id,
             organization_name: options.organization,
             cluster_name: options.cluster,
@@ -713,7 +712,13 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
             export_validity_seconds: options.export_validity_seconds,
         };
         let cancel = CancellationToken::new();
-        let capture = crate::connect::request_local_top_disk(&options.state_dir, input, &cancel);
+        let capture = async {
+            if tool_id == "top.disk" {
+                crate::connect::request_local_top_disk(&options.state_dir, input, &cancel).await
+            } else {
+                crate::connect::request_local_top_locks(&options.state_dir, input, &cancel).await
+            }
+        };
         tokio::pin!(capture);
         let export = tokio::select! {
             biased;
@@ -722,7 +727,7 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
                 cancel.cancel();
                 return match capture.await {
                     Err(error) => Err(Error::other(error)),
-                    Ok(_) => Err(Error::other("top disk collection cancelled")),
+                    Ok(_) => Err(Error::other("top collection cancelled")),
                 };
             }
             result = &mut capture => result.map_err(Error::other)?,
@@ -753,7 +758,7 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Ok(());
     }
     if options.offline_key_id.is_some() {
-        return Err(Error::other("--offline-key-id is only supported for top disk"));
+        return Err(Error::other("--offline-key-id is only supported for top disk or locks"));
     }
     let identity = IdentityStore::new(options.state_dir.join("identity"))
         .load()
@@ -786,10 +791,6 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     match tool_id {
         "top.api" => {
             let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.locks" => {
-            let result = await_top_capture(capture_top_locks(&request, &cancel), &cancel).await?;
             finish_top_capture(&request, result, &identity, options.output, &cancel).await
         }
         "top.net" => {
