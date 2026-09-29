@@ -52,6 +52,7 @@ mod config_test;
 // Re-export public types
 #[cfg(test)]
 pub(crate) use cli::Cli;
+pub use cli::ConnectHealthOpts;
 pub use cli::ConnectSiteReplicationPerformanceOpts;
 pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{

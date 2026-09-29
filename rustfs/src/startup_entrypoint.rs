@@ -15,11 +15,11 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
-        ConnectEnvironmentInventoryOpts, ConnectInspectObjectOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts,
-        ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts,
-        ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts,
-        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
-        ConnectTopCommands, Opt,
+        ConnectEnvironmentInventoryOpts, ConnectHealthOpts, ConnectInspectObjectOpts, ConnectLicenseCommands,
+        ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation,
+        ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts,
+        ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
+        ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -149,6 +149,7 @@ async fn async_main() -> Result<()> {
             return execute_connect_site_replication_performance(*options).await;
         }
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
+        CommandResult::ConnectHealth(options) => return execute_connect_health(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
@@ -1390,6 +1391,61 @@ async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts)
         "artifact={} bytes={} sha256={}",
         receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
     );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_health(options: ConnectHealthOpts) -> Result<()> {
+    let cancel = CancellationToken::new();
+    let request = crate::connect::LocalHealthRequest {
+        offline_key_id: options.offline_key_id,
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: 1,
+        capability: crate::connect::HEALTH_SERVICE_CAPABILITY.to_owned(),
+        consent_uid: options.consent_uid,
+        policy_revision: options.policy_revision,
+        consent_expires_at_unix: options.consent_expires_at_unix,
+        acknowledge_l0: options.acknowledge_l0,
+        expires_at_unix: options.expires_at_unix,
+    };
+    let capture = crate::connect::request_local_health(&options.state_dir, request, &cancel);
+    tokio::pin!(capture);
+    let archive = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return match capture.await {
+                Err(error) => Err(Error::other(error)),
+                Ok(_) => Err(Error::other("health collection cancelled")),
+            };
+        }
+        result = &mut capture => result.map_err(Error::other)?,
+    };
+    let size = archive.archive_bytes.len();
+    let sha256 = archive.archive_sha256.clone();
+    let artifact_uid = archive.artifact_uid.clone();
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        crate::connect::save_signed_health_export(&output, &archive.archive_bytes, &archive.artifact_uid, &writer_cancel)
+    });
+    tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?;
+            return Err(Error::other("health export cancelled"));
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    }
+    println!("tool=health.check outcome=PARTIAL");
+    println!("artifact={artifact_uid} bytes={size} sha256={sha256}");
     println!("upload=not-performed");
     Ok(())
 }
