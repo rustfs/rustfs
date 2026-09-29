@@ -177,7 +177,8 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] =
+    &["POST /v1/{prefix}/catalog/backup", "POST /v1/{prefix}/catalog/restore"];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
@@ -186,6 +187,8 @@ static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = Ge
 static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
     MaterializeTableCatalogMigrationHandler {};
 static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
+static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
+static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
@@ -460,6 +463,24 @@ struct CatalogImportRequest {
     metadata_location: String,
     #[serde(default)]
     properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBackupRequest {
+    #[serde(default, rename = "expected-snapshot-etag")]
+    expected_snapshot_etag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogRestoreRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
+    #[serde(default, rename = "expected-snapshot-etag")]
+    expected_snapshot_etag: Option<String>,
+    #[serde(default, rename = "allow-replace")]
+    allow_replace: bool,
 }
 
 #[derive(Debug, Deserialize)]

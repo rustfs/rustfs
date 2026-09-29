@@ -1033,6 +1033,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup",
+        GET_TABLE_CATALOG,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/restore",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
         "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
@@ -1318,6 +1330,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/catalog/migration",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup",
+        GET_TABLE_CATALOG,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/restore",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -2088,6 +2112,10 @@ mod tests {
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Delete, "/iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Delete, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
         assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",

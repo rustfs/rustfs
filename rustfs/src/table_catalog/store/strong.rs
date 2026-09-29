@@ -51,7 +51,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) hydrated: bool,
     snapshot_required: bool,
     pub(in crate::table_catalog) snapshot_etag: Option<String>,
-    snapshot_version: Option<u16>,
+    pub(super) snapshot_version: Option<u16>,
     pub(in crate::table_catalog) table_buckets: BTreeMap<String, TableBucketEntry>,
     pub(in crate::table_catalog) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
     namespace_children: BTreeMap<StrongNamespaceChildKey, String>,
@@ -102,7 +102,8 @@ pub(in crate::table_catalog) struct StrongTableCatalogSnapshot {
     pub(in crate::table_catalog) idempotency: Vec<StrongCommitSnapshotRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
     pub(super) table_bucket: TableBucketEntry,
     pub(super) namespaces: Vec<NamespaceEntry>,
@@ -113,7 +114,7 @@ pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
 }
 
 #[derive(Clone)]
-enum StrongSnapshotWritePostcondition {
+pub(super) enum StrongSnapshotWritePostcondition {
     TableBucketPresent(TableBucketEntry),
     TableBucketAbsent(String),
     NamespacePresent(NamespaceEntry),
@@ -297,8 +298,8 @@ pub(in crate::table_catalog) fn table_catalog_bucket_snapshot_fingerprint(
 
 #[derive(Clone)]
 pub(crate) struct StrongTableCatalogStore<B> {
-    object_backend: B,
-    snapshot_write_version: u16,
+    pub(super) object_backend: B,
+    pub(super) snapshot_write_version: u16,
     snapshot_required_on_start: bool,
     // Single mutex protecting all catalog state (table_buckets, namespaces, tables, views, commits, idempotency).
     // This is intentional: many operations require atomic read-modify-write across multiple fields.
@@ -309,7 +310,7 @@ pub(crate) struct StrongTableCatalogStore<B> {
     // 3. Using optimistic concurrency with version checks
     pub(in crate::table_catalog) state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
     // Coalesces reloads for clones of one store so only one task reads and decodes a changed snapshot.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -596,7 +597,7 @@ where
         }
     }
 
-    fn bucket_snapshot_from_state_locked(
+    pub(super) fn bucket_snapshot_from_state_locked(
         state: &StrongTableCatalogState,
         table_bucket: &str,
     ) -> Option<StrongTableCatalogBucketSnapshot> {
@@ -646,7 +647,7 @@ where
         })
     }
 
-    fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
+    pub(super) fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
         state.table_buckets.remove(table_bucket);
         state.namespaces.retain(|(entry_bucket, _), _| entry_bucket != table_bucket);
         state
@@ -960,7 +961,7 @@ where
         Ok(())
     }
 
-    fn snapshot_from_mutated_state_locked(
+    pub(super) fn snapshot_from_mutated_state_locked(
         state: &mut StrongTableCatalogState,
         configured_write_version: u16,
     ) -> TableCatalogStoreResult<StrongTableCatalogSnapshot> {
@@ -1000,7 +1001,7 @@ where
         Ok(snapshot)
     }
 
-    fn state_from_snapshot(
+    pub(super) fn state_from_snapshot(
         snapshot: StrongTableCatalogSnapshot,
         snapshot_etag: Option<String>,
     ) -> TableCatalogStoreResult<StrongTableCatalogState> {
@@ -1228,7 +1229,7 @@ where
         );
     }
 
-    async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
+    pub(super) async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
         let Some((current_snapshot_etag, current_snapshot_required)) = ({
             let state = self.state.lock().await;
             if state.hydrated {
@@ -1330,7 +1331,7 @@ where
         ))
     }
 
-    async fn finalize_snapshot_write(
+    pub(super) async fn finalize_snapshot_write(
         &self,
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
@@ -1591,7 +1592,7 @@ where
         Ok(())
     }
 
-    fn table_commit_recovery_report_for_entry_locked(
+    pub(super) fn table_commit_recovery_report_for_entry_locked(
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {

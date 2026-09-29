@@ -14,10 +14,14 @@
 
 use super::*;
 
+mod backup;
 mod migration;
 mod object;
 mod strong;
 
+pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
+#[cfg(test)]
+pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
@@ -567,6 +571,7 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+    pub size: u64,
 }
 
 pub(crate) struct TableCatalogLockGuard {
@@ -680,6 +685,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: object.data.len() as u64,
             }))
     }
 
@@ -694,6 +700,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
                 mod_time: object.mod_time,
+                size: object.data.len() as u64,
             }))
     }
 
@@ -1149,6 +1156,26 @@ impl TableCatalogObjectPaths {
         format!(
             "{}/{}/{}",
             self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK
+        )
+    }
+
+    pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
+        format!(
+            "{}/{}/{}/{}.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket),
+            table_catalog_path_hash(backup_id)
+        )
+    }
+
+    pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_RESTORE_ROOT,
+            table_catalog_path_hash(table_bucket),
+            TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE
         )
     }
 
@@ -1782,6 +1809,42 @@ where
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
         }
     }
+
+    pub(crate) async fn create_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        expected_snapshot_etag: Option<&str>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog backup requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn restore_durable_catalog_backup(
+        &self,
+        table_bucket: &str,
+        backup_id: &str,
+        expected_snapshot_etag: Option<&str>,
+        allow_replace: bool,
+    ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "durable catalog restore requires durable-strong backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .await
+            }
+        }
+    }
 }
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
@@ -1869,6 +1932,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
@@ -1895,6 +1959,7 @@ where
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
+                size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
             })),
             Err(err) if is_missing_storage_error(&err) => Ok(None),
             Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
