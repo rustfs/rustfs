@@ -2706,6 +2706,16 @@ mod tests {
         let Some(state) = std::env::var_os("RUSTFS_TEST_TOP_DISK_STATE") else {
             return;
         };
+        super::super::top_disk::AFTER_INITIAL_DISK_SNAPSHOT
+            .set(|| {
+                // Keep real writes between the collector's snapshots in this dedicated child.
+                let mut file = tempfile::tempfile().expect("create top.disk fixture file");
+                for _ in 0..32 {
+                    file.write_all(&[1u8; 4096]).expect("write top.disk fixture data");
+                }
+                file.sync_all().expect("flush top.disk fixture data");
+            })
+            .expect("install top.disk fixture writer once");
         let state = std::path::PathBuf::from(state);
         let stop = CancellationToken::new();
         let input_stop = stop.clone();
@@ -2715,12 +2725,7 @@ mod tests {
         });
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let runtime = spawn_local_trace_capture_runtime(&state, &stop).unwrap();
-            let mut file = tempfile::tempfile().unwrap();
-            while !stop.is_cancelled() {
-                file.write_all(&[1u8; 4096]).unwrap();
-                file.sync_all().unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            stop.cancelled().await;
             runtime.shutdown().await;
         });
     }
