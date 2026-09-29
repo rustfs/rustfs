@@ -87,3 +87,11 @@ pub(crate) async fn request_local_top_locks(
 ) -> Result<super::top_disk::LocalTopArchive, LocalTraceCaptureError> {
     Err(LocalTraceCaptureError::RuntimeUnavailable)
 }
+
+pub(crate) async fn request_local_top_api(
+    _state_root: &Path,
+    _request: super::top_disk::LocalTopRequest,
+    _cancel: &CancellationToken,
+) -> Result<super::top_disk::LocalTopArchive, LocalTraceCaptureError> {
+    Err(LocalTraceCaptureError::RuntimeUnavailable)
+}

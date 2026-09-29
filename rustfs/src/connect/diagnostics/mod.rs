@@ -173,8 +173,8 @@ pub use trace_record::{
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
 pub(crate) use trace_runtime::{
     LocalHealthRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_health,
-    request_local_native_threads_profile, request_local_runtime_profile, request_local_top_disk, request_local_top_locks,
-    request_local_trace_capture, spawn_local_trace_capture_runtime,
+    request_local_native_threads_profile, request_local_runtime_profile, request_local_top_api, request_local_top_disk,
+    request_local_top_locks, request_local_trace_capture, spawn_local_trace_capture_runtime,
 };
 
 pub(crate) use top_api::save_top_archive;

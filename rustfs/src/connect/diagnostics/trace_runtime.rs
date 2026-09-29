@@ -14,7 +14,7 @@
 
 //! Owner-only local transport between diagnostic CLI commands and the running server.
 //!
-//! Version 1 accepts TRACE_RECORD, RUNTIME_PROFILE, NATIVE_THREADS_PROFILE, TOP_DISK, TOP_LOCKS and HEALTH. Signed requests select
+//! Version 1 accepts TRACE_RECORD, RUNTIME_PROFILE, NATIVE_THREADS_PROFILE, TOP_API, TOP_DISK, TOP_LOCKS and HEALTH. Signed requests select
 //! an existing offline key by SPKI digest; this is not proof of Connect enrollment.
 //! The receiver checks enrollment, target ownership and consent at import. The
 //! server owns provenance, nonce generation, capture and signing; the CLI receives
@@ -54,6 +54,7 @@ const SOCKET_MODE: u32 = 0o600;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalTopKind {
+    Api,
     Disk,
     Locks,
 }
@@ -61,6 +62,7 @@ enum LocalTopKind {
 impl LocalTopKind {
     const fn tool_id(self) -> &'static str {
         match self {
+            Self::Api => "top.api",
             Self::Disk => "top.disk",
             Self::Locks => "top.locks",
         }
@@ -132,6 +134,10 @@ enum CaptureRequest {
         request: LocalRuntimeProfileRequest,
     },
     TopDisk {
+        protocol_version: u16,
+        request: super::top_disk::LocalTopRequest,
+    },
+    TopApi {
         protocol_version: u16,
         request: super::top_disk::LocalTopRequest,
     },
@@ -240,6 +246,14 @@ enum CaptureResponse {
         artifact_uid: String,
     },
     TopDiskError {
+        code: RuntimeErrorCode,
+    },
+    TopApiOk {
+        archive_base64: String,
+        archive_sha256: String,
+        artifact_uid: String,
+    },
+    TopApiError {
         code: RuntimeErrorCode,
     },
     TopLocksOk {
@@ -583,6 +597,14 @@ pub(crate) async fn request_local_top_locks(
     request_local_top_capture(state_root, request, cancel, LocalTopKind::Locks).await
 }
 
+pub(crate) async fn request_local_top_api(
+    state_root: &Path,
+    request: super::top_disk::LocalTopRequest,
+    cancel: &CancellationToken,
+) -> Result<super::top_disk::LocalTopArchive, LocalTraceCaptureError> {
+    request_local_top_capture(state_root, request, cancel, LocalTopKind::Api).await
+}
+
 async fn request_local_top_capture(
     state_root: &Path,
     request: super::top_disk::LocalTopRequest,
@@ -603,6 +625,10 @@ async fn request_local_top_capture(
             request,
         },
         LocalTopKind::Locks => CaptureRequest::TopLocks {
+            protocol_version: PROTOCOL_VERSION,
+            request,
+        },
+        LocalTopKind::Api => CaptureRequest::TopApi {
             protocol_version: PROTOCOL_VERSION,
             request,
         },
@@ -640,6 +666,7 @@ async fn request_local_top_capture(
             let acknowledged = match tokio::time::timeout(Duration::from_secs(2), &mut response).await {
                 Ok(Ok(Ok(CaptureResponse::TopDiskError { .. } | CaptureResponse::TopDiskOk { .. }))) => kind == LocalTopKind::Disk,
                 Ok(Ok(Ok(CaptureResponse::TopLocksError { .. } | CaptureResponse::TopLocksOk { .. }))) => kind == LocalTopKind::Locks,
+                Ok(Ok(Ok(CaptureResponse::TopApiError { .. } | CaptureResponse::TopApiOk { .. }))) => kind == LocalTopKind::Api,
                 _ => false,
             };
             if !acknowledged { return Err(LocalTraceCaptureError::CancellationUnconfirmed); }
@@ -663,6 +690,14 @@ async fn request_local_top_capture(
                 archive_sha256,
                 artifact_uid: returned_uid,
             },
+        )
+        | (
+            LocalTopKind::Api,
+            CaptureResponse::TopApiOk {
+                archive_base64,
+                archive_sha256,
+                artifact_uid: returned_uid,
+            },
         ) => {
             let archive_bytes = URL_SAFE_NO_PAD
                 .decode_to_vec(&archive_base64)
@@ -682,7 +717,8 @@ async fn request_local_top_capture(
             })
         }
         (LocalTopKind::Disk, CaptureResponse::TopDiskError { code })
-        | (LocalTopKind::Locks, CaptureResponse::TopLocksError { code }) => Err(LocalTraceCaptureError::Top(format!("{code:?}"))),
+        | (LocalTopKind::Locks, CaptureResponse::TopLocksError { code })
+        | (LocalTopKind::Api, CaptureResponse::TopApiError { code }) => Err(LocalTraceCaptureError::Top(format!("{code:?}"))),
         _ => Err(LocalTraceCaptureError::Protocol),
     }
 }
@@ -811,8 +847,14 @@ async fn handle_top_capture(
             archive_sha256: export.archive_sha256,
             artifact_uid: export.artifact_uid,
         },
+        (LocalTopKind::Api, Ok(export)) => CaptureResponse::TopApiOk {
+            archive_base64: URL_SAFE_NO_PAD.encode_to_string(&export.archive_bytes),
+            archive_sha256: export.archive_sha256,
+            artifact_uid: export.artifact_uid,
+        },
         (LocalTopKind::Disk, Err(code)) => CaptureResponse::TopDiskError { code },
         (LocalTopKind::Locks, Err(code)) => CaptureResponse::TopLocksError { code },
+        (LocalTopKind::Api, Err(code)) => CaptureResponse::TopApiError { code },
     };
     if let Ok(bytes) = serde_json::to_vec(&response)
         && bytes.len() as u64 <= MAX_RUNTIME_RESPONSE_BYTES
@@ -994,6 +1036,12 @@ async fn capture_local_top(
         }
         LocalTopKind::Locks => {
             let result = super::top_locks::capture_top_locks(&request, cancel)
+                .await
+                .map_err(top_error)?;
+            sign_local_top_result(&request, &result, &key, cancel)
+        }
+        LocalTopKind::Api => {
+            let result = super::top_api::capture_top_api(&request, super::top_api::TopApiOperation::GetObject, cancel)
                 .await
                 .map_err(top_error)?;
             sign_local_top_result(&request, &result, &key, cancel)
@@ -1316,6 +1364,13 @@ async fn handle_connection(stream: UnixStream, state_root: PathBuf, shutdown: Ca
             request,
         } => {
             handle_top_capture(reader, writer, &state_root, protocol_version, request, shutdown, LocalTopKind::Locks).await;
+            return;
+        }
+        CaptureRequest::TopApi {
+            protocol_version,
+            request,
+        } => {
+            handle_top_capture(reader, writer, &state_root, protocol_version, request, shutdown, LocalTopKind::Api).await;
             return;
         }
         CaptureRequest::Health {
@@ -1807,6 +1862,129 @@ mod tests {
         assert!(serde_json::from_value::<super::super::top_disk::LocalTopRequest>(value).is_err());
     }
 
+    #[tokio::test]
+    async fn local_top_api_rejects_consent_expiry_and_missing_offline_key() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = disk_request(state.path());
+        std::fs::remove_file(crate::connect::OfflineKeyStore::new(state.path()).key_path()).unwrap();
+        request.acknowledge_l3 = false;
+        assert!(matches!(
+            super::capture_local_top(state.path(), 1, request.clone(), &CancellationToken::new(), super::LocalTopKind::Api).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        request.acknowledge_l3 = true;
+        request.consent_expires_at_unix = 1;
+        assert!(matches!(
+            super::capture_local_top(state.path(), 1, request.clone(), &CancellationToken::new(), super::LocalTopKind::Api).await,
+            Err(super::RuntimeErrorCode::ConsentExpired)
+        ));
+        request.consent_expires_at_unix = request.run_expires_at_unix + 60;
+        assert!(matches!(
+            super::capture_local_top(state.path(), 1, request, &CancellationToken::new(), super::LocalTopKind::Api).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+    }
+
+    #[test]
+    fn local_top_api_service_child() {
+        use rustfs_io_metrics::record_s3_op;
+        use rustfs_s3_ops::S3Operation;
+        use std::io::Read as _;
+
+        let Some(state) = std::env::var_os("RUSTFS_TEST_TOP_API_STATE") else {
+            return;
+        };
+        let stop = CancellationToken::new();
+        let input_stop = stop.clone();
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().read(&mut [0u8]);
+            input_stop.cancel();
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
+            let emit = async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while telemetry_trace_subscriber_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("top.api service subscriber");
+                for (operation, status) in [
+                    (S3Operation::GetObject, 200),
+                    (S3Operation::GetObject, 503),
+                    (S3Operation::PutObject, 500),
+                ] {
+                    let mut guard = crate::server::s3_http_request_guard("GET");
+                    guard.in_scope(|| record_s3_op(operation));
+                    tokio::task::yield_now().await;
+                    guard.response(status);
+                }
+            };
+            tokio::select! {
+                _ = stop.cancelled() => {},
+                _ = emit => stop.cancelled().await,
+            }
+            runtime.shutdown().await;
+        });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_top_api_reads_service_s3_events_and_signs_offline() {
+        use std::io::Read as _;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = disk_request(state.path());
+        request.window_millis = 500;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "connect::diagnostics::trace_runtime::tests::local_top_api_service_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RUSTFS_TEST_TOP_API_STATE", state.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.path().join(super::SOCKET_FILE).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let result = if ready.is_ok() {
+            super::request_local_top_api(state.path(), request.clone(), &CancellationToken::new()).await
+        } else {
+            Err(LocalTraceCaptureError::Protocol)
+        };
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success(), "capture error: {:?}", result.as_ref().err());
+        let export = result.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
+        let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
+        assert_eq!(result["toolId"], "top.api");
+        assert_eq!(result["outcome"], "SUCCEEDED");
+        assert_eq!(result["runUid"], request.run_uid);
+        assert_eq!(result["data"]["operation"], "GET_OBJECT");
+        assert_eq!(result["data"]["requestCount"], 2);
+        assert_eq!(result["data"]["errorCount"], 1);
+        let mut envelope = Vec::new();
+        zip.by_name("envelope.json").unwrap().read_to_end(&mut envelope).unwrap();
+        let envelope_value: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(envelope_value["deviceKeyId"], request.offline_key_id);
+        assert_eq!(envelope_value["organizationName"], request.organization_name);
+        assert_eq!(envelope_value["clusterName"], request.cluster_name);
+        assert_eq!(envelope_value["deviceName"], request.device_name);
+        assert_eq!(envelope_value["classification"], "L3");
+        let key = super::load_offline_key(state.path(), &request.offline_key_id).unwrap();
+        let signature: serde_json::Value = serde_json::from_reader(zip.by_name("envelope.sig").unwrap()).unwrap();
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope);
+        assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
+    }
+
     #[test]
     fn local_top_locks_service_child() {
         use std::io::Read as _;
@@ -2264,7 +2442,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn local_signed_capture_does_not_claim_unacknowledged_cancellation() {
-        for kind in 0..3 {
+        for kind in 0..4 {
             let state = tempfile::tempdir().unwrap();
             std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let (request, _) = runtime_request(state.path());
@@ -2293,7 +2471,10 @@ mod tests {
                     1 => super::request_local_native_threads_profile(&state_root, request, &task_cancel)
                         .await
                         .map(|_| ()),
-                    _ => super::request_local_top_disk(&state_root, disk_input, &task_cancel)
+                    2 => super::request_local_top_disk(&state_root, disk_input, &task_cancel)
+                        .await
+                        .map(|_| ()),
+                    _ => super::request_local_top_api(&state_root, disk_input, &task_cancel)
                         .await
                         .map(|_| ()),
                 }
