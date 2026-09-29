@@ -1453,7 +1453,12 @@ mod tests {
         let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG")
             .unwrap_or_else(|_| "rustfs::heal::task=info,rustfs=error".to_string());
         cluster.set_env("RUST_LOG", server_rust_log);
-        let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| format!("{}/logs", cluster.temp_dir));
+        let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| {
+            // Keep explicit directories compatible and isolate parallel suite captures.
+            std::env::var("RUSTFS_HEAL_CHAOS_LOG_ROOT")
+                .map(|root| format!("{root}/{interruption_kind}-{}", uuid::Uuid::new_v4()))
+                .unwrap_or_else(|_| format!("{}/logs", cluster.temp_dir))
+        });
         std::fs::create_dir_all(&log_dir)?;
         for node_index in 0..cluster.nodes.len() {
             cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
