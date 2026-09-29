@@ -998,7 +998,18 @@ impl DataUsageCache {
             // not bind to the process-local leader epoch.
             receipt.digest = digest;
         }
-        if let Some(progress) = &mut self.info.scan_progress {
+        // A sweep without a durable position restarts from the first entry,
+        // so it observes nothing under the plan that finished the previous
+        // sweep. Keeping that plan would mark every sweep of a bucket written
+        // between cycles as mixed, and the bucket could never certify.
+        let has_position = self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some();
+        if let Some(progress) = &mut self.info.scan_progress
+            && has_position
+        {
             progress.requested_plan = scan_plan_digest;
         } else {
             self.info.scan_progress = Some(DataUsageScanProgress {
