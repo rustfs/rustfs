@@ -193,13 +193,10 @@ jobs:
           # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
           # merge path is untouched while the experiment runs.
           #
-          # Dispatch is included because push alone cannot supply the samples:
-          # this workflow cancels superseded runs on main, and only 4 of the last
-          # 20 push-triggered Test and Lint jobs reached a terminal state — at
-          # that rate ten samples would take roughly fifty merges. The
-          # concurrency group is scoped by event_name, so a dispatched run has
-          # its own group and is not cancelled by merge traffic, which makes the
-          # sample collectable on demand rather than by waiting.
+          # During baseline collection, main pushes cancelled superseded runs:
+          # only 4 of 20 Test and Lint jobs reached a terminal state. Running
+          # main validations now finish; dispatch remains an independent group
+          # for collecting additional samples on demand.
           #
           # Baseline over 17 samples at 2:
           # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2

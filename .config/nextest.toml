@@ -162,6 +162,13 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
 threads-required = "num-test-threads"
 
+# Real target-repair and rebalance-stop fixtures commit durable metadata while
+# peers wait on production locks or bounded cancellation checks. Reserve IO
+# capacity for each fixture; its internal races and deadlines remain intact.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
+threads-required = "num-test-threads"
+
 # Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
 # Their existing deadlines, assertions, and retry policy remain in force.
 [[profile.default.overrides]]
@@ -388,6 +395,12 @@ threads-required = "num-test-threads"
 # production lock deadline, internal concurrency, assertions, or retry policy.
 [[profile.ci.overrides]]
 filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
+threads-required = "num-test-threads"
+
+# Match the real admin fixture capacity reservation without retries or changes
+# to production lock deadlines, cancellation barriers, or assertions.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
 threads-required = "num-test-threads"
 
 # Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
