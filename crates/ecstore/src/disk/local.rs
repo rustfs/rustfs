@@ -10554,28 +10554,30 @@ impl DiskAPI for LocalDisk {
                 };
                 write_metacache_obj(&mut out, &meta).await?;
                 objs_returned += 1;
-            } else {
-                let fpath = self
-                    .io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+            }
 
-                if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
-                    && meta.is_file()
+            // A plain object shares this directory with its children even when
+            // an explicit directory marker exists in the sibling encoded path.
+            let fpath =
+                self.io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+
+            if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
+                && meta.is_file()
+            {
+                skip_current_dir_object = true;
+                if let Ok(meta_bytes) = with_walk_stall_deadline(
+                    stall,
+                    self.read_metadata(
+                        opts.bucket.as_str(),
+                        path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
+                    ),
+                )
+                .await?
+                    && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                    && let Ok(data_dirs) = file_meta.get_data_dirs()
                 {
-                    skip_current_dir_object = true;
-                    if let Ok(meta_bytes) = with_walk_stall_deadline(
-                        stall,
-                        self.read_metadata(
-                            opts.bucket.as_str(),
-                            path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
-                        ),
-                    )
-                    .await?
-                        && let Ok(file_meta) = FileMeta::load(&meta_bytes)
-                        && let Ok(data_dirs) = file_meta.get_data_dirs()
-                    {
-                        for data_dir in data_dirs.iter().flatten() {
-                            multipart_dir_to_skip.insert(data_dir.to_string());
-                        }
+                    for data_dir in data_dirs.iter().flatten() {
+                        multipart_dir_to_skip.insert(data_dir.to_string());
                     }
                 }
             }
@@ -18879,6 +18881,89 @@ mod test {
             ),
             0
         );
+    }
+
+    async fn assert_walk_dir_prefix_marker_entries(with_plain_object: bool) {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        async fn write_metadata(root: &Path, name: &str, size: i64, data_dir: Option<Uuid>) -> Vec<u8> {
+            let object_dir = root.join(encode_dir_object(name));
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("object directory should be created");
+            let mut file_info = FileInfo::new(name, 1, 1);
+            file_info.size = size;
+            file_info.data_dir = data_dir;
+            file_info.mod_time = Some(OffsetDateTime::now_utc());
+            let mut metadata = FileMeta::default();
+            metadata.add_version(file_info).expect("object metadata should be valid");
+            let bytes = metadata.marshal_msg().expect("object metadata should encode");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &bytes)
+                .await
+                .expect("object metadata should be written");
+            bytes
+        }
+
+        let dir = tempdir().expect("temporary disk should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let marker_metadata = write_metadata(&bucket_dir, "content/", 0, None).await;
+        let child_metadata = write_metadata(&bucket_dir, "content/child", 7, None).await;
+        let data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("data directory UUID should parse");
+        if with_plain_object {
+            write_metadata(&bucket_dir, "content", 19, Some(data_dir)).await;
+            // A storage data directory can contain metadata-bearing subdirectories.
+            // The entire directory must be skipped rather than exposed as objects.
+            write_metadata(&bucket_dir, &format!("content/{data_dir}/segment"), 31, None).await;
+            fs::write(bucket_dir.join("content").join(data_dir.to_string()).join("part.1"), b"part")
+                .await
+                .expect("object part should be written");
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let (reader, mut writer) = tokio::io::duplex(65536);
+        disk.walk_dir(
+            WalkDirOptions {
+                bucket: bucket.to_owned(),
+                base_dir: "content/".to_owned(),
+                recursive: true,
+                ..Default::default()
+            },
+            &mut writer,
+        )
+        .await
+        .expect("prefix walk should succeed");
+        let entries = MetacacheReader::new(reader)
+            .read_all()
+            .await
+            .expect("walk output should decode");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.name.starts_with(&format!("content/{data_dir}"))),
+            "plain object storage directories must not appear in the walk"
+        );
+        let objects: Vec<_> = entries.into_iter().filter(MetaCacheEntry::is_object).collect();
+        assert_eq!(
+            objects.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["content/", "content/child"],
+            "the marker and child must each appear exactly once"
+        );
+        assert_eq!(objects[0].metadata, marker_metadata, "the marker must retain its own metadata");
+        assert_eq!(objects[1].metadata, child_metadata, "the child must retain its own metadata");
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_prefix_marker_with_children_is_unique() {
+        assert_walk_dir_prefix_marker_entries(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_prefix_marker_skips_plain_object_and_parts() {
+        assert_walk_dir_prefix_marker_entries(true).await;
     }
 
     #[tokio::test]

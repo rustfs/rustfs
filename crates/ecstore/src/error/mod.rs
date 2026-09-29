@@ -623,8 +623,9 @@ impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
             StorageError::Io(e) => {
-                if let Some(error) =
-                    DiskError::clone_dangling_delete_grace(e).or_else(|| DiskError::clone_retired_marker_deferred(e))
+                if let Some(error) = DiskError::clone_rpc_status_io_error(e)
+                    .or_else(|| DiskError::clone_dangling_delete_grace(e))
+                    .or_else(|| DiskError::clone_retired_marker_deferred(e))
                 {
                     return StorageError::Io(error);
                 }

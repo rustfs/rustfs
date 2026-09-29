@@ -1599,6 +1599,8 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                // Hold this object's hedge timer so real-disk latency cannot add speculative fanout.
+                let _hedge_timer = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER);
                 let calls = disk_call_counters::observe(&object);
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)

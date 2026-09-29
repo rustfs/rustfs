@@ -1264,7 +1264,11 @@ mod tests {
 
         match result {
             Ok(_) => panic!("expected open_target_queue_store to fail on file base path"),
-            Err(err) => assert!(err.to_string().contains("custom open context")),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("custom open context"));
+                assert!(message.contains(base.to_string_lossy().as_ref()));
+            }
         }
         let _ = fs::remove_file(base);
     }

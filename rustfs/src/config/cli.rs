@@ -137,6 +137,8 @@ pub enum ConnectCommands {
     Performance(ConnectPerformanceOpts),
     /// Capture a consent-bound local profile and write a signed export
     Profile(ConnectProfileOpts),
+    /// Capture bounded service health in the running server and write a signed export
+    Health(ConnectHealthOpts),
     /// Capture allow-listed local log events and write a signed export
     Logs(ConnectLogsOpts),
     /// Record, forward, or replay consent-bound telemetry
@@ -391,7 +393,7 @@ pub enum ConnectTopCommands {
 
 #[derive(Args, Clone)]
 pub struct ConnectTopCaptureOpts {
-    /// Explicit existing offline identity pin, required for service disk capture
+    /// Explicit existing offline identity pin, required for service API, disk, locks and RPC capture
     #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
     pub offline_key_id: Option<String>,
     /// Directory containing an enrolled Connect device identity
@@ -1027,6 +1029,50 @@ pub enum ConnectLogsMode {
     Live,
 }
 
+/// `connect health` options.
+#[derive(Args, Clone)]
+pub struct ConnectHealthOpts {
+    /// Owner-only server state directory containing an enrolled offline identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// SHA-256 of the enrolled offline public key
+    #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub offline_key_id: String,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Organization resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    /// Cluster resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    /// Cluster-device resource name bound to the export
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    /// UUIDv7 diagnostic run identifier issued by Connect
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    /// UUIDv7 artifact identifier issued by Connect
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    /// UUIDv7 consent identifier issued by Connect
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    /// Consent policy revision bound to this capture
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    /// Consent expiry as UTC Unix seconds
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    /// Artifact expiry as UTC Unix seconds
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    /// Confirm this explicit local L0 health capture
+    #[arg(long = "acknowledge-l0", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l0: bool,
+}
+
 /// `connect profile` options.
 #[derive(Args, Clone)]
 pub struct ConnectProfileOpts {
@@ -1589,6 +1635,8 @@ pub enum CommandResult {
     ConnectSiteReplicationPerformance(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Consent-bound local Connect profile export
     ConnectProfile(ConnectProfileOpts),
+    /// Consent-bound serving-process health export
+    ConnectHealth(ConnectHealthOpts),
     /// Consent-bound local Connect log export
     ConnectLogs(ConnectLogsOpts),
     /// Consent-bound local Connect telemetry operation

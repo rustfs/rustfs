@@ -57,7 +57,7 @@ permissions:
 jobs:
   profile-threads:
     name: Verify Linux x86_64 profile.threads service job
-    runs-on: sm-standard-2
+    runs-on: dind-sm-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout acceptance harness
@@ -88,6 +88,39 @@ jobs:
           cache: npm
           cache-dependency-path: connect-harness/web/package-lock.json
 
+      - name: Ensure GitHub CLI
+        shell: bash
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+
+          gh_version="2.101.0"
+          case "$(uname -m)" in
+            x86_64) gh_arch="amd64" ;;
+            aarch64|arm64) gh_arch="arm64" ;;
+            *)
+              echo "Unsupported Linux architecture for GitHub CLI: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          gh_install_root="${RUNNER_TEMP:-$PWD}/gh-cli"
+          rm -rf "$gh_install_root"
+          mkdir -p "$gh_install_root/bin"
+          archive="$gh_install_root/gh.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_${gh_arch}.tar.gz" \
+            --output "$archive"
+          tar -xzf "$archive" -C "$gh_install_root"
+          install -m 0755 \
+            "$gh_install_root/gh_${gh_version}_linux_${gh_arch}/bin/gh" \
+            "$gh_install_root/bin/gh"
+          echo "$gh_install_root/bin" >> "$GITHUB_PATH"
+          export PATH="$gh_install_root/bin:$PATH"
+          gh --version
+
       - name: Verify source run and artifact identity
         shell: bash
         env:
@@ -115,7 +148,7 @@ jobs:
           [[ $(jq -r '.head_repository.full_name' <<<"$run") == "$GITHUB_REPOSITORY" ]]
           [[ $(jq -r '.name' <<<"$run") == "Build and Release" ]]
 
-          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-2, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
+          expected_job='Build RustFS (linux-x86_64-gnu, sm-standard-4, x86_64-unknown-linux-gnu, false, linux, pyroscope)'
           jobs=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e --arg name "$expected_job" '
             [.[].jobs[] | select(.name == $name)] as $matches

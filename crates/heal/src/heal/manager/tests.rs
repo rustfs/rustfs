@@ -1228,6 +1228,7 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
         }),
         delete_marker_purge: None,
         lease: None,
+        durable_anchor: None,
     };
     let matching = HealObjectOutcome {
         identity: HealObjectIdentity {
@@ -1336,6 +1337,102 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
 }
 
 #[test]
+fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    use rustfs_common::mrf_channel::{
+        MrfDurableRepairAnchor, MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent,
+    };
+
+    let bucket = Arc::<str>::from("legacy-held-bucket");
+    let object = Arc::<str>::from("legacy-held-object");
+    let scope = MrfScope {
+        pool_index: 1,
+        set_index: 2,
+    };
+    let mut intent = MrfIntent {
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(scope),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let lease = intent.lease.expect("replayed intent should own a generation");
+    let anchor = MrfDurableRepairAnchor {
+        kind: MrfKind::PartialWrite,
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        scope: Some(scope),
+        delete_marker_purge: None,
+        lease,
+        bucket_incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let target = MrfRepairNoticeTarget {
+        bucket: bucket.clone(),
+        object: object.clone(),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        scope: Some(scope),
+        delete_marker_purge: None,
+        lease: Some(lease),
+        durable_anchor: Some(anchor.clone()),
+    };
+    let incarnation = anchor.bucket_incarnation_id;
+    let outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Unknown,
+        detail: Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_string()),
+    };
+
+    let event = super::scheduler::unverified_legacy_mrf_event_for_target(&target, &outcome)
+        .expect("exact legacy partial-write outcome should park only its runtime retry");
+    assert_eq!(event.anchor, anchor);
+
+    let wrong_identity = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            object: "other-object".to_string(),
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_identity).is_none());
+    let missing_incarnation = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            bucket_incarnation_id: None,
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &missing_incarnation).is_none());
+    let wrong_incarnation = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            bucket_incarnation_id: Some(uuid::Uuid::new_v4()),
+            ..outcome.identity.clone()
+        },
+        ..outcome.clone()
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_incarnation).is_none());
+    let wrong_reason = HealObjectOutcome {
+        detail: Some("object was readable".to_string()),
+        ..outcome
+    };
+    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_none());
+}
+
+#[test]
 fn completed_mrf_notice_publishes_only_verified_positive_events() {
     use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome};
     use rustfs_common::mrf_channel::{MrfKind, MrfScope, take_mrf_verified_repair_events_for};
@@ -1355,6 +1452,7 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
         }),
         delete_marker_purge: None,
         lease: None,
+        durable_anchor: None,
     };
     let mismatch_target = MrfRepairNoticeTarget {
         object: Arc::from("object-b"),

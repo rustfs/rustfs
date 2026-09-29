@@ -1166,7 +1166,7 @@ impl SetDisks {
 
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
                             result.detail =
-                                "Legacy object uses standard repair; independent object identity remains unverified".to_owned();
+                                rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned();
                         }
 
                         if disks_to_heal_count == 0 {
@@ -4862,18 +4862,33 @@ mod heal_result_report_tests {
             },
         )
         .await
-        .expect("commit all source shards");
+        .expect("commit source object");
 
-        let mut files = Vec::new();
+        // PUT can succeed at quorum while minority shards remain unavailable.
+        // Require every source disk before modifying any shard in this fixture.
+        let mut source_metadata = Vec::with_capacity(disks.len());
+        for disk in &disks {
+            source_metadata.push(disk.read_version("", bucket, object, "", &ReadOptions::default()).await);
+        }
+        assert!(
+            source_metadata.iter().all(|source| source.is_ok()),
+            "source fixture must populate all {} disks before truncation in {mode:?} mode; per-disk errors: {:?}",
+            disks.len(),
+            source_metadata
+                .iter()
+                .enumerate()
+                .map(|(slot, source)| (slot, source.as_ref().err()))
+                .collect::<Vec<_>>()
+        );
+        let files: Vec<_> = source_metadata
+            .into_iter()
+            .map(|source| source.expect("source metadata checked above"))
+            .collect();
         let mut paths = Vec::new();
         let mut original_shards = Vec::new();
         let mut original_metadata = Vec::new();
         let mut damaged = Vec::new();
-        for (slot, disk) in disks.iter().enumerate() {
-            let source = disk
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .expect("read source metadata");
+        for (slot, source) in files.iter().enumerate() {
             assert_eq!((source.erasure.data_blocks, source.erasure.parity_blocks), (12, 4));
             assert_eq!(source.parts[0].integrity.is_some(), mode == ShardIntegrityWriteMode::Protected);
             let directory = temp_dirs[slot].path().join(bucket).join(object);
@@ -4905,7 +4920,6 @@ mod heal_result_report_tests {
             }
             paths.push(path);
             original_shards.push(original);
-            files.push(source);
         }
         assert_eq!(damaged.len(), coding_indexes.len());
         if mode == ShardIntegrityWriteMode::Protected {

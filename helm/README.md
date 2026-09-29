@@ -277,7 +277,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | gatewayApi.listeners.tls.name | string | `tls` | Gateway API TLS passthrough listener name. |
 | gatewayApi.listeners.tls.port | int | `443` | Gateway API TLS passthrough listener port. |
 | gatewayApi.listeners.tls.backendPort | int | `null` | Backend service port that terminates TLS; defaults to the console port. |
-| gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
+| gatewayApi.hostname | string | `example.rustfs.com` | Console hostname for Gateway API. |
+| gatewayApi.endpointHostname | string | `""` | Optional separate S3 endpoint hostname; empty disables the S3 HTTPRoute. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
 | gatewayApi.existingGateway.namespace | string | `""` |  The namespace of the existing gateway, if not the local namespace. |
@@ -449,7 +450,21 @@ NAME           HOSTNAMES            AGE
 rustfs-route   ["example.rustfs.com"]   172m
 ```
 
-Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
+Access the console at `https://example.rustfs.com`; HTTP redirects to HTTPS by default. HTTPRoutes reference the chart's Kubernetes Service directly and do not require the TraefikService CRD or Traefik's Kubernetes CRD provider. The former TraefikService cookie stickiness is no longer configured by this chart.
+
+To expose the S3 endpoint alongside the console, set a different `gatewayApi.endpointHostname`:
+
+```yaml
+gatewayApi:
+  enabled: true
+  hostname: console.example.com
+  endpointHostname: s3.example.com
+  existingGateway:
+    name: shared-gateway
+    namespace: gateway-system
+```
+
+The console route uses `service.console.port` (9001 by default), and the optional S3 route uses `service.endpoint.port` (9000 by default). Both attach to the configured HTTPS listener and preserve request paths. Configure DNS and the Gateway's TLS certificate for both hostnames. When using a Gateway in another namespace, its listener must allow routes from the RustFS namespace. Leaving `endpointHostname` empty preserves the console-only behavior.
 
 For end-to-end encryption, set `gatewayApi.listeners.tls.enabled` to `true`. The chart then adds a `TLS` listener with `tls.mode: Passthrough` to the `Gateway` and generates a `TLSRoute` that forwards the encrypted stream to the RustFS service, where TLS is terminated on the backend side. Note that backend TLS termination must be configured on RustFS itself (for example `RUSTFS_TLS_PATH` pointing to server certificates), and the installed Gateway API CRDs must include `TLSRoute`.
 

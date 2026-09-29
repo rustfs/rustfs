@@ -198,6 +198,11 @@ impl Error {
 }
 
 fn is_recoverable_internode_error(error: &std::io::Error) -> bool {
+    // A peer restart can cancel an RPC after a partial repair. Replay it within
+    // the existing heal retry budget; task cancellation remains terminal.
+    if DiskError::io_error_is_rpc_cancelled(error) {
+        return true;
+    }
     let Some(error) = error.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) else {
         return false;
     };
@@ -258,6 +263,39 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn cancelled_rpc_is_recoverable_across_storage_error_conversions() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        let disk = DiskError::from(status.clone());
+        let storage = EcstoreError::from(status.clone());
+        let disk_storage = EcstoreError::from(DiskError::from(status.clone()));
+        for error in [
+            Error::Disk(disk.clone()),
+            Error::Disk(disk),
+            Error::Storage(storage.clone()),
+            Error::Storage(storage),
+            Error::Storage(disk_storage.clone()),
+            Error::Storage(disk_storage),
+            Error::Io(std::io::Error::from(DiskError::from(status))),
+        ] {
+            assert!(error.is_recoverable_heal(), "typed RPC cancellation must be recoverable: {error:?}");
+        }
+        for status in [
+            tonic::Status::permission_denied("operation was canceled"),
+            tonic::Status::unauthenticated("operation was canceled"),
+            tonic::Status::invalid_argument("operation was canceled"),
+            tonic::Status::internal("operation was canceled"),
+        ] {
+            assert!(
+                !Error::Storage(EcstoreError::from(status).clone()).is_recoverable_heal(),
+                "cancellation text alone must not change application error classification"
+            );
+        }
+        assert!(!Error::Io(std::io::Error::other("operation was canceled")).is_recoverable_heal());
+        assert!(!Error::TaskCancelled.is_recoverable_heal());
+        assert!(!Error::TaskTimeout.is_recoverable_heal());
+    }
 
     #[test]
     fn internode_transport_errors_keep_their_recovery_classification() {

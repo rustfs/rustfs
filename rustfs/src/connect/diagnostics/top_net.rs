@@ -16,7 +16,6 @@
 
 use serde::Serialize;
 use sysinfo::Networks;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopReasonCode, TopResult};
@@ -57,10 +56,11 @@ pub async fn capture_top_net(
     if networks.is_empty() {
         return request.failed(TOOL_ID, 0, TopReasonCode::SourceUnavailable);
     }
-    let started = Instant::now();
     if !request.wait_window(TOOL_ID, cancel).await? {
         return request.cancelled(TOOL_ID);
     }
+    // Report the authorized window; see capture_top_disk.
+    let window_millis = u64::try_from(request.window.as_millis()).map_err(|_| TopCaptureError::Limits)?;
     let observed = rustfs_obs::metrics::stats_collector::collect_host_network_stats(&mut networks);
     evaluate_network_window(
         request,
@@ -72,7 +72,7 @@ pub async fn capture_top_net(
             received_bytes: observed.total_received,
             sent_bytes: observed.total_transmitted,
         },
-        elapsed_millis(started.elapsed()),
+        window_millis,
     )
 }
 
@@ -108,8 +108,4 @@ pub fn evaluate_network_window(
             window_millis,
         },
     )
-}
-
-fn elapsed_millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1)
 }

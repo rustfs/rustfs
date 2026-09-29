@@ -24,6 +24,12 @@ pub const HEAL_DELETE_DANGLING: bool = true;
 pub const RUSTFS_RESERVED_BUCKET: &str = "rustfs";
 pub const RUSTFS_RESERVED_BUCKET_PATH: &str = "/rustfs";
 
+/// Detail attached to a completed deep heal when a healthy legacy object has
+/// no independent identity commitment. Durable MRF handling uses this exact
+/// reason to pause proofless retries without treating the object as repaired.
+pub const LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL: &str =
+    "Legacy object uses standard repair; independent object identity remains unverified";
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum HealItemType {
     Metadata,

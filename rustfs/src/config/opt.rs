@@ -159,6 +159,7 @@ impl Opt {
                     }
                 },
                 ConnectCommands::Profile(opts) => Ok(CommandResult::ConnectProfile(opts)),
+                ConnectCommands::Health(opts) => Ok(CommandResult::ConnectHealth(opts)),
                 ConnectCommands::Logs(opts) => Ok(CommandResult::ConnectLogs(opts)),
                 ConnectCommands::Telemetry(opts) => Ok(CommandResult::ConnectTelemetry(opts.command)),
                 ConnectCommands::Top(opts) => Ok(CommandResult::ConnectTop(opts.command)),

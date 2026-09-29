@@ -669,8 +669,13 @@ jobs:
           package_file="${{ steps.package.outputs.package_file }}"
           archive_members="$(unzip -Z1 "$package_file" | sort)"
           expected_members=$'rustfs\nrustfs-cli'
+          target="${{ matrix.target }}"
+          features="${{ matrix.features }}"
+          if [[ "$target" == *-linux-gnu && "$features" == "pyroscope" ]]; then
+            expected_members+=$'\nrustfs.cpu-symbol-catalog.json\nrustfs.cpu-symbol-catalog.sha256'
+          fi
           if [[ "$archive_members" != "$expected_members" ]]; then
-            echo "Linux package must contain exactly rustfs and rustfs-cli" >&2
+            echo "Linux package does not contain the expected files" >&2
             printf '%s\n' "$archive_members" >&2
             exit 1
           fi
@@ -1162,7 +1167,7 @@ jobs:
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

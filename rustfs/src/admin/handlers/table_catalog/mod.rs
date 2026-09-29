@@ -4761,12 +4761,14 @@ where
                     "manifest changed entries must belong to the committed snapshot"
                 ));
             }
+            // Rewritten files may preserve an older data sequence number.
             if status == 1
-                && manifest.location.sequence_number.is_some_and(|sequence_number| {
-                    reference.sequence_number != Some(sequence_number) || reference.file_sequence_number != Some(sequence_number)
-                })
+                && manifest
+                    .location
+                    .sequence_number
+                    .is_some_and(|sequence_number| reference.file_sequence_number != Some(sequence_number))
             {
-                return Err(s3_error!(InvalidRequest, "added manifest entry sequence must match its manifest"));
+                return Err(s3_error!(InvalidRequest, "added manifest entry file sequence must match its manifest"));
             }
             if status == 2
                 && context
