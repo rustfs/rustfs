@@ -284,6 +284,16 @@ Reports scanner-driven bitrot state together with heal queue execution state. `h
 
 Use this route when `metrics.source_work` shows `heal` or `bitrot` queued or missed work. Scanner-originated object checks should appear under `scanner/low`, manual admin heal under `admin/high`. If scanner work grows but admin work remains blocked, treat that as heal queue pressure rather than scanner pacing pressure.
 
+Durable partial-write responsibilities also have node-local MRF metrics:
+
+| Metric | Meaning |
+|---|---|
+| `rustfs_heal_mrf_queue_depth` | In-memory MRF work plus retained durable responsibilities, including held legacy entries. |
+| `rustfs_heal_mrf_unverified_legacy` | Durable `PartialWrite` entries whose completed deep check found healthy legacy data without an independent payload identity proof. The journal entry remains intact; the current process pauses automatic re-dispatch for that entry. |
+| `rustfs_heal_mrf_unverified_legacy_oldest_age_seconds` | Age of the oldest such retained responsibility on this node. |
+
+These gauges are emitted per node through the configured OTLP metrics exporter (`RUSTFS_OBS_ENDPOINT` or `RUSTFS_OBS_METRIC_ENDPOINT`). The background-heal status endpoint reports execution tasks; it does not include durable MRF responsibilities. A process restart replays unchanged journal records and checks them again; it does not delete or certify an entry, and it replays all other durable intents on that node as well. For an unversioned object, restore the expected content from a trusted canonical source with protected shard integrity enabled, then restart the node that owns the journal so its intent can obtain an exact receipt. For a versioned object, a protected rewrite creates a new version and does not resolve a responsibility for the old version; preserve the source and only retire that exact version when the intended data is backed up and an authoritative absence proof is appropriate. A successful receipt may discharge only the matching responsibility; an unverified result remains retained and becomes held again. If no trusted copy or expected checksum is available, preserve the held responsibility and investigate its source of truth before retrying. The protected-copy migration in the [shard-integrity audit workflow](shard-integrity-audit.md) writes a new key and preserves its source; completing that migration alone does not prove or discharge an intent for the original key. Never remove MRF journal files manually.
+
 ## Heal runtime controls
 
 Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/src/heal/manager.rs`), the MRF queue (`crates/heal/src/heal/mrf_queue.rs`), or the erasure-set healer (`crates/heal/src/heal/erasure_healer.rs`). The admin `heal` config subsystem accepts only `bitrot_cycle` (`HEAL_KEYS`), which is documented in the scanner table above. Constants live in `crates/config/src/constants/heal.rs` unless another file is named.

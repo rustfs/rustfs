@@ -861,16 +861,19 @@ fn classify_http_response(
     operation: Option<&'static str>,
 ) -> ClassifiedHttpResponse {
     let kind = classify_http_status(status);
-    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR || operation != Some(INTERNODE_OPERATION_READ_FILE_STREAM) {
+    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
         return ClassifiedHttpResponse {
             kind,
             remote_disk_error: None,
         };
     }
-    let remote_disk_error = match headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok()) {
-        Some(INTERNODE_FILE_NOT_FOUND) => Some(RemoteDiskErrorKind::FileNotFound),
-        Some(INTERNODE_VOLUME_NOT_FOUND) => Some(RemoteDiskErrorKind::VolumeNotFound),
-        Some(INTERNODE_FILE_CORRUPT) => Some(RemoteDiskErrorKind::FileCorrupt),
+    let token = headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok());
+    let remote_disk_error = match (operation, token) {
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_FILE_NOT_FOUND)) => Some(RemoteDiskErrorKind::FileNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_VOLUME_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_VOLUME_NOT_FOUND)) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_CORRUPT)) => Some(RemoteDiskErrorKind::FileCorrupt),
         _ => None,
     };
     ClassifiedHttpResponse { kind, remote_disk_error }
@@ -2126,8 +2129,18 @@ mod tests {
         let wrong_status =
             classify_http_response(reqwest::StatusCode::NOT_FOUND, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM));
         assert!(wrong_status.remote_disk_error.is_none());
-        let wrong_operation =
+        let walk_dir_missing =
             classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_missing.remote_disk_error, Some(RemoteDiskErrorKind::FileNotFound));
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_VOLUME_NOT_FOUND.parse().unwrap());
+        let walk_dir_volume_missing =
+            classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_volume_missing.remote_disk_error, Some(RemoteDiskErrorKind::VolumeNotFound));
+        let wrong_operation = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        );
         assert!(wrong_operation.remote_disk_error.is_none());
     }
 
@@ -2150,8 +2163,8 @@ mod tests {
         }
         for operation in [
             None,
-            Some(INTERNODE_OPERATION_WALK_DIR),
             Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            Some(INTERNODE_OPERATION_WALK_DIR),
         ] {
             assert!(
                 classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, operation)
