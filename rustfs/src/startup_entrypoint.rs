@@ -1401,8 +1401,12 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     };
     use rand::{TryRng as _, rngs::SysRng};
 
-    let runtime_scope =
-        options.tool == ConnectProfileTool::Threads && options.thread_scope == Some(ConnectThreadProfileScope::TokioRuntime);
+    let runtime_scope = (options.tool == ConnectProfileTool::Threads
+        && options.thread_scope == Some(ConnectThreadProfileScope::TokioRuntime))
+        || (options.tool == ConnectProfileTool::Memory && options.offline_key_id.is_some());
+    if options.tool == ConnectProfileTool::Memory && options.thread_scope.is_some() {
+        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+    }
     if !runtime_scope && options.offline_key_id.is_some() {
         return Err(Error::other("--offline-key-id is valid only for a service runtime profile"));
     }

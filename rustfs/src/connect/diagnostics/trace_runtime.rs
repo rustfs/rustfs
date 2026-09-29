@@ -306,6 +306,11 @@ pub(crate) async fn request_local_runtime_profile(
     request: LocalRuntimeProfileRequest,
     cancel: &CancellationToken,
 ) -> Result<SignedProfileExport, LocalTraceCaptureError> {
+    let tool = match request.capability.as_str() {
+        super::profile_cpu::THREAD_PROFILE_CAPABILITY => ProfileTool::Threads,
+        super::profile_cpu::MEMORY_PROFILE_CAPABILITY => ProfileTool::Memory,
+        _ => return Err(LocalTraceCaptureError::Protocol),
+    };
     let owner = private_state_owner(state_root)?;
     let socket_path = state_root.join(SOCKET_FILE);
     socket_identity(&socket_path, owner)?;
@@ -374,7 +379,7 @@ pub(crate) async fn request_local_runtime_profile(
             }
             Ok(SignedProfileExport {
                 artifact_uid,
-                tool: ProfileTool::Threads,
+                tool,
                 outcome: ProfileOutcome::Succeeded,
                 reason_code: ProfileReasonCode::Complete,
                 archive_bytes,
@@ -717,7 +722,12 @@ async fn capture_local_runtime_profile(
     {
         return Err(RuntimeErrorCode::LimitExceeded);
     }
-    if input.schema_version != 1 || input.capability != super::profile_cpu::THREAD_PROFILE_CAPABILITY {
+    let tool = match input.capability.as_str() {
+        super::profile_cpu::THREAD_PROFILE_CAPABILITY => ProfileTool::Threads,
+        super::profile_cpu::MEMORY_PROFILE_CAPABILITY => ProfileTool::Memory,
+        _ => return Err(RuntimeErrorCode::InvalidRequest),
+    };
+    if input.schema_version != 1 {
         return Err(RuntimeErrorCode::InvalidRequest);
     }
     let key = load_offline_key(state_root, &input.offline_key_id)?;
@@ -749,19 +759,27 @@ async fn capture_local_runtime_profile(
         sample_period: Duration::from_micros(input.sample_period_micros),
         provenance,
     };
-    let metrics = tokio::runtime::Handle::current().metrics();
-    let cancel = cancel.clone();
-    // Always await this task, including after disconnect, so the lease is released before acknowledgement.
-    tokio::task::spawn_blocking(move || {
-        let result = super::profile_threads::capture_runtime_profile(&request, &metrics, MAX_PROFILE_DURATION, &cancel)?;
-        if result.outcome() != ProfileOutcome::Succeeded {
-            return Err(ProfileError::CollectionFailed);
+    match tool {
+        ProfileTool::Memory => super::profile_memory::export_memory_profile(&request, &key, cancel)
+            .await
+            .map_err(RuntimeErrorCode::from),
+        ProfileTool::Threads => {
+            let metrics = tokio::runtime::Handle::current().metrics();
+            let cancel = cancel.clone();
+            // Always await this task, including after disconnect, so the lease is released before acknowledgement.
+            tokio::task::spawn_blocking(move || {
+                let result = super::profile_threads::capture_runtime_profile(&request, &metrics, MAX_PROFILE_DURATION, &cancel)?;
+                if result.outcome() != ProfileOutcome::Succeeded {
+                    return Err(ProfileError::CollectionFailed);
+                }
+                encode_signed_profile_export(&request, &result, &key, &cancel)
+            })
+            .await
+            .map_err(|_| RuntimeErrorCode::CollectionFailed)?
+            .map_err(RuntimeErrorCode::from)
         }
-        encode_signed_profile_export(&request, &result, &key, &cancel)
-    })
-    .await
-    .map_err(|_| RuntimeErrorCode::CollectionFailed)?
-    .map_err(RuntimeErrorCode::from)
+        ProfileTool::Cpu => Err(RuntimeErrorCode::InvalidRequest),
+    }
 }
 
 async fn run_listener(listener: UnixListener, owner: u32, state_root: PathBuf, shutdown: CancellationToken) {
@@ -1340,12 +1358,51 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn local_memory_profile_signs_service_capture_with_offline_identity() {
+        use std::io::Read as _;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut request, key) = runtime_request(state.path());
+        request.capability = super::super::profile_cpu::MEMORY_PROFILE_CAPABILITY.to_owned();
+        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        let export = super::request_local_runtime_profile(state.path(), request.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(export.tool, super::ProfileTool::Memory);
+        runtime.shutdown().await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
+        let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
+        assert_eq!(result["toolId"], "profile.memory");
+        assert_eq!(result["outcome"], "SUCCEEDED");
+        assert!(result["data"]["allocatedBytes"].is_u64());
+        assert!(result["data"]["allocationCount"].is_u64());
+        let mut envelope = Vec::new();
+        zip.by_name("envelope.json").unwrap().read_to_end(&mut envelope).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(metadata["classification"], "L3");
+        assert_eq!(metadata["deviceKeyId"], request.offline_key_id);
+        let signature: serde_json::Value = serde_json::from_reader(zip.by_name("envelope.sig").unwrap()).unwrap();
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope);
+        assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
+        assert!(!state.path().join("identity").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn local_runtime_profile_rejects_invalid_consent_identity_and_protocol() {
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (request, _) = runtime_request(state.path());
         let cancel = CancellationToken::new();
         let mut invalid = request.clone();
+        invalid.acknowledge_l3 = false;
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        let mut invalid = request.clone();
+        invalid.capability = super::super::profile_cpu::MEMORY_PROFILE_CAPABILITY.to_owned();
         invalid.acknowledge_l3 = false;
         assert!(matches!(
             super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
