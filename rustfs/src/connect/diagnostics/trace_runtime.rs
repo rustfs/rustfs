@@ -1997,7 +1997,7 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 let server = tokio::spawn(async move {
                     let (socket, _) = listener.accept().await.unwrap();
-                    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::default()) });
                     server_http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(socket),
