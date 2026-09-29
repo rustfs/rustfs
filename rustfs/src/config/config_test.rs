@@ -88,6 +88,47 @@ mod tests {
     }
 
     #[test]
+    fn connect_network_cli_requires_l1_consent_and_has_no_peer_override() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "network",
+            "--state-dir",
+            "/state",
+            "--offline-key-id",
+            "key",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+        ];
+        assert!(Opt::parse_command(base).is_err());
+        let approved = base.into_iter().chain(["--acknowledge-l1"]).collect::<Vec<_>>();
+        assert!(matches!(
+            Opt::parse_command(approved.clone()),
+            Ok(CommandResult::ConnectNetworkPerformance(_))
+        ));
+        assert!(Opt::parse_command(approved.into_iter().chain(["--peer-address", "example.com"])).is_err());
+    }
+
+    #[test]
     #[serial]
     fn test_tls_inspect_subcommand_parses_tls_path_alias() {
         let result =

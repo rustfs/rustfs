@@ -456,6 +456,46 @@ pub enum ConnectPerformanceCommands {
     SiteReplication(Box<ConnectSiteReplicationPerformanceOpts>),
     /// Measure generated-file write and warm page-cache read performance
     Drive(Box<ConnectDrivePerformanceOpts>),
+    /// Measure bounded traffic to peers in the running server's cluster topology
+    Network(Box<ConnectNetworkPerformanceOpts>),
+}
+
+#[derive(Args, Clone)]
+pub struct ConnectNetworkPerformanceOpts {
+    /// Owner-only Connect runtime state containing the existing offline identity
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+    /// SHA-256 identifier of the enrolled offline public key
+    #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
+    pub offline_key_id: String,
+    /// New local archive path; an existing file is never replaced
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub organization: String,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub cluster: String,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub device: String,
+    #[arg(long = "run-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub run_uid: String,
+    #[arg(long = "artifact-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub artifact_uid: String,
+    #[arg(long = "consent-uid", value_parser = NonEmptyStringValueParser::new())]
+    pub consent_uid: String,
+    #[arg(long = "policy-revision")]
+    pub policy_revision: u64,
+    #[arg(long = "consent-expires-at")]
+    pub consent_expires_at_unix: i64,
+    #[arg(long = "expires-at")]
+    pub expires_at_unix: i64,
+    #[arg(long = "duration-millis", default_value_t = 1_000)]
+    pub duration_millis: u64,
+    /// Total traffic budget across all topology peers
+    #[arg(long = "traffic-bytes", default_value_t = 65_536)]
+    pub traffic_bytes: u64,
+    #[arg(long = "acknowledge-l1", required = true, action = clap::ArgAction::SetTrue)]
+    pub acknowledge_l1: bool,
 }
 
 #[derive(Args, Clone)]
@@ -1627,6 +1667,7 @@ pub enum CommandResult {
     ConnectEnvironmentInventory(ConnectEnvironmentInventoryOpts),
     /// Consent-bound local Connect drive performance export
     ConnectDrivePerformance(ConnectDrivePerformanceOpts),
+    ConnectNetworkPerformance(ConnectNetworkPerformanceOpts),
     /// Consent-bound client-to-deployment performance export
     ConnectClientPerformance(Box<ConnectClientPerformanceOpts>),
     /// Consent-bound S3 object performance export
