@@ -149,7 +149,7 @@ mod tests {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
         let store = OfflineKeyStore::new(&state);
 
-        let error = store.load_or_create().err().expect("public state root must fail closed");
+        let error = store.load_or_create().expect_err("public state root must fail closed");
         assert!(error.to_string().contains("mode 0700"));
         assert!(!store.key_path().exists());
         assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o7777, 0o755);
