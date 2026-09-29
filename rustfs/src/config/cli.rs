@@ -393,7 +393,7 @@ pub enum ConnectTopCommands {
 
 #[derive(Args, Clone)]
 pub struct ConnectTopCaptureOpts {
-    /// Explicit existing offline identity pin, required for service disk and locks capture
+    /// Explicit existing offline identity pin, required for service API, disk and locks capture
     #[arg(long = "offline-key-id", value_parser = NonEmptyStringValueParser::new())]
     pub offline_key_id: Option<String>,
     /// Directory containing an enrolled Connect device identity
