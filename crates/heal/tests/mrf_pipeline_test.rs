@@ -60,6 +60,16 @@ async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     heal_env_at(None).await
 }
 
+async fn heal_env_with_bucket(bucket: &str) -> (Vec<PathBuf>, Arc<dyn HealStorageAPI>) {
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("rustfs_heal_mrf_test")
+        .build()
+        .await;
+    env.make_bucket(bucket, false).await;
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+    (env.disk_paths, storage)
+}
+
 async fn heal_env_at(base_dir: Option<&Path>) -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     let mut builder = rustfs_test_utils::TestECStoreEnv::builder().prefix("rustfs_heal_mrf_test");
     if let Some(base_dir) = base_dir {
@@ -356,7 +366,7 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("replay-bucket").await;
 
     // The journal reader resolves disks through the process-local disk map;
     // register the environment's disks the same way server startup does.
@@ -387,8 +397,14 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
     assert!(
         disk_paths
             .iter()
-            .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
-        "missing authoritative journal remains absent"
+            .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "partial-write dispatch must first publish its authoritative successor"
+    );
+    let successor = journal_record(3, "replay-bucket", "partial-object", None, 1);
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &successor)
+            && committed_checkpoint_matches_on_all_disks(&disk_paths, 1, &successor),
+        "the committed and authoritative successor must preserve the partial-write identity"
     );
 
     let snapshot = manager.operations_snapshot().await;
@@ -402,7 +418,7 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("committed-bucket").await;
     register_local_disks(&disk_paths, "mrf-committed-replay-test").await;
 
     let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
@@ -534,11 +550,13 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("identity-bucket").await;
     register_local_disks(&disk_paths, "mrf-authoritative-identity-test").await;
 
-    let mut authoritative = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
-    authoritative.extend(scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 8));
+    let first_partial = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
+    let second_partial = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 8);
+    let mut authoritative = first_partial.clone();
+    authoritative.extend_from_slice(&second_partial);
     authoritative.extend(journal_record(2, "identity-bucket", "same-object", None, 0));
     authoritative.extend(journal_record(1, "identity-bucket", "same-object", Some([4u8; 16]), 0));
     let stale_legacy = journal_record(3, "identity-bucket", "stale-legacy-object", None, 0);
@@ -570,11 +588,14 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
         "decode-failure repair must not merge with object repair responsibility"
     );
     assert!(
-        disk_paths.iter().all(|path| {
-            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
-        }),
-        "partial-write responsibilities keep both replay anchors until proof"
+        journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &first_partial)
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &second_partial)
+            && committed_payload_contains_on_all_disks(&disk_paths, &[&first_partial, &second_partial]),
+        "both scoped partial-write identities must survive in the authoritative and committed successor"
+    );
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &[]),
+        "the legacy mirror must not misrepresent scoped-only partial-write responsibilities"
     );
 }
 

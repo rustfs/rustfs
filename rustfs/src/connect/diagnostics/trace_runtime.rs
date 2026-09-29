@@ -2410,13 +2410,11 @@ mod tests {
             rustfs_credentials::set_global_rpc_secret("top-rpc-local-test-secret".to_owned()).unwrap();
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             let emit = async {
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while telemetry_trace_subscriber_count() == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("top.rpc service subscriber");
+                // Executable hashing precedes subscription. The parent's bounded
+                // request and stdin cancellation govern this readiness wait.
+                while telemetry_trace_subscriber_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 let server = tokio::spawn(async move {
@@ -2552,13 +2550,11 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             let emit = async {
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while telemetry_trace_subscriber_count() == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("top.api service subscriber");
+                // Executable hashing precedes subscription. The parent's bounded
+                // request and stdin cancellation govern this readiness wait.
+                while telemetry_trace_subscriber_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
                 for (operation, status) in [
                     (S3Operation::GetObject, 200),
                     (S3Operation::GetObject, 503),
