@@ -91,7 +91,7 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
 }
 
 #[test]
-fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof() {
+fn deleted_partial_write_is_discharged_by_an_absence_proof() {
     const STACK_SIZE: usize = 8 * 1024 * 1024;
     std::thread::Builder::new()
         .name("mrf-partial-write-absence".to_owned())
@@ -102,20 +102,21 @@ fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof() {
                 .enable_all()
                 .build()
                 .expect("partial-write absence runtime should build");
-            runtime.block_on(unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inner());
+            runtime.block_on(deleted_partial_write_is_discharged_by_an_absence_proof_inner());
         })
         .expect("partial-write absence test thread should spawn")
         .join()
         .expect("partial-write absence test thread should finish");
 }
 
-async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inner() {
+async fn deleted_partial_write_is_discharged_by_an_absence_proof_inner() {
     use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent};
 
     temp_env::async_with_vars([("RUSTFS_HEAL_MRF_ENABLE", Some("true"))], async {
         let root = tempfile::tempdir().expect("partial-write absence fixture directory");
         let env = TestECStoreEnv::builder().disk_count(16).base_dir(root.path()).build().await;
         env.make_bucket("partial-absence", false).await;
+        env.make_bucket("partial-absence-versioned", true).await;
         let mut coordinator_pool = env.endpoint_pools.as_ref()[0].clone();
         let mut endpoints = coordinator_pool.endpoints.as_ref().to_vec();
         for endpoint in endpoints.iter_mut().skip(4) {
@@ -128,31 +129,99 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
 
         let manager = manager(&env);
         mrf_queue::spawn_mrf_consumer(manager.clone());
-        for (object, version_id) in [
-            ("deleted-unversioned.bin", None),
-            ("deleted-versioned.bin", Some(uuid::Uuid::new_v4())),
-        ] {
-            persist_partial_write_intent(
-                "partial-absence",
-                object,
-                version_id,
-                MrfScope {
-                    pool_index: 0,
-                    set_index: 0,
+        let scope = MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        };
+        let deleted_object = "deleted-unversioned.bin";
+        env.put_object_bytes("partial-absence", deleted_object, b"object to delete".to_vec())
+            .await;
+        persist_partial_write_intent("partial-absence", deleted_object, None, scope)
+            .await
+            .expect("durable partial-write responsibility must commit before scheduling");
+        assert!(
+            snapshot_contains(deleted_object).await,
+            "committed responsibility must exist before repair runs"
+        );
+        env.ecstore
+            .delete_object("partial-absence", deleted_object, ObjectOptions::default())
+            .await
+            .expect("delete the exact object after its durable heal responsibility commits");
+        assert!(
+            env.ecstore
+                .get_object_info("partial-absence", deleted_object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the deleted key must be absent before replay"
+        );
+        assert!(
+            snapshot_contains(deleted_object).await,
+            "deleting the object must not release its pending heal responsibility"
+        );
+
+        let versioned_bucket = "partial-absence-versioned";
+        let versioned_object = "deleted-versioned.bin";
+        let version_id = put(&env, versioned_bucket, versioned_object, b"version to delete", true)
+            .await
+            .expect("versioned PUT must return a version ID");
+        let version_uuid = uuid::Uuid::parse_str(&version_id).expect("version ID must be a UUID");
+        persist_partial_write_intent(versioned_bucket, versioned_object, Some(version_uuid), scope)
+            .await
+            .expect("versioned durable partial-write responsibility must commit before scheduling");
+        assert!(
+            snapshot_contains(versioned_object).await,
+            "versioned responsibility must remain pending before repair"
+        );
+        env.ecstore
+            .delete_object(
+                versioned_bucket,
+                versioned_object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.clone()),
+                    ..Default::default()
                 },
             )
             .await
-            .expect("durable partial-write responsibility must commit before scheduling");
-            assert!(snapshot_contains(object).await, "committed responsibility must exist before repair runs");
-        }
+            .expect("delete the exact version after its durable heal responsibility commits");
+        let deleted_version_options = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+        assert!(
+            env.ecstore
+                .get_object_info(versioned_bucket, versioned_object, &deleted_version_options)
+                .await
+                .is_err(),
+            "the deleted version must be absent before replay"
+        );
+        assert!(
+            snapshot_contains(versioned_object).await,
+            "deleting the version must not release its pending heal responsibility"
+        );
 
         manager.start().await.expect("MRF scheduler should start");
-        for object in ["deleted-unversioned.bin", "deleted-versioned.bin"] {
+        for object in [deleted_object, versioned_object] {
             assert!(
                 wait_until(|| async { !snapshot_contains(object).await }).await,
                 "complete absence proof must discharge the durable responsibility"
             );
         }
+        assert!(
+            env.ecstore
+                .get_object_info("partial-absence", deleted_object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "absence-proof replay must not recreate the deleted object"
+        );
+        assert!(
+            env.ecstore
+                .get_object_info(versioned_bucket, versioned_object, &deleted_version_options)
+                .await
+                .is_err(),
+            "absence-proof replay must not recreate the deleted version"
+        );
         assert!(
             wait_until(|| async {
                 let snapshot = manager.operations_snapshot().await;
