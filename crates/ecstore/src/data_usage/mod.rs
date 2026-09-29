@@ -6053,7 +6053,8 @@ mod tests {
             (Some(7), Some(11), true, mutation_at),
             (None, Some(11), false, mutation_at),
             (Some(7), None, false, mutation_at),
-            (Some(7), Some(11), false, mutation_at - Duration::from_nanos(1)),
+            // Windows `SystemTime` stores 100 ns intervals, so a 1 ns offset is a no-op there.
+            (Some(7), Some(11), false, mutation_at - Duration::from_micros(1)),
         ] {
             let mut snapshot = first.clone();
             snapshot.scanner_epoch = epoch;
