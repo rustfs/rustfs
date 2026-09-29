@@ -20,6 +20,36 @@ use tokio_util::sync::CancellationToken;
 
 use super::{TelemetryProducerError, TraceRecordCapture, TraceRecordLimits};
 
+pub(crate) struct LocalNetworkRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l1: bool,
+    pub expires_at_unix: i64,
+    pub duration_millis: u64,
+    pub traffic_bytes: u64,
+}
+
+pub(crate) struct LocalNetworkArchive {
+    pub artifact_uid: String,
+    pub archive_bytes: Vec<u8>,
+    pub archive_sha256: String,
+}
+
+pub(crate) async fn request_local_network(
+    _state_root: &Path,
+    _request: LocalNetworkRequest,
+    _cancel: &CancellationToken,
+) -> Result<LocalNetworkArchive, LocalTraceCaptureError> {
+    Err(LocalTraceCaptureError::RuntimeUnavailable)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum LocalTraceCaptureError {
     #[error("telemetry server runtime is unavailable")]

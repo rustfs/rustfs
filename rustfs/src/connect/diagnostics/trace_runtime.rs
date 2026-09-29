@@ -14,7 +14,7 @@
 
 //! Owner-only local transport between diagnostic CLI commands and the running server.
 //!
-//! Version 1 accepts TRACE_RECORD, RUNTIME_PROFILE, NATIVE_THREADS_PROFILE, TOP_API, TOP_DISK, TOP_LOCKS, TOP_RPC and HEALTH. Signed requests select
+//! Version 1 accepts TRACE_RECORD, RUNTIME_PROFILE, NATIVE_THREADS_PROFILE, TOP_API, TOP_DISK, TOP_LOCKS, TOP_RPC, NETWORK_PERFORMANCE and HEALTH. Signed requests select
 //! an existing offline key by SPKI digest; this is not proof of Connect enrollment.
 //! The receiver checks enrollment, target ownership and consent at import. The
 //! server owns provenance, nonce generation, capture and signing; the CLI receives
@@ -89,6 +89,8 @@ pub(crate) enum LocalTraceCaptureError {
     Health(String),
     #[error("top request rejected: {0}")]
     Top(String),
+    #[error("network performance request rejected: {0}")]
+    Network(String),
     #[error("local diagnostic cancellation was not acknowledged")]
     CancellationUnconfirmed,
 }
@@ -151,6 +153,10 @@ enum CaptureRequest {
         protocol_version: u16,
         request: super::top_disk::LocalTopRequest,
     },
+    NetworkPerformance {
+        protocol_version: u16,
+        request: LocalNetworkRequest,
+    },
     Health {
         protocol_version: u16,
         request: LocalHealthRequest,
@@ -176,6 +182,30 @@ pub(crate) struct LocalHealthRequest {
 }
 
 pub(crate) struct LocalHealthArchive {
+    pub artifact_uid: String,
+    pub archive_bytes: Vec<u8>,
+    pub archive_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct LocalNetworkRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l1: bool,
+    pub expires_at_unix: i64,
+    pub duration_millis: u64,
+    pub traffic_bytes: u64,
+}
+
+pub(crate) struct LocalNetworkArchive {
     pub artifact_uid: String,
     pub archive_bytes: Vec<u8>,
     pub archive_sha256: String,
@@ -278,6 +308,14 @@ enum CaptureResponse {
     TopRpcError {
         code: RuntimeErrorCode,
     },
+    NetworkOk {
+        archive_base64: String,
+        archive_sha256: String,
+        artifact_uid: String,
+    },
+    NetworkError {
+        code: RuntimeErrorCode,
+    },
     HealthOk {
         archive_base64: String,
         archive_sha256: String,
@@ -377,6 +415,7 @@ enum RuntimeErrorCode {
     Cancelled,
     TimedOut,
     UnsupportedPlatform,
+    SourceUnavailable,
     CollectionFailed,
 }
 
@@ -485,6 +524,86 @@ pub(crate) async fn request_local_health(
             })
         }
         CaptureResponse::HealthError { code } => Err(LocalTraceCaptureError::Health(format!("{code:?}"))),
+        _ => Err(LocalTraceCaptureError::Protocol),
+    }
+}
+
+pub(crate) async fn request_local_network(
+    state_root: &Path,
+    request: LocalNetworkRequest,
+    cancel: &CancellationToken,
+) -> Result<LocalNetworkArchive, LocalTraceCaptureError> {
+    let owner = private_state_owner(state_root)?;
+    let socket_path = state_root.join(SOCKET_FILE);
+    socket_identity(&socket_path, owner)?;
+    let stream = UnixStream::connect(&socket_path).await.map_err(LocalTraceCaptureError::Io)?;
+    if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == owner) {
+        return Err(LocalTraceCaptureError::StateSecurity);
+    }
+    let artifact_uid = request.artifact_uid.clone();
+    let mut bytes = serde_json::to_vec(&CaptureRequest::NetworkPerformance {
+        protocol_version: PROTOCOL_VERSION,
+        request,
+    })
+    .map_err(|_| LocalTraceCaptureError::Protocol)?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+        return Err(LocalTraceCaptureError::Protocol);
+    }
+    let (reader, mut writer) = stream.into_split();
+    tokio::time::timeout(REQUEST_TIMEOUT, writer.write_all(&bytes))
+        .await
+        .map_err(|_| LocalTraceCaptureError::Protocol)?
+        .map_err(LocalTraceCaptureError::Io)?;
+    let response = async {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_RUNTIME_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(LocalTraceCaptureError::Io)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_RUNTIME_RESPONSE_BYTES {
+            return Err(LocalTraceCaptureError::Protocol);
+        }
+        serde_json::from_slice::<CaptureResponse>(&bytes).map_err(|_| LocalTraceCaptureError::Protocol)
+    };
+    let response = tokio::time::timeout(super::perf_network::MAX_NETWORK_DURATION + Duration::from_secs(5), response);
+    tokio::pin!(response);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            writer.shutdown().await.map_err(|_| LocalTraceCaptureError::CancellationUnconfirmed)?;
+            let acknowledged = matches!(tokio::time::timeout(Duration::from_secs(2), &mut response).await,
+                Ok(Ok(Ok(CaptureResponse::NetworkError { .. } | CaptureResponse::NetworkOk { .. }))));
+            if !acknowledged { return Err(LocalTraceCaptureError::CancellationUnconfirmed); }
+            return Err(LocalTraceCaptureError::Network("CANCELLED".to_owned()));
+        }
+        response = &mut response => response.map_err(|_| LocalTraceCaptureError::Protocol)??,
+    };
+    match response {
+        CaptureResponse::NetworkOk {
+            archive_base64,
+            archive_sha256,
+            artifact_uid: returned_uid,
+        } => {
+            let archive_bytes = URL_SAFE_NO_PAD
+                .decode_to_vec(&archive_base64)
+                .map_err(|_| LocalTraceCaptureError::Protocol)?;
+            if archive_bytes.is_empty()
+                || archive_bytes.len() > super::perf_network::MAX_ARCHIVE_BYTES
+                || returned_uid != artifact_uid
+                || URL_SAFE_NO_PAD.encode_to_string(&archive_bytes) != archive_base64
+                || hex_simd::encode_to_string(Sha256::digest(&archive_bytes), hex_simd::AsciiCase::Lower) != archive_sha256
+            {
+                return Err(LocalTraceCaptureError::Protocol);
+            }
+            Ok(LocalNetworkArchive {
+                artifact_uid,
+                archive_bytes,
+                archive_sha256,
+            })
+        }
+        CaptureResponse::NetworkError { code } => Err(LocalTraceCaptureError::Network(format!("{code:?}"))),
         _ => Err(LocalTraceCaptureError::Protocol),
     }
 }
@@ -906,6 +1025,159 @@ async fn handle_top_capture(
             writer.shutdown().await
         })
         .await;
+    }
+}
+
+async fn handle_network_capture(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state_root: &Path,
+    protocol_version: u16,
+    request: LocalNetworkRequest,
+    shutdown: CancellationToken,
+) {
+    let cancel = shutdown.child_token();
+    let capture = capture_local_network(state_root, protocol_version, request, &cancel);
+    tokio::pin!(capture);
+    let mut unexpected = [0_u8; 1];
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => { cancel.cancel(); let _ = capture.await; return; }
+        _ = reader.read(&mut unexpected) => { cancel.cancel(); let _ = capture.await; Err(RuntimeErrorCode::Cancelled) }
+        result = &mut capture => result,
+    };
+    let response = match result {
+        Ok(export) => CaptureResponse::NetworkOk {
+            archive_base64: URL_SAFE_NO_PAD.encode_to_string(&export.archive_bytes),
+            archive_sha256: export.archive_sha256,
+            artifact_uid: export.artifact_uid,
+        },
+        Err(code) => CaptureResponse::NetworkError { code },
+    };
+    if let Ok(bytes) = serde_json::to_vec(&response)
+        && bytes.len() as u64 <= MAX_RUNTIME_RESPONSE_BYTES
+    {
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            writer.write_all(&bytes).await?;
+            writer.shutdown().await
+        })
+        .await;
+    }
+}
+
+async fn capture_local_network(
+    state_root: &Path,
+    protocol_version: u16,
+    input: LocalNetworkRequest,
+    cancel: &CancellationToken,
+) -> Result<super::perf_network::SignedNetworkExport, RuntimeErrorCode> {
+    use super::perf_network::{
+        LocalNetworkConsent, MAX_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DURATION, MAX_TRAFFIC_BYTES, NETWORK_CAPABILITY,
+        NETWORK_SCHEMA_VERSION, NetworkOutcome, NetworkPerformanceRequest, NetworkProvenance, measure_network,
+        runtime_network_peer_aliases, sign_network_export,
+    };
+    use rand::{TryRng as _, rngs::SysRng};
+
+    if protocol_version != PROTOCOL_VERSION
+        || input.offline_key_id.len() != 64
+        || !input
+            .offline_key_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RuntimeErrorCode::InvalidRequest);
+    }
+    if cancel.is_cancelled() {
+        return Err(RuntimeErrorCode::Cancelled);
+    }
+    if !input.acknowledge_l1 || input.policy_revision == 0 {
+        return Err(RuntimeErrorCode::ConsentRequired);
+    }
+    let now = unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    if input.consent_expires_at_unix <= now || input.expires_at_unix > input.consent_expires_at_unix {
+        return Err(RuntimeErrorCode::ConsentExpired);
+    }
+    if input.expires_at_unix <= now || input.expires_at_unix.saturating_sub(now) > 2_592_000 {
+        return Err(RuntimeErrorCode::Expired);
+    }
+    if input.duration_millis == 0
+        || input.duration_millis > MAX_NETWORK_DURATION.as_millis() as u64
+        || input.traffic_bytes == 0
+        || input.traffic_bytes > MAX_TRAFFIC_BYTES
+        || input.traffic_bytes > MAX_BANDWIDTH_BYTES_PER_SECOND.saturating_mul(input.duration_millis) / 1_000
+    {
+        return Err(RuntimeErrorCode::LimitExceeded);
+    }
+    if input.duration_millis.div_ceil(1_000) as i64 > input.expires_at_unix.min(input.consent_expires_at_unix).saturating_sub(now)
+    {
+        return Err(RuntimeErrorCode::Expired);
+    }
+    let key = load_offline_key(state_root, &input.offline_key_id)?;
+    let peer_aliases = runtime_network_peer_aliases().ok_or(RuntimeErrorCode::SourceUnavailable)?;
+    let peer_count = u64::try_from(peer_aliases.len()).map_err(|_| RuntimeErrorCode::LimitExceeded)?;
+    let traffic_bytes_per_peer = input
+        .traffic_bytes
+        .checked_div(peer_count)
+        .filter(|bytes| *bytes > 0)
+        .ok_or(RuntimeErrorCode::LimitExceeded)?;
+    let provenance = super::job_delivery::executable_provenance()
+        .await
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let mut nonce = [0_u8; 32];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let request = NetworkPerformanceRequest {
+        organization_name: input.organization_name,
+        cluster_name: input.cluster_name,
+        device_name: input.device_name,
+        run_uid: input.run_uid,
+        artifact_uid: input.artifact_uid,
+        schema_version: NETWORK_SCHEMA_VERSION,
+        capability: NETWORK_CAPABILITY.to_owned(),
+        consent: LocalNetworkConsent {
+            consent_uid: input.consent_uid,
+            policy_revision: input.policy_revision,
+            expires_at_unix: input.consent_expires_at_unix,
+            confirmed: input.acknowledge_l1,
+        },
+        produced_at_unix: unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?,
+        expires_at_unix: input.expires_at_unix,
+        nonce,
+        duration: Duration::from_millis(input.duration_millis),
+        peer_aliases,
+        traffic_bytes_per_peer,
+        provenance: NetworkProvenance::new(
+            provenance.source_commit(),
+            provenance.executable_sha256(),
+            provenance.rustfs_version(),
+            provenance.build_features().to_vec(),
+        ),
+    };
+    let measurement = measure_network(&request, cancel).await.map_err(network_error)?;
+    match measurement.result.outcome() {
+        NetworkOutcome::Succeeded | NetworkOutcome::Partial => {
+            sign_network_export(&request, &measurement, &key, cancel).map_err(network_error)
+        }
+        NetworkOutcome::Cancelled => Err(RuntimeErrorCode::Cancelled),
+        NetworkOutcome::Unsupported => Err(RuntimeErrorCode::SourceUnavailable),
+        NetworkOutcome::Failed => Err(RuntimeErrorCode::CollectionFailed),
+    }
+}
+
+fn network_error(error: super::perf_network::NetworkPerformanceError) -> RuntimeErrorCode {
+    use super::perf_network::NetworkPerformanceError;
+    match error {
+        NetworkPerformanceError::ConsentRequired => RuntimeErrorCode::ConsentRequired,
+        NetworkPerformanceError::ConsentExpired => RuntimeErrorCode::ConsentExpired,
+        NetworkPerformanceError::Expired => RuntimeErrorCode::Expired,
+        NetworkPerformanceError::LimitExceeded => RuntimeErrorCode::LimitExceeded,
+        NetworkPerformanceError::Cancelled => RuntimeErrorCode::Cancelled,
+        NetworkPerformanceError::Busy => RuntimeErrorCode::Busy,
+        NetworkPerformanceError::InvalidRequest
+        | NetworkPerformanceError::UnsupportedCapability
+        | NetworkPerformanceError::UnsupportedVersion => RuntimeErrorCode::InvalidRequest,
+        _ => RuntimeErrorCode::CollectionFailed,
     }
 }
 
@@ -1426,6 +1698,13 @@ async fn handle_connection(stream: UnixStream, state_root: PathBuf, shutdown: Ca
             handle_top_capture(reader, writer, &state_root, protocol_version, request, shutdown, LocalTopKind::Rpc).await;
             return;
         }
+        CaptureRequest::NetworkPerformance {
+            protocol_version,
+            request,
+        } => {
+            handle_network_capture(reader, writer, &state_root, protocol_version, request, shutdown).await;
+            return;
+        }
         CaptureRequest::Health {
             protocol_version,
             request,
@@ -1802,6 +2081,93 @@ mod tests {
         }
     }
 
+    fn network_request(state: &std::path::Path) -> super::LocalNetworkRequest {
+        let (request, _) = runtime_request(state);
+        super::LocalNetworkRequest {
+            offline_key_id: request.offline_key_id,
+            organization_name: request.organization_name,
+            cluster_name: request.cluster_name,
+            device_name: request.device_name,
+            run_uid: request.run_uid,
+            artifact_uid: request.artifact_uid,
+            consent_uid: request.consent_uid,
+            policy_revision: request.policy_revision,
+            consent_expires_at_unix: request.consent_expires_at_unix,
+            acknowledge_l1: true,
+            expires_at_unix: request.expires_at_unix,
+            duration_millis: 1_000,
+            traffic_bytes: 65_536,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_network_rejects_unapproved_expired_and_unbounded_work_before_using_key() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = network_request(state.path());
+        std::fs::remove_file(crate::connect::OfflineKeyStore::new(state.path()).key_path()).unwrap();
+        request.acknowledge_l1 = false;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        request.acknowledge_l1 = true;
+        request.consent_expires_at_unix = 1;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::ConsentExpired)
+        ));
+        request.consent_expires_at_unix = request.expires_at_unix + 60;
+        request.traffic_bytes = 1_048_577;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::LimitExceeded)
+        ));
+        request.duration_millis = 1;
+        request.traffic_bytes = 2_000;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::LimitExceeded)
+        ));
+        request.duration_millis = 30_001;
+        request.traffic_bytes = 65_536;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::LimitExceeded)
+        ));
+        request.duration_millis = 1_000;
+        request.traffic_bytes = 65_536;
+        assert!(matches!(
+            super::capture_local_network(state.path(), 1, request, &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_network_wire_rejects_caller_selected_peer_address() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = network_request(state.path());
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire["peerAddress"] = serde_json::json!("example.com");
+        assert!(serde_json::from_value::<super::LocalNetworkRequest>(wire).is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_network_service_fails_closed_without_cluster_peers() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = network_request(state.path());
+        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        assert!(matches!(
+            super::request_local_network(state.path(), request, &CancellationToken::new()).await,
+            Err(LocalTraceCaptureError::Network(code)) if code == "SourceUnavailable"
+        ));
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn local_health_requires_consent_bounds_and_separate_offline_identity() {
         let state = tempfile::tempdir().unwrap();
@@ -1997,7 +2363,9 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 let server = tokio::spawn(async move {
                     let (socket, _) = listener.accept().await.unwrap();
-                    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::default()) });
+                    let fallback = tower::service_fn(|_| async {
+                        Ok::<_, Infallible>(Response::new(crate::storage_api::server::http::rpc::Body::empty()))
+                    });
                     server_http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(socket),
@@ -2664,7 +3032,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn local_signed_capture_does_not_claim_unacknowledged_cancellation() {
-        for kind in 0..5 {
+        for kind in 0..6 {
             let state = tempfile::tempdir().unwrap();
             std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let (request, _) = runtime_request(state.path());
@@ -2685,6 +3053,7 @@ mod tests {
             let task_cancel = cancel.clone();
             let state_root = state.path().to_path_buf();
             let disk_input = disk_request(state.path());
+            let network_input = network_request(state.path());
             let task = tokio::spawn(async move {
                 match kind {
                     0 => super::request_local_runtime_profile(&state_root, request, &task_cancel)
@@ -2699,7 +3068,10 @@ mod tests {
                     3 => super::request_local_top_api(&state_root, disk_input, &task_cancel)
                         .await
                         .map(|_| ()),
-                    _ => super::request_local_top_rpc(&state_root, disk_input, &task_cancel)
+                    4 => super::request_local_top_rpc(&state_root, disk_input, &task_cancel)
+                        .await
+                        .map(|_| ()),
+                    _ => super::request_local_network(&state_root, network_input, &task_cancel)
                         .await
                         .map(|_| ()),
                 }
