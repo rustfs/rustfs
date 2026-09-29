@@ -438,6 +438,7 @@ impl HealManager {
                             release_mrf_repair_notice_targets(&notice_targets);
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
+                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -876,6 +877,66 @@ pub(super) fn publish_verified_mrf_repair_events(targets: &[MrfRepairNoticeTarge
             .find_map(|object| mrf_verified_repair_event_for_target(target, object))
         {
             rustfs_common::mrf_channel::note_mrf_verified_repair(event);
+        }
+    }
+}
+
+pub(super) fn unverified_legacy_mrf_event_for_target(
+    target: &MrfRepairNoticeTarget,
+    outcome: &crate::heal::outcome::HealObjectOutcome,
+) -> Option<rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent> {
+    use crate::heal::outcome::{HealObjectDisposition, HealObjectKind};
+    use rustfs_common::mrf_channel::MrfKind;
+
+    let anchor = target.durable_anchor.as_ref()?;
+    if target.kind != MrfKind::PartialWrite
+        || outcome.disposition != HealObjectDisposition::Unknown
+        || outcome.detail.as_deref() != Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+    {
+        return None;
+    }
+    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
+    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    if anchor.kind != target.kind
+        || anchor.bucket != target.bucket
+        || anchor.object != target.object
+        || anchor.version_id != version_id
+        || anchor.scope != target.scope
+        || Some(anchor.lease) != target.lease
+        || outcome.identity.kind != HealObjectKind::Object
+        || outcome.identity.bucket != target.bucket.as_ref()
+        || outcome.identity.object != target.object.as_ref()
+        || outcome.identity.version_id != expected_version
+        || outcome.identity.pool_index != expected_pool
+        || outcome.identity.set_index != expected_set
+        || outcome.identity.bucket_incarnation_id != Some(anchor.bucket_incarnation_id)
+    {
+        return None;
+    }
+    Some(rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent { anchor: anchor.clone() })
+}
+
+pub(super) fn publish_unverified_legacy_mrf_events(targets: &[MrfRepairNoticeTarget], completed: &CompletedHealStatus) {
+    use crate::heal::outcome::HealExecutionOutcome;
+
+    if !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. }) {
+        return;
+    }
+    let Some(outcome) = completed.outcome.as_ref() else {
+        return;
+    };
+    if outcome.execution != HealExecutionOutcome::Completed {
+        return;
+    }
+    for target in targets {
+        if let Some(event) = outcome
+            .objects
+            .iter()
+            .find_map(|object| unverified_legacy_mrf_event_for_target(target, object))
+        {
+            rustfs_common::mrf_channel::note_mrf_unverified_legacy(event);
         }
     }
 }

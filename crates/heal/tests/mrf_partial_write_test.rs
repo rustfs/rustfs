@@ -588,6 +588,15 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
             .await,
             "legacy replay attempts must finish"
         );
+        // Cover two MRF admission backoff periods so a missed hold notice
+        // cannot pass merely because its task finished between polls.
+        let retry_window = tokio::time::Instant::now() + Duration::from_secs(12);
+        while tokio::time::Instant::now() < retry_window {
+            let snapshot = manager.operations_snapshot().await;
+            assert_eq!(snapshot.queue_length, 0, "an unverified legacy result must not refill the manager queue");
+            assert_eq!(snapshot.active_tasks, 0, "a held intent must not stay active");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(snapshot_contains("crash.bin").await, "unverified legacy responsibility must remain");
     }
     manager.stop().await.expect("restarted manager should stop");
