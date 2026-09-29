@@ -142,11 +142,11 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
-# Inventory delivery and real drive/object probes include durable filesystem IO
-# in short deadlines. Reserve capacity so unrelated storage fixtures cannot
-# exhaust those budgets. Keep the deadlines and assertions unchanged.
+# Registration, inventory delivery, and real drive/object probes include
+# durable filesystem IO in short deadlines. Reserve capacity so sibling test
+# processes cannot exhaust those budgets. Keep deadlines and assertions intact.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
 # These concurrent state writers keep the production 5s lock-acquisition limit
@@ -363,7 +363,7 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
 # Keep the same state-writer capacity reservation in CI without changing the
