@@ -88,10 +88,15 @@ pub use diagnostics::{
 };
 pub use diagnostics::{
     HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
-    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome, HealthSaveError,
     HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
     MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
-    sign_health_export,
+    save_signed_health_export, sign_health_export,
+};
+pub(crate) use diagnostics::{
+    LocalHealthRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_health,
+    request_local_native_threads_profile, request_local_runtime_profile, request_local_top_disk, request_local_trace_capture,
+    spawn_local_trace_capture_runtime,
 };
 pub use diagnostics::{
     LocalNetworkConsent, MAX_NETWORK_ARCHIVE_BYTES, MAX_NETWORK_BANDWIDTH_BYTES_PER_SECOND, MAX_NETWORK_DECOMPRESSED_BYTES,
@@ -127,10 +132,6 @@ pub use diagnostics::{
     TopCaptureScope, TopCoverage, TopDiskData, TopLocksData, TopNetData, TopOutcome, TopProvenance, TopReasonCode, TopResult,
     TopRpcData, capture_top_api, capture_top_disk, capture_top_locks, capture_top_net, capture_top_rpc, evaluate_disk_window,
     evaluate_network_window, save_signed_top_export, sign_top_export,
-};
-pub(crate) use diagnostics::{
-    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_runtime_profile, request_local_top_disk,
-    request_local_trace_capture, spawn_local_trace_capture_runtime,
 };
 pub use environment::{
     ENVIRONMENT_CAPABILITY, ENVIRONMENT_SCHEMA_VERSION, EnvironmentCollectionRequest, EnvironmentError, EnvironmentExportRequest,

@@ -14,7 +14,7 @@
 
 //! Owner-only local transport between diagnostic CLI commands and the running server.
 //!
-//! Version 1 accepts only TRACE_RECORD, RUNTIME_PROFILE and TOP_DISK. Signed requests select
+//! Version 1 accepts TRACE_RECORD, RUNTIME_PROFILE, NATIVE_THREADS_PROFILE, TOP_DISK and HEALTH. Signed requests select
 //! an existing offline key by SPKI digest; this is not proof of Connect enrollment.
 //! The receiver checks enrollment, target ownership and consent at import. The
 //! server owns provenance, nonce generation, capture and signing; the CLI receives
@@ -66,6 +66,8 @@ pub(crate) enum LocalTraceCaptureError {
     Producer(#[from] TelemetryProducerError),
     #[error("runtime profile request rejected: {0}")]
     RuntimeProfile(String),
+    #[error("health request rejected: {0}")]
+    Health(String),
     #[error("top disk request rejected: {0}")]
     TopDisk(String),
     #[error("local diagnostic cancellation was not acknowledged")]
@@ -110,10 +112,42 @@ enum CaptureRequest {
         protocol_version: u16,
         request: LocalRuntimeProfileRequest,
     },
+    NativeThreadsProfile {
+        protocol_version: u16,
+        request: LocalRuntimeProfileRequest,
+    },
     TopDisk {
         protocol_version: u16,
         request: super::top_disk::LocalTopDiskRequest,
     },
+    Health {
+        protocol_version: u16,
+        request: LocalHealthRequest,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct LocalHealthRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub schema_version: u16,
+    pub capability: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l0: bool,
+    pub expires_at_unix: i64,
+}
+
+pub(crate) struct LocalHealthArchive {
+    pub artifact_uid: String,
+    pub archive_bytes: Vec<u8>,
+    pub archive_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -187,6 +221,14 @@ enum CaptureResponse {
         artifact_uid: String,
     },
     TopDiskError {
+        code: RuntimeErrorCode,
+    },
+    HealthOk {
+        archive_base64: String,
+        archive_sha256: String,
+        artifact_uid: String,
+    },
+    HealthError {
         code: RuntimeErrorCode,
     },
 }
@@ -306,6 +348,17 @@ pub(crate) async fn request_local_runtime_profile(
     request: LocalRuntimeProfileRequest,
     cancel: &CancellationToken,
 ) -> Result<SignedProfileExport, LocalTraceCaptureError> {
+    request_local_profile_capture(state_root, request, cancel, false).await
+}
+
+pub(crate) async fn request_local_health(
+    state_root: &Path,
+    request: LocalHealthRequest,
+    cancel: &CancellationToken,
+) -> Result<LocalHealthArchive, LocalTraceCaptureError> {
+    if request.capability != super::health::HEALTH_SERVICE_CAPABILITY {
+        return Err(LocalTraceCaptureError::Protocol);
+    }
     let owner = private_state_owner(state_root)?;
     let socket_path = state_root.join(SOCKET_FILE);
     socket_identity(&socket_path, owner)?;
@@ -314,9 +367,110 @@ pub(crate) async fn request_local_runtime_profile(
         return Err(LocalTraceCaptureError::StateSecurity);
     }
     let artifact_uid = request.artifact_uid.clone();
-    let message = CaptureRequest::RuntimeProfile {
+    let mut bytes = serde_json::to_vec(&CaptureRequest::Health {
         protocol_version: PROTOCOL_VERSION,
         request,
+    })
+    .map_err(|_| LocalTraceCaptureError::Protocol)?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+        return Err(LocalTraceCaptureError::Protocol);
+    }
+    let (reader, mut writer) = stream.into_split();
+    tokio::time::timeout(REQUEST_TIMEOUT, writer.write_all(&bytes))
+        .await
+        .map_err(|_| LocalTraceCaptureError::Protocol)?
+        .map_err(LocalTraceCaptureError::Io)?;
+    let response = async {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_RUNTIME_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(LocalTraceCaptureError::Io)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_RUNTIME_RESPONSE_BYTES {
+            return Err(LocalTraceCaptureError::Protocol);
+        }
+        serde_json::from_slice::<CaptureResponse>(&bytes).map_err(|_| LocalTraceCaptureError::Protocol)
+    };
+    let response = tokio::time::timeout(Duration::from_secs(super::health::HEALTH_TIMEOUT_SECONDS + 5), response);
+    tokio::pin!(response);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            writer.shutdown().await.map_err(|_| LocalTraceCaptureError::CancellationUnconfirmed)?;
+            let acknowledged = matches!(tokio::time::timeout(Duration::from_secs(2), &mut response).await,
+                Ok(Ok(Ok(CaptureResponse::HealthError { .. } | CaptureResponse::HealthOk { .. }))));
+            if !acknowledged { return Err(LocalTraceCaptureError::CancellationUnconfirmed); }
+            return Err(LocalTraceCaptureError::Health("CANCELLED".to_owned()));
+        }
+        response = &mut response => response.map_err(|_| LocalTraceCaptureError::Protocol)??,
+    };
+    match response {
+        CaptureResponse::HealthOk {
+            archive_base64,
+            archive_sha256,
+            artifact_uid: returned_uid,
+        } => {
+            let archive_bytes = URL_SAFE_NO_PAD
+                .decode_to_vec(&archive_base64)
+                .map_err(|_| LocalTraceCaptureError::Protocol)?;
+            if archive_bytes.is_empty()
+                || archive_bytes.len() as u64 > super::health::MAX_HEALTH_OUTPUT_BYTES
+                || returned_uid != artifact_uid
+                || URL_SAFE_NO_PAD.encode_to_string(&archive_bytes) != archive_base64
+                || hex_simd::encode_to_string(Sha256::digest(&archive_bytes), hex_simd::AsciiCase::Lower) != archive_sha256
+            {
+                return Err(LocalTraceCaptureError::Protocol);
+            }
+            Ok(LocalHealthArchive {
+                artifact_uid,
+                archive_bytes,
+                archive_sha256,
+            })
+        }
+        CaptureResponse::HealthError { code } => Err(LocalTraceCaptureError::Health(format!("{code:?}"))),
+        _ => Err(LocalTraceCaptureError::Protocol),
+    }
+}
+
+pub(crate) async fn request_local_native_threads_profile(
+    state_root: &Path,
+    request: LocalRuntimeProfileRequest,
+    cancel: &CancellationToken,
+) -> Result<SignedProfileExport, LocalTraceCaptureError> {
+    request_local_profile_capture(state_root, request, cancel, true).await
+}
+
+async fn request_local_profile_capture(
+    state_root: &Path,
+    request: LocalRuntimeProfileRequest,
+    cancel: &CancellationToken,
+    native_threads: bool,
+) -> Result<SignedProfileExport, LocalTraceCaptureError> {
+    let tool = match request.capability.as_str() {
+        super::profile_cpu::THREAD_PROFILE_CAPABILITY => ProfileTool::Threads,
+        super::profile_cpu::MEMORY_PROFILE_CAPABILITY if !native_threads => ProfileTool::Memory,
+        _ => return Err(LocalTraceCaptureError::Protocol),
+    };
+    let owner = private_state_owner(state_root)?;
+    let socket_path = state_root.join(SOCKET_FILE);
+    socket_identity(&socket_path, owner)?;
+    let stream = UnixStream::connect(&socket_path).await.map_err(LocalTraceCaptureError::Io)?;
+    if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == owner) {
+        return Err(LocalTraceCaptureError::StateSecurity);
+    }
+    let artifact_uid = request.artifact_uid.clone();
+    let message = if native_threads {
+        CaptureRequest::NativeThreadsProfile {
+            protocol_version: PROTOCOL_VERSION,
+            request,
+        }
+    } else {
+        CaptureRequest::RuntimeProfile {
+            protocol_version: PROTOCOL_VERSION,
+            request,
+        }
     };
     let mut bytes = serde_json::to_vec(&message).map_err(|_| LocalTraceCaptureError::Protocol)?;
     bytes.push(b'\n');
@@ -374,7 +528,7 @@ pub(crate) async fn request_local_runtime_profile(
             }
             Ok(SignedProfileExport {
                 artifact_uid,
-                tool: ProfileTool::Threads,
+                tool,
                 outcome: ProfileOutcome::Succeeded,
                 reason_code: ProfileReasonCode::Complete,
                 archive_bytes,
@@ -475,9 +629,16 @@ async fn handle_runtime_profile(
     protocol_version: u16,
     request: LocalRuntimeProfileRequest,
     shutdown: CancellationToken,
+    native_threads: bool,
 ) {
     let cancel = shutdown.child_token();
-    let capture = capture_local_runtime_profile(state_root, protocol_version, request, &cancel);
+    let capture = async {
+        if native_threads {
+            capture_local_native_threads_profile(state_root, protocol_version, request, &cancel).await
+        } else {
+            capture_local_runtime_profile(state_root, protocol_version, request, &cancel).await
+        }
+    };
     tokio::pin!(capture);
     let mut unexpected = [0_u8; 1];
     let result = tokio::select! {
@@ -493,6 +654,56 @@ async fn handle_runtime_profile(
             artifact_uid: export.artifact_uid,
         },
         Err(code) => CaptureResponse::RuntimeError { code },
+    };
+    if let Ok(bytes) = serde_json::to_vec(&response)
+        && bytes.len() as u64 <= MAX_RUNTIME_RESPONSE_BYTES
+    {
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            writer.write_all(&bytes).await?;
+            writer.shutdown().await
+        })
+        .await;
+    }
+}
+
+async fn handle_health(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state_root: &Path,
+    protocol_version: u16,
+    request: LocalHealthRequest,
+    shutdown: CancellationToken,
+) {
+    let cancel = shutdown.child_token();
+    let capture = async {
+        match tokio::time::timeout(
+            Duration::from_secs(super::health::HEALTH_TIMEOUT_SECONDS),
+            capture_local_health(state_root, protocol_version, request, &cancel),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                cancel.cancel();
+                Err(RuntimeErrorCode::TimedOut)
+            }
+        }
+    };
+    tokio::pin!(capture);
+    let mut unexpected = [0_u8; 1];
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => { cancel.cancel(); let _ = capture.await; return; }
+        _ = reader.read(&mut unexpected) => { cancel.cancel(); let _ = capture.await; Err(RuntimeErrorCode::Cancelled) }
+        result = &mut capture => result,
+    };
+    let response = match result {
+        Ok(export) => CaptureResponse::HealthOk {
+            archive_base64: URL_SAFE_NO_PAD.encode_to_string(&export.archive_bytes),
+            archive_sha256: export.archive_sha256,
+            artifact_uid: export.artifact_uid,
+        },
+        Err(code) => CaptureResponse::HealthError { code },
     };
     if let Ok(bytes) = serde_json::to_vec(&response)
         && bytes.len() as u64 <= MAX_RUNTIME_RESPONSE_BYTES
@@ -539,6 +750,87 @@ async fn handle_top_disk(
             writer.shutdown().await
         })
         .await;
+    }
+}
+
+async fn capture_local_health(
+    state_root: &Path,
+    protocol_version: u16,
+    input: LocalHealthRequest,
+    cancel: &CancellationToken,
+) -> Result<super::health::SignedHealthExport, RuntimeErrorCode> {
+    use super::health::{HEALTH_SERVICE_CAPABILITY, HealthServiceRequest, LocalHealthConsent};
+    use rand::{TryRng as _, rngs::SysRng};
+    if protocol_version != PROTOCOL_VERSION
+        || input.offline_key_id.len() != 64
+        || !input
+            .offline_key_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || input.schema_version != 1
+        || input.capability != HEALTH_SERVICE_CAPABILITY
+    {
+        return Err(RuntimeErrorCode::InvalidRequest);
+    }
+    if cancel.is_cancelled() {
+        return Err(RuntimeErrorCode::Cancelled);
+    }
+    if !input.acknowledge_l0 || input.policy_revision == 0 {
+        return Err(RuntimeErrorCode::ConsentRequired);
+    }
+    let now = unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    if input.consent_expires_at_unix <= now || input.expires_at_unix > input.consent_expires_at_unix {
+        return Err(RuntimeErrorCode::ConsentExpired);
+    }
+    if input.expires_at_unix <= now {
+        return Err(RuntimeErrorCode::Expired);
+    }
+    let key = load_offline_key(state_root, &input.offline_key_id)?;
+    let provenance = super::job_delivery::executable_provenance()
+        .await
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let mut nonce = [0_u8; 32];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let request = HealthServiceRequest {
+        organization_name: input.organization_name,
+        cluster_name: input.cluster_name,
+        device_name: input.device_name,
+        run_uid: input.run_uid,
+        artifact_uid: input.artifact_uid,
+        schema_version: input.schema_version,
+        capability: input.capability,
+        consent: LocalHealthConsent {
+            consent_uid: input.consent_uid,
+            policy_revision: input.policy_revision,
+            expires_at_unix: input.consent_expires_at_unix,
+            active: input.acknowledge_l0,
+        },
+        produced_at_unix: unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?,
+        expires_at_unix: input.expires_at_unix,
+        nonce,
+        max_evidence_age_seconds: 300,
+        provenance,
+    };
+    super::health::collect_runtime_health(&request, &key, cancel)
+        .await
+        .map_err(health_error)
+}
+
+fn health_error(error: super::health::HealthError) -> RuntimeErrorCode {
+    use super::health::HealthError;
+    match error {
+        HealthError::ConsentRequired => RuntimeErrorCode::ConsentRequired,
+        HealthError::ConsentExpired => RuntimeErrorCode::ConsentExpired,
+        HealthError::Expired => RuntimeErrorCode::Expired,
+        HealthError::LimitExceeded => RuntimeErrorCode::LimitExceeded,
+        HealthError::Busy => RuntimeErrorCode::Busy,
+        HealthError::Cancelled => RuntimeErrorCode::Cancelled,
+        HealthError::Unsupported | HealthError::InvalidRequest => RuntimeErrorCode::InvalidRequest,
+        HealthError::SourceUnavailable | HealthError::CollectionFailed | HealthError::Signing | HealthError::Encoding => {
+            RuntimeErrorCode::CollectionFailed
+        }
     }
 }
 
@@ -717,7 +1009,12 @@ async fn capture_local_runtime_profile(
     {
         return Err(RuntimeErrorCode::LimitExceeded);
     }
-    if input.schema_version != 1 || input.capability != super::profile_cpu::THREAD_PROFILE_CAPABILITY {
+    let tool = match input.capability.as_str() {
+        super::profile_cpu::THREAD_PROFILE_CAPABILITY => ProfileTool::Threads,
+        super::profile_cpu::MEMORY_PROFILE_CAPABILITY => ProfileTool::Memory,
+        _ => return Err(RuntimeErrorCode::InvalidRequest),
+    };
+    if input.schema_version != 1 {
         return Err(RuntimeErrorCode::InvalidRequest);
     }
     let key = load_offline_key(state_root, &input.offline_key_id)?;
@@ -749,11 +1046,104 @@ async fn capture_local_runtime_profile(
         sample_period: Duration::from_micros(input.sample_period_micros),
         provenance,
     };
-    let metrics = tokio::runtime::Handle::current().metrics();
+    match tool {
+        ProfileTool::Memory => super::profile_memory::export_memory_profile(&request, &key, cancel)
+            .await
+            .map_err(RuntimeErrorCode::from),
+        ProfileTool::Threads => {
+            let metrics = tokio::runtime::Handle::current().metrics();
+            let cancel = cancel.clone();
+            // Always await this task, including after disconnect, so the lease is released before acknowledgement.
+            tokio::task::spawn_blocking(move || {
+                let result = super::profile_threads::capture_runtime_profile(&request, &metrics, MAX_PROFILE_DURATION, &cancel)?;
+                if result.outcome() != ProfileOutcome::Succeeded {
+                    return Err(ProfileError::CollectionFailed);
+                }
+                encode_signed_profile_export(&request, &result, &key, &cancel)
+            })
+            .await
+            .map_err(|_| RuntimeErrorCode::CollectionFailed)?
+            .map_err(RuntimeErrorCode::from)
+        }
+        ProfileTool::Cpu => Err(RuntimeErrorCode::InvalidRequest),
+    }
+}
+
+async fn capture_local_native_threads_profile(
+    state_root: &Path,
+    protocol_version: u16,
+    input: LocalRuntimeProfileRequest,
+    cancel: &CancellationToken,
+) -> Result<SignedProfileExport, RuntimeErrorCode> {
+    use rand::{TryRng as _, rngs::SysRng};
+    if protocol_version != PROTOCOL_VERSION
+        || input.offline_key_id.len() != 64
+        || !input
+            .offline_key_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || input.schema_version != 1
+        || input.capability != super::profile_cpu::THREAD_PROFILE_CAPABILITY
+    {
+        return Err(RuntimeErrorCode::InvalidRequest);
+    }
+    if cancel.is_cancelled() {
+        return Err(RuntimeErrorCode::Cancelled);
+    }
+    if !input.acknowledge_l3 || input.policy_revision == 0 {
+        return Err(RuntimeErrorCode::ConsentRequired);
+    }
+    let now = unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    if input.consent_expires_at_unix <= now || input.expires_at_unix > input.consent_expires_at_unix {
+        return Err(RuntimeErrorCode::ConsentExpired);
+    }
+    if input.expires_at_unix <= now || input.expires_at_unix.saturating_sub(now) > super::profile_cpu::MAX_VALIDITY_SECONDS {
+        return Err(RuntimeErrorCode::Expired);
+    }
+    if input.duration_millis == 0
+        || input.duration_millis > 30_000
+        || input.sample_period_micros == 0
+        || input.sample_period_micros > input.duration_millis * 1_000
+    {
+        return Err(RuntimeErrorCode::LimitExceeded);
+    }
+    let key = load_offline_key(state_root, &input.offline_key_id)?;
+    let provenance = super::job_delivery::executable_provenance()
+        .await
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let mut nonce = [0_u8; 32];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| RuntimeErrorCode::CollectionFailed)?;
+    let request = ProfileCaptureRequest {
+        organization_name: input.organization_name,
+        cluster_name: input.cluster_name,
+        device_name: input.device_name,
+        run_uid: input.run_uid,
+        artifact_uid: input.artifact_uid,
+        schema_version: input.schema_version,
+        capability: input.capability,
+        consent: LocalProfileConsent {
+            consent_uid: input.consent_uid,
+            policy_revision: input.policy_revision,
+            expires_at_unix: input.consent_expires_at_unix,
+            confirmed: input.acknowledge_l3,
+        },
+        produced_at_unix: unix_now().map_err(|_| RuntimeErrorCode::CollectionFailed)?,
+        expires_at_unix: input.expires_at_unix,
+        nonce,
+        duration: Duration::from_millis(input.duration_millis),
+        sample_period: Duration::from_micros(input.sample_period_micros),
+        provenance,
+    };
     let cancel = cancel.clone();
-    // Always await this task, including after disconnect, so the lease is released before acknowledgement.
+    // The blocking collector runs in this serving process; joining it also releases its lease.
     tokio::task::spawn_blocking(move || {
-        let result = super::profile_threads::capture_runtime_profile(&request, &metrics, MAX_PROFILE_DURATION, &cancel)?;
+        let result = super::profile_threads::capture_thread_profile(
+            &request,
+            super::profile_cpu::ThreadProfileScope::NativeThreads,
+            &cancel,
+        )?;
         if result.outcome() != ProfileOutcome::Succeeded {
             return Err(ProfileError::CollectionFailed);
         }
@@ -802,7 +1192,14 @@ async fn handle_connection(stream: UnixStream, state_root: PathBuf, shutdown: Ca
             protocol_version,
             request,
         } => {
-            handle_runtime_profile(reader, writer, &state_root, protocol_version, request, shutdown).await;
+            handle_runtime_profile(reader, writer, &state_root, protocol_version, request, shutdown, false).await;
+            return;
+        }
+        CaptureRequest::NativeThreadsProfile {
+            protocol_version,
+            request,
+        } => {
+            handle_runtime_profile(reader, writer, &state_root, protocol_version, request, shutdown, true).await;
             return;
         }
         CaptureRequest::TopDisk {
@@ -810,6 +1207,13 @@ async fn handle_connection(stream: UnixStream, state_root: PathBuf, shutdown: Ca
             request,
         } => {
             handle_top_disk(reader, writer, &state_root, protocol_version, request, shutdown).await;
+            return;
+        }
+        CaptureRequest::Health {
+            protocol_version,
+            request,
+        } => {
+            handle_health(reader, writer, &state_root, protocol_version, request, shutdown).await;
             return;
         }
         CaptureRequest::TraceRecord {
@@ -1162,6 +1566,65 @@ mod tests {
         }
     }
 
+    fn health_request(state: &std::path::Path) -> super::LocalHealthRequest {
+        let (request, _) = runtime_request(state);
+        super::LocalHealthRequest {
+            offline_key_id: request.offline_key_id,
+            organization_name: request.organization_name,
+            cluster_name: request.cluster_name,
+            device_name: request.device_name,
+            run_uid: request.run_uid,
+            artifact_uid: request.artifact_uid,
+            schema_version: 1,
+            capability: "health.check.service@1".to_owned(),
+            consent_uid: request.consent_uid,
+            policy_revision: request.policy_revision,
+            consent_expires_at_unix: request.consent_expires_at_unix,
+            acknowledge_l0: true,
+            expires_at_unix: request.expires_at_unix,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_health_requires_consent_bounds_and_separate_offline_identity() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = health_request(state.path());
+        std::fs::remove_file(crate::connect::OfflineKeyStore::new(state.path()).key_path()).unwrap();
+        request.acknowledge_l0 = false;
+        assert!(matches!(
+            super::capture_local_health(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        request.acknowledge_l0 = true;
+        let valid_consent_expiry = request.consent_expires_at_unix;
+        request.consent_expires_at_unix = request.expires_at_unix - 1;
+        assert!(matches!(
+            super::capture_local_health(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::ConsentExpired)
+        ));
+        request.consent_expires_at_unix = valid_consent_expiry;
+        let valid_expiry = request.expires_at_unix;
+        request.expires_at_unix = request.consent_expires_at_unix - 121;
+        assert!(matches!(
+            super::capture_local_health(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::Expired)
+        ));
+        request.expires_at_unix = valid_expiry;
+        assert!(matches!(
+            super::capture_local_health(state.path(), 1, request.clone(), &CancellationToken::new()).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+        assert!(
+            super::request_local_health(state.path(), request.clone(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let mut value = serde_json::to_value(&request).unwrap();
+        value["command"] = serde_json::json!("shell.exec");
+        assert!(serde_json::from_value::<super::LocalHealthRequest>(value).is_err());
+    }
+
     #[tokio::test]
     async fn local_top_disk_rejects_invalid_requests_without_identity_or_socket_fallback() {
         let state = tempfile::tempdir().unwrap();
@@ -1338,6 +1801,159 @@ mod tests {
         assert!(!state.path().join("identity").exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_native_threads_service_child() {
+        let Some(state) = std::env::var_os("RUSTFS_TEST_NATIVE_THREADS_STATE") else {
+            return;
+        };
+        let stop = CancellationToken::new();
+        let input_stop = stop.clone();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let _ = std::io::stdin().read(&mut [0u8]);
+            input_stop.cancel();
+        });
+        let sleepers: Vec<_> = (0..16)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.is_cancelled() {
+                        std::thread::park_timeout(Duration::from_millis(100));
+                    }
+                })
+            })
+            .collect();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
+            stop.cancelled().await;
+            runtime.shutdown().await;
+        });
+        for sleeper in sleepers {
+            sleeper.join().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn local_native_threads_profiles_service_process_and_signs_offline() {
+        use std::io::Read as _;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, key) = runtime_request(state.path());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "connect::diagnostics::trace_runtime::tests::local_native_threads_service_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RUSTFS_TEST_NATIVE_THREADS_STATE", state.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.path().join(super::SOCKET_FILE).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let export = if ready.is_ok() {
+            super::request_local_native_threads_profile(state.path(), request.clone(), &CancellationToken::new()).await
+        } else {
+            Err(LocalTraceCaptureError::Protocol)
+        };
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let export = export.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
+        let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
+        assert_eq!(result["toolId"], "profile.threads");
+        assert_eq!(result["outcome"], "SUCCEEDED");
+        assert_eq!(result["data"]["scope"], "NATIVE_THREADS");
+        let states = result["data"]["states"].as_array().unwrap();
+        assert_eq!(states.len(), 4);
+        assert!(states.iter().map(|state| state["threadCount"].as_u64().unwrap()).sum::<u64>() >= 16);
+        assert!(result["data"].get("threadNames").is_none());
+        let mut envelope = Vec::new();
+        zip.by_name("envelope.json").unwrap().read_to_end(&mut envelope).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(metadata["classification"], "L3");
+        assert_eq!(metadata["deviceKeyId"], request.offline_key_id);
+        let signature: serde_json::Value = serde_json::from_reader(zip.by_name("envelope.sig").unwrap()).unwrap();
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope);
+        assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
+        assert!(!state.path().join("identity").exists());
+    }
+
+    #[tokio::test]
+    async fn local_native_threads_rejects_consent_scope_and_missing_identity() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (request, _) = runtime_request(state.path());
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            super::capture_local_native_threads_profile(state.path(), 2, request.clone(), &cancel).await,
+            Err(super::RuntimeErrorCode::InvalidRequest)
+        ));
+        let mut invalid = request.clone();
+        invalid.acknowledge_l3 = false;
+        assert!(matches!(
+            super::capture_local_native_threads_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        let mut invalid = request.clone();
+        invalid.capability = "profile.memory@1".to_owned();
+        assert!(matches!(
+            super::capture_local_native_threads_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::InvalidRequest)
+        ));
+        let mut invalid = request.clone();
+        invalid.expires_at_unix = 1;
+        assert!(matches!(
+            super::capture_local_native_threads_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::Expired)
+        ));
+        std::fs::remove_file(crate::connect::OfflineKeyStore::new(state.path()).key_path()).unwrap();
+        assert!(matches!(
+            super::capture_local_native_threads_profile(state.path(), 1, request, &cancel).await,
+            Err(super::RuntimeErrorCode::IdentityUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_memory_profile_signs_service_capture_with_offline_identity() {
+        use std::io::Read as _;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut request, key) = runtime_request(state.path());
+        request.capability = super::super::profile_cpu::MEMORY_PROFILE_CAPABILITY.to_owned();
+        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        let export = super::request_local_runtime_profile(state.path(), request.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(export.tool, super::ProfileTool::Memory);
+        runtime.shutdown().await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
+        let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
+        assert_eq!(result["toolId"], "profile.memory");
+        assert_eq!(result["outcome"], "SUCCEEDED");
+        assert!(result["data"]["allocatedBytes"].is_u64());
+        assert!(result["data"]["allocationCount"].is_u64());
+        let mut envelope = Vec::new();
+        zip.by_name("envelope.json").unwrap().read_to_end(&mut envelope).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(metadata["classification"], "L3");
+        assert_eq!(metadata["deviceKeyId"], request.offline_key_id);
+        let signature: serde_json::Value = serde_json::from_reader(zip.by_name("envelope.sig").unwrap()).unwrap();
+        let mut signed = b"rustfs-diagnostic-envelope-v1\0".to_vec();
+        signed.extend_from_slice(&envelope);
+        assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
+        assert!(!state.path().join("identity").exists());
+    }
+
     #[tokio::test]
     #[serial]
     async fn local_runtime_profile_rejects_invalid_consent_identity_and_protocol() {
@@ -1346,6 +1962,13 @@ mod tests {
         let (request, _) = runtime_request(state.path());
         let cancel = CancellationToken::new();
         let mut invalid = request.clone();
+        invalid.acknowledge_l3 = false;
+        assert!(matches!(
+            super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
+            Err(super::RuntimeErrorCode::ConsentRequired)
+        ));
+        let mut invalid = request.clone();
+        invalid.capability = super::super::profile_cpu::MEMORY_PROFILE_CAPABILITY.to_owned();
         invalid.acknowledge_l3 = false;
         assert!(matches!(
             super::capture_local_runtime_profile(state.path(), 1, invalid, &cancel).await,
@@ -1427,7 +2050,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn local_signed_capture_does_not_claim_unacknowledged_cancellation() {
-        for disk in [false, true] {
+        for kind in 0..3 {
             let state = tempfile::tempdir().unwrap();
             std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let (request, _) = runtime_request(state.path());
@@ -1449,14 +2072,16 @@ mod tests {
             let state_root = state.path().to_path_buf();
             let disk_input = disk_request(state.path());
             let task = tokio::spawn(async move {
-                if disk {
-                    super::request_local_top_disk(&state_root, disk_input, &task_cancel)
+                match kind {
+                    0 => super::request_local_runtime_profile(&state_root, request, &task_cancel)
                         .await
-                        .map(|_| ())
-                } else {
-                    super::request_local_runtime_profile(&state_root, request, &task_cancel)
+                        .map(|_| ()),
+                    1 => super::request_local_native_threads_profile(&state_root, request, &task_cancel)
                         .await
-                        .map(|_| ())
+                        .map(|_| ()),
+                    _ => super::request_local_top_disk(&state_root, disk_input, &task_cancel)
+                        .await
+                        .map(|_| ()),
                 }
             });
             received.await.unwrap();

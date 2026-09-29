@@ -323,11 +323,14 @@ async fn wait_for(
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("status channel");
+            status
+                .changed()
+                .await
+                .unwrap_or_else(|error| panic!("heartbeat status channel closed: {error}; last status: {:?}", *status.borrow()));
         }
     })
     .await
-    .expect("heartbeat status timeout")
+    .unwrap_or_else(|error| panic!("heartbeat status timeout: {error}; last status: {:?}", *status.borrow()))
 }
 
 async fn assert_credential_failure(config: HeartbeatConfig, server: &TestServer, expected: &str) {
@@ -634,7 +637,13 @@ async fn restart_replays_pending_request_then_advances_sequence() {
         }
     })
     .await
-    .expect("two heartbeats");
+    .unwrap_or_else(|error| {
+        panic!(
+            "two heartbeats: {error}; last status: {:?}; received: {}",
+            *runtime.status().borrow(),
+            second_server.seen.lock().expect("seen lock").len()
+        )
+    });
     runtime.shutdown().await;
 
     let seen = second_server.seen.lock().expect("seen lock");
@@ -694,14 +703,25 @@ fn pending_heartbeat_with_capabilities(capabilities: &[&str]) -> Value {
 
 #[tokio::test]
 async fn restart_replays_exact_legacy_capabilities_with_and_without_jobs() {
-    for (job_capable, service_memory) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (job_capable, service_memory, health_service) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
         let pki = TestPki::new();
         let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
         let temp = tempfile::tempdir().expect("tempdir");
         let shutdown = CancellationToken::new();
         let config = config(&temp, &pki, &server);
         fs::create_dir_all(config.state_path.parent().expect("state directory")).expect("create state directory");
-        let pending = pending_heartbeat_with_capabilities(&legacy_capabilities(job_capable, service_memory));
+        let mut capabilities = legacy_capabilities(job_capable, service_memory);
+        if health_service {
+            capabilities.insert(if job_capable { 4 } else { 3 }, "health.check.service@1");
+        }
+        let pending = pending_heartbeat_with_capabilities(&capabilities);
         let state = json!({"nextSequence": 0, "pending": pending});
         fs::write(&config.state_path, serde_json::to_vec(&state).expect("heartbeat state JSON")).expect("write heartbeat state");
         private_mode(&config.state_path);

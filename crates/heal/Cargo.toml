@@ -99,6 +99,7 @@ crc-fast = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tonic = { workspace = true }
 rustfs-filemeta = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rustfs-test-utils = { workspace = true }

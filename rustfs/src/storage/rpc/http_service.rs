@@ -871,7 +871,11 @@ async fn read_file_stream_with_legacy_meta_fallback(
 ) -> Result<FileReader, DiskError> {
     match disk.read_file_stream(volume, path, offset, length).await {
         Ok(file) => Ok(file),
-        Err(error) if legacy_meta_alias_can_retry(&error, volume) => {
+        // A legacy format is migration evidence. Substituting the RustFS
+        // format would grant remote peers authority they did not establish.
+        Err(error)
+            if !(volume == MIGRATING_META_BUCKET && path == "format.json") && legacy_meta_alias_can_retry(&error, volume) =>
+        {
             let alias = legacy_meta_bucket_alias(volume).expect("legacy meta alias checked before retry");
             disk.read_file_stream(&alias, path, offset, length).await
         }
@@ -3115,5 +3119,42 @@ mod tests {
         );
         assert_eq!(legacy_meta_bucket_alias(".minio.sys-lookalike"), None);
         assert_eq!(legacy_meta_bucket_alias("user-bucket"), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_format_read_requires_the_original_namespace() {
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all(".rustfs.sys", "format.json", Bytes::from_static(b"rustfs-format"))
+            .await
+            .expect("RustFS format");
+        disk.write_all(".rustfs.sys", "config/settings.json", Bytes::from_static(b"settings"))
+            .await
+            .expect("migrated configuration");
+
+        for legacy_volume_exists in [false, true] {
+            if legacy_volume_exists {
+                disk.make_volume(".minio.sys").await.expect("empty legacy volume");
+            }
+            let result = super::read_file_stream_with_legacy_meta_fallback(&disk, ".minio.sys", "format.json", 0, 0).await;
+            assert!(
+                matches!(result, Err(DiskError::FileNotFound | DiskError::VolumeNotFound)),
+                "a RustFS format must never count as legacy migration evidence"
+            );
+        }
+
+        disk.write_all(".minio.sys", "format.json", Bytes::from_static(b"minio-format"))
+            .await
+            .expect("original legacy format");
+        for (path, expected) in [
+            ("format.json", b"minio-format".as_slice()),
+            ("config/settings.json", b"settings"),
+        ] {
+            let mut reader = super::read_file_stream_with_legacy_meta_fallback(&disk, ".minio.sys", path, 0, 0)
+                .await
+                .expect("original formats and migrated configuration remain readable");
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data).await.expect("read metadata");
+            assert_eq!(data, expected);
+        }
     }
 }

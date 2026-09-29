@@ -107,6 +107,16 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the replacement bucket metadata heal test. It builds a real-disk
+# hermetic erasure set, writes bucket metadata, then asserts byte-identical
+# xl.meta readback after a rejected delayed repair. Under parallel load,
+# concurrent ecstore tests mutate the process-wide disk registry and alter
+# the serialized timestamp/disk-identity fields, flipping the assertion.
+# Preventive serialization only, no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the metadata-cache generation-retirement pair. Both carry
 # #[serial(metadata_cache_invalidation_probe)] — a no-op across nextest's
 # process boundary — and assert get_object_metadata_cache generation
@@ -137,6 +147,12 @@ test-group = 'embedded-test-ports'
 # exhaust those budgets. Keep the deadlines and assertions unchanged.
 [[profile.default.overrides]]
 filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+threads-required = "num-test-threads"
+
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
+# Their existing deadlines, assertions, and retry policy remain in force.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test across nextest's
@@ -321,6 +337,11 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the replacement bucket metadata heal test under the ci profile too.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(replacement_bucket_metadata_respects_pool_ownership_and_required_records)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the metadata-cache generation-retirement pair under the ci
 # profile too (see the matching default-profile override near the top). Not a
 # quarantine: no retries.
@@ -336,6 +357,12 @@ test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
 filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+threads-required = "num-test-threads"
+
+# Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
+# Their existing deadlines, assertions, and retry policy remain in force.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(connect_heartbeat) & test(/^(restart_replays_pending_request_then_advances_sequence|restart_replays_exact_legacy_capabilities_with_and_without_jobs)$/)'
 threads-required = "num-test-threads"
 
 # Serialize the durable manual-transition checkpoint test under the ci profile

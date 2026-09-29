@@ -68,10 +68,10 @@ mod trace_runtime;
 
 pub use health::{
     HEALTH_CATALOG_CHECKS, HEALTH_SCHEMA_VERSION, HEALTH_SERVICE_CAPABILITY, HEALTH_TIMEOUT_SECONDS, HealthCheckResult,
-    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome,
+    HealthDiagnosticResult, HealthError, HealthFreshness, HealthOutcome, HealthResultReason, HealthRuleOutcome, HealthSaveError,
     HealthServiceRequest, HealthSourceObservation, LocalHealthConsent, MAX_EVIDENCE_AGE_SECONDS, MAX_HEALTH_CPU_MILLIS,
     MAX_HEALTH_MEMORY_BYTES, MAX_HEALTH_OUTPUT_BYTES, SignedHealthExport, collect_runtime_health, evaluate_health_observation,
-    sign_health_export,
+    save_signed_health_export, sign_health_export,
 };
 pub use inspect::{
     INSPECT_CAPABILITY, INSPECT_SCHEMA_VERSION, InspectArtifactConsent, InspectDiagnosticResult, InspectError, InspectFinding,
@@ -172,8 +172,9 @@ pub use trace_record::{
 };
 pub use trace_replay::{LocallyReviewedTraceArtifact, ReplayedTrace, TraceReplayError, replay_trace, replay_trace_result};
 pub(crate) use trace_runtime::{
-    LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_runtime_profile, request_local_top_disk,
-    request_local_trace_capture, spawn_local_trace_capture_runtime,
+    LocalHealthRequest, LocalTraceCaptureError, LocalTraceCaptureRuntime, request_local_health,
+    request_local_native_threads_profile, request_local_runtime_profile, request_local_top_disk, request_local_trace_capture,
+    spawn_local_trace_capture_runtime,
 };
 
 pub(crate) use top_api::save_top_archive;
