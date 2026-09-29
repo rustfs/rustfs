@@ -34,6 +34,8 @@ Superseded PR attempts are cancelled. A running main validation finishes, with o
 
 Protocol matrix jobs finish independently when a sibling fails. Each executed protocol test step preserves its log and available JUnit under a separate, attempt-specific artifact; a skipped test step cannot upload a cached report.
 
+The four site-replication state-writer concurrency proofs reserve the available nextest slots in both local and CI profiles. This isolates their durable IO from unrelated test processes while retaining each proof's internal two-writer race, production five-second lock-acquisition limit, assertions, and zero retries.
+
 ## Pull request and merge matrix
 
 "Via aggregate" means a wrong result fails the required `Test and Lint` check. "Report-only" means visible and actionable but outside both the required list and aggregate. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
