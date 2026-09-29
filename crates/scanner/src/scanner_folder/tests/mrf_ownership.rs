@@ -21,7 +21,7 @@ use rustfs_common::mrf_channel::{
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     mrf_queue::spawn_mrf_consumer,
-    storage::{HealListItem, HealObjectInfo, HealStorageAPI},
+    storage::{HealListItem, HealObjectInfo, HealStorageAPI, HealStorageObjectResult},
 };
 use rustfs_heal_contracts::heal_channel::HealOpts;
 
@@ -239,11 +239,25 @@ impl HealStorageAPI for NoticeStorage {
     async fn mrf_bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
         Ok(Some(self.bucket_incarnation_id))
     }
+    async fn bucket_incarnation_id(&self, _: &str) -> rustfs_heal::Result<Option<Uuid>> {
+        Ok(Some(self.bucket_incarnation_id))
+    }
     async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }
     async fn object_exists(&self, _: &str, _: &str) -> rustfs_heal::Result<bool> {
         Ok(true)
+    }
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> rustfs_heal::Result<HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
     }
     async fn heal_object(
         &self,
@@ -396,8 +410,8 @@ async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
         if *object == "unknown" {
             assert_eq!(
                 manager.get_statistics().await.total_objects_healed,
-                1,
-                "legacy healed count is not repair proof"
+                0,
+                "a durable repair without exact storage proof must not count as healed"
             );
         }
         assert_eq!(

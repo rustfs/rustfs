@@ -70,6 +70,16 @@ async fn heal_env_at(base_dir: Option<&Path>) -> (Vec<std::path::PathBuf>, Arc<d
     (env.disk_paths, heal_storage)
 }
 
+async fn heal_env_with_bucket(bucket: &str) -> (Vec<PathBuf>, Arc<dyn HealStorageAPI>) {
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("rustfs_heal_mrf_replay")
+        .build()
+        .await;
+    env.make_bucket(bucket, false).await;
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+    (env.disk_paths, storage)
+}
+
 fn make_manager(storage: Arc<dyn HealStorageAPI>) -> Arc<HealManager> {
     Arc::new(HealManager::new(
         storage,
@@ -356,7 +366,7 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("replay-bucket").await;
 
     // The journal reader resolves disks through the process-local disk map;
     // register the environment's disks the same way server startup does.
@@ -387,8 +397,12 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
     assert!(
         disk_paths
             .iter()
-            .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
-        "missing authoritative journal remains absent"
+            .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "durable replay must publish its authoritative successor"
+    );
+    assert!(
+        committed_payload_contains_on_all_disks(&disk_paths, &[b"partial-object"]),
+        "the durable partial-write identity must be checkpointed before dispatch"
     );
 
     let snapshot = manager.operations_snapshot().await;
@@ -402,7 +416,7 @@ async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("committed-bucket").await;
     register_local_disks(&disk_paths, "mrf-committed-replay-test").await;
 
     let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
@@ -534,7 +548,7 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
-    let (disk_paths, storage) = heal_env().await;
+    let (disk_paths, storage) = heal_env_with_bucket("identity-bucket").await;
     register_local_disks(&disk_paths, "mrf-authoritative-identity-test").await;
 
     let mut authoritative = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
@@ -578,9 +592,9 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
     );
 }
 
-/// If replay reaches a full heal-manager queue, the old journal remains the
-/// durable restart anchor until a later consumer flush publishes the pending
-/// successor snapshot.
+/// If replay reaches a full heal-manager queue, startup checkpoints the
+/// refused tail so the next process can admit it without replaying the head
+/// already handed to the manager.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn journal_replay_retains_file_when_manager_is_full() {
@@ -614,6 +628,11 @@ async fn journal_replay_retains_file_when_manager_is_full() {
             .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
         "replay must keep the authoritative journal when a later record is pending retry"
     );
+    let pending_tail = journal_record(1, "full-bucket", "second-object", None, 1);
+    assert!(
+        committed_checkpoint_matches_on_all_disks(&disk_paths, 1, &pending_tail),
+        "the committed successor must preserve exactly the refused tail and its retry count"
+    );
 
     let restarted = Arc::new(HealManager::new(
         storage,
@@ -626,13 +645,18 @@ async fn journal_replay_retains_file_when_manager_is_full() {
     ));
     let replayed_after_restart = mrf_queue::replay_journal_once(&restarted).await;
     assert_eq!(
-        replayed_after_restart, 2,
-        "retained startup journal must replay again after a process restart"
+        replayed_after_restart, 1,
+        "the restart must decode the refused tail from the committed successor"
     );
     assert_eq!(
         restarted.operations_snapshot().await.queued_by_source.mrf,
         1,
         "the restart sees the same bounded admission state instead of a lost tail"
+    );
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf + restarted.operations_snapshot().await.queued_by_source.mrf,
+        2,
+        "both original records must reach a manager across the two bounded admissions"
     );
     assert!(
         disk_paths

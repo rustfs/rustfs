@@ -930,17 +930,13 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
     tracing::info!(target: "rustfs::heal::mrf", "MRF intent consumer started");
 }
 
-/// Replay the durable journal into a fresh pending queue and submit whatever
-/// it armed. Returns the number of intact intents replayed. Duplicates are
-/// merged by the manager's dedup key; the journal is retained whenever replay
-/// cannot fully hand off a successor in-memory snapshot (torn tails truncate
-/// via the per-record CRC). Public for integration tests; the live consumer
-/// invokes this through [`replay_into`] at startup.
+/// Replay through the consumer's startup checkpoint boundary, then attempt
+/// one dispatch. Returns the number of intact intents decoded. Public for
+/// integration tests; retained responsibilities remain on disk for restart.
 pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
-    let config = MrfConsumerConfig::default();
-    let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
-    let mut backoff_until: Option<tokio::time::Instant> = None;
-    replay_into(manager, &mut queue, &mut backoff_until).await.replayed
+    let (mut runtime, replayed) = replay_startup(manager).await;
+    runtime.dispatch(manager.as_ref()).await;
+    replayed
 }
 
 struct ReplayOutcome {
@@ -1183,13 +1179,7 @@ async fn replay_into(
     }
 }
 
-/// Replay the journal, then keep draining the channel into the heal manager
-/// while persisting the pending snapshot.
-async fn run_mrf_consumer(
-    manager: Arc<HealManager>,
-    mut receiver: mpsc::Receiver<MrfIntent>,
-    mut durable_receiver: mpsc::Receiver<MrfDurableSubmission>,
-) {
+async fn replay_startup(manager: &Arc<HealManager>) -> (MrfRuntime, usize) {
     let config = MrfConsumerConfig::default();
     let mut runtime = MrfRuntime {
         partial_writes: PartialWrites::default(),
@@ -1209,7 +1199,8 @@ async fn run_mrf_consumer(
 
     // Replay reads the journal and re-arms intents. The startup journal stays
     // on disk whenever any replayed intent still needs a successor snapshot.
-    let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
+    let replay = replay_into(manager, &mut runtime.queue, &mut runtime.backoff_until).await;
+    let replayed = replay.replayed;
     runtime.journal_on_disk = replay.journal_on_disk;
     runtime.retain_replay_journal = replay.retain_journal_for_replay;
     runtime.durable_replay_anchors = replay.durable_replay_anchors;
@@ -1229,6 +1220,18 @@ async fn run_mrf_consumer(
         runtime.flush().await;
     }
     runtime.publish_metrics();
+
+    (runtime, replayed)
+}
+
+/// Replay the journal, then keep draining the channel into the heal manager
+/// while persisting the pending snapshot.
+async fn run_mrf_consumer(
+    manager: Arc<HealManager>,
+    mut receiver: mpsc::Receiver<MrfIntent>,
+    mut durable_receiver: mpsc::Receiver<MrfDurableSubmission>,
+) {
+    let (mut runtime, _) = replay_startup(&manager).await;
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1551,15 +1554,14 @@ mod tests {
         let mut backoff_until = None;
         let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
         assert_eq!(replay.replayed, 1, "W13 committed checkpoint must replay one record");
-        assert_eq!(queue.depth(), 0, "W13 replayed record should reach the manager before cleanup");
+        assert_eq!(queue.depth(), 0, "W13 durable replay must transfer to the checkpointed owner");
         assert_eq!(replay.durable_replay_anchors.len(), 1, "W13 replay must create a proof anchor");
         assert_eq!(
             manager.operations_snapshot().await.queued_by_source.mrf,
-            1,
-            "W13 replayed work must be visible as MRF manager work"
+            0,
+            "durable replay must not dispatch before its successor checkpoint"
         );
 
-        let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
             partial_writes: PartialWrites::default(),
             queue,
@@ -1575,6 +1577,33 @@ mod tests {
             runtime_checkpoint: None,
             backoff_until,
         };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        runtime.dispatch(manager.as_ref()).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "unpersisted replay must not dispatch"
+        );
+        assert!(runtime.flush().await, "publish the replay successor before admission");
+        let checkpoint = snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+            .await
+            .expect("inspect replay successor")
+            .expect("replay successor must be committed");
+        assert_eq!(checkpoint.owner(), runtime.checkpoint_owner);
+        assert_eq!(checkpoint.sequence(), 12);
+        runtime.dispatch(manager.as_ref()).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "persisted replay must reach the manager"
+        );
+        let anchor = runtime
+            .partial_writes
+            .anchors()
+            .next()
+            .expect("dispatched replay has a proof anchor")
+            .clone();
+
         let retained_before_proof = runtime.retained_replay_journal();
         assert!(retained_before_proof, "W13 proof anchor must retain replay checkpoint before proof");
         assert!(
@@ -2469,12 +2498,12 @@ mod tests {
         let mut backoff_until = None;
         let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
         assert_eq!(replay.replayed, 1, "the committed replay checkpoint must decode one record");
-        assert_eq!(queue.depth(), 0, "the replayed record must be admitted before cleanup is considered");
+        assert_eq!(queue.depth(), 0, "durable replay must transfer to the checkpointed owner");
         assert!(backoff_until.is_none(), "the accepted replay must not arm admission backoff");
         assert_eq!(
             manager.operations_snapshot().await.queued_by_source.mrf,
-            1,
-            "the replayed record must be visible as an MRF manager request"
+            0,
+            "durable replay must not dispatch before its successor checkpoint"
         );
         assert!(
             replay.journal_on_disk,
@@ -2498,7 +2527,6 @@ mod tests {
             "cleanup must remember the committed checkpoint generation read at startup"
         );
 
-        let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
             partial_writes: PartialWrites::default(),
             queue,
@@ -2514,6 +2542,33 @@ mod tests {
             runtime_checkpoint: None,
             backoff_until,
         };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        runtime.dispatch(manager.as_ref()).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "unpersisted replay must not dispatch"
+        );
+        assert!(runtime.flush().await, "publish the replay successor before admission");
+        let checkpoint = snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+            .await
+            .expect("inspect replay successor")
+            .expect("replay successor must be committed");
+        assert_eq!(checkpoint.owner(), runtime.checkpoint_owner);
+        assert_eq!(checkpoint.sequence(), 12);
+        runtime.dispatch(manager.as_ref()).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "persisted replay must reach the manager"
+        );
+        let anchor = runtime
+            .partial_writes
+            .anchors()
+            .next()
+            .expect("dispatched replay has a proof anchor")
+            .clone();
+
         assert!(runtime.retained_replay_journal(), "proof-bearing replay anchors must block idle cleanup");
         assert!(
             snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
