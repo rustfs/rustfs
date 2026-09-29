@@ -386,10 +386,21 @@ fn target_and_identity(config: &HeartbeatConfig) -> Result<(DiagnosticJobTarget,
 }
 
 pub(super) async fn executable_provenance() -> Result<ProfileProvenance, &'static str> {
-    let digest = tokio::task::spawn_blocking(hash_current_executable)
-        .await
-        .map_err(|_| "PROVENANCE_FAILED")?
-        .map_err(|_| "PROVENANCE_FAILED")?;
+    let digest = tokio::task::spawn_blocking(|| {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let result = hash_current_executable();
+        #[cfg(test)]
+        eprintln!(
+            "executable_provenance_test hash_elapsed_ms={} success={}",
+            started.elapsed().as_millis(),
+            result.is_ok()
+        );
+        result
+    })
+    .await
+    .map_err(|_| "PROVENANCE_FAILED")?
+    .map_err(|_| "PROVENANCE_FAILED")?;
     Ok(ProfileProvenance::new(
         crate::version::build::COMMIT_HASH,
         digest,
