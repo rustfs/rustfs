@@ -2494,13 +2494,11 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             let emit = async {
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while telemetry_trace_subscriber_count() == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("top.api service subscriber");
+                // Executable hashing precedes subscription. The parent's bounded
+                // request and stdin cancellation govern this readiness wait.
+                while telemetry_trace_subscriber_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
                 for (operation, status) in [
                     (S3Operation::GetObject, 200),
                     (S3Operation::GetObject, 503),
