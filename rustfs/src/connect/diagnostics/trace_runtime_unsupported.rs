@@ -64,6 +64,14 @@ pub(crate) async fn request_local_runtime_profile(
     Err(LocalTraceCaptureError::RuntimeUnavailable)
 }
 
+pub(crate) async fn request_local_native_threads_profile(
+    _state_root: &Path,
+    _request: super::profile_cpu::LocalRuntimeProfileRequest,
+    _cancel: &CancellationToken,
+) -> Result<super::profile_cpu::SignedProfileExport, LocalTraceCaptureError> {
+    Err(LocalTraceCaptureError::RuntimeUnavailable)
+}
+
 pub(crate) async fn request_local_top_disk(
     _state_root: &Path,
     _request: super::top_disk::LocalTopDiskRequest,
