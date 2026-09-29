@@ -20,7 +20,9 @@
 //! cannot discharge them; only an exact storage-verified proof may do so.
 //! Both paths share the existing committed snapshot format and legacy mirrors.
 //! Replay retains partial-write intents for live retries when a member is
-//! still offline at startup. A lost proof causes another repair, not deletion.
+//! still offline at startup. Healthy legacy objects without identity proof are
+//! held in memory after one check; their unchanged journal records are retried
+//! on process restart. A lost proof causes another repair, not deletion.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
@@ -584,7 +586,11 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
     request
 }
 
-async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> crate::Result<HealAdmissionResult> {
+async fn submit_mrf_heal_request(
+    manager: &HealManager,
+    intent: &MrfIntent,
+    durable_anchor: Option<MrfDurableRepairAnchor>,
+) -> crate::Result<HealAdmissionResult> {
     let receipt = manager
         .submit_mrf_heal_request_with_receipt_and_identity(
             build_heal_request(intent),
@@ -596,6 +602,7 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
                 scope: intent.scope,
                 delete_marker_purge: intent.delete_marker_purge.as_ref().map(MrfDeleteMarkerPurge::identity),
                 lease: intent.lease,
+                durable_anchor,
             },
         )
         .await?;
@@ -763,7 +770,7 @@ impl MrfRuntime {
             // attempts counter) changes the encoded snapshot; mark it dirty
             // either way.
             self.dirty = true;
-            match submit_mrf_heal_request(manager, &intent).await {
+            match submit_mrf_heal_request(manager, &intent, None).await {
                 // Accepted intents leave the pending set; the next flush persists the
                 // smaller snapshot. This is not a durable successor receipt and
                 // does not discharge the producer's existing retry hints.
@@ -796,8 +803,7 @@ impl MrfRuntime {
                 }
             }
         }
-        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
-        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
+        self.publish_metrics();
     }
 
     fn retained_replay_journal(&self) -> bool {
@@ -856,12 +862,38 @@ impl MrfRuntime {
         let mut buckets: Vec<Arc<str>> = anchors.iter().map(|anchor| anchor.bucket.clone()).collect();
         buckets.sort_unstable();
         buckets.dedup();
-        for bucket in buckets {
+        for bucket in &buckets {
             rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(bucket.as_ref(), &mut anchors);
         }
         let remaining: HashSet<_> = anchors.into_iter().collect();
         self.durable_replay_anchors.retain(|anchor| remaining.contains(anchor));
         self.dirty |= self.partial_writes.retain_unproven(&remaining);
+        for bucket in buckets {
+            for event in rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(bucket.as_ref()) {
+                // Parking is an in-memory dispatch decision. The unchanged
+                // durable journal remains the recovery/retry authority.
+                self.partial_writes.park_unverified_legacy(&event.anchor);
+            }
+        }
+        self.publish_metrics();
+    }
+
+    fn publish_metrics(&self) {
+        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
+        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
+        let held = self.partial_writes.unverified_legacy_count();
+        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(held));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let oldest_age_seconds = self
+            .partial_writes
+            .oldest_unverified_legacy_enqueued_at_ms()
+            .map(|enqueued_at_ms| now_ms.saturating_sub(enqueued_at_ms) / 1_000)
+            .unwrap_or_default();
+        gauge!("rustfs_heal_mrf_unverified_legacy_oldest_age_seconds")
+            .set(metric_f64(usize::try_from(oldest_age_seconds).unwrap_or(usize::MAX)));
     }
 }
 
@@ -1081,16 +1113,16 @@ async fn replay_into(
                 break;
             }
             if intent.kind.is_durable() {
-                // Preserve the executable record as well as its proof anchor:
-                // a target that is still offline during replay needs live retries.
+                // Adopt durable replay into its single checkpointed owner. The
+                // runtime dispatches it after publishing the successor, avoiding
+                // a duplicate task in the startup-replay and steady-state paths.
                 if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
-                    durable_replay_anchors.push(anchor);
+                    durable_replay_anchors.push(anchor.clone());
                 }
-                let _ = submit_mrf_heal_request(manager, &intent).await;
                 partial_writes.push(intent);
                 continue;
             }
-            match submit_mrf_heal_request(manager, &intent).await {
+            match submit_mrf_heal_request(manager, &intent, None).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
                     if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
                         durable_replay_anchors.push(anchor);
@@ -1196,6 +1228,7 @@ async fn run_mrf_consumer(
     if runtime.dirty {
         runtime.flush().await;
     }
+    runtime.publish_metrics();
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1301,7 +1334,7 @@ async fn run_mrf_consumer(
                     }
                     TickAction::Idle => {}
                 }
-                gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(runtime.queue.depth() + runtime.partial_writes.depth()));
+                runtime.publish_metrics();
             }
         }
     }
