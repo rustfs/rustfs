@@ -190,6 +190,8 @@ pub(crate) mod server {
 
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
+            #[cfg(all(test, unix))]
+            pub(crate) use s3s::Body;
         }
 
         pub(crate) mod tonic_service {
