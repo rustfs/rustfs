@@ -412,28 +412,34 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_a
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
 
-    let locks_output = directory.path().join("locks.zip");
-    let locks = top_command("locks", &state, &locks_output, "019e3ae0-0000-7000-8000-000000000031", 1, true)
-        .output()
-        .expect("run top.locks outside the server process");
-    assert!(!locks.status.success());
-    let stdout = String::from_utf8(locks.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains(r#""outcome":"FAILED""#));
-    assert!(stdout.contains(r#""reasonCode":"SOURCE_UNAVAILABLE""#));
-    assert!(!locks_output.exists());
-
-    for (index, tool) in ["api", "rpc"].into_iter().enumerate() {
+    // Service-backed captures require an explicit offline identity pin before
+    // connecting to the server or emitting an export.
+    for (index, tool) in ["locks", "api"].into_iter().enumerate() {
         let output = directory.path().join(format!("{tool}.zip"));
         let artifact_uid = format!("019e3ae0-0000-7000-8000-00000000003{}", index + 1);
         let run = top_command(tool, &state, &output, &artifact_uid, 1, true)
             .output()
-            .expect("run unsupported top command");
-        assert!(!run.status.success());
+            .expect("run top command without an offline identity pin");
+        assert!(!run.status.success(), "{tool} must reject a missing offline identity pin");
         let stdout = String::from_utf8(run.stdout).expect("UTF-8 stdout");
-        assert!(stdout.contains("\"outcome\":\"UNSUPPORTED\""));
-        assert!(stdout.contains("\"reasonCode\":\"UNSUPPORTED_TOOL\""));
+        let stderr = String::from_utf8(run.stderr).expect("UTF-8 stderr");
+        assert!(stdout.is_empty(), "{tool} stdout: {stdout}");
+        assert!(
+            stderr.contains("--offline-key-id must select an existing offline identity"),
+            "{tool} stderr: {stderr}"
+        );
         assert!(!output.exists());
     }
+
+    let rpc_output = directory.path().join("rpc.zip");
+    let rpc = top_command("rpc", &state, &rpc_output, "019e3ae0-0000-7000-8000-000000000033", 1, true)
+        .output()
+        .expect("run unsupported top.rpc command");
+    assert!(!rpc.status.success());
+    let stdout = String::from_utf8(rpc.stdout).expect("UTF-8 stdout");
+    assert!(stdout.contains("\"outcome\":\"UNSUPPORTED\""));
+    assert!(stdout.contains("\"reasonCode\":\"UNSUPPORTED_TOOL\""));
+    assert!(!rpc_output.exists());
 
     let no_consent = top_command(
         "net",

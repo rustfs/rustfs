@@ -32,6 +32,8 @@ The aggregate requires the validation lanes already selected by `ci.yml`; this c
 
 Superseded PR attempts are cancelled. A running main validation finishes, with only the newest pending main run retained, so frequent merges cannot continuously cancel the full baseline. Having a `merge_group` trigger does not itself require use of the merge queue.
 
+Protocol matrix jobs finish independently when a sibling fails. Each executed protocol test step preserves its log and available JUnit under a separate, attempt-specific artifact; a skipped test step cannot upload a cached report.
+
 ## Pull request and merge matrix
 
 "Via aggregate" means a wrong result fails the required `Test and Lint` check. "Report-only" means visible and actionable but outside both the required list and aggregate. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
@@ -39,7 +41,7 @@ Superseded PR attempts are cancelled. A running main validation finishes, with o
 | Event | Check name | Workflow / job | Merge status | Reproduce |
 |---|---|---|---|---|
 | PR, non-doc change | `Quick Checks` | `ci.yml` `quick-checks` | Required | `make pre-commit` |
-| PR, non-doc change | `Workspace Test and Lint` | `ci.yml` `test-and-lint` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test --features rustfs-ecstore/test-util`; `cargo test --all --doc`; migration evidence check described below |
+| PR, non-doc change | `Workspace Test and Lint` | `ci.yml` `test-and-lint` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; migration evidence check described below |
 | PR, non-doc change | `Typos` | `ci.yml` `typos` | Via aggregate | `typos` |
 | PR, full selection | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Via aggregate | exact command in the job |
 | PR, full selection | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Via aggregate | `cargo nextest run` with the job's `--features` |
