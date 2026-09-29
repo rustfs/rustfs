@@ -1997,11 +1997,11 @@ mod tests {
                 let addr = listener.local_addr().unwrap();
                 let server = tokio::spawn(async move {
                     let (socket, _) = listener.accept().await.unwrap();
-                    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::default()) });
                     server_http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(socket),
-                            TowerToHyperService::new(crate::storage::rpc::InternodeRpcService::new(fallback)),
+                            TowerToHyperService::new(crate::storage_api::server::http::rpc::InternodeRpcService::new(fallback)),
                         )
                         .await
                         .unwrap();
@@ -2019,7 +2019,7 @@ mod tests {
                     .unwrap();
                 signed_request
                     .headers_mut()
-                    .extend(crate::storage::storage_api::gen_signature_headers(&uri, &Method::GET).unwrap());
+                    .extend(crate::storage_api::server::http::gen_signature_headers(&uri, &Method::GET).unwrap());
                 let success = sender.send_request(signed_request).await.unwrap();
                 assert_eq!(success.status(), StatusCode::OK);
                 success.into_body().collect().await.unwrap();
