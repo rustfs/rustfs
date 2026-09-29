@@ -345,7 +345,7 @@ fn local_top_export_is_private_no_clobber_cancel_safe_and_rejects_forged_artifac
 }
 
 #[test]
-fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_and_invalid_runs() {
+fn production_cli_exports_top_net_and_fails_closed_for_unavailable_and_invalid_runs() {
     let directory = tempfile::tempdir().expect("CLI directory");
     let state = directory.path().join("state");
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
@@ -414,7 +414,7 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_a
 
     // Service-backed captures require an explicit offline identity pin before
     // connecting to the server or emitting an export.
-    for (index, tool) in ["locks", "api"].into_iter().enumerate() {
+    for (index, tool) in ["locks", "api", "rpc"].into_iter().enumerate() {
         let output = directory.path().join(format!("{tool}.zip"));
         let artifact_uid = format!("019e3ae0-0000-7000-8000-00000000003{}", index + 1);
         let run = top_command(tool, &state, &output, &artifact_uid, 1, true)
@@ -430,16 +430,6 @@ fn production_cli_exports_top_net_and_fails_closed_for_unavailable_unsupported_a
         );
         assert!(!output.exists());
     }
-
-    let rpc_output = directory.path().join("rpc.zip");
-    let rpc = top_command("rpc", &state, &rpc_output, "019e3ae0-0000-7000-8000-000000000033", 1, true)
-        .output()
-        .expect("run unsupported top.rpc command");
-    assert!(!rpc.status.success());
-    let stdout = String::from_utf8(rpc.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains("\"outcome\":\"UNSUPPORTED\""));
-    assert!(stdout.contains("\"reasonCode\":\"UNSUPPORTED_TOOL\""));
-    assert!(!rpc_output.exists());
 
     let no_consent = top_command(
         "net",
