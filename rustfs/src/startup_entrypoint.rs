@@ -1401,17 +1401,17 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     };
     use rand::{TryRng as _, rngs::SysRng};
 
-    let runtime_scope = (options.tool == ConnectProfileTool::Threads
-        && options.thread_scope == Some(ConnectThreadProfileScope::TokioRuntime))
+    let service_profile = (options.tool == ConnectProfileTool::Threads && options.thread_scope.is_some())
         || (options.tool == ConnectProfileTool::Memory && options.offline_key_id.is_some());
     if options.tool == ConnectProfileTool::Memory && options.thread_scope.is_some() {
         return Err(Error::other("--thread-scope is valid only for the threads profile"));
     }
-    if !runtime_scope && options.offline_key_id.is_some() {
-        return Err(Error::other("--offline-key-id is valid only for a service runtime profile"));
+    if !service_profile && options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is valid only for a service profile"));
     }
     let cancel = tokio_util::sync::CancellationToken::new();
-    let export = if runtime_scope {
+    let export = if service_profile {
+        let native_threads = options.thread_scope == Some(ConnectThreadProfileScope::NativeThreads);
         let offline_key_id = options
             .offline_key_id
             .ok_or_else(|| Error::other("--offline-key-id must explicitly select an existing offline identity"))?;
@@ -1432,7 +1432,13 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
             duration_millis: options.duration_millis,
             sample_period_micros: options.sample_period_micros,
         };
-        let capture = crate::connect::request_local_runtime_profile(&options.state_dir, input, &cancel);
+        let capture = async {
+            if native_threads {
+                crate::connect::request_local_native_threads_profile(&options.state_dir, input, &cancel).await
+            } else {
+                crate::connect::request_local_runtime_profile(&options.state_dir, input, &cancel).await
+            }
+        };
         tokio::pin!(capture);
         tokio::select! {
             biased;
