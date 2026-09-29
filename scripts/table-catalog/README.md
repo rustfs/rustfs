@@ -302,7 +302,11 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   operators
 - catalog export and diagnostics expose the current catalog backing manifest,
   recoverable commit-log WAL state, strong backing migration target, single
-  active writer HA policy, and scale validation matrix
+  active writer HA policy, and scale validation matrix; durable-strong responses
+  additionally identify the snapshot path, ETag, and format version, and
+  diagnostics fail closed if the strong snapshot changes during inspection;
+  until strong maintenance configuration is persisted, diagnostics use a
+  conservative zero-file retention default
 
 ## Client Matrix
 
