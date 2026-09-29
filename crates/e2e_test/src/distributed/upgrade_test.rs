@@ -26,7 +26,7 @@
 
 use super::harness::{
     DistCluster, DistLayout, TestResult, assert_object_bytes, cluster_admin_ok, enable_versioning, get_object_bytes, put_object,
-    unique_bucket, wait_until,
+    s3_probe_client, s3_probe_error_code, sha256_hex, unique_bucket, wait_until,
 };
 use crate::common::{
     AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via, init_logging,
@@ -111,6 +111,7 @@ async fn create_iam_user(dist: &DistCluster, user: &str, secret: &str, policy_na
 }
 
 async fn wait_for_put(client: &Client, bucket: &str, key: &str, body: Vec<u8>, label: &str) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         CREDENTIAL_TIMEOUT,
         || {
@@ -119,8 +120,18 @@ async fn wait_for_put(client: &Client, bucket: &str, key: &str, body: Vec<u8>, l
             let key = key.to_string();
             let body = body.clone();
             async move {
-                put_object(&client, &bucket, &key, body).await?;
-                Ok(true)
+                match put_object(&client, &bucket, &key, body).await {
+                    Ok(()) => Ok(true),
+                    Err(error)
+                        if matches!(
+                            s3_probe_error_code(error.as_ref()),
+                            Some("AccessDenied" | "InvalidAccessKeyId" | "SlowDown" | "ServiceUnavailable")
+                        ) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         },
         label,
@@ -129,6 +140,7 @@ async fn wait_for_put(client: &Client, bucket: &str, key: &str, body: Vec<u8>, l
 }
 
 async fn wait_for_bytes(client: &Client, bucket: &str, key: &str, expected: &[u8], label: &str) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         CREDENTIAL_TIMEOUT,
         || {
@@ -137,13 +149,80 @@ async fn wait_for_bytes(client: &Client, bucket: &str, key: &str, expected: &[u8
             let key = key.to_string();
             let expected = expected.to_vec();
             async move {
-                let got = get_object_bytes(&client, &bucket, &key).await?;
-                Ok(got == expected)
+                match get_object_bytes(&client, &bucket, &key).await {
+                    Ok(got) if got == expected => Ok(true),
+                    Ok(got) => Err(format!(
+                        "{label}: object {bucket}/{key} bytes mismatch: expected sha256={} got sha256={}",
+                        sha256_hex(&expected),
+                        sha256_hex(&got)
+                    )
+                    .into()),
+                    Err(error)
+                        if matches!(
+                            s3_probe_error_code(error.as_ref()),
+                            Some("AccessDenied" | "InvalidAccessKeyId" | "SlowDown" | "ServiceUnavailable")
+                        ) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         },
         label,
     )
     .await
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::common::build_test_s3_config;
+    use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction, Operation};
+
+    #[tokio::test]
+    async fn iam_polls_only_retry_auth_propagation_and_availability() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("upgrade-retry-probe");
+        let client = Client::from_conf(build_test_s3_config(
+            target.endpoint(),
+            FAKE_ACCESS_KEY,
+            FAKE_SECRET_KEY,
+            None,
+            "upgrade-retry-test",
+        ));
+
+        for status in [403, 503] {
+            target.inject(Operation::PutObject, FaultAction::ResponseStatus(status), 1);
+            wait_for_put(&client, "upgrade-retry-probe", "key", b"body".to_vec(), "IAM PUT").await?;
+            assert_eq!(target.take_requests().len(), 2);
+
+            target.inject(Operation::GetObject, FaultAction::ResponseStatus(status), 1);
+            wait_for_bytes(&client, "upgrade-retry-probe", "key", b"body", "IAM GET").await?;
+            assert_eq!(target.take_requests().len(), 2);
+        }
+
+        target.inject(Operation::PutObject, FaultAction::ResponseStatus(500), 1);
+        let error = wait_for_put(&client, "upgrade-retry-probe", "key", b"body".to_vec(), "IAM PUT")
+            .await
+            .expect_err("IAM convergence must not hide InternalError on PUT");
+        assert_eq!(s3_probe_error_code(error.as_ref()), Some("InternalError"));
+        assert_eq!(target.take_requests().len(), 1);
+
+        target.inject(Operation::GetObject, FaultAction::ResponseStatus(500), 1);
+        let error = wait_for_bytes(&client, "upgrade-retry-probe", "key", b"body", "IAM GET")
+            .await
+            .expect_err("IAM convergence must not hide InternalError on GET");
+        assert_eq!(s3_probe_error_code(error.as_ref()), Some("InternalError"));
+        assert_eq!(target.take_requests().len(), 1);
+
+        let error = wait_for_bytes(&client, "upgrade-retry-probe", "key", b"wrong bytes", "IAM GET")
+            .await
+            .expect_err("IAM convergence must not hide a payload mismatch");
+        assert!(error.to_string().contains("bytes mismatch"));
+        assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
 }
 
 async fn seed_history_and_iam(dist: &DistCluster) -> TestResult<UpgradeSeed> {

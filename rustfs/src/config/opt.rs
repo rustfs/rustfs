@@ -153,6 +153,7 @@ impl Opt {
                 ConnectCommands::Performance(opts) => match opts.command {
                     ConnectPerformanceCommands::Client(opts) => Ok(CommandResult::ConnectClientPerformance(opts)),
                     ConnectPerformanceCommands::Drive(opts) => Ok(CommandResult::ConnectDrivePerformance(*opts)),
+                    ConnectPerformanceCommands::Network(opts) => Ok(CommandResult::ConnectNetworkPerformance(*opts)),
                     ConnectPerformanceCommands::Object(opts) => Ok(CommandResult::ConnectObjectPerformance(*opts)),
                     ConnectPerformanceCommands::SiteReplication(opts) => {
                         Ok(CommandResult::ConnectSiteReplicationPerformance(opts))
