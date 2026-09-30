@@ -1372,13 +1372,24 @@ pub(crate) fn durability_mode() -> DurabilityMode {
             rustfs_utils::get_env_opt_str(ENV_RUSTFS_DURABILITY_MODE),
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
         );
-        info!(
-            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-            mode = mode.as_str(),
-            "Storage durability mode resolved"
-        );
+        if mode == DurabilityMode::Strict {
+            info!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                mode = mode.as_str(),
+                "Storage durability mode resolved"
+            );
+        } else {
+            warn!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "non_strict_mode_configured",
+                mode = mode.as_str(),
+                "Storage durability mode does not provide strict power-loss durability"
+            );
+        }
         mode
     })
 }
@@ -6915,7 +6926,9 @@ impl LocalDisk {
 
         let (buf, mtime) = res?;
         if buf.is_empty() {
-            return Err(DiskError::FileNotFound);
+            // A missing xl.meta is mapped by the open/read error above. A file
+            // that exists but has no metadata bytes is corruption, not absence.
+            return Err(DiskError::FileCorrupt);
         }
 
         Ok((buf, mtime))
@@ -11693,6 +11706,39 @@ mod test {
             )
             .await
             .expect_err("invalid erasure geometry must fail before shard size calculation");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
+    async fn read_version_reports_empty_xl_meta_as_corrupt_not_missing() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("test directory should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("test path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "empty-metadata";
+        ensure_test_volume(&disk, bucket).await;
+
+        let missing_err = disk
+            .read_version("", bucket, "missing-object", "", &ReadOptions::default())
+            .await
+            .expect_err("a missing xl.meta remains not found");
+        assert_eq!(missing_err, DiskError::FileNotFound);
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir)
+            .await
+            .expect("object directory should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"")
+            .await
+            .expect("empty metadata fixture should be written");
+
+        let err = disk
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("an existing zero-length xl.meta is corrupt, not an absent object");
 
         assert_eq!(err, DiskError::FileCorrupt);
     }

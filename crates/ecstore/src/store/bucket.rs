@@ -3394,7 +3394,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn make_bucket_seeds_new_bucket_durability_override() {
+    async fn make_bucket_inherits_default_durability() {
         temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
             let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
             let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
@@ -3407,10 +3407,7 @@ mod tests {
             let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
                 .await
                 .expect("metadata should load for the new bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
         })
         .await;
     }
