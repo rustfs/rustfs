@@ -408,7 +408,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
                         &ObjectOptions {
                             no_lock: true,
                             versioned: true,
-                            expected_bucket_incarnation_id: Some(expected_bucket_incarnation_id),
+                            expected_bucket_incarnation_id: Some(put_incarnation),
                             ..Default::default()
                         },
                     )
