@@ -245,11 +245,11 @@ jobs:
           mkdir -p artifacts/test-and-lint
           set +e
           timeout --verbose --signal=TERM --kill-after=30s 15m \
-            cargo test --all --doc \
+            cargo test --all --exclude e2e_test --doc \
             2>&1 | tee artifacts/test-and-lint/doctest.log
           status=${PIPESTATUS[0]}
           {
-            echo "command=cargo test --all --doc"
+            echo "command=cargo test --all --exclude e2e_test --doc"
             echo "exit_status=${status}"
             echo "finished_at=$(date --utc --iso-8601=seconds)"
             echo
@@ -823,6 +823,10 @@ jobs:
           cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
           python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
           ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
+
+      # Keep E2E documentation coverage with its already-built package graph.
+      - name: Run E2E documentation tests
+        run: cargo test -p e2e_test --doc
 
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
       # profile.e2e-smoke default-filter in .config/nextest.toml is the single
