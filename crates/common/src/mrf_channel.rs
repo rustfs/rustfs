@@ -333,6 +333,9 @@ pub enum MrfDurableAdmissionError {
 /// cancel repair.
 pub struct MrfDurableSubmission {
     pub intent: MrfIntent,
+    /// Bucket incarnation observed by the committed-write caller, when
+    /// available. Old journal records and legacy callers remain unbound.
+    pub source_bucket_incarnation_id: Option<Uuid>,
     pub response: oneshot::Sender<Result<(), MrfDurableAdmissionError>>,
 }
 
@@ -353,6 +356,19 @@ pub async fn persist_partial_write_intent(
     version_id: Option<Uuid>,
     scope: MrfScope,
 ) -> Result<(), MrfDurableAdmissionError> {
+    persist_partial_write_intent_with_incarnation(bucket, object, version_id, scope, None).await
+}
+
+pub async fn persist_partial_write_intent_with_incarnation(
+    bucket: &str,
+    object: &str,
+    version_id: Option<Uuid>,
+    scope: MrfScope,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
+    if source_bucket_incarnation_id.is_some_and(|incarnation| incarnation.is_nil()) {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
     let intent = MrfIntent {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
@@ -364,7 +380,7 @@ pub async fn persist_partial_write_intent(
         enqueued_at_ms: unix_now_ms(),
         attempts: 0,
     };
-    persist_durable_intent(intent).await
+    persist_durable_intent(intent, source_bucket_incarnation_id).await
 }
 
 pub async fn persist_delete_marker_purge_intent(
@@ -377,6 +393,7 @@ pub async fn persist_delete_marker_purge_intent(
     if version_id.is_nil() {
         return Err(MrfDurableAdmissionError::InvalidIdentity);
     }
+    let source_bucket_incarnation_id = delete_marker_purge.bucket_incarnation_id;
     let intent = MrfIntent {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
@@ -388,17 +405,23 @@ pub async fn persist_delete_marker_purge_intent(
         enqueued_at_ms: unix_now_ms(),
         attempts: 0,
     };
-    persist_durable_intent_unconditionally(intent).await
+    persist_durable_intent_unconditionally(intent, Some(source_bucket_incarnation_id)).await
 }
 
-async fn persist_durable_intent(intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+async fn persist_durable_intent(
+    intent: MrfIntent,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
     if !mrf_delivery_enabled() {
         return Err(MrfDurableAdmissionError::Disabled);
     }
-    persist_durable_intent_unconditionally(intent).await
+    persist_durable_intent_unconditionally(intent, source_bucket_incarnation_id).await
 }
 
-async fn persist_durable_intent_unconditionally(mut intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+async fn persist_durable_intent_unconditionally(
+    mut intent: MrfIntent,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
     if intent.bucket.is_empty()
         || intent.object.is_empty()
         || intent.bucket.len() > MRF_MAX_IDENTITY_COMPONENT
@@ -413,7 +436,11 @@ async fn persist_durable_intent_unconditionally(mut intent: MrfIntent) -> Result
     }
     let (response, receipt) = oneshot::channel();
     sender
-        .try_send(MrfDurableSubmission { intent, response })
+        .try_send(MrfDurableSubmission {
+            intent,
+            source_bucket_incarnation_id,
+            response,
+        })
         .map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => MrfDurableAdmissionError::Full,
             mpsc::error::TrySendError::Closed(_) => MrfDurableAdmissionError::Unavailable,

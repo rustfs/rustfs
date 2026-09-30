@@ -242,6 +242,13 @@ test-group = 'e2e-cluster-nightly'
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
+# These server-heavy smoke cases perform 1k+ sequential S3 writes or run the
+# scanner and a remote tier server together. Reserve the full test budget so
+# unrelated E2E processes cannot starve their storage and polling deadlines.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+threads-required = "num-test-threads"
+
 # This four-disk, 65-member rollback probe already drives up to 32 concurrent
 # durable deletions. Reserve this nextest run's capacity for its progress oracle.
 [[profile.default.overrides]]
@@ -525,6 +532,11 @@ path = "junit.xml"
 [[profile.e2e-smoke.overrides]]
 filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
 slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
+threads-required = "num-test-threads"
+
+[[profile.e2e-smoke.overrides]]
+filter = 'package(e2e_test) & test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry)'
+threads-required = "num-test-threads"
 
 # ---------------------------------------------------------------------------
 # e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)
@@ -763,3 +775,9 @@ test-group = 'e2e-cluster-nightly'
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
+
+# Keep the storage-heavy smoke cases isolated in the full suite too. They
+# start multiple server fixtures and issue many sequential S3 operations.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+threads-required = "num-test-threads"

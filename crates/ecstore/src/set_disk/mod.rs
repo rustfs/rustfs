@@ -4339,9 +4339,15 @@ impl SetDisks {
         }
     }
 
-    pub(in crate::set_disk) async fn persist_partial_write(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+    pub(in crate::set_disk) async fn persist_partial_write(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        source_bucket_incarnation_id: Option<Uuid>,
+    ) -> bool {
         use rustfs_common::mrf_channel::{
-            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent,
+            MrfDurableAdmissionError, MrfScope, mrf_delivery_enabled, persist_partial_write_intent_with_incarnation,
         };
 
         if !mrf_delivery_enabled() {
@@ -4360,7 +4366,9 @@ impl SetDisks {
             Ok::<_, MrfDurableAdmissionError>((version, scope))
         })();
         let result = match identity {
-            Ok((version, scope)) => persist_partial_write_intent(bucket, object, version, scope).await,
+            Ok((version, scope)) => {
+                persist_partial_write_intent_with_incarnation(bucket, object, version, scope, source_bucket_incarnation_id).await
+            }
             Err(err) => Err(err),
         };
         match result {
@@ -4396,15 +4404,24 @@ impl SetDisks {
 
     pub(in crate::set_disk) async fn submit_rename_tail_heal(
         &self,
-        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        mut request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     ) {
         if let Some(object) = request.object_prefix.as_deref()
             && self
-                .persist_partial_write(&request.bucket, object, request.object_version_id.as_deref())
+                .persist_partial_write(
+                    &request.bucket,
+                    object,
+                    request.object_version_id.as_deref(),
+                    request.expected_bucket_incarnation_id,
+                )
                 .await
         {
             return;
         }
+        if request.expected_bucket_incarnation_id.is_none() {
+            return;
+        }
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
         {
             let capture = self

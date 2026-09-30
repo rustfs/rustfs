@@ -366,6 +366,19 @@ pub async fn publish_committed_snapshot(
     payload: &[u8],
     limit: usize,
 ) -> Result<SnapshotPublication, SnapshotError> {
+    publish_committed_snapshot_with_companion(disks, owner, sequence, payload, limit, None).await
+}
+
+/// Publish a companion lifecycle record on the same disk before the commit
+/// manifest. A replica is committed only after both payloads have been stored.
+pub async fn publish_committed_snapshot_with_companion(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    payload: &[u8],
+    limit: usize,
+    companion: Option<(&[&str; 2], &[u8], usize)>,
+) -> Result<SnapshotPublication, SnapshotError> {
     if disks.is_empty() {
         return Err(SnapshotError::NoWritableReplica);
     }
@@ -413,6 +426,18 @@ pub async fn publish_committed_snapshot(
                 continue;
             }
         }
+        if let Some((companion_paths, companion_bytes, companion_limit)) = companion {
+            match cas_replace(disk, companion_paths[slot], companion_bytes, companion_limit).await {
+                Ok(EcstoreConditionalFileUpdate::Updated) => {}
+                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            }
+        }
         match cas_replace_expected(disk, MANIFEST_PATHS[slot], expected_manifest.map(EcstoreDiskBytes::from), &manifest).await {
             Ok(EcstoreConditionalFileUpdate::Updated) => manifest_replicas += 1,
             Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => {}
@@ -434,6 +459,80 @@ pub async fn publish_committed_snapshot(
         payload_replicas,
         manifest_replicas,
     })
+}
+
+/// Read a companion only from replicas that also contain its matching
+/// committed checkpoint. Differing companions for the same checkpoint fail
+/// closed rather than selecting one replica arbitrarily.
+pub async fn read_committed_companion(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    companion_paths: &[&str; 2],
+    checkpoint_limit: usize,
+    companion_limit: usize,
+) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let mut selected: Option<Vec<u8>> = None;
+    let mut first_error = None;
+    for disk in disks {
+        let mut checkpoint_slot = None;
+        for (slot, (manifest_path, payload_path)) in MANIFEST_PATHS.into_iter().zip(PAYLOAD_PATHS).enumerate() {
+            let manifest_bytes = match read_bounded(disk, manifest_path, MANIFEST_LEN).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error @ SnapshotError::Unsupported) => return Err(error),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            let manifest = match Manifest::decode(&manifest_bytes, checkpoint_limit) {
+                Ok(manifest) if manifest.owner == owner && manifest.sequence == sequence => manifest,
+                Ok(_) | Err(SnapshotError::Corrupt) | Err(SnapshotError::TooLarge) => continue,
+                Err(error) => return Err(error),
+            };
+            let payload = match read_bounded(disk, payload_path, manifest.payload_len).await {
+                Ok(Some(payload)) => payload,
+                Ok(None) => continue,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if CommittedSnapshot::decode(slot, &manifest_bytes, payload, checkpoint_limit).is_ok() {
+                checkpoint_slot = Some(slot);
+                break;
+            }
+        }
+        let Some(checkpoint_slot) = checkpoint_slot else {
+            continue;
+        };
+        let companion = match read_bounded(disk, companion_paths[checkpoint_slot], companion_limit).await {
+            Ok(Some(companion)) => companion,
+            Ok(None) => continue,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        if selected.as_ref().is_some_and(|existing| existing != &companion) {
+            return Err(SnapshotError::Conflict);
+        }
+        selected = Some(companion);
+    }
+    if selected.is_some() {
+        Ok(selected)
+    } else if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Reclaim the slot superseded by an already committed checkpoint.
@@ -840,6 +939,81 @@ mod tests {
             assert_eq!(recovered.manifest.sequence, 2);
             assert_eq!(recovered.payload, payload("new"));
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_companion_is_read_only_with_its_matching_checkpoint_replica() {
+        let root = TempDir::new().expect("test directory");
+        let checkpoint_disk = disk(&root, "checkpoint").await;
+        let sidecar_disk = disk(&root, "sidecar").await;
+        let owner = Uuid::new_v4();
+        let checkpoint_payload = payload("responsibility");
+        let sidecar = b"lifecycle state";
+        commit(&checkpoint_disk, 0, owner, 7, &checkpoint_payload).await;
+        install(&sidecar_disk, ".heal-mrf-lifecycle.0.bin", sidecar).await;
+
+        let absent = read_committed_companion(
+            &[checkpoint_disk.clone(), sidecar_disk.clone()],
+            owner,
+            7,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("unpaired lifecycle sidecar is ignored");
+        assert!(absent.is_none());
+
+        publish_committed_snapshot_with_companion(
+            &[checkpoint_disk.clone(), sidecar_disk.clone()],
+            owner,
+            8,
+            &checkpoint_payload,
+            4096,
+            Some((&[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"], sidecar, 4096)),
+        )
+        .await
+        .expect("paired checkpoint and lifecycle state publish");
+        let paired = read_committed_companion(
+            &[checkpoint_disk, sidecar_disk],
+            owner,
+            8,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("read paired lifecycle sidecar")
+        .expect("paired sidecar exists");
+        assert_eq!(paired, sidecar);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_companion_recovers_from_a_healthy_replica_after_peer_read_error() {
+        let root = TempDir::new().expect("test directory");
+        let failing_disk = disk(&root, "failing").await;
+        let healthy_disk = disk(&root, "healthy").await;
+        let owner = Uuid::new_v4();
+        let checkpoint_payload = payload("responsibility");
+        let sidecar = b"operator audit and source incarnation";
+        commit(&healthy_disk, 0, owner, 9, &checkpoint_payload).await;
+        install(&healthy_disk, ".heal-mrf-lifecycle.0.bin", sidecar).await;
+        std::fs::create_dir(root.path().join("failing").join(RUSTFS_META_BUCKET).join(MANIFEST_PATHS[0]))
+            .expect("simulate one replica read error");
+
+        let recovered = read_committed_companion(
+            &[failing_disk, healthy_disk],
+            owner,
+            9,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("one unreadable replica must not hide a healthy paired sidecar")
+        .expect("healthy paired sidecar must be recovered");
+
+        assert_eq!(recovered, sidecar);
     }
 
     #[tokio::test]
