@@ -29,7 +29,10 @@ const MINIO_S2_COMPRESSION_SCHEME: &str = "klauspost/compress/s2";
 // encryption. Only the padding test asserts it today, so the lib target sees
 // it as unused (backlog#1823).
 #[cfg(feature = "rio-v2")]
-#[allow(dead_code, reason = "on-disk contract asserted by the rio-v2 padding test (backlog#1823)")]
+#[allow(
+    dead_code,
+    reason = "on-disk contract asserted by the rio-v2 padding test (backlog#1823)"
+)]
 const ENCRYPTED_S2_PADDING_MULTIPLE: usize = 256;
 
 /// Which rio implementation this build compiled in. Only the feature-seam
@@ -70,7 +73,9 @@ pub enum ReadCompressionBackend {
     V2,
 }
 
-pub fn compression_scheme_to_read_plan(scheme: &str) -> std::io::Result<(CompressionAlgorithm, ReadCompressionBackend)> {
+pub fn compression_scheme_to_read_plan(
+    scheme: &str,
+) -> std::io::Result<(CompressionAlgorithm, ReadCompressionBackend)> {
     #[cfg(feature = "rio-v2")]
     if scheme.eq_ignore_ascii_case(MINIO_S2_COMPRESSION_SCHEME) {
         return Ok((CompressionAlgorithm::default(), ReadCompressionBackend::V2));
@@ -342,7 +347,65 @@ pub(crate) fn encryption_frame_v2_enabled() -> bool {
     #[cfg(not(test))]
     {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_FRAME_V2, DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2))
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTION_FRAME_V2, DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2)
+        })
+    }
+}
+//New add
+#[cfg(not(feature = "rio-v2"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncryptCipher {
+    Aes256Gcm,
+    XkunlunAes256Gcm,
+}
+//New add
+#[cfg(not(feature = "rio-v2"))]
+impl Default for EncryptCipher {
+    fn default() -> Self {
+        Self::Aes256Gcm
+    }
+}
+//New add
+#[cfg(not(feature = "rio-v2"))]
+impl FromStr for EncryptCipher {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        tracing::debug!("cao_ch RUSTFS_ENCRYPTION_CIPHER: {}", s);
+        match s {
+            "AES-256-GCM" => Ok(Self::Aes256Gcm),
+            "XKUNLUN-AES-256-GCM" => Ok(Self::XkunlunAes256Gcm),
+            other => {
+                tracing::error!("Unknown RUSTFS_ENCRYPTION_CIPHER value: {}", other);
+                Err(())
+            }
+        }
+    }
+}
+//New add
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) fn encryption_cipher() -> EncryptCipher {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_str(
+            rustfs_config::ENV_RUSTFS_ENCRYPTION_CIPHER, 
+            rustfs_config::DEFAULT_RUSTFS_ENCRYPTION_CIPHER,
+        )
+        .parse()
+        .unwrap_or_default()
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<EncryptCipher> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_str(
+                rustfs_config::ENV_RUSTFS_ENCRYPTION_CIPHER,
+                rustfs_config::DEFAULT_RUSTFS_ENCRYPTION_CIPHER,
+            )
+            .parse()
+            .unwrap_or_default()
+        })
     }
 }
 
@@ -443,54 +506,88 @@ impl WritePlan {
 
         if let Some(encryption) = self.encryption {
             reader = match encryption.mode {
-                WriteEncryptionMode::SinglepartObjectKey => HashReader::from_reader(
+                WriteEncryptionMode::SinglepartObjectKey => {// New add
                     #[cfg(feature = "rio-v2")]
-                    EncryptReader::new_with_object_key(reader, encryption.key_bytes),
+                    let encrypy_reader = EncryptReader::new_with_object_key(reader, encryption.key_bytes);
                     #[cfg(not(feature = "rio-v2"))]
-                    EncryptReader::new(reader, encryption.key_bytes, [0u8; 12]),
-                    HashReader::SIZE_PRESERVE_LAYER,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )?,
-                WriteEncryptionMode::Singlepart { base_nonce } => {
+                    let encrypy_reader = if encryption_cipher() == EncryptCipher::XkunlunAes256Gcm {
+                        tracing::debug!("SinglepartObjectKey with XKUNLUN-AES-256-GCM");
+                        EncryptReader::new_v2_with_xkunlun_aes256gcm(reader, encryption.key_bytes, [0u8; 12])
+                    } else {
+                        EncryptReader::new(reader, encryption.key_bytes, [0u8; 12])
+                    };  
+                    HashReader::from_reader(
+                        encrypy_reader, 
+                        HashReader::SIZE_PRESERVE_LAYER, 
+                        actual_size, 
+                        None, 
+                        None,
+                        false)?
+                }
+                WriteEncryptionMode::Singlepart { base_nonce } => {// New add
                     #[cfg(not(feature = "rio-v2"))]
-                    let encrypt_reader = if encryption_frame_v2_enabled() {
+                    let encrypt_reader = if encryption_cipher() == EncryptCipher::XkunlunAes256Gcm {
+                        tracing::debug!("Singlepart with XKUNLUN-AES-256-GCM");
+                        EncryptReader::new_v2_with_xkunlun_aes256gcm(reader, encryption.key_bytes, base_nonce)
+                    } else if encryption_frame_v2_enabled() {
                         EncryptReader::new_v2(reader, encryption.key_bytes, base_nonce)
                     } else {
                         EncryptReader::new(reader, encryption.key_bytes, base_nonce)
                     };
                     #[cfg(feature = "rio-v2")]
                     let encrypt_reader = EncryptReader::new(reader, encryption.key_bytes, base_nonce);
-                    HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
+                    HashReader::from_reader(
+                        encrypt_reader,
+                        HashReader::SIZE_PRESERVE_LAYER,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )?
                 }
                 WriteEncryptionMode::MultipartLegacy {
                     base_nonce,
                     multipart_part_number,
                 } => {
                     #[cfg(not(feature = "rio-v2"))]
-                    let encrypt_reader = if encryption_frame_v2_enabled() {
+                    let encrypt_reader = if encryption_cipher() == EncryptCipher::XkunlunAes256Gcm {
+                        tracing::debug!("MultipartLegacy with XKUNLUN-AES-256-GCM");
+                        EncryptReader::new_multipart_v2_with_xkunlun_aes256gcm(reader, encryption.key_bytes, base_nonce, multipart_part_number as usize)
+                    } else if encryption_frame_v2_enabled() {
                         EncryptReader::new_multipart_v2(reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     } else {
                         EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     };
                     #[cfg(feature = "rio-v2")]
-                    let encrypt_reader =
-                        EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number);
-                    HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
+                    let encrypt_reader = EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number);
+                    HashReader::from_reader(
+                        encrypt_reader,
+                        HashReader::SIZE_PRESERVE_LAYER,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )?
                 }
-                WriteEncryptionMode::MultipartObjectKey { multipart_part_number } => HashReader::from_reader(
+                WriteEncryptionMode::MultipartObjectKey { multipart_part_number } => {// New add
                     #[cfg(feature = "rio-v2")]
-                    EncryptReader::new_multipart_with_object_key(reader, encryption.key_bytes, multipart_part_number),
+                    let encrypt_reader = EncryptReader::new_multipart_with_object_key(reader, encryption.key_bytes, multipart_part_number);
                     #[cfg(not(feature = "rio-v2"))]
-                    EncryptReader::new_multipart(reader, encryption.key_bytes, [0u8; 12], multipart_part_number as usize),
-                    HashReader::SIZE_PRESERVE_LAYER,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )?,
+                    let encrypt_reader = if encryption_cipher() == EncryptCipher::XkunlunAes256Gcm {
+                        tracing::debug!("MultipartObjectKey with XKUNLUN-AES-256-GCM");
+                        EncryptReader::new_multipart_v2_with_xkunlun_aes256gcm(reader, encryption.key_bytes, [0u8; 12], multipart_part_number as usize)
+                    } else {
+                        EncryptReader::new_multipart(reader, encryption.key_bytes, [0u8; 12], multipart_part_number as usize)
+                    };
+                    HashReader::from_reader(
+                        encrypt_reader,
+                        HashReader::SIZE_PRESERVE_LAYER,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )?
+                }
             };
         }
 
@@ -580,8 +677,9 @@ mod tests {
         let mut offset = 0usize;
         while offset + 4 <= stream.len() {
             let chunk_type = stream[offset];
-            let chunk_len =
-                (stream[offset + 1] as usize) | ((stream[offset + 2] as usize) << 8) | ((stream[offset + 3] as usize) << 16);
+            let chunk_len = (stream[offset + 1] as usize)
+                | ((stream[offset + 2] as usize) << 8)
+                | ((stream[offset + 3] as usize) << 16);
             chunk_types.push(chunk_type);
             offset += 4 + chunk_len;
         }
@@ -619,8 +717,9 @@ mod tests {
         let base_nonce = [0xA5u8; 12];
         let part_number = 7;
 
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_compression(CompressionAlgorithm::default())
@@ -634,7 +733,8 @@ mod tests {
             .await
             .expect("read transformed ciphertext");
 
-        let decrypt_reader = DecryptReader::new_multipart(Cursor::new(ciphertext), key_bytes, base_nonce, vec![part_number]);
+        let decrypt_reader =
+            DecryptReader::new_multipart(Cursor::new(ciphertext), key_bytes, base_nonce, vec![part_number]);
         let mut decompressed = DecompressReader::new(Box::new(decrypt_reader), CompressionAlgorithm::default());
 
         let mut actual = Vec::new();
@@ -653,8 +753,9 @@ mod tests {
         let actual_size = plaintext.len() as i64;
         let object_key = [0x7Cu8; 32];
 
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_encryption(WriteEncryption::singlepart_object_key(object_key))
@@ -669,7 +770,10 @@ mod tests {
 
         let mut decrypted = DecryptReader::new_with_object_key(Cursor::new(encrypted), object_key);
         let mut actual = Vec::new();
-        decrypted.read_to_end(&mut actual).await.expect("decrypt object-key stream");
+        decrypted
+            .read_to_end(&mut actual)
+            .await
+            .expect("decrypt object-key stream");
 
         assert_eq!(actual, plaintext);
     }
@@ -682,8 +786,9 @@ mod tests {
         let object_key = [0x2Du8; 32];
         let part_number = 3u32;
 
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_encryption(WriteEncryption::multipart_object_key(object_key, part_number))
@@ -710,8 +815,9 @@ mod tests {
     async fn write_plan_rio_v2_compression_emits_s2_stream_and_seekable_index() {
         let plaintext = b"rustfs-rio-v2-s2-".repeat(600_000);
         let actual_size = plaintext.len() as i64;
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_compression(CompressionAlgorithm::default())
@@ -733,14 +839,18 @@ mod tests {
             .try_get_index()
             .cloned()
             .expect("rio_v2 compressed stream should expose a compression index");
-        let (compressed_offset, uncompressed_offset) = index.find(2 * 1024 * 1024).expect("seek into compression index");
+        let (compressed_offset, uncompressed_offset) =
+            index.find(2 * 1024 * 1024).expect("seek into compression index");
 
         assert!(compressed_offset > 0, "expected a non-zero compressed offset for the second block");
         assert!(uncompressed_offset > 0, "expected a non-zero uncompressed offset for the second block");
 
         let mut decompressed = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut actual = Vec::new();
-        decompressed.read_to_end(&mut actual).await.expect("decompress rio_v2 stream");
+        decompressed
+            .read_to_end(&mut actual)
+            .await
+            .expect("decompress rio_v2 stream");
 
         assert_eq!(actual, plaintext);
     }
@@ -750,8 +860,9 @@ mod tests {
     async fn write_plan_rio_v2_small_compression_skips_index_below_minio_threshold() {
         let plaintext = b"rustfs-rio-v2-s2-".repeat(32_768);
         let actual_size = plaintext.len() as i64;
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_compression(CompressionAlgorithm::default())
@@ -771,7 +882,10 @@ mod tests {
 
         let mut decompressed = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut actual = Vec::new();
-        decompressed.read_to_end(&mut actual).await.expect("decompress rio_v2 stream");
+        decompressed
+            .read_to_end(&mut actual)
+            .await
+            .expect("decompress rio_v2 stream");
 
         assert_eq!(actual, plaintext);
     }
@@ -814,8 +928,9 @@ mod tests {
         let key_bytes = [0x1Bu8; 32];
         let base_nonce = [0xC4u8; 12];
 
-        let reader = HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
-            .expect("create hash reader");
+        let reader =
+            HashReader::from_stream(Cursor::new(plaintext.clone()), actual_size, actual_size, None, None, false)
+                .expect("create hash reader");
 
         let mut transformed = WritePlan::new()
             .with_compression(CompressionAlgorithm::default())
@@ -865,7 +980,10 @@ mod tests {
 
         let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut buf = [0u8; 64];
-        let n = decompressor.read(&mut buf).await.expect("read first decompressed chunk");
+        let n = decompressor
+            .read(&mut buf)
+            .await
+            .expect("read first decompressed chunk");
 
         assert!(n > 0);
         assert_eq!(&buf[..n], plaintext.as_slice());
@@ -884,7 +1002,10 @@ mod tests {
 
         let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut buf = [0u8; 8192];
-        let n = decompressor.read(&mut buf).await.expect("read first decompressed chunk");
+        let n = decompressor
+            .read(&mut buf)
+            .await
+            .expect("read first decompressed chunk");
 
         assert!(n > 0);
         assert_eq!(&buf[..n], plaintext.as_slice());

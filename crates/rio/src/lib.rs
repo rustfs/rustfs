@@ -112,6 +112,9 @@ pub use compress_reader::{CompressReader, DecompressReader};
 
 mod encrypt_reader;
 pub use encrypt_reader::{DecryptReader, EncryptReader, multipart_part_nonce};
+// New add
+mod xkunlun_aead;
+pub use xkunlun_aead::XkunlunAes256Gcm;
 
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;

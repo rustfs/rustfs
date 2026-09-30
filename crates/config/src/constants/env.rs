@@ -40,6 +40,12 @@ pub const ENV_ILM_PROCESS_TIME: &str = "RUSTFS_ILM_PROCESS_TIME";
 pub const ENV_ILM_PROCESS_TIME_DEPRECATED: &str = "_RUSTFS_ILM_PROCESS_TIME";
 /// Default ILM process boundary in seconds (24h).
 pub const DEFAULT_ILM_PROCESS_TIME_SECS: i32 = 86400;
+/// Environment variable selecting the cipher used to encrypt newly written objects.
+/// Only the write path reads this; the decrypt reader dispatches on the on-disk
+/// frame type byte and never consults this variable.
+pub const ENV_RUSTFS_ENCRYPTION_CIPHER: &str = "RUSTFS_ENCRYPTION_CIPHER";//New add
+/// Default encryption cipher.
+pub const DEFAULT_RUSTFS_ENCRYPTION_CIPHER: &str = "AES-256-GCM";//New add
 
 /// **TEST/DEBUG ONLY** — lifecycle "day" length override, in seconds.
 ///

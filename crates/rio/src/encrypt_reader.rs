@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::aead::{Aead, AeadCore, Payload, TagPosition};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
 use rustfs_utils::{put_uvarint, put_uvarint_len};
@@ -44,6 +44,10 @@ const ENCRYPTION_BLOCK_SIZE: usize = 8 * 1024;
 const FRAME_TYPE_V1: u8 = 0x00;
 const FRAME_TYPE_V2: u8 = 0x01;
 const FRAME_TYPE_V2_FINAL: u8 = 0x02;
+//New add
+const FRAME_TYPE_XKUNLUN_AES245GCM_V2: u8 = 0x03;
+const FRAME_TYPE_XKUNLUN_AES245GCM_V2_FINAL: u8 = 0x04;
+
 const FRAME_TYPE_END: u8 = 0xFF;
 
 /// AEAD associated data of a v2 frame: the 8-byte header followed by the
@@ -55,13 +59,57 @@ fn v2_frame_aad(header: &[u8; 8], block_index: usize) -> [u8; 16] {
     aad
 }
 
+// New add
+enum EncryptCipher {
+    Aes256Gcm(aes_gcm::Aes256Gcm),
+    XkunlunAes256Gcm(crate::XkunlunAes256Gcm),//To Do
+}
+
+impl EncryptCipher {
+    fn clipher_token(&self) -> u8 {
+        match self {
+            Self::Aes256Gcm(_) => 0,
+            Self::XkunlunAes256Gcm(_) => 1,
+        }
+    }
+
+    fn cliphertext_overhead(&self) -> usize {
+        match self {
+            Self::Aes256Gcm(_) => 16,
+            Self::XkunlunAes256Gcm(_) => crate::XkunlunAes256Gcm::CIPHERTEXT_OVERHEAD,//32
+        }
+    }
+}
+
+impl AeadCore for EncryptCipher {
+    type NonceSize = <Aes256Gcm as AeadCore>::NonceSize; //12
+    type TagSize = <Aes256Gcm as AeadCore>::TagSize; //16
+    const TAG_POSITION: TagPosition = TagPosition::Postfix;
+}
+
+impl Aead for EncryptCipher {
+    fn encrypt<'m, 'a>(&self, nonce: &Nonce<Self::NonceSize>, plaintext: impl Into<Payload<'m, 'a>>) -> aes_gcm::aead::Result<Vec<u8>> {
+        match self {
+            EncryptCipher::Aes256Gcm(c) => c.encrypt(nonce, plaintext),
+            EncryptCipher::XkunlunAes256Gcm(c) => c.encrypt(nonce, plaintext),
+        }
+    }
+
+    fn decrypt<'m, 'a>(&self, nonce: &Nonce<Self::NonceSize>, ciphertext: impl Into<Payload<'m, 'a>>) -> aes_gcm::aead::Result<Vec<u8>> {
+        match self {
+            EncryptCipher::Aes256Gcm(c) => c.decrypt(nonce, ciphertext),
+            EncryptCipher::XkunlunAes256Gcm(c) => c.decrypt(nonce, ciphertext),
+        }
+    }
+}
+
 pin_project! {
     /// A reader wrapper that encrypts data on the fly using AES-256-GCM.
     /// This is a demonstration. For production, use a secure and audited crypto library.
     pub struct EncryptReader<R> {
         #[pin]
         pub inner: R,
-        cipher: Aes256Gcm,
+        cipher: EncryptCipher,//New add
         base_nonce: [u8; 12], // 96-bit base nonce for GCM
         buffer: Vec<u8>,
         buffer_pos: usize,
@@ -82,7 +130,7 @@ where
     pub fn new(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
+            cipher: EncryptCipher::Aes256Gcm(Aes256Gcm::new_from_slice(&key).expect("key")),//Update
             base_nonce: nonce,
             buffer: Vec::new(),
             buffer_pos: 0,
@@ -95,8 +143,24 @@ where
         }
     }
 
+    // New add
+    pub fn new_v2_with_xkunlun_aes256gcm(inner: R, key: [u8; 32], nonce: [u8; 12]) ->Self {
+        let mut reader = Self::new(inner, key, nonce);
+        reader.cipher = EncryptCipher::XkunlunAes256Gcm(crate::XkunlunAes256Gcm::new_from_key(&key));
+        reader.frame_v2 = true;
+        reader
+    }
+
     pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
         Self::new(inner, key, multipart_part_nonce(base_nonce, part_number))
+    }
+
+    // New add
+    pub fn new_multipart_v2_with_xkunlun_aes256gcm(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        let mut reader = Self::new_multipart(inner, key, base_nonce, part_number);
+        reader.cipher = EncryptCipher::XkunlunAes256Gcm(crate::XkunlunAes256Gcm::new_from_key(&key));   
+        reader.frame_v2 = true;
+        reader
     }
 
     /// Writer for the authenticated, fixed-frame v2 layout.
@@ -121,7 +185,7 @@ where
 /// Build one frame: header, plaintext-length uvarint, ciphertext. For v2
 /// frames the header and frame index are the AEAD associated data.
 fn build_frame(
-    cipher: &Aes256Gcm,
+    cipher: &EncryptCipher,//New add
     nonce_bytes: &[u8; 12],
     type_byte: u8,
     block_index: usize,
@@ -137,7 +201,7 @@ fn build_frame(
     let int_len = put_uvarint_len(plaintext.len() as u64);
     // Ciphertext length is plaintext + 16-byte GCM tag, known ahead of
     // encryption, so the header can be fixed before it becomes the AAD.
-    let clen = int_len + plaintext.len() + 16 + 4;
+    let clen = int_len + plaintext.len() + cipher.cliphertext_overhead() + 4;
     let mut header = [0u8; 8];
     header[0] = type_byte;
     header[1] = (clen & 0xFF) as u8;
@@ -148,20 +212,20 @@ fn build_frame(
     header[6] = ((crc >> 16) & 0xFF) as u8;
     header[7] = ((crc >> 24) & 0xFF) as u8;
 
-    let ciphertext = match type_byte {
-        FRAME_TYPE_V1 => cipher.encrypt(nonce, plaintext),
-        _ => {
-            let aad = v2_frame_aad(&header, block_index);
-            cipher.encrypt(
-                nonce,
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
+    //New add update
+    let ciphertext = match(cipher, type_byte) {
+        (EncryptCipher::Aes256Gcm(c), FRAME_TYPE_V1) => c.encrypt(nonce, plaintext),
+        (EncryptCipher::Aes256Gcm(c), _) => {
+            let add = v2_frame_aad(&header, block_index);
+            tracing::debug!("Aes256Gcm V2 frame AAD: {:?}", add);
+            c.encrypt(nonce,Payload {msg: plaintext, aad: &add})
         }
-    }
-    .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
+        (EncryptCipher::XkunlunAes256Gcm(c), _) => {
+            let add = v2_frame_aad(&header, block_index);
+            tracing::debug!("XkunlunAes256Gcm V2 frame AAD: {:?}", add);
+            c.encrypt(nonce,Payload {msg: plaintext, aad: &add})
+        }
+    }.map_err(|e| Error::other(format!("encrypt error: {e}")))?;
 
     let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
     out.extend_from_slice(&header);
@@ -216,8 +280,15 @@ where
             // A short block is only ever the stream tail; EOF exactly on a block
             // boundary emits that full block as non-final and an empty final
             // frame on the next poll, so emptiness is always authenticated.
+            //New add update
             let is_final = *this.input_done && *this.pending < ENCRYPTION_BLOCK_SIZE;
-            let type_byte = if is_final { FRAME_TYPE_V2_FINAL } else { FRAME_TYPE_V2 };
+            let (non_final_byte, final_byte) = match this.cipher {
+                //New add update
+                EncryptCipher::Aes256Gcm(_) => (FRAME_TYPE_V2, FRAME_TYPE_V2_FINAL),
+                EncryptCipher::XkunlunAes256Gcm(_) => (FRAME_TYPE_XKUNLUN_AES245GCM_V2, FRAME_TYPE_XKUNLUN_AES245GCM_V2_FINAL),
+            };
+            
+            let type_byte = if is_final { final_byte } else { non_final_byte };
             let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
             let mut out = build_frame(
                 this.cipher,
@@ -382,7 +453,8 @@ pin_project! {
     pub struct DecryptReader<R> {
         #[pin]
         pub inner: R,
-        cipher: Aes256Gcm,
+        cipher: Option<EncryptCipher>, // New add update
+        key: [u8; 32],// New add
         base_nonce: [u8; 12], // Base nonce recorded in object metadata
         current_nonce_base: [u8; 12], // Active base nonce for the current encrypted segment
         multipart_mode: bool,
@@ -419,7 +491,8 @@ where
     pub fn new(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
+            cipher: None,
+            key,
             base_nonce: nonce,
             current_nonce_base: nonce,
             multipart_mode: false,
@@ -471,7 +544,8 @@ where
 
         Self {
             inner,
-            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
+            cipher: None,
+            key,
             base_nonce,
             current_nonce_base: initial_nonce,
             multipart_mode: true,
@@ -497,6 +571,27 @@ where
             v1_nonce_layout: None,
             legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
         }
+    }
+}
+
+// New add
+fn cipher_for_type(typ: u8, key: [u8; 32]) -> std::io::Result<EncryptCipher> {
+    match typ {
+        FRAME_TYPE_V1 | FRAME_TYPE_V2 | FRAME_TYPE_V2_FINAL => {
+            Ok(EncryptCipher::Aes256Gcm(Aes256Gcm::new_from_slice(&key).expect("key")))
+        }
+        FRAME_TYPE_XKUNLUN_AES245GCM_V2 | FRAME_TYPE_XKUNLUN_AES245GCM_V2_FINAL => {
+            Ok(EncryptCipher::XkunlunAes256Gcm(crate::XkunlunAes256Gcm::new_from_key(&key)))
+        }
+        _other => Err(Error::other(format!("unknown encrypted frame type: {typ}"))),
+    }
+}
+
+fn cipher_token_for_type(typ: u8) -> u8 {
+    match typ {
+        FRAME_TYPE_V1 | FRAME_TYPE_V2 | FRAME_TYPE_V2_FINAL => FRAME_TYPE_V2,
+        FRAME_TYPE_XKUNLUN_AES245GCM_V2 | FRAME_TYPE_XKUNLUN_AES245GCM_V2_FINAL => FRAME_TYPE_XKUNLUN_AES245GCM_V2,
+        _ => 0xff,
     }
 }
 
@@ -632,7 +727,7 @@ where
 
                 let frame_version = match typ {
                     FRAME_TYPE_V1 => 1,
-                    FRAME_TYPE_V2 | FRAME_TYPE_V2_FINAL => 2,
+                    FRAME_TYPE_V2 | FRAME_TYPE_V2_FINAL | FRAME_TYPE_XKUNLUN_AES245GCM_V2 | FRAME_TYPE_XKUNLUN_AES245GCM_V2_FINAL => 2,//New add update
                     other => {
                         return Poll::Ready(Err(Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -658,6 +753,15 @@ where
                 }
                 if frame_version == 2 {
                     *this.stream_saw_v2 = true;
+                }
+                //New add
+                if this.cipher.is_none() {
+                    *this.cipher = Some(cipher_for_type(typ, *this.key)?);
+                } else if this.cipher.as_ref().unwrap().clipher_token() != cipher_token_for_type(typ) {
+                    return Poll::Ready(Err(Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "encrypted segment mixes frame types",
+                    )));
                 }
                 *this.current_frame_type = typ;
 
@@ -736,15 +840,13 @@ where
                 // derivation is exactly the modern scheme, and there are no
                 // legacy fallbacks — any mismatch is tampering, not history.
                 let aad = v2_frame_aad(this.header_buf, *this.block_index);
-                this.cipher
-                    .decrypt(
-                        &nonce,
-                        Payload {
-                            msg: ciphertext,
-                            aad: &aad,
-                        },
-                    )
-                    .map_err(|_| Error::new(std::io::ErrorKind::InvalidData, "v2 encrypted frame failed authentication"))?
+                //New add update
+                let cipher = this.cipher.as_ref().expect("cipher initialized on first frame");
+                let decrypted = match cipher {
+                    EncryptCipher::Aes256Gcm(c) => c.decrypt(&nonce, Payload{msg: ciphertext, aad: &aad}).map_err(|_| Error::other("decrypt failed"))?,
+                    EncryptCipher::XkunlunAes256Gcm(c) => c.decrypt(&nonce, Payload{msg: ciphertext, aad: &aad}).map_err(|_| Error::other("decrypt failed"))?,
+                };
+                decrypted
             } else {
                 let legacy_part_nonce = if *this.multipart_mode {
                     derive_legacy_part_nonce(this.base_nonce, *this.current_part)
@@ -771,7 +873,7 @@ where
                     if layout == V1NonceLayout::ReusedPart && !*this.legacy_nonce_fallback {
                         continue;
                     }
-                    match this.cipher.decrypt(candidate_nonce, ciphertext) {
+                    match this.cipher.as_ref().expect("cipher").decrypt(candidate_nonce, ciphertext) {
                         Ok(value) => {
                             plaintext = Some((value, layout));
                             break;
