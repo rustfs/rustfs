@@ -960,6 +960,8 @@ mod tests {
     /// tests the non-delimiter case.
     #[tokio::test]
     async fn test_list_objects_v2_maxkeys_above_limit_with_delimiter() {
+        use futures::{StreamExt, stream};
+
         init_logging();
         info!("Starting test: ListObjectsV2 MaxKeys above limit with delimiter");
 
@@ -974,21 +976,38 @@ mod tests {
         // 12 dirs × 100 files = 1200 raw keys
         let dir_count = 12;
         let files_per_dir = 100;
-        for d in 0..dir_count {
-            for f in 0..files_per_dir {
-                let key = format!("dir-{:02}/file{:03}.txt", d, f);
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&key)
-                    .body(ByteStream::from_static(b"x"))
-                    .send()
-                    .await
-                    .expect("Failed to put object");
-            }
-        }
+        const FIXTURE_CONCURRENCY: usize = 8;
+        let fixture_started = std::time::Instant::now();
+        eprintln!(
+            "Preparing {} objects with at most {FIXTURE_CONCURRENCY} concurrent PUTs",
+            dir_count * files_per_dir
+        );
+        // Object creation order is irrelevant to this listing contract. Bound
+        // fixture I/O and await every PUT before issuing the LIST request.
+        stream::iter((0..dir_count).flat_map(|d| (0..files_per_dir).map(move |f| (d, f))))
+            .for_each_concurrent(FIXTURE_CONCURRENCY, |(d, f)| {
+                let client = &client;
+                async move {
+                    let key = format!("dir-{d:02}/file{f:03}.txt");
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .unwrap_or_else(|err| panic!("Failed to prepare fixture object {key}: {err:?}"));
+                }
+            })
+            .await;
+        eprintln!(
+            "Prepared all {} objects in {:?}; starting ListObjectsV2",
+            dir_count * files_per_dir,
+            fixture_started.elapsed()
+        );
 
         // With delimiter: 12 CommonPrefixes visible, all fit within capped 1000
+        let list_started = std::time::Instant::now();
         let output = client
             .list_objects_v2()
             .bucket(bucket)
@@ -1005,6 +1024,15 @@ mod tests {
             dir_count,
             output.common_prefixes().len()
         );
+        let prefixes = output
+            .common_prefixes()
+            .iter()
+            .map(|entry| entry.prefix().expect("each CommonPrefix must carry its prefix").to_owned())
+            .collect::<Vec<_>>();
+        let expected_prefixes = (0..dir_count).map(|d| format!("dir-{d:02}/")).collect::<Vec<_>>();
+        assert_eq!(prefixes, expected_prefixes);
+        assert!(output.contents().is_empty(), "all fixture objects must collapse into prefixes");
+        assert_eq!(output.key_count(), Some(i32::try_from(dir_count).expect("fixture count fits i32")));
         assert_eq!(output.max_keys(), Some(1000));
         // 12 visible < 1000 capped MaxKeys → not truncated
         assert!(
@@ -1013,6 +1041,11 @@ mod tests {
             output.common_prefixes().len()
         );
 
+        assert!(
+            output.next_continuation_token().is_none(),
+            "a complete page must not carry a continuation token"
+        );
+        eprintln!("ListObjectsV2 assertions completed in {:?}", list_started.elapsed());
         info!("MaxKeys above limit with delimiter test passed");
 
         env.stop_server();
