@@ -151,6 +151,9 @@ impl Error {
                     )
                     || is_recoverable_heal_error_message(&err.to_string())
             }
+            // Nonblocking local CAS and replacement leases report lock
+            // contention as WouldBlock; retain the existing task retry budget.
+            Error::Disk(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => true,
             Error::Disk(err) => {
                 if err.is_dangling_delete_grace() {
                     return true;

@@ -602,9 +602,18 @@ pub(crate) async fn initialize_local_disk_maps(
 }
 
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
-    let handle = get_global_tier_config_mgr();
-    TierConfigMgr::reload_handle(&handle, store.clone()).await?;
-    tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
+    init_tier_config_mgr_handle(get_global_tier_config_mgr(), store).await
+}
+
+pub(crate) async fn init_tier_config_mgr_handle(handle: Arc<RwLock<TierConfigMgr>>, store: Arc<ECStore>) -> Result<()> {
+    let initial_reload = TierConfigMgr::reload_handle(&handle, store.clone()).await;
+    // Startup may continue after a transient recovery failure. Its retained
+    // mutation fences still need a worker to consume later commit notifications.
+    tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle.clone(), store));
+    if initial_reload.is_err() {
+        TierConfigMgr::request_committed_mutation_refresh(&handle).await;
+    }
+    initial_reload?;
     Ok(())
 }
 
