@@ -13,15 +13,13 @@
 // limitations under the License.
 
 use crate::runtime_sources::current_action_credentials;
-#[cfg(feature = "webdav")]
 use crate::shared_types::RemoteAddr;
-use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
+use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-#[cfg(feature = "webdav")]
 use rustfs_protocols::common::SessionContext;
-#[cfg(feature = "webdav")]
+use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
@@ -179,6 +177,50 @@ impl ProtocolStorageClient {
         Self { fs }
     }
 
+    async fn authorize_protocol_request(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> S3Result<()> {
+        let context = self.fs.server_ctx().app_context();
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), context.as_deref()).await?;
+        let listing = matches!(action, S3Action::ListBucket | S3Action::HeadBucket);
+        let uri = if listing {
+            build_bucket_uri(bucket, &[("prefix", Some(object.unwrap_or_default()))])?
+        } else {
+            build_object_uri(bucket, object.unwrap_or_default(), &[])?
+        };
+        let mut request = Self::create_request(
+            (),
+            Method::GET,
+            uri,
+            RequestParams {
+                bucket: Some(bucket.to_owned()),
+                object: if listing { None } else { object.map(str::to_owned) },
+                credentials: &credentials,
+            },
+        )?;
+        request.extensions.insert(self.fs.server_ctx().clone());
+        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
+            info.is_owner = is_owner;
+        }
+        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
+        request.extensions.insert(Some(RemoteAddr(remote_addr)));
+        let mut client_info = ClientInfo::direct(remote_addr);
+        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
+        request.extensions.insert(client_info);
+        request.headers = session.request_headers.clone();
+        let policy_action = if matches!(action, S3Action::HeadBucket) {
+            S3Action::ListBucket.into()
+        } else {
+            action.clone().into()
+        };
+        authorize_request(&mut request, policy_action).await
+    }
+
     /// Create a proper S3Request with ReqInfo extension for authorization
     fn create_request<T>(input: T, method: Method, uri: http::Uri, params: RequestParams<'_>) -> S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
@@ -224,6 +266,24 @@ impl ProtocolStorageClient {
 #[async_trait::async_trait]
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
     type Error = s3s::S3Error;
+
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        if !is_operation_supported(session.protocol, action) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, action, bucket, object)
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
 
     async fn get_object(
         &self,

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
-use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -496,6 +496,9 @@ where
 
     /// Attach the request context used by IAM policy conditions.
     pub fn with_request_context(mut self, request_headers: http::HeaderMap, secure_transport: bool) -> Self {
+        let session = Arc::make_mut(&mut self.session_context);
+        session.request_headers = request_headers.clone();
+        session.secure_transport = secure_transport;
         self.request_headers = Some(request_headers);
         self.secure_transport = secure_transport;
         self
@@ -654,7 +657,9 @@ where
     async fn probe_head_object(&self, bucket: &str, key: &str) -> FsResult<HeadObjectProbe> {
         let credentials = self.credentials();
 
-        if authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
+        if self
+            .storage
+            .authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
             .await
             .is_err()
         {
@@ -700,7 +705,9 @@ where
                 }
 
                 if size == 0
-                    && authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
+                    && self
+                        .storage
+                        .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
                         .await
                         .is_ok()
                     && self.prefix_has_entries(bucket, &prefix).await?
@@ -732,7 +739,9 @@ where
             HeadObjectProbe::Forbidden => {}
         }
 
-        if authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
+        if self
+            .storage
+            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
             .await
             .is_ok()
         {
@@ -783,7 +792,11 @@ where
 
     /// List all buckets (for root path)
     async fn list_buckets(&self) -> FsResult<Vec<WebDavDirEntry>> {
-        match authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None).await {
+        match self
+            .storage
+            .authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None)
+            .await
+        {
             Ok(()) => {
                 let credentials = self.credentials();
                 return match self.storage.list_buckets(credentials).await {
@@ -864,7 +877,8 @@ where
     /// List objects in a bucket
     async fn list_objects(&self, bucket: &str, prefix: Option<&str>) -> FsResult<Vec<WebDavDirEntry>> {
         // Authorize the operation
-        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, prefix)
+        self.storage
+            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, prefix)
             .await
             .map_err(|_| FsError::Forbidden)?;
 
@@ -1000,7 +1014,8 @@ where
         // SECURITY: s3:DeleteBucket does not imply the right to destroy the
         // bucket contents. Enumerating and deleting each object are separate
         // authorization boundaries and must be cleared on their own.
-        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
+        self.storage
+            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
             .await
             .map_err(|_| FsError::Forbidden)?;
 
@@ -1020,7 +1035,8 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
-                            authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                            self.storage
+                                .authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
                                 .await
                                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1078,11 +1094,13 @@ where
 
             // Check authorization based on operation type
             if options.write || options.create || options.create_new || options.append {
-                authorize_operation(&session_context, &S3Action::PutObject, &bucket, Some(&key))
+                self.storage
+                    .authorize_operation(&session_context, &S3Action::PutObject, &bucket, Some(&key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
             } else {
-                authorize_operation(&session_context, &S3Action::GetObject, &bucket, Some(&key))
+                self.storage
+                    .authorize_operation(&session_context, &S3Action::GetObject, &bucket, Some(&key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
             }
@@ -1183,7 +1201,8 @@ where
                 };
             } else {
                 // Get bucket metadata
-                authorize_operation(&self.session_context, &S3Action::HeadBucket, &bucket, None)
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::HeadBucket, &bucket, None)
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1230,7 +1249,8 @@ where
                     format!("{}/", key_str)
                 };
 
-                authorize_operation(&self.session_context, &S3Action::PutObject, &bucket, Some(&dir_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::PutObject, &bucket, Some(&dir_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1277,7 +1297,8 @@ where
             }
 
             // Create bucket
-            authorize_operation(&self.session_context, &S3Action::CreateBucket, &bucket, None)
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::CreateBucket, &bucket, None)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1326,7 +1347,8 @@ where
                     format!("{}/", prefix)
                 };
 
-                authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1334,7 +1356,8 @@ where
                 // says nothing about the children stored under it. Enumerating the
                 // prefix and deleting each child are separate authorization
                 // boundaries and must be cleared on their own.
-                authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1355,7 +1378,13 @@ where
                         if let Some(objects) = output.contents {
                             for obj in objects {
                                 if let Some(obj_key) = obj.key {
-                                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&obj_key))
+                                    self.storage
+                                        .authorize_operation(
+                                            &self.session_context,
+                                            &S3Action::DeleteObject,
+                                            &bucket,
+                                            Some(&obj_key),
+                                        )
                                         .await
                                         .map_err(|_| FsError::Forbidden)?;
 
@@ -1383,7 +1412,8 @@ where
             }
 
             // Delete bucket
-            authorize_operation(&self.session_context, &S3Action::DeleteBucket, &bucket, None)
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::DeleteBucket, &bucket, None)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1403,7 +1433,8 @@ where
             let key = key.ok_or(FsError::Forbidden)?;
 
             // Authorize delete object
-            authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&key))
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&key))
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1453,13 +1484,16 @@ where
             let resolved_src = self.resolve_path(&src_bucket, &src_key).await?;
             let (src_prefix, include_src_marker) = match resolved_src {
                 ResolvedPath::File(_) => {
-                    authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
-                    authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
-                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
                         .await
                         .map_err(|_| FsError::Forbidden)?;
 
@@ -1506,7 +1540,8 @@ where
             };
             let dst_prefix = format!("{}/", dst_key);
 
-            authorize_operation(&self.session_context, &S3Action::ListBucket, &src_bucket, Some(&src_prefix))
+            self.storage
+                .authorize_operation(&self.session_context, &S3Action::ListBucket, &src_bucket, Some(&src_prefix))
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
@@ -1514,13 +1549,16 @@ where
             let mut renamed_any = false;
 
             if include_src_marker {
-                authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                self.storage
+                    .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1567,13 +1605,16 @@ where
 
                 if !page_pairs.is_empty() {
                     for (src_obj_key, dst_obj_key) in &page_pairs {
-                        authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
-                        authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
-                        authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
+                        self.storage
+                            .authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
                             .await
                             .map_err(|_| FsError::Forbidden)?;
                     }
@@ -1646,6 +1687,19 @@ mod tests {
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn backend_policy_denial_blocks_webdav_delete() {
+        let backend = DummyBackend::new().deny_authorization();
+        backend.queue_delete_object_ok();
+        let driver = WebDavDriver::new(backend, Arc::new(test_session(Protocol::WebDav)));
+        let path = DavPath::new("/bucket/secret.txt").expect("path");
+        let result = with_test_auth_override(|_, _, _| true, driver.remove_file(&path)).await;
+        assert!(
+            matches!(result, Err(FsError::Forbidden)),
+            "backend policy deny must override identity allow"
+        );
+    }
 
     #[derive(Clone)]
     struct DummyStorage;

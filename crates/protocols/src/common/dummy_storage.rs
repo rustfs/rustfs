@@ -243,6 +243,7 @@ impl Inner {
 #[derive(Clone)]
 pub struct DummyBackend {
     inner: Arc<Mutex<Inner>>,
+    deny_authorization: bool,
 }
 
 // Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
@@ -266,7 +267,13 @@ impl DummyBackend {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
+            deny_authorization: false,
         }
+    }
+
+    pub fn deny_authorization(mut self) -> Self {
+        self.deny_authorization = true;
+        self
     }
 
     /// Opt in to consuming upload bodies for byte-for-byte protocol tests.
@@ -506,6 +513,15 @@ impl DummyBackend {
         self.inner.lock().expect("lock").get_object_range.push_back(Err(err));
     }
 
+    pub fn queue_get_object_bytes(&self, payload: Vec<u8>) {
+        let output = GetObjectOutput {
+            content_length: Some(i64::try_from(payload.len()).expect("test payload length")),
+            body: Some(StreamingBlob::from_bytes(Bytes::from(payload))),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(output));
+    }
+
     /// Queue a get_object_range Ok response carrying the given bytes as
     /// the streaming body. content_length is set to bytes.len().
     pub fn queue_get_object_range_bytes(&self, payload: Vec<u8>) {
@@ -629,6 +645,19 @@ impl DummyBackend {
 #[async_trait]
 impl StorageBackend for DummyBackend {
     type Error = DummyError;
+
+    async fn authorize_operation(
+        &self,
+        session: &crate::common::session::SessionContext,
+        action: &crate::common::gateway::S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        if self.deny_authorization {
+            return Err(crate::common::gateway::AuthorizationError::AccessDenied);
+        }
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
 
     async fn get_object(
         &self,

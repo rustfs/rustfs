@@ -16,13 +16,25 @@ use async_trait::async_trait;
 use rustfs_credentials::Credentials;
 use s3s::dto::*;
 
-#[cfg(feature = "webdav")]
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
     type Error: std::error::Error + Send + Sync + 'static;
+    /// Authorize a protocol operation against the backend's policy domain.
+    /// Backends with resource policies must override this identity-policy fallback.
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
     /// Get object content and metadata
     async fn get_object(
         &self,

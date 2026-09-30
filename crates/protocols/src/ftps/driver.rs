@@ -14,7 +14,6 @@
 
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
 use crate::common::gateway::S3Action;
-use crate::common::gateway::authorize_operation;
 use async_trait::async_trait;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
@@ -123,7 +122,11 @@ where
         session_context: &crate::common::session::SessionContext,
     ) -> Result<Vec<Fileinfo<PathBuf, <FtpsDriver<S> as unftp_core::storage::StorageBackend<super::server::FtpsUser>>::Metadata>>>
     {
-        match authorize_operation(session_context, &S3Action::ListBuckets, "", None).await {
+        match self
+            .storage
+            .authorize_operation(session_context, &S3Action::ListBuckets, "", None)
+            .await
+        {
             Ok(_) => {}
             Err(_e) => {
                 return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"));
@@ -168,7 +171,8 @@ where
         // SECURITY: s3:DeleteBucket does not imply the right to destroy the
         // bucket contents. Enumerating and deleting each object are separate
         // authorization boundaries and must be cleared on their own.
-        authorize_operation(session_context, &S3Action::ListBucket, bucket, None)
+        self.storage
+            .authorize_operation(session_context, &S3Action::ListBucket, bucket, None)
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -190,7 +194,8 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
-                            authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                            self.storage
+                                .authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
                                 .await
                                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -247,7 +252,8 @@ where
 
         if let Some(key) = key {
             // Authorize HeadObject
-            authorize_operation(session_context, &S3Action::HeadObject, &bucket, Some(&key))
+            self.storage
+                .authorize_operation(session_context, &S3Action::HeadObject, &bucket, Some(&key))
                 .await
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -283,7 +289,8 @@ where
         } else {
             // Directory metadata - use HeadBucket
             // Authorize HeadBucket
-            authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+            self.storage
+                .authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
                 .await
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -332,7 +339,8 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize the operation
-        authorize_operation(session_context, &S3Action::ListBucket, &bucket, prefix.as_deref())
+        self.storage
+            .authorize_operation(session_context, &S3Action::ListBucket, &bucket, prefix.as_deref())
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -455,7 +463,8 @@ where
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
 
         // Authorize GetObject
-        authorize_operation(session_context, &S3Action::GetObject, &bucket, Some(&key))
+        self.storage
+            .authorize_operation(session_context, &S3Action::GetObject, &bucket, Some(&key))
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -542,7 +551,8 @@ where
         }
 
         // Authorize the operation
-        authorize_operation(session_context, &S3Action::PutObject, &bucket, Some(&key))
+        self.storage
+            .authorize_operation(session_context, &S3Action::PutObject, &bucket, Some(&key))
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -579,7 +589,8 @@ where
 
         if let Some(key) = key {
             // Authorize delete object
-            authorize_operation(session_context, &S3Action::DeleteObject, &bucket, Some(&key))
+            self.storage
+                .authorize_operation(session_context, &S3Action::DeleteObject, &bucket, Some(&key))
                 .await
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -607,7 +618,8 @@ where
             // If path ends with '/', treat it as bucket deletion request
             if path_str.ends_with('/') {
                 // Authorize delete bucket
-                authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
+                self.storage
+                    .authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
                     .await
                     .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -637,7 +649,8 @@ where
 
         // MKD creates a bucket, so it has to clear the same authorization boundary as
         // an S3 CreateBucket call.
-        authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
+        self.storage
+            .authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -681,7 +694,8 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize delete bucket
-        authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
+        self.storage
+            .authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -737,7 +751,8 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize HeadBucket (CWD probes bucket existence)
-        authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+        self.storage
+            .authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
@@ -814,6 +829,27 @@ mod tests {
             result.is_err(),
             "MKD must fail closed when authorization denies s3:CreateBucket, even though the backend was primed to succeed"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_policy_denial_blocks_ftp_read_and_bucket_creation() {
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+        let backend = DummyBackend::new().deny_authorization();
+        backend.queue_create_bucket_ok();
+        backend.queue_get_object_bytes(b"secret content".to_vec());
+        let driver = super::FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "protocol-user".into(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+        let result = with_test_auth_override(|_, _, _| true, driver.mkd(&user, "/bucket")).await;
+        assert!(result.is_err(), "backend policy deny must override identity allow");
+        let result = with_test_auth_override(|_, _, _| true, driver.get(&user, "/bucket/secret.txt", 0)).await;
+        assert!(result.is_err(), "backend policy denial must prevent returning the queued object body");
     }
 
     /// RMD deletes every object in the bucket, so `s3:DeleteBucket` alone must
@@ -894,11 +930,7 @@ mod tests {
 }
 
 mod upload {
-    use crate::common::{
-        client::s3::StorageBackend,
-        gateway::{S3Action, authorize_operation},
-        session::SessionContext,
-    };
+    use crate::common::{client::s3::StorageBackend, gateway::S3Action, session::SessionContext};
     use bytes::Bytes;
     use s3s::dto::*;
     use std::{
@@ -924,8 +956,15 @@ mod upload {
         Error::new(ErrorKind::TransientFileNotAvailable, error.to_string())
     }
 
-    async fn authorize(session: &SessionContext, action: S3Action, bucket: &str, key: &str) -> Result<()> {
-        authorize_operation(session, &action, bucket, Some(key))
+    async fn authorize<S: StorageBackend>(
+        storage: &S,
+        session: &SessionContext,
+        action: S3Action,
+        bucket: &str,
+        key: &str,
+    ) -> Result<()> {
+        storage
+            .authorize_operation(session, &action, bucket, Some(key))
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))
     }
@@ -974,7 +1013,7 @@ mod upload {
 
     async fn abort_upload<S: StorageBackend>(storage: &S, session: &SessionContext, input: AbortMultipartUploadInput) {
         let cleanup = async {
-            authorize(session, S3Action::AbortMultipartUpload, &input.bucket, &input.key).await?;
+            authorize(storage, session, S3Action::AbortMultipartUpload, &input.bucket, &input.key).await?;
             storage
                 .abort_multipart_upload(input, session.credentials())
                 .await
@@ -1028,7 +1067,7 @@ mod upload {
         let mut part = read_part(&mut reader).await?;
         if part.len() < PART_SIZE {
             let size = u64::try_from(part.len()).map_err(upload_error)?;
-            authorize(session, S3Action::PutObject, bucket, key).await?;
+            authorize(storage.as_ref(), session, S3Action::PutObject, bucket, key).await?;
             let input = PutObjectInput::builder()
                 .bucket(bucket.to_owned())
                 .key(key.to_owned())
@@ -1040,7 +1079,7 @@ mod upload {
             return Ok(size);
         }
 
-        authorize(session, S3Action::CreateMultipartUpload, bucket, key).await?;
+        authorize(storage.as_ref(), session, S3Action::CreateMultipartUpload, bucket, key).await?;
         let input = CreateMultipartUploadInput::builder()
             .bucket(bucket.to_owned())
             .key(key.to_owned())
@@ -1075,7 +1114,7 @@ mod upload {
                 total = total
                     .checked_add(u64::try_from(part.len()).map_err(upload_error)?)
                     .ok_or_else(|| upload_error("FTPS upload size overflow"))?;
-                authorize(session, S3Action::UploadPart, bucket, key).await?;
+                authorize(storage.as_ref(), session, S3Action::UploadPart, bucket, key).await?;
                 let input = UploadPartInput::builder()
                     .bucket(bucket.to_owned())
                     .key(key.to_owned())
@@ -1097,7 +1136,7 @@ mod upload {
                 });
                 part = read_part(&mut reader).await?;
             }
-            authorize(session, S3Action::CompleteMultipartUpload, bucket, key).await?;
+            authorize(storage.as_ref(), session, S3Action::CompleteMultipartUpload, bucket, key).await?;
             let input = CompleteMultipartUploadInput::builder()
                 .bucket(bucket.to_owned())
                 .key(key.to_owned())

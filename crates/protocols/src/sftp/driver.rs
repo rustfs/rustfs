@@ -31,7 +31,7 @@ use super::paths::{parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
 use crate::common::client::s3::StorageBackend;
-use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
 use rustfs_credentials::Credentials;
@@ -297,7 +297,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// the SSH keepalive closed the transport (~45 s). The deadline
     /// closes that gap and returns IamUnavailable to the client.
     pub(super) async fn authorize(&self, action: &S3Action, bucket: &str, key: Option<&str>) -> Result<(), SftpError> {
-        let auth_fut = authorize_operation(&self.session_context, action, bucket, key);
+        let auth_fut = self.storage.authorize_operation(&self.session_context, action, bucket, key);
         let outcome = match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), auth_fut).await {
             Ok(inner) => inner,
             Err(_elapsed) => {

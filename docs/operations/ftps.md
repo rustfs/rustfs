@@ -23,3 +23,21 @@ for denied/failed cleanup, process crashes, or losing the upload ID while upload
 initiation is in flight. Before completion, received parts do not replace an existing completed object.
 A lost or failed completion response may have an ambiguous outcome; clients
 should verify the destination before retrying.
+
+## Authorization
+
+FTP and FTPS operations use RustFS's S3 IAM and bucket-policy evaluator. An
+applicable bucket-policy Deny blocks an operation even when an identity policy
+allows it. Source-IP conditions use the FTP control connection's peer address;
+concurrent sessions using the same access key retain their own addresses.
+
+`aws:SecureTransport` is true when the control connection uses TLS and the
+listener requires TLS for data connections. With optional data-channel TLS,
+the authorization context conservatively reports false because the driver's
+operation interface does not expose the data connection's negotiated state.
+HTTP-only attributes such as `UserAgent` and `Referer` are absent and retain
+normal policy missing-key semantics.
+
+Upgrades enforce restrictions that older protocol listeners could bypass.
+Previously accepted operations can therefore return permission denied. No
+object format or policy migration is required.
