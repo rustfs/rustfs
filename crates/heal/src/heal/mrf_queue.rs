@@ -631,7 +631,7 @@ fn encode_mrf_lifecycle_checkpoint(
             != records.len()
         || records
             .iter()
-            .map(|record| record.intent_digest)
+            .map(|record| (record.intent_digest, record.source_bucket_incarnation_id))
             .collect::<HashSet<_>>()
             .len()
             != records.len()
@@ -691,7 +691,7 @@ fn decode_mrf_lifecycle_checkpoint(data: &[u8], byte_limit: usize) -> Option<Mrf
         || decoded
             .records
             .iter()
-            .map(|record| record.intent_digest)
+            .map(|record| (record.intent_digest, record.source_bucket_incarnation_id))
             .collect::<HashSet<_>>()
             .len()
             != decoded.records.len()
@@ -1520,7 +1520,19 @@ enum ReplayCleanup {
 struct ReplaySource {
     data: Vec<u8>,
     cleanup: ReplayCleanup,
-    lifecycle: HashMap<[u8; 32], ResponsibilityCheckpoint>,
+    lifecycle: HashMap<[u8; 32], VecDeque<ResponsibilityCheckpoint>>,
+}
+
+fn take_lifecycle_record(
+    lifecycle: &mut HashMap<[u8; 32], VecDeque<ResponsibilityCheckpoint>>,
+    intent_digest: [u8; 32],
+) -> Option<ResponsibilityCheckpoint> {
+    let records = lifecycle.get_mut(&intent_digest)?;
+    let record = records.pop_front();
+    if records.is_empty() {
+        lifecycle.remove(&intent_digest);
+    }
+    record
 }
 
 async fn read_replay_source(
@@ -1533,16 +1545,9 @@ async fn read_replay_source(
         let records = read_mrf_lifecycle_checkpoint(owner, sequence, max_bytes, lifecycle_max_bytes)
             .await
             .unwrap_or_default();
-        let mut lifecycle = HashMap::with_capacity(records.len());
-        let mut duplicate = false;
+        let mut lifecycle: HashMap<[u8; 32], VecDeque<ResponsibilityCheckpoint>> = HashMap::with_capacity(records.len());
         for record in records {
-            if lifecycle.insert(record.intent_digest, record).is_some() {
-                duplicate = true;
-                break;
-            }
-        }
-        if duplicate {
-            lifecycle.clear();
+            lifecycle.entry(record.intent_digest).or_default().push_back(record);
         }
         return Ok(Some(ReplaySource {
             data: committed.payload().to_vec(),
@@ -1656,7 +1661,23 @@ async fn replay_into(
     let mut accepted_without_durable_anchor = false;
     let mut durable_replay_anchors = Vec::new();
     let mut partial_writes = Vec::new();
-    for intent in intents {
+    for mut intent in intents {
+        if intent.kind.is_durable() {
+            if !matches!(
+                rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut intent),
+                MrfIngressResult::Enqueued
+            ) {
+                rearm_incomplete = true;
+                rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                continue;
+            }
+            if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+                durable_replay_anchors.push(anchor);
+            }
+            let restored = intent_digest(&intent).and_then(|digest| take_lifecycle_record(&mut lifecycle, digest));
+            partial_writes.push((intent, restored));
+            continue;
+        }
         let result = queue.try_push_typed(intent.clone());
         match result {
             MrfQueuePushResult::Enqueued => {}
@@ -1666,6 +1687,9 @@ async fn replay_into(
                 rustfs_common::mrf_channel::release_mrf_intent(&intent);
             }
         }
+    }
+    if lifecycle.values().any(|records| !records.is_empty()) {
+        rearm_incomplete = true;
     }
 
     // Drain the replayed intents immediately; whatever the manager refuses
@@ -1688,7 +1712,7 @@ async fn replay_into(
                 if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
                     durable_replay_anchors.push(anchor.clone());
                 }
-                let restored = intent_digest(&intent).and_then(|digest| lifecycle.remove(&digest));
+                let restored = intent_digest(&intent).and_then(|digest| take_lifecycle_record(&mut lifecycle, digest));
                 partial_writes.push((intent, restored));
                 continue;
             }

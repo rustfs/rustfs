@@ -28,6 +28,35 @@ const MAX_OPERATOR_ACTOR_BYTES: usize = 256;
 const MAX_OPERATOR_REFERENCE_BYTES: usize = 256;
 const LIFECYCLE_CHECKPOINT_RECORD_OVERHEAD_BYTES: usize = 256;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PartialWriteKey {
+    identity: MrfQueueKey,
+    source_bucket_incarnation_id: Option<Uuid>,
+}
+
+impl PartialWriteKey {
+    fn new(intent: &MrfIntent, source_bucket_incarnation_id: Option<Uuid>) -> Self {
+        Self {
+            identity: queue_key(intent),
+            source_bucket_incarnation_id,
+        }
+    }
+
+    fn from_anchor(anchor: &MrfDurableRepairAnchor) -> Self {
+        Self {
+            identity: MrfQueueKey {
+                kind: anchor.kind,
+                bucket: anchor.bucket.clone(),
+                object: anchor.object.clone(),
+                version_id: anchor.version_id,
+                scope: anchor.scope,
+                delete_marker_purge: anchor.delete_marker_purge,
+            },
+            source_bucket_incarnation_id: Some(anchor.bucket_incarnation_id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ResponsibilityState {
@@ -174,9 +203,9 @@ struct Responsibility {
 /// Admission, task failure and retry exhaustion cannot release their records.
 #[derive(Default)]
 pub(super) struct PartialWrites {
-    entries: HashMap<MrfQueueKey, Responsibility>,
-    retry_order: VecDeque<MrfQueueKey>,
-    retry_index: HashSet<MrfQueueKey>,
+    entries: HashMap<PartialWriteKey, Responsibility>,
+    retry_order: VecDeque<PartialWriteKey>,
+    retry_index: HashSet<PartialWriteKey>,
     bytes: usize,
 }
 
@@ -188,7 +217,7 @@ impl PartialWrites {
     pub(super) fn cost_with_state(intent: &MrfIntent, state: &ResponsibilityState) -> usize {
         intent.estimated_bytes()
             + std::mem::size_of::<Responsibility>()
-            + 2 * std::mem::size_of::<MrfQueueKey>()
+            + 2 * std::mem::size_of::<PartialWriteKey>()
             + LIFECYCLE_CHECKPOINT_RECORD_OVERHEAD_BYTES
             + state.estimated_bytes()
     }
@@ -229,7 +258,7 @@ impl PartialWrites {
         if try_rearm_mrf_replay_intent(&mut intent) != MrfIngressResult::Enqueued {
             return Err(MrfDurableAdmissionError::InvalidIdentity);
         }
-        let key = queue_key(&intent);
+        let key = PartialWriteKey::new(&intent, source_bucket_incarnation_id);
         let previous = self.entries.get(&key);
         let previous_was_held = previous.is_some_and(|entry| entry.state.is_parked());
         let mut retry_queued = previous.is_some_and(|entry| entry.retry_queued);
@@ -247,8 +276,6 @@ impl PartialWrites {
             }
             retry_queued = true;
         }
-        // Replacing the generation preserves the logical repair obligation,
-        // but requires a new checkpoint and proof before it can be released.
         self.entries.insert(
             key,
             Responsibility {
@@ -284,14 +311,7 @@ impl PartialWrites {
     }
 
     pub(super) fn park_unverified_legacy(&mut self, anchor: &MrfDurableRepairAnchor) -> bool {
-        let key = MrfQueueKey {
-            kind: anchor.kind,
-            bucket: anchor.bucket.clone(),
-            object: anchor.object.clone(),
-            version_id: anchor.version_id,
-            scope: anchor.scope,
-            delete_marker_purge: anchor.delete_marker_purge,
-        };
+        let key = PartialWriteKey::from_anchor(anchor);
         let Some(entry) = self.entries.get_mut(&key) else {
             return false;
         };
@@ -378,7 +398,7 @@ impl PartialWrites {
     }
 
     pub(super) fn restore_state(&mut self, intent: &MrfIntent, record: &ResponsibilityCheckpoint) -> bool {
-        let key = queue_key(intent);
+        let key = PartialWriteKey::new(intent, record.source_bucket_incarnation_id);
         let Some(entry) = self.entries.get_mut(&key) else {
             return false;
         };
@@ -563,7 +583,7 @@ impl PartialWrites {
         entry.persisted = false;
         entry.next_attempt = Instant::now();
         if !entry.retry_queued {
-            let key = queue_key(&entry.intent);
+            let key = PartialWriteKey::new(&entry.intent, entry.source_bucket_incarnation_id);
             if self.retry_index.insert(key.clone()) {
                 self.retry_order.push_back(key);
             }
@@ -770,7 +790,7 @@ impl PartialWrites {
         lifecycle_changed
     }
 
-    fn ready_keys(&mut self, now: Instant, limit: usize) -> Vec<MrfQueueKey> {
+    fn ready_keys(&mut self, now: Instant, limit: usize) -> Vec<PartialWriteKey> {
         let mut ready = Vec::with_capacity(limit.min(self.entries.len()));
         // Rotation prevents a permanently failing prefix from starving the
         // rest of a backlog larger than one retry interval's batch budget.
@@ -873,7 +893,9 @@ fn unix_now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest;
+    use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
     use rustfs_common::mrf_channel::{MrfKind, MrfScope};
+    use serial_test::serial;
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -942,11 +964,11 @@ mod tests {
         let now = Instant::now();
         assert!(writes.ready_keys(now, 2).is_empty(), "uncommitted responsibility must not be dispatched");
         writes.mark_persisted();
-        let first: Vec<_> = writes.ready_keys(now, 2).into_iter().map(|key| key.object).collect();
+        let first: Vec<_> = writes.ready_keys(now, 2).into_iter().map(|key| key.identity.object).collect();
         assert_eq!(first, vec![Arc::<str>::from("a"), Arc::<str>::from("b")]);
         let second = writes.ready_keys(now, 2);
         assert_eq!(
-            second[0].object.as_ref(),
+            second[0].identity.object.as_ref(),
             "c",
             "the old prefix becoming due again cannot starve the next member"
         );
@@ -962,7 +984,11 @@ mod tests {
             .expect("durable intent should be retained");
         writes.mark_persisted();
         let anchor = MrfDurableRepairAnchor::from_intent(&original, incarnation).expect("exact durable anchor");
-        writes.entries.get_mut(&queue_key(&original)).expect("resident intent").anchor = Some(anchor.clone());
+        writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&original, Some(incarnation)))
+            .expect("resident intent")
+            .anchor = Some(anchor.clone());
 
         assert!(writes.park_unverified_legacy(&anchor));
         assert!(!writes.park_unverified_legacy(&anchor), "duplicate notices are idempotent");
@@ -999,13 +1025,13 @@ mod tests {
         writes.mark_persisted();
         let responsibility_id = writes
             .entries
-            .get(&queue_key(&original))
+            .get(&PartialWriteKey::new(&original, Some(incarnation)))
             .expect("resident responsibility")
             .responsibility_id;
         let anchor = MrfDurableRepairAnchor::from_intent(&original, incarnation).expect("exact durable anchor");
         writes
             .entries
-            .get_mut(&queue_key(&original))
+            .get_mut(&PartialWriteKey::new(&original, Some(incarnation)))
             .expect("resident responsibility")
             .anchor = Some(anchor.clone());
         assert!(writes.park_unverified_legacy(&anchor));
@@ -1042,7 +1068,7 @@ mod tests {
         assert_eq!(restored.operator_accepted_unverified_count(), 1);
         let accepted_entry = restored
             .entries
-            .get(&queue_key(&intent("legacy-lifecycle")))
+            .get(&PartialWriteKey::new(&intent("legacy-lifecycle"), Some(incarnation)))
             .expect("accepted entry");
         assert_eq!(
             restored.bytes(),
@@ -1064,7 +1090,7 @@ mod tests {
         assert_eq!(restored.operator_accepted_unverified_count(), 0);
         let active_entry = restored
             .entries
-            .get(&queue_key(&intent("legacy-lifecycle")))
+            .get(&PartialWriteKey::new(&intent("legacy-lifecycle"), Some(incarnation)))
             .expect("active entry");
         assert_eq!(
             restored.bytes(),
@@ -1090,7 +1116,11 @@ mod tests {
             .expect("durable intent should be retained");
         writes.mark_persisted();
         let anchor = MrfDurableRepairAnchor::from_intent(&original, original_incarnation).expect("anchor");
-        writes.entries.get_mut(&queue_key(&original)).expect("entry").anchor = Some(anchor.clone());
+        writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&original, Some(original_incarnation)))
+            .expect("entry")
+            .anchor = Some(anchor.clone());
         assert!(writes.park_unverified_legacy(&anchor));
         let checkpoint = writes.checkpoint_records(|_| Some([4; 32])).remove(0);
 
@@ -1112,10 +1142,18 @@ mod tests {
             Some((_, ResponsibilityState::BucketIncarnationChanged { observed_bucket_incarnation_id, .. }, _))
                 if observed_bucket_incarnation_id == recreated_incarnation
         ));
-        assert!(restored.retry_index.contains(&queue_key(&original)));
+        assert!(
+            restored
+                .retry_index
+                .contains(&PartialWriteKey::new(&original, Some(original_incarnation)))
+        );
         assert_eq!(restored.retry_order.len(), 1, "restoration must not scan/reinsert the full retry queue");
         restored.restore_operator_state(checkpoint.responsibility_id, previous, None);
-        assert!(restored.retry_index.contains(&queue_key(&original)));
+        assert!(
+            restored
+                .retry_index
+                .contains(&PartialWriteKey::new(&original, Some(original_incarnation)))
+        );
         assert_eq!(restored.retry_order.len(), 1, "rollback leaves one lazily cleaned queue key");
     }
 
@@ -1130,11 +1168,15 @@ mod tests {
         let anchor = MrfDurableRepairAnchor::from_intent(&original, incarnation).expect("exact durable anchor");
         writes
             .entries
-            .get_mut(&queue_key(&original))
+            .get_mut(&PartialWriteKey::new(&original, Some(incarnation)))
             .expect("resident responsibility")
             .anchor = Some(anchor.clone());
         assert!(writes.park_unverified_legacy(&anchor));
-        let id = writes.entries.get(&queue_key(&original)).expect("entry").responsibility_id;
+        let id = writes
+            .entries
+            .get(&PartialWriteKey::new(&original, Some(incarnation)))
+            .expect("entry")
+            .responsibility_id;
 
         assert!(
             writes
@@ -1163,7 +1205,7 @@ mod tests {
         writes
             .admit_with_source_incarnation(item.clone(), Some(source), 1, 8192)
             .expect("retain generation-bound durable intent");
-        let key = queue_key(&item);
+        let key = PartialWriteKey::new(&item, Some(source));
         let entry = writes.entries.get_mut(&key).expect("resident intent");
         entry.state = ResponsibilityState::BucketIncarnationChanged {
             source_bucket_incarnation_id: source,
@@ -1207,6 +1249,163 @@ mod tests {
         assert!(item.accepted.is_some_and(|audit| audit.acknowledged_incarnation_mismatch));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn same_key_bucket_incarnations_keep_separate_lifecycle_records_through_replay() {
+        use crate::heal::mrf_queue::{MrfConsumerConfig, MrfQueue, MrfRuntime};
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_same_key_incarnation_replay")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
+        let disks = super::super::journal_disks().await;
+        assert!(!disks.is_empty(), "test environment must register local MRF disks");
+
+        let old_incarnation = Uuid::new_v4();
+        let current_incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("current bucket incarnation must be available");
+        assert_ne!(old_incarnation, current_incarnation);
+
+        let old_intent = intent("same-object");
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(old_intent.clone(), Some(old_incarnation), 2, 64 * 1024)
+            .expect("retain the old bucket's partial-write responsibility");
+        let old_key = PartialWriteKey::new(&old_intent, Some(old_incarnation));
+        let old_entry = writes.entries.get(&old_key).expect("old responsibility should be resident");
+        let old_id = old_entry.responsibility_id;
+        let retained_old_intent = old_entry.intent.clone();
+        let old_anchor =
+            super::super::MrfDurableRepairAnchor::from_intent(&retained_old_intent, old_incarnation).expect("old proof anchor");
+        writes
+            .entries
+            .get_mut(&old_key)
+            .expect("old responsibility remains resident")
+            .anchor = Some(old_anchor.clone());
+        assert!(writes.park_unverified_legacy(&old_anchor));
+        let old_request_id = Uuid::new_v4();
+        writes
+            .record_operator_acceptance(
+                64 * 1024,
+                MrfLegacyRiskAcceptanceRequest {
+                    responsibility_id: old_id,
+                    expected_bucket_incarnation_id: old_incarnation,
+                    acknowledge_unknown_source_incarnation: false,
+                    acknowledge_incarnation_mismatch: false,
+                    actor: "integration-test-operator".to_string(),
+                    reason: "Keep the old bucket generation's disposition attached to its own responsibility".to_string(),
+                    reference: "TEST-ISSUE-8192-G1".to_string(),
+                    request_id: old_request_id,
+                },
+            )
+            .expect("old-generation risk disposition should be recorded");
+
+        let current_intent = intent("same-object");
+        assert_eq!(
+            super::super::intent_digest(&retained_old_intent),
+            super::super::intent_digest(&current_intent),
+            "the two bucket incarnations must exercise the same journal identity digest"
+        );
+        writes
+            .admit_with_source_incarnation(current_intent.clone(), Some(current_incarnation), 2, 64 * 1024)
+            .expect("retain the replacement bucket's separate responsibility");
+        writes.mark_persisted();
+        assert_eq!(writes.depth(), 2, "different bucket incarnations are distinct responsibilities");
+        let current_key = PartialWriteKey::new(&current_intent, Some(current_incarnation));
+        let current_entry = writes
+            .entries
+            .get(&current_key)
+            .expect("current responsibility should be resident");
+        let current_id = current_entry.responsibility_id;
+        assert_ne!(old_id, current_id);
+        assert!(matches!(current_entry.state, ResponsibilityState::Active));
+        assert!(current_entry.last_operator_acceptance.is_none());
+        assert!(
+            !writes.park_unverified_legacy(&old_anchor),
+            "a delayed G1 hold event must not alter the G2 responsibility"
+        );
+        assert!(matches!(
+            writes.intent_for_responsibility(current_id),
+            Some((_, ResponsibilityState::Active, Some(source))) if source == current_incarnation
+        ));
+
+        let mut journal = Vec::new();
+        for pending in writes.intents() {
+            assert!(
+                super::super::encode_intent(pending, &mut journal),
+                "both generations must fit the journal"
+            );
+        }
+        let (decoded_intents, truncated) = super::super::decode_journal(&journal);
+        assert_eq!(truncated, 0);
+        assert_eq!(decoded_intents.len(), 2, "the journal must retain both incarnations");
+        assert_eq!(
+            super::super::intent_digest(&decoded_intents[0]),
+            super::super::intent_digest(&decoded_intents[1])
+        );
+
+        let owner = Uuid::new_v4();
+        let sequence = 7;
+        let config = MrfConsumerConfig::default();
+        let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
+        let records = writes.checkpoint_records(super::super::intent_digest);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].intent_digest, records[1].intent_digest);
+        let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(owner, sequence, records, lifecycle_limit)
+            .expect("same-key generations need distinct lifecycle records");
+        super::super::snapshot::publish_committed_snapshot_with_companion(
+            &disks,
+            owner,
+            sequence,
+            &journal,
+            config.journal_max_bytes,
+            Some((&super::super::MRF_LIFECYCLE_PATHS, &lifecycle, lifecycle_limit)),
+        )
+        .await
+        .expect("publish journal and both lifecycle records together");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let replay = super::super::replay_into(&manager, &mut queue, &mut None).await;
+        assert_eq!(replay.replayed, 2);
+        assert_eq!(queue.depth(), 0, "durable generations bypass ordinary MRF coalescing");
+        assert_eq!(replay.partial_writes.len(), 2, "replay must preserve both responsibilities");
+
+        let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        assert_eq!(runtime.partial_writes.depth(), 2);
+        assert!(matches!(
+            runtime.partial_writes.intent_for_responsibility(old_id),
+            Some((_, ResponsibilityState::OperatorAcceptedUnverified { request_id, .. }, Some(source)))
+                if source == old_incarnation && request_id == old_request_id
+        ));
+        assert!(matches!(
+            runtime.partial_writes.intent_for_responsibility(current_id),
+            Some((_, ResponsibilityState::Active, Some(source))) if source == current_incarnation
+        ));
+        assert!(runtime.partial_writes.last_operator_acceptance(current_id).is_none());
+    }
+
     #[test]
     fn lifecycle_listing_uses_stable_bounded_cursors() {
         let mut writes = PartialWrites::default();
@@ -1216,7 +1415,7 @@ mod tests {
             writes
                 .admit_with_source_incarnation(item.clone(), Some(incarnation), 4, 8192)
                 .expect("retain durable intent");
-            let key = queue_key(&item);
+            let key = PartialWriteKey::new(&item, Some(incarnation));
             let entry = writes.entries.get_mut(&key).expect("resident intent");
             entry.responsibility_id = Uuid::from_u128(u128::try_from(index + 1).expect("small test index"));
             let anchor = MrfDurableRepairAnchor::from_intent(&item, incarnation).expect("exact durable anchor");
@@ -1275,7 +1474,7 @@ mod tests {
     fn partial_write_retention_new_generation_rejects_old_proof_and_requires_checkpoint() {
         let mut writes = PartialWrites::default();
         let first = intent("same-key");
-        let key = queue_key(&first);
+        let key = PartialWriteKey::new(&first, None);
         let incarnation = Uuid::new_v4();
         let old_anchor = MrfDurableRepairAnchor::from_intent(&first, incarnation).expect("first anchor should be complete");
         writes.admit(first, 1, 4096).expect("first write should fit");
