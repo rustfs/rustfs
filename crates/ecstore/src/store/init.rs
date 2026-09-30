@@ -11176,9 +11176,17 @@ mod tests {
         const ADMITTED_READS: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create validation-read shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-validation-read-shutdown", &[4]))
-                .await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-validation-read-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-validation-read-shutdown-bucket";
         store
@@ -11710,8 +11718,17 @@ mod tests {
         const ADMITTED_BATCH: usize = 32;
 
         let temp_dir = tempfile::tempdir().expect("create delete-batch shutdown store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-delete-batch-shutdown", &[4])).await;
+        // The manual worker must own the seeded records and shutdown progress.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-delete-batch-shutdown",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-delete-batch-shutdown-bucket";
         store
