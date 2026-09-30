@@ -253,23 +253,17 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
-fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
-    match value {
-        Value::Object(fields) => fields
-            .get(field)
-            .and_then(numeric_json_value)
-            .or_else(|| fields.values().find_map(|value| numeric_json_field(value, field))),
-        Value::Array(values) => values.iter().find_map(|value| numeric_json_field(value, field)),
-        _ => None,
-    }
-}
-
-#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
             if let Some(metric_value) = fields.get(metric)
-                && let Some(value) = numeric_json_value(metric_value).or_else(|| numeric_json_field(metric_value, field))
+                && let Some(value) = metric_value
+                    .as_object()
+                    .and_then(|fields| fields.get(field))
+                    .and_then(numeric_json_value)
+                    // Mimalloc serializes cumulative counters as scalars and
+                    // count statistics as objects with current/peak/total.
+                    .or_else(|| (field == "total").then(|| numeric_json_value(metric_value)).flatten())
             {
                 return Some(value);
             }
@@ -287,31 +281,24 @@ fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
-fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
-    metrics
-        .iter()
-        .map(|metric| mimalloc_stat_field(value, metric, field))
-        .try_fold(0_u64, |sum, value| value.map(|value| sum.saturating_add(value)))
-        .filter(|value| *value > 0)
-}
-
-#[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
-    let malloc_metrics = ["malloc_normal", "malloc_huge"];
+    let requested_current = mimalloc_stat_current(&value, "malloc_requested");
+    let requested_peak = mimalloc_stat_field(&value, "malloc_requested", "peak");
+    let requested_total = mimalloc_stat_field(&value, "malloc_requested", "total");
+    // All-zero count stats can mean allocation accounting was compiled out.
+    // Normal/huge allocation stats are not a substitute for live requested bytes.
+    let requested_available = [requested_current, requested_peak, requested_total]
+        .into_iter()
+        .flatten()
+        .any(|value| value > 0);
     let observation = AllocatorMemoryObservation {
         reserved_bytes: mimalloc_stat_current(&value, "reserved"),
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
-        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested")
-            .filter(|value| *value > 0)
-            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "current")),
-        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak")
-            .filter(|value| *value > 0)
-            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "peak")),
-        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total")
-            .filter(|value| *value > 0)
-            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "total")),
+        malloc_requested_bytes: requested_current.filter(|_| requested_available),
+        malloc_requested_peak_bytes: requested_peak.filter(|_| requested_available),
+        malloc_requested_total_bytes: requested_total.filter(|_| requested_available),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
     };
 
@@ -405,6 +392,13 @@ fn record_container_resource_detection() {
     metrics::gauge!("rustfs_container_overridden").set(if res.overridden { 1.0 } else { 0.0 });
 }
 
+fn allocator_snapshot_or_unavailable(snapshot: Option<AllocatorMemorySnapshot>) -> AllocatorMemorySnapshot {
+    snapshot.unwrap_or_else(|| AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation: AllocatorMemoryObservation::default(),
+    })
+}
+
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -433,11 +427,12 @@ async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
                 );
             }
 
-            if let Some(allocator) = allocator {
-                record_allocator_memory_observation(allocator.backend, allocator.observation);
-            }
+            let allocator = allocator_snapshot_or_unavailable(allocator);
+            record_allocator_memory_observation(allocator.backend, allocator.observation);
         }
         Err(err) => {
+            let allocator = allocator_snapshot_or_unavailable(None);
+            record_allocator_memory_observation(allocator.backend, allocator.observation);
             debug!(error = ?err, "memory observability sampler task failed");
         }
     }
@@ -541,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mimalloc_stats_json_falls_back_to_allocated_bytes_when_requested_is_zero() {
+    fn parse_mimalloc_stats_json_does_not_infer_live_bytes_from_allocation_totals() {
         let parsed = parse_mimalloc_stats_json(
             r#"{
                 "stat_version": 1,
@@ -558,15 +553,68 @@ mod tests {
 
         assert_eq!(parsed.reserved_bytes, Some(1_048_576));
         assert_eq!(parsed.committed_bytes, Some(524_288));
-        assert_eq!(parsed.malloc_requested_bytes, Some(262_144));
-        assert_eq!(parsed.malloc_requested_peak_bytes, Some(393_216));
-        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
         assert_eq!(parsed.heap_count, Some(1));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_scalar_requested_is_only_a_cumulative_total() {
+        for requested in ["311856733152", "\"311856733152\""] {
+            let payload = format!(r#"{{ "stat_version": 5, "malloc_requested": {requested} }}"#);
+            let parsed = parse_mimalloc_stats_json(&payload).expect("counter stats should parse");
+            assert_eq!(parsed.malloc_requested_bytes, None);
+            assert_eq!(parsed.malloc_requested_peak_bytes, None);
+            assert_eq!(parsed.malloc_requested_total_bytes, Some(311_856_733_152));
+        }
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_preserves_zero_after_live_allocations_are_freed() {
+        let parsed =
+            parse_mimalloc_stats_json(r#"{ "malloc_requested": { "current": 0, "peak": 10485760, "total": 20971520 } }"#)
+                .expect("supported drained allocation stats should parse");
+        assert_eq!(parsed.malloc_requested_bytes, Some(0));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(10_485_760));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(20_971_520));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_does_not_fabricate_missing_or_invalid_requested_fields() {
+        let parsed = parse_mimalloc_stats_json(r#"{ "malloc_requested": { "total": 10485760 } }"#)
+            .expect("partial counter stats should parse");
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        for payload in [
+            r#"{ "malloc_requested": -1 }"#,
+            r#"{ "malloc_requested": "invalid" }"#,
+            r#"{ "malloc_requested": { "current": -1 } }"#,
+            r#"{ "malloc_requested": { "unexpected": { "current": 123 } } }"#,
+        ] {
+            assert_eq!(parse_mimalloc_stats_json(payload), None, "invalid schema: {payload}");
+        }
     }
 
     #[test]
     fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
         assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
+    }
+
+    #[test]
+    fn missing_allocator_snapshot_marks_requested_bytes_as_unavailable() {
+        let supported = super::AllocatorMemorySnapshot {
+            backend: crate::allocator_reclaim::allocator_backend(),
+            observation: rustfs_io_metrics::AllocatorMemoryObservation {
+                malloc_requested_bytes: Some(128),
+                ..Default::default()
+            },
+        };
+        assert_eq!(super::allocator_snapshot_or_unavailable(Some(supported)), supported);
+        let unavailable = super::allocator_snapshot_or_unavailable(None);
+        assert_eq!(unavailable.backend, supported.backend);
+        assert_eq!(unavailable.observation, rustfs_io_metrics::AllocatorMemoryObservation::default());
     }
 
     #[test]
