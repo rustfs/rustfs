@@ -2395,18 +2395,40 @@ mod tests {
             assert!(pool_meta_lock.get_write_lock_quiet(Duration::from_millis(100)).await.is_err());
             barrier.release();
             tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let loaded = load_scanner_pause_backlog(Arc::clone(&store))
-                        .await
-                        .expect("cancellation cannot erase the old authority");
-                    assert_eq!(loaded.ledger, original);
-                    let committed = loaded.authoritative_commit.expect("seed retains the old cohort proof");
-                    assert_eq!(committed.replicas, vec![replica_id(0, 0), replica_id(0, 1)]);
-                    if loaded.healthy_replicas == loaded.replica_count {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
+                let drained_fence = pool_meta_lock
+                    .get_write_lock_quiet(Duration::from_secs(30))
+                    .await
+                    .expect("the detached seed owner releases its membership fence after persistence");
+                drop(drained_fence);
+                let loaded = load_scanner_pause_backlog(Arc::clone(&store))
+                    .await
+                    .expect("cancellation cannot erase the old authority");
+                assert_eq!(loaded.ledger, original);
+                let committed = loaded
+                    .authoritative_commit
+                    .as_ref()
+                    .expect("seed retains the old cohort proof");
+                assert_eq!(committed.replicas, vec![replica_id(0, 0), replica_id(0, 1)]);
+                assert_eq!(loaded.replica_count, 6);
+                assert_eq!(loaded.healthy_replicas, 5);
+                let seeded = loaded
+                    .replicas
+                    .iter()
+                    .find(|replica| replica.id == replica_id(2, 0))
+                    .expect("the canceled caller's admitted seed replica");
+                assert!(matches!(
+                    &seeded.state,
+                    ScannerPauseBacklogReplicaState::Valid(record)
+                        if record.stable.as_ref() == Some(&original) && record.committed.as_ref() == Some(committed)
+                ));
+                // Serial publication owns only the write already admitted when
+                // its caller is canceled; the next replica belongs to a fresh claim.
+                let unstarted = loaded
+                    .replicas
+                    .iter()
+                    .find(|replica| replica.id == replica_id(2, 1))
+                    .expect("the remaining seed replica");
+                assert!(matches!(unstarted.state, ScannerPauseBacklogReplicaState::Missing));
             })
             .await
             .expect("detached native seed owners must drain without the canceled caller");
