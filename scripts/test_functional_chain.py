@@ -410,7 +410,7 @@ class WorkflowTimeoutTests(unittest.TestCase):
                     line in ("        id: test", "        id: pool_test") for line in step)]
                 self.assertEqual(len(primary), 1)
                 if suite == "pool-expand":
-                    self.assertIn("        timeout-minutes: ${{ inputs.pool_timeout_minutes || 240 }}", primary[0])
+                    self.assertIn("        timeout-minutes: ${{ fromJSON(inputs.pool_timeout_minutes || '240') }}", primary[0])
                     for event in ("workflow_call", "workflow_dispatch"):
                         event_block = yaml_block(source.splitlines(), event, 2)
                         timeout_input = yaml_block(event_block, "pool_timeout_minutes", 6)
