@@ -534,11 +534,15 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Protect Connect test home
-        run: chmod go-w "$(realpath "$HOME")"
+      - name: Prepare protocol test state
+        run: |
+          rm -f target/nextest/ci/junit.xml
+          chmod go-w "$(realpath "$HOME")"
 
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
+          ./scripts/ci/resource_sampler.sh start clippy
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
@@ -548,24 +552,26 @@ jobs:
           # Keep feature-test linking under the same bounded concurrency as the
           # main nextest lane; Clippy is metadata-only and needs no such limit.
           CARGO_BUILD_JOBS: "2"
+          SAMPLER_INTERVAL_SECS: "15"
         run: |
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
           mkdir -p artifacts/protocol-tests
-          rm -f target/nextest/ci/junit.xml
+          ./scripts/ci/resource_sampler.sh start nextest
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }} \
             2>&1 | tee artifacts/protocol-tests/nextest.log
 
       - name: Upload protocol test reports and diagnostics
-        if: >-
-          always() && contains(fromJSON('["success", "failure", "cancelled"]'), steps.protocol-tests.outcome)
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: junit-test-and-lint-${{ matrix.features.name }}-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
             artifacts/protocol-tests
+            artifacts/test-and-lint
           retention-days: 3
           if-no-files-found: warn
 
