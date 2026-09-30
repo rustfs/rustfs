@@ -9420,6 +9420,31 @@ mod tests {
         assert!(!purged, "a missing prefix should report nothing to purge");
     }
 
+    #[tokio::test]
+    async fn orphan_directory_purge_preserves_tree_when_a_disk_slot_is_offline() {
+        let (dir, disk) = make_single_local_disk().await;
+        let prefix_dir = dir.path().join("bucket").join("pfx");
+        fs::create_dir_all(prefix_dir.join("nested").join("leaf"))
+            .await
+            .expect("orphan directory tree should be created");
+
+        let set = make_set_disks_with(vec![Some(disk), None]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("an unavailable slot should fail closed without a scan error");
+
+        assert!(!purged, "an incomplete disk scan must not claim the tree is an orphan");
+        assert!(prefix_dir.join("nested/leaf").exists(), "online disk contents must remain untouched");
+
+        let bucket_purged = set.purge_orphan_dir_objects_in_bucket("bucket").await;
+        assert!(!bucket_purged, "bucket-wide cleanup must fail closed with an unavailable disk slot");
+        assert!(
+            prefix_dir.join("nested/leaf").exists(),
+            "bucket-wide cleanup must preserve the online tree"
+        );
+    }
+
     // Cross-disk safety: if any drive still holds object data under the prefix, refuse
     // to purge on every drive so a degraded/healable object is never destroyed.
     #[tokio::test]

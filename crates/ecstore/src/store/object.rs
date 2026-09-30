@@ -4693,6 +4693,14 @@ impl ECStore {
     /// the caller falls back to surfacing the original NotFound.
     pub(super) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
         let prefix = decode_dir_object(object);
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                if !set.orphan_purge_has_complete_disk_set().await {
+                    return false;
+                }
+            }
+        }
+
         let mut purged = false;
         for pool in self.pools.iter() {
             for set in pool.disk_set.iter() {
@@ -4708,6 +4716,27 @@ impl ECStore {
                         );
                     }
                 }
+            }
+        }
+        purged
+    }
+
+    pub(super) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
+        if is_meta_bucketname(bucket) {
+            return false;
+        }
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                if !set.orphan_purge_has_complete_disk_set().await {
+                    return false;
+                }
+            }
+        }
+
+        let mut purged = false;
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                purged |= set.purge_orphan_dir_objects_in_bucket(bucket).await;
             }
         }
         purged
