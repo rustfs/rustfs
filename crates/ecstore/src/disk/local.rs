@@ -23691,12 +23691,23 @@ mod test {
             .expect("operation should succeed");
         assert_eq!(second, Bytes::from_static(payload));
 
-        // Concurrent cache hits must use positioned reads on the shared descriptor.
-        let reads =
-            futures::future::join_all((0..payload.len()).map(|offset| backend.pread_bytes(volume, object, offset, 1, None)))
-                .await;
-        for (offset, read) in reads.into_iter().enumerate() {
-            assert_eq!(read.expect("cached offset read"), &payload[offset..offset + 1]);
+        // Both read methods must preserve offsets on the shared cached descriptor.
+        for method in [
+            RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY,
+            RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY,
+        ] {
+            let reads = temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(method))], async {
+                futures::future::join_all((0..payload.len()).map(|offset| backend.pread_bytes(volume, object, offset, 1, None)))
+                    .await
+            })
+            .await;
+            for (offset, read) in reads.into_iter().enumerate() {
+                assert_eq!(
+                    read.expect("cached offset read"),
+                    &payload[offset..offset + 1],
+                    "{method} at offset {offset}"
+                );
+            }
         }
 
         // Invalidating by the object prefix drops the cached descriptor.
