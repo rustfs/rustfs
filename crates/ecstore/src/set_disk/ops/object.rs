@@ -3502,7 +3502,10 @@ impl SetDisks {
         let protect_write = opts.shard_integrity_write_enabled();
         let source_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
             Some(incarnation_id) => Some(incarnation_id),
-            None => self.bucket_incarnation_id_from_disk(bucket).await.ok(),
+            // Internal metadata writes may already hold the pool metadata
+            // lock; resolving a user bucket identity would re-enter it.
+            None if !is_meta_bucketname(bucket) => self.bucket_incarnation_id_from_disk(bucket).await.ok(),
+            None => None,
         };
         if publication_fence.is_none()
             && opts.data_movement
@@ -8077,7 +8080,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let source_bucket_incarnation_id = self.bucket_incarnation_id_from_disk(bucket).await.ok();
+        let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            self.bucket_incarnation_id_from_disk(bucket).await.ok()
+        };
         self.delete_object_version_with_purge(bucket, object, fi, force_del_marker, None, source_bucket_incarnation_id)
             .await
     }
@@ -9277,7 +9284,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        let source_bucket_incarnation_id = self.bucket_incarnation_id_from_disk(bucket).await.ok();
+        let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            self.bucket_incarnation_id_from_disk(bucket).await.ok()
+        };
         self.add_partial_with_source_incarnation(bucket, object, version_id, source_bucket_incarnation_id)
             .await
     }
@@ -22441,6 +22452,61 @@ mod single_delete_namespace_owner_tests {
         )
         .await
         .expect("seed a complete real object version");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_metadata_mutations_do_not_reenter_pool_metadata() {
+        let (_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let set = &store.pools[0].disk_set[0];
+        let disks = set.disk_inventory().await.into_iter().flatten().collect::<Vec<_>>();
+
+        for bucket in [RUSTFS_META_BUCKET, crate::disk::MIGRATING_META_BUCKET] {
+            for disk in &disks {
+                if let Err(err) = disk.make_volume(bucket).await {
+                    assert_eq!(err, DiskError::VolumeExists, "prepare the internal metadata volume");
+                }
+            }
+            let version = Uuid::new_v4();
+            seed_version(set, bucket, "delete-under-pool-lock", version, b"metadata version").await;
+            let request = FileInfo {
+                name: "delete-under-pool-lock".to_string(),
+                version_id: Some(version),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let mut reader = PutObjReader::from_vec(b"metadata under lock".to_vec());
+            let opts = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+
+            // Pool metadata transactions retain this write guard while saving
+            // internal objects. None of these paths may look up a user bucket.
+            let _pool_meta_guard = store.pool_meta.write().await;
+            let limit = Duration::from_secs(30);
+            let (put, delete, partial) = tokio::join!(
+                tokio::time::timeout(limit, set.put_object(bucket, "put-under-pool-lock", &mut reader, &opts)),
+                tokio::time::timeout(limit, set.delete_object_version(bucket, &request.name, &request, false)),
+                tokio::time::timeout(limit, set.add_partial(bucket, "partial-under-pool-lock", "")),
+            );
+            assert!(
+                matches!(&put, Ok(Ok(_))) && matches!(&delete, Ok(Ok(()))) && matches!(&partial, Ok(Ok(()))),
+                "internal operations must finish while pool metadata is locked: bucket={bucket}, put={put:?}, delete={delete:?}, partial={partial:?}"
+            );
+            for disk in &disks {
+                let written = disk
+                    .read_version("", bucket, "put-under-pool-lock", "", &ReadOptions::default())
+                    .await
+                    .expect("the internal PUT must reach every disk");
+                assert_eq!(written.size, b"metadata under lock".len() as i64);
+                let deleted = disk
+                    .read_version("", bucket, &request.name, &version.to_string(), &ReadOptions::default())
+                    .await;
+                assert!(matches!(deleted, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)));
+            }
+        }
     }
 
     #[tokio::test]

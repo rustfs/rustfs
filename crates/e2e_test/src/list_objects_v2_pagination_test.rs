@@ -32,7 +32,18 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use futures::{StreamExt, stream};
     use std::collections::HashSet;
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::time::{Instant, error::Elapsed, timeout_at};
     use tracing::info;
+
+    const PAGINATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+    // Fixture population can require thousands of durable PUTs. Bound the
+    // listing traversal itself with one deadline shared by every page.
+    async fn listing_request_before<T>(deadline: Instant, request: impl Future<Output = T>) -> Result<T, Elapsed> {
+        timeout_at(deadline, request).await
+    }
 
     /// Helper function to create an S3 client for testing
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -56,6 +67,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_deadline_rejects_unresponsive_peer() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unresponsive listing peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listing peer address"));
+        let (received_tx, received_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept listing request");
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).await.expect("read listing request") > 0);
+            received_tx.send(()).expect("signal received listing request");
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let client = Client::from_conf(
+            crate::common::build_test_s3_config(&endpoint, "test-access", "test-secret", None, "pagination-deadline")
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let request = client.list_objects_v2().bucket("deadline-test").send();
+        tokio::pin!(request);
+        tokio::select! {
+            response = &mut request => panic!("unresponsive listing peer unexpectedly returned: {response:?}"),
+            received = timeout(Duration::from_secs(10), received_rx) => {
+                received.expect("listing request must reach peer").expect("listing peer must remain alive");
+            }
+        }
+
+        // Expire the same absolute deadline after the real request is observed;
+        // this tests a stalled response without relying on transport timing.
+        let result = timeout(Duration::from_secs(1), listing_request_before(Instant::now(), request))
+            .await
+            .expect("expired pagination deadline must stop the in-flight request");
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_err(),
+            "an unresponsive ListObjectsV2 request must exceed the pagination deadline"
+        );
     }
 
     /// Test for Issue #2775: continuation forwarding must not
@@ -515,12 +574,12 @@ mod tests {
                 .expect("Failed to put object");
         }
 
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .max_keys(1001)
-            .send()
+        eprintln!("Seeded {object_count} objects in {bucket}; starting ListObjectsV2 pagination");
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
+        let output = listing_request_before(deadline, client.list_objects_v2().bucket(bucket).max_keys(1001).send())
             .await
+            .expect("ListObjectsV2 pagination exceeded its deadline after fixture population")
             .expect("Failed to list objects");
 
         assert_eq!(output.contents().len(), 1000);
@@ -536,14 +595,18 @@ mod tests {
             .expect("NextContinuationToken should be present when capped response is truncated")
             .to_string();
 
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .max_keys(1001)
-            .continuation_token(next_token)
-            .send()
-            .await
-            .expect("Failed to list objects with continuation token");
+        let output = listing_request_before(
+            deadline,
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1001)
+                .continuation_token(next_token)
+                .send(),
+        )
+        .await
+        .expect("ListObjectsV2 continuation exceeded the shared pagination deadline")
+        .expect("Failed to list objects with continuation token");
 
         assert_eq!(output.contents().len(), 2);
         assert!(!output.is_truncated().unwrap_or(false));
@@ -766,6 +829,9 @@ mod tests {
             }
         }
 
+        eprintln!("Seeded {} objects in {bucket}; starting ListObjectsV2 pagination", all_keys.len());
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
         // Paginate with delimiter="/" and max_keys=50
         // Visible per page: up to 50 CommonPrefixes
         let mut listed_keys = Vec::new();
@@ -781,7 +847,10 @@ mod tests {
                 request = request.continuation_token(token);
             }
 
-            let output = request.send().await.expect("Failed to list objects");
+            let output = listing_request_before(deadline, request.send())
+                .await
+                .expect("ListObjectsV2 delimiter traversal exceeded the shared pagination deadline")
+                .expect("Failed to list objects");
             last_page_is_truncated = output.is_truncated().unwrap_or(false);
 
             for obj in output.contents() {
@@ -1002,15 +1071,18 @@ mod tests {
             "Pagination fixture ready"
         );
 
+        eprintln!(
+            "Seeded {} objects in {bucket}; starting ListObjectsV2 pagination",
+            dir_count * files_per_dir
+        );
+        let deadline = Instant::now() + PAGINATION_TIMEOUT;
+
         // With delimiter: 12 CommonPrefixes visible, all fit within capped 1000
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .delimiter("/")
-            .max_keys(2000)
-            .send()
-            .await
-            .expect("Failed to list objects");
+        let output =
+            listing_request_before(deadline, client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(2000).send())
+                .await
+                .expect("ListObjectsV2 delimiter listing exceeded its deadline after fixture population")
+                .expect("Failed to list objects");
 
         assert_eq!(
             output.common_prefixes().len(),

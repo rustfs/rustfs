@@ -387,6 +387,24 @@ fn should_purge_empty_directory_listing(
         && result.prefixes.is_empty()
 }
 
+fn should_purge_empty_recursive_bucket_listing(
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max_keys: i32,
+    incl_deleted: bool,
+    result: &ListObjectsInfo,
+) -> bool {
+    prefix.is_empty()
+        && delimiter.is_none()
+        && marker.is_none()
+        && max_keys > 0
+        && !incl_deleted
+        && !result.is_truncated
+        && result.objects.is_empty()
+        && result.prefixes.is_empty()
+}
+
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
 const LIST_CACHE_MARKER_PREFIX: &str = "[rustfs_cache:";
@@ -4006,82 +4024,91 @@ impl ECStore {
         // key sorting between `<marker>` and `<marker>[` is silently skipped on
         // the continuation page (backlog#1047).
         opts.parse_marker();
-        if let Some(mode) = list_objects_index_mode_from_env()
-            && let Some(result) = self
-                .clone()
+        let key_only_result = if let Some(mode) = list_objects_index_mode_from_env() {
+            self.clone()
                 .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
                 .await?
-        {
-            if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
-                && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
-                    .await
-                    .unwrap_or(false)
-            {
-                self.purge_orphan_dir_object(bucket, prefix).await;
-            }
-            return Ok(result);
-        }
-
-        let mut list_result = self
-            .clone()
-            .list_path(&opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(to_filemeta_err(err)),
-                ..Default::default()
-            });
-        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
-
-        // err=None means gather_results filled its limit → disk has more data
-        let disk_has_more = list_result.err.is_none();
-
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker.clone());
-        }
-
-        // contextCanceled
-
-        // Last RAW scanned key, captured before folding, so `list_objects_paginate`
-        // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
-        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
-
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
-
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
-            get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            false,
-            last_scanned_key.as_deref(),
-        );
-        let _ = next_version_idmarker;
-
-        let result = ListObjectsInfo {
-            is_truncated,
-            next_marker,
-            objects,
-            prefixes,
+        } else {
+            None
         };
-        if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
+
+        let result = if let Some(result) = key_only_result {
+            result
+        } else {
+            let mut list_result = self
+                .clone()
+                .list_path(&opts)
+                .await
+                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                    err: Some(to_filemeta_err(err)),
+                    ..Default::default()
+                });
+            let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+
+            // err=None means gather_results filled its limit → disk has more data
+            let disk_has_more = list_result.err.is_none();
+
+            if let Some(err) = list_result.err.take()
+                && err != rustfs_filemeta::Error::Unexpected
+            {
+                return Err(to_object_err(err.into(), vec![bucket, prefix]));
+            }
+
+            if let Some(result) = list_result.entries.as_mut() {
+                result.forward_past(opts.marker.clone());
+            }
+
+            // Last RAW scanned key, captured before folding, so `list_objects_paginate`
+            // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
+            let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
+            let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+                &list_result.entries.unwrap_or_default(),
+                bucket,
+                prefix,
+                delimiter.clone(),
+            )
+            .await;
+
+            let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+                get_objects,
+                &delimiter,
+                max_keys,
+                disk_has_more,
+                next_cache_id.as_deref(),
+                false,
+                last_scanned_key.as_deref(),
+            );
+            let _ = next_version_idmarker;
+
+            ListObjectsInfo {
+                is_truncated,
+                next_marker,
+                objects,
+                prefixes,
+            }
+        };
+
+        let purge_exact_prefix =
+            should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result);
+        let purge_empty_bucket = should_purge_empty_recursive_bucket_listing(
+            prefix,
+            delimiter.as_deref(),
+            opts.marker.as_deref(),
+            max_keys,
+            incl_deleted,
+            &result,
+        );
+        if (purge_exact_prefix || purge_empty_bucket)
             && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
                 .await
                 .unwrap_or(false)
         {
-            self.purge_orphan_dir_object(bucket, prefix).await;
+            if purge_exact_prefix {
+                self.purge_orphan_dir_object(bucket, prefix).await;
+            } else {
+                self.purge_orphan_dir_objects_in_bucket(bucket).await;
+            }
         }
         Ok(result)
     }
@@ -9507,6 +9534,38 @@ mod test {
         assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
     }
 
+    #[test]
+    fn recursive_bucket_orphan_purge_requires_an_empty_complete_root_scan() {
+        let empty = ListObjectsInfo::default();
+        assert!(super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing(
+            "ghost/", None, None, 1, false, &empty
+        ));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", Some("/"), None, 1, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing(
+            "",
+            None,
+            Some("marker"),
+            1,
+            false,
+            &empty
+        ));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 0, false, &empty));
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, true, &empty));
+
+        let live = ListObjectsInfo {
+            objects: vec![ObjectInfo::default()],
+            ..Default::default()
+        };
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &live));
+
+        let incomplete = ListObjectsInfo {
+            is_truncated: true,
+            ..Default::default()
+        };
+        assert!(!super::should_purge_empty_recursive_bucket_listing("", None, None, 1, false, &incomplete));
+    }
+
     #[tokio::test]
     async fn empty_recursive_listing_purges_committed_delete_residue() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
@@ -9554,6 +9613,72 @@ mod test {
             assert!(
                 !dir.path().join(bucket).join("ghost").exists(),
                 "the empty listing should reclaim its committed delete residue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_recursive_bucket_listing_purges_orphan_directory_prefixes() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "recursive-bucket-orphan-purge";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+
+        for dir in &dirs {
+            tokio::fs::create_dir_all(dir.path().join(bucket).join("ghost").join("nested").join("leaf"))
+                .await
+                .expect("metadata-less orphan directory tree should be created");
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive bucket listing should succeed");
+
+        assert!(result.objects.is_empty(), "orphan directories are not S3 objects");
+        assert!(result.prefixes.is_empty(), "a delimiter-less listing has no CommonPrefixes");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("ghost").exists(),
+                "an empty recursive bucket scan should reclaim its metadata-less orphan prefix"
+            );
+        }
+
+        let versioned_bucket = "recursive-bucket-versioned-orphan";
+        store
+            .make_bucket(versioned_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("versioned test bucket should be created");
+        store
+            .update_bucket_metadata_config(
+                versioned_bucket,
+                crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("bucket versioning should be enabled");
+        for dir in &dirs {
+            tokio::fs::create_dir_all(dir.path().join(versioned_bucket).join("ghost").join("nested").join("leaf"))
+                .await
+                .expect("versioned bucket orphan tree should be created");
+        }
+
+        store
+            .clone()
+            .list_objects_generic(versioned_bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive versioned bucket listing should succeed");
+        for dir in &dirs {
+            assert!(
+                dir.path().join(versioned_bucket).join("ghost").exists(),
+                "root recursive LIST must not purge orphan residue in a versioned bucket"
             );
         }
     }
