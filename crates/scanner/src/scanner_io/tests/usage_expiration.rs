@@ -4,22 +4,29 @@
 use super::*;
 use crate::storage_api::owner::ObjectOperations as _;
 use crate::storage_api::scanner_io::{
-    BUCKET_LIFECYCLE_CONFIG, apply_bucket_usage_memory_overlay, init_background_expiry,
+    BUCKET_LIFECYCLE_CONFIG, apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_background_expiry,
     load_admin_data_usage_from_backend_cached, load_data_usage_from_backend, record_bucket_object_delete_memory,
     record_bucket_object_write_memory, replace_bucket_usage_memory_from_info, seed_persisted_usage, update_bucket_metadata,
 };
 
 // Lifecycle expiry goes through the process-global store, which the first
 // store created in the process claims. Nextest runs this test in its own
-// process; sharing one store also lets all scenarios run in one filtered
-// `cargo test` process.
+// process; the lifecycle scenarios share the store that owns expiry processing.
 #[tokio::test]
 #[serial]
 async fn lifecycle_expiration_usage_converges_across_complete_scans() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
-    let next_cycle = check_persisted_stale_usage_recovery(&store, 1).await;
+    let next_cycle = check_persisted_stale_usage_recovery(&store, false, 1).await;
+    let next_cycle = check_persisted_stale_usage_recovery(&store, true, next_cycle + 1).await;
     let next_cycle = check_usage_after_lifecycle_expiration(&store, "idle", false, next_cycle).await;
     check_usage_after_lifecycle_expiration(&store, "busy", true, next_cycle).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn historical_usage_converges_with_writes_on_one_drive() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    check_persisted_stale_usage_recovery(&store, true, 1).await;
 }
 
 async fn check_usage_after_lifecycle_expiration(
@@ -150,8 +157,12 @@ async fn check_usage_after_lifecycle_expiration(
     cycle
 }
 
-async fn check_persisted_stale_usage_recovery(store: &Arc<ECStore>, first_cycle: u64) -> u64 {
-    let cases = [("historical-empty", 0_u64), ("historical-retained", 1_u64)];
+async fn check_persisted_stale_usage_recovery(store: &Arc<ECStore>, continuing_writes: bool, first_cycle: u64) -> u64 {
+    let cases = if continuing_writes {
+        [("historical-busy-empty", 0_u64), ("historical-busy-retained", 1_u64)]
+    } else {
+        [("historical-empty", 0_u64), ("historical-retained", 1_u64)]
+    };
     let mut stale = DataUsageInfo {
         last_update: Some(SystemTime::now()),
         usage_snapshot_complete: true,
@@ -185,6 +196,7 @@ async fn check_persisted_stale_usage_recovery(store: &Arc<ECStore>, first_cycle:
     }
     stale.calculate_totals();
     wait_for_namespace_commit_tails(store.as_ref()).await;
+    stale.last_update = Some(SystemTime::now());
     seed_persisted_usage(stale, store.clone())
         .await
         .expect("persist an incorrect complete aggregate");
@@ -196,11 +208,23 @@ async fn check_persisted_stale_usage_recovery(store: &Arc<ECStore>, first_cycle:
         assert_eq!(loaded.buckets_usage[bucket].objects_count, 436 + retained);
         assert_eq!(loaded.buckets_usage[bucket].size, 4_587_688_512 + retained * 42);
     }
-    // Model startup from the stale durable aggregate. No object mutation or
-    // expiry receipt is issued after this point, and no corrected snapshot is
-    // constructed by the test. This does not model corrupt per-set caches.
+    // Start from the incorrect durable aggregate; only the production scanner
+    // may publish a corrected snapshot. Per-set cache corruption is separate.
     replace_bucket_usage_memory_from_info(&loaded).await;
-    for cycle in first_cycle..first_cycle + 2 {
+    let cycles = if continuing_writes { 6 } else { 2 };
+    for cycle in first_cycle..first_cycle + cycles {
+        let added_objects = if continuing_writes { cycle - first_cycle + 1 } else { 0 };
+        if continuing_writes {
+            for (bucket, _) in cases {
+                let mut reader = ScannerPutObjReader::from_vec(vec![0; 42]);
+                store
+                    .put_object(bucket, &format!("keep/write-{cycle}"), &mut reader, &ScannerObjectOptions::default())
+                    .await
+                    .expect("write before each historical recovery scan");
+                record_bucket_object_write_memory(bucket, None, 42).await;
+            }
+            wait_for_namespace_commit_tails(store.as_ref()).await;
+        }
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
         let (updates, receiver) = mpsc::channel(4);
@@ -222,17 +246,19 @@ async fn check_persisted_stale_usage_recovery(store: &Arc<ECStore>, first_cycle:
             .await
             .expect("reload scanner-produced durable usage");
         assert!(durable.is_complete_bucket_usage_snapshot());
+        assert_eq!(durable.usage_snapshot_converged, Some(true));
         assert_eq!(durable.scanner_cycle, Some(cycle));
         let mut displayed = load_admin_data_usage_from_backend_cached(store.clone())
             .await
             .expect("load usage through the admin snapshot path");
         apply_bucket_usage_memory_overlay(&mut displayed).await;
         for (bucket, retained) in cases {
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some((retained + added_objects) * 42));
             for snapshot in [&durable, &displayed] {
-                assert_eq!(snapshot.buckets_usage[bucket].objects_count, retained);
-                assert_eq!(snapshot.buckets_usage[bucket].size, retained * 42);
+                assert_eq!(snapshot.buckets_usage[bucket].objects_count, retained + added_objects);
+                assert_eq!(snapshot.buckets_usage[bucket].size, (retained + added_objects) * 42);
             }
         }
     }
-    first_cycle + 2
+    first_cycle + cycles
 }

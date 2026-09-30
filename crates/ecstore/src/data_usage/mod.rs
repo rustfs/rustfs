@@ -67,12 +67,14 @@ struct CachedBucketUsage {
     usage_updated_at: SystemTime,
     // Set by request-path mutations until a scanner snapshot catches up to the same core counts.
     dirty: bool,
-    // Set when a newer scanner snapshot was observed but did not include the dirty counts yet.
+    // Set when an observed snapshot cannot replace this absolute baseline.
     stale_snapshot_pending: bool,
     // First complete scanner generation observed after an unknown-baseline
     // mutation. A strictly later generation is required before the mutation
     // evidence can be discarded.
     pending_scanner_position: Option<(u64, u64)>,
+    // Generation that supplied this absolute baseline, retained across mutations.
+    scanner_position: Option<(u64, u64)>,
     // Deletes are visible to admin immediately, but quota admission keeps
     // them pending until a complete scanner generation reconciles the set.
     // This marker intentionally remains process-local: the delete request
@@ -2017,6 +2019,7 @@ fn cached_bucket_usage_from_backend(usage: BucketUsageInfo, updated_at: SystemTi
         dirty: false,
         stale_snapshot_pending: false,
         pending_scanner_position: None,
+        scanner_position: None,
         pending_negative_delta: 0,
         pending_negative_updated_at: None,
         pending_negative_reconciliation: None,
@@ -2034,6 +2037,7 @@ fn cached_bucket_usage_now(usage: BucketUsageInfo) -> CachedBucketUsage {
         dirty: false,
         stale_snapshot_pending: false,
         pending_scanner_position: None,
+        scanner_position: None,
         pending_negative_delta: 0,
         pending_negative_updated_at: None,
         pending_negative_reconciliation: None,
@@ -2053,27 +2057,26 @@ fn bucket_usage_counts_match(left: &BucketUsageInfo, right: &BucketUsageInfo) ->
 }
 
 fn preserve_unknown_dirty_usage(
-    existing: &CachedBucketUsage,
+    existing: &mut CachedBucketUsage,
     snapshot_position: Option<(u64, u64)>,
     snapshot_update: SystemTime,
-) -> Option<CachedBucketUsage> {
+) -> bool {
     if existing.authoritative || !existing.dirty {
-        return None;
+        return false;
     }
     if existing
         .pending_scanner_position
         .zip(snapshot_position)
         .is_some_and(|(previous, current)| current.0 > previous.0 || (current.0 == previous.0 && current.1 > previous.1))
     {
-        return None;
+        return false;
     }
 
-    let mut preserved = existing.clone();
-    preserved.stale_snapshot_pending = true;
-    if preserved.pending_scanner_position.is_none() && snapshot_update >= existing.usage_updated_at {
-        preserved.pending_scanner_position = snapshot_position;
+    existing.stale_snapshot_pending = true;
+    if existing.pending_scanner_position.is_none() && snapshot_update >= existing.usage_updated_at {
+        existing.pending_scanner_position = snapshot_position;
     }
-    Some(preserved)
+    true
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -2338,35 +2341,48 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
 
     let usage_updated_at = data_usage_info_updated_at(data_usage_info);
     let snapshot_position = data_usage_info.scanner_epoch.zip(data_usage_info.scanner_cycle);
+    let snapshot_converged = data_usage_info.usage_snapshot_converged == Some(true) && !data_usage_info.usage_snapshot_partial;
     let mut next_cache = HashMap::with_capacity(data_usage_info.buckets_usage.len());
     for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
-        next_cache.insert(
-            bucket.clone(),
-            cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at, true),
-        );
+        let mut entry = cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at, true);
+        entry.scanner_position = snapshot_position;
+        next_cache.insert(bucket.clone(), entry);
     }
 
     let mut cache = memory_cache().write().await;
     if expected_generation.is_some_and(|expected| usage_memory_generation() != expected) {
         return;
     }
-    for (bucket, existing) in cache.iter_mut() {
+    // Move preserved entries instead of cloning their histograms under the lock.
+    for (bucket, mut existing) in std::mem::take(&mut *cache) {
+        let advances_baseline = match (existing.scanner_position, snapshot_position) {
+            (Some(previous), Some(current)) if current.0 >= previous.0 && current.1 >= previous.1 => current.1 > previous.1,
+            (None, _) => true,
+            _ => {
+                existing.stale_snapshot_pending = true;
+                next_cache.insert(bucket, existing);
+                continue;
+            }
+        };
         existing.reconcile_pending_deletes(snapshot_position, usage_updated_at);
         if existing.in_flight_expirations.load(Ordering::Acquire) > 0 {
-            next_cache.insert(bucket.clone(), existing.clone());
+            next_cache.insert(bucket, existing);
             continue;
         }
-        // Leadership fencing can advance the epoch without scanning. Only a
-        // later cycle can reconcile a dirty overlay that disagreed with the
-        // first complete observation after its last request mutation.
-        let reconciled_dirty_usage = existing
-            .pending_scanner_position
-            .zip(snapshot_position)
-            .is_some_and(|(previous, current)| current.0 >= previous.0 && current.1 > previous.1);
-        match next_cache.entry(bucket.clone()) {
+        // Both convergence and the two-observation fallback must advance the
+        // baseline's cycle. Epoch-only changes cannot prove a new scan, and
+        // the timestamp check below still protects post-scan mutations.
+        let reconciled_dirty_usage = advances_baseline
+            && snapshot_position.is_some_and(|current| {
+                snapshot_converged
+                    || existing
+                        .pending_scanner_position
+                        .is_some_and(|previous| current.0 >= previous.0 && current.1 > previous.1)
+            });
+        match next_cache.entry(bucket) {
             Entry::Occupied(mut candidate) => {
-                if let Some(preserved) = preserve_unknown_dirty_usage(existing, snapshot_position, usage_updated_at) {
-                    candidate.insert(preserved);
+                if preserve_unknown_dirty_usage(&mut existing, snapshot_position, usage_updated_at) {
+                    candidate.insert(existing);
                     continue;
                 }
                 if existing.authoritative && existing.dirty && bucket_usage_counts_match(&existing.usage, &candidate.get().usage)
@@ -2377,7 +2393,7 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                     continue;
                 }
                 if existing.authoritative && existing.usage_updated_at > usage_updated_at {
-                    candidate.insert(existing.clone());
+                    candidate.insert(existing);
                     continue;
                 }
                 if existing.authoritative
@@ -2386,7 +2402,7 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                     && !bucket_usage_counts_match(&existing.usage, &candidate.get().usage)
                 {
                     // A scanner snapshot can be saved after newer writes but still miss them if it listed the bucket earlier.
-                    let mut preserved = existing.clone();
+                    let mut preserved = existing;
                     if preserved.pending_negative_delta > 0 && preserved.usage.size == candidate.get().usage.size {
                         // The complete scanner snapshot has reconciled the
                         // post-delete byte total. Keep the request-path object
@@ -2401,12 +2417,12 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                 }
             }
             Entry::Vacant(candidate) => {
-                if let Some(preserved) = preserve_unknown_dirty_usage(existing, snapshot_position, usage_updated_at) {
-                    candidate.insert(preserved);
+                if preserve_unknown_dirty_usage(&mut existing, snapshot_position, usage_updated_at) {
+                    candidate.insert(existing);
                 } else if existing.authoritative && existing.usage_updated_at > usage_updated_at {
-                    candidate.insert(existing.clone());
+                    candidate.insert(existing);
                 } else if existing.authoritative && existing.dirty && !reconciled_dirty_usage {
-                    let mut preserved = existing.clone();
+                    let mut preserved = existing;
                     if preserved.pending_negative_delta > 0 && preserved.usage.size == 0 {
                         // Omitting the bucket from a complete snapshot confirms
                         // that its post-delete byte total is zero.
@@ -4464,6 +4480,7 @@ mod tests {
         let mut first_snapshot = data_usage_info_for_test(bucket, 10, 420, mutation_update + Duration::from_nanos(1));
         first_snapshot.scanner_epoch = Some(7);
         first_snapshot.scanner_cycle = Some(10);
+        first_snapshot.usage_snapshot_converged = Some(true);
         replace_bucket_usage_memory_from_info(&first_snapshot).await;
 
         let mut first_response = first_snapshot.clone();
@@ -5919,7 +5936,10 @@ mod tests {
         replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 2, 84, SystemTime::now())).await;
         let first = begin_expiry_usage_accounting(bucket).await;
         let cancelled = begin_expiry_usage_accounting(bucket).await;
-        let after_delete = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        let mut after_delete = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        after_delete.scanner_epoch = Some(7);
+        after_delete.scanner_cycle = Some(10);
+        after_delete.usage_snapshot_converged = Some(true);
         replace_bucket_usage_memory_from_info(&after_delete).await;
         assert_eq!(memory_cache().read().await[bucket].usage.size, 84);
         first.commit(42).await;
@@ -6197,6 +6217,173 @@ mod tests {
         apply_bucket_usage_memory_overlay_if_authoritative(&mut snapshot, true).await;
         assert_eq!(snapshot.objects_total_count, 0);
         assert_eq!(snapshot.objects_total_size, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn converged_scans_repair_historical_usage_during_continuing_writes() {
+        let bucket = "historical-busy";
+        for position in [None, Some((7, 10))] {
+            clear_usage_memory_cache_for_test().await;
+            let mut baseline = data_usage_info_for_test(bucket, 436, 4_587_688_512, SystemTime::now());
+            baseline.scanner_epoch = position.map(|value| value.0);
+            baseline.scanner_cycle = position.map(|value| value.1);
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            for objects in 1..=6 {
+                record_bucket_object_write_memory(bucket, None, 42).await;
+                let mut scanned = data_usage_info_for_test(bucket, objects, objects * 42, SystemTime::now());
+                scanned.scanner_epoch = Some(7);
+                scanned.scanner_cycle = Some(10 + objects);
+                scanned.usage_snapshot_converged = Some(true);
+                replace_bucket_usage_memory_from_info(&scanned).await;
+                assert_eq!(get_bucket_usage_memory(bucket).await, Some(objects * 42));
+                apply_bucket_usage_memory_overlay_if_authoritative(&mut scanned, true).await;
+                assert_eq!(scanned.objects_total_count, objects);
+                assert_eq!(scanned.objects_total_size, objects * 42);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn converged_usage_refresh_requires_a_new_valid_scanner_generation() {
+        let bucket = "converged-generation";
+        for (converged, epoch, cycle, partial) in [
+            (None, Some(7), Some(11), false),
+            (Some(false), Some(7), Some(11), false),
+            (Some(true), None, Some(11), false),
+            (Some(true), Some(7), None, false),
+            (Some(true), Some(7), Some(10), false),
+            (Some(true), Some(8), Some(10), false),
+            (Some(true), Some(6), Some(11), false),
+            (Some(true), Some(7), Some(9), false),
+            (Some(true), Some(7), Some(11), true),
+        ] {
+            clear_usage_memory_cache_for_test().await;
+            let mut baseline = data_usage_info_for_test(bucket, 436, 4_587_688_512, SystemTime::now());
+            baseline.scanner_epoch = Some(7);
+            baseline.scanner_cycle = Some(10);
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            record_bucket_object_write_memory(bucket, None, 42).await;
+            let mut scanned = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+            scanned.usage_snapshot_converged = converged;
+            scanned.scanner_epoch = epoch;
+            scanned.scanner_cycle = cycle;
+            scanned.usage_snapshot_partial = partial;
+            replace_bucket_usage_memory_from_info(&scanned).await;
+            assert_eq!(
+                get_bucket_usage_memory(bucket).await,
+                Some(4_587_688_554),
+                "converged={converged:?}, epoch={epoch:?}, cycle={cycle:?}, partial={partial}"
+            );
+            scanned.usage_snapshot_converged = Some(true);
+            scanned.scanner_epoch = Some(8);
+            scanned.scanner_cycle = Some(11);
+            scanned.usage_snapshot_partial = false;
+            replace_bucket_usage_memory_from_info(&scanned).await;
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn converged_usage_refresh_preserves_mutations_after_the_scan() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "converged-write-race";
+        let mut baseline = data_usage_info_for_test(bucket, 0, 0, SystemTime::now());
+        baseline.scanner_epoch = Some(7);
+        baseline.scanner_cycle = Some(10);
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        let mut scanned = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        scanned.scanner_epoch = Some(7);
+        scanned.scanner_cycle = Some(11);
+        scanned.usage_snapshot_converged = Some(true);
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        let after_scan = scanned.last_update.expect("scanner timestamp") + Duration::from_secs(1);
+        memory_cache()
+            .write()
+            .await
+            .get_mut(bucket)
+            .expect("dirty cache")
+            .usage_updated_at = after_scan;
+        replace_bucket_usage_memory_from_info(&scanned).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+        apply_bucket_usage_memory_overlay_if_authoritative(&mut scanned, true).await;
+        assert_eq!(scanned.objects_total_count, 2);
+        assert_eq!(scanned.objects_total_size, 84);
+        let mut successor = data_usage_info_for_test(bucket, 2, 84, after_scan);
+        successor.scanner_epoch = Some(7);
+        successor.scanner_cycle = Some(12);
+        successor.usage_snapshot_converged = Some(true);
+        replace_bucket_usage_memory_from_info(&successor).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fallback_observations_cannot_bypass_the_cached_scanner_generation() {
+        let bucket = "historical-generation-floor";
+        for (converged, epoch, first_cycle) in [(None, 7, 10), (Some(true), 7, 10), (None, 6, 21), (Some(true), 6, 21)] {
+            clear_usage_memory_cache_for_test().await;
+            let mut baseline = data_usage_info_for_test(bucket, 436, 4_587_688_512, SystemTime::now());
+            baseline.scanner_epoch = Some(7);
+            baseline.scanner_cycle = Some(20);
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            record_bucket_object_write_memory(bucket, None, 42).await;
+            // Wall clocks may step back; a timestamp alone cannot establish
+            // that an asynchronously loaded generation includes this write.
+            let update = memory_cache().read().await[bucket].usage_updated_at + Duration::from_secs(1);
+            for cycle in first_cycle..first_cycle + 3 {
+                let mut scanned = data_usage_info_for_test(bucket, 0, 0, update);
+                scanned.scanner_epoch = Some(epoch);
+                scanned.scanner_cycle = Some(cycle);
+                scanned.usage_snapshot_converged = converged;
+                replace_bucket_usage_memory_from_info(&scanned).await;
+                assert_eq!(
+                    get_bucket_usage_memory(bucket).await,
+                    Some(4_587_688_554),
+                    "older epoch/cycle cannot release quota: converged={converged:?}, epoch={epoch}, cycle={cycle}"
+                );
+                apply_bucket_usage_memory_overlay_if_authoritative(&mut scanned, true).await;
+                assert_eq!(scanned.objects_total_count, 437);
+                assert_eq!(scanned.objects_total_size, 4_587_688_554);
+            }
+            let mut successor = data_usage_info_for_test(bucket, 1, 42, update);
+            successor.scanner_epoch = Some(8);
+            successor.scanner_cycle = Some(21);
+            successor.usage_snapshot_converged = Some(true);
+            replace_bucket_usage_memory_from_info(&successor).await;
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn matching_counts_cannot_discard_the_cached_scanner_generation() {
+        let bucket = "matching-generation-floor";
+        for position in [None, Some((7, 10))] {
+            clear_usage_memory_cache_for_test().await;
+            let mut baseline = data_usage_info_for_test(bucket, 2, 84, SystemTime::now());
+            baseline.scanner_epoch = Some(7);
+            baseline.scanner_cycle = Some(20);
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            let mut matching = baseline.clone();
+            matching.scanner_epoch = position.map(|value| value.0);
+            matching.scanner_cycle = position.map(|value| value.1);
+            replace_bucket_usage_memory_from_info(&matching).await;
+            record_bucket_object_write_memory(bucket, None, 42).await;
+            let update = memory_cache().read().await[bucket].usage_updated_at + Duration::from_secs(1);
+            let mut older = data_usage_info_for_test(bucket, 0, 0, update);
+            older.scanner_epoch = Some(7);
+            older.scanner_cycle = Some(12);
+            older.usage_snapshot_converged = Some(true);
+            replace_bucket_usage_memory_from_info(&older).await;
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some(126));
+            apply_bucket_usage_memory_overlay_if_authoritative(&mut older, true).await;
+            assert_eq!(older.objects_total_count, 3);
+            assert_eq!(older.objects_total_size, 126);
+        }
     }
 
     #[tokio::test]
