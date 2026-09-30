@@ -916,8 +916,9 @@ impl DataUsageCache {
         // cursor/coverage receipt.  Caches without that proof still take the
         // normal rebuild path; this keeps an old, incomplete writer from
         // authorizing a new leader to skip namespace coverage.
+        // Cycle deadlines advance both counters, so a validated frontier from
+        // an earlier cycle must remain eligible for adoption.
         let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
-            && self.info.next_cycle == next_cycle
             && self.info.scan_identity == Some(identity)
             && (self.validated_scan_frontier().is_some()
                 || self.validated_raw_enumeration_cursor().is_some()
