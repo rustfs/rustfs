@@ -50,6 +50,8 @@ const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
 const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
 const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
+const MIXED_BASELINE_KEY: &str = ".upgrade-baseline/persisted-before-restart";
+const MIXED_BASELINE_BODY: &[u8] = b"previous-release data survives restart and rolling upgrade";
 const MIXED_NODE_COUNT: usize = 4;
 const MULTIPART_WORKERS: usize = 16;
 const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
@@ -424,6 +426,11 @@ async fn exercise_mixed_cluster(
     let multipart_keys = write_multipart_load(&clients, phase).await?;
     let expected_count = multipart_keys.len() + 2;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
+            MIXED_BASELINE_BODY,
+            "{phase}: the {label} node must retain the previous-release seed"
+        );
         wait_for_phase_listing(
             client,
             phase,
@@ -875,6 +882,42 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     configure_cluster_logs(&mut cluster)?;
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
+    {
+        let client = Client::from_conf(
+            cluster
+                .create_s3_client(0)?
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        client
+            .put_object()
+            .bucket(MIXED_BUCKET)
+            .key(MIXED_BASELINE_KEY)
+            .body(ByteStream::from_static(MIXED_BASELINE_BODY))
+            .send()
+            .await?;
+    }
+
+    // rc.5 joiners can latch pool-metadata write protection during fresh
+    // bootstrap. Establish a persisted old deployment before evaluating the
+    // upgrade; this fixed preparation step does not retry failed upgrade writes.
+    for node_idx in 0..cluster.nodes.len() {
+        cluster.stop_node(node_idx)?;
+    }
+    cluster.start_with_binary(&previous_binary).await?;
+    {
+        let clients = cluster.create_all_clients()?;
+        wait_for_upgrade_write_readiness(&clients, "previous-release-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+        for (node_idx, client) in clients.iter().enumerate() {
+            assert_eq!(
+                read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
+                MIXED_BASELINE_BODY,
+                "previous-release node {node_idx} must read the seed after restart"
+            );
+        }
+    }
 
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
@@ -890,6 +933,11 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     cluster.start_node_from_binary(3, &current_binary).await?;
 
     for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
+            MIXED_BASELINE_BODY,
+            "current node {node_idx} must retain the previous-release seed"
+        );
         for phase in ["one-current-node", "one-previous-node"] {
             wait_for_phase_listing(
                 client,
@@ -917,7 +965,8 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
                 "assertions": [
                     "current node reads objects written through previous-release client",
                     "previous-release node reads objects written through current client",
-                    "all nodes list every mixed-version object after homogeneous-current convergence"
+                    "all nodes list every mixed-version object after homogeneous-current convergence",
+                    "the previous-release seed survives the baseline restart and every upgrade phase"
                 ],
             }),
         )?;
