@@ -999,7 +999,7 @@ mod tests {
 
         let replacement = intent("legacy");
         writes
-            .admit(replacement, 1, 8192)
+            .admit_with_source_incarnation(replacement, Some(incarnation), 1, 8192)
             .expect("a new generation should become retryable");
         writes.mark_persisted();
         assert_eq!(writes.unverified_legacy_count(), 0);
@@ -1007,7 +1007,7 @@ mod tests {
 
         let mut restarted = PartialWrites::default();
         restarted
-            .admit(original, 1, 8192)
+            .admit_with_source_incarnation(original, Some(incarnation), 1, 8192)
             .expect("the unchanged journal re-arms the same responsibility after restart");
         restarted.mark_persisted();
         assert_eq!(restarted.unverified_legacy_count(), 0);
@@ -1043,7 +1043,7 @@ mod tests {
             .expect("hold state checkpoint");
         let mut restored = PartialWrites::default();
         restored
-            .admit(original, 1, 8192)
+            .admit_with_source_incarnation(original, Some(incarnation), 1, 8192)
             .expect("replay journal intent before applying lifecycle state");
         assert!(restored.restore_state(&intent("legacy-lifecycle"), &checkpoint));
         restored.mark_persisted();
@@ -1126,7 +1126,7 @@ mod tests {
 
         let mut restored = PartialWrites::default();
         restored
-            .admit(original.clone(), 1, 8192)
+            .admit_with_source_incarnation(original.clone(), Some(original_incarnation), 1, 8192)
             .expect("replay creates retry index entry");
         assert!(restored.restore_state(&original, &checkpoint));
         let (previous, _) = restored
