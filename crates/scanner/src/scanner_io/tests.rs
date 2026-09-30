@@ -27,9 +27,10 @@ use crate::storage_api::owner::{
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
-    DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
-    ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
-    init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
+    DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
+    ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests,
+    init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
+    save_config,
 };
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
@@ -564,6 +565,123 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
     (temp_dir, store)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_uses_global_cycle_fence_with_set_scoped_cache_revisions() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let cycle = 41341;
+    let leader_epoch = 17;
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(cycle, leader_epoch),
+    )
+    .await
+    .expect("persist cycle fence through global scanner store");
+    crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, store.clone())
+        .await
+        .expect("global scanner store must read the fence");
+    let ctx = CancellationToken::new();
+    let cache_name = "diagnostic-bucket/.usage-cache.bin";
+    let mut checkpoint = DataUsageCache::default();
+    checkpoint.info.name = "diagnostic-bucket".to_string();
+    checkpoint.info.next_cycle = cycle;
+    checkpoint.info.leader_epoch = leader_epoch;
+    let mut mismatched_sets = 0;
+    for (pool_index, pool) in store.pools.iter().enumerate() {
+        for (set_index, set) in pool.disk_set.iter().enumerate() {
+            let source = DataUsageCacheSource::new(pool_index, set_index);
+            let publication_epoch = scanner_publication_epoch(set.clone())
+                .await
+                .expect("set publication admission");
+            DataUsageCache::default()
+                .save(set.clone(), cache_name)
+                .await
+                .expect("seed set-scoped cache");
+            let mut revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+                .await
+                .expect("initial set-scoped revisions");
+            let initial_revisions = revisions.clone();
+            let make_context = |scanner_kind| ScannerCheckpointPersistContext {
+                ctx: &ctx,
+                expected_publication_epoch: publication_epoch,
+                cycle,
+                leader_epoch,
+                scanner_kind,
+                bucket: "diagnostic-bucket",
+                source,
+                disk_location: "disk-0".to_string(),
+                session_id: Uuid::nil(),
+                retry_generation: None,
+                another_local_owner: false,
+            };
+            if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, set.clone())
+                .await
+                .is_err()
+            {
+                mismatched_sets += 1;
+                assert!(
+                    matches!(
+                        persist_scanner_checkpoint(
+                            set.clone(),
+                            set.clone(),
+                            make_context("local_coordinator"),
+                            cache_name,
+                            &checkpoint,
+                            &mut revisions,
+                        )
+                        .await,
+                        ScannerCheckpointPersistResult::FenceChanged
+                    ),
+                    "set-scoped cycle lookup must reproduce the original failure for pool={pool_index}, set={set_index}"
+                );
+            }
+            assert_eq!(revisions, initial_revisions, "rejected checkpoint must not update revisions");
+            for scanner_kind in ["local_coordinator", "remote_worker"] {
+                checkpoint.info.skip_healing = scanner_kind == "remote_worker";
+                let before_save = revisions.clone();
+                assert!(
+                    matches!(
+                        persist_scanner_checkpoint(
+                            set.clone(),
+                            store.clone(),
+                            make_context(scanner_kind),
+                            cache_name,
+                            &checkpoint,
+                            &mut revisions,
+                        )
+                        .await,
+                        ScannerCheckpointPersistResult::Saved
+                    ),
+                    "both scanner paths must use the global cycle fence"
+                );
+                assert_ne!(revisions, before_save, "new checkpoint content must advance cache revisions");
+            }
+            let saved_revisions = revisions.clone();
+            assert!(
+                matches!(
+                    persist_scanner_checkpoint(
+                        set.clone(),
+                        store.clone(),
+                        ScannerCheckpointPersistContext {
+                            leader_epoch: leader_epoch + 1,
+                            ..make_context("remote_worker")
+                        },
+                        cache_name,
+                        &checkpoint,
+                        &mut revisions,
+                    )
+                    .await,
+                    ScannerCheckpointPersistResult::FenceChanged
+                ),
+                "a stale leader fence must still reject checkpoint persistence"
+            );
+            assert_eq!(revisions, saved_revisions, "stale leader must not mutate cache revisions");
+        }
+    }
+    assert!(mismatched_sets > 0, "multi-pool fixture must expose a set-scoped cycle fence mismatch");
 }
 
 async fn wait_for_namespace_commit_tails(store: &ECStore) {
