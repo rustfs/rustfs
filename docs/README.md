@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [Multipart upload memory diagnosis](operations/multipart-memory.md) — allocator attribution, Docker reproduction and sustained upload checks.
+
 For the logical per-operation io_uring read cap, see
 [io_uring read chunk size](operations/io-uring-read-chunks.md).
 

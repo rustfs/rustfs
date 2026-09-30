@@ -2415,6 +2415,13 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
     if let Some(page_committed_bytes) = observation.page_committed_bytes {
         gauge!("rustfs_memory_allocator_page_committed_bytes", "backend" => backend).set(page_committed_bytes as f64);
     }
+    gauge!("rustfs_memory_allocator_malloc_requested_bytes_available", "backend" => backend).set(
+        if observation.malloc_requested_bytes.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    );
     if let Some(malloc_requested_bytes) = observation.malloc_requested_bytes {
         gauge!("rustfs_memory_allocator_malloc_requested_bytes", "backend" => backend).set(malloc_requested_bytes as f64);
     }
@@ -2793,6 +2800,46 @@ mod tests {
             .collect();
         samples.sort_by(f64::total_cmp);
         samples
+    }
+
+    #[test]
+    fn allocator_requested_availability_distinguishes_missing_from_zero() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (previous, requested, expected_value, expected_availability) in [
+            (None, None, None, 0.0),
+            (None, Some(0), Some(0.0), 1.0),
+            (Some(128), None, Some(128.0), 0.0),
+            (Some(128), Some(0), Some(0.0), 1.0),
+        ] {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                if let Some(previous) = previous {
+                    record_allocator_memory_observation(
+                        "mimalloc",
+                        AllocatorMemoryObservation {
+                            malloc_requested_bytes: Some(previous),
+                            ..Default::default()
+                        },
+                    );
+                }
+                record_allocator_memory_observation(
+                    "mimalloc",
+                    AllocatorMemoryObservation {
+                        malloc_requested_bytes: requested,
+                        ..Default::default()
+                    },
+                );
+                set_metrics_enabled(false);
+            });
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes_available"),
+                Some(expected_availability),
+            );
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), expected_value);
+        }
     }
 
     /// Replaces four smoke tests that called the zero-copy and bytes-pool recorders
