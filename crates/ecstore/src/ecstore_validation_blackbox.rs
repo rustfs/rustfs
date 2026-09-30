@@ -380,6 +380,9 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     let (_put_dirs, put_set) = make_local_set_disks(4, 2).await;
     let put_bucket = "bb-put-partial-convergence";
     let put_object = "object.bin";
+    // This direct SetDisks fixture bypasses ECStore bucket metadata preparation. Supply an identity to exercise
+    // heal-request transport.
+    let expected_bucket_incarnation_id = uuid::Uuid::new_v4();
     put_set
         .make_bucket(put_bucket, &MakeBucketOptions::default())
         .await
@@ -400,6 +403,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
                         &ObjectOptions {
                             no_lock: true,
                             versioned: true,
+                            expected_bucket_incarnation_id: Some(expected_bucket_incarnation_id),
                             ..Default::default()
                         },
                     )
@@ -417,6 +421,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         .to_string();
 
     assert_eq!(request.object_version_id.as_deref(), Some(committed_version.as_str()));
+    assert_eq!(request.expected_bucket_incarnation_id, Some(expected_bucket_incarnation_id));
     assert_eq!(request.pool_index, Some(0));
     assert_eq!(request.set_index, Some(0));
 

@@ -3502,6 +3502,9 @@ impl SetDisks {
         let protect_write = opts.shard_integrity_write_enabled();
         let source_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
             Some(incarnation_id) => Some(incarnation_id),
+            // System metadata buckets cannot be deleted or recreated. Avoid re-entering the metadata store while
+            // publishing a system metadata object; runtime pool-meta writers can already hold its write guard.
+            None if is_meta_bucketname(bucket) => None,
             None => self.bucket_incarnation_id_from_disk(bucket).await.ok(),
         };
         if publication_fence.is_none()

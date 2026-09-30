@@ -1025,7 +1025,12 @@ async fn get_bucket_quota(env: &RustFSTestEnvironment, bucket: &str) -> Result<O
     let path = format!("/rustfs/admin/v3/quota/{bucket}");
     let deadline = Instant::now() + QUOTA_USAGE_READINESS_TIMEOUT;
     loop {
-        let (status, response) = admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key).await?;
+        let (status, response) = tokio::time::timeout_at(
+            deadline,
+            admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key),
+        )
+        .await
+        .map_err(|_| format!("reading the quota of {bucket} exceeded the usage-readiness timeout"))??;
         if status == StatusCode::OK {
             let quota: serde_json::Value = serde_json::from_str(&response)?;
             return Ok(quota.get("quota").and_then(serde_json::Value::as_u64));
