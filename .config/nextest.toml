@@ -155,11 +155,11 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
 threads-required = "num-test-threads"
 
-# These concurrent state writers keep the production 5s lock-acquisition limit
-# while their peer completes durable IO. Reserve capacity from unrelated test
-# processes while preserving each test's internal two-writer race.
+# These real IAM/state fixtures keep production lock-acquisition limits while
+# peers complete durable IO. Reserve capacity from unrelated test processes;
+# the shared fixture's durable_iam_state_ prefix keeps the whole family together.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
 threads-required = "num-test-threads"
 
 # Real target-repair and rebalance-stop fixtures commit durable metadata while
@@ -391,10 +391,10 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
 threads-required = "num-test-threads"
 
-# Keep the same state-writer capacity reservation in CI without changing the
+# Keep the same IAM/state fixture capacity reservation in CI without changing the
 # production lock deadline, internal concurrency, assertions, or retry policy.
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
 threads-required = "num-test-threads"
 
 # Match the real admin fixture capacity reservation without retries or changes
