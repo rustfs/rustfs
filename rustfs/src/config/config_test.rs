@@ -88,6 +88,96 @@ mod tests {
     }
 
     #[test]
+    fn connect_network_cli_requires_l1_consent_and_has_no_peer_override() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "network",
+            "--state-dir",
+            "/state",
+            "--offline-key-id",
+            "key",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+        ];
+        assert!(Opt::parse_command(base).is_err());
+        let approved = base.into_iter().chain(["--acknowledge-l1"]).collect::<Vec<_>>();
+        assert!(matches!(
+            Opt::parse_command(approved.clone()),
+            Ok(CommandResult::ConnectNetworkPerformance(_))
+        ));
+        assert!(Opt::parse_command(approved.into_iter().chain(["--peer-address", "example.com"])).is_err());
+    }
+
+    #[test]
+    fn connect_client_cli_selects_offline_key_only_when_requested() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "client",
+            "--state-dir",
+            "/state",
+            "--endpoint",
+            "https://storage.example",
+            "--access-key-file",
+            "/access",
+            "--secret-key-file",
+            "/secret",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+            "--operation",
+            "get",
+            "--acknowledge-l1",
+        ];
+        assert!(matches!(
+            Opt::parse_command(base),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.is_none()
+        ));
+        assert!(matches!(
+            Opt::parse_command(base.into_iter().chain(["--offline-key-id", "selected"])),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.as_deref() == Some("selected")
+        ));
+    }
+
+    #[test]
     #[serial]
     fn test_tls_inspect_subcommand_parses_tls_path_alias() {
         let result =

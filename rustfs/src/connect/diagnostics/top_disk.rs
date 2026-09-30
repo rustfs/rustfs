@@ -22,10 +22,13 @@ use super::top_api::{MAX_SAFE_INTEGER, TopCaptureError, TopCaptureRequest, TopRe
 const TOOL_ID: &str = "top.disk";
 pub const TOP_DISK_CAPABILITY: &str = "top.disk@1";
 
-/// Closed local-service request: no process selector, paths, or supplied provenance.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) static AFTER_INITIAL_DISK_SNAPSHOT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Closed local-service request for supported top tools: no process selector, paths, or supplied provenance.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct LocalTopDiskRequest {
+pub struct LocalTopRequest {
     pub offline_key_id: String,
     pub organization_name: String,
     pub cluster_name: String,
@@ -42,7 +45,7 @@ pub struct LocalTopDiskRequest {
 }
 
 /// Archive received from the owner-only service socket.
-pub(crate) struct LocalTopDiskArchive {
+pub(crate) struct LocalTopArchive {
     pub artifact_uid: String,
     pub archive_bytes: Vec<u8>,
     pub archive_sha256: String,
@@ -89,6 +92,10 @@ pub async fn capture_top_disk(
         }
         let mut sampler = rustfs_io_metrics::ProcessSampler::new();
         let before = process_snapshot(&mut sampler)?;
+        #[cfg(test)]
+        if let Some(write_fixture_data) = AFTER_INITIAL_DISK_SNAPSHOT.get() {
+            write_fixture_data();
+        }
         if !request.wait_window(TOOL_ID, cancel).await? {
             return request.cancelled(TOOL_ID);
         }

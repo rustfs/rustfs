@@ -16,10 +16,10 @@ use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
         ConnectEnvironmentInventoryOpts, ConnectHealthOpts, ConnectInspectObjectOpts, ConnectLicenseCommands,
-        ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation,
-        ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts,
-        ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands,
-        ConnectThreadProfileScope, ConnectTopCommands, Opt,
+        ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectNetworkPerformanceOpts,
+        ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
+        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts,
+        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -144,6 +144,7 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(*options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
+        CommandResult::ConnectNetworkPerformance(options) => return execute_connect_network_performance(options).await,
         CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
         CommandResult::ConnectSiteReplicationPerformance(options) => {
             return execute_connect_site_replication_performance(*options).await;
@@ -675,9 +676,8 @@ fn unix_now() -> Result<i64> {
 
 async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     use crate::connect::{
-        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
-        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_locks, capture_top_net,
-        capture_top_rpc,
+        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopCaptureLimits,
+        TopCaptureRequest, TopCaptureScope, capture_top_net,
     };
 
     let (tool_id, options) = match command {
@@ -693,11 +693,11 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Err(Error::other("connect_top_limits_invalid"));
     }
 
-    if tool_id == "top.disk" {
+    if matches!(tool_id, "top.api" | "top.disk" | "top.locks" | "top.rpc") {
         let offline_key_id = options
             .offline_key_id
             .ok_or_else(|| Error::other("--offline-key-id must select an existing offline identity"))?;
-        let input = crate::connect::diagnostics::LocalTopDiskRequest {
+        let input = crate::connect::diagnostics::LocalTopRequest {
             offline_key_id,
             organization_name: options.organization,
             cluster_name: options.cluster,
@@ -713,7 +713,15 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
             export_validity_seconds: options.export_validity_seconds,
         };
         let cancel = CancellationToken::new();
-        let capture = crate::connect::request_local_top_disk(&options.state_dir, input, &cancel);
+        let capture = async {
+            match tool_id {
+                "top.api" => crate::connect::request_local_top_api(&options.state_dir, input, &cancel).await,
+                "top.disk" => crate::connect::request_local_top_disk(&options.state_dir, input, &cancel).await,
+                "top.locks" => crate::connect::request_local_top_locks(&options.state_dir, input, &cancel).await,
+                "top.rpc" => crate::connect::request_local_top_rpc(&options.state_dir, input, &cancel).await,
+                _ => unreachable!("closed local top command"),
+            }
+        };
         tokio::pin!(capture);
         let export = tokio::select! {
             biased;
@@ -722,7 +730,7 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
                 cancel.cancel();
                 return match capture.await {
                     Err(error) => Err(Error::other(error)),
-                    Ok(_) => Err(Error::other("top disk collection cancelled")),
+                    Ok(_) => Err(Error::other("top collection cancelled")),
                 };
             }
             result = &mut capture => result.map_err(Error::other)?,
@@ -753,7 +761,7 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Ok(());
     }
     if options.offline_key_id.is_some() {
-        return Err(Error::other("--offline-key-id is only supported for top disk"));
+        return Err(Error::other("--offline-key-id is only supported for top api, disk, locks or rpc"));
     }
     let identity = IdentityStore::new(options.state_dir.join("identity"))
         .load()
@@ -784,20 +792,8 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     };
     let cancel = CancellationToken::new();
     match tool_id {
-        "top.api" => {
-            let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.locks" => {
-            let result = await_top_capture(capture_top_locks(&request, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
         "top.net" => {
             let result = await_top_capture(capture_top_net(&request, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.rpc" => {
-            let result = await_top_capture(capture_top_rpc(&request, &cancel), &cancel).await?;
             finish_top_capture(&request, result, &identity, options.output, &cancel).await
         }
         _ => unreachable!("closed top command"),
@@ -871,10 +867,14 @@ async fn execute_connect_client_performance(options: ConnectClientPerformanceOpt
 
     let duration = Duration::from_millis(options.duration_millis);
     validate_client_limits(duration, options.traffic_bytes).map_err(Error::other)?;
-    let key = IdentityStore::new(options.state_dir.join("identity"))
-        .load()
-        .map_err(Error::other)?
-        .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?;
+    let key = if let Some(offline_key_id) = options.offline_key_id.as_deref() {
+        crate::connect::load_selected_offline_key(&options.state_dir, offline_key_id).map_err(Error::other)?
+    } else {
+        IdentityStore::new(options.state_dir.join("identity"))
+            .load()
+            .map_err(Error::other)?
+            .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?
+    };
     let access_key = read_protected_client_credential(&options.access_key_file).map_err(Error::other)?;
     let secret_key = read_protected_client_credential(&options.secret_key_file).map_err(Error::other)?;
     let session_token = options
@@ -1395,6 +1395,65 @@ async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts)
     Ok(())
 }
 
+async fn execute_connect_network_performance(options: ConnectNetworkPerformanceOpts) -> Result<()> {
+    let cancel = CancellationToken::new();
+    let request = crate::connect::LocalNetworkRequest {
+        offline_key_id: options.offline_key_id,
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        consent_uid: options.consent_uid,
+        policy_revision: options.policy_revision,
+        consent_expires_at_unix: options.consent_expires_at_unix,
+        acknowledge_l1: options.acknowledge_l1,
+        expires_at_unix: options.expires_at_unix,
+        duration_millis: options.duration_millis,
+        traffic_bytes: options.traffic_bytes,
+    };
+    let capture = crate::connect::request_local_network(&options.state_dir, request, &cancel);
+    tokio::pin!(capture);
+    let archive = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return match capture.await {
+                Err(error) => Err(Error::other(error)),
+                Ok(_) => Err(Error::other("network performance collection cancelled")),
+            };
+        }
+        result = &mut capture => result.map_err(Error::other)?,
+    };
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        crate::connect::diagnostics::save_top_archive(
+            &options.output,
+            &archive.artifact_uid,
+            &archive.archive_bytes,
+            &archive.archive_sha256,
+            &writer_cancel,
+        )
+    });
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!("tool=performance.network");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
 async fn execute_connect_health(options: ConnectHealthOpts) -> Result<()> {
     let cancel = CancellationToken::new();
     let request = crate::connect::LocalHealthRequest {
@@ -1458,8 +1517,8 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     use rand::{TryRng as _, rngs::SysRng};
 
     let service_profile = (options.tool == ConnectProfileTool::Threads && options.thread_scope.is_some())
-        || (options.tool == ConnectProfileTool::Memory && options.offline_key_id.is_some());
-    if options.tool == ConnectProfileTool::Memory && options.thread_scope.is_some() {
+        || (options.tool != ConnectProfileTool::Threads && options.offline_key_id.is_some());
+    if options.tool != ConnectProfileTool::Threads && options.thread_scope.is_some() {
         return Err(Error::other("--thread-scope is valid only for the threads profile"));
     }
     if !service_profile && options.offline_key_id.is_some() {

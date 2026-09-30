@@ -56,7 +56,8 @@ pub use cli::ConnectHealthOpts;
 pub use cli::ConnectSiteReplicationPerformanceOpts;
 pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use cli::{
-    ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectPerformanceCommands,
+    ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectNetworkPerformanceOpts,
+    ConnectPerformanceCommands,
 };
 pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
 pub use cli::{ConnectInspectCommands, ConnectInspectObjectOpts, ConnectInspectOpts};
