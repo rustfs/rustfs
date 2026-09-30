@@ -1589,22 +1589,29 @@ where
         .collect::<HashMap<_, _>>();
     // Replica writes can share the pool namespace or the fixed multipool lock.
     // Finish each write before starting another acquisition for this publication.
-    let mut results = Vec::with_capacity(writable.len());
-    for set in writable {
-        let id = ScannerPauseBacklogReplicaId {
-            pool_index: set.pool_index,
-            set_index: set.set_index,
-        };
-        let result = match revisions.get(&id) {
-            Some(revision) => storeapi
-                .clone()
-                .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data.clone(), revision.preconditions())
-                .await
-                .map_err(|err| err.to_string()),
-            None => Err("replica revision is unavailable".to_string()),
-        };
-        results.push((id, result));
-    }
+    // Own the whole selected cohort so canceling the waiter cannot abandon
+    // replicas that have not started their serialized write yet.
+    let results = tokio::spawn(async move {
+        let mut results = Vec::with_capacity(writable.len());
+        for set in writable {
+            let id = ScannerPauseBacklogReplicaId {
+                pool_index: set.pool_index,
+                set_index: set.set_index,
+            };
+            let result = match revisions.get(&id) {
+                Some(revision) => storeapi
+                    .clone()
+                    .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data.clone(), revision.preconditions())
+                    .await
+                    .map_err(|err| err.to_string()),
+                None => Err("replica revision is unavailable".to_string()),
+            };
+            results.push((id, result));
+        }
+        results
+    })
+    .await
+    .map_err(|err| format!("scanner pause backlog publication owner failed: {err}"))?;
 
     let failures = results
         .iter()

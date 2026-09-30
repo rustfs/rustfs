@@ -229,10 +229,42 @@ fn committed_manifest(owner: uuid::Uuid, sequence: u64, payload: &[u8]) -> Vec<u
     manifest
 }
 
-fn write_committed_snapshot_to_disks(disk_paths: &[std::path::PathBuf], sequence: u64, payload: &[u8]) {
-    let manifest = committed_manifest(uuid::Uuid::new_v4(), sequence, payload);
+fn write_generation_bound_snapshot_to_disks(
+    disk_paths: &[PathBuf],
+    sequence: u64,
+    payload: &[u8],
+    source_incarnation: uuid::Uuid,
+    partial_records: &[&[u8]],
+) {
+    assert!(!source_incarnation.is_nil(), "replay source must come from the persisted bucket");
+    let owner = uuid::Uuid::new_v4();
+    let records = partial_records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "intent_digest": Sha256::digest(record).to_vec(),
+                "responsibility_id": uuid::Uuid::new_v4(),
+                "source_bucket_incarnation_id": source_incarnation,
+                "last_operator_acceptance": null,
+                "state": { "state": "active" },
+            })
+        })
+        .collect::<Vec<_>>();
+    let lifecycle = serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "checkpoint_owner": owner,
+        "checkpoint_sequence": sequence,
+        "records": records,
+    }))
+    .expect("encode source-bound lifecycle fixture");
+    let mut companion = b"RFMFLC01".to_vec();
+    companion.push(1);
+    companion.extend_from_slice(&u64::try_from(lifecycle.len()).expect("fixture length fits").to_le_bytes());
+    companion.extend_from_slice(&Sha256::digest(&lifecycle));
+    companion.extend_from_slice(&lifecycle);
+    write_journal_path_to_disks(disk_paths, ".heal-mrf-lifecycle.0.bin", &companion);
     write_journal_path_to_disks(disk_paths, COMMITTED_PAYLOAD_REL, payload);
-    write_journal_path_to_disks(disk_paths, COMMITTED_MANIFEST_REL, &manifest);
+    write_journal_path_to_disks(disk_paths, COMMITTED_MANIFEST_REL, &committed_manifest(owner, sequence, payload));
 }
 
 fn journal_exists_on_all_disks(disk_paths: &[std::path::PathBuf], relative_path: &str) -> bool {
@@ -423,7 +455,12 @@ async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
 
     let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
     let stale_legacy = journal_record(1, "legacy-bucket", "legacy-object", None, 0);
-    write_committed_snapshot_to_disks(&disk_paths, 7, &committed);
+    let incarnation = storage
+        .mrf_bucket_incarnation_id("committed-bucket")
+        .await
+        .expect("read committed source incarnation")
+        .expect("committed source bucket has a persisted incarnation");
+    write_generation_bound_snapshot_to_disks(&disk_paths, 7, &committed, incarnation, &[&committed]);
     write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy);
     write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
 
@@ -562,6 +599,12 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
     let stale_legacy = journal_record(3, "identity-bucket", "stale-legacy-object", None, 0);
     write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &authoritative);
     write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+    let incarnation = storage
+        .mrf_bucket_incarnation_id("identity-bucket")
+        .await
+        .expect("read authoritative source incarnation")
+        .expect("authoritative source bucket has a persisted incarnation");
+    write_generation_bound_snapshot_to_disks(&disk_paths, 1, &authoritative, incarnation, &[&first_partial, &second_partial]);
 
     let manager = make_manager(storage);
     let replayed = mrf_queue::replay_journal_once(&manager).await;
