@@ -894,7 +894,7 @@ mod tests {
     use super::*;
     use crate::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
-    use rustfs_common::mrf_channel::{MrfKind, MrfScope};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
     use serial_test::serial;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1404,6 +1404,56 @@ mod tests {
             Some((_, ResponsibilityState::Active, Some(source))) if source == current_incarnation
         ));
         assert!(runtime.partial_writes.last_operator_acceptance(current_id).is_none());
+
+        let replayed_old_intent = runtime
+            .partial_writes
+            .intent_for_responsibility(old_id)
+            .expect("old lifecycle responsibility should remain addressable")
+            .0;
+        let replayed_current_intent = runtime
+            .partial_writes
+            .intent_for_responsibility(current_id)
+            .expect("current lifecycle responsibility should remain addressable")
+            .0;
+        let replayed_old_anchor = super::super::MrfDurableRepairAnchor::from_intent(&replayed_old_intent, old_incarnation)
+            .expect("replayed old-generation proof anchor");
+        let replayed_current_anchor =
+            super::super::MrfDurableRepairAnchor::from_intent(&replayed_current_intent, current_incarnation)
+                .expect("replayed current-generation proof anchor");
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&replayed_old_intent, Some(old_incarnation)))
+            .expect("old-generation entry after replay")
+            .anchor = Some(replayed_old_anchor.clone());
+        runtime
+            .partial_writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&replayed_current_intent, Some(current_incarnation)))
+            .expect("current-generation entry after replay")
+            .anchor = Some(replayed_current_anchor.clone());
+
+        let verified_event = |anchor: &super::super::MrfDurableRepairAnchor| MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
+            lease: Some(anchor.lease),
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        rustfs_common::mrf_channel::note_mrf_verified_repair(verified_event(&replayed_old_anchor));
+        runtime.discharge_durable_replay_anchors();
+        assert!(runtime.partial_writes.intent_for_responsibility(old_id).is_none());
+        assert!(
+            runtime.partial_writes.intent_for_responsibility(current_id).is_some(),
+            "a matching G1 proof must not release G2"
+        );
+        rustfs_common::mrf_channel::note_mrf_verified_repair(verified_event(&replayed_current_anchor));
+        runtime.discharge_durable_replay_anchors();
+        assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
     }
 
     #[test]
