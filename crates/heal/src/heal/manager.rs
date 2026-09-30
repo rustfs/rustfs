@@ -174,6 +174,7 @@ pub(super) struct MrfRepairNoticeTarget {
     pub(super) scope: Option<rustfs_common::mrf_channel::MrfScope>,
     pub(super) delete_marker_purge: Option<rustfs_common::mrf_channel::MrfDeleteMarkerPurgeIdentity>,
     pub(super) lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
+    pub(super) durable_anchor: Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1808,6 +1809,7 @@ impl HealManager {
                 scope: None,
                 delete_marker_purge: None,
                 lease: None,
+                durable_anchor: None,
             },
         )
         .await

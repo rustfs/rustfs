@@ -94,6 +94,12 @@ run_success preview-x86_64-gnu \
 run_success preview-aarch64-musl \
   $'deb_version=1.0.0~rc.5~preview.2\nrpm_version=1.0.0~rc.5~preview.2\nrpm_release=1\ndeb_file=rustfs-linux-aarch64-musl-v1.0.0-rc.5-preview.2.deb\nrpm_file=rustfs-linux-aarch64-musl-v1.0.0-rc.5-preview.2.rpm' \
   preview 1.0.0-rc.5-preview.2 '' aarch64 musl
+run_success stable-preview-x86_64-gnu \
+  $'deb_version=1.0.1~preview.14\nrpm_version=1.0.1~preview.14\nrpm_release=1\ndeb_file=rustfs-linux-x86_64-gnu-v1.0.1-preview.14.deb\nrpm_file=rustfs-linux-x86_64-gnu-v1.0.1-preview.14.rpm' \
+  preview 1.0.1-preview.14 '' x86_64 gnu
+run_success stable-preview-aarch64-musl \
+  $'deb_version=1.0.1~preview.14\nrpm_version=1.0.1~preview.14\nrpm_release=1\ndeb_file=rustfs-linux-aarch64-musl-v1.0.1-preview.14.deb\nrpm_file=rustfs-linux-aarch64-musl-v1.0.1-preview.14.rpm' \
+  preview 1.0.1-preview.14 '' aarch64 musl
 run_success development-x86_64-gnu \
   "deb_version=0~dev.7463.${sha}
 rpm_version=0
@@ -117,7 +123,8 @@ run_failure release-with-sequence release 1.2.3 1 x86_64 gnu
 run_failure release-prerelease-mismatch release 1.2.3-rc.1 '' x86_64 gnu
 run_failure prerelease-release-mismatch prerelease 1.2.3 '' x86_64 gnu
 run_failure preview-malformed preview 1.2.3-rc.1-preview '' x86_64 gnu
-run_failure preview-wrong-shape preview 1.2.3-preview.1 '' x86_64 gnu
+run_failure preview-leading-zero preview 1.2.3-preview.01 '' x86_64 gnu
+run_failure preview-extra-suffix preview 1.2.3-preview.1-extra '' x86_64 gnu
 run_failure short-semver release 1.2 '' x86_64 gnu
 run_failure leading-v release v1.2.3 '' x86_64 gnu
 run_failure leading-zero release 01.2.3 '' x86_64 gnu
@@ -139,8 +146,8 @@ run_failure unknown-libc release 1.2.3 '' x86_64 static
 run_failure too-many-arguments release 1.2.3 '' x86_64 gnu extra
 
 # Ordering contract shared by both package managers: every pre-release sorts
-# below its final release, every preview sorts below the pre-release it
-# previews, and pre-release kinds/numbers keep their SemVer order.
+# below its final release, every preview sorts below the target it previews,
+# and pre-release kinds/numbers keep their SemVer order.
 if command -v dpkg >/dev/null 2>&1; then
   dpkg --compare-versions "0~dev.7462.${sha}" lt "0~dev.7463.${sha}"
   dpkg --compare-versions "0~dev.7463.${sha}" lt 0.1.0
@@ -152,7 +159,10 @@ if command -v dpkg >/dev/null 2>&1; then
   dpkg --compare-versions 1.0.0~rc.5~preview.1 lt 1.0.0~rc.5~preview.2
   dpkg --compare-versions 1.0.0~rc.5~preview.2 lt 1.0.0~rc.6
   dpkg --compare-versions 1.0.0~rc.5 lt 1.0.1
-  passed=$((passed + 10))
+  dpkg --compare-versions 1.0.0 lt 1.0.1~preview.14
+  dpkg --compare-versions 1.0.1~preview.13 lt 1.0.1~preview.14
+  dpkg --compare-versions 1.0.1~preview.14 lt 1.0.1
+  passed=$((passed + 13))
 elif [[ $require_package_managers == true ]]; then
   printf 'FAIL package ordering: dpkg is required\n' >&2
   exit 1
@@ -175,6 +185,9 @@ if command -v rpm >/dev/null 2>&1; then
   rpm_lt 1.0.0~rc.5~preview.1-1 1.0.0~rc.5~preview.2-1
   rpm_lt 1.0.0~rc.5~preview.2-1 1.0.0~rc.6-1
   rpm_lt 1.0.0~rc.5-1 1.0.1-1
+  rpm_lt 1.0.0-1 1.0.1~preview.14-1
+  rpm_lt 1.0.1~preview.13-1 1.0.1~preview.14-1
+  rpm_lt 1.0.1~preview.14-1 1.0.1-1
 elif [[ $require_package_managers == true ]]; then
   printf 'FAIL package ordering: rpm is required\n' >&2
   exit 1

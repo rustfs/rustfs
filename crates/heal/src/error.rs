@@ -267,10 +267,16 @@ mod tests {
     #[test]
     fn cancelled_rpc_is_recoverable_across_storage_error_conversions() {
         let status = tonic::Status::cancelled("operation was canceled");
+        let disk = DiskError::from(status.clone());
+        let storage = EcstoreError::from(status.clone());
+        let disk_storage = EcstoreError::from(DiskError::from(status.clone()));
         for error in [
-            Error::Disk(DiskError::from(status.clone())),
-            Error::Storage(EcstoreError::from(status.clone())),
-            Error::Storage(EcstoreError::from(DiskError::from(status.clone()))),
+            Error::Disk(disk.clone()),
+            Error::Disk(disk),
+            Error::Storage(storage.clone()),
+            Error::Storage(storage),
+            Error::Storage(disk_storage.clone()),
+            Error::Storage(disk_storage),
             Error::Io(std::io::Error::from(DiskError::from(status))),
         ] {
             assert!(error.is_recoverable_heal(), "typed RPC cancellation must be recoverable: {error:?}");
@@ -282,7 +288,7 @@ mod tests {
             tonic::Status::internal("operation was canceled"),
         ] {
             assert!(
-                !Error::Storage(EcstoreError::from(status)).is_recoverable_heal(),
+                !Error::Storage(EcstoreError::from(status).clone()).is_recoverable_heal(),
                 "cancellation text alone must not change application error classification"
             );
         }

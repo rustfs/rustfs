@@ -1207,6 +1207,17 @@ mod tests {
     }
 
     #[test]
+    fn mixed_missing_and_body_io_errors_remain_an_actionable_quorum_failure() {
+        let failures = [
+            DiskError::FileNotFound,
+            DiskError::Io(std::io::Error::other("remote body stream aborted")),
+        ];
+
+        assert!(!is_benign_not_found_listing_failure(&failures));
+        assert_eq!(classify_listing_quorum_failure(&failures), DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
     fn missing_path_error_classification_excludes_actionable_failures() {
         assert!(is_missing_path_error(&DiskError::FileNotFound));
         assert!(is_missing_path_error(&DiskError::FileVersionNotFound));

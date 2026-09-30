@@ -2476,7 +2476,11 @@ mod resume_loop_tests {
                 }
                 HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
                 HealOutcome::RpcCancelled(_) => {
-                    Err(Error::Storage(EcstoreError::from(tonic::Status::cancelled("injected peer cancellation"))))
+                    // Pool aggregation clones the selected error before returning it to heal.
+                    let error = EcstoreError::from(tonic::Status::cancelled("injected peer cancellation"));
+                    let cloned = error.clone();
+                    assert_eq!(cloned, error, "pool error clone must preserve its kind and message");
+                    Err(Error::Storage(cloned))
                 }
                 HealOutcome::Cancelled => Err(Error::TaskCancelled),
                 HealOutcome::Timeout => Err(Error::TaskTimeout),

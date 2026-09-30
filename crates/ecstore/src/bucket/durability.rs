@@ -64,25 +64,40 @@ impl BucketDurabilityConfig {
     }
 }
 
-/// Default durability tier seeded into a newly created bucket's metadata
-/// (rustfs/backlog#1811). `relaxed` aligns new buckets with MinIO's default
-/// posture: object data is still fdatasynced, while xl.meta and directory-entry
-/// fsyncs follow the relaxed durability gate.
+/// Default durability policy for newly created buckets. An unset value must
+/// inherit the process-wide mode so a default single-node deployment remains
+/// strict. Relaxed and none remain explicit operator choices.
 pub const ENV_NEW_BUCKET_DURABILITY_MODE: &str = "RUSTFS_NEW_BUCKET_DURABILITY_MODE";
-pub const DEFAULT_NEW_BUCKET_DURABILITY_MODE: &str = BUCKET_DURABILITY_MODE_RELAXED;
+pub const DEFAULT_NEW_BUCKET_DURABILITY_MODE: &str = "inherit";
+
+const EVENT_NEW_BUCKET_DURABILITY_MODE: &str = "new_bucket_durability_mode";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_BUCKET_DURABILITY: &str = "bucket_durability";
 
 /// The `durability.json` bytes to seed into a freshly created bucket's metadata.
 /// Empty means "no override" (the bucket then follows the global
-/// `RUSTFS_DURABILITY_MODE`); otherwise the serialized chosen tier. Operators
-/// can set `inherit` to disable the new-bucket override. Invalid values also
-/// fail closed to inherit the global mode instead of seeding a surprising tier.
-pub fn new_bucket_durability_config_json() -> Vec<u8> {
+/// `RUSTFS_DURABILITY_MODE`); otherwise the serialized chosen tier. Invalid
+/// values also fail closed to inherit the global mode instead of seeding a
+/// surprising tier.
+pub fn new_bucket_durability_config_json(bucket: &str) -> Vec<u8> {
     let raw = std::env::var(ENV_NEW_BUCKET_DURABILITY_MODE).unwrap_or_else(|_| DEFAULT_NEW_BUCKET_DURABILITY_MODE.to_string());
     let mode = raw.trim();
     if mode.eq_ignore_ascii_case("inherit") || mode.is_empty() || !BucketDurabilityConfig::is_valid_mode(mode) {
         return Vec::new();
     }
-    serde_json::to_vec(&BucketDurabilityConfig::new(mode)).expect("BucketDurabilityConfig serialization cannot fail")
+    let config = BucketDurabilityConfig::new(mode);
+    if let Some(mode) = config.normalized_mode().filter(|mode| mode != BUCKET_DURABILITY_MODE_STRICT) {
+        tracing::warn!(
+            event = EVENT_NEW_BUCKET_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_BUCKET_DURABILITY,
+            state = "non_strict_new_bucket_override",
+            bucket = %bucket,
+            mode = %mode,
+            "New bucket durability is explicitly configured below strict"
+        );
+    }
+    serde_json::to_vec(&config).expect("BucketDurabilityConfig serialization cannot fail")
 }
 
 #[cfg(test)]
@@ -90,7 +105,7 @@ mod tests {
     use super::*;
 
     fn new_bucket_seeded_mode() -> Option<String> {
-        let json = new_bucket_durability_config_json();
+        let json = new_bucket_durability_config_json("test-bucket");
         if json.is_empty() {
             return None;
         }
@@ -132,9 +147,9 @@ mod tests {
     }
 
     #[test]
-    fn new_bucket_default_seeds_relaxed_when_unset() {
+    fn new_bucket_default_inherits_when_unset() {
         temp_env::with_var_unset(ENV_NEW_BUCKET_DURABILITY_MODE, || {
-            assert_eq!(new_bucket_seeded_mode().as_deref(), Some(BUCKET_DURABILITY_MODE_RELAXED));
+            assert_eq!(new_bucket_seeded_mode(), None);
         });
     }
 

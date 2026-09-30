@@ -22,6 +22,8 @@
 //! - Common test constants and utilities
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::list_buckets::ListBucketsError;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use http::header::{CONTENT_TYPE, HOST};
@@ -60,6 +62,41 @@ const TEST_PORT_RANGE_ENV: &str = "RUSTFS_E2E_TEST_PORT_RANGE";
 const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
 const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
 const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+fn list_buckets_readiness_error(err: &SdkError<ListBucketsError>) -> String {
+    // SDK Display reports only the category. Do not expose raw response bodies or headers.
+    let service_code = err.as_service_error().and_then(|error| error.code()).filter(|code| {
+        matches!(
+            *code,
+            "ServiceUnavailable"
+                | "ServerNotInitialized"
+                | "InternalError"
+                | "AccessDenied"
+                | "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+        )
+    });
+    let transport = match err {
+        SdkError::DispatchFailure(failure) if failure.is_timeout() => Some("timeout"),
+        SdkError::DispatchFailure(failure) if failure.is_io() => Some("io"),
+        SdkError::DispatchFailure(failure) if failure.is_user() => Some("user"),
+        SdkError::DispatchFailure(failure) if failure.is_other() => Some("other"),
+        _ => None,
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut io_error = None;
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            io_error = Some((error.kind(), error.raw_os_error()));
+            break;
+        }
+        source = error.source();
+    }
+    format!(
+        "{err}; http_status={:?}; service_code={service_code:?}; transport={transport:?}; io_error={io_error:?}",
+        err.raw_response().map(|response| response.status().as_u16())
+    )
+}
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -1575,8 +1612,9 @@ impl RustFSTestClusterEnvironment {
     ///
     /// Verifies service availability by calling the S3 `list_buckets` API against the requested node,
     /// retries up to 120 times with a 1-second interval between attempts.
-    async fn wait_for_node_service_ready(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_for_node_service_ready(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.create_s3_client(node_idx)?;
+        let mut last_error = None;
 
         for attempt in 0..120 {
             match client.list_buckets().send().await {
@@ -1584,13 +1622,28 @@ impl RustFSTestClusterEnvironment {
                     info!("Cluster node {} service ready after {} attempts", node_idx, attempt + 1);
                     return Ok(());
                 }
-                Err(_) => {
+                Err(err) => {
+                    last_error = Some(err);
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         }
 
-        Err(format!("Cluster node {} service failed to become ready", node_idx).into())
+        let last_error = last_error.as_ref().map(list_buckets_readiness_error);
+        // Observe liveness only after the existing readiness budget is exhausted, before cleanup.
+        let process_status = match self.nodes[node_idx].process.as_mut() {
+            Some(process) => match process.try_wait() {
+                Ok(Some(status)) => format!("exited ({status})"),
+                Ok(None) => "running".to_string(),
+                Err(error) => format!("unavailable (kind={:?}, os_code={:?})", error.kind(), error.raw_os_error()),
+            },
+            None => "not started".to_string(),
+        };
+        Err(format!(
+            "Cluster node {node_idx} service failed to become ready; last ListBuckets error={last_error:?}; process_status={process_status}; capture_log_path={:?}",
+            self.node_capture_log_paths[node_idx]
+        )
+        .into())
     }
 
     /// Create an S3 client configured to communicate with a specific cluster node.
@@ -2099,6 +2152,34 @@ mod tests {
         let executable = std::env::current_exe().expect("the test executable should have a path");
 
         verify_awscurl_path(&executable).expect("an available client with a working help command should pass");
+    }
+
+    #[test]
+    fn readiness_error_reports_transport_without_sensitive_source_text() {
+        use aws_sdk_s3::error::ConnectorError;
+
+        let sensitive = "request credentials must not appear in diagnostics";
+        for (connector, category) in [
+            (
+                ConnectorError::io(std::io::Error::new(ErrorKind::ConnectionReset, sensitive).into()),
+                "io",
+            ),
+            (ConnectorError::timeout(sensitive.into()), "timeout"),
+            (ConnectorError::user(sensitive.into()), "user"),
+            (ConnectorError::other(sensitive.into(), None), "other"),
+        ] {
+            let diagnostic = list_buckets_readiness_error(&SdkError::dispatch_failure(connector));
+            assert!(diagnostic.contains(&format!("transport=Some(\"{category}\")")), "{diagnostic}");
+            assert!(diagnostic.contains("http_status=None"), "{diagnostic}");
+            assert!(!diagnostic.contains(sensitive), "{diagnostic}");
+            if category == "io" {
+                assert!(diagnostic.contains("io_error=Some((ConnectionReset, None))"), "{diagnostic}");
+            }
+        }
+        let os_error = std::io::Error::from_raw_os_error(13);
+        let expected = format!("io_error=Some(({:?}, Some(13)))", os_error.kind());
+        let diagnostic = list_buckets_readiness_error(&SdkError::dispatch_failure(ConnectorError::io(os_error.into())));
+        assert!(diagnostic.contains(&expected), "{diagnostic}");
     }
 
     #[test]

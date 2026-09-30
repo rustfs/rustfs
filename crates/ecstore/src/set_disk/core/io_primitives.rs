@@ -2884,7 +2884,16 @@ impl SetDisks {
             let result = if let Some(deadline) = single_pending_hedge_deadline.take() {
                 tokio::select! {
                     result = join_set.join_next() => result,
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = async {
+                        tokio::time::sleep_until(deadline).await;
+                        #[cfg(test)]
+                        rename_fanout_barrier::checkpoint(
+                            object.as_ref(),
+                            0,
+                            rename_fanout_barrier::PHASE_NON_INLINE_HEDGE_TIMER,
+                        )
+                        .await;
+                    } => {
                         if bounded_fanout
                             && !force_full_wait
                             && join_set.len() == 1
@@ -7321,6 +7330,9 @@ pub(crate) mod rename_fanout_barrier {
     pub use super::rename_fanout_barrier_phase::{
         CLEANUP as PHASE_CLEANUP, READ_VERSION as PHASE_READ_VERSION, RENAME as PHASE_RENAME, ROLLBACK as PHASE_ROLLBACK,
     };
+
+    /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
+    pub const PHASE_NON_INLINE_HEDGE_TIMER: &str = "non_inline_hedge_timer";
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {

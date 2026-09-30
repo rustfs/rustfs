@@ -1569,12 +1569,27 @@ mod tests {
         disk_indexes: &[usize],
     ) -> Vec<(usize, crate::disk::DiskStore)> {
         let offline = {
-            let mut disks = set.disks.write().await;
+            let disks = set.disks.read().await;
             disk_indexes
                 .iter()
-                .map(|index| (*index, disks[*index].take().expect("fault-injection disk should start online")))
+                .map(|index| (*index, disks[*index].clone().expect("fault-injection disk should start online")))
                 .collect::<Vec<_>>()
         };
+        for (_, disk) in &offline {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_offline_for_test();
+        }
+        // Empty slots can be renewed from the still-present disk paths by the endpoint monitor.
+        // Keep the original handles and prove reconnect cannot clear their injected IO failure.
+        set.connect_disks().await;
+        {
+            let disks = set.disks.read().await;
+            for (index, disk) in &offline {
+                let current = disks[*index].as_ref().expect("fault-injection slot should remain populated");
+                assert!(Arc::ptr_eq(current, disk), "reconnect must preserve the fault-injection handle");
+                assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            }
+        }
         let local_disk_map = ecstore.ctx.local_disk_map();
         let mut local_disks = local_disk_map.write().await;
         for (_, disk) in &offline {
@@ -1595,9 +1610,12 @@ mod tests {
                 local_disks.insert(disk.endpoint().to_string(), Some(Arc::clone(disk)));
             }
         }
-        let mut disks = set.disks.write().await;
+        let disks = set.disks.read().await;
         for (index, disk) in offline {
-            assert!(disks[index].replace(disk).is_none(), "fault-injection disk slot should remain empty");
+            let current = disks[index].as_ref().expect("fault-injection slot should remain populated");
+            assert!(Arc::ptr_eq(current, &disk), "fault-injection disk handle should remain unchanged");
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.reset_health_for_store_init_retry();
         }
     }
 
@@ -3376,7 +3394,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn make_bucket_seeds_new_bucket_durability_override() {
+    async fn make_bucket_inherits_default_durability() {
         temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
             let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
             let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
@@ -3389,10 +3407,7 @@ mod tests {
             let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
                 .await
                 .expect("metadata should load for the new bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
         })
         .await;
     }

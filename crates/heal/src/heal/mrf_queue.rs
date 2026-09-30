@@ -20,7 +20,9 @@
 //! cannot discharge them; only an exact storage-verified proof may do so.
 //! Both paths share the existing committed snapshot format and legacy mirrors.
 //! Replay retains partial-write intents for live retries when a member is
-//! still offline at startup. A lost proof causes another repair, not deletion.
+//! still offline at startup. Healthy legacy objects without identity proof are
+//! held in memory after one check; their unchanged journal records are retried
+//! on process restart. A lost proof causes another repair, not deletion.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
@@ -584,7 +586,11 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
     request
 }
 
-async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> crate::Result<HealAdmissionResult> {
+async fn submit_mrf_heal_request(
+    manager: &HealManager,
+    intent: &MrfIntent,
+    durable_anchor: Option<MrfDurableRepairAnchor>,
+) -> crate::Result<HealAdmissionResult> {
     let receipt = manager
         .submit_mrf_heal_request_with_receipt_and_identity(
             build_heal_request(intent),
@@ -596,6 +602,7 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
                 scope: intent.scope,
                 delete_marker_purge: intent.delete_marker_purge.as_ref().map(MrfDeleteMarkerPurge::identity),
                 lease: intent.lease,
+                durable_anchor,
             },
         )
         .await?;
@@ -763,7 +770,7 @@ impl MrfRuntime {
             // attempts counter) changes the encoded snapshot; mark it dirty
             // either way.
             self.dirty = true;
-            match submit_mrf_heal_request(manager, &intent).await {
+            match submit_mrf_heal_request(manager, &intent, None).await {
                 // Accepted intents leave the pending set; the next flush persists the
                 // smaller snapshot. This is not a durable successor receipt and
                 // does not discharge the producer's existing retry hints.
@@ -796,8 +803,7 @@ impl MrfRuntime {
                 }
             }
         }
-        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
-        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
+        self.publish_metrics();
     }
 
     fn retained_replay_journal(&self) -> bool {
@@ -856,12 +862,38 @@ impl MrfRuntime {
         let mut buckets: Vec<Arc<str>> = anchors.iter().map(|anchor| anchor.bucket.clone()).collect();
         buckets.sort_unstable();
         buckets.dedup();
-        for bucket in buckets {
+        for bucket in &buckets {
             rustfs_common::mrf_channel::consume_recorded_verified_mrf_repair_events_for(bucket.as_ref(), &mut anchors);
         }
         let remaining: HashSet<_> = anchors.into_iter().collect();
         self.durable_replay_anchors.retain(|anchor| remaining.contains(anchor));
         self.dirty |= self.partial_writes.retain_unproven(&remaining);
+        for bucket in buckets {
+            for event in rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(bucket.as_ref()) {
+                // Parking is an in-memory dispatch decision. The unchanged
+                // durable journal remains the recovery/retry authority.
+                self.partial_writes.park_unverified_legacy(&event.anchor);
+            }
+        }
+        self.publish_metrics();
+    }
+
+    fn publish_metrics(&self) {
+        gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
+        gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
+        let held = self.partial_writes.unverified_legacy_count();
+        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(held));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let oldest_age_seconds = self
+            .partial_writes
+            .oldest_unverified_legacy_enqueued_at_ms()
+            .map(|enqueued_at_ms| now_ms.saturating_sub(enqueued_at_ms) / 1_000)
+            .unwrap_or_default();
+        gauge!("rustfs_heal_mrf_unverified_legacy_oldest_age_seconds")
+            .set(metric_f64(usize::try_from(oldest_age_seconds).unwrap_or(usize::MAX)));
     }
 }
 
@@ -898,17 +930,38 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
     tracing::info!(target: "rustfs::heal::mrf", "MRF intent consumer started");
 }
 
-/// Replay the durable journal into a fresh pending queue and submit whatever
-/// it armed. Returns the number of intact intents replayed. Duplicates are
-/// merged by the manager's dedup key; the journal is retained whenever replay
-/// cannot fully hand off a successor in-memory snapshot (torn tails truncate
-/// via the per-record CRC). Public for integration tests; the live consumer
-/// invokes this through [`replay_into`] at startup.
+/// Replay the journal once for integration tests, publishing a durable
+/// successor before dispatching partial writes. Returns the number of intact
+/// intents replayed. Ordinary-only admission retries remain in the startup journal;
+/// this helper does not run the consumer's retry loop or proof-driven cleanup.
+/// The live consumer invokes [`replay_into`] directly at startup.
 pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
     let config = MrfConsumerConfig::default();
     let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
     let mut backoff_until: Option<tokio::time::Instant> = None;
-    replay_into(manager, &mut queue, &mut backoff_until).await.replayed
+    let replay = replay_into(manager, &mut queue, &mut backoff_until).await;
+    if replay.partial_writes.is_empty() {
+        return replay.replayed;
+    }
+    let mut runtime = MrfRuntime {
+        partial_writes: PartialWrites::default(),
+        queue,
+        config,
+        checkpoint_owner: Uuid::new_v4(),
+        next_checkpoint_sequence: replay.next_checkpoint_sequence,
+        new_since_flush: 0,
+        dirty: false,
+        journal_on_disk: replay.journal_on_disk,
+        retain_replay_journal: replay.retain_journal_for_replay,
+        durable_replay_anchors: replay.durable_replay_anchors,
+        replay_cleanup: replay.cleanup,
+        runtime_checkpoint: None,
+        backoff_until,
+    };
+    runtime.adopt_replayed_partial_writes(replay.partial_writes);
+    runtime.flush().await;
+    runtime.dispatch(manager).await;
+    replay.replayed
 }
 
 struct ReplayOutcome {
@@ -1081,16 +1134,16 @@ async fn replay_into(
                 break;
             }
             if intent.kind.is_durable() {
-                // Preserve the executable record as well as its proof anchor:
-                // a target that is still offline during replay needs live retries.
+                // Adopt durable replay into its single checkpointed owner. The
+                // runtime dispatches it after publishing the successor, avoiding
+                // a duplicate task in the startup-replay and steady-state paths.
                 if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
-                    durable_replay_anchors.push(anchor);
+                    durable_replay_anchors.push(anchor.clone());
                 }
-                let _ = submit_mrf_heal_request(manager, &intent).await;
                 partial_writes.push(intent);
                 continue;
             }
-            match submit_mrf_heal_request(manager, &intent).await {
+            match submit_mrf_heal_request(manager, &intent, None).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
                     if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
                         durable_replay_anchors.push(anchor);
@@ -1196,6 +1249,7 @@ async fn run_mrf_consumer(
     if runtime.dirty {
         runtime.flush().await;
     }
+    runtime.publish_metrics();
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1301,7 +1355,7 @@ async fn run_mrf_consumer(
                     }
                     TickAction::Idle => {}
                 }
-                gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(runtime.queue.depth() + runtime.partial_writes.depth()));
+                runtime.publish_metrics();
             }
         }
     }
@@ -1518,15 +1572,15 @@ mod tests {
         let mut backoff_until = None;
         let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
         assert_eq!(replay.replayed, 1, "W13 committed checkpoint must replay one record");
-        assert_eq!(queue.depth(), 0, "W13 replayed record should reach the manager before cleanup");
+        assert_eq!(queue.depth(), 0, "W13 durable replay must leave the ordinary queue");
+        assert_eq!(replay.partial_writes.len(), 1, "W13 replay must retain its executable durable record");
         assert_eq!(replay.durable_replay_anchors.len(), 1, "W13 replay must create a proof anchor");
         assert_eq!(
             manager.operations_snapshot().await.queued_by_source.mrf,
-            1,
-            "W13 replayed work must be visible as MRF manager work"
+            0,
+            "W13 durable replay must wait for its successor checkpoint before dispatch"
         );
 
-        let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
             partial_writes: PartialWrites::default(),
             queue,
@@ -1542,6 +1596,45 @@ mod tests {
             runtime_checkpoint: None,
             backoff_until,
         };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        assert_eq!(runtime.partial_writes.depth(), 1, "durable replay must have one executable owner");
+        assert!(
+            runtime.durable_replay_anchors.is_empty(),
+            "adoption must remove the duplicate startup anchor"
+        );
+        runtime.dispatch(&manager).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "unpersisted replay must not enter the manager"
+        );
+        assert!(runtime.flush().await, "publish the durable replay successor before dispatch");
+        let successor = snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+            .await
+            .expect("inspect durable replay successor")
+            .expect("durable replay must publish a committed successor");
+        assert_eq!((successor.owner(), successor.sequence()), (runtime.checkpoint_owner, 12));
+        assert_eq!(runtime.runtime_checkpoint, Some((runtime.checkpoint_owner, 12)));
+        assert!(
+            env.disk_paths.iter().all(|path| {
+                [".heal-mrf-commit.0.bin", ".heal-mrf-commit.1.bin"]
+                    .iter()
+                    .all(|manifest| path.join(".rustfs.sys").join(manifest).exists())
+            }),
+            "both startup and successor checkpoints must remain before proof"
+        );
+        runtime.dispatch(&manager).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "the checkpointed replay must be visible as one MRF manager request"
+        );
+        let anchor = runtime
+            .partial_writes
+            .anchors()
+            .next()
+            .expect("dispatched replay has a proof anchor")
+            .clone();
         let retained_before_proof = runtime.retained_replay_journal();
         assert!(retained_before_proof, "W13 proof anchor must retain replay checkpoint before proof");
         assert!(
@@ -2436,12 +2529,13 @@ mod tests {
         let mut backoff_until = None;
         let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
         assert_eq!(replay.replayed, 1, "the committed replay checkpoint must decode one record");
-        assert_eq!(queue.depth(), 0, "the replayed record must be admitted before cleanup is considered");
+        assert_eq!(queue.depth(), 0, "durable replay must leave the ordinary queue");
+        assert_eq!(replay.partial_writes.len(), 1, "replay must retain its executable durable record");
         assert!(backoff_until.is_none(), "the accepted replay must not arm admission backoff");
         assert_eq!(
             manager.operations_snapshot().await.queued_by_source.mrf,
-            1,
-            "the replayed record must be visible as an MRF manager request"
+            0,
+            "durable replay must wait for its successor checkpoint before dispatch"
         );
         assert!(
             replay.journal_on_disk,
@@ -2465,7 +2559,6 @@ mod tests {
             "cleanup must remember the committed checkpoint generation read at startup"
         );
 
-        let anchor = replay.durable_replay_anchors[0].clone();
         let mut runtime = MrfRuntime {
             partial_writes: PartialWrites::default(),
             queue,
@@ -2481,6 +2574,45 @@ mod tests {
             runtime_checkpoint: None,
             backoff_until,
         };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        assert_eq!(runtime.partial_writes.depth(), 1, "durable replay must have one executable owner");
+        assert!(
+            runtime.durable_replay_anchors.is_empty(),
+            "adoption must remove the duplicate startup anchor"
+        );
+        runtime.dispatch(&manager).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "unpersisted replay must not enter the manager"
+        );
+        assert!(runtime.flush().await, "publish the durable replay successor before dispatch");
+        let successor = snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+            .await
+            .expect("inspect durable replay successor")
+            .expect("durable replay must publish a committed successor");
+        assert_eq!((successor.owner(), successor.sequence()), (runtime.checkpoint_owner, 12));
+        assert_eq!(runtime.runtime_checkpoint, Some((runtime.checkpoint_owner, 12)));
+        assert!(
+            env.disk_paths.iter().all(|path| {
+                [".heal-mrf-commit.0.bin", ".heal-mrf-commit.1.bin"]
+                    .iter()
+                    .all(|manifest| path.join(".rustfs.sys").join(manifest).exists())
+            }),
+            "both startup and successor checkpoints must remain before proof"
+        );
+        runtime.dispatch(&manager).await;
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "the checkpointed replay must be visible as one MRF manager request"
+        );
+        let anchor = runtime
+            .partial_writes
+            .anchors()
+            .next()
+            .expect("dispatched replay has a proof anchor")
+            .clone();
         assert!(runtime.retained_replay_journal(), "proof-bearing replay anchors must block idle cleanup");
         assert!(
             snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
@@ -2508,7 +2640,7 @@ mod tests {
         );
         assert!(
             runtime.delete_idle_recovery_anchors().await,
-            "idle cleanup must delete the proof-discharged committed replay checkpoint"
+            "idle cleanup must delete both proof-discharged checkpoint generations"
         );
         runtime.journal_on_disk = false;
         assert!(
@@ -2516,8 +2648,10 @@ mod tests {
                 .await
                 .expect("inspect committed checkpoints after proof cleanup")
                 .is_none(),
-            "the committed replay checkpoint must be gone after proof-driven cleanup"
+            "both committed checkpoint generations must be gone after proof-driven cleanup"
         );
+        assert_eq!(read_journal(MRF_SCOPED_JOURNAL_PATH).await, None);
+        assert_eq!(read_journal(MRF_JOURNAL_PATH).await, None);
 
         let restart_manager = Arc::new(HealManager::new(
             storage,

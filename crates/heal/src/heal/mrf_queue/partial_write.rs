@@ -21,6 +21,11 @@ struct Responsibility {
     intent: MrfIntent,
     anchor: Option<MrfDurableRepairAnchor>,
     persisted: bool,
+    /// A completed check identified a healthy legacy object that cannot
+    /// discharge its durable intent without an independent payload proof.
+    /// This is process-local only: the unchanged journal rechecks it on restart.
+    unverified_legacy: bool,
+    retry_queued: bool,
     next_attempt: Instant,
 }
 
@@ -49,6 +54,8 @@ impl PartialWrites {
         }
         let key = queue_key(&intent);
         let previous = self.entries.get(&key);
+        let previous_was_held = previous.is_some_and(|entry| entry.unverified_legacy);
+        let mut retry_queued = previous.is_some_and(|entry| entry.retry_queued);
         let old_cost = previous.map_or(0, |entry| Self::cost(&entry.intent));
         let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::cost(&intent));
         if (previous.is_none() && self.entries.len() >= capacity) || next_bytes > byte_budget {
@@ -57,8 +64,9 @@ impl PartialWrites {
         if previous.is_some_and(|entry| entry.intent.lease == intent.lease) {
             return Ok(());
         }
-        if previous.is_none() {
+        if previous.is_none() || (previous_was_held && !retry_queued) {
             self.retry_order.push_back(key.clone());
+            retry_queued = true;
         }
         // Replacing the generation preserves the logical repair obligation,
         // but requires a new checkpoint and proof before it can be released.
@@ -68,6 +76,8 @@ impl PartialWrites {
                 intent,
                 anchor: None,
                 persisted: false,
+                unverified_legacy: false,
+                retry_queued,
                 next_attempt: Instant::now(),
             },
         );
@@ -91,6 +101,37 @@ impl PartialWrites {
         self.entries.values().filter_map(|entry| entry.anchor.as_ref())
     }
 
+    pub(super) fn park_unverified_legacy(&mut self, anchor: &MrfDurableRepairAnchor) -> bool {
+        let key = MrfQueueKey {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
+        };
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return false;
+        };
+        if entry.anchor.as_ref() != Some(anchor) || entry.unverified_legacy {
+            return false;
+        }
+        entry.unverified_legacy = true;
+        true
+    }
+
+    pub(super) fn unverified_legacy_count(&self) -> usize {
+        self.entries.values().filter(|entry| entry.unverified_legacy).count()
+    }
+
+    pub(super) fn oldest_unverified_legacy_enqueued_at_ms(&self) -> Option<u64> {
+        self.entries
+            .values()
+            .filter(|entry| entry.unverified_legacy)
+            .map(|entry| entry.intent.enqueued_at_ms)
+            .min()
+    }
+
     pub(super) fn mark_persisted(&mut self) {
         for entry in self.entries.values_mut() {
             entry.persisted = true;
@@ -107,10 +148,12 @@ impl PartialWrites {
             if entry.anchor.is_none() {
                 entry.anchor = manager.durable_mrf_repair_anchor(&entry.intent).await;
             }
-            if entry.anchor.is_some() {
+            if let Some(anchor) = entry.anchor.clone() {
                 // Every outcome retains responsibility until a verified proof.
-                // A full manager or an offline target only postpones another try.
-                let _ = submit_mrf_heal_request(manager, &entry.intent).await;
+                // A healthy legacy object without an independent identity proof
+                // is parked in memory after one check; its disk journal remains
+                // unchanged and startup replay checks it again.
+                let _ = submit_mrf_heal_request(manager, &entry.intent, Some(anchor)).await;
             }
         }
     }
@@ -126,10 +169,17 @@ impl PartialWrites {
             let Some(key) = self.retry_order.pop_front() else {
                 break;
             };
-            let due = self
-                .entries
-                .get(&key)
-                .is_some_and(|entry| entry.persisted && entry.next_attempt <= now);
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            entry.retry_queued = false;
+            if entry.unverified_legacy {
+                // Held obligations remain in the durable responsibility map,
+                // but leave the hot retry index until a new generation arrives.
+                continue;
+            }
+            let due = entry.persisted && entry.next_attempt <= now;
+            entry.retry_queued = true;
             self.retry_order.push_back(key.clone());
             if due {
                 ready.push(key);
@@ -161,6 +211,7 @@ mod tests {
     use super::*;
     use rustfs_common::mrf_channel::{MrfKind, MrfScope};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn intent(object: &str) -> MrfIntent {
@@ -176,7 +227,7 @@ mod tests {
             }),
             lease: None,
             enqueued_at_ms: 1,
-            attempts: u8::MAX,
+            attempts: 0,
         };
         assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
         intent
@@ -215,6 +266,41 @@ mod tests {
             "c",
             "the old prefix becoming due again cannot starve the next member"
         );
+    }
+
+    #[test]
+    fn unverified_legacy_responsibility_is_held_until_restart_without_being_released() {
+        let original = intent("legacy");
+        let mut writes = PartialWrites::default();
+        writes
+            .admit(original.clone(), 1, 8192)
+            .expect("durable intent should be retained");
+        writes.mark_persisted();
+        let anchor = MrfDurableRepairAnchor::from_intent(&original, Uuid::new_v4()).expect("exact durable anchor");
+        writes.entries.get_mut(&queue_key(&original)).expect("resident intent").anchor = Some(anchor.clone());
+
+        assert!(writes.park_unverified_legacy(&anchor));
+        assert!(!writes.park_unverified_legacy(&anchor), "duplicate notices are idempotent");
+        assert_eq!(writes.unverified_legacy_count(), 1);
+        assert_eq!(writes.depth(), 1, "holding the intent must preserve responsibility");
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(60), 1).is_empty());
+        assert!(writes.retry_order.is_empty(), "held intents leave the retry index after one pass");
+
+        let replacement = intent("legacy");
+        writes
+            .admit(replacement, 1, 8192)
+            .expect("a new generation should become retryable");
+        writes.mark_persisted();
+        assert_eq!(writes.unverified_legacy_count(), 0);
+        assert_eq!(writes.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
+
+        let mut restarted = PartialWrites::default();
+        restarted
+            .admit(original, 1, 8192)
+            .expect("the unchanged journal re-arms the same responsibility after restart");
+        restarted.mark_persisted();
+        assert_eq!(restarted.unverified_legacy_count(), 0);
+        assert_eq!(restarted.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
     }
 
     #[test]
