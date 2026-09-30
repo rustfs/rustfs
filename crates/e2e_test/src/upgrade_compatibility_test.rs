@@ -67,6 +67,7 @@ const CONFIG_REPLICA_BUCKET: &str = "upgrade-config-replica";
 const ROLLBACK_BUCKET: &str = "rollback-config-data";
 const ROLLBACK_REPLICA_BUCKET: &str = "rollback-config-replica";
 const BUCKET_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+const QUOTA_USAGE_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const LIFECYCLE_RULE_ID: &str = "upgrade-expire-logs";
 const LIFECYCLE_PREFIX: &str = "logs/";
 const LIFECYCLE_DAYS: i32 = 30;
@@ -1022,12 +1023,18 @@ async fn put_object_through_quota_warmup(client: &Client, bucket: &str, key: &st
 
 async fn get_bucket_quota(env: &RustFSTestEnvironment, bucket: &str) -> Result<Option<u64>, BoxError> {
     let path = format!("/rustfs/admin/v3/quota/{bucket}");
-    let (status, response) = admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key).await?;
-    if status != StatusCode::OK {
-        return Err(format!("reading the quota of {bucket} failed: {status} {response}").into());
+    let deadline = Instant::now() + QUOTA_USAGE_READINESS_TIMEOUT;
+    loop {
+        let (status, response) = admin_request(&env.url, Method::GET, &path, None, &env.access_key, &env.secret_key).await?;
+        if status == StatusCode::OK {
+            let quota: serde_json::Value = serde_json::from_str(&response)?;
+            return Ok(quota.get("quota").and_then(serde_json::Value::as_u64));
+        }
+        if status != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
+            return Err(format!("reading the quota of {bucket} failed: {status} {response}").into());
+        }
+        sleep(Duration::from_millis(500)).await;
     }
-    let quota: serde_json::Value = serde_json::from_str(&response)?;
-    Ok(quota.get("quota").and_then(serde_json::Value::as_u64))
 }
 
 /// `GET /rustfs/admin/v3/list-remote-targets?bucket=...`.
