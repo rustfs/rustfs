@@ -1874,12 +1874,12 @@ where
         Ok(Self::table_commit_recovery_report_for_entry_locked(&state, entry))
     }
 
-    fn table_catalog_export_locked(
+    fn table_catalog_export_with_recovery_locked(
         state: &StrongTableCatalogState,
         table_bucket: &str,
         namespace: &Namespace,
         table: &IdentifierSegment,
-    ) -> TableCatalogStoreResult<TableCatalogExport> {
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
         Self::ensure_namespace_identifiers_are_unambiguous_locked(state, table_bucket, &namespace.public_name())?;
         let table_bucket_entry = state
             .table_buckets
@@ -1952,12 +1952,15 @@ where
             &commit_recovery,
         );
 
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
     }
 
     pub(crate) async fn export_table_catalog_entry(
@@ -1970,7 +1973,7 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let state = self.state.lock().await;
-        Self::table_catalog_export_locked(&state, table_bucket, &namespace, &table)
+        Self::table_catalog_export_with_recovery_locked(&state, table_bucket, &namespace, &table).map(|(catalog, _)| catalog)
     }
 
     pub(crate) async fn diagnose_table_catalog(
@@ -1987,21 +1990,15 @@ where
             self.hydrate_state().await?;
             let (catalog, commit_recovery, observation) = {
                 let state = self.state.lock().await;
-                let catalog = Self::table_catalog_export_locked(&state, table_bucket, &parsed_namespace, &parsed_table)?;
-                let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(&state, &catalog.table);
+                let (catalog, commit_recovery) =
+                    Self::table_catalog_export_with_recovery_locked(&state, table_bucket, &parsed_namespace, &parsed_table)?;
                 let observation = (state.snapshot_etag.clone(), state.snapshot_version);
                 (catalog, commit_recovery, observation)
             };
 
-            let report = diagnose_table_catalog_from_export(
-                &self.object_backend,
-                &parsed_namespace,
-                &parsed_table,
-                catalog,
-                commit_recovery,
-                retain_recent_metadata_files,
-            )
-            .await?;
+            let report =
+                diagnose_table_catalog_from_export(&self.object_backend, catalog, commit_recovery, retain_recent_metadata_files)
+                    .await?;
 
             self.hydrate_state().await?;
             let current_observation = {

@@ -304,9 +304,14 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   recoverable commit-log WAL state, strong backing migration target, single
   active writer HA policy, and scale validation matrix; durable-strong responses
   additionally identify the snapshot path, ETag, and format version, and
-  diagnostics fail closed if the strong snapshot changes during inspection;
-  until strong maintenance configuration is persisted, diagnostics use a
-  conservative zero-file retention default
+  diagnostics retry a bounded number of times when the strong snapshot changes
+  during inspection, then fail closed if no stable observation is available.
+  Metadata scans follow the persisted directory, including renamed tables and
+  same-bucket S3 locations. Until strong maintenance configuration is persisted,
+  diagnostics add no count-based retention; current metadata, metadata-log entries,
+  and snapshot refs remain protected. Orphan candidates are read-only observations,
+  not deletion authorization. Object-backed reports share one recovery observation
+  but do not provide a cross-object linearizable snapshot.
 
 ## Client Matrix
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
 
 mod migration;
@@ -785,8 +786,6 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
 pub(super) async fn diagnose_table_catalog_from_export<B>(
     backend: &B,
-    parsed_namespace: &Namespace,
-    parsed_table: &IdentifierSegment,
     catalog: TableCatalogExport,
     commit_recovery: TableCommitRecoveryReport,
     retain_recent_metadata_files: usize,
@@ -794,40 +793,53 @@ pub(super) async fn diagnose_table_catalog_from_export<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    let current_metadata_location = catalog.table.metadata_location.clone();
+    let current_metadata_location =
+        table_catalog_object_key_from_location(&catalog.table.table_bucket, &catalog.table.metadata_location);
     let backing_manifest = catalog.backing_manifest.clone();
+    let metadata_prefix = table_metadata_dir_path_for_entry(&catalog.table)
+        .ok()
+        .map(|directory| format!("{directory}/"));
+    let is_valid_location = |location: &str| {
+        metadata_prefix.as_ref().is_some_and(|prefix| {
+            location
+                .strip_prefix(prefix.as_str())
+                .is_some_and(is_valid_table_metadata_file_name)
+        })
+    };
     let mut retained = BTreeSet::new();
     let mut current_metadata_for_refs = None;
-    let current_metadata_status = if is_valid_table_metadata_location(parsed_namespace, parsed_table, &current_metadata_location)
-    {
-        retained.insert(current_metadata_location.clone());
-        match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
-            Ok(Some(current_metadata)) => {
-                retained.extend(metadata_log_locations(
-                    &current_metadata,
-                    &catalog.table_bucket.table_bucket,
-                    parsed_namespace,
-                    parsed_table,
-                ));
-                current_metadata_for_refs = Some(current_metadata);
-                TableMetadataPointerStatus::Valid
+    let current_metadata_status =
+        if let Some(current_metadata_location) = current_metadata_location.filter(|location| is_valid_location(location)) {
+            retained.insert(current_metadata_location.clone());
+            match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
+                Ok(Some(current_metadata)) => {
+                    retained.extend(metadata_log_locations_matching(
+                        &current_metadata,
+                        &catalog.table_bucket.table_bucket,
+                        is_valid_location,
+                    ));
+                    current_metadata_for_refs = Some(current_metadata);
+                    TableMetadataPointerStatus::Valid
+                }
+                Ok(None) => TableMetadataPointerStatus::MissingObject,
+                Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
+                Err(err) => return Err(err),
             }
-            Ok(None) => TableMetadataPointerStatus::MissingObject,
-            Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
-            Err(err) => return Err(err),
-        }
-    } else {
-        TableMetadataPointerStatus::InvalidLocation
-    };
+        } else {
+            TableMetadataPointerStatus::InvalidLocation
+        };
 
     let mut metadata_locations = Vec::new();
-    let metadata_prefix = format!("{}/", default_table_metadata_dir_path(parsed_namespace, parsed_table));
-    for object in backend
-        .list_objects(&catalog.table_bucket.table_bucket, &metadata_prefix)
-        .await?
-    {
-        if let Some(metadata_location) = metadata_location_from_metadata_file_path(parsed_namespace, parsed_table, &object) {
-            metadata_locations.push(metadata_location);
+    // A renamed or registered table can keep a metadata directory unrelated to its current name.
+    // If the pointer is invalid, no directory can safely be treated as owned by this table.
+    if let Some(metadata_prefix) = metadata_prefix.as_ref() {
+        for object in backend
+            .list_objects(&catalog.table_bucket.table_bucket, metadata_prefix)
+            .await?
+        {
+            if is_valid_location(&object) {
+                metadata_locations.push(object);
+            }
         }
     }
     metadata_locations.sort();
@@ -838,13 +850,12 @@ where
     }
     if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
         retained.extend(
-            metadata_locations_for_protected_snapshot_refs(
+            metadata_locations_for_protected_snapshot_refs_matching(
                 backend,
                 &catalog.table_bucket.table_bucket,
-                parsed_namespace,
-                parsed_table,
                 current_metadata,
                 &metadata_locations,
+                is_valid_location,
             )
             .await?,
         );
@@ -1215,8 +1226,8 @@ where
                 .get_table_maintenance_config(table_bucket, namespace, table)
                 .await?
                 .retain_recent_metadata_files),
-            // Durable-strong maintenance configuration is not persisted yet; use the
-            // conservative default while keeping diagnostics read-only.
+            // Durable-strong maintenance configuration is not persisted yet. Zero adds no
+            // count-based retention; reachability still protects references, and this API never deletes.
             Self::DurableStrong(_) => Ok(0),
         }
     }

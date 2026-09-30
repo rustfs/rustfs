@@ -141,7 +141,7 @@ pub(super) fn durable_strong_table_catalog_backing_manifest(
     manifest.current.current_pointer_path = snapshot_path.clone();
     // Strong backing embeds the commit log and idempotency index in one authoritative snapshot.
     manifest.current.wal.commit_log_prefix = snapshot_path.clone();
-    manifest.current.wal.idempotency_index_prefix = snapshot_path.clone();
+    manifest.current.wal.idempotency_index_prefix = snapshot_path;
     manifest.current.snapshot.snapshot_etag = snapshot_etag;
     manifest.current.snapshot.snapshot_version = snapshot_version;
 

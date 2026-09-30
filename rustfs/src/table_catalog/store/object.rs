@@ -2424,6 +2424,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn plan_table_commit_recovery(
         &self,
         table_bucket: &str,
@@ -4076,6 +4077,17 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCatalogExport> {
+        self.table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await
+            .map(|(catalog, _)| catalog)
+    }
+
+    async fn table_catalog_export_with_recovery(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<(TableCatalogExport, TableCommitRecoveryReport)> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
 
@@ -4110,12 +4122,15 @@ where
         let commit_recovery = self.table_commit_recovery_report_for_entry(&table_entry, 0).await?;
         let backing_manifest = table_catalog_backing_manifest(&self.paths, &namespace, &table, &table_entry, &commit_recovery);
 
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
+        Ok((
+            TableCatalogExport {
+                table_bucket: table_bucket_entry,
+                namespace: namespace_entry,
+                table: table_entry,
+                backing_manifest,
+            },
+            commit_recovery,
+        ))
     }
 
     pub(crate) async fn diagnose_table_catalog(
@@ -4125,19 +4140,10 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
-        let parsed_namespace = parse_namespace_for_store(namespace)?;
-        let parsed_table = parse_table_for_store(table)?;
-        let catalog = self.export_table_catalog_entry(table_bucket, namespace, table).await?;
-        let commit_recovery = self.table_commit_recovery_report_for_entry(&catalog.table, 0).await?;
-        diagnose_table_catalog_from_export(
-            &self.backend,
-            &parsed_namespace,
-            &parsed_table,
-            catalog,
-            commit_recovery,
-            retain_recent_metadata_files,
-        )
-        .await
+        let (catalog, commit_recovery) = self
+            .table_catalog_export_with_recovery(table_bucket, namespace, table)
+            .await?;
+        diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
     }
 
     pub(crate) async fn plan_table_metadata_maintenance(
