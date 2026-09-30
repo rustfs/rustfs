@@ -190,6 +190,19 @@ impl PartialWrites {
             + state.estimated_bytes()
     }
 
+    pub(super) fn cost_with_state_and_audit(
+        intent: &MrfIntent,
+        state: &ResponsibilityState,
+        audit: Option<&MrfOperatorAcceptance>,
+    ) -> usize {
+        Self::cost_with_state(intent, state)
+            + audit.map_or(0, |audit| audit.actor.len() + audit.reason.len() + audit.reference.len())
+    }
+
+    fn entry_cost(entry: &Responsibility) -> usize {
+        Self::cost_with_state_and_audit(&entry.intent, &entry.state, entry.last_operator_acceptance.as_ref())
+    }
+
     #[cfg(test)]
     pub(super) fn admit(
         &mut self,
@@ -217,7 +230,7 @@ impl PartialWrites {
         let previous = self.entries.get(&key);
         let previous_was_held = previous.is_some_and(|entry| entry.state.is_parked());
         let mut retry_queued = previous.is_some_and(|entry| entry.retry_queued);
-        let old_cost = previous.map_or(0, |entry| Self::cost_with_state(&entry.intent, &entry.state));
+        let old_cost = previous.map_or(0, Self::entry_cost);
         let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::cost(&intent));
         if (previous.is_none() && self.entries.len() >= capacity) || next_bytes > byte_budget {
             return Err(MrfDurableAdmissionError::Full);
@@ -286,15 +299,12 @@ impl PartialWrites {
         {
             return false;
         }
-        let old_cost = Self::cost_with_state(&entry.intent, &entry.state);
+        let old_cost = Self::entry_cost(entry);
         entry.state = ResponsibilityState::HeldUnverifiedLegacy {
             bucket_incarnation_id: anchor.bucket_incarnation_id,
             since_ms: unix_now_ms(),
         };
-        self.bytes = self
-            .bytes
-            .saturating_sub(old_cost)
-            .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+        self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         true
     }
 
@@ -372,15 +382,12 @@ impl PartialWrites {
         if !matches!(&entry.state, ResponsibilityState::Active) {
             return false;
         }
-        let old_cost = Self::cost_with_state(&entry.intent, &entry.state);
+        let old_cost = Self::entry_cost(entry);
         entry.responsibility_id = record.responsibility_id;
         entry.source_bucket_incarnation_id = record.source_bucket_incarnation_id;
         entry.last_operator_acceptance = record.last_operator_acceptance.clone();
         entry.state = record.state.clone();
-        self.bytes = self
-            .bytes
-            .saturating_sub(old_cost)
-            .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+        self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         if entry.state.is_parked() {
             entry.retry_queued = false;
         }
@@ -480,7 +487,7 @@ impl PartialWrites {
         }
         let previous = entry.state.clone();
         let previous_acceptance = entry.last_operator_acceptance.clone();
-        let old_cost = Self::cost_with_state(&entry.intent, &previous);
+        let old_cost = Self::entry_cost(entry);
         let accepted_at_ms = unix_now_ms();
         let acceptance = MrfOperatorAcceptance {
             accepted_at_ms,
@@ -501,7 +508,7 @@ impl PartialWrites {
             reference,
             request_id,
         };
-        let next_cost = Self::cost_with_state(&entry.intent, &next_state);
+        let next_cost = Self::cost_with_state_and_audit(&entry.intent, &next_state, Some(&acceptance));
         let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(next_cost);
         if next_bytes > byte_budget {
             return Err("durable responsibility byte budget is exhausted");
@@ -544,9 +551,9 @@ impl PartialWrites {
             return Err("bucket incarnation changed; refresh the responsibility listing");
         }
         let previous = entry.state.clone();
-        let old_cost = Self::cost_with_state(&entry.intent, &previous);
+        let old_cost = Self::entry_cost(entry);
         entry.state = ResponsibilityState::Active;
-        self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::cost(&entry.intent));
+        self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         entry.persisted = false;
         entry.next_attempt = Instant::now();
         if !entry.retry_queued {
@@ -572,13 +579,10 @@ impl PartialWrites {
         else {
             return false;
         };
-        let old_cost = Self::cost_with_state(&entry.intent, &entry.state);
+        let old_cost = Self::entry_cost(entry);
         entry.state = state;
         entry.last_operator_acceptance = last_operator_acceptance;
-        self.bytes = self
-            .bytes
-            .saturating_sub(old_cost)
-            .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+        self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         entry.persisted = true;
         if entry.state.is_parked() {
             entry.retry_queued = false;
@@ -675,7 +679,7 @@ impl PartialWrites {
         let previous = entry.state.clone();
         let previous_acceptance = entry.last_operator_acceptance.clone();
         if source_bucket_incarnation_id.is_some_and(|source| source != observed_bucket_incarnation_id) {
-            let old_cost = Self::cost_with_state(&entry.intent, &previous);
+            let old_cost = Self::entry_cost(entry);
             entry.state = ResponsibilityState::BucketIncarnationChanged {
                 source_bucket_incarnation_id: match source_bucket_incarnation_id {
                     Some(source) => source,
@@ -684,21 +688,15 @@ impl PartialWrites {
                 observed_bucket_incarnation_id,
                 detected_at_ms: unix_now_ms(),
             };
-            self.bytes = self
-                .bytes
-                .saturating_sub(old_cost)
-                .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+            self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
             entry.retry_queued = false;
         } else if source_bucket_incarnation_id.is_none() {
-            let old_cost = Self::cost_with_state(&entry.intent, &previous);
+            let old_cost = Self::entry_cost(entry);
             entry.state = ResponsibilityState::LegacyGenerationUnknown {
                 observed_bucket_incarnation_id,
                 detected_at_ms: unix_now_ms(),
             };
-            self.bytes = self
-                .bytes
-                .saturating_sub(old_cost)
-                .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+            self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
             entry.retry_queued = false;
         }
         Ok((previous, previous_acceptance))
@@ -727,8 +725,7 @@ impl PartialWrites {
             entry.anchor = manager.durable_mrf_repair_anchor(&entry.intent).await;
             if let Some(anchor) = entry.anchor.clone() {
                 if entry.source_bucket_incarnation_id.is_none() {
-                    let previous = entry.state.clone();
-                    let old_cost = Self::cost_with_state(&entry.intent, &previous);
+                    let old_cost = Self::entry_cost(entry);
                     let detected_at_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
@@ -736,10 +733,7 @@ impl PartialWrites {
                         observed_bucket_incarnation_id: anchor.bucket_incarnation_id,
                         detected_at_ms,
                     };
-                    self.bytes = self
-                        .bytes
-                        .saturating_sub(old_cost)
-                        .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+                    self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
                     entry.retry_queued = false;
                     lifecycle_changed = true;
                     continue;
@@ -747,8 +741,7 @@ impl PartialWrites {
                 if let Some(source_bucket_incarnation_id) = entry.source_bucket_incarnation_id
                     && source_bucket_incarnation_id != anchor.bucket_incarnation_id
                 {
-                    let previous = entry.state.clone();
-                    let old_cost = Self::cost_with_state(&entry.intent, &previous);
+                    let old_cost = Self::entry_cost(entry);
                     let detected_at_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
@@ -757,10 +750,7 @@ impl PartialWrites {
                         observed_bucket_incarnation_id: anchor.bucket_incarnation_id,
                         detected_at_ms,
                     };
-                    self.bytes = self
-                        .bytes
-                        .saturating_sub(old_cost)
-                        .saturating_add(Self::cost_with_state(&entry.intent, &entry.state));
+                    self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
                     entry.retry_queued = false;
                     lifecycle_changed = true;
                     continue;
@@ -818,11 +808,7 @@ impl PartialWrites {
         if before == self.entries.len() {
             return false;
         }
-        self.bytes = self
-            .entries
-            .values()
-            .map(|entry| Self::cost_with_state(&entry.intent, &entry.state))
-            .sum();
+        self.bytes = self.entries.values().map(Self::entry_cost).sum();
         self.retry_order.retain(|key| self.entries.contains_key(key));
         self.retry_index.retain(|key| self.entries.contains_key(key));
         true
@@ -1027,6 +1013,18 @@ mod tests {
         assert!(matches!(previous, ResponsibilityState::HeldUnverifiedLegacy { .. }));
         assert_eq!(restored.unverified_legacy_count(), 0);
         assert_eq!(restored.operator_accepted_unverified_count(), 1);
+        let accepted_entry = restored
+            .entries
+            .get(&queue_key(&intent("legacy-lifecycle")))
+            .expect("accepted entry");
+        assert_eq!(
+            restored.bytes(),
+            PartialWrites::cost_with_state_and_audit(
+                &accepted_entry.intent,
+                &accepted_entry.state,
+                accepted_entry.last_operator_acceptance.as_ref(),
+            )
+        );
         let (mut items, next_cursor) = restored.list_unverified_legacy(None, 10);
         let item = items.pop().expect("operator state remains visible");
         assert!(next_cursor.is_none());
@@ -1037,6 +1035,19 @@ mod tests {
             .expect("explicit targeted recheck");
         assert!(matches!(accepted, ResponsibilityState::OperatorAcceptedUnverified { .. }));
         assert_eq!(restored.operator_accepted_unverified_count(), 0);
+        let active_entry = restored
+            .entries
+            .get(&queue_key(&intent("legacy-lifecycle")))
+            .expect("active entry");
+        assert_eq!(
+            restored.bytes(),
+            PartialWrites::cost_with_state_and_audit(
+                &active_entry.intent,
+                &active_entry.state,
+                active_entry.last_operator_acceptance.as_ref(),
+            ),
+            "recheck must continue accounting for the retained audit record"
+        );
         restored.mark_persisted();
         assert_eq!(restored.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
     }

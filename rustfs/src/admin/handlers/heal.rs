@@ -1681,19 +1681,21 @@ fn parse_mrf_legacy_responsibility_query(uri: &Uri) -> S3Result<(Option<uuid::Uu
                     cursor = Some(
                         value
                             .parse()
-                            .map_err(|_| s3_error!(InvalidArgument, "cursor must be a UUID"))?,
+                            .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "cursor must be a UUID"))?,
                     );
                 }
                 "limit" if seen.insert("limit") => {
                     limit = value
                         .parse::<usize>()
-                        .map_err(|_| s3_error!(InvalidArgument, "limit must be an integer between 1 and 256"))?;
+                        .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "limit must be an integer between 1 and 256"))?;
                     if limit == 0 || limit > MRF_RESPONSIBILITY_LIST_MAX_LIMIT {
-                        return Err(s3_error!(InvalidArgument, "limit must be between 1 and 256"));
+                        return Err(admin_error(S3ErrorCode::InvalidArgument, "limit must be between 1 and 256"));
                     }
                 }
-                "cursor" | "limit" => return Err(s3_error!(InvalidArgument, "duplicate MRF responsibility query parameter")),
-                _ => return Err(s3_error!(InvalidArgument, "unknown MRF responsibility query parameter")),
+                "cursor" | "limit" => {
+                    return Err(admin_error(S3ErrorCode::InvalidArgument, "duplicate MRF responsibility query parameter"));
+                }
+                _ => return Err(admin_error(S3ErrorCode::InvalidArgument, "unknown MRF responsibility query parameter")),
             }
         }
     }
@@ -1713,14 +1715,19 @@ fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifec
     use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
     match error {
         MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
-            s3_error!(ServiceUnavailable, "MRF lifecycle operation could not be completed")
+            admin_error(S3ErrorCode::ServiceUnavailable, "MRF lifecycle operation could not be completed")
         }
-        MrfLifecycleControlError::StaleGeneration => s3_error!(InvalidRequest, "MRF responsibility generation changed"),
-        MrfLifecycleControlError::NotHeld => s3_error!(InvalidRequest, "MRF responsibility is not held as unverified legacy"),
-        MrfLifecycleControlError::IncarnationChanged => {
-            s3_error!(InvalidRequest, "bucket incarnation changed; refresh the MRF responsibility listing")
+        MrfLifecycleControlError::StaleGeneration => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility generation changed")
         }
-        MrfLifecycleControlError::InvalidAction(reason) => s3_error!(InvalidRequest, "{reason}"),
+        MrfLifecycleControlError::NotHeld => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility is not held as unverified legacy")
+        }
+        MrfLifecycleControlError::IncarnationChanged => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "bucket incarnation changed; refresh the MRF responsibility listing",
+        ),
+        MrfLifecycleControlError::InvalidAction(reason) => admin_error(S3ErrorCode::InvalidRequest, reason),
     }
 }
 
@@ -1736,10 +1743,10 @@ impl Operation for MrfLegacyResponsibilitiesHandler {
             rustfs_heal::heal::mrf_queue::list_legacy_responsibilities(cursor, limit),
         )
         .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "MRF responsibility listing timed out"))?
+        .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility listing timed out"))?
         .map_err(map_mrf_lifecycle_control_error)?;
-        let body =
-            serde_json::to_vec(&snapshot).map_err(|_| s3_error!(InternalError, "failed to encode MRF responsibility listing"))?;
+        let body = serde_json::to_vec(&snapshot)
+            .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility listing"))?;
         Ok(json_response(StatusCode::OK, body))
     }
 }
@@ -1754,10 +1761,10 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
             .input
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
-            .map_err(|_| s3_error!(InvalidRequest, "MRF responsibility action body is too large or unreadable"))?;
-        let action: MrfLegacyResponsibilityActionRequest =
-            serde_json::from_slice(&bytes).map_err(|_| s3_error!(InvalidRequest, "invalid MRF responsibility action body"))?;
-        validate_mrf_legacy_responsibility_action(&action).map_err(|reason| s3_error!(InvalidRequest, "{reason}"))?;
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility action body is too large or unreadable"))?;
+        let action: MrfLegacyResponsibilityActionRequest = serde_json::from_slice(&bytes)
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "invalid MRF responsibility action body"))?;
+        validate_mrf_legacy_responsibility_action(&action).map_err(|reason| admin_error(S3ErrorCode::InvalidRequest, reason))?;
         let (state, data_verified, durable_responsibility_retained) = match action.action {
             MrfLegacyResponsibilityAction::Refresh => {
                 timeout(
@@ -1768,7 +1775,7 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     ),
                 )
                 .await
-                .map_err(|_| s3_error!(ServiceUnavailable, "MRF responsibility refresh timed out"))?
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility refresh timed out"))?
                 .map_err(map_mrf_lifecycle_control_error)?;
                 ("refreshed", false, true)
             }
@@ -1781,18 +1788,20 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     ),
                 )
                 .await
-                .map_err(|_| s3_error!(ServiceUnavailable, "MRF responsibility recheck timed out"))?
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility recheck timed out"))?
                 .map_err(map_mrf_lifecycle_control_error)?;
                 ("active", false, true)
             }
             MrfLegacyResponsibilityAction::AcceptUnverifiedRisk => {
-                let reason = action.reason.ok_or_else(|| s3_error!(InvalidRequest, "reason is required"))?;
+                let reason = action
+                    .reason
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reason is required"))?;
                 let reference = action
                     .reference
-                    .ok_or_else(|| s3_error!(InvalidRequest, "reference is required"))?;
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reference is required"))?;
                 let request_id = action
                     .request_id
-                    .ok_or_else(|| s3_error!(InvalidRequest, "requestId is required"))?;
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "requestId is required"))?;
                 timeout(
                     Duration::from_secs(30),
                     rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
@@ -1807,7 +1816,12 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     ),
                 )
                 .await
-                .map_err(|_| s3_error!(ServiceUnavailable, "MRF risk disposition timed out; read status before retrying"))?
+                .map_err(|_| {
+                    admin_error(
+                        S3ErrorCode::ServiceUnavailable,
+                        "MRF risk disposition timed out; read status before retrying",
+                    )
+                })?
                 .map_err(map_mrf_lifecycle_control_error)?;
                 ("operatorAcceptedUnverified", false, true)
             }
@@ -1818,7 +1832,7 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
             data_verified,
             durable_responsibility_retained,
         })
-        .map_err(|_| s3_error!(InternalError, "failed to encode MRF responsibility action response"))?;
+        .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility action response"))?;
         Ok(json_response(StatusCode::OK, body))
     }
 }

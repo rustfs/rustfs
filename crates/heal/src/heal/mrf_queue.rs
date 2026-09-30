@@ -948,7 +948,9 @@ impl MrfRuntime {
             intents
                 .iter()
                 .map(|(intent, record)| match record {
-                    Some(record) => PartialWrites::cost_with_state(intent, &record.state),
+                    Some(record) => {
+                        PartialWrites::cost_with_state_and_audit(intent, &record.state, record.last_operator_acceptance.as_ref())
+                    }
                     None => PartialWrites::cost(intent),
                 })
                 .sum::<usize>(),

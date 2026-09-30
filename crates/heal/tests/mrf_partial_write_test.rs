@@ -90,8 +90,26 @@ async fn partial_write_persistence_failure_is_reported_and_retained_for_retry() 
     );
 }
 
-#[tokio::test]
-async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptance() {
+#[test]
+fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptance() {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mrf-unbound-lifecycle".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("unbound lifecycle runtime should build");
+            runtime.block_on(legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptance_inner());
+        })
+        .expect("unbound lifecycle test thread should spawn")
+        .join()
+        .expect("unbound lifecycle test thread should finish");
+}
+
+async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptance_inner() {
     use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent};
 
     temp_env::async_with_vars([("RUSTFS_HEAL_MRF_ENABLE", Some("true"))], async {
