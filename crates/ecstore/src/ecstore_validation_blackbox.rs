@@ -378,8 +378,10 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     // admission channel and wait for its receipt before acknowledging the write.
     // Drive the test receiver alongside the PUT so neither waits on the other.
     let (_put_dirs, put_store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
-    crate::bucket::metadata_sys::init_bucket_metadata_sys(put_store.clone(), Vec::new()).await;
-    let put_set = put_store.pools[0].disk_set[0].clone();
+    crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&put_store), Vec::new()).await;
+    let put_set = Arc::clone(&put_store.pools[0].disk_set[0]);
+    assert_eq!(put_set.set_drive_count, 4);
+    assert_eq!(put_set.default_parity_count, 2);
     let put_bucket = "bb-put-partial-convergence";
     let put_object = "object.bin";
     put_store
@@ -389,7 +391,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     let put_incarnation = put_store
         .bucket_incarnation_id_from_disk(put_bucket)
         .await
-        .expect("PUT bucket should have a persisted incarnation");
+        .expect("partial repair must bind the real persisted bucket generation");
     let offline_disk = {
         let mut disks = put_set.disks.write().await;
         disks[0].take()
@@ -424,9 +426,10 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         .to_string();
 
     assert_eq!(request.object_version_id.as_deref(), Some(committed_version.as_str()));
-    assert_eq!(request.expected_bucket_incarnation_id, Some(put_incarnation));
     assert_eq!(request.pool_index, Some(0));
     assert_eq!(request.set_index, Some(0));
+    assert_eq!(request.source, HealRequestSource::Mrf);
+    assert_eq!(request.expected_bucket_incarnation_id, Some(put_incarnation));
 
     let duplicate_request = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {

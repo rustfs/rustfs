@@ -155,11 +155,18 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
 threads-required = "num-test-threads"
 
-# These concurrent state writers keep the production 5s lock-acquisition limit
-# while their peer completes durable IO. Reserve capacity from unrelated test
-# processes while preserving each test's internal two-writer race.
+# These real IAM/state fixtures keep production lock-acquisition limits while
+# peers complete durable IO. Reserve capacity from unrelated test processes;
+# the shared fixture's durable_iam_state_ prefix keeps the whole family together.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+threads-required = "num-test-threads"
+
+# Real target-repair and rebalance-stop fixtures commit durable metadata while
+# peers wait on production locks or bounded cancellation checks. Reserve IO
+# capacity for each fixture; its internal races and deadlines remain intact.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
 threads-required = "num-test-threads"
 
 # Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
@@ -319,13 +326,6 @@ retries = 2
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes))'
 test-group = 'ecstore-serial-flaky'
 
-# QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
-# on producer/consumer timing windows that stretch past the budget on loaded
-# CI runners (regression test for rustfs#4644; failed on a zero-Rust-diff PR).
-[[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
-retries = 2
-
 # Serialize the relocated-pool GET resume regression under the ci profile too
 # (see the matching default-profile override near the top). No longer a
 # quarantine: the fixture race (rustfs#6701/rustfs#6703) was fixed by #6707,
@@ -384,10 +384,16 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs) & test(=connect::diagnostics::trace_runtime::tests::local_runtime_profile_cancellation_waits_for_lease_release)'
 threads-required = "num-test-threads"
 
-# Keep the same state-writer capacity reservation in CI without changing the
+# Keep the same IAM/state fixture capacity reservation in CI without changing the
 # production lock deadline, internal concurrency, assertions, or retry policy.
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::test_(peer_edit_generations_are_unique_across_nodes|recreated_state_object_allocates_over_the_previous_lifetimes_mark|state_object_lock_serializes_writers_from_separate_nodes|retry_event_persist_must_not_wipe_concurrent_locked_rmw)$/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+threads-required = "num-test-threads"
+
+# Match the real admin fixture capacity reservation without retries or changes
+# to production lock deadlines, cancellation barriers, or assertions.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(/^admin::handlers::(replication::target_repair_tests::|rebalance::rebalance_handler_tests::real_admin_stop_)/)'
 threads-required = "num-test-threads"
 
 # Reserve capacity for these short heartbeat TLS/fsync probes (rustfs#8129).
@@ -536,13 +542,10 @@ fail-fast = false
 [profile.e2e-smoke.junit]
 path = "junit.xml"
 
-# The pagination boundary cases can stall when a server/listing regression
-# prevents the continuation request from completing. Keep the timeout scoped
-# to those known failure modes so legitimate lifecycle/tiering waits retain
-# their test-level timing budget.
+# These storage-heavy fixtures reserve capacity. Pagination tests bound listing
+# requests separately, after their seed objects have been written.
 [[profile.e2e-smoke.overrides]]
 filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
-slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 threads-required = "num-test-threads"
 
 [[profile.e2e-smoke.overrides]]
