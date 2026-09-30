@@ -403,7 +403,10 @@ async fn enqueue_transition_after_write(
 ) -> Result<ObjectInfo> {
     match result {
         Ok(oi) => {
-            if should_enqueue_transition_immediately(&oi) {
+            // A retried completion did not publish a new object. Immediate
+            // transition/expiry already ran for the original commit; the scanner
+            // still sees the object if that commit never reached this hook.
+            if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
                 enqueue_transition_immediate(&oi, src.clone()).await;
                 if let Ok(api) = metadata_sys::object_store_in(&store.ctx).await {
                     enqueue_immediate_expiry(api, &oi, src, opts).await;

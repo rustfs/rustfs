@@ -17,7 +17,25 @@ pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 use self::commit::lock_rename_commit_directories;
 
 mod commit;
+#[cfg(all(unix, test))]
+#[path = "fd_cache_tests.rs"]
+mod fd_cache_tests;
 mod replacement_lease;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_driver_budget.rs"]
+mod uring_driver_budget;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_probe.rs"]
+mod uring_probe;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_read_budget.rs"]
+mod uring_read_budget;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_read_chunks.rs"]
+mod uring_read_chunks;
+#[cfg(any(target_os = "linux", test))]
+#[path = "uring_result_budget.rs"]
+mod uring_result_budget;
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -91,6 +109,12 @@ use uuid::Uuid;
 
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
 const PART_METADATA_READ_CONCURRENCY: usize = 8;
+
+/// The fresh health path uses a synchronous capacity syscall. Keep the permit
+/// inside the blocking closure so cancelling its async caller cannot admit a
+/// second probe while the first syscall is still running.
+static FRESH_CAPACITY_PROBE_PERMIT: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -799,6 +823,14 @@ const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback
 /// (rustfs/backlog#1172). The gray-release signal operators watch for.
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_READ_CHUNKS: &str = "disk_local_uring_read_chunks";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_DRIVER_BUDGET: &str = "disk_local_uring_driver_budget";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_READ_BUDGET: &str = "disk_local_uring_read_budget";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_RESULT_BUDGET: &str = "disk_local_uring_result_budget";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
@@ -1098,15 +1130,30 @@ const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
 
-/// Maximum bytes handed to the driver in a single op on the buffered read path
-/// (rustfs/backlog#1174). Backpressure permits count OPS, not bytes, and the
-/// driver zero-fills a full-size buffer per op, so an unbounded single read could
-/// pin ~length bytes per permit. Reads at or below this cap take the fast
-/// single-op, zero-copy path; larger reads are split into sequential chunks so
-/// worst-case in-flight memory is bounded by `permits x this` per shard. Set high
-/// so ordinary shard reads are never chunked.
 #[cfg(target_os = "linux")]
-const URING_MAX_OP_LEN: usize = 128 << 20;
+const ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES: &str = "RUSTFS_IO_URING_READ_CHUNK_BYTES";
+
+// Snapshot on first enabled backend construction. Invalid configuration disables
+// this backend rather than silently using a different logical read cap.
+#[cfg(target_os = "linux")]
+static URING_READ_CHUNK_SIZE: std::sync::LazyLock<Option<uring_read_chunks::ReadChunkSize>> = std::sync::LazyLock::new(|| {
+    let value = std::env::var_os(ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES);
+    match uring_read_chunks::ReadChunkSize::from_env_value(value.as_deref()) {
+        Ok(size) => Some(size),
+        Err(error) => {
+            warn!(
+                event = EVENT_DISK_LOCAL_URING_READ_CHUNKS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "invalid_configuration",
+                config = ENV_RUSTFS_IO_URING_READ_CHUNK_BYTES,
+                reason = %error,
+                "Invalid io_uring read chunk size; using StdBackend"
+            );
+            None
+        }
+    }
+});
 
 /// Number of independent io_uring rings (each with its own driver thread) to run
 /// per disk (backlog#1145).
@@ -1125,6 +1172,85 @@ const URING_MAX_OP_LEN: usize = 128 << 20;
 const ENV_RUSTFS_IO_URING_SHARDS: &str = "RUSTFS_IO_URING_SHARDS";
 #[cfg(target_os = "linux")]
 const MAX_URING_SHARDS: usize = 16;
+
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS: &str = "RUSTFS_IO_URING_MAX_DRIVER_THREADS";
+
+// Read once on first enabled backend initialization. Invalid configuration is
+// explicitly disabled, never silently converted into unlimited admission.
+#[cfg(target_os = "linux")]
+static URING_DRIVER_THREAD_BUDGET: std::sync::LazyLock<Option<uring_driver_budget::DriverThreadBudget>> =
+    std::sync::LazyLock::new(|| {
+        let value = std::env::var_os(ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS);
+        match uring_driver_budget::DriverThreadBudget::from_env_value(value.as_deref()) {
+            Ok(budget) => Some(budget),
+            Err(error) => {
+                warn!(
+                    event = EVENT_DISK_LOCAL_URING_DRIVER_BUDGET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    state = "invalid_configuration",
+                    config = ENV_RUSTFS_IO_URING_MAX_DRIVER_THREADS,
+                    reason = %error,
+                    "Invalid io_uring driver thread budget; using StdBackend"
+                );
+                None
+            }
+        }
+    });
+
+#[cfg(target_os = "linux")]
+static URING_DRIVER_BUDGET_EXHAUSTION_LOGGED: AtomicBool = AtomicBool::new(false);
+
+// Keep a single accounting domain alive across backend retirement and reconnect.
+// A leaked library Pending retains its receipt even after the backend is gone.
+#[cfg(target_os = "linux")]
+static URING_READ_BUDGET: std::sync::LazyLock<Option<uring_read_budget::DriverReadBudget>> = std::sync::LazyLock::new(|| {
+    let total = std::env::var_os(uring_read_budget::ENV_TOTAL);
+    let per_driver = std::env::var_os(uring_read_budget::ENV_DRIVER);
+    match uring_read_budget::ReadBudgetConfig::from_env_values(total.as_deref(), per_driver.as_deref())
+        .and_then(uring_read_budget::DriverReadBudget::from_config)
+    {
+        Ok(budget) => Some(budget),
+        Err(error) => {
+            warn!(
+                event = EVENT_DISK_LOCAL_URING_READ_BUDGET,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "invalid_configuration",
+                total_config = uring_read_budget::ENV_TOTAL,
+                driver_config = uring_read_budget::ENV_DRIVER,
+                reason = %error,
+                "Invalid io_uring shared read budget; using StdBackend"
+            );
+            None
+        }
+    }
+});
+
+#[cfg(target_os = "linux")]
+static URING_RESULT_BUDGET: std::sync::LazyLock<Option<uring_result_budget::ProcessResultBudget>> =
+    std::sync::LazyLock::new(|| {
+        let value = std::env::var_os(uring_result_budget::ENV_RESULT);
+        match uring_result_budget::ResultBudgetConfig::from_env_value(value.as_deref()) {
+            Ok(config) => Some(uring_result_budget::ProcessResultBudget::from_config(config)),
+            Err(error) => {
+                warn!(
+                    event = EVENT_DISK_LOCAL_URING_RESULT_BUDGET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    state = "invalid_configuration",
+                    config = uring_result_budget::ENV_RESULT,
+                    reason = %error,
+                    "Invalid io_uring result budget; using StdBackend"
+                );
+                None
+            }
+        }
+    });
+
+#[cfg(target_os = "linux")]
+static URING_READ_BUDGET_EXHAUSTION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Shards per disk: `RUSTFS_IO_URING_SHARDS` when set, else a quarter of the
 /// available parallelism clamped to `1..=4`. Clamped to `1..=MAX_URING_SHARDS`
@@ -1246,13 +1372,24 @@ pub(crate) fn durability_mode() -> DurabilityMode {
             rustfs_utils::get_env_opt_str(ENV_RUSTFS_DURABILITY_MODE),
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
         );
-        info!(
-            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-            mode = mode.as_str(),
-            "Storage durability mode resolved"
-        );
+        if mode == DurabilityMode::Strict {
+            info!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                mode = mode.as_str(),
+                "Storage durability mode resolved"
+            );
+        } else {
+            warn!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "non_strict_mode_configured",
+                mode = mode.as_str(),
+                "Storage durability mode does not provide strict power-loss durability"
+            );
+        }
         mode
     })
 }
@@ -3798,13 +3935,13 @@ const DEFAULT_RUSTFS_IO_URING_FD_CACHE: bool = true;
 /// Open descriptors kept per disk. Each entry holds an fd, so this bounds the
 /// cache's share of `RLIMIT_NOFILE`. moka evicts asynchronously, so the count may
 /// briefly exceed this.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_CAPACITY: u64 = 512;
 
 /// Backstop on how long a cached descriptor may serve reads. Explicit
 /// invalidation (below) is the correctness mechanism; this only bounds the
 /// blast radius if a future mutation path forgets to call it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
@@ -3883,9 +4020,7 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
 
 /// A cached descriptor is keyed by the open flags too: the O_DIRECT and buffered
 /// read paths must never hand each other a descriptor opened the other way.
-/// Only the buffered path caches today, so `direct` is always `false`; keeping it
-/// in the key stops a future O_DIRECT cache from colliding with this one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct FdKey {
     volume: String,
@@ -3908,10 +4043,11 @@ struct FdCacheEntry {
 
 /// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
 ///
-/// Why this exists: `pread_uring` opened the file on the blocking pool for every
-/// read, so each read paid a `spawn_blocking` round trip — the very thread hop
-/// io_uring exists to avoid. Measured on a 16-core host with a 4-shard driver,
-/// removing it is worth +36% to +180% IOPS and 3-5x better p999.
+/// Why this exists: both `pread_uring` and the native O_DIRECT path used to open
+/// the file on the blocking pool for every read, so each read paid a
+/// `spawn_blocking` round trip — the very thread hop io_uring exists to avoid.
+/// Measured on a 16-core host with a 4-shard driver, removing that hop is worth
+/// +36% to +180% IOPS and 3-5x better p999.
 ///
 /// Why it is safe to cache a *part file* descriptor:
 /// - only `<object>/<data_dir>/part.N` reaches this backend's `pread_bytes`;
@@ -3933,7 +4069,7 @@ struct FdCacheEntry {
 /// TTL should a future mutation path forget to invalidate; `max_capacity` bounds
 /// this cache's share of `RLIMIT_NOFILE`. Eviction drops the `Arc<File>`, closing
 /// the descriptor once no in-flight read still holds it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<FdCacheEntry>>,
     /// Bumped by every invalidation. A miss-path open snapshots this before it
@@ -3943,7 +4079,7 @@ struct FdCache {
     generation: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 impl FdCache {
     fn new() -> Self {
         Self::with_ttl(FD_CACHE_TTL)
@@ -3990,19 +4126,21 @@ impl FdCache {
         }
     }
 
-    /// Drop the descriptor for exactly this path. Preferred wherever the caller
-    /// knows the keys: unlike a predicate it costs nothing on later reads.
+    /// Drop both buffered and direct-mode descriptors for exactly this path.
+    /// Once awaited, both variants have been invalidated; the two operations
+    /// are not an atomic pair. Unlike a predicate, this adds no later-read cost.
     async fn invalidate_exact(&self, volume: &str, path: &str) {
         // Bump BEFORE the moka invalidation so a concurrent miss-path insert
         // that snapshotted the old generation is refused (rustfs/backlog#1176).
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.cache
-            .invalidate(&FdKey {
-                volume: volume.to_owned(),
-                path: path.to_owned(),
-                direct: false,
-            })
-            .await;
+        let mut key = FdKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            direct: false,
+        };
+        self.cache.invalidate(&key).await;
+        key.direct = true;
+        self.cache.invalidate(&key).await;
     }
 
     /// Drop every descriptor for `volume` whose path is `prefix` or lies under it.
@@ -4065,6 +4203,9 @@ impl FdCache {
     }
 }
 
+#[cfg(target_os = "linux")]
+type BudgetedUringDriver = uring_driver_budget::BudgetedDriver<rustfs_uring::UringDriver>;
+
 /// Runtime-probed io_uring read backend (backlog#1104).
 ///
 /// Wraps a [`StdBackend`] for everything except positioned reads, which go
@@ -4077,6 +4218,9 @@ impl FdCache {
 #[cfg(target_os = "linux")]
 pub(crate) struct UringBackend {
     root: PathBuf,
+    /// Per-operation logical read cap, excluding direct padding, concurrent
+    /// requests and the full assembled/returned application result.
+    read_chunk_size: uring_read_chunks::ReadChunkSize,
     /// Caches `root.display().to_string()` for the metric `"root"` label. `root`
     /// never changes after construction, so formatting the `Path` on every
     /// fallback emission is pure waste (rustfs/backlog#1185).
@@ -4087,7 +4231,11 @@ pub(crate) struct UringBackend {
     /// can block up to the bounded-drain timeout on a hung disk, which must never
     /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
     /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
-    driver: std::mem::ManuallyDrop<Arc<rustfs_uring::UringDriver>>,
+    driver: std::mem::ManuallyDrop<Arc<BudgetedUringDriver>>,
+    /// Optional process-wide result/fallback reservation. The receipt is
+    /// attached to returned `Bytes`, so retained result clones keep the budget
+    /// charged instead of releasing it when the read future completes.
+    result_budget: uring_result_budget::ProcessResultBudget,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -4199,7 +4347,65 @@ impl UringBackend {
     /// Probe io_uring on `root`; `Some(backend)` if usable, `None` to fall back
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
     /// unexpected errno is surfaced as a warning (both still fall back).
-    pub(crate) fn try_new(root: PathBuf) -> Option<Self> {
+    pub(crate) async fn try_new(root: PathBuf) -> Option<Self> {
+        let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
+        let read_budget = URING_READ_BUDGET.as_ref()?;
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
+        let read_chunk_size = (*URING_READ_CHUNK_SIZE)?;
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            get_io_uring_shards(),
+            budget,
+            read_budget,
+            result_budget,
+            read_chunk_size,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn try_new_with_budgets(
+        root: PathBuf,
+        shards: usize,
+        budget: &uring_driver_budget::DriverThreadBudget,
+        read_budget: &uring_read_budget::DriverReadBudget,
+    ) -> Option<Self> {
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            shards,
+            budget,
+            read_budget,
+            result_budget,
+            (*URING_READ_CHUNK_SIZE)?,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn try_new_with_read_chunk_size(root: PathBuf, read_chunk_size: uring_read_chunks::ReadChunkSize) -> Option<Self> {
+        let budget = URING_DRIVER_THREAD_BUDGET.as_ref()?;
+        let read_budget = URING_READ_BUDGET.as_ref()?;
+        let result_budget = URING_RESULT_BUDGET.as_ref()?;
+        Self::try_new_with_budgets_and_read_chunk_size(
+            root,
+            get_io_uring_shards(),
+            budget,
+            read_budget,
+            result_budget,
+            read_chunk_size,
+        )
+        .await
+    }
+
+    async fn try_new_with_budgets_and_read_chunk_size(
+        root: PathBuf,
+        shards: usize,
+        budget: &uring_driver_budget::DriverThreadBudget,
+        read_budget: &uring_read_budget::DriverReadBudget,
+        result_budget: &uring_result_budget::ProcessResultBudget,
+        read_chunk_size: uring_read_chunks::ReadChunkSize,
+    ) -> Option<Self> {
         // Per-disk probe cache: skip a disk already known not to support
         // io_uring (backlog#1101).
         if URING_UNSUPPORTED_DISKS
@@ -4209,8 +4415,36 @@ impl UringBackend {
         {
             return None;
         }
-        let shards = get_io_uring_shards();
-        match rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards) {
+        let thread_slots = match budget.try_reserve(shards) {
+            Ok(slots) => slots,
+            Err(_) => {
+                if !URING_DRIVER_BUDGET_EXHAUSTION_LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_URING_DRIVER_BUDGET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        state = "capacity_unavailable",
+                        requested_shards = shards,
+                        "io_uring driver thread budget exhausted; using StdBackend"
+                    );
+                }
+                // Capacity can return after another driver retires. This is not
+                // an io_uring restriction and must not enter the negative cache.
+                return None;
+            }
+        };
+        // Only the driver probe is detached into blocking work. `root` may be
+        // rooted at a mount-lease fd owned by LocalDisk::new; keep all path-based
+        // backend construction in this future so cancellation cannot outlive it.
+        let read_budget = read_budget.clone();
+        let probe = uring_probe::run(move || {
+            read_budget
+                .start_driver(URING_QUEUE_DEPTH, shards)
+                .map(|driver| uring_driver_budget::BudgetedDriver::new(driver, thread_slots))
+        })
+        .await
+        .unwrap_or_else(|error| Err(rustfs_uring::ProbeFailure::Setup(error)));
+        match probe {
             Ok(driver) => {
                 info!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -4247,14 +4481,32 @@ impl UringBackend {
                 Some(Self {
                     inner: StdBackend::new_without_fd_cache(root.clone()),
                     root,
+                    read_chunk_size,
                     root_label,
                     driver: std::mem::ManuallyDrop::new(driver),
+                    result_budget: result_budget.clone(),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
                     native_direct_reads: std::sync::atomic::AtomicU64::new(0),
                     fd_cache,
                 })
+            }
+            Err(rustfs_uring::ProbeFailure::Setup(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock && error.raw_os_error().is_none() =>
+            {
+                if !URING_READ_BUDGET_EXHAUSTION_LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_URING_READ_BUDGET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        state = "capacity_unavailable",
+                        "io_uring shared read budget exhausted; using StdBackend"
+                    );
+                }
+                // This is temporary pool pressure, not a kernel restriction.
+                // Construction can retry after retirement releases a reservation.
+                None
             }
             Err(err) => {
                 if err.is_expected_restriction() {
@@ -4326,10 +4578,9 @@ impl UringBackend {
     /// reference it takes to read stats is dropped on the blocking pool so that,
     /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
     /// runs on an async worker (rustfs/backlog#1170).
-    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
-        // try_new may be constructed outside a tokio runtime (some unit tests
-        // build the backend directly); only run the exporter when a runtime is
-        // present. Production always constructs it from async LocalDisk::new.
+    fn spawn_stats_exporter(driver: &Arc<BudgetedUringDriver>, root: PathBuf) {
+        // Export into the caller's runtime after the blocking probe completes;
+        // backend construction remains in async LocalDisk::new's task.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
@@ -4478,7 +4729,7 @@ impl UringBackend {
 
         // The driver consumes the handle; keep one for the post-read reclaim.
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = if length <= URING_MAX_OP_LEN {
+        let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
             match self.driver.read_at(file, offset_u64, length).await {
                 Ok(bytes) => bytes,
@@ -4493,14 +4744,13 @@ impl UringBackend {
                 }
             }
         } else {
-            // Very large read: split into sequential chunks so a single op cannot
-            // pin ~length bytes of driver buffer, bounding worst-case in-flight
-            // memory (rustfs/backlog#1174). Chunks are awaited one at a time, so
-            // only one is in flight per read.
+            // Sequential chunks cap each driver operation's logical length.
+            // The full assembled result below is a separate allocation and is
+            // not bounded by the per-operation cap.
             let mut assembled = Vec::with_capacity(length);
             let mut done = 0usize;
             while done < length {
-                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
                 let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
                     Ok(part) => part,
@@ -4555,56 +4805,91 @@ impl UringBackend {
         let Some(end_offset) = offset.checked_add(length) else {
             return Err(DiskError::FileCorrupt);
         };
-        let root = self.root.clone();
-        let volume_owned = volume.to_owned();
-        let path_owned = path.to_owned();
         // Probe the device alignment at most once per disk: pass the cached
         // value in so the blocking closure can skip `statx` when it is known.
         let cached_align = self.direct_uring.align.get().copied();
 
-        let opened = tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
-            let file = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
-                .open(&file_path)
-            {
-                Ok(file) => file,
-                // Filesystem refuses O_DIRECT: signal a latch, not a hard error.
-                Err(e) if is_direct_io_unsupported(&e) => return Err(DirectOpenError::ODirectRefused),
-                Err(e) => return Err(DirectOpenError::Disk(DiskError::from(e))),
-            };
-            let meta = file.metadata().map_err(|e| DirectOpenError::Disk(DiskError::from(e)))?;
-            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
-            if meta.len() < end_offset_u64 {
-                return Err(DirectOpenError::Disk(DiskError::FileCorrupt));
-            }
-            let offset_u64 = u64::try_from(offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
-            let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
-            Ok((file, offset_u64, align))
-        })
-        .await
-        .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
-
-        let (file, offset_u64, probed_align) = match opened {
-            Ok(t) => t,
-            Err(DirectOpenError::ODirectRefused) => {
-                // Latch the native O_DIRECT path off for this disk; the caller
-                // falls back to StdBackend's aligned path for this and every
-                // future eligible read.
-                self.direct_uring.supported.store(false, Ordering::Relaxed);
-                if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
-                    debug!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        "filesystem refused O_DIRECT under io_uring; using StdBackend aligned path (logged once per disk)"
-                    );
-                }
-                return Err(DiskError::other("filesystem refused O_DIRECT"));
-            }
-            Err(DirectOpenError::Disk(e)) => return Err(e),
+        let key = FdKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            direct: true,
         };
+        let cache = self.fd_cache.as_ref();
+        let cached = match cache {
+            Some(cache) => cache.get(&key).await,
+            None => None,
+        };
+        let (file, file_len, probed_align) = match cached {
+            Some(entry) => {
+                // Every direct cache entry is populated after the first alignment
+                // probe. Never reintroduce a blocking statx call on a Tokio worker
+                // if an entry outlives a future state change.
+                let align = cached_align.ok_or_else(|| DiskError::other("direct fd cache entry missing alignment state"))?;
+                (Arc::clone(&entry.file), entry.len, align)
+            }
+            None => {
+                let root = self.root.clone();
+                let volume_owned = volume.to_owned();
+                let path_owned = path.to_owned();
+                let gen_at_open = cache.map(FdCache::generation);
+                let opened =
+                    tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let file_path =
+                            resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
+                        let file = match std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+                            .open(&file_path)
+                        {
+                            Ok(file) => file,
+                            // Filesystem refuses O_DIRECT: signal a latch, not a hard error.
+                            Err(e) if is_direct_io_unsupported(&e) => return Err(DirectOpenError::ODirectRefused),
+                            Err(e) => return Err(DirectOpenError::Disk(DiskError::from(e))),
+                        };
+                        let len = file.metadata().map_err(|e| DirectOpenError::Disk(DiskError::from(e)))?.len();
+                        let end_offset_u64 =
+                            u64::try_from(end_offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
+                        if len < end_offset_u64 {
+                            return Err(DirectOpenError::Disk(DiskError::FileCorrupt));
+                        }
+                        let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
+                        Ok((file, len, align))
+                    })
+                    .await
+                    .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
+                let (file, len, align) = match opened {
+                    Ok(opened) => opened,
+                    Err(DirectOpenError::ODirectRefused) => {
+                        self.direct_uring.supported.store(false, Ordering::Relaxed);
+                        if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                            debug!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                "filesystem refused O_DIRECT under io_uring; using StdBackend aligned path (logged once per disk)"
+                            );
+                        }
+                        return Err(DiskError::other("filesystem refused O_DIRECT"));
+                    }
+                    Err(DirectOpenError::Disk(error)) => return Err(error),
+                };
+                let entry = Arc::new(FdCacheEntry {
+                    file: Arc::new(file),
+                    len,
+                });
+                if let (Some(cache), Some(gen_at_open)) = (cache, gen_at_open) {
+                    cache.insert_if_fresh(key.clone(), Arc::clone(&entry), gen_at_open).await;
+                }
+                (entry.file.clone(), len, align)
+            }
+        };
+
+        let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+        let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+        if file_len < end_offset_u64 {
+            return Err(DiskError::FileCorrupt);
+        }
+
         // Cache the alignment so the next read skips the statx probe.
         let align = *self.direct_uring.align.get_or_init(|| probed_align);
 
@@ -4612,9 +4897,8 @@ impl UringBackend {
             return Ok(Bytes::new());
         }
 
-        let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = if length <= URING_MAX_OP_LEN {
+        let bytes = if length <= self.read_chunk_size.get() {
             // Fast path: one op. The driver's Vec becomes the result with no copy.
             match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
                 Ok(bytes) => bytes,
@@ -4624,15 +4908,14 @@ impl UringBackend {
                 }
             }
         } else {
-            // Split a very large O_DIRECT read into sequential chunks so a single
-            // op cannot pin ~length bytes of driver buffer, bounding worst-case
-            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
-            // chunk's sub-range internally; chunk sizes are a multiple of
-            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            // The cap is logical: read_at_direct aligns each chunk internally.
+            // A configured cap need not be block-aligned; adjacent chunks may
+            // re-read a boundary block. Padding and the full assembled result
+            // are not limited by this cap.
             let mut assembled = Vec::with_capacity(length);
             let mut done = 0usize;
             while done < length {
-                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk = (length - done).min(self.read_chunk_size.get());
                 let chunk_off = offset_u64 + done as u64;
                 let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
                     Ok(part) => part,
@@ -4676,6 +4959,17 @@ enum DirectOpenError {
 }
 
 #[cfg(target_os = "linux")]
+impl UringBackend {
+    fn reserve_result_bytes(&self, length: usize) -> Result<Option<uring_result_budget::ResultBudgetReservation>> {
+        self.result_budget.reserve(length).map_err(DiskError::Io)
+    }
+
+    fn wrap_result_bytes(&self, bytes: Bytes, reservation: Option<uring_result_budget::ResultBudgetReservation>) -> Bytes {
+        uring_result_budget::BudgetedBytes::wrap(bytes, reservation)
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl LocalIoBackend for UringBackend {
     async fn pread_bytes(
@@ -4686,11 +4980,13 @@ impl LocalIoBackend for UringBackend {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
+        let result_reservation = self.reserve_result_bytes(length)?;
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
             self.record_uring_fallback();
-            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+            let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+            return Ok(self.wrap_result_bytes(bytes, result_reservation));
         }
 
         // O_DIRECT interop (backlog#1102): pick the read shape by eligibility
@@ -4704,7 +5000,7 @@ impl LocalIoBackend for UringBackend {
                 // for this read; the latching errnos already flipped the
                 // relevant per-disk latch inside `pread_uring_direct`.
                 match self.pread_uring_direct(volume, path, offset, length).await {
-                    Ok(bytes) => return Ok(bytes),
+                    Ok(bytes) => return Ok(self.wrap_result_bytes(bytes, result_reservation)),
                     Err(err) => {
                         if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                             debug!(
@@ -4715,7 +5011,8 @@ impl LocalIoBackend for UringBackend {
                             );
                         }
                         self.record_uring_fallback();
-                        return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+                        let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+                        return Ok(self.wrap_result_bytes(bytes, result_reservation));
                     }
                 }
             }
@@ -4723,13 +5020,14 @@ impl LocalIoBackend for UringBackend {
             // aligned path, which itself degrades to buffered if the filesystem
             // rejects O_DIRECT. Not an io_uring downgrade — io_uring cannot
             // serve an O_DIRECT read here without polluting the page cache.
-            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+            let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+            return Ok(self.wrap_result_bytes(bytes, result_reservation));
         }
 
         // Non-O_DIRECT read: buffered io_uring, falling back to StdBackend on any
         // per-read error.
         match self.pread_uring(volume, path, offset, length).await {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok(self.wrap_result_bytes(bytes, result_reservation)),
             Err(err) => {
                 if !self.fallback_logged.swap(true, Ordering::Relaxed) {
                     let latched = !self.active.load(Ordering::Relaxed);
@@ -4742,7 +5040,8 @@ impl LocalIoBackend for UringBackend {
                     );
                 }
                 self.record_uring_fallback();
-                self.inner.pread_bytes(volume, path, offset, length, metrics).await
+                let bytes = self.inner.pread_bytes(volume, path, offset, length, metrics).await?;
+                Ok(self.wrap_result_bytes(bytes, result_reservation))
             }
         }
     }
@@ -4788,10 +5087,10 @@ impl LocalIoBackend for UringBackend {
 /// enabled and the per-disk probe succeeds, otherwise the default
 /// [`StdBackend`] (backlog#1104). Enabling io_uring is opt-in and falls back
 /// byte-for-byte, so the default build is unchanged.
-fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
+async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     #[cfg(target_os = "linux")]
     if is_io_uring_read_enabled()
-        && let Some(backend) = UringBackend::try_new(root.clone())
+        && let Some(backend) = UringBackend::try_new(root.clone()).await
     {
         return Arc::new(backend);
     }
@@ -5292,7 +5591,7 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
-            io_backend: build_local_io_backend(io_root.clone()),
+            io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
             snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
         };
@@ -6627,7 +6926,9 @@ impl LocalDisk {
 
         let (buf, mtime) = res?;
         if buf.is_empty() {
-            return Err(DiskError::FileNotFound);
+            // A missing xl.meta is mapped by the open/read error above. A file
+            // that exists but has no metadata bytes is corruption, not absence.
+            return Err(DiskError::FileCorrupt);
         }
 
         Ok((buf, mtime))
@@ -10159,28 +10460,30 @@ impl DiskAPI for LocalDisk {
                 };
                 write_metacache_obj(&mut out, &meta).await?;
                 objs_returned += 1;
-            } else {
-                let fpath = self
-                    .io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+            }
 
-                if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
-                    && meta.is_file()
+            // A plain object shares this directory with its children even when
+            // an explicit directory marker exists in the sibling encoded path.
+            let fpath =
+                self.io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+
+            if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
+                && meta.is_file()
+            {
+                skip_current_dir_object = true;
+                if let Ok(meta_bytes) = with_walk_stall_deadline(
+                    stall,
+                    self.read_metadata(
+                        opts.bucket.as_str(),
+                        path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
+                    ),
+                )
+                .await?
+                    && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                    && let Ok(data_dirs) = file_meta.get_data_dirs()
                 {
-                    skip_current_dir_object = true;
-                    if let Ok(meta_bytes) = with_walk_stall_deadline(
-                        stall,
-                        self.read_metadata(
-                            opts.bucket.as_str(),
-                            path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
-                        ),
-                    )
-                    .await?
-                        && let Ok(file_meta) = FileMeta::load(&meta_bytes)
-                        && let Ok(data_dirs) = file_meta.get_data_dirs()
-                    {
-                        for data_dir in data_dirs.iter().flatten() {
-                            multipart_dir_to_skip.insert(data_dir.to_string());
-                        }
+                    for data_dir in data_dirs.iter().flatten() {
+                        multipart_dir_to_skip.insert(data_dir.to_string());
                     }
                 }
             }
@@ -10841,7 +11144,34 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
+        if opts.fresh_capacity {
+            let permit = FRESH_CAPACITY_PROBE_PERMIT
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| DiskError::other("fresh capacity probe unavailable"))?;
+            let root = self.root.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let drive_path = root.to_string_lossy().to_string();
+                check_path_length(&drive_path)?;
+                get_info(&drive_path).map_err(DiskError::from)
+            })
+            .await
+            .map_err(|_| DiskError::other("fresh capacity probe failed"))??;
+            let healing = fs::try_exists(self.root.join(RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
+                .await
+                .unwrap_or(false);
+            return Ok(DiskInfo {
+                total: info.total,
+                free: info.free,
+                used: info.used,
+                healing,
+                fresh_capacity: true,
+                ..Default::default()
+            });
+        }
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
@@ -11376,6 +11706,39 @@ mod test {
             )
             .await
             .expect_err("invalid erasure geometry must fail before shard size calculation");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
+    async fn read_version_reports_empty_xl_meta_as_corrupt_not_missing() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("test directory should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("test path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "empty-metadata";
+        ensure_test_volume(&disk, bucket).await;
+
+        let missing_err = disk
+            .read_version("", bucket, "missing-object", "", &ReadOptions::default())
+            .await
+            .expect_err("a missing xl.meta remains not found");
+        assert_eq!(missing_err, DiskError::FileNotFound);
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir)
+            .await
+            .expect("object directory should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"")
+            .await
+            .expect("empty metadata fixture should be written");
+
+        let err = disk
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("an existing zero-length xl.meta is corrupt, not an absent object");
 
         assert_eq!(err, DiskError::FileCorrupt);
     }
@@ -18392,6 +18755,89 @@ mod test {
         );
     }
 
+    async fn assert_walk_dir_prefix_marker_entries(with_plain_object: bool) {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        async fn write_metadata(root: &Path, name: &str, size: i64, data_dir: Option<Uuid>) -> Vec<u8> {
+            let object_dir = root.join(encode_dir_object(name));
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("object directory should be created");
+            let mut file_info = FileInfo::new(name, 1, 1);
+            file_info.size = size;
+            file_info.data_dir = data_dir;
+            file_info.mod_time = Some(OffsetDateTime::now_utc());
+            let mut metadata = FileMeta::default();
+            metadata.add_version(file_info).expect("object metadata should be valid");
+            let bytes = metadata.marshal_msg().expect("object metadata should encode");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &bytes)
+                .await
+                .expect("object metadata should be written");
+            bytes
+        }
+
+        let dir = tempdir().expect("temporary disk should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let marker_metadata = write_metadata(&bucket_dir, "content/", 0, None).await;
+        let child_metadata = write_metadata(&bucket_dir, "content/child", 7, None).await;
+        let data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("data directory UUID should parse");
+        if with_plain_object {
+            write_metadata(&bucket_dir, "content", 19, Some(data_dir)).await;
+            // A storage data directory can contain metadata-bearing subdirectories.
+            // The entire directory must be skipped rather than exposed as objects.
+            write_metadata(&bucket_dir, &format!("content/{data_dir}/segment"), 31, None).await;
+            fs::write(bucket_dir.join("content").join(data_dir.to_string()).join("part.1"), b"part")
+                .await
+                .expect("object part should be written");
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let (reader, mut writer) = tokio::io::duplex(65536);
+        disk.walk_dir(
+            WalkDirOptions {
+                bucket: bucket.to_owned(),
+                base_dir: "content/".to_owned(),
+                recursive: true,
+                ..Default::default()
+            },
+            &mut writer,
+        )
+        .await
+        .expect("prefix walk should succeed");
+        let entries = MetacacheReader::new(reader)
+            .read_all()
+            .await
+            .expect("walk output should decode");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.name.starts_with(&format!("content/{data_dir}"))),
+            "plain object storage directories must not appear in the walk"
+        );
+        let objects: Vec<_> = entries.into_iter().filter(MetaCacheEntry::is_object).collect();
+        assert_eq!(
+            objects.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["content/", "content/child"],
+            "the marker and child must each appear exactly once"
+        );
+        assert_eq!(objects[0].metadata, marker_metadata, "the marker must retain its own metadata");
+        assert_eq!(objects[1].metadata, child_metadata, "the child must retain its own metadata");
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_prefix_marker_with_children_is_unique() {
+        assert_walk_dir_prefix_marker_entries(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_prefix_marker_skips_plain_object_and_parts() {
+        assert_walk_dir_prefix_marker_entries(true).await;
+    }
+
     #[tokio::test]
     async fn test_scan_dir_reports_base_dir_object_metadata() {
         use rustfs_filemeta::MetacacheReader;
@@ -20826,6 +21272,7 @@ mod test {
             disk_id: "test-disk".to_string(),
             metrics: true,
             noop: false,
+            fresh_capacity: false,
         };
 
         let disk_info = disk.disk_info(&disk_info_opts).await.expect("operation should succeed");
@@ -20842,6 +21289,26 @@ mod test {
         assert_eq!(disk_info.rotational, disk.rotational);
         assert!(!disk_info.mount_path.is_empty());
         assert!(!disk_info.endpoint.is_empty());
+
+        let fresh = disk
+            .disk_info(&DiskInfoOptions {
+                fresh_capacity: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fresh capacity should be available");
+        assert!(fresh.fresh_capacity);
+        assert!(fresh.total > 0);
+        assert!(fresh.used <= fresh.total);
+        assert!(fresh.endpoint.is_empty());
+        assert!(fresh.mount_path.is_empty());
+        assert!(fresh.physical_device_ids.is_empty());
+        assert!(fresh.id.is_none());
+        assert!(fresh.fs_type.is_empty());
+        assert_eq!(fresh.major, 0);
+        assert_eq!(fresh.minor, 0);
+        assert_eq!(fresh.used_inodes, 0);
+        assert_eq!(fresh.free_inodes, 0);
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
@@ -22584,11 +23051,131 @@ mod test {
         eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
     }
 
+    #[cfg(target_os = "linux")]
+    async fn check_uring_configured_read_chunks(direct: bool) {
+        const FILE_LEN: usize = 65536 + 7;
+        let root_dir = tempfile::tempdir().expect("chunked read fixture");
+        let root = root_dir.path().to_path_buf();
+        let volume = "chunk-bucket";
+        let path = "object/part.1";
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        std::fs::create_dir_all(root.join(volume).join("object")).expect("fixture directory");
+        std::fs::write(root.join(volume).join(path), &content).expect("fixture contents");
+
+        for (cap_index, cap) in [4096usize, 4097].into_iter().enumerate() {
+            let chunk_size = uring_read_chunks::ReadChunkSize::from_env_value(Some(std::ffi::OsStr::new(&cap.to_string())))
+                .expect("valid test cap");
+            let Some(backend) = UringBackend::try_new_with_read_chunk_size(root.clone(), chunk_size).await else {
+                assert_eq!(
+                    cap_index, 0,
+                    "io_uring already worked for this fixture; a later backend failure is not a capability skip"
+                );
+                uring_test_skip("uring_configured_read_chunks (io_uring probe)");
+                return;
+            };
+            if direct && cap_index == 0 {
+                // Establish support with one fixed, aligned read before testing
+                // any chunk shape. Only this preflight may skip for O_DIRECT;
+                // later EINVAL/alignment errors must fail even outside MUST_RUN.
+                let native_before = backend.native_direct_reads.load(Ordering::Relaxed);
+                let preflight = backend.pread_uring_direct(volume, path, 0, 4096).await;
+                let bytes = match preflight {
+                    Ok(bytes) => bytes,
+                    Err(_) if !backend.direct_uring.supported.load(Ordering::Relaxed) => {
+                        uring_test_skip("uring_configured_read_chunks (native O_DIRECT preflight unavailable)");
+                        return;
+                    }
+                    Err(error) => panic!("aligned O_DIRECT preflight failed unexpectedly: {error:?}"),
+                };
+                assert_eq!(bytes.as_ref(), &content[..4096], "preflight must read the exact fixture bytes");
+                assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), native_before + 1);
+                if let Some(cache) = backend.fd_cache.as_ref() {
+                    assert_eq!(
+                        cache.entry_count().await,
+                        1,
+                        "the first native direct read must populate the direct descriptor cache"
+                    );
+                }
+            }
+            // Cover the fast-path boundary, multiple operations, unaligned heads,
+            // non-block-multiple caps, exact EOF and the zero-length no-op.
+            for (offset, length) in [
+                (0, cap),
+                (3, cap + 1),
+                (31, 3 * cap + 13),
+                (cap - 1, 2 * cap + 7),
+                (FILE_LEN - 2 * cap - 7, 2 * cap + 7),
+                (FILE_LEN, 0),
+            ] {
+                let before = backend.driver.stats().submitted;
+                let direct_before = backend.native_direct_reads.load(Ordering::Relaxed);
+                // Invoke the actual backend read implementations directly: no env
+                // mutation and no StdBackend fallback can hide a missing chunk.
+                let result = if direct {
+                    backend.pread_uring_direct(volume, path, offset, length).await
+                } else {
+                    backend.pread_uring(volume, path, offset, length).await
+                };
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        panic!("chunked read failed: direct={direct} cap={cap} offset={offset} length={length}: {error:?}")
+                    }
+                };
+                assert_eq!(
+                    bytes.as_ref(),
+                    &content[offset..offset + length],
+                    "direct={direct} cap={cap} offset={offset}"
+                );
+                let operations = u64::try_from(length.div_ceil(cap)).expect("small fixture operation count");
+                assert_eq!(
+                    backend.driver.stats().submitted - before,
+                    operations,
+                    "configured chunk cap must reach the driver"
+                );
+                if direct && length != 0 {
+                    assert_eq!(backend.native_direct_reads.load(Ordering::Relaxed), direct_before + 1);
+                }
+            }
+            if direct && let Some(cache) = backend.fd_cache.as_ref() {
+                assert_eq!(cache.entry_count().await, 1, "direct reads must reuse one cached O_DIRECT descriptor");
+            }
+            for (offset, length) in [(FILE_LEN - 1, 2), (FILE_LEN + 1, 0)] {
+                let before = backend.driver.stats().submitted;
+                let result = if direct {
+                    backend.pread_uring_direct(volume, path, offset, length).await
+                } else {
+                    backend.pread_uring(volume, path, offset, length).await
+                };
+                assert!(matches!(result, Err(DiskError::FileCorrupt)), "range validation changed: {result:?}");
+                assert_eq!(
+                    backend.driver.stats().submitted,
+                    before,
+                    "invalid full ranges must fail before the first chunk"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_configured_read_chunks_buffered_match_bytes_and_operation_count() {
+        check_uring_configured_read_chunks(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_configured_read_chunks_direct_match_bytes_and_operation_count() {
+        check_uring_configured_read_chunks(true).await;
+    }
+
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
     /// unsupported is skipped by `try_new` without a fresh probe.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn uring_probe_cache_skips_known_unsupported_disk() {
+    #[tokio::test]
+    async fn uring_probe_cache_skips_known_unsupported_disk() {
         use tempfile::tempdir;
 
         // Precondition: io_uring must be usable on this host. Otherwise a `None`
@@ -22598,7 +23185,7 @@ mod test {
         // unavailable. (The returned backend, if any, is dropped immediately,
         // shutting its driver down.)
         let probe_dir = tempdir().expect("tempdir");
-        if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+        if UringBackend::try_new(probe_dir.path().to_path_buf()).await.is_none() {
             uring_test_skip("uring_probe_cache_skips_known_unsupported_disk");
             return;
         }
@@ -22610,7 +23197,7 @@ mod test {
             .lock()
             .expect("uring probe cache mutex poisoned")
             .insert(cached.clone());
-        let skipped = UringBackend::try_new(cached.clone()).is_none();
+        let skipped = UringBackend::try_new(cached.clone()).await.is_none();
         // Clean up the process-wide cache entry so no shared state leaks to
         // other tests.
         URING_UNSUPPORTED_DISKS
@@ -22618,6 +23205,287 @@ mod test {
             .expect("uring probe cache mutex poisoned")
             .remove(&cached);
         assert!(skipped, "a cached-unsupported disk must skip the probe and return None");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_driver_thread_budget_denial_is_retryable_after_real_driver_retirement() {
+        let root_dir = tempfile::tempdir().expect("budget test root");
+        let root = root_dir.path().to_path_buf();
+        let budget = uring_driver_budget::DriverThreadBudget::from_env_value(Some(std::ffi::OsStr::new("1")))
+            .expect("one driver thread budget");
+        // Positive precondition: do not mistake a restricted-kernel None for
+        // successful budget denial. Fix shards locally without changing env.
+        let read_budget = uring_read_budget::DriverReadBudget::Disabled;
+        let Some(backend) = UringBackend::try_new_with_budgets(root.clone(), 1, &budget, &read_budget).await else {
+            uring_test_skip("uring_driver_thread_budget_denial_is_retryable_after_real_driver_retirement");
+            return;
+        };
+        let exporter_reference = Arc::clone(&*backend.driver);
+        let weak = Arc::downgrade(&exporter_reference);
+        let denied = tokio::time::timeout(
+            Duration::from_secs(2),
+            UringBackend::try_new_with_budgets(root.clone(), 1, &budget, &read_budget),
+        )
+        .await
+        .expect("budget exhaustion must not queue behind a live driver");
+        assert!(denied.is_none());
+        assert!(
+            !URING_UNSUPPORTED_DISKS.lock().expect("probe cache lock").contains(&root),
+            "budget denial must not permanently mark the root unsupported"
+        );
+        drop(backend);
+        assert!(
+            budget.try_reserve(1).is_err(),
+            "an outstanding stats reference still owns the live driver"
+        );
+        tokio::task::spawn_blocking(move || drop(exporter_reference))
+            .await
+            .expect("drop last explicit driver reference off worker");
+        let uring_driver_budget::DriverThreadBudget::Limited(permits) = &budget else {
+            panic!("finite test budget")
+        };
+        let returned = tokio::time::timeout(Duration::from_secs(10), permits.clone().acquire_owned())
+            .await
+            .expect("real driver join must return its thread reservation")
+            .expect("budget remains open");
+        assert!(weak.upgrade().is_none(), "reservation must not return before driver owner destruction");
+        drop(returned);
+        let rebuilt = UringBackend::try_new_with_budgets(root.clone(), 1, &budget, &read_budget)
+            .await
+            .expect("same root can probe again after temporary budget denial");
+        assert!(budget.try_reserve(1).is_err(), "replacement driver is charged");
+        drop(rebuilt);
+        let returned = tokio::time::timeout(Duration::from_secs(10), permits.clone().acquire_owned())
+            .await
+            .expect("replacement driver joins and returns capacity")
+            .expect("budget remains open");
+        drop(returned);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uring_test_read_budget(total: usize, per_driver: usize) -> uring_read_budget::DriverReadBudget {
+        let config = uring_read_budget::ReadBudgetConfig::from_env_values(
+            Some(std::ffi::OsStr::new(&total.to_string())),
+            Some(std::ffi::OsStr::new(&per_driver.to_string())),
+        )
+        .expect("valid shared read quota pair");
+        uring_read_budget::DriverReadBudget::from_config(config).expect("create shared test pool")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_uring_read_budget(pool: &rustfs_uring::SharedReadBudget, available: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pool.available() != available {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retiring backends must return their clean read quota");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_shared_read_budget_retirement_isolated_and_denial_retryable() {
+        let first_root = tempfile::tempdir().expect("first shared-budget fixture");
+        let second_root = tempfile::tempdir().expect("second shared-budget fixture");
+        let threads = uring_driver_budget::DriverThreadBudget::from_env_value(Some(std::ffi::OsStr::new("3")))
+            .expect("three test driver threads");
+        let reads = uring_test_read_budget(8192, 4096);
+        let uring_read_budget::DriverReadBudget::Limited { pool, .. } = &reads else {
+            panic!("finite test read budget")
+        };
+        let Some(first) = UringBackend::try_new_with_budgets(first_root.path().to_path_buf(), 1, &threads, &reads).await else {
+            uring_test_skip("uring_shared_read_budget_retirement_isolated_and_denial_retryable");
+            return;
+        };
+        let second = UringBackend::try_new_with_budgets(second_root.path().to_path_buf(), 1, &threads, &reads)
+            .await
+            .expect("second driver fits after native capability was established");
+        assert_eq!(pool.available(), 0, "idle backends reserve their full driver quotas");
+        let denied = tokio::time::timeout(
+            Duration::from_secs(5),
+            UringBackend::try_new_with_budgets(first_root.path().to_path_buf(), 1, &threads, &reads),
+        )
+        .await
+        .expect("shared quota denial must not await a live driver's retirement");
+        assert!(denied.is_none());
+        let spare_thread = threads
+            .try_reserve(1)
+            .expect("read quota denial returns the tentative thread permit");
+        drop(spare_thread);
+        assert!(
+            !URING_UNSUPPORTED_DISKS
+                .lock()
+                .expect("probe cache lock")
+                .contains(first_root.path()),
+            "temporary read pressure must not poison the negative cache"
+        );
+
+        // This is the same owner borrowed by the real stats exporter.
+        let exporter_reference = Arc::clone(&*first.driver);
+        drop(first);
+        assert_eq!(pool.available(), 0, "backend drop is not final driver retirement");
+        tokio::task::spawn_blocking(move || drop(exporter_reference))
+            .await
+            .expect("drop stats reference outside worker");
+        wait_for_uring_read_budget(pool, 4096).await;
+
+        std::fs::create_dir(second_root.path().join("bucket")).expect("peer fixture bucket");
+        std::fs::write(second_root.path().join("bucket/part"), b"peer read").expect("peer fixture file");
+        let before = second.driver.stats().submitted;
+        assert_eq!(
+            second
+                .pread_uring("bucket", "part", 0, 9)
+                .await
+                .expect("peer remains usable")
+                .as_ref(),
+            b"peer read"
+        );
+        assert_eq!(second.driver.stats().submitted, before + 1, "peer must really use io_uring, not fallback");
+        let replacement = UringBackend::try_new_with_budgets(first_root.path().to_path_buf(), 1, &threads, &reads)
+            .await
+            .expect("the same root can retry after capacity returns");
+        assert_eq!(pool.available(), 0);
+        drop(replacement);
+        drop(second);
+        wait_for_uring_read_budget(pool, 8192).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_shared_read_budget_small_quota_preserves_std_fallback_and_retained_results() {
+        let directory = tempfile::tempdir().expect("fallback quota fixture");
+        let content: Vec<u8> = (0..8192)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        std::fs::create_dir(directory.path().join("bucket")).expect("fixture bucket");
+        std::fs::write(directory.path().join("bucket/part"), &content).expect("fixture contents");
+        let threads = uring_driver_budget::DriverThreadBudget::Unlimited;
+        let reads = uring_test_read_budget(4096, 4096);
+        let uring_read_budget::DriverReadBudget::Limited { pool, .. } = &reads else {
+            panic!("finite test read budget")
+        };
+        let Some(backend) = UringBackend::try_new_with_budgets(directory.path().to_path_buf(), 1, &threads, &reads).await else {
+            uring_test_skip("uring_shared_read_budget_small_quota_preserves_std_fallback_and_retained_results");
+            return;
+        };
+        assert_eq!(
+            backend
+                .pread_uring("bucket", "part", 0, 8)
+                .await
+                .expect("native positive precondition")
+                .as_ref(),
+            &content[..8]
+        );
+        let submitted = backend.driver.stats().submitted;
+        assert_eq!(submitted, 1);
+        let error = backend
+            .pread_uring("bucket", "part", 0, content.len())
+            .await
+            .expect_err("single op exceeds quota");
+        assert!(matches!(error, DiskError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(backend.active.load(Ordering::Relaxed), "local quota errors must not latch off io_uring");
+        let retained = backend
+            .pread_bytes("bucket", "part", 0, content.len(), None)
+            .await
+            .expect("existing std fallback");
+        assert_eq!(retained.as_ref(), content.as_slice());
+        assert_eq!(backend.driver.stats().submitted, submitted, "quota-rejected range must not be submitted");
+        assert!(backend.active.load(Ordering::Relaxed));
+        assert_eq!(pool.available(), 0, "the live driver still holds its full quota");
+        drop(backend);
+        wait_for_uring_read_budget(pool, 4096).await;
+        assert_eq!(
+            retained.as_ref(),
+            content.as_slice(),
+            "retained results are outside the driver read quota"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_shared_read_budget_direct_padding_rejects_logical_fit_without_latching() {
+        let directory = tempfile::tempdir().expect("direct padding fixture");
+        let content: Vec<u8> = (0..8192)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        std::fs::create_dir(directory.path().join("bucket")).expect("fixture bucket");
+        std::fs::write(directory.path().join("bucket/part"), &content).expect("fixture contents");
+        let threads = uring_driver_budget::DriverThreadBudget::Unlimited;
+        let Some(preflight) = UringBackend::try_new_with_budgets(
+            directory.path().to_path_buf(),
+            1,
+            &threads,
+            &uring_read_budget::DriverReadBudget::Disabled,
+        )
+        .await
+        else {
+            uring_test_skip("uring_shared_read_budget_direct_padding_rejects_logical_fit_without_latching (probe)");
+            return;
+        };
+        preflight.direct_uring.align.set(4096).expect("fixed preflight alignment");
+        let native_before = preflight.native_direct_reads.load(Ordering::Relaxed);
+        let bytes = match preflight.pread_uring_direct("bucket", "part", 0, 4096).await {
+            Ok(bytes) => bytes,
+            Err(_) if !preflight.direct_uring.supported.load(Ordering::Relaxed) => {
+                uring_test_skip(
+                    "uring_shared_read_budget_direct_padding_rejects_logical_fit_without_latching (O_DIRECT preflight)",
+                );
+                return;
+            }
+            Err(error) => panic!("native O_DIRECT preflight failed: {error:?}"),
+        };
+        assert_eq!(bytes.as_ref(), &content[..4096]);
+        assert_eq!(preflight.native_direct_reads.load(Ordering::Relaxed), native_before + 1);
+        drop(preflight);
+
+        let reads = uring_test_read_budget(4096, 4096);
+        let uring_read_budget::DriverReadBudget::Limited { pool, .. } = &reads else {
+            panic!("finite test read budget")
+        };
+        let backend = UringBackend::try_new_with_budgets(directory.path().to_path_buf(), 1, &threads, &reads)
+            .await
+            .expect("kernel capability already established before quota testing");
+        backend.direct_uring.align.set(4096).expect("fixed quota-case alignment");
+        // Logical 4096 fits, but the driver's enclosing 4096-byte region plus
+        // alignment allocation padding charges 8191 bytes. No buffer is submitted.
+        let error = backend
+            .pread_uring_direct("bucket", "part", 0, 4096)
+            .await
+            .expect_err("direct padding exceeds quota");
+        assert!(matches!(error, DiskError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(backend.active.load(Ordering::Relaxed));
+        assert!(
+            backend.direct_uring.supported.load(Ordering::Relaxed),
+            "budget error is not O_DIRECT refusal"
+        );
+        let returned = temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
+            ],
+            async {
+                assert!(is_direct_io_read_enabled());
+                assert_eq!(get_direct_io_read_threshold(), 1);
+                backend
+                    .pread_bytes("bucket", "part", 0, 4096, None)
+                    .await
+                    .expect("std fallback after direct quota rejection")
+            },
+        )
+        .await;
+        assert_eq!(returned.as_ref(), &content[..4096]);
+        assert_eq!(backend.driver.stats().submitted, 0, "the direct budget error must precede submission");
+        assert_eq!(
+            backend.native_direct_reads.load(Ordering::Relaxed),
+            0,
+            "returned data came from std fallback"
+        );
+        assert!(backend.active.load(Ordering::Relaxed));
+        assert!(backend.direct_uring.supported.load(Ordering::Relaxed));
+        drop(backend);
+        wait_for_uring_read_budget(pool, 4096).await;
     }
 
     /// Shard count (backlog#1145): `disks × shards` driver threads is the cost, so
@@ -22708,13 +23576,15 @@ mod test {
 
         let root_dir = tempdir().expect("operation should succeed");
         let root = root_dir.path().to_path_buf();
-        let Some(backend) = temp_env::with_vars(
+        let Some(backend) = temp_env::async_with_vars(
             [
                 (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
             ],
-            || UringBackend::try_new(root.clone()),
-        ) else {
+            async { UringBackend::try_new(root.clone()).await },
+        )
+        .await
+        else {
             // Restricted environment (CI seccomp): io_uring is unavailable, so
             // there is no descriptor cache to exercise. Do not vacuously pass.
             uring_test_skip("uring_fd_cache_hides_a_healed_shard_until_invalidated");
@@ -23018,6 +23888,7 @@ mod test {
                 // (RLIMIT_NOFILE headroom, backlog#1178). Probe the (existing)
                 // root to decide; otherwise there is nothing to exercise.
                 let cache_on = UringBackend::try_new(root.clone())
+                    .await
                     .map(|b| b.fd_cache.is_some())
                     .unwrap_or(false);
                 if !cache_on {
@@ -23153,13 +24024,15 @@ mod test {
 
         let root_dir = tempdir().expect("operation should succeed");
         let root = root_dir.path().to_path_buf();
-        let Some(backend) = temp_env::with_vars(
+        let Some(backend) = temp_env::async_with_vars(
             [
                 (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
             ],
-            || UringBackend::try_new(root.clone()),
-        ) else {
+            async { UringBackend::try_new(root.clone()).await },
+        )
+        .await
+        else {
             uring_test_skip("uring_zero_length_read_bounds_match_std_on_cache_hit");
             return;
         };
@@ -23264,8 +24137,9 @@ mod test {
         let total_pages = LEN.div_ceil(mmap_page_size().expect("page size should be available") as usize);
 
         let std_backend: Arc<dyn LocalIoBackend> = Arc::new(StdBackend::new(root.clone()));
-        let uring_backend: Option<Arc<dyn LocalIoBackend>> =
-            UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
+        let uring_backend: Option<Arc<dyn LocalIoBackend>> = UringBackend::try_new(root.clone())
+            .await
+            .map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
         if uring_backend.is_none() {
             uring_test_skip("io_uring_reclaims_page_cache_exactly_like_std (io_uring half)");
         }
@@ -23371,7 +24245,7 @@ mod test {
 
         // Skip if io_uring is unavailable on this host (restricted env, e.g. the
         // Kubernetes CI runners): there is no native O_DIRECT path to exercise.
-        let Some(backend) = UringBackend::try_new(root) else {
+        let Some(backend) = UringBackend::try_new(root).await else {
             uring_test_skip("uring_preserves_o_direct_for_eligible_reads");
             return;
         };
@@ -23454,7 +24328,7 @@ mod test {
         }
 
         // Skip if io_uring is unavailable on this host (restricted env).
-        let Some(backend) = UringBackend::try_new(root) else {
+        let Some(backend) = UringBackend::try_new(root).await else {
             uring_test_skip("uring_backend_latched_off_reads_via_std");
             return;
         };

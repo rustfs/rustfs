@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use p256::pkcs8::DecodePrivateKey as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -86,7 +86,7 @@ impl ProfileTool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProfileOutcome {
     Succeeded,
@@ -108,7 +108,7 @@ impl ProfileOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProfileReasonCode {
     Complete,
@@ -185,6 +185,14 @@ impl ProfileProvenance {
     pub(crate) fn build_features(&self) -> &[String] {
         &self.build_features
     }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        lower_hex(&self.source_commit, 40)
+            && lower_hex(&self.executable_sha256, 64)
+            && version(&self.rustfs_version)
+            && self.build_features.len() <= MAX_BUILD_FEATURES
+            && self.build_features.iter().all(|feature| build_feature(feature))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -234,6 +242,27 @@ pub struct LocalProfileConsent {
     pub policy_revision: u64,
     pub expires_at_unix: i64,
     pub confirmed: bool,
+}
+
+/// Owner-authorized request for the running service, never a CLI process profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct LocalRuntimeProfileRequest {
+    pub offline_key_id: String,
+    pub organization_name: String,
+    pub cluster_name: String,
+    pub device_name: String,
+    pub run_uid: String,
+    pub artifact_uid: String,
+    pub schema_version: u16,
+    pub capability: String,
+    pub consent_uid: String,
+    pub policy_revision: u64,
+    pub consent_expires_at_unix: i64,
+    pub acknowledge_l3: bool,
+    pub expires_at_unix: i64,
+    pub duration_millis: u64,
+    pub sample_period_micros: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,7 +384,32 @@ impl ThreadStateCount {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProfileData {
+    pub(super) scope: ThreadProfileScope,
+    pub(super) worker_count: usize,
+    pub(super) samples: [RuntimeProfileSample; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeProfileSample {
+    pub elapsed_micros: u64,
+    pub alive_task_count: u64,
+    pub global_queue_depth: u64,
+    pub workers: Vec<RuntimeWorkerSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeWorkerSample {
+    pub worker_index: usize,
+    pub busy_duration_micros: u64,
+    pub park_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ThreadProfileScope {
     TokioRuntime,
@@ -368,6 +422,7 @@ pub enum ProfileData {
     Cpu(CpuProfileData),
     Memory(MemoryProfileData),
     Threads(ThreadProfileData),
+    Runtime(RuntimeProfileData),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -411,6 +466,19 @@ impl ProfileResult {
             coverage: ProfileCoverage::complete_window(),
             data: Some(data),
         }
+    }
+
+    pub(super) fn runtime_succeeded(
+        request: &ProfileCaptureRequest,
+        duration: Duration,
+        data: RuntimeProfileData,
+    ) -> Result<Self, ProfileError> {
+        if duration > MAX_PROFILE_DURATION {
+            return Err(ProfileError::TimedOut);
+        }
+        let mut result = Self::succeeded(request, ProfileTool::Threads, duration, ProfileData::Runtime(data));
+        result.duration_millis = u64::try_from(duration.as_millis()).map_err(|_| ProfileError::LimitExceeded)?;
+        Ok(result)
     }
 
     #[cfg(all(
@@ -581,8 +649,11 @@ pub async fn export_cpu_profile(
     )
 ))]
 mod local_cpu {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    use object::{Object as _, ObjectSymbol as _};
 
     use pyroscope::backend::{BackendConfig, PprofConfig, ReportData, pprof_backend};
     use sha2::{Digest as _, Sha256};
@@ -597,6 +668,10 @@ mod local_cpu {
     const MAX_UNIQUE_SYMBOLS: usize = 4_096;
     const MAX_OUTPUT_SYMBOLS: usize = 256;
     const MAX_SYMBOL_BYTES: usize = 4_096;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_CATALOG_SYMBOLS: usize = 200_000;
 
     pub(super) fn collect(
         request: &ProfileCaptureRequest,
@@ -610,6 +685,8 @@ mod local_cpu {
         if sample_rate == 0 || sample_rate > MAX_SAMPLE_RATE_HZ {
             return Err(ProfileError::LimitExceeded);
         }
+
+        let reviewed_symbols = reviewed_executable_symbols(cancel)?;
 
         let started = Instant::now();
         let deadline = started.checked_add(request.duration).ok_or(ProfileError::LimitExceeded)?;
@@ -626,7 +703,7 @@ mod local_cpu {
             return Err(ProfileError::SourceUnavailable);
         };
 
-        let mut accumulator = Accumulator::new(request.nonce);
+        let mut accumulator = Accumulator::new(request.nonce, reviewed_symbols.as_ref());
         for report in reports {
             for (stack, count) in report.data {
                 accumulator.record_stack(stack.frames.iter().filter_map(|frame| frame.name.as_deref()), count)?;
@@ -650,18 +727,89 @@ mod local_cpu {
         }
     }
 
-    struct Accumulator {
+    // The packaged Connect catalog is derived from this executable's ELF text symbols.
+    // Match that exact symbol set before signing; shared-library and runtime frames
+    // cannot be reviewed by a catalog bound to the RustFS executable alone.
+    fn reviewed_executable_symbols(cancel: &CancellationToken) -> Result<Option<HashSet<String>>, ProfileError> {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            return load_executable_symbols(cancel).map(Some);
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            check_cancel(cancel)?;
+            Ok(None)
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn load_executable_symbols(cancel: &CancellationToken) -> Result<HashSet<String>, ProfileError> {
+        check_cancel(cancel)?;
+        let path = std::env::current_exe().map_err(|_| ProfileError::SourceUnavailable)?;
+        let executable = std::fs::File::open(path).map_err(|_| ProfileError::SourceUnavailable)?;
+        let size = executable.metadata().map_err(|_| ProfileError::SourceUnavailable)?.len();
+        if size == 0 || size > 1_073_741_824 {
+            return Err(ProfileError::SourceUnavailable);
+        }
+        let cache = object::read::ReadCache::new(executable);
+        let file = object::File::parse(&cache).map_err(|_| ProfileError::SourceUnavailable)?;
+        if file.format() != object::BinaryFormat::Elf || file.symbol_table().is_none() {
+            return Err(ProfileError::SourceUnavailable);
+        }
+        let mut symbols = HashSet::new();
+        let mut symbol_bytes = 0_usize;
+        for (index, symbol) in file.symbols().chain(file.dynamic_symbols()).enumerate() {
+            if index % 1_024 == 0 {
+                check_cancel(cancel)?;
+            }
+            if symbol.kind() != object::SymbolKind::Text || symbol.is_undefined() {
+                continue;
+            }
+            if let Some(name) = symbol.name_bytes().ok().and_then(catalog_symbol_name)
+                && !symbols.contains(&name)
+            {
+                symbol_bytes = symbol_bytes
+                    .checked_add(name.len() + 3)
+                    .ok_or(ProfileError::SourceUnavailable)?;
+                if symbol_bytes > MAX_CATALOG_BYTES || symbols.len() >= MAX_CATALOG_SYMBOLS {
+                    return Err(ProfileError::SourceUnavailable);
+                }
+                symbols.insert(name);
+            }
+        }
+        if symbols.is_empty() {
+            return Err(ProfileError::SourceUnavailable);
+        }
+        Ok(symbols)
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn catalog_symbol_name(raw: &[u8]) -> Option<String> {
+        let name = symbolic_demangle::demangle(&String::from_utf8_lossy(raw)).into_owned();
+        if name.is_empty()
+            || name.len() > MAX_SYMBOL_BYTES
+            || matches!(name.as_str(), "Unknown" | "<unresolved>")
+            || name.bytes().any(|byte| byte < 32 || byte == 127)
+        {
+            return None;
+        }
+        Some(name)
+    }
+
+    struct Accumulator<'a> {
         nonce: [u8; 32],
+        reviewed_symbols: Option<&'a HashSet<String>>,
         samples: HashMap<String, u64>,
         stack_records: usize,
         accepted_sample_count: u64,
         dropped_sample_count: u64,
     }
 
-    impl Accumulator {
-        fn new(nonce: [u8; 32]) -> Self {
+    impl<'a> Accumulator<'a> {
+        fn new(nonce: [u8; 32], reviewed_symbols: Option<&'a HashSet<String>>) -> Self {
             Self {
                 nonce,
+                reviewed_symbols,
                 samples: HashMap::new(),
                 stack_records: 0,
                 accepted_sample_count: 0,
@@ -669,7 +817,7 @@ mod local_cpu {
             }
         }
 
-        fn record_stack<'a>(&mut self, symbols: impl Iterator<Item = &'a str>, count: usize) -> Result<(), ProfileError> {
+        fn record_stack<'s>(&mut self, symbols: impl Iterator<Item = &'s str>, count: usize) -> Result<(), ProfileError> {
             self.stack_records = self.stack_records.checked_add(1).ok_or(ProfileError::LimitExceeded)?;
             let count = u64::try_from(count).map_err(|_| ProfileError::LimitExceeded)?;
             if self.stack_records > MAX_STACK_RECORDS {
@@ -688,6 +836,9 @@ mod local_cpu {
                 .into_iter()
                 .find(|symbol| !symbol.is_empty() && symbol.len() <= MAX_SYMBOL_BYTES)
                 .unwrap_or("<unresolved>");
+            if self.reviewed_symbols.is_some_and(|reviewed| !reviewed.contains(symbol)) {
+                return self.drop_samples(accepted_count);
+            }
             let symbol_id = symbol_id(&self.nonce, symbol);
             if !self.samples.contains_key(&symbol_id) && self.samples.len() >= MAX_UNIQUE_SYMBOLS {
                 return self.drop_samples(accepted_count);
@@ -752,12 +903,12 @@ mod local_cpu {
         #[test]
         fn summary_uses_nonce_bound_ids_and_excludes_raw_symbols() {
             let raw_symbol = "rustfs::storage::disk::read_object";
-            let mut first = Accumulator::new([7; 32]);
+            let mut first = Accumulator::new([7; 32], None);
             first
                 .record_stack([raw_symbol].into_iter(), 9)
                 .expect("first stack should be recorded");
             let first = first.finish(10_000).expect("first summary should be produced");
-            let mut second = Accumulator::new([8; 32]);
+            let mut second = Accumulator::new([8; 32], None);
             second
                 .record_stack([raw_symbol].into_iter(), 9)
                 .expect("second stack should be recorded");
@@ -773,7 +924,7 @@ mod local_cpu {
 
         #[test]
         fn summary_bounds_samples_and_output_symbols() {
-            let mut accumulator = Accumulator::new([3; 32]);
+            let mut accumulator = Accumulator::new([3; 32], None);
             for index in 0..=MAX_OUTPUT_SYMBOLS {
                 let symbol = format!("rustfs::bounded::{index}");
                 accumulator
@@ -798,6 +949,29 @@ mod local_cpu {
                 wait_for_window(Instant::now() + Duration::from_secs(1), &cancel),
                 Err(ProfileError::Cancelled)
             ));
+        }
+
+        #[test]
+        fn unreviewed_symbol_counts_are_dropped_without_exporting_their_ids() {
+            let reviewed = HashSet::from(["rustfs::known".to_owned()]);
+            let mut accumulator = Accumulator::new([4; 32], Some(&reviewed));
+            accumulator
+                .record_stack(["rustfs::known"].into_iter(), 3)
+                .expect("reviewed stack");
+            accumulator
+                .record_stack(["libc::unreviewed"].into_iter(), 2)
+                .expect("unreviewed stack");
+            let summary = accumulator.finish(10_000).expect("summary");
+            assert_eq!(summary.samples.len(), 1);
+            assert_eq!(summary.samples[0].sample_count, 3);
+            assert_eq!(summary.dropped_sample_count, 2);
+            assert_ne!(summary.samples[0].symbol_id, symbol_id(&[4; 32], "libc::unreviewed"));
+
+            let mut only_unreviewed = Accumulator::new([4; 32], Some(&reviewed));
+            only_unreviewed
+                .record_stack(["libc::unreviewed"].into_iter(), 2)
+                .expect("unreviewed stack");
+            assert!(matches!(only_unreviewed.finish(10_000), Err(ProfileError::SourceUnavailable)));
         }
     }
 }
@@ -969,11 +1143,7 @@ impl ProfileCaptureRequest {
             || !uuid7(&self.artifact_uid)
             || !uuid7(&self.consent.consent_uid)
             || !resource_names_match(self)
-            || !lower_hex(&self.provenance.source_commit, 40)
-            || !lower_hex(&self.provenance.executable_sha256, 64)
-            || !version(&self.provenance.rustfs_version)
-            || self.provenance.build_features.len() > MAX_BUILD_FEATURES
-            || !self.provenance.build_features.iter().all(|feature| build_feature(feature))
+            || !self.provenance.is_valid()
         {
             return Err(ProfileError::InvalidRequest);
         }

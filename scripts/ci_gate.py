@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select safe documentation-only CI and verify the complete required job set."""
+"""Select conservative PR scopes and verify the complete required job set."""
 from __future__ import annotations
 
 import json
@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
+from unittest.mock import patch
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +21,19 @@ CODE_JOBS = (
     "build-rustfs-debug-binary", "uring-integration", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
+# These jobs still exercise the server and its black-box harness when only E2E
+# Rust sources change. Production code, manifests and shared test configuration
+# always select the full matrix. No production package depends on e2e_test.
+E2E_JOBS = (
+    "test-and-lint", "build-rustfs-debug-binary", "e2e-tests",
+    "s3-implemented-tests", "s3-lifecycle-behavior-tests",
+)
+E2E_SELECTION_FILES = {
+    f".config/{profile}-selection.txt" for profile in (
+        "e2e-smoke", "e2e-full", "e2e-nightly", "e2e-repl-nightly",
+        "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
+    )
+}
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 
@@ -36,6 +51,53 @@ def documentation_path(path: str) -> bool:
     return path.startswith("docs/") and path.endswith((".png", ".jpg", ".svg"))
 
 
+def e2e_crate_is_isolated(root: Path) -> bool:
+    """A new dependency on the harness invalidates the test-only shortcut."""
+    target = (root / "crates/e2e_test").resolve()
+    manifests = {root / "Cargo.toml"}
+
+    def references_harness(value: object, directory: Path) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for key, item in value.items():
+            if key in ("dependencies", "dev-dependencies", "build-dependencies") and isinstance(item, dict):
+                for name, dependency in item.items():
+                    if name == "e2e_test":
+                        return True
+                    if isinstance(dependency, dict):
+                        if dependency.get("package") == "e2e_test":
+                            return True
+                        if isinstance(dependency.get("path"), str):
+                            dependency_root = (directory / dependency["path"]).resolve()
+                            if dependency_root == target or not dependency_root.is_relative_to(root.resolve()):
+                                return True
+                            # Cargo also includes in-tree path dependencies that
+                            # are not explicitly listed as workspace members.
+                            manifests.add(dependency_root / "Cargo.toml")
+            if references_harness(item, directory):
+                return True
+        return False
+
+    try:
+        workspace = tomllib.loads((root / "Cargo.toml").read_text())
+        for member in workspace["workspace"]["members"]:
+            members = list(root.glob(member))
+            if not members:
+                return False
+            manifests.update(directory / "Cargo.toml" for directory in members if directory.resolve() != target)
+        visited = set()
+        while manifests:
+            path = manifests.pop().resolve()
+            if path in visited:
+                continue
+            visited.add(path)
+            if references_harness(tomllib.loads(path.read_text()), path.parent):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def select_mode(event: str, base: str, head: str, root: Path) -> str:
     if event != "pull_request" or not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
         return "full"
@@ -47,16 +109,24 @@ def select_mode(event: str, base: str, head: str, root: Path) -> str:
     except (subprocess.CalledProcessError, UnicodeError):
         return "full"
     paths = changed.rstrip("\0").split("\0") if changed else []
-    return "docs" if paths and all(documentation_path(path) for path in paths) else "full"
+    if paths and all(documentation_path(path) for path in paths):
+        return "docs"
+    if paths and all(documentation_path(path) or path in E2E_SELECTION_FILES or (
+        path.startswith("crates/e2e_test/src/") and path.endswith(".rs")
+        and not any(part in (".", "..") for part in path.split("/"))
+        and not any(ord(char) < 32 for char in path)
+    ) for path in paths) and e2e_crate_is_isolated(root):
+        return "e2e"
+    return "full"
 
 
 def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
     if event not in ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch"):
         raise ValueError(f"unsupported CI event: {event!r}")
-    if mode not in ("docs", "full") or (mode == "docs" and event != "pull_request"):
+    if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
     expected = {job: "success" for job in ALWAYS_JOBS}
-    expected.update({job: "success" if mode == "full" else "skipped" for job in CODE_JOBS})
+    expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
     full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
@@ -158,6 +228,62 @@ def check_workflow(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def test_e2e_shortcut_rejects_new_direct_renamed_and_target_dependencies(self):
+        self.assertTrue(e2e_crate_is_isolated(ROOT))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rustfs").mkdir()
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["rustfs"]\n')
+            path = root / "rustfs/Cargo.toml"
+            path.write_text('[package]\nname = "rustfs"\n')
+            self.assertTrue(e2e_crate_is_isolated(root))
+            for dependency in (
+                '[dependencies]\ne2e_test = "1"\n',
+                '[dev-dependencies]\nharness = { package = "e2e_test", version = "1" }\n',
+                '[target.\'cfg(unix)\'.build-dependencies]\nharness = { path = "../crates/e2e_test" }\n',
+            ):
+                path.write_text(dependency)
+                self.assertFalse(e2e_crate_is_isolated(root), dependency)
+            path.unlink()
+            self.assertFalse(e2e_crate_is_isolated(root))
+
+    def test_e2e_shortcut_traverses_implicit_path_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rustfs").mkdir()
+            (root / "helper").mkdir()
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["rustfs"]\n')
+            (root / "rustfs/Cargo.toml").write_text('[dependencies]\nhelper = { path = "../helper" }\n')
+            helper = root / "helper/Cargo.toml"
+            helper.write_text('[package]\nname = "helper"\n')
+            self.assertTrue(e2e_crate_is_isolated(root))
+            helper.write_text('[dependencies]\nharness = { path = "../crates/e2e_test" }\n')
+            self.assertFalse(e2e_crate_is_isolated(root))
+            helper.unlink()
+            self.assertFalse(e2e_crate_is_isolated(root))
+
+    def test_e2e_scope_keeps_production_and_shared_configuration_full(self):
+        cases = (
+            (["crates/e2e_test/src/distributed/harness.rs"], "e2e"),
+            (["README.md", "crates/e2e_test/src/common.rs"], "e2e"),
+            (["crates/e2e_test/src/distributed/harness.rs", ".config/e2e-distributed-selection.txt"], "e2e"),
+            ([".config/e2e-full-selection.txt"], "e2e"),
+            ([".config/unrecognized-selection.txt"], "full"),
+            (["crates/e2e_test/src/common.rs", "crates/ecstore/src/lib.rs"], "full"),
+            (["crates/e2e_test/src/common.rs", "crates/e2e_test/Cargo.toml"], "full"),
+            (["crates/e2e_test/build.rs"], "full"),
+            (["crates/e2e_test/src/fixture.json"], "full"),
+            ([".config/nextest.toml"], "full"),
+            (["Cargo.lock"], "full"),
+            (["scripts/e2e_binary.py"], "full"),
+            (["crates/e2e_test/src/../Cargo.toml.rs"], "full"),
+            (["crates/e2e_test/src/unusual\nname.rs"], "full"),
+            ([], "full"),
+        )
+        for paths, expected in cases:
+            with self.subTest(paths=paths), patch("subprocess.check_output", return_value=("\0".join(paths) + "\0").encode()):
+                self.assertEqual(select_mode("pull_request", "a" * 40, "b" * 40, ROOT), expected)
+
     def test_documentation_paths_do_not_hide_build_or_fixture_changes(self):
         for path in ("README.md", "AGENTS.md", "crates/utils/AGENTS.md", "docs/testing/README.md", "docs/diagram.svg", ".agents/skills/example/SKILL.md"):
             self.assertTrue(documentation_path(path), path)
@@ -192,15 +318,19 @@ class SelfTests(unittest.TestCase):
         self.assertEqual({job for job, state in ordinary.items() if state == "skipped"}, set(OPTIONAL_JOBS))
         docs = expected_results("docs", "pull_request", "refs/pull/1/merge")
         self.assertEqual({job for job, state in docs.items() if state == "success"}, set(ALWAYS_JOBS))
+        e2e = expected_results("e2e", "pull_request", "refs/pull/1/merge")
+        self.assertEqual({job for job, state in e2e.items() if state == "success"}, set(ALWAYS_JOBS + E2E_JOBS))
         for event in ("schedule", "workflow_dispatch", "merge_group", "push"):
             result = expected_results("full", event, "refs/heads/main")
             self.assertEqual(result["e2e-full"], "skipped" if event == "schedule" else "success")
             self.assertEqual(result["e2e-tests-rio-v2"], "success" if event in ("schedule", "workflow_dispatch") else "skipped")
             with self.assertRaises(ValueError):
                 expected_results("docs", event, "refs/heads/main")
+            with self.assertRaises(ValueError):
+                expected_results("e2e", event, "refs/heads/main")
 
     def test_every_wrong_result_missing_job_or_selection_fails_closed(self):
-        for mode, event in (("full", "pull_request"), ("docs", "pull_request"), ("full", "schedule"), ("full", "workflow_dispatch"), ("full", "merge_group")):
+        for mode, event in (("full", "pull_request"), ("docs", "pull_request"), ("e2e", "pull_request"), ("full", "schedule"), ("full", "workflow_dispatch"), ("full", "merge_group")):
             good = {job: {"result": value} for job, value in expected_results(mode, event, "refs/heads/main").items()}
             good["classify-changes"]["outputs"] = {"mode": mode}
             self.assertEqual(verify_results(good, event, "refs/heads/main"), [])
@@ -324,6 +454,9 @@ class SelfTests(unittest.TestCase):
         for event, changed, base_sha, available, broken, expected in (
             ("pull_request", "README.md", "b" * 40, True, False, "docs"),
             ("pull_request", "src/server.rs", "b" * 40, True, False, "full"),
+            ("pull_request", "crates/e2e_test/src/distributed/harness.rs", "b" * 40, True, False, "e2e"),
+            ("pull_request", "crates/e2e_test/Cargo.toml", "b" * 40, True, False, "full"),
+            ("pull_request", ".config/nextest.toml", "b" * 40, True, False, "full"),
             ("pull_request", "README.md", "b" * 40, False, False, "full"),
             ("merge_group", "README.md", "b" * 40, False, False, "full"),
             ("pull_request", "README.md", "b" * 40, True, True, None),
@@ -333,6 +466,7 @@ class SelfTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "scripts").mkdir()
                 (root / "scripts/ci_gate.py").write_text("raise SystemExit(71)\n")
+                (root / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
                 (root / "python3").symlink_to(sys.executable)
                 base = root / "base-policy.py"
                 base.write_text("raise SystemExit(29)\n" if broken else Path(__file__).read_text())

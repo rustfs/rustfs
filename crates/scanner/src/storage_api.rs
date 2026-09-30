@@ -150,7 +150,11 @@ pub(crate) mod owner {
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
 
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
+    pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        PutObjectCommitBarrier, PutObjectCommitPause, hold_namespace_commit as ecstore_hold_namespace_commit,
+    };
 
     pub(crate) use super::storage_contracts::{
         HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,

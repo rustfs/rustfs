@@ -812,7 +812,12 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
     let log_limit = args.limit;
     let log_disk_id = args.disk_id.clone();
     let log_skip_total_timeout = args.skip_total_timeout;
-    let body = walk_dir_response_body(propagate_completion_errors, move |mut writer| async move {
+    // Only callers requesting missing-path reporting need a typed pre-stream status.
+    let preflight_missing_path_error = propagate_completion_errors && args.report_notfound;
+    runtime_sources::current_internode_metrics()
+        .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
+
+    let body = walk_dir_response_body(propagate_completion_errors, preflight_missing_path_error, move |mut writer| async move {
         walk_dir_with_legacy_meta_fallback(&disk, args, &mut writer)
             .await
             .map_err(|e| {
@@ -835,12 +840,15 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
                     error = %e,
                     "internode rpc background task failed"
                 );
-                io::Error::other("remote walk_dir failed")
+                e
             })
-    });
+    })
+    .await;
 
-    runtime_sources::current_internode_metrics()
-        .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return response_with_disk_error(&error, error.to_string()),
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -871,7 +879,11 @@ async fn read_file_stream_with_legacy_meta_fallback(
 ) -> Result<FileReader, DiskError> {
     match disk.read_file_stream(volume, path, offset, length).await {
         Ok(file) => Ok(file),
-        Err(error) if legacy_meta_alias_can_retry(&error, volume) => {
+        // A legacy format is migration evidence. Substituting the RustFS
+        // format would grant remote peers authority they did not establish.
+        Err(error)
+            if !(volume == MIGRATING_META_BUCKET && path == "format.json") && legacy_meta_alias_can_retry(&error, volume) =>
+        {
             let alias = legacy_meta_bucket_alias(volume).expect("legacy meta alias checked before retry");
             disk.read_file_stream(&alias, path, offset, length).await
         }
@@ -1194,10 +1206,14 @@ fn remote_scanner_claim_rejection(error: &rustfs_scanner::ScannerError) -> (Stat
     }
 }
 
-fn walk_dir_response_body<F, Fut>(propagate_completion_errors: bool, producer: F) -> Body
+async fn walk_dir_response_body<F, Fut>(
+    propagate_completion_errors: bool,
+    preflight_missing_path_error: bool,
+    producer: F,
+) -> Result<Body, DiskError>
 where
     F: FnOnce(tokio::io::DuplexStream) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<()>> + Send + 'static,
+    Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
 {
     let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
@@ -1220,14 +1236,45 @@ where
         );
         bytes
     });
-    let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
+    let mut stream = Box::pin(stream);
+    if !preflight_missing_path_error {
+        let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
+        return Ok(Body::from(StreamingBlob::wrap(stream)));
+    }
 
+    // Keep the first chunk bounded in memory so a missing-path error can use
+    // the typed HTTP error headers before the response status is committed.
+    match stream.next().await {
+        Some(Ok(first_bytes)) => {
+            let stream = stream::once(async move { Ok(first_bytes) }).chain(stream);
+            let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
+            Ok(Body::from(StreamingBlob::wrap(stream)))
+        }
+        Some(Err(first_error)) => {
+            let stream = stream::once(async move { Err(first_error) }).chain(stream);
+            let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
+            Ok(Body::from(StreamingBlob::wrap(stream)))
+        }
+        None => match completion_rx.await {
+            Ok(Ok(())) => Ok(Body::empty()),
+            Ok(Err(error)) if propagate_completion_errors => match error {
+                DiskError::FileNotFound | DiskError::VolumeNotFound => Err(error),
+                _ => Ok(walk_dir_error_body("remote walk_dir failed")),
+            },
+            Err(_) if propagate_completion_errors => Ok(walk_dir_error_body("remote walk_dir task ended without a result")),
+            Ok(Err(_)) | Err(_) => Ok(Body::empty()),
+        },
+    }
+}
+
+fn walk_dir_error_body(message: &'static str) -> Body {
+    let stream = stream::once(async move { Err(io::Error::other(message)) });
     Body::from(StreamingBlob::wrap(stream))
 }
 
 fn append_walk_dir_completion<S>(
     stream: S,
-    completion_rx: oneshot::Receiver<io::Result<()>>,
+    completion_rx: oneshot::Receiver<Result<(), DiskError>>,
     propagate_completion_errors: bool,
 ) -> impl Stream<Item = io::Result<Bytes>>
 where
@@ -1237,9 +1284,9 @@ where
         stream::once(async move {
             match completion_rx.await {
                 Ok(Ok(())) => None,
-                Ok(Err(err)) if propagate_completion_errors => Some(Err(err)),
-                Err(err) if propagate_completion_errors => {
-                    Some(Err(io::Error::other(format!("remote walk_dir task ended without a result: {err}"))))
+                Ok(Err(_)) if propagate_completion_errors => Some(Err(io::Error::other("remote walk_dir failed"))),
+                Err(_) if propagate_completion_errors => {
+                    Some(Err(io::Error::other("remote walk_dir task ended without a result")))
                 }
                 Ok(Err(_)) | Err(_) => None,
             }
@@ -2901,10 +2948,12 @@ mod tests {
 
     #[tokio::test]
     async fn walk_dir_body_surfaces_background_failure_after_data() {
-        let body = walk_dir_response_body(true, |mut writer| async move {
+        let body = walk_dir_response_body(true, true, |mut writer| async move {
             writer.write_all(b"partial walk data").await?;
-            Err(io::Error::other("remote walk_dir failed"))
-        });
+            Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+        })
+        .await
+        .expect("partial output should retain the streaming response");
         let err = BodyExt::collect(body)
             .await
             .expect_err("failed completion must fail body collection");
@@ -2914,10 +2963,12 @@ mod tests {
 
     #[tokio::test]
     async fn walk_dir_body_preserves_data_after_success() {
-        let body = walk_dir_response_body(true, |mut writer| async move {
+        let body = walk_dir_response_body(true, true, |mut writer| async move {
             writer.write_all(b"complete walk data").await?;
             Ok(())
-        });
+        })
+        .await
+        .expect("successful response should be prepared");
         let bytes = BodyExt::collect(body)
             .await
             .expect("successful completion should preserve the body")
@@ -2927,15 +2978,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_dir_pre_stream_missing_errors_remain_typed_for_capable_peers() {
+        let error = match walk_dir_response_body(true, true, |_writer| async { Err(DiskError::FileNotFound) }).await {
+            Ok(_) => panic!("capable peers should receive a pre-stream missing-path result"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, DiskError::FileNotFound));
+
+        let body = walk_dir_response_body(false, false, |_writer| async { Err(DiskError::FileNotFound) })
+            .await
+            .expect("legacy peers should retain their clean-EOF behavior");
+        assert!(
+            BodyExt::collect(body)
+                .await
+                .expect("legacy missing-path response should remain clean EOF")
+                .to_bytes()
+                .is_empty()
+        );
+
+        let body = walk_dir_response_body(true, true, |_writer| async { Ok(()) })
+            .await
+            .expect("an empty successful walk should complete during preflight");
+        assert!(
+            BodyExt::collect(body)
+                .await
+                .expect("empty successful walk should remain a complete body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn capable_walk_without_missing_report_streams_before_producer_finishes() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            walk_dir_response_body(true, false, move |mut writer| async move {
+                let _ = started_tx.send(());
+                release_rx.await.expect("test should release the walk producer");
+                writer.write_all(b"partial walk data").await?;
+                Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+            }),
+        )
+        .await
+        .expect("ordinary v1 streams must return before the producer's first output")
+        .expect("ordinary v1 stream response should be prepared");
+
+        started_rx.await.expect("walk producer should start");
+        release_tx.send(()).expect("walk producer should be released");
+        let error = BodyExt::collect(body)
+            .await
+            .expect_err("terminal producer errors must still fail ordinary v1 streams");
+        assert!(error.to_string().contains("remote walk_dir failed"));
+    }
+
+    #[tokio::test]
     async fn walk_dir_body_records_operation_sent_bytes() {
         let metrics = global_internode_metrics();
         let before = metrics.snapshot().sent_bytes_total;
         let payload = Bytes::from_static(b"metered walk data");
         let expected_len = u64::try_from(payload.len()).expect("test payload length should fit u64");
-        let body = walk_dir_response_body(true, move |mut writer| async move {
+        let body = walk_dir_response_body(true, true, move |mut writer| async move {
             writer.write_all(&payload).await?;
             Ok(())
-        });
+        })
+        .await
+        .expect("successful response should be prepared");
 
         let bytes = BodyExt::collect(body)
             .await
@@ -2968,11 +3077,13 @@ mod tests {
     async fn dropping_walk_dir_body_cancels_blocked_producer() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let body = walk_dir_response_body(true, move |_writer| async move {
+        let body = walk_dir_response_body(true, false, move |_writer| async move {
             let _drop_notifier = DropNotifier(Some(dropped_tx));
             let _ = started_tx.send(());
-            std::future::pending::<io::Result<()>>().await
-        });
+            std::future::pending::<Result<(), DiskError>>().await
+        })
+        .await
+        .expect("ordinary streams should start without a first-chunk preflight");
 
         started_rx.await.expect("walk producer should start");
         drop(body);
@@ -2985,10 +3096,12 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_walk_dir_client_keeps_clean_eof_compatibility() {
-        let body = walk_dir_response_body(false, |mut writer| async move {
+        let body = walk_dir_response_body(false, false, |mut writer| async move {
             writer.write_all(b"legacy partial data").await?;
-            Err(io::Error::other("remote walk_dir failed"))
-        });
+            Err(DiskError::Io(io::Error::other("remote walk_dir failed")))
+        })
+        .await
+        .expect("legacy response should preserve clean EOF compatibility");
 
         let bytes = BodyExt::collect(body)
             .await
@@ -3115,5 +3228,42 @@ mod tests {
         );
         assert_eq!(legacy_meta_bucket_alias(".minio.sys-lookalike"), None);
         assert_eq!(legacy_meta_bucket_alias("user-bucket"), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_format_read_requires_the_original_namespace() {
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all(".rustfs.sys", "format.json", Bytes::from_static(b"rustfs-format"))
+            .await
+            .expect("RustFS format");
+        disk.write_all(".rustfs.sys", "config/settings.json", Bytes::from_static(b"settings"))
+            .await
+            .expect("migrated configuration");
+
+        for legacy_volume_exists in [false, true] {
+            if legacy_volume_exists {
+                disk.make_volume(".minio.sys").await.expect("empty legacy volume");
+            }
+            let result = super::read_file_stream_with_legacy_meta_fallback(&disk, ".minio.sys", "format.json", 0, 0).await;
+            assert!(
+                matches!(result, Err(DiskError::FileNotFound | DiskError::VolumeNotFound)),
+                "a RustFS format must never count as legacy migration evidence"
+            );
+        }
+
+        disk.write_all(".minio.sys", "format.json", Bytes::from_static(b"minio-format"))
+            .await
+            .expect("original legacy format");
+        for (path, expected) in [
+            ("format.json", b"minio-format".as_slice()),
+            ("config/settings.json", b"settings"),
+        ] {
+            let mut reader = super::read_file_stream_with_legacy_meta_fallback(&disk, ".minio.sys", path, 0, 0)
+                .await
+                .expect("original formats and migrated configuration remain readable");
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data).await.expect("read metadata");
+            assert_eq!(data, expected);
+        }
     }
 }

@@ -428,6 +428,19 @@ impl DiskError {
         }
     }
 
+    /// Whether an internode RPC was cancelled, without classifying the peer as offline.
+    pub fn io_error_is_rpc_cancelled(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RpcStatusError>())
+            .is_some_and(|error| error.status().code() == tonic::Code::Cancelled)
+    }
+
+    pub(crate) fn clone_rpc_status_io_error(error: &io::Error) -> Option<io::Error> {
+        let status = error.get_ref()?.downcast_ref::<RpcStatusError>()?;
+        Some(io::Error::new(error.kind(), RpcStatusError(status.0.clone())))
+    }
+
     pub fn internode_http_error_kind(&self) -> Option<InternodeHttpErrorKind> {
         match self {
             DiskError::Io(io_error) => io_error
@@ -701,8 +714,8 @@ impl Clone for DiskError {
                 DiskError::conditional_file_not_committed(io::Error::new(io_error.kind(), io_error.to_string())),
             ),
             DiskError::Io(io_error) => {
-                if let Some(status) = io_error.get_ref().and_then(|source| source.downcast_ref::<RpcStatusError>()) {
-                    return DiskError::Io(io::Error::new(io_error.kind(), RpcStatusError(status.0.clone())));
+                if let Some(error) = Self::clone_rpc_status_io_error(io_error) {
+                    return DiskError::Io(error);
                 }
                 DiskError::Io(
                     Self::clone_dangling_delete_grace(io_error)
@@ -899,6 +912,25 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn rpc_status_survives_disk_and_storage_clones() {
+        for code in [tonic::Code::Cancelled, tonic::Code::PermissionDenied] {
+            let status = tonic::Status::new(code, "operation was canceled");
+            let original = DiskError::Io(io::Error::new(io::ErrorKind::Interrupted, RpcStatusError::from(status)));
+            let display = original.to_string();
+            let disk = original.clone();
+            let storage = crate::error::StorageError::from(disk);
+            let cloned = storage.clone();
+            for error in [io::Error::from(original), io::Error::from(storage), io::Error::from(cloned)] {
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                let status = error.get_ref().unwrap().downcast_ref::<RpcStatusError>().unwrap().status();
+                assert_eq!(status.code(), code);
+                assert_eq!(status.message(), "operation was canceled");
+                assert_eq!(DiskError::from(error).to_string(), display);
+            }
+        }
+    }
 
     #[test]
     fn retired_marker_deferral_survives_disk_and_storage_clones() {

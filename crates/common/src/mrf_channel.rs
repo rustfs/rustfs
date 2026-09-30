@@ -163,6 +163,15 @@ pub struct MrfDurableRepairAnchor {
     pub bucket_incarnation_id: Uuid,
 }
 
+/// A completed deep check proved that a legacy object is present and healthy,
+/// but the format has no independent identity commitment that can discharge a
+/// durable partial-write responsibility. Keep the journal entry and pause
+/// automatic retries until an operator has repaired the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MrfUnverifiedLegacyEvent {
+    pub anchor: MrfDurableRepairAnchor,
+}
+
 impl MrfDurableRepairAnchor {
     /// Build a dischargeable anchor only when the caller supplies the storage
     /// incarnation and the original ingress lease. Legacy replay records lack
@@ -324,6 +333,9 @@ pub enum MrfDurableAdmissionError {
 /// cancel repair.
 pub struct MrfDurableSubmission {
     pub intent: MrfIntent,
+    /// Bucket incarnation observed by the committed-write caller, when
+    /// available. Old journal records and legacy callers remain unbound.
+    pub source_bucket_incarnation_id: Option<Uuid>,
     pub response: oneshot::Sender<Result<(), MrfDurableAdmissionError>>,
 }
 
@@ -344,6 +356,19 @@ pub async fn persist_partial_write_intent(
     version_id: Option<Uuid>,
     scope: MrfScope,
 ) -> Result<(), MrfDurableAdmissionError> {
+    persist_partial_write_intent_with_incarnation(bucket, object, version_id, scope, None).await
+}
+
+pub async fn persist_partial_write_intent_with_incarnation(
+    bucket: &str,
+    object: &str,
+    version_id: Option<Uuid>,
+    scope: MrfScope,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
+    if source_bucket_incarnation_id.is_some_and(|incarnation| incarnation.is_nil()) {
+        return Err(MrfDurableAdmissionError::InvalidIdentity);
+    }
     let intent = MrfIntent {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
@@ -355,7 +380,7 @@ pub async fn persist_partial_write_intent(
         enqueued_at_ms: unix_now_ms(),
         attempts: 0,
     };
-    persist_durable_intent(intent).await
+    persist_durable_intent(intent, source_bucket_incarnation_id).await
 }
 
 pub async fn persist_delete_marker_purge_intent(
@@ -368,6 +393,7 @@ pub async fn persist_delete_marker_purge_intent(
     if version_id.is_nil() {
         return Err(MrfDurableAdmissionError::InvalidIdentity);
     }
+    let source_bucket_incarnation_id = delete_marker_purge.bucket_incarnation_id;
     let intent = MrfIntent {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
@@ -379,17 +405,23 @@ pub async fn persist_delete_marker_purge_intent(
         enqueued_at_ms: unix_now_ms(),
         attempts: 0,
     };
-    persist_durable_intent_unconditionally(intent).await
+    persist_durable_intent_unconditionally(intent, Some(source_bucket_incarnation_id)).await
 }
 
-async fn persist_durable_intent(intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+async fn persist_durable_intent(
+    intent: MrfIntent,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
     if !mrf_delivery_enabled() {
         return Err(MrfDurableAdmissionError::Disabled);
     }
-    persist_durable_intent_unconditionally(intent).await
+    persist_durable_intent_unconditionally(intent, source_bucket_incarnation_id).await
 }
 
-async fn persist_durable_intent_unconditionally(mut intent: MrfIntent) -> Result<(), MrfDurableAdmissionError> {
+async fn persist_durable_intent_unconditionally(
+    mut intent: MrfIntent,
+    source_bucket_incarnation_id: Option<Uuid>,
+) -> Result<(), MrfDurableAdmissionError> {
     if intent.bucket.is_empty()
         || intent.object.is_empty()
         || intent.bucket.len() > MRF_MAX_IDENTITY_COMPONENT
@@ -404,7 +436,11 @@ async fn persist_durable_intent_unconditionally(mut intent: MrfIntent) -> Result
     }
     let (response, receipt) = oneshot::channel();
     sender
-        .try_send(MrfDurableSubmission { intent, response })
+        .try_send(MrfDurableSubmission {
+            intent,
+            source_bucket_incarnation_id,
+            response,
+        })
         .map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => MrfDurableAdmissionError::Full,
             mpsc::error::TrySendError::Closed(_) => MrfDurableAdmissionError::Unavailable,
@@ -782,6 +818,8 @@ const MRF_REPAIRED_EVENT_CAP: usize = 4096;
 static MRF_REPAIRED_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfRepairedEvent>>> = OnceLock::new();
 static MRF_VERIFIED_REPAIR_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfVerifiedRepairEvent>>> =
     OnceLock::new();
+static MRF_UNVERIFIED_LEGACY_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfUnverifiedLegacyEvent>>> =
+    OnceLock::new();
 
 /// Record a legacy notification for compatibility. This is not an
 /// acknowledgement of storage verification or durable repair completion.
@@ -856,6 +894,44 @@ pub fn take_mrf_verified_repair_events_for(bucket: &str) -> Vec<MrfVerifiedRepai
         }
     }
     *events = retained;
+    taken
+}
+
+/// Record a bounded, exact-identity notice that a legacy durable partial-write
+/// was checked but cannot be proven from its on-disk format. This is not a
+/// repair proof and must never release the durable responsibility.
+pub fn note_mrf_unverified_legacy(event: MrfUnverifiedLegacyEvent) {
+    let registry = MRF_UNVERIFIED_LEGACY_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut events) = registry.lock() else {
+        return;
+    };
+    if events.contains(&event) {
+        return;
+    }
+    if events.len() >= MRF_REPAIRED_EVENT_CAP {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+/// Take held-legacy notices for one bucket. The durable ledger still verifies
+/// the full anchor before changing the journal entry to its held state.
+pub fn take_mrf_unverified_legacy_events_for(bucket: &str) -> Vec<MrfUnverifiedLegacyEvent> {
+    let Some(registry) = MRF_UNVERIFIED_LEGACY_EVENTS.get() else {
+        return Vec::new();
+    };
+    let Ok(mut events) = registry.lock() else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    events.retain(|event| {
+        if event.anchor.bucket.as_ref() == bucket {
+            taken.push(event.clone());
+            false
+        } else {
+            true
+        }
+    });
     taken
 }
 
@@ -1232,6 +1308,53 @@ mod tests {
         assert_eq!(taken, vec![event]);
         assert!(take_mrf_verified_repair_events_for("verified-bucket-a").is_empty());
         assert_eq!(take_mrf_verified_repair_events_for("verified-bucket-b").len(), 1);
+    }
+
+    #[test]
+    fn unverified_legacy_events_are_bucket_scoped_and_bounded() {
+        let bucket = Arc::<str>::from("unverified-legacy-event-bucket");
+        let _ = take_mrf_unverified_legacy_events_for(bucket.as_ref());
+        let event = MrfUnverifiedLegacyEvent {
+            anchor: MrfDurableRepairAnchor {
+                kind: MrfKind::PartialWrite,
+                bucket: bucket.clone(),
+                object: Arc::from("unverified-object"),
+                version_id: None,
+                scope: Some(MrfScope {
+                    pool_index: 1,
+                    set_index: 2,
+                }),
+                delete_marker_purge: None,
+                lease: MrfIngressLease::new(912),
+                bucket_incarnation_id: Uuid::new_v4(),
+            },
+        };
+        note_mrf_unverified_legacy(event.clone());
+        note_mrf_unverified_legacy(event.clone());
+        assert_eq!(take_mrf_unverified_legacy_events_for(bucket.as_ref()), vec![event]);
+        assert!(take_mrf_unverified_legacy_events_for(bucket.as_ref()).is_empty());
+
+        let cap_bucket = Arc::<str>::from("unverified-legacy-event-cap-bucket");
+        for index in 0..MRF_REPAIRED_EVENT_CAP + 4 {
+            note_mrf_unverified_legacy(MrfUnverifiedLegacyEvent {
+                anchor: MrfDurableRepairAnchor {
+                    kind: MrfKind::PartialWrite,
+                    bucket: cap_bucket.clone(),
+                    object: Arc::from(format!("object-{index}")),
+                    version_id: None,
+                    scope: Some(MrfScope {
+                        pool_index: 1,
+                        set_index: 2,
+                    }),
+                    delete_marker_purge: None,
+                    lease: MrfIngressLease::new(u64::try_from(index).expect("test index fits")),
+                    bucket_incarnation_id: Uuid::new_v4(),
+                },
+            });
+        }
+        let events = take_mrf_unverified_legacy_events_for(cap_bucket.as_ref());
+        assert_eq!(events.len(), MRF_REPAIRED_EVENT_CAP);
+        assert_eq!(events.first().expect("bounded ring is non-empty").anchor.object.as_ref(), "object-4");
     }
 }
 #[tokio::test]

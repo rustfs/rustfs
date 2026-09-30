@@ -3655,10 +3655,9 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
     tokio::fs::create_dir_all(&object_dir)
         .await
         .expect("failed to create object directory");
-    tokio::fs::write(&metadata_path, b"not-valid-filemeta")
+    tokio::fs::write(&metadata_path, b"")
         .await
-        .expect("failed to write corrupt metadata");
-
+        .expect("empty metadata fixture should be created");
     let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
     let disk = new_disk(
         &endpoint,
@@ -3691,11 +3690,16 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
         debug: false,
     };
 
-    let err = disk
-        .get_size(item)
-        .await
-        .expect_err("corrupt metadata should be surfaced as scanner-heal work");
-    assert!(is_scanner_metadata_corrupt_error(&err));
+    for contents in [b"".as_slice(), b"not-valid-filemeta".as_slice()] {
+        tokio::fs::write(&metadata_path, contents)
+            .await
+            .expect("corrupt metadata fixture should be written");
+        let err = disk
+            .get_size(item.clone())
+            .await
+            .expect_err("corrupt metadata should be surfaced as scanner-heal work");
+        assert!(is_scanner_metadata_corrupt_error(&err));
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

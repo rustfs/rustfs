@@ -5,11 +5,9 @@
 
 RustFS lets operators choose how much fsync work runs on the object write
 path. The default (`strict`) preserves the fully synced behavior RustFS has
-always shipped; the relaxed tiers are **opt-in** trades of power-loss
-durability for latency/IOPS. Note that **newly created buckets default to
-`relaxed`** (see [New-bucket default](#new-bucket-default)) — a gradual
-migration that leaves the process-wide default and all pre-existing buckets
-on `strict`.
+always shipped. `relaxed` and `none` are **opt-in** trades of power-loss
+durability for latency/IOPS. Newly created buckets inherit the process-wide
+mode unless `RUSTFS_NEW_BUCKET_DURABILITY_MODE` explicitly sets an override.
 
 ## Configuration
 
@@ -21,7 +19,7 @@ RUSTFS_DURABILITY_MODE=strict|relaxed|none   # default: strict
 RUSTFS_DRIVE_SYNC_ENABLE=true|false          # default: true
 
 # Tier seeded into a NEWLY CREATED bucket's own override (see "New-bucket default")
-RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed|strict|none|inherit   # default: relaxed
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed|strict|none|inherit   # default: inherit process mode
 ```
 
 Resolution rules:
@@ -93,6 +91,20 @@ power simultaneously, `relaxed` can lose recently acknowledged objects
 cluster-wide. Single-node
 deployments must stay on `strict`.
 
+## Recovery from corrupt object metadata
+
+A zero-length or unreadable `xl.meta` is corruption, not an absent object.
+RustFS reports it as a metadata error and keeps usage snapshots incomplete;
+quota admission can fail closed until a complete snapshot is available. On a
+multi-node deployment, attempt heal from healthy replicas and verify the
+recovered versions before cleaning any drive. If no healthy metadata copy or
+backup exists, the version index cannot be reconstructed from shard data
+alone. Preserve the affected directory for recovery before any operator-led
+cleanup. S3 `DeleteObject` is not a physical cleanup mechanism for corrupt
+metadata. After a successful repair or cleanup, a complete scanner cycle
+reconciles the failed-path cache; confirm the scanner reports a completed
+cycle before relying on a newly published usage snapshot.
+
 **`none`.** No fsync on the object data path at all; acknowledged objects can
 vanish wholesale on power loss, payload included. System-critical writes are
 still pinned (below). This is the tier equivalent of the old escape hatch,
@@ -149,18 +161,21 @@ configuration plane.
 
 ### New-bucket default
 
-A newly created bucket gets a `relaxed` override **seeded into its own
-metadata** at creation time, so it opts
-into MinIO's default posture (object data still fdatasynced; xl.meta and
-directory-entry fsyncs left to the page cache) without touching the
-process-wide default. This is a gradual migration:
+A newly created bucket inherits the process-wide mode by default. On an
+otherwise unconfigured deployment this means `strict`. Operators can explicitly
+set `RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed` to seed a relaxed override into
+new buckets, or choose `strict`, `none`, or `inherit`. A non-strict override is
+logged when the bucket is created; an explicitly non-strict process-wide mode
+is warned at startup. Relaxed remains appropriate only for the multi-node,
+independent-power-domain deployment described above.
 
-- **Pre-existing buckets are unaffected.** A bucket with no `durability.json`
-  entry keeps following the process-wide mode (`strict` by default), exactly
-  as before.
-- **The process-wide default stays `strict`.** `RUSTFS_DURABILITY_MODE` and
-  `RUSTFS_DRIVE_SYNC_ENABLE` are unchanged; only newly created buckets carry
-  their own `relaxed` override.
+- **Pre-existing buckets are unaffected by this default change.** Existing
+  per-bucket overrides remain stored in metadata, and buckets without an
+  override continue to follow the process-wide mode.
+- **Explicit global configuration still applies.** If the process-wide mode is
+  explicitly relaxed (or the legacy full-off mode is selected), an inherited
+  new bucket follows that mode. Keep the process-wide mode strict on a
+  single-node deployment.
 - **System-critical namespaces stay pinned to `strict`** regardless of any
   override (see [System-critical pinning](#system-critical-pinning)).
 
@@ -168,17 +183,21 @@ The seeded tier is controlled by an env var read once per bucket creation
 (bucket creation is not a hot path):
 
 ```bash
-RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed   # default: seed `relaxed`
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed   # explicitly seed `relaxed`
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict    # seed `strict` instead
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=none      # seed `none` instead
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=inherit   # seed nothing: follow the global mode
 ```
 
-`inherit` (and any unrecognized value, which fails closed to `inherit`) means
-the new bucket gets no override and follows the process-wide mode. Set this
-cluster-wide to opt out of the new default entirely. The seed only applies at
-bucket creation; it never retroactively rewrites existing buckets. To change
-an existing bucket's tier, use the per-bucket admin API above.
+`inherit` (the default) and any unrecognized value, which fails closed to
+`inherit`, mean the new bucket gets no override and follows the process-wide
+mode. The seed only applies at bucket creation; it never retroactively rewrites
+existing buckets. To correct an existing bucket created with a relaxed
+override, use the admin API above to set `strict` or delete the override to
+inherit the process-wide mode. Stored overrides do not record whether `relaxed`
+came from an earlier default or an explicit operator choice, so RustFS does not
+rewrite them automatically. Read and correct each affected bucket through the
+admin API; changing the env var alone is not a migration.
 
 ### Resolution order
 

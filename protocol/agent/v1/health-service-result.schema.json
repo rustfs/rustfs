@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://connect.rustfs.com/schemas/agent/v1/health-service-result.schema.json",
+  "title": "RustFS bounded health service result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runUid", "toolId", "capability", "outcome", "reasonCode", "durationMillis", "provenance", "coverage", "data"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "runUid": { "$ref": "#/$defs/uuid7" },
+    "toolId": { "const": "health.check" },
+    "capability": { "const": "health.check.service@1" },
+    "outcome": { "const": "PARTIAL" },
+    "reasonCode": {
+      "enum": ["CATALOG_PARTIAL", "EVIDENCE_INCOMPLETE", "EVIDENCE_STALE", "EVIDENCE_FRESHNESS_UNKNOWN", "CLOCK_SKEW"]
+    },
+    "durationMillis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "coverage": { "$ref": "#/$defs/coverage" },
+    "data": { "$ref": "#/$defs/data" }
+  },
+  "$defs": {
+    "uuid7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "sourceCommit", "executableSha256", "rustfsVersion", "osFamily", "architecture", "buildFeatures"],
+      "properties": {
+        "repository": { "const": "rustfs/rustfs" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "executableSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "rustfsVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "osFamily": { "enum": ["LINUX", "DARWIN", "WINDOWS", "FREEBSD", "OTHER"] },
+        "architecture": { "enum": ["x86_64", "aarch64", "other"] },
+        "buildFeatures": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestedUnits", "completedUnits", "unsupportedUnits", "unit"],
+      "properties": {
+        "requestedUnits": { "const": 13 },
+        "completedUnits": { "const": 2 },
+        "unsupportedUnits": { "const": 11 },
+        "unit": { "const": "CHECK" }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogVersion", "resourceAlias", "observations", "checks", "unsupportedChecks"],
+      "properties": {
+        "catalogVersion": { "const": 1 },
+        "resourceAlias": { "const": "cluster-1" },
+        "observations": { "$ref": "#/$defs/observations" },
+        "checks": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/capacityCheck" },
+            { "$ref": "#/$defs/flagsCheck" }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "unsupportedChecks": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/unsupportedMemory" },
+            { "$ref": "#/$defs/unsupportedTls" },
+            { "$ref": "#/$defs/unsupportedCpu" },
+            { "$ref": "#/$defs/unsupportedSwap" },
+            { "$ref": "#/$defs/unsupportedDrive" },
+            { "$ref": "#/$defs/unsupportedInode" },
+            { "$ref": "#/$defs/unsupportedFilesystem" },
+            { "$ref": "#/$defs/unsupportedOsKernel" },
+            { "$ref": "#/$defs/unsupportedLaunch" },
+            { "$ref": "#/$defs/unsupportedVersion" },
+            { "$ref": "#/$defs/unsupportedKubernetes" }
+          ],
+          "items": false,
+          "minItems": 11,
+          "maxItems": 11
+        }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capacity", "coarseFlags"],
+      "properties": {
+        "capacity": { "$ref": "#/$defs/capacityObservation" },
+        "coarseFlags": { "$ref": "#/$defs/flagsObservation" }
+      }
+    },
+    "capacityObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "observedAt", "freshness", "complete", "totalBytes", "usedBytes"],
+      "properties": {
+        "source": { "const": "LIVE_DISK_PROBE" },
+        "observedAt": { "type": ["string", "null"], "format": "date-time" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "complete": { "type": "boolean" },
+        "totalBytes": { "$ref": "#/$defs/nullableCounter" },
+        "usedBytes": { "$ref": "#/$defs/nullableCounter" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "complete": { "const": true } } },
+          "then": {
+            "properties": {
+              "observedAt": { "type": "string", "format": "date-time" },
+              "totalBytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "usedBytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          }
+        }
+      ]
+    },
+    "flagsObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "observedAt", "freshness", "complete", "values"],
+      "properties": {
+        "source": { "const": "LIVE_DISK_PROBE" },
+        "observedAt": { "type": ["string", "null"], "format": "date-time" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "complete": { "type": "boolean" },
+        "values": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "array",
+              "items": {
+                "enum": ["capacity.critical", "capacity.warning", "clock.skew", "cluster.degraded", "cluster.healing", "cluster.readonly", "drive.offline", "node.offline"]
+              },
+              "maxItems": 8,
+              "uniqueItems": true
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "complete": { "const": true } } },
+          "then": {
+            "properties": {
+              "observedAt": { "type": "string", "format": "date-time" },
+              "values": {
+                "type": "array",
+                "items": {
+                  "enum": ["capacity.critical", "capacity.warning", "clock.skew", "cluster.degraded", "cluster.healing", "cluster.readonly", "drive.offline", "node.offline"]
+                },
+                "maxItems": 8,
+                "uniqueItems": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "freshness": { "enum": ["CURRENT", "STALE", "UNKNOWN"] },
+    "nullableCounter": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "capacityCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/check" },
+        {
+          "properties": {
+            "checkId": { "const": "capacity.exhausted" },
+            "reasonCode": {
+              "enum": ["CAPACITY_EXHAUSTED", "CAPACITY_REMAINING", "CAPACITY_UNAVAILABLE", "EVIDENCE_MISSING", "INVALID_EVIDENCE", "EVIDENCE_STALE", "EVIDENCE_FRESHNESS_UNKNOWN", "CLOCK_SKEW"]
+            }
+          }
+        }
+      ]
+    },
+    "flagsCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/check" },
+        {
+          "properties": {
+            "checkId": { "const": "cluster.reportedFlags" },
+            "reasonCode": {
+              "enum": ["COARSE_CONDITION_REPORTED", "NO_COARSE_CONDITION_REPORTED", "EVIDENCE_MISSING", "INVALID_EVIDENCE", "EVIDENCE_STALE", "EVIDENCE_FRESHNESS_UNKNOWN", "CLOCK_SKEW"]
+            }
+          }
+        }
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkId", "outcome", "reasonCode", "resourceAlias"],
+      "properties": {
+        "checkId": { "type": "string" },
+        "outcome": { "enum": ["PASS", "FAIL", "UNKNOWN"] },
+        "reasonCode": { "type": "string" },
+        "resourceAlias": { "const": "cluster-1" }
+      }
+    },
+    "unsupported": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkId", "reasonCode"],
+      "properties": {
+        "checkId": { "type": "string" },
+        "reasonCode": { "const": "EVIDENCE_CONTRACT_UNAVAILABLE" }
+      }
+    },
+    "unsupportedMemory": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "memory.reportedPressure" } } }] },
+    "unsupportedTls": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "tls.validity" } } }] },
+    "unsupportedCpu": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "cpu.sufficiency" } } }] },
+    "unsupportedSwap": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "swap.pressure" } } }] },
+    "unsupportedDrive": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "drive.health" } } }] },
+    "unsupportedInode": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "inode.available" } } }] },
+    "unsupportedFilesystem": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "filesystem.compatibility" } } }] },
+    "unsupportedOsKernel": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "osKernel.compatibility" } } }] },
+    "unsupportedLaunch": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "launch.permissions" } } }] },
+    "unsupportedVersion": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "version.consistency" } } }] },
+    "unsupportedKubernetes": { "allOf": [{ "$ref": "#/$defs/unsupported" }, { "properties": { "checkId": { "const": "kubernetes.configuration" } } }] }
+  }
+}

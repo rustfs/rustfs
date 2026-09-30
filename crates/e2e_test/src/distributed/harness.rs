@@ -34,6 +34,9 @@ use crate::common::{
 };
 use crate::replication_extension_test::LOOPBACK_REPLICATION_TARGET_ENV;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use http::{Method, StatusCode};
@@ -41,7 +44,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use uuid::Uuid;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -400,9 +403,9 @@ pub(crate) async fn put_inventory(
     Ok(inventory)
 }
 
-/// Retry only transport-level service availability failures while a data
-/// movement operation changes the pool map. Generic InternalError responses
-/// remain fatal because accepting them would hide server defects.
+/// Retry only explicit S3 availability responses while a data movement
+/// operation changes the pool map. Transport failures and InternalError
+/// responses remain fatal because callers already require a ready endpoint.
 pub(crate) async fn put_inventory_retrying(
     client: &Client,
     bucket: &str,
@@ -449,17 +452,46 @@ where
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(50);
     loop {
-        let last_error = match probe().await {
-            Ok(true) => return Ok(()),
-            Ok(false) => format!("{label} still false"),
-            Err(error) => error.to_string(),
-        };
         if Instant::now() >= deadline {
-            return Err(format!("{label} did not become true within {timeout:?}: {last_error}").into());
+            return Err(format!("{label} did not become true within {timeout:?}").into());
         }
-        sleep(delay).await;
+        // A pending request must consume the same budget as unsuccessful probes.
+        match timeout_at(deadline, probe()).await {
+            Err(_) => return Err(format!("{label} did not become true within {timeout:?}").into()),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => {}
+        }
+        tokio::time::sleep_until((Instant::now() + delay).min(deadline)).await;
         delay = (delay * 2).min(Duration::from_secs(1));
     }
+}
+
+// Boxed SDK errors retain the operation's service code; Display only says
+// "service error" and cannot distinguish convergence from a server defect.
+pub(crate) fn s3_probe_error_code<'a>(error: &'a (dyn std::error::Error + Send + Sync + 'static)) -> Option<&'a str> {
+    error
+        .downcast_ref::<SdkError<GetObjectError>>()
+        .and_then(|error| error.as_service_error())
+        .and_then(ProvideErrorMetadata::code)
+        .or_else(|| {
+            error
+                .downcast_ref::<SdkError<PutObjectError>>()
+                .and_then(|error| error.as_service_error())
+                .and_then(ProvideErrorMetadata::code)
+        })
+}
+
+pub(crate) fn s3_probe_client(client: &Client) -> Client {
+    // The probe owns the retry policy. SDK retries must not hide a response
+    // that the probe would classify as fatal.
+    Client::from_conf(
+        client
+            .config()
+            .to_builder()
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .build(),
+    )
 }
 
 pub(crate) async fn cluster_admin(
@@ -598,15 +630,20 @@ pub(crate) async fn wait_for_replicated_bytes(
     expected: &[u8],
     timeout: Duration,
 ) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || async {
-            match get_object_bytes(client, bucket, key).await {
+            match get_object_bytes(&client, bucket, key).await {
                 Ok(got) if got.as_slice() == expected => Ok(true),
-                Ok(_) => Ok(false),
+                Ok(got) => Err(format!(
+                    "replicated object {bucket}/{key} bytes mismatch: expected sha256={} got sha256={}",
+                    sha256_hex(expected),
+                    sha256_hex(&got)
+                )
+                .into()),
                 Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("NoSuchKey") || message.contains("NotFound") {
+                    if matches!(s3_probe_error_code(error.as_ref()), Some("NoSuchKey" | "NotFound")) {
                         Ok(false)
                     } else {
                         Err(error)
@@ -988,6 +1025,7 @@ pub(crate) async fn list_pools_json(cluster: &RustFSTestClusterEnvironment) -> T
 }
 
 pub(crate) async fn retrying_put(client: &Client, bucket: &str, key: &str, body: Vec<u8>, timeout: Duration) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || {
@@ -999,8 +1037,7 @@ pub(crate) async fn retrying_put(client: &Client, bucket: &str, key: &str, body:
                 match put_object(&client, &bucket, &key, body).await {
                     Ok(()) => Ok(true),
                     Err(error) => {
-                        let message = error.to_string();
-                        if message.contains("SlowDown") || message.contains("ServiceUnavailable") || message.contains("503") {
+                        if matches!(s3_probe_error_code(error.as_ref()), Some("SlowDown" | "ServiceUnavailable")) {
                             Ok(false)
                         } else {
                             Err(error)
@@ -1021,19 +1058,20 @@ pub(crate) async fn retrying_get_equals(
     expected: &[u8],
     timeout: Duration,
 ) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || async {
-            match get_object_bytes(client, bucket, key).await {
+            match get_object_bytes(&client, bucket, key).await {
                 Ok(got) if got.as_slice() == expected => Ok(true),
-                Ok(_) => Ok(false),
+                Ok(got) => Err(format!(
+                    "object {bucket}/{key} bytes mismatch: expected sha256={} got sha256={}",
+                    sha256_hex(expected),
+                    sha256_hex(&got)
+                )
+                .into()),
                 Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("NoSuchKey")
-                        || message.contains("SlowDown")
-                        || message.contains("ServiceUnavailable")
-                        || message.contains("503")
-                    {
+                    if matches!(s3_probe_error_code(error.as_ref()), Some("SlowDown" | "ServiceUnavailable")) {
                         Ok(false)
                     } else {
                         Err(error)
@@ -1044,6 +1082,162 @@ pub(crate) async fn retrying_get_equals(
         &format!("get {bucket}/{key} during data movement"),
     )
     .await
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction, Operation, SeedMetadata};
+    use std::cell::Cell;
+
+    fn client(target: &FakeS3Target) -> Client {
+        Client::from_conf(build_test_s3_config(
+            target.endpoint(),
+            FAKE_ACCESS_KEY,
+            FAKE_SECRET_KEY,
+            None,
+            "distributed-retry-test",
+        ))
+    }
+
+    #[tokio::test]
+    async fn wait_until_preserves_first_error() {
+        let attempts = Cell::new(0);
+        let error = wait_until(
+            Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(if attempts.get() == 1 {
+                    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permanent probe failure").into())
+                } else {
+                    Ok(true)
+                })
+            },
+            "permanent failure",
+        )
+        .await
+        .expect_err("a later success must not hide a permanent failure");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("preserve the original error")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_retries_explicit_pending_state() -> TestResult {
+        let attempts = Cell::new(0);
+        wait_until(
+            Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(attempts.get() == 2))
+            },
+            "eventual readiness",
+        )
+        .await?;
+        assert_eq!(attempts.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_until_bounds_a_pending_probe() {
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_until(Duration::from_millis(10), std::future::pending, "hung probe"),
+        )
+        .await
+        .expect("the probe deadline must finish before the test watchdog")
+        .expect_err("a permanently pending probe must time out");
+        assert!(error.to_string().contains("hung probe did not become true"));
+    }
+
+    #[tokio::test]
+    async fn wait_until_does_not_start_a_probe_after_its_deadline() {
+        let attempts = Cell::new(0);
+        wait_until(
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(true))
+            },
+            "expired budget",
+        )
+        .await
+        .expect_err("an expired budget must not admit another probe");
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn retrying_put_does_not_hide_internal_error() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.inject(Operation::PutObject, FaultAction::ResponseStatus(500), 1);
+        let error = retrying_put(&client(&target), "retry-probe", "key", b"body".to_vec(), Duration::from_secs(5))
+            .await
+            .expect_err("InternalError must remain fatal even if the next PUT would succeed");
+        assert_eq!(s3_probe_error_code(error.as_ref()), Some("InternalError"));
+        assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retrying_put_allows_transient_availability_errors() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        for status in [429, 503] {
+            target.inject(Operation::PutObject, FaultAction::ResponseStatus(status), 1);
+            retrying_put(&client(&target), "retry-probe", "key", b"body".to_vec(), Duration::from_secs(5)).await?;
+            assert_eq!(target.take_requests().len(), 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_polls_reject_wrong_object_bytes() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.put_seed_object("retry-probe", "key", "wrong bytes", &SeedMetadata::default());
+        let error = retrying_get_equals(&client(&target), "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+            .await
+            .expect_err("a successful response with wrong bytes must fail immediately");
+        assert!(error.to_string().contains("bytes mismatch"));
+        assert_eq!(target.take_requests().len(), 1);
+        let error = wait_for_replicated_bytes(&client(&target), "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+            .await
+            .expect_err("replication may lag, but it must not return corrupt bytes");
+        assert!(error.to_string().contains("bytes mismatch"));
+        assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_polls_distinguish_committed_and_replicated_keys() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.put_seed_object("retry-probe", "key", "expected bytes", &SeedMetadata::default());
+        let client = client(&target);
+        for (status, expected_code) in [(404, "NoSuchKey"), (500, "InternalError"), (403, "AccessDenied")] {
+            target.inject(Operation::GetObject, FaultAction::ResponseStatus(status), 1);
+            let error = retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+                .await
+                .expect_err("an acknowledged object must not disappear or fail before a later successful read");
+            assert_eq!(s3_probe_error_code(error.as_ref()), Some(expected_code));
+            assert_eq!(target.take_requests().len(), 1);
+        }
+        for status in [429, 503] {
+            target.inject(Operation::GetObject, FaultAction::ResponseStatus(status), 1);
+            retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await?;
+            assert_eq!(target.take_requests().len(), 2);
+        }
+        target.inject(Operation::GetObject, FaultAction::ResponseStatus(404), 1);
+        wait_for_replicated_bytes(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await?;
+        assert_eq!(target.requests().len(), 2);
+        Ok(())
+    }
 }
 
 #[tokio::test]

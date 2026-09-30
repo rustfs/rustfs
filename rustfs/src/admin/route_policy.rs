@@ -356,6 +356,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/background-heal/status", HEAL, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/responsibilities",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/heal/mrf/responsibilities/actions",
+        HEAL,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v4/heal/replacement-recovery",
         HEAL,
         RouteRiskLevel::Sensitive,

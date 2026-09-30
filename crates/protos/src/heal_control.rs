@@ -153,6 +153,7 @@ impl StartCommand {
             bucket: self.bucket,
             object_prefix: self.object_prefix,
             object_version_id: self.object_version_id,
+            expected_bucket_incarnation_id: None,
             force_start: self.force_start,
             priority: self.priority.into(),
             pool_index: self

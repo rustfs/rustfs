@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+pub(super) mod cycle_persist_failure;
 mod quota_reset_preservation;
 
 mod recovery_control;
@@ -635,8 +636,8 @@ async fn cycle_budget_fence_accepts_bootstrap_pending_usage_marker() {
 
 #[tokio::test]
 async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
-    let lock = store
+    let (_temp_dir, lock_store) = setup_scanner_cycle_store().await;
+    let lock = lock_store
         .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
         .await
         .expect("scanner leader lock should be created");
@@ -644,6 +645,17 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
         .get_write_lock(Duration::from_secs(1))
         .await
         .expect("scanner leader lock should be acquired");
+
+    // Keep the real guard, but isolate the fencing deadline from filesystem I/O.
+    let store = Arc::new(MemoryConfigStore::default());
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+            .expect("scanner cycle usage baseline should encode"),
+    )
+    .await
+    .expect("scanner cycle usage baseline should persist");
 
     let ctx = CancellationToken::new();
     let mut cycle_info = CurrentCycle {
@@ -678,6 +690,8 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     .await;
 
     assert!(guard.is_released());
+    assert_eq!(leader_epoch, 2, "deadline handler should claim the next epoch");
+    assert!(matches!(cycle_revision, DataUsageCacheRevision::Etag(_)));
     let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .expect("deadline handler should persist a fenced cursor");

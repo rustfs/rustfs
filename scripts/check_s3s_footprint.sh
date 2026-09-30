@@ -62,10 +62,10 @@ cd "$(dirname "$0")/.."
 # s3_error! constructors for heal percent-decoding or tagging not-found errors.
 # 2026-09-15 main -> release integration retains the reviewed diagnostics
 # handlers from main (+3 invocation lines relative to release) and release's
-# other reductions. The merged tree measures 209 import files and 1587
-# invocation lines, tightening main's reviewed 1592-line baseline by five.
+# other reductions. The merged tree measures 209 import files and 1586
+# invocation lines, tightening main's reviewed 1592-line baseline by six.
 S3S_IMPORT_FILES_BASELINE=209
-S3_ERROR_LINES_BASELINE=1587
+S3_ERROR_LINES_BASELINE=1586
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;
