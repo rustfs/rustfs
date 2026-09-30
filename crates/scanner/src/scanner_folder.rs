@@ -3005,4 +3005,7 @@ pub use item_actions::{GetSizeFn, ScannerItem};
 use ledger::*;
 
 #[cfg(test)]
+pub(crate) use tests::checkpoint_fixture::run_checkpoint_fixture;
+
+#[cfg(test)]
 mod tests;
