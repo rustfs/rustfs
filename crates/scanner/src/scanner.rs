@@ -3835,4 +3835,4 @@ pub use heal_info::{BackgroundHealInfo, read_background_heal_info, save_backgrou
 pub use usage_store::store_data_usage_in_backend;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -219,6 +219,7 @@ async fn mrf_ownership_cancelled_batch_restores_sync_without_per_item_clones() {
 struct NoticeStorage {
     calls: std::sync::Mutex<HashMap<String, u32>>,
     retry_started: tokio::sync::Notify,
+    first_started: tokio::sync::Notify,
     bucket_incarnation_id: Uuid,
 }
 
@@ -272,6 +273,9 @@ impl HealStorageAPI for NoticeStorage {
             *count += 1;
             *count
         };
+        if call == 1 {
+            self.first_started.notify_one();
+        }
         if call > 1 {
             if call == 2 {
                 self.retry_started.notify_one();
@@ -308,6 +312,82 @@ impl HealStorageAPI for NoticeStorage {
     async fn get_disk_for_resume(&self, _: &str) -> rustfs_heal::Result<crate::DiskStore> {
         Err(rustfs_heal::Error::other("unused resume fixture"))
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_metadata_heal_reaches_budgeted_tail() {
+    const CHILD: &str = "RUSTFS_CHECKPOINT_REPAIR_TAIL_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("RUSTFS_HEAL_MRF_ENABLE", "true")
+            // Required metadata repair is independent of probabilistic object
+            // sampling. Keep unrelated sampled repairs out of this fixture.
+            .env("RUSTFS_HEAL_OBJECT_SELECT_PROB", "0")
+            .env("NO_PROXY", "localhost,127.0.0.1,::1")
+            .output()
+            .expect("isolated checkpoint repair process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let journal_root = tempfile::tempdir().expect("repair-tail MRF journal");
+    let _journal_env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(journal_root.path())
+        .build()
+        .await;
+    let storage = Arc::new(NoticeStorage {
+        bucket_incarnation_id: Uuid::from_u128(1),
+        ..Default::default()
+    });
+    let manager = Arc::new(HealManager::new(
+        storage.clone(),
+        Some(HealConfig {
+            enable_auto_heal: false,
+            mainline_throttle_enable: false,
+            ..Default::default()
+        }),
+    ));
+    manager.start().await.expect("start real heal manager");
+    spawn_mrf_consumer(manager.clone());
+    let saved = super::checkpoint_fixture::scan_budgeted_metadata_repair_tail().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if storage
+                .calls
+                .lock()
+                .expect("repair calls")
+                .get("static/zz-failed")
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                break;
+            }
+            storage.first_started.notified().await;
+        }
+    })
+    .await
+    .expect("the real MRF consumer must dispatch the discovered tail repair");
+    assert!(
+        saved
+            .info
+            .pending_heals
+            .iter()
+            .any(|entry| { entry.bucket == "bucket" && entry.object.as_deref() == Some("static/zz-failed") }),
+        "the dispatched repair must already be recorded in the saved scanner ledger"
+    );
+    manager.stop().await.expect("stop repair-tail manager");
 }
 
 #[tokio::test]

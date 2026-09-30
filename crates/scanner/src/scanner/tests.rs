@@ -700,6 +700,113 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     global_metrics().set_cycle(None).await;
 }
 
+/// Drive the production timeout, partial-cycle persistence, and leadership
+/// fences for the disk-backed checkpoint fixture.
+pub(crate) async fn checkpoint_fixture_runtime_handoff(checkpoint: &crate::DataUsageCache) -> (u64, u64) {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    usage.scanner_epoch = Some(checkpoint.info.leader_epoch);
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&usage).expect("complete fixture usage baseline"),
+    )
+    .await
+    .expect("seed usage fencing baseline");
+    let ctx = CancellationToken::new();
+    let mut cycle = CurrentCycle {
+        current: checkpoint.info.next_cycle,
+        next: checkpoint.info.next_cycle,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut epoch = checkpoint.info.leader_epoch;
+    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone()).await;
+    tokio::time::pause();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let worker_budget = budget.clone();
+    let worker = async {
+        worker_budget.token().cancelled().await;
+        assert!(
+            finalize_partial_scan_cycle_for_epoch(&ctx, store.clone(), &mut cycle, &mut revision, epoch, &mut metrics, Some(0),)
+                .await,
+            "a cooperative timeout must advance and persist the partial cycle"
+        );
+        worker_budget.mark_cycle_state_persisted();
+    };
+    let outcome = await_scanner_cycle_with_budget_fence(&ctx, &budget, worker, std::future::pending()).await;
+    tokio::time::resume();
+    assert_eq!(outcome, ScannerCycleWaitOutcome::Deadline { worker_stopped: true });
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+    assert!(budget.cycle_state_persisted());
+    assert!(
+        fence_scanner_epoch_after_cycle_timeout(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            std::future::pending(),
+        )
+        .await
+    );
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await,
+        "the next leader must claim the durable generation"
+    );
+    assert!(cycle.next > checkpoint.info.next_cycle);
+    assert!(epoch > checkpoint.info.leader_epoch);
+    let persisted = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("read durable timeout fence");
+    let (saved, saved_epoch) = decode_scanner_cycle_state(&persisted).expect("decode durable timeout fence");
+    assert_eq!((saved.next, saved_epoch), (cycle.next, epoch));
+    let cache_name = "bucket/.usage-cache.bin";
+    let mut cache_revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("read missing cache revisions");
+    for late_cycle in [checkpoint.info.next_cycle, cycle.next] {
+        let late = crate::scanner_io::persist_scanner_checkpoint(
+            store.clone(),
+            crate::scanner_io::ScannerCheckpointPersistContext {
+                ctx: &ctx,
+                expected_publication_epoch: 0,
+                cycle: late_cycle,
+                leader_epoch: checkpoint.info.leader_epoch,
+            },
+            cache_name,
+            checkpoint,
+            &mut cache_revisions,
+        )
+        .await;
+        assert!(matches!(late, crate::scanner_io::ScannerCheckpointPersistResult::FenceChanged));
+    }
+    assert!(
+        !store
+            .objects
+            .lock()
+            .await
+            .contains_key(&memory_config_key(RUSTFS_META_BUCKET, cache_name))
+    );
+    (cycle.next, epoch)
+}
+
 #[tokio::test]
 async fn scanner_cycle_recovery_wake_survives_wait_registration_race() {
     notify_scanner_cycle_recovery_wake();
