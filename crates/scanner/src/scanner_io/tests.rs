@@ -522,12 +522,16 @@ fn complete_set_cache_with_segment_proof(
 }
 
 async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
+    setup_local_scanner_store(2, 4).await
+}
+
+async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
     let mut pools = Vec::new();
-    for pool_index in 0..2 {
+    for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
-        for disk_index in 0..4 {
+        for disk_index in 0..drives_per_set {
             let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
             tokio::fs::create_dir_all(&disk_path)
                 .await
@@ -542,7 +546,7 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
         pools.push(PoolEndpoints {
             legacy: false,
             set_count: 1,
-            drives_per_set: 4,
+            drives_per_set,
             endpoints: Endpoints::from(endpoints),
             cmd_line: format!("scanner-cycle-pool-{pool_index}"),
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
