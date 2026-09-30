@@ -2678,6 +2678,25 @@ async fn read_repair_object_heal_sets_read_repair_option() {
     assert!(!opts[0].no_lock);
 }
 
+#[tokio::test]
+async fn durable_mrf_heal_rejects_a_recreated_bucket_before_storage_heal() {
+    let original_incarnation = Uuid::new_v4();
+    let recreated_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(recreated_incarnation)),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(original_incarnation);
+    let task = HealTask::from_request(request, storage.clone());
+
+    let result = task.heal_object("bucket", "object", None).await;
+
+    assert!(matches!(result, Err(Error::TaskExecutionFailed { .. })));
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
     let storage = Arc::new(MockStorage {
@@ -4002,6 +4021,7 @@ async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() 
         HealPriority::Normal,
     );
     request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(incarnation);
     let task = HealTask::from_request(request, storage.clone());
 
     task.execute()
