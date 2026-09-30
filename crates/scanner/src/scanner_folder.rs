@@ -719,6 +719,7 @@ pub struct FolderScanner {
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
     failed_object_paths_seen: HashSet<String>,
+    resolved_failed_object_paths: HashSet<String>,
 
     sleeper: DynamicSleeper,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -948,6 +949,7 @@ impl FolderScanner {
             return;
         }
 
+        self.resolved_failed_object_paths.remove(path);
         let now = Self::now_secs();
         self.new_cache.info.failed_objects.insert(path.to_string(), now);
 
@@ -968,11 +970,19 @@ impl FolderScanner {
     }
 
     fn clear_failed_path(&mut self, path: &str) {
-        self.new_cache.info.failed_objects.remove(path);
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            self.resolved_failed_object_paths.insert(path.to_string());
+        }
         self.failed_object_paths_seen.remove(path);
     }
 
     fn reconcile_failed_objects_after_full_scan(&mut self) {
+        self.new_cache
+            .info
+            .failed_objects
+            .retain(|path, _| !self.resolved_failed_object_paths.contains(path));
+        self.resolved_failed_object_paths.clear();
+
         let mixed_coverage = self
             .new_cache
             .info
@@ -1848,6 +1858,7 @@ impl FolderScanner {
                         let retry_suppressed = self.failed_retry_suppressed(&item.path);
 
                         if failure_action != GetSizeFailureAction::Skip {
+                            self.resolved_failed_object_paths.remove(&item.path);
                             self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                             if !retry_suppressed {
                                 into.failed_objects += 1;
@@ -2813,6 +2824,7 @@ pub(crate) async fn scan_data_folder_scoped(
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
         failed_object_paths_seen: HashSet::new(),
+        resolved_failed_object_paths: HashSet::new(),
         sleeper,
         disks,
         disks_quorum,

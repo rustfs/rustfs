@@ -337,6 +337,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_ttl_secs: u64::MAX,
         failed_objects_max: usize::MAX,
         failed_object_paths_seen: HashSet::new(),
+        resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
         disks: Vec::new(),
         disks_quorum: 0,
@@ -1136,6 +1137,10 @@ async fn test_failed_objects_clear_on_recovery_and_full_scan_reconciliation() {
         .insert("bucket/still-failed/xl.meta".to_string(), now);
 
     scanner.clear_failed_path("bucket/recovered/xl.meta");
+    assert!(
+        scanner.new_cache.info.failed_objects.contains_key("bucket/recovered/xl.meta"),
+        "recovery is committed only after the scan completes"
+    );
     scanner.mark_failed_path_seen("bucket/still-failed/xl.meta");
     scanner.reconcile_failed_objects_after_full_scan();
 
@@ -2899,10 +2904,17 @@ async fn full_scan_clears_failed_cache_for_manually_removed_object() {
         name: "bucket".to_string(),
         ..Default::default()
     };
-    info.failed_objects
-        .insert("bucket/removed/xl.meta".to_string(), FolderScanner::now_secs());
-    info.failed_objects
-        .insert("bucket/repaired/xl.meta".to_string(), FolderScanner::now_secs());
+    let canonical_root = temp_dir
+        .canonicalize()
+        .expect("test disk root should resolve to the path used by scanner");
+    info.failed_objects.insert(
+        canonical_root.join("bucket/removed/xl.meta").to_string_lossy().into_owned(),
+        FolderScanner::now_secs(),
+    );
+    info.failed_objects.insert(
+        canonical_root.join("bucket/repaired/xl.meta").to_string_lossy().into_owned(),
+        FolderScanner::now_secs(),
+    );
     let cache = DataUsageCache {
         info,
         ..Default::default()
@@ -3600,11 +3612,12 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),
     };
-    write_test_object_metadata(&temp_dir, "bucket", "object").await;
+    write_test_object_metadata_bytes(&temp_dir, "bucket", "object", &[]).await;
 
     let failed_path = temp_dir
-        .join("bucket")
-        .join("object")
+        .canonicalize()
+        .expect("test disk root should resolve to the path used by scanner")
+        .join("bucket/object")
         .join(STORAGE_FORMAT_FILE)
         .to_string_lossy()
         .into_owned();
@@ -3616,7 +3629,10 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         },
         ..Default::default()
     };
-    cache.info.failed_objects.insert(failed_path, FolderScanner::now_secs());
+    cache
+        .info
+        .failed_objects
+        .insert(failed_path.clone(), FolderScanner::now_secs());
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new(&parent, Default::default());
@@ -3637,7 +3653,11 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         other => panic!("expected unresolved object to keep the cache partial, got {other:?}"),
     };
     assert!(!partial.info.snapshot_complete);
-    assert!(!partial.info.failed_objects.is_empty());
+    assert!(
+        partial.info.failed_objects.contains_key(&failed_path),
+        "corrupt object failure should remain recorded: {:?}",
+        partial.info.failed_objects
+    );
 }
 
 #[tokio::test]
