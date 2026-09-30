@@ -253,54 +253,52 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
-fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
+fn find_mimalloc_stat<'a>(value: &'a Value, metric: &str) -> Option<&'a Value> {
     match value {
-        Value::Object(fields) => {
-            if let Some(metric_value) = fields.get(metric)
-                && let Some(value) = metric_value
-                    .as_object()
-                    .and_then(|fields| fields.get(field))
-                    .and_then(numeric_json_value)
-                    // Mimalloc serializes cumulative counters as scalars and
-                    // count statistics as objects with current/peak/total.
-                    .or_else(|| (field == "total").then(|| numeric_json_value(metric_value)).flatten())
-            {
-                return Some(value);
-            }
-
-            fields.values().find_map(|value| mimalloc_stat_field(value, metric, field))
-        }
-        Value::Array(values) => values.iter().find_map(|value| mimalloc_stat_field(value, metric, field)),
+        Value::Object(fields) => fields
+            .get(metric)
+            .or_else(|| fields.values().find_map(|value| find_mimalloc_stat(value, metric))),
+        Value::Array(values) => values.iter().find_map(|value| find_mimalloc_stat(value, metric)),
         _ => None,
     }
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
-    mimalloc_stat_field(value, metric, "current")
+    find_mimalloc_stat(value, metric)?
+        .as_object()?
+        .get("current")
+        .and_then(numeric_json_value)
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
-    let requested_current = mimalloc_stat_current(&value, "malloc_requested");
-    let requested_peak = mimalloc_stat_field(&value, "malloc_requested", "peak");
-    let requested_total = mimalloc_stat_field(&value, "malloc_requested", "total");
-    // All-zero count stats can mean allocation accounting was compiled out.
-    // Normal/huge allocation stats are not a substitute for live requested bytes.
-    let requested_available = [requested_current, requested_peak, requested_total]
-        .into_iter()
-        .flatten()
-        .any(|value| value > 0);
-    let observation = AllocatorMemoryObservation {
+    let mut observation = AllocatorMemoryObservation {
         reserved_bytes: mimalloc_stat_current(&value, "reserved"),
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
-        malloc_requested_bytes: requested_current.filter(|_| requested_available),
-        malloc_requested_peak_bytes: requested_peak.filter(|_| requested_available),
-        malloc_requested_total_bytes: requested_total.filter(|_| requested_available),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
+        ..AllocatorMemoryObservation::default()
     };
+    if let Some(requested) = find_mimalloc_stat(&value, "malloc_requested") {
+        // Count fields belong to one statistic; scalar counters only have a total.
+        let (current, peak, total) = match requested {
+            Value::Object(fields) => (
+                fields.get("current").and_then(numeric_json_value),
+                fields.get("peak").and_then(numeric_json_value),
+                fields.get("total").and_then(numeric_json_value),
+            ),
+            _ => (None, None, numeric_json_value(requested)),
+        };
+        // All-zero stats can mean accounting was compiled out. Normal/huge
+        // allocation stats are not a substitute for live requested bytes.
+        if [current, peak, total].into_iter().flatten().any(|value| value > 0) {
+            observation.malloc_requested_bytes = current;
+            observation.malloc_requested_peak_bytes = peak;
+            observation.malloc_requested_total_bytes = total;
+        }
+    }
 
     if observation == AllocatorMemoryObservation::default() {
         None
@@ -594,6 +592,43 @@ mod tests {
             r#"{ "malloc_requested": { "unexpected": { "current": 123 } } }"#,
         ] {
             assert_eq!(parse_mimalloc_stats_json(payload), None, "invalid schema: {payload}");
+        }
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_does_not_mix_duplicate_statistic_nodes() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "malloc_requested": 10,
+                "wrapper": { "malloc_requested": { "current": 20, "peak": 30, "total": 40 } }
+            }"#,
+        )
+        .expect("top-level counter should parse");
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10));
+
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "a": { "malloc_requested": { "current": 7 } },
+                "b": { "malloc_requested": { "peak": 9, "total": 20 } }
+            }"#,
+        )
+        .expect("first wrapped statistic should parse");
+        assert_eq!(parsed.malloc_requested_bytes, Some(7));
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_keeps_all_zero_requested_stats_unavailable() {
+        for requested in ["0", "\"0\"", r#"{ "current": 0, "peak": 0, "total": 0 }"#] {
+            let payload = format!(r#"{{ "reserved": {{ "current": 1 }}, "malloc_requested": {requested} }}"#);
+            let parsed = parse_mimalloc_stats_json(&payload).expect("reserved count should parse");
+            assert_eq!(parsed.reserved_bytes, Some(1));
+            assert_eq!(parsed.malloc_requested_bytes, None);
+            assert_eq!(parsed.malloc_requested_peak_bytes, None);
+            assert_eq!(parsed.malloc_requested_total_bytes, None);
         }
     }
 
