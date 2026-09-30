@@ -12907,6 +12907,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn ordinary_expiry_accounts_the_committed_receipt_once() {
+        use crate::bucket::quota::{QuotaOperation, checker::QuotaChecker};
         use crate::data_usage::{apply_bucket_usage_memory_overlay, replace_bucket_usage_memory_from_info};
         use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 
@@ -12943,6 +12944,25 @@ mod tests {
             baseline.bucket_sizes.insert(bucket.clone(), bytes * 2);
             baseline.calculate_totals();
             replace_bucket_usage_memory_from_info(&baseline).await;
+            // Legacy quota admission consumes the same conservative overlay.
+            // Durable reservations have their own storage-commit accounting.
+            metadata_sys::update(
+                &bucket,
+                rustfs_config::QUOTA_CONFIG_FILE,
+                format!(r#"{{"quota":{},"quota_type":"Hard"}}"#, bytes * 2).into_bytes(),
+            )
+            .await
+            .expect("configure the legacy quota");
+            let checker =
+                QuotaChecker::new(Arc::new(tokio::sync::RwLock::new(metadata_sys::BucketMetadataSys::new(ecstore.clone()))));
+            let attempted_size = bytes.max(1);
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota before expiration");
+            assert!(!quota.allowed);
+            assert!(!quota.uses_durable_reservations);
+            assert_eq!(quota.current_usage, Some(bytes * 2));
             // Queued metadata is not the accounting receipt from the storage commit.
             queued.size = 1;
             let event = lifecycle::Event {
@@ -12970,7 +12990,35 @@ mod tests {
                 let remaining = if attempt_incarnation == incarnation { 1 } else { 2 };
                 assert_eq!(response.buckets_usage[&bucket].objects_count, remaining);
                 assert_eq!(response.buckets_usage[&bucket].size, remaining * bytes);
+                let quota = checker
+                    .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                    .await
+                    .expect("check quota before scanner confirmation");
+                assert!(!quota.allowed, "expiry must not release unconfirmed quota credit");
+                assert_eq!(quota.current_usage, Some(bytes * 2));
             }
+            let mut confirmed = baseline.clone();
+            confirmed.last_update = Some(std::time::SystemTime::now());
+            confirmed.scanner_epoch = Some(7);
+            confirmed.scanner_cycle = Some(10);
+            let usage = confirmed.buckets_usage.get_mut(&bucket).expect("bucket is in the snapshot");
+            usage.size = bytes;
+            usage.objects_count = 1;
+            usage.versions_count = 0; // The scanner does not count unversioned objects as versions.
+            confirmed.bucket_sizes.insert(bucket.clone(), bytes);
+            confirmed.calculate_totals();
+            replace_bucket_usage_memory_from_info(&confirmed).await;
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota after scanner confirmation");
+            assert_eq!(quota.allowed, bytes > 0);
+            assert_eq!(quota.current_usage, Some(bytes));
+            let too_large = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, bytes + 1)
+                .await
+                .expect("check the first byte above the quota limit");
+            assert!(!too_large.allowed);
             assert!(
                 ecstore
                     .get_object_info(&bucket, "keep", &ObjectOptions::default())

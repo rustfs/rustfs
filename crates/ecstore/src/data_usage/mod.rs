@@ -118,15 +118,15 @@ impl CachedBucketUsage {
 }
 
 /// Keeps a scanner refresh from including a delete before its memory receipt.
-pub(crate) struct ExpiryUsageAccounting {
-    bucket: String,
+pub(crate) struct ExpiryUsageAccounting<'a> {
+    bucket: &'a str,
     in_flight: Arc<AtomicUsize>,
 }
 
-impl ExpiryUsageAccounting {
+impl ExpiryUsageAccounting<'_> {
     pub(crate) async fn commit(self, deleted_size: u64) {
         let mut cache = memory_cache().write().await;
-        if let Some(entry) = cache.get_mut(&self.bucket)
+        if let Some(entry) = cache.get_mut(self.bucket)
             && Arc::ptr_eq(&entry.in_flight_expirations, &self.in_flight)
         {
             apply_bucket_object_delete_memory(entry, deleted_size, true);
@@ -134,23 +134,28 @@ impl ExpiryUsageAccounting {
     }
 }
 
-impl Drop for ExpiryUsageAccounting {
+impl Drop for ExpiryUsageAccounting<'_> {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-pub(crate) async fn begin_expiry_usage_accounting(bucket: &str) -> ExpiryUsageAccounting {
+pub(crate) async fn begin_expiry_usage_accounting(bucket: &str) -> ExpiryUsageAccounting<'_> {
     ensure_bucket_usage_cached(bucket).await;
     let mut cache = memory_cache().write().await;
-    let entry = cache
-        .entry(bucket.to_owned())
-        .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
-    entry.in_flight_expirations.fetch_add(1, Ordering::AcqRel);
-    ExpiryUsageAccounting {
-        bucket: bucket.to_owned(),
-        in_flight: Arc::clone(&entry.in_flight_expirations),
-    }
+    // The caller owns the bucket name through commit. Avoid allocating either
+    // a receipt name or a map key for every expiry in an already cached bucket.
+    let in_flight = match cache.get(bucket) {
+        Some(entry) => Arc::clone(&entry.in_flight_expirations),
+        None => {
+            let entry = cached_bucket_usage_now(BucketUsageInfo::default());
+            let in_flight = Arc::clone(&entry.in_flight_expirations);
+            cache.insert(bucket.to_owned(), entry);
+            in_flight
+        }
+    };
+    in_flight.fetch_add(1, Ordering::AcqRel);
+    ExpiryUsageAccounting { bucket, in_flight }
 }
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
@@ -5512,11 +5517,12 @@ mod tests {
             .expect("delete usage should remain cached")
             .usage_updated_at;
 
-        let stale = data_usage_info_for_test("bucket-a", 2, 768, mutation_update + Duration::from_nanos(1));
+        // Windows SystemTime has 100 ns resolution; retain strict ordering there.
+        let stale = data_usage_info_for_test("bucket-a", 2, 768, mutation_update + Duration::from_micros(1));
         replace_bucket_usage_memory_from_info(&stale).await;
         assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(768));
 
-        let mut too_old_matching = data_usage_info_for_test("bucket-a", 1, 256, mutation_update - Duration::from_nanos(1));
+        let mut too_old_matching = data_usage_info_for_test("bucket-a", 1, 256, mutation_update - Duration::from_micros(1));
         too_old_matching
             .buckets_usage
             .get_mut("bucket-a")
@@ -5530,7 +5536,7 @@ mod tests {
             "a matching byte total from before the delete cannot release the hold"
         );
 
-        let mut reconciled = data_usage_info_for_test("bucket-a", 1, 256, mutation_update + Duration::from_nanos(2));
+        let mut reconciled = data_usage_info_for_test("bucket-a", 1, 256, mutation_update + Duration::from_micros(2));
         reconciled
             .buckets_usage
             .get_mut("bucket-a")
@@ -5936,6 +5942,94 @@ mod tests {
 
         replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 1, 42, SystemTime::now())).await;
         assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cancelled_expiry_receipt_reconciles_without_another_mutation() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "expiry-cancelled-after-delete";
+        replace_bucket_usage_memory_from_info(&data_usage_info_for_test(bucket, 0, 0, SystemTime::now())).await;
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        let receipt = begin_expiry_usage_accounting(bucket).await;
+
+        // Storage has deleted one object, but the task has not committed its
+        // memory receipt. Even two complete scans must not replace its baseline.
+        let mut scanned = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        scanned.scanner_epoch = Some(7);
+        for cycle in [10, 11] {
+            scanned.scanner_cycle = Some(cycle);
+            replace_bucket_usage_memory_from_info(&scanned).await;
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+        }
+        drop(receipt);
+
+        for (cycle, expected) in [(12, 84), (13, 42)] {
+            scanned.scanner_cycle = Some(cycle);
+            replace_bucket_usage_memory_from_info(&scanned).await;
+            assert_eq!(get_bucket_usage_memory(bucket).await, Some(expected));
+            let mut displayed = scanned.clone();
+            apply_bucket_usage_memory_overlay(&mut displayed).await;
+            assert_eq!(displayed.buckets_usage[bucket].size, expected);
+            assert_eq!(displayed.buckets_usage[bucket].objects_count, expected / 42);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiry_restart_reloads_durable_usage_without_persisting_the_overlay() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "expiry-restart";
+        clear_usage_memory_cache_for_test().await;
+        let baseline = data_usage_info_for_test(bucket, 2, 84, SystemTime::now());
+        store_data_usage_in_backend(baseline.clone(), store.clone())
+            .await
+            .expect("persist the pre-expiration scanner snapshot");
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        begin_expiry_usage_accounting(bucket).await.commit(42).await;
+        let mut displayed = baseline.clone();
+        apply_bucket_usage_memory_overlay(&mut displayed).await;
+        assert_eq!(displayed.buckets_usage[bucket].size, 42);
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+
+        // Recreate only process-local usage state, then use the real backend
+        // loader. This is a restart-state regression, not a process restart E2E.
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
+        let recovered = load_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("reload the durable pre-expiration snapshot");
+        assert_eq!(recovered.buckets_usage[bucket].size, 84);
+        replace_bucket_usage_memory_from_info(&recovered).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(84));
+
+        let confirmed = data_usage_info_for_test(bucket, 1, 42, SystemTime::now());
+        store_data_usage_in_backend(confirmed, store.clone())
+            .await
+            .expect("persist scanner confirmation without another object mutation");
+        let recovered = load_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("reload the confirmed snapshot");
+        replace_bucket_usage_memory_from_info(&recovered).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+
+        // Historical overlay drift must not contaminate the persisted scan.
+        record_bucket_object_write_memory(bucket, None, 42).await;
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
+        let mut recovered = load_data_usage_from_backend_cached(store)
+            .await
+            .expect("reload the confirmed snapshot after losing the stale overlay");
+        replace_bucket_usage_memory_from_info(&recovered).await;
+        apply_bucket_usage_memory_overlay(&mut recovered).await;
+        assert_eq!(recovered.buckets_usage[bucket].objects_count, 1);
+        assert_eq!(recovered.buckets_usage[bucket].size, 42);
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(42));
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
     }
 
     #[tokio::test]
