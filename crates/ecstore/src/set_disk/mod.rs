@@ -4809,6 +4809,10 @@ impl SetDisks {
     /// Read the persisted bucket identity through this set's metadata owner.
     /// Missing or non-authoritative legacy identities remain errors.
     pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            // Metadata writes can already hold the pool metadata write lock.
+            return Err(Error::other("system metadata bucket has no bucket incarnation"));
+        }
         metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
@@ -7432,6 +7436,35 @@ mod tests {
 
     async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
         make_test_set_disks_with_ctx(lockers, bootstrap_ctx()).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn system_metadata_incarnation_lookup_does_not_reenter_pool_metadata() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let _pool_meta_guard = store.pool_meta.write().await;
+        let set = &store.pools[0].disk_set[0];
+
+        for bucket in [RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, crate::disk::MIGRATING_META_BUCKET] {
+            tokio::time::timeout(Duration::from_secs(30), set.bucket_incarnation_id_from_disk(bucket))
+                .await
+                .expect("system metadata identity lookup must not reacquire the held pool metadata lock")
+                .expect_err("system metadata buckets have no user bucket incarnation");
+        }
+
+        drop(_pool_meta_guard);
+        let bucket = "user-incarnation-boundary";
+        let incarnation = Uuid::new_v4();
+        crate::bucket::metadata::save_bucket_incarnation(Arc::clone(&store), bucket, incarnation)
+            .await
+            .expect("persist the user bucket identity through the metadata owner");
+        assert_eq!(
+            set.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("user bucket identities must still load from the metadata owner"),
+            incarnation,
+        );
     }
 
     async fn make_test_set_disks_with_ctx(
