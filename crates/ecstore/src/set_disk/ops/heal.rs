@@ -1166,7 +1166,7 @@ impl SetDisks {
 
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
                             result.detail =
-                                "Legacy object uses standard repair; independent object identity remains unverified".to_owned();
+                                rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned();
                         }
 
                         if disks_to_heal_count == 0 {

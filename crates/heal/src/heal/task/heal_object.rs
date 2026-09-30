@@ -93,6 +93,12 @@ impl HealTask {
             "Heal object stage entered"
         );
         self.check_control_flags().await?;
+        if self.source == HealRequestSource::Mrf {
+            // Durable partial writes always use the incarnation-fenced storage
+            // path, including for present objects. A normal heal can inspect a
+            // recreated bucket after the replay anchor was captured.
+            return self.heal_mrf_partial_write_object(bucket, object, version_id).await;
+        }
         let mut object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
             Err(err @ Error::TransientSkip { .. }) => {
@@ -429,10 +435,6 @@ impl HealTask {
 
     /// Recreate missing object (for EC decode scenarios)
     async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        if self.source == HealRequestSource::Mrf {
-            return self.recreate_missing_mrf_object(bucket, object, version_id).await;
-        }
-
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_OBJECT_STAGE,
@@ -534,8 +536,8 @@ impl HealTask {
         }
     }
 
-    /// Durable MRF responsibilities may complete only with an exact storage proof.
-    async fn recreate_missing_mrf_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+    /// Durable MRF partial writes may complete only with an incarnation-fenced storage proof.
+    async fn heal_mrf_partial_write_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
         let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
@@ -577,7 +579,30 @@ impl HealTask {
             storage_result.receipt.as_ref().map(|receipt| &receipt.disposition),
             Some(HealObjectDisposition::AuthoritativelyAbsent)
         );
-        if !self.record_verified_storage_receipt(expected, storage_result.receipt).await {
+        let receipt_missing = storage_result.receipt.is_none();
+        if !self
+            .record_verified_storage_receipt(expected.clone(), storage_result.receipt)
+            .await
+        {
+            let ok_drive_state = DriveState::Ok.to_string();
+            let healthy_legacy_without_repair = receipt_missing
+                && storage_result.item.detail == rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+                && storage_result.item.drives_healed() == Some(0)
+                && !storage_result.item.after.drives.is_empty()
+                && storage_result
+                    .item
+                    .after
+                    .drives
+                    .iter()
+                    .all(|drive| drive.state == ok_drive_state);
+            if healthy_legacy_without_repair {
+                self.outcome.write().await.record(HealObjectOutcome {
+                    identity: expected,
+                    disposition: HealObjectDisposition::Unknown,
+                    detail: Some(storage_result.item.detail.clone()),
+                });
+            }
+            self.record_result_item(storage_result.item).await;
             return Err(Error::TaskExecutionFailed {
                 message: format!("Missing exact storage proof for durable MRF repair {bucket}/{object}"),
             });
