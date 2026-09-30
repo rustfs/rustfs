@@ -68,6 +68,18 @@ pub enum MrfLifecycleControlError {
     Persistence,
 }
 
+#[derive(Debug)]
+pub struct MrfLegacyRiskAcceptanceRequest {
+    pub responsibility_id: Uuid,
+    pub expected_bucket_incarnation_id: Uuid,
+    pub acknowledge_unknown_source_incarnation: bool,
+    pub acknowledge_incarnation_mismatch: bool,
+    pub actor: String,
+    pub reason: String,
+    pub reference: String,
+    pub request_id: Uuid,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MrfLegacyResponsibilitySnapshot {
@@ -142,32 +154,13 @@ pub async fn refresh_legacy_responsibility(
     receiver.await.map_err(|_| MrfLifecycleControlError::Unavailable)?
 }
 
-pub async fn accept_unverified_legacy_risk(
-    responsibility_id: Uuid,
-    expected_bucket_incarnation_id: Uuid,
-    acknowledge_unknown_source_incarnation: bool,
-    acknowledge_incarnation_mismatch: bool,
-    actor: String,
-    reason: String,
-    reference: String,
-    request_id: Uuid,
-) -> Result<(), MrfLifecycleControlError> {
+pub async fn accept_unverified_legacy_risk(request: MrfLegacyRiskAcceptanceRequest) -> Result<(), MrfLifecycleControlError> {
     let sender = GLOBAL_MRF_LIFECYCLE_SENDER
         .get()
         .ok_or(MrfLifecycleControlError::Unavailable)?;
     let (response, receiver) = tokio::sync::oneshot::channel();
     sender
-        .send(MrfLifecycleCommand::AcceptUnverifiedRisk {
-            responsibility_id,
-            expected_bucket_incarnation_id,
-            acknowledge_unknown_source_incarnation,
-            acknowledge_incarnation_mismatch,
-            actor,
-            reason,
-            reference,
-            request_id,
-            response,
-        })
+        .send(MrfLifecycleCommand::AcceptUnverifiedRisk { request, response })
         .await
         .map_err(|_| MrfLifecycleControlError::Unavailable)?;
     receiver.await.map_err(|_| MrfLifecycleControlError::Unavailable)?
@@ -190,14 +183,7 @@ enum MrfLifecycleCommand {
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
     AcceptUnverifiedRisk {
-        responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
-        acknowledge_unknown_source_incarnation: bool,
-        acknowledge_incarnation_mismatch: bool,
-        actor: String,
-        reason: String,
-        reference: String,
-        request_id: Uuid,
+        request: MrfLegacyRiskAcceptanceRequest,
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
 }
@@ -1107,58 +1093,32 @@ impl MrfRuntime {
     async fn accept_legacy_risk(
         &mut self,
         manager: &HealManager,
-        responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
-        acknowledge_unknown_source_incarnation: bool,
-        acknowledge_incarnation_mismatch: bool,
-        actor: String,
-        reason: String,
-        reference: String,
-        request_id: Uuid,
+        request: MrfLegacyRiskAcceptanceRequest,
     ) -> Result<(), MrfLifecycleControlError> {
+        let responsibility_id = request.responsibility_id;
         if self
             .partial_writes
-            .intent_for_responsibility(responsibility_id)
+            .intent_for_responsibility(request.responsibility_id)
             .is_some_and(|(_, state, _)| {
                 matches!(
                     state,
                     partial_write::ResponsibilityState::OperatorAcceptedUnverified {
                         request_id: stored_request_id,
                         ..
-                    } if stored_request_id == request_id
+                    } if stored_request_id == request.request_id
                 )
             })
         {
             self.partial_writes
-                .record_operator_acceptance(
-                    self.queue.byte_budget.saturating_sub(self.queue.bytes()),
-                    responsibility_id,
-                    expected_bucket_incarnation_id,
-                    acknowledge_unknown_source_incarnation,
-                    acknowledge_incarnation_mismatch,
-                    actor,
-                    reason,
-                    reference,
-                    request_id,
-                )
+                .record_operator_acceptance(self.queue.byte_budget.saturating_sub(self.queue.bytes()), request)
                 .map_err(map_mrf_lifecycle_state_error)?;
             return Ok(());
         }
-        self.verify_legacy_generation_incarnation(manager, responsibility_id, expected_bucket_incarnation_id)
+        self.verify_legacy_generation_incarnation(manager, request.responsibility_id, request.expected_bucket_incarnation_id)
             .await?;
         let (previous, previous_acceptance) = self
             .partial_writes
-            .record_operator_acceptance(
-                self.queue.byte_budget.saturating_sub(self.queue.bytes()),
-                responsibility_id,
-                expected_bucket_incarnation_id,
-                acknowledge_unknown_source_incarnation,
-                acknowledge_incarnation_mismatch,
-                actor,
-                reason,
-                reference,
-                request_id,
-            )
+            .record_operator_acceptance(self.queue.byte_budget.saturating_sub(self.queue.bytes()), request)
             .map_err(map_mrf_lifecycle_state_error)?;
         self.dirty = true;
         if !self.flush().await {
@@ -1903,30 +1863,8 @@ async fn run_mrf_consumer(
                             .await;
                         let _ = response.send(result);
                     }
-                    MrfLifecycleCommand::AcceptUnverifiedRisk {
-                        responsibility_id,
-                        expected_bucket_incarnation_id,
-                        acknowledge_unknown_source_incarnation,
-                        acknowledge_incarnation_mismatch,
-                        actor,
-                        reason,
-                        reference,
-                        request_id,
-                        response,
-                    } => {
-                        let result = runtime
-                            .accept_legacy_risk(
-                                manager.as_ref(),
-                                responsibility_id,
-                                expected_bucket_incarnation_id,
-                                acknowledge_unknown_source_incarnation,
-                                acknowledge_incarnation_mismatch,
-                                actor,
-                                reason,
-                                reference,
-                                request_id,
-                            )
-                            .await;
+                    MrfLifecycleCommand::AcceptUnverifiedRisk { request, response } => {
+                        let result = runtime.accept_legacy_risk(manager.as_ref(), request).await;
                         let _ = response.send(result);
                     }
                 }
@@ -2162,7 +2100,7 @@ mod tests {
                 request_id: accepted_request_id,
             },
         };
-        let records = vec![record.clone(), accepted.clone()];
+        let records = vec![record, accepted];
         let encoded = encode_mrf_lifecycle_checkpoint(owner, 42, records.clone(), 8192)
             .expect("lifecycle checkpoint should fit the configured bound");
         let decoded = decode_mrf_lifecycle_checkpoint(&encoded, 8192).expect("valid lifecycle checkpoint");

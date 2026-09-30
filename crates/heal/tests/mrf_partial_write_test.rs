@@ -167,16 +167,16 @@ async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptan
             mrf_queue::recheck_legacy_responsibility(entry.responsibility_id, entry.bucket_incarnation_id).await,
             Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::InvalidAction(_))
         ));
-        mrf_queue::accept_unverified_legacy_risk(
-            entry.responsibility_id,
-            entry.bucket_incarnation_id,
-            true,
-            false,
-            "integration-test-operator".to_string(),
-            "The old journal has no source bucket-generation binding".to_string(),
-            "TEST-ISSUE-2682-UNBOUND".to_string(),
-            uuid::Uuid::new_v4(),
-        )
+        mrf_queue::accept_unverified_legacy_risk(mrf_queue::MrfLegacyRiskAcceptanceRequest {
+            responsibility_id: entry.responsibility_id,
+            expected_bucket_incarnation_id: entry.bucket_incarnation_id,
+            acknowledge_unknown_source_incarnation: true,
+            acknowledge_incarnation_mismatch: false,
+            actor: "integration-test-operator".to_string(),
+            reason: "The old journal has no source bucket-generation binding".to_string(),
+            reference: "TEST-ISSUE-2682-UNBOUND".to_string(),
+            request_id: uuid::Uuid::new_v4(),
+        })
         .await
         .expect("unbound risk disposition requires explicit acknowledgment and must be durable");
         assert!(
@@ -752,16 +752,16 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
         let responsibility_id = held.responsibility_id;
         let bucket_incarnation_id = held.bucket_incarnation_id;
         let request_id = uuid::Uuid::new_v4();
-        mrf_queue::accept_unverified_legacy_risk(
+        mrf_queue::accept_unverified_legacy_risk(mrf_queue::MrfLegacyRiskAcceptanceRequest {
             responsibility_id,
-            bucket_incarnation_id,
-            true,
-            false,
-            "integration-test-operator".to_string(),
-            "The operator has accepted that legacy object identity cannot be proven automatically".to_string(),
-            "TEST-ISSUE-2682".to_string(),
+            expected_bucket_incarnation_id: bucket_incarnation_id,
+            acknowledge_unknown_source_incarnation: true,
+            acknowledge_incarnation_mismatch: false,
+            actor: "integration-test-operator".to_string(),
+            reason: "The operator has accepted that legacy object identity cannot be proven automatically".to_string(),
+            reference: "TEST-ISSUE-2682".to_string(),
             request_id,
-        )
+        })
         .await
         .expect("explicit risk acceptance must persist before success");
         assert!(snapshot_contains("crash.bin").await, "risk acceptance must retain the MRF responsibility");

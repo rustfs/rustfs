@@ -1805,14 +1805,16 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                 timeout(
                     Duration::from_secs(30),
                     rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
-                        action.responsibility_id,
-                        action.expected_bucket_incarnation_id,
-                        action.acknowledge_unknown_source_incarnation == Some(true),
-                        action.acknowledge_bucket_incarnation_mismatch == Some(true),
-                        actor,
-                        reason,
-                        reference,
-                        request_id,
+                        rustfs_heal::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest {
+                            responsibility_id: action.responsibility_id,
+                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id,
+                            acknowledge_unknown_source_incarnation: action.acknowledge_unknown_source_incarnation == Some(true),
+                            acknowledge_incarnation_mismatch: action.acknowledge_bucket_incarnation_mismatch == Some(true),
+                            actor,
+                            reason,
+                            reference,
+                            request_id,
+                        },
                     ),
                 )
                 .await

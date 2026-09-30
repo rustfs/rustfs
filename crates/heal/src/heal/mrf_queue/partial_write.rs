@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{HealManager, MrfConsumerConfig, MrfDurableRepairAnchor, MrfIntent, MrfQueueKey, queue_key, submit_mrf_heal_request};
+use super::{
+    HealManager, MrfConsumerConfig, MrfDurableRepairAnchor, MrfIntent, MrfLegacyRiskAcceptanceRequest, MrfQueueKey, queue_key,
+    submit_mrf_heal_request,
+};
 use rustfs_common::mrf_channel::{MrfDurableAdmissionError, MrfIngressResult, release_mrf_intent, try_rearm_mrf_replay_intent};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -421,15 +424,18 @@ impl PartialWrites {
     pub(super) fn record_operator_acceptance(
         &mut self,
         byte_budget: usize,
-        responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
-        acknowledge_unknown_source_incarnation: bool,
-        acknowledge_incarnation_mismatch: bool,
-        actor: String,
-        reason: String,
-        reference: String,
-        request_id: Uuid,
+        request: MrfLegacyRiskAcceptanceRequest,
     ) -> Result<(ResponsibilityState, Option<MrfOperatorAcceptance>), &'static str> {
+        let MrfLegacyRiskAcceptanceRequest {
+            responsibility_id,
+            expected_bucket_incarnation_id,
+            acknowledge_unknown_source_incarnation,
+            acknowledge_incarnation_mismatch,
+            actor,
+            reason,
+            reference,
+            request_id,
+        } = request;
         validate_operator_audit_fields(&actor, &reason, &reference, request_id)?;
         let entry = self
             .entries
@@ -866,6 +872,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest;
     use rustfs_common::mrf_channel::{MrfKind, MrfScope};
     use std::sync::Arc;
     use std::time::Duration;
@@ -888,6 +895,26 @@ mod tests {
         };
         assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
         intent
+    }
+
+    fn risk_acceptance(
+        responsibility_id: Uuid,
+        expected_bucket_incarnation_id: Uuid,
+        acknowledge_unknown_source_incarnation: bool,
+        acknowledge_incarnation_mismatch: bool,
+        reason: &str,
+        reference: &str,
+    ) -> MrfLegacyRiskAcceptanceRequest {
+        MrfLegacyRiskAcceptanceRequest {
+            responsibility_id,
+            expected_bucket_incarnation_id,
+            acknowledge_unknown_source_incarnation,
+            acknowledge_incarnation_mismatch,
+            actor: "operator-a".to_string(),
+            reason: reason.to_string(),
+            reference: reference.to_string(),
+            request_id: Uuid::new_v4(),
+        }
     }
 
     #[test]
@@ -1000,14 +1027,14 @@ mod tests {
         let (previous, _) = restored
             .record_operator_acceptance(
                 8192,
-                responsibility_id,
-                incarnation,
-                true,
-                false,
-                "operator-a".to_string(),
-                "Reviewed against trusted backup; accepting unresolved identity risk".to_string(),
-                "INC-1234".to_string(),
-                Uuid::new_v4(),
+                risk_acceptance(
+                    responsibility_id,
+                    incarnation,
+                    true,
+                    false,
+                    "Reviewed against trusted backup; accepting unresolved identity risk",
+                    "INC-1234",
+                ),
             )
             .expect("explicit risk acceptance");
         assert!(matches!(previous, ResponsibilityState::HeldUnverifiedLegacy { .. }));
@@ -1111,47 +1138,17 @@ mod tests {
 
         assert!(
             writes
-                .record_operator_acceptance(
-                    8192,
-                    id,
-                    Uuid::new_v4(),
-                    true,
-                    false,
-                    "operator-a".to_string(),
-                    "reason".to_string(),
-                    "INC-1234".to_string(),
-                    Uuid::new_v4(),
-                )
+                .record_operator_acceptance(8192, risk_acceptance(id, Uuid::new_v4(), true, false, "reason", "INC-1234"))
                 .is_err()
         );
         assert!(
             writes
-                .record_operator_acceptance(
-                    8192,
-                    Uuid::new_v4(),
-                    incarnation,
-                    true,
-                    false,
-                    "operator-a".to_string(),
-                    "reason".to_string(),
-                    "INC-1234".to_string(),
-                    Uuid::new_v4(),
-                )
+                .record_operator_acceptance(8192, risk_acceptance(Uuid::new_v4(), incarnation, true, false, "reason", "INC-1234"))
                 .is_err()
         );
         assert!(
             writes
-                .record_operator_acceptance(
-                    8192,
-                    id,
-                    incarnation,
-                    true,
-                    false,
-                    "operator-a".to_string(),
-                    " ".to_string(),
-                    "INC-1234".to_string(),
-                    Uuid::new_v4(),
-                )
+                .record_operator_acceptance(8192, risk_acceptance(id, incarnation, true, false, " ", "INC-1234"))
                 .is_err()
         );
         assert_eq!(writes.unverified_legacy_count(), 1);
@@ -1179,28 +1176,28 @@ mod tests {
             writes
                 .record_operator_acceptance(
                     8192,
-                    responsibility_id,
-                    observed,
-                    false,
-                    false,
-                    "operator-a".to_string(),
-                    "The old bucket generation is no longer available".to_string(),
-                    "INC-5678".to_string(),
-                    Uuid::new_v4(),
+                    risk_acceptance(
+                        responsibility_id,
+                        observed,
+                        false,
+                        false,
+                        "The old bucket generation is no longer available",
+                        "INC-5678",
+                    ),
                 )
                 .is_err()
         );
         let (accepted, _) = writes
             .record_operator_acceptance(
                 8192,
-                responsibility_id,
-                observed,
-                false,
-                true,
-                "operator-a".to_string(),
-                "The old bucket generation is no longer available".to_string(),
-                "INC-5678".to_string(),
-                Uuid::new_v4(),
+                risk_acceptance(
+                    responsibility_id,
+                    observed,
+                    false,
+                    true,
+                    "The old bucket generation is no longer available",
+                    "INC-5678",
+                ),
             )
             .expect("generation mismatch requires and accepts explicit acknowledgment");
         assert!(matches!(accepted, ResponsibilityState::BucketIncarnationChanged { .. }));
