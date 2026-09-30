@@ -3194,25 +3194,25 @@ mod tests {
         replay_intent.kind = MrfKind::PartialWrite;
         replay_intent.version_id = None;
         let replay_payload = encoded_payload(&replay_intent);
-        let source_incarnation = storage
+        let source_bucket_incarnation_id = storage
             .mrf_bucket_incarnation_id(bucket)
             .await
-            .expect("read persisted replay source identity")
-            .expect("replay source bucket has a persisted incarnation");
+            .expect("read the producer's bucket incarnation")
+            .expect("the fixture bucket must have a persisted incarnation");
         let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
         let lifecycle = encode_mrf_lifecycle_checkpoint(
             replay_owner,
             11,
             vec![ResponsibilityCheckpoint {
-                intent_digest: intent_digest(&replay_intent).expect("fixture intent has a canonical digest"),
+                intent_digest: intent_digest(&replay_intent).expect("encode the replay intent identity"),
                 responsibility_id: Uuid::new_v4(),
-                source_bucket_incarnation_id: Some(source_incarnation),
+                source_bucket_incarnation_id: Some(source_bucket_incarnation_id),
                 last_operator_acceptance: None,
                 state: partial_write::ResponsibilityState::Active,
             }],
             lifecycle_limit,
         )
-        .expect("encode generation-bound replay responsibility");
+        .expect("encode the producer's source-bound responsibility");
         snapshot::publish_committed_snapshot_with_companion(
             &disks,
             replay_owner,
@@ -3222,7 +3222,7 @@ mod tests {
             Some((&MRF_LIFECYCLE_PATHS, &lifecycle, lifecycle_limit)),
         )
         .await
-        .expect("publish committed replay checkpoint with its source identity");
+        .expect("publish committed replay checkpoint with its producer identity");
 
         let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
         let mut backoff_until = None;

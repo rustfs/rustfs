@@ -50,9 +50,11 @@ const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
 const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
 const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
-const MIXED_BASELINE_KEY: &str = ".upgrade-baseline/persisted-before-restart";
-const MIXED_BASELINE_BODY: &[u8] = b"previous-release data survives restart and rolling upgrade";
 const MIXED_NODE_COUNT: usize = 4;
+const UPGRADE_READINESS_BODY: &[u8] = b"upgrade write readiness";
+// Written by the "previous-seed" readiness probe through node 0 before any
+// current binary starts; every later phase must still read it.
+const PREVIOUS_RELEASE_SEED_KEY: &str = ".upgrade-readiness/previous-seed/node-0";
 const MULTIPART_WORKERS: usize = 16;
 const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
 // Peers keep a restarted node's drive in Suspect/Returning for roughly
@@ -427,8 +429,8 @@ async fn exercise_mixed_cluster(
     let expected_count = multipart_keys.len() + 2;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
         assert_eq!(
-            read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
-            MIXED_BASELINE_BODY,
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
             "{phase}: the {label} node must retain the previous-release seed"
         );
         wait_for_phase_listing(
@@ -449,6 +451,16 @@ async fn exercise_mixed_cluster(
     Ok(())
 }
 
+fn upgrade_probe_client(client: &Client) -> Client {
+    Client::from_conf(
+        client
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .build(),
+    )
+}
+
 async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budget: Duration) -> TestResult {
     // ListBuckets can succeed before peers recover a restarted disk. Cluster
     // health also accepts Returning disks whose write health is still FAULTY.
@@ -456,13 +468,7 @@ async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budge
     // writes still execute once and retain their original assertions.
     let deadline = Instant::now() + budget;
     for (node, client) in clients.iter().enumerate() {
-        let client = Client::from_conf(
-            client
-                .config()
-                .to_builder()
-                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
-                .build(),
-        );
+        let client = upgrade_probe_client(client);
         let key = format!(".upgrade-readiness/{phase}/node-{node}");
         let mut last_response = "no response".to_string();
         loop {
@@ -477,7 +483,7 @@ async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budge
                     .put_object()
                     .bucket(MIXED_BUCKET)
                     .key(&key)
-                    .body(ByteStream::from_static(b"upgrade write readiness"))
+                    .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
                     .send(),
             )
             .await;
@@ -499,6 +505,43 @@ async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budge
                 }
             }
             tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(500))).await;
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
+    let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
+    // rc.5 can latch a non-elected node's write fence while its first startup
+    // waits for pool metadata (#7473). First prove the elected writer can
+    // persist data, then restart each old process once with three peers still
+    // readable. This preparation ends before any current binary is started.
+    wait_for_upgrade_write_readiness(&clients[..1], "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    for node in [1, 2, 3, 0] {
+        cluster.stop_node(node)?;
+        cluster.start_node_from_binary(node, previous_binary).await?;
+        wait_for_upgrade_write_readiness(
+            std::slice::from_ref(&clients[node]),
+            &format!("previous-restart-{node}"),
+            LISTING_CONVERGENCE_TIMEOUT,
+        )
+        .await?;
+    }
+
+    wait_for_upgrade_write_readiness(&clients, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+    for (reader, client) in clients.iter().enumerate() {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
+            "previous-release node {reader} must retain the seed across its rolling restart"
+        );
+        for writer in 0..clients.len() {
+            let key = format!(".upgrade-readiness/previous-baseline/node-{writer}");
+            assert_eq!(
+                read_object(client, MIXED_BUCKET, &key, None).await?.1,
+                UPGRADE_READINESS_BODY,
+                "previous-release node {reader} must read baseline data from writer {writer}"
+            );
         }
     }
     Ok(())
@@ -882,42 +925,7 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     configure_cluster_logs(&mut cluster)?;
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
-    {
-        let client = Client::from_conf(
-            cluster
-                .create_s3_client(0)?
-                .config()
-                .to_builder()
-                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
-                .build(),
-        );
-        client
-            .put_object()
-            .bucket(MIXED_BUCKET)
-            .key(MIXED_BASELINE_KEY)
-            .body(ByteStream::from_static(MIXED_BASELINE_BODY))
-            .send()
-            .await?;
-    }
-
-    // rc.5 joiners can latch pool-metadata write protection during fresh
-    // bootstrap. Establish a persisted old deployment before evaluating the
-    // upgrade; this fixed preparation step does not retry failed upgrade writes.
-    for node_idx in 0..cluster.nodes.len() {
-        cluster.stop_node(node_idx)?;
-    }
-    cluster.start_with_binary(&previous_binary).await?;
-    {
-        let clients = cluster.create_all_clients()?;
-        wait_for_upgrade_write_readiness(&clients, "previous-release-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
-        for (node_idx, client) in clients.iter().enumerate() {
-            assert_eq!(
-                read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
-                MIXED_BASELINE_BODY,
-                "previous-release node {node_idx} must read the seed after restart"
-            );
-        }
-    }
+    prepare_previous_release_baseline(&mut cluster, &previous_binary).await?;
 
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
@@ -934,8 +942,8 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
 
     for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
         assert_eq!(
-            read_object(client, MIXED_BUCKET, MIXED_BASELINE_KEY, None).await?.1,
-            MIXED_BASELINE_BODY,
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
             "current node {node_idx} must retain the previous-release seed"
         );
         for phase in ["one-current-node", "one-previous-node"] {
