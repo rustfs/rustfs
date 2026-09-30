@@ -118,7 +118,8 @@ def record(chain, suite, report, output):
     result = {"schema": 1, "suite": suite, "chain": chain, "valid": False, "counts": {}, "report_sha256": None}
     error = None
     try:
-        private_head = subprocess.check_output(["git", "-C", "auto-testing", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        private_head = subprocess.check_output(["git", "-C", "auto-testing", "rev-parse", "HEAD"],
+                                               cwd=os.environ.get("GITHUB_WORKSPACE", ROOT), text=True).strip()
         require(private_head == chain["testing_sha"], "suite used a different private script revision")
         require(report.is_file() and 0 < report.stat().st_size <= MAX_REPORT, "missing, empty or oversized report")
         data = report.read_bytes()
