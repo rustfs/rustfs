@@ -142,11 +142,11 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
 test-group = 'embedded-test-ports'
 
-# Inventory delivery and real drive/object probes include durable filesystem IO
-# in short deadlines. Reserve capacity so unrelated storage fixtures cannot
-# exhaust those budgets. Keep the deadlines and assertions unchanged.
+# Registration, inventory delivery, and real drive/object probes include
+# durable filesystem IO in short deadlines. Reserve capacity so sibling test
+# processes cannot exhaust those budgets. Keep deadlines and assertions intact.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
 # These concurrent state writers keep the production 5s lock-acquisition limit
@@ -363,7 +363,7 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & (binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_object) & test(=real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put)))'
 threads-required = "num-test-threads"
 
 # Keep the same state-writer capacity reservation in CI without changing the
@@ -509,6 +509,7 @@ default-filter = """
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
+        | test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
         | test(/^on_demand_migration::(get_basic_test::(get_miss_pulls_inline_and_serves_locally_afterwards|head_miss_answers_from_the_source_without_persisting)|interaction_test::test_odm_admin_config_is_redacted_and_status_counts_match_the_source)$/)
     )
 """
@@ -733,6 +734,7 @@ default-filter = """
     & !test(/^replication_extension_test::/)
     & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)
+    & !test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
 """
 fail-fast = false
 

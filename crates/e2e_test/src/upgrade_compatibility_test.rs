@@ -395,6 +395,7 @@ async fn exercise_mixed_cluster(
     previous_node: usize,
 ) -> TestResult {
     let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
     let current_client = &clients[current_node];
     let previous_client = &clients[previous_node];
 
@@ -439,6 +440,190 @@ async fn exercise_mixed_cluster(
     );
 
     Ok(())
+}
+
+async fn wait_for_upgrade_write_readiness(clients: &[Client], phase: &str, budget: Duration) -> TestResult {
+    // ListBuckets can succeed before peers recover a restarted disk. Cluster
+    // health also accepts Returning disks whose write health is still FAULTY.
+    // Probe every writer outside the asserted phase prefix; compatibility
+    // writes still execute once and retain their original assertions.
+    let deadline = Instant::now() + budget;
+    for (node, client) in clients.iter().enumerate() {
+        let client = Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let key = format!(".upgrade-readiness/{phase}/node-{node}");
+        let mut last_response = "no response".to_string();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(
+                    format!("{phase}: node {node} write readiness deadline exceeded; last response: {last_response}").into(),
+                );
+            }
+            let response = tokio::time::timeout_at(
+                deadline,
+                client
+                    .put_object()
+                    .bucket(MIXED_BUCKET)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"upgrade write readiness"))
+                    .send(),
+            )
+            .await;
+            match response {
+                Ok(Ok(_)) => break,
+                Ok(Err(error)) => {
+                    if error.raw_response().map(|response| response.status().as_u16()) != Some(503)
+                        || error.as_service_error().and_then(ProvideErrorMetadata::code) != Some("ServiceUnavailable")
+                    {
+                        return Err(format!("{phase}: node {node} write readiness failed: {error:?}").into());
+                    }
+                    last_response = format!("{error:?}");
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "{phase}: node {node} write readiness deadline exceeded during PutObject; last response: {last_response}"
+                    )
+                    .into());
+                }
+            }
+            tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(500))).await;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod upgrade_write_readiness_tests {
+    use super::*;
+    use crate::fake_s3_target::FaultAction;
+
+    #[tokio::test]
+    async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket(MIXED_BUCKET);
+        let client = fake_source_client(&target);
+        client.head_bucket().bucket(MIXED_BUCKET).send().await?;
+
+        let phase = "one-previous-node";
+        let first_key = format!(".upgrade-readiness/{phase}/node-0");
+        let second_key = format!(".upgrade-readiness/{phase}/node-1");
+        target.inject_for_key(
+            FakeTargetOperation::PutObject,
+            &first_key,
+            FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
+            2,
+        );
+        target.inject_for_key(
+            FakeTargetOperation::PutObject,
+            &second_key,
+            FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
+            1,
+        );
+        // Metadata readiness does not prove that a data write can succeed.
+        let premature = client
+            .put_object()
+            .bucket(MIXED_BUCKET)
+            .key(&first_key)
+            .body(ByteStream::from_static(b"upgrade write readiness"))
+            .send()
+            .await
+            .expect_err("metadata readiness does not prove write readiness");
+        assert_eq!(premature.raw_response().map(|response| response.status().as_u16()), Some(503));
+
+        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], phase, Duration::from_secs(5)).await?;
+        assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &first_key), 3);
+        assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &second_key), 2);
+        assert!(target.has_object(MIXED_BUCKET, &first_key));
+        assert!(target.has_object(MIXED_BUCKET, &second_key));
+        assert!(
+            client
+                .list_objects_v2()
+                .bucket(MIXED_BUCKET)
+                .prefix(format!("{phase}/"))
+                .send()
+                .await?
+                .contents()
+                .is_empty()
+        );
+        target.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_permanent_errors_without_sdk_retries() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket(MIXED_BUCKET);
+        let client = Client::from_conf(
+            fake_source_client(&target)
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3))
+                .build(),
+        );
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            let phase = format!("permanent-{}", status.as_u16());
+            let key = format!(".upgrade-readiness/{phase}/node-0");
+            target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Status(status), 1);
+            let error = wait_for_upgrade_write_readiness(std::slice::from_ref(&client), &phase, Duration::from_secs(5))
+                .await
+                .expect_err("a permanent error must not be retried into success");
+            assert!(error.to_string().contains("node 0 write readiness failed"), "{error}");
+            assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &key), 1);
+            assert!(!target.has_object(MIXED_BUCKET, &key));
+        }
+        target.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_errors_stop_at_the_deadline() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket(MIXED_BUCKET);
+        let client = fake_source_client(&target);
+        client.head_bucket().bucket(MIXED_BUCKET).send().await?;
+        let phase = "deadline";
+        let key = format!(".upgrade-readiness/{phase}/node-0");
+        target.inject_for_key(
+            FakeTargetOperation::PutObject,
+            &key,
+            FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
+            10,
+        );
+        let error = wait_for_upgrade_write_readiness(&[client], phase, Duration::from_secs(1))
+            .await
+            .expect_err("persistent unavailability must exhaust the shared deadline");
+        // Transport scheduling consumes the same budget; do not require a
+        // response to reach the fake target before the deadline on a busy host.
+        assert!(error.to_string().contains("deadline exceeded"), "{error}");
+        target.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_flight_requests_are_bounded_by_the_deadline() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket(MIXED_BUCKET);
+        let client = fake_source_client(&target);
+        client.head_bucket().bucket(MIXED_BUCKET).send().await?;
+        let phase = "stalled";
+        let key = format!(".upgrade-readiness/{phase}/node-0");
+        target.inject_for_key(FakeTargetOperation::PutObject, &key, FaultAction::Stall(Duration::from_secs(30)), 1);
+        let error = wait_for_upgrade_write_readiness(&[client], phase, Duration::from_secs(1))
+            .await
+            .expect_err("a stalled request must not outlive the readiness deadline");
+        assert!(error.to_string().contains("deadline exceeded during PutObject"), "{error}");
+        target.shutdown().await;
+        Ok(())
+    }
 }
 
 /// Pins the published old writer's limitation and the supported recovery

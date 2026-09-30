@@ -593,7 +593,7 @@ impl BucketMetadata {
     /// durability posture.
     pub fn new_with_default_durability(name: &str) -> Self {
         let mut metadata = Self::new(name);
-        metadata.durability_config_json = super::durability::new_bucket_durability_config_json();
+        metadata.durability_config_json = super::durability::new_bucket_durability_config_json(name);
         metadata
     }
 
@@ -1732,21 +1732,15 @@ mod test {
     }
 
     #[test]
-    fn new_bucket_metadata_constructor_seeds_default_durability() {
+    fn new_bucket_metadata_constructor_inherits_default_durability() {
         temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
             let metadata = BucketMetadata::new_with_default_durability("new-user-bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
 
             let encoded = metadata.marshal_msg().expect("marshal metadata");
             let decoded = BucketMetadata::unmarshal(&encoded).expect("unmarshal metadata");
             assert_eq!(decoded.durability_config_json, metadata.durability_config_json);
-            assert_eq!(
-                decoded.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(decoded.durability_config().is_none());
         });
     }
 

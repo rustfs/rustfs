@@ -881,11 +881,13 @@ async fn wait_for_heartbeat_status(
             if predicate(&current) {
                 return current;
             }
-            status.changed().await.expect("heartbeat status channel");
+            status.changed().await.unwrap_or_else(|error| {
+                panic!("heartbeat status channel: {error}; last status: {:?}", *status.borrow());
+            });
         }
     })
     .await
-    .expect("heartbeat status")
+    .unwrap_or_else(|error| panic!("heartbeat status: {error}; last status: {:?}", *status.borrow()))
 }
 
 fn rotation_response(pki: &TestPki, identity: &rustfs::connect::DeviceIdentity, serial: u8) -> (Value, Value) {
@@ -1647,11 +1649,13 @@ async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
                 if matches!(current, InventoryStatus::Online { .. }) {
                     break current;
                 }
-                inventory_status.changed().await.expect("inventory status channel");
+                inventory_status.changed().await.unwrap_or_else(|error| {
+                    panic!("inventory status channel: {error}; last status: {:?}", *inventory_status.borrow());
+                });
             }
         })
         .await
-        .expect("inventory online status"),
+        .unwrap_or_else(|error| panic!("inventory online status: {error}; last status: {:?}", *inventory_status.borrow())),
         InventoryStatus::Online { .. }
     ));
 
