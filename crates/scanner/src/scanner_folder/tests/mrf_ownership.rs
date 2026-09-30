@@ -314,31 +314,48 @@ impl HealStorageAPI for NoticeStorage {
     }
 }
 
+/// Singleton channels need a fresh process. Reuse nextest isolation when its
+/// startup environment already satisfies the fixture; otherwise configure it
+/// before launching the single-test child, including the cargo-test fallback.
+fn run_isolated_mrf_fixture(test_name: &str, environment: &[(&str, &str)]) -> bool {
+    const CHILD: &str = "RUSTFS_MRF_FIXTURE_CHILD";
+    let child = std::env::var(CHILD).ok().as_deref() == Some(test_name);
+    let isolated = std::env::var("NEXTEST_EXECUTION_MODE").ok().as_deref() == Some("process-per-test")
+        && std::env::var("NEXTEST_TEST_NAME").ok().as_deref() == Some(test_name);
+    let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_MRF_ENABLE, rustfs_config::DEFAULT_HEAL_MRF_ENABLE);
+    let configured = environment
+        .iter()
+        .all(|(key, value)| std::env::var(key).ok().as_deref() == Some(*value));
+    if child || (isolated && enabled && configured) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name)
+        .env(rustfs_config::ENV_HEAL_MRF_ENABLE, "true")
+        .envs(environment.iter().copied())
+        .output()
+        .expect("isolated MRF fixture process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_metadata_heal_reaches_budgeted_tail() {
-    const CHILD: &str = "RUSTFS_CHECKPOINT_REPAIR_TAIL_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("RUSTFS_HEAL_MRF_ENABLE", "true")
-            // Required metadata repair is independent of probabilistic object
-            // sampling. Keep unrelated sampled repairs out of this fixture.
-            .env("RUSTFS_HEAL_OBJECT_SELECT_PROB", "0")
-            .env("NO_PROXY", "localhost,127.0.0.1,::1")
-            .output()
-            .expect("isolated checkpoint repair process");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed;"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    // Required metadata repair is independent of probabilistic object sampling.
+    if run_isolated_mrf_fixture(
+        "scanner_folder::tests::mrf_ownership::checkpoint_fixture_metadata_heal_reaches_budgeted_tail",
+        &[
+            ("RUSTFS_HEAL_OBJECT_SELECT_PROB", "0"),
+            ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ],
+    ) {
         return;
     }
     let journal_root = tempfile::tempdir().expect("repair-tail MRF journal");
@@ -393,24 +410,10 @@ async fn checkpoint_fixture_metadata_heal_reaches_budgeted_tail() {
 #[tokio::test]
 #[serial]
 async fn mrf_ownership_manager_completion_preserves_scanner_pending() {
-    const CHILD: &str = "RUSTFS_MRF_OWNERSHIP_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("RUSTFS_HEAL_MRF_ENABLE", "true")
-            .output()
-            .expect("isolated ingress test process");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed;"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if run_isolated_mrf_fixture(
+        "scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending",
+        &[],
+    ) {
         return;
     }
     // The production ingress channel is a process singleton; isolation keeps

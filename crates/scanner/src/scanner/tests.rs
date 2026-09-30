@@ -700,27 +700,15 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     global_metrics().set_cycle(None).await;
 }
 
-/// Drive the production timeout, partial-cycle persistence, and leadership
-/// fences for the disk-backed checkpoint fixture.
-pub(crate) async fn checkpoint_fixture_runtime_handoff(checkpoint: &crate::DataUsageCache) -> (u64, u64) {
-    let store = Arc::new(MemoryConfigStore::default());
-    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
-    usage.scanner_epoch = Some(checkpoint.info.leader_epoch);
-    save_config(
-        store.clone(),
-        DATA_USAGE_OBJ_NAME_PATH.as_str(),
-        serde_json::to_vec(&usage).expect("complete fixture usage baseline"),
-    )
-    .await
-    .expect("seed usage fencing baseline");
+async fn checkpoint_runtime_handoff(store: Arc<MemoryConfigStore>, expected_cycle: u64, mut epoch: u64) -> (u64, u64) {
+    let (encoded, mut revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("read the previous durable generation");
+    let (mut cycle, saved_epoch) =
+        decode_scanner_cycle_state(&encoded.expect("a preceding generation must exist")).expect("decode preceding cycle");
+    assert_eq!((cycle.next, saved_epoch), (expected_cycle, epoch));
+    cycle.current = cycle.next;
     let ctx = CancellationToken::new();
-    let mut cycle = CurrentCycle {
-        current: checkpoint.info.next_cycle,
-        next: checkpoint.info.next_cycle,
-        ..Default::default()
-    };
-    let mut revision = DataUsageCacheRevision::Missing;
-    let mut epoch = checkpoint.info.leader_epoch;
     let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone()).await;
     tokio::time::pause();
     let budget = ScannerCycleBudget::new(
@@ -730,15 +718,14 @@ pub(crate) async fn checkpoint_fixture_runtime_handoff(checkpoint: &crate::DataU
             ..Default::default()
         },
     );
-    let worker_budget = budget.clone();
     let worker = async {
-        worker_budget.token().cancelled().await;
+        budget.token().cancelled().await;
         assert!(
             finalize_partial_scan_cycle_for_epoch(&ctx, store.clone(), &mut cycle, &mut revision, epoch, &mut metrics, Some(0),)
                 .await,
-            "a cooperative timeout must advance and persist the partial cycle"
+            "runtime expiry must durably advance the partial cycle"
         );
-        worker_budget.mark_cycle_state_persisted();
+        budget.mark_cycle_state_persisted();
     };
     let outcome = await_scanner_cycle_with_budget_fence(&ctx, &budget, worker, std::future::pending()).await;
     tokio::time::resume();
@@ -767,44 +754,86 @@ pub(crate) async fn checkpoint_fixture_runtime_handoff(checkpoint: &crate::DataU
             false,
             ScannerCycleResetPolicy::None,
         )
-        .await,
-        "the next leader must claim the durable generation"
+        .await
     );
-    assert!(cycle.next > checkpoint.info.next_cycle);
-    assert!(epoch > checkpoint.info.leader_epoch);
+    let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("read durable takeover fence");
+    let (saved, saved_epoch) = decode_scanner_cycle_state(&persisted).expect("decode takeover fence");
+    assert_eq!((saved.next, saved_epoch), (cycle.next, epoch));
+    (cycle.next, epoch)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
+    // One control store survives every handoff, as it does across real cycles.
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    usage.scanner_epoch = Some(7);
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&usage).expect("usage baseline"),
+    )
+    .await
+    .expect("seed usage fence once");
+    let mut cycle = CurrentCycle {
+        next: 11,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 7).await);
+    let checkpoint = crate::scanner_folder::run_checkpoint_fixture(false, |cycle, epoch| {
+        checkpoint_runtime_handoff(store.clone(), cycle, epoch)
+    })
+    .await;
     let persisted = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
-        .expect("read durable timeout fence");
-    let (saved, saved_epoch) = decode_scanner_cycle_state(&persisted).expect("decode durable timeout fence");
-    assert_eq!((saved.next, saved_epoch), (cycle.next, epoch));
+        .expect("final durable control state");
+    let (saved, epoch) = decode_scanner_cycle_state(&persisted).expect("final control state");
+    assert_eq!((saved.next, epoch), (checkpoint.info.next_cycle, checkpoint.info.leader_epoch));
+    assert!(saved.next > 11 && epoch > 7);
     let cache_name = "bucket/.usage-cache.bin";
-    let mut cache_revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+    let cache_revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
         .await
-        .expect("read missing cache revisions");
-    for late_cycle in [checkpoint.info.next_cycle, cycle.next] {
+        .expect("initial cache revisions");
+    checkpoint
+        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0)
+        .await
+        .expect("publish the current checkpoint into the fenced store");
+    let cache_path = rustfs_utils::path::path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name]);
+    let key = memory_config_key(RUSTFS_META_BUCKET, &cache_path);
+    let before = store.objects.lock().await.get(&key).cloned().expect("saved checkpoint bytes");
+    let mut revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("current cache revisions");
+    let mut stale = checkpoint.clone();
+    stale.info.next_cycle = 11;
+    stale.info.leader_epoch = 7;
+    stale.info.snapshot_complete = false;
+    for late_cycle in [11, saved.next] {
         let late = crate::scanner_io::persist_scanner_checkpoint(
             store.clone(),
             crate::scanner_io::ScannerCheckpointPersistContext {
                 ctx: &ctx,
                 expected_publication_epoch: 0,
                 cycle: late_cycle,
-                leader_epoch: checkpoint.info.leader_epoch,
+                leader_epoch: 7,
             },
             cache_name,
-            checkpoint,
-            &mut cache_revisions,
+            &stale,
+            &mut revisions,
         )
         .await;
         assert!(matches!(late, crate::scanner_io::ScannerCheckpointPersistResult::FenceChanged));
+        assert_eq!(
+            store.objects.lock().await.get(&key),
+            Some(&before),
+            "late writes cannot overwrite the current checkpoint"
+        );
     }
-    assert!(
-        !store
-            .objects
-            .lock()
-            .await
-            .contains_key(&memory_config_key(RUSTFS_META_BUCKET, cache_name))
-    );
-    (cycle.next, epoch)
 }
 
 #[tokio::test]

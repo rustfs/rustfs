@@ -870,19 +870,13 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_save_reload_resume_across_cycles_and_leaders() {
-    run_checkpoint_fixture(false, false).await;
-}
-
-#[tokio::test]
-#[serial]
-async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
-    run_checkpoint_fixture(false, true).await;
+    run_checkpoint_fixture(false, |cycle, epoch| std::future::ready((cycle + 1, epoch + 1))).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_hot_digest_retains_partial_progress() {
-    run_checkpoint_fixture(true, false).await;
+    run_checkpoint_fixture(true, |cycle, epoch| std::future::ready((cycle + 1, epoch + 1))).await;
 }
 
 /// A bucket written between every cycle requests a new plan each round. Once
@@ -1081,7 +1075,11 @@ pub(super) async fn scan_budgeted_metadata_repair_tail() -> DataUsageCache {
     panic!("required metadata repair at the budgeted tail was never discovered");
 }
 
-async fn run_checkpoint_fixture(change_digest: bool, runtime_handoffs: bool) {
+pub(crate) async fn run_checkpoint_fixture<Handoff, Step>(change_digest: bool, mut handoff: Handoff) -> DataUsageCache
+where
+    Handoff: FnMut(u64, u64) -> Step,
+    Step: std::future::Future<Output = (u64, u64)>,
+{
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -1186,11 +1184,7 @@ async fn run_checkpoint_fixture(change_digest: bool, runtime_handoffs: bool) {
         assert!(loaded.info.scan_plan_digest.is_none(), "old readers must rebuild an uncertified sweep");
         crate::remote_scanner::checkpoint_fixture_partial_return(budget.progress(), budget.entries_visited()).await;
         previous = reloaded;
-        (cycle, epoch) = if runtime_handoffs {
-            crate::scanner::tests::checkpoint_fixture_runtime_handoff(&loaded).await
-        } else {
-            (loaded.info.next_cycle + 1, loaded.info.leader_epoch + 1)
-        };
+        (cycle, epoch) = handoff(loaded.info.next_cycle, loaded.info.leader_epoch).await;
     }
     assert!(visited > 0, "fixture must exercise the directory walk");
     assert!(previous > 0, "fixture must retain and enumerate static subtree entries");
@@ -1315,18 +1309,14 @@ async fn run_checkpoint_fixture(change_digest: bool, runtime_handoffs: bool) {
             assert_eq!((total.objects, total.versions, total.size), (25, 2, 34));
             assert_eq!(saved.checked_flatten("bucket/static").expect("static subtree").objects, 23);
             assert_eq!(saved.checked_flatten("bucket/hot").expect("hot subtree").objects, 2);
-            return;
+            return saved;
         }
         assert!(!saved.info.snapshot_complete);
         assert!(saved.info.scan_plan_digest.is_none());
         if !budget.budget_elapsed() {
             saw_mixed_sweep_end = true;
         }
-        (cycle, epoch) = if runtime_handoffs {
-            crate::scanner::tests::checkpoint_fixture_runtime_handoff(&saved).await
-        } else {
-            (saved.info.next_cycle + 1, saved.info.leader_epoch + 1)
-        };
+        (cycle, epoch) = handoff(saved.info.next_cycle, saved.info.leader_epoch).await;
     }
     panic!("finite stable fixture must converge using the same four-object budget without an unbounded final sweep");
 }
