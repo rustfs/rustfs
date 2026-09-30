@@ -113,6 +113,8 @@ Authentication is by password only, verified against RustFS IAM users. Public-ke
 
 RustFS authorizes SFTP operations through the same IAM and bucket-policy evaluator used by S3. Applicable bucket-policy Deny statements constrain object operations, including root access. Request conditions include the SSH peer address as `aws:SourceIp` and the encrypted SSH connection as `aws:SecureTransport`. HTTP-only attributes such as `UserAgent` and `Referer` are absent and follow the policy engine's normal missing-key rules. Cached file reads also check authorization.
 
+Directory listing conditions (`s3:prefix`, `s3:delimiter`, and `s3:max-keys`) use the actual `ListObjectsV2` parameters. Directory prefixes include their trailing `/`. Each listing page checks the current policies.
+
 Upgrading from versions that checked only IAM with an empty condition context can cause previously accepted operations to return permission denied. Review the applicable identity and bucket policies when diagnosing this change. Object formats, bucket policies, and existing stored data require no migration.
 
 | SFTP activity | Required S3 actions |

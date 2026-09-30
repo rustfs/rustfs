@@ -156,6 +156,22 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
 }
 
+fn build_list_objects_uri(input: &ListObjectsV2Input) -> S3Result<http::Uri> {
+    let max_keys = input.max_keys.map(|value| value.to_string());
+    let query: Vec<_> = [
+        ("list-type", Some("2")),
+        ("prefix", input.prefix.as_deref()),
+        ("delimiter", input.delimiter.as_deref()),
+        ("max-keys", max_keys.as_deref()),
+        ("continuation-token", input.continuation_token.as_deref()),
+        ("start-after", input.start_after.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .collect();
+    build_bucket_uri(&input.bucket, &query)
+}
+
 /// Request parameters for creating S3 requests
 #[derive(Debug)]
 struct RequestParams<'a> {
@@ -183,15 +199,17 @@ impl ProtocolStorageClient {
         action: &S3Action,
         bucket: &str,
         object: Option<&str>,
+        listing: Option<&ListObjectsV2Input>,
     ) -> S3Result<()> {
         let context = self.fs.server_ctx().app_context();
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session.access_key(), context.as_deref()).await?;
-        let listing = matches!(action, S3Action::ListBucket | S3Action::HeadBucket);
-        let uri = if listing {
-            build_bucket_uri(bucket, &[("prefix", Some(object.unwrap_or_default()))])?
+        let uri = if let Some(input) = listing {
+            build_list_objects_uri(input)?
+        } else if let Some(key) = object {
+            build_object_uri(bucket, key, &[])?
         } else {
-            build_object_uri(bucket, object.unwrap_or_default(), &[])?
+            build_bucket_uri(bucket, &[])?
         };
         let mut request = Self::create_request(
             (),
@@ -199,7 +217,7 @@ impl ProtocolStorageClient {
             uri,
             RequestParams {
                 bucket: Some(bucket.to_owned()),
-                object: if listing { None } else { object.map(str::to_owned) },
+                object: object.map(str::to_owned),
                 credentials: &credentials,
             },
         )?;
@@ -274,10 +292,27 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         bucket: &str,
         object: Option<&str>,
     ) -> Result<(), AuthorizationError> {
-        if !is_operation_supported(session.protocol, action) {
+        // ListBucket requires the complete listing input to evaluate request conditions.
+        if matches!(action, S3Action::ListBucket) || !is_operation_supported(session.protocol, action) {
             return Err(AuthorizationError::AccessDenied);
         }
-        self.authorize_protocol_request(session, action, bucket, object)
+        self.authorize_protocol_request(session, action, bucket, object, None)
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
+
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        if !is_operation_supported(session.protocol, &S3Action::ListBucket) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, &S3Action::ListBucket, &input.bucket, None, Some(input))
             .await
             .map_err(|error| match error.code() {
                 s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
@@ -490,7 +525,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("list_objects_v2", Some(&input.bucket), None);
 
         let bucket = input.bucket.clone();
-        let uri = build_bucket_uri(&bucket, &[("list-type", Some("2"))])?;
+        let uri = build_list_objects_uri(&input)?;
         let req = Self::create_request(
             input,
             Method::GET,

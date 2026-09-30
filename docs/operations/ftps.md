@@ -38,6 +38,8 @@ operation interface does not expose the data connection's negotiated state.
 HTTP-only attributes such as `UserAgent` and `Referer` are absent and retain
 normal policy missing-key semantics.
 
+Directory listing conditions (`s3:prefix`, `s3:delimiter`, and `s3:max-keys`) use the actual `ListObjectsV2` parameters. Directory prefixes include their trailing `/`. Each listing page checks the current policies.
+
 Upgrades enforce restrictions that older protocol listeners could bypass.
 Previously accepted operations can therefore return permission denied. No
 object format or policy migration is required.

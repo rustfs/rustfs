@@ -31,6 +31,7 @@ use rustfs_protocols::common::{
     gateway::{AuthorizationError, S3Action},
     session::{Protocol, ProtocolPrincipal, SessionContext},
 };
+use s3s::dto::ListObjectsV2Input;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -141,19 +142,33 @@ fn protocol_policy_denials_and_request_conditions() {
             .await
             .expect("save bucket deny");
         for session in &sessions {
+            let list_input = ListObjectsV2Input::builder()
+                .bucket(bucket.to_owned())
+                .prefix(Some("secret/".into()))
+                .build()
+                .expect("list input");
+            assert!(
+                matches!(
+                    backend.authorize_list_objects(session, &list_input).await,
+                    Err(AuthorizationError::AccessDenied)
+                ),
+                "bucket deny constrains listing"
+            );
             for action in [
                 S3Action::GetObject,
                 S3Action::HeadObject,
                 S3Action::PutObject,
                 S3Action::DeleteObject,
-                S3Action::ListBucket,
                 S3Action::HeadBucket,
             ] {
+                let object = if matches!(action, S3Action::HeadBucket) {
+                    None
+                } else {
+                    Some("secret.txt")
+                };
                 assert!(
                     matches!(
-                        backend
-                            .authorize_operation(session, &action, bucket, Some("secret.txt"))
-                            .await,
+                        backend.authorize_operation(session, &action, bucket, object).await,
                         Err(AuthorizationError::AccessDenied)
                     ),
                     "bucket deny must constrain {action:?} over {:?}",
@@ -186,6 +201,115 @@ fn protocol_policy_denials_and_request_conditions() {
             )
             .await
             .expect("clear bucket policy");
+        let list_input = ListObjectsV2Input::builder()
+            .bucket(bucket.to_owned())
+            .prefix(Some("private /+&=照片/".into()))
+            .delimiter(Some("/".into()))
+            .max_keys(Some(2))
+            .build()
+            .expect("conditioned listing input");
+        // Request condition values must come from the same DTO as execution,
+        // including percent-encoded prefixes, explicit empty strings and zero.
+        for (key, operator, value, input) in [
+            ("s3:prefix", "StringEquals", json!("private /+&=照片/"), list_input.clone()),
+            (
+                "s3:prefix",
+                "StringEquals",
+                json!(""),
+                ListObjectsV2Input {
+                    prefix: Some(String::new()),
+                    ..list_input.clone()
+                },
+            ),
+            ("s3:delimiter", "StringEquals", json!("/"), list_input.clone()),
+            ("s3:max-keys", "NumericLessThanEquals", json!("2"), list_input.clone()),
+            (
+                "s3:max-keys",
+                "NumericEquals",
+                json!("0"),
+                ListObjectsV2Input {
+                    max_keys: Some(0),
+                    ..list_input.clone()
+                },
+            ),
+        ] {
+            let mut non_matching = input.clone();
+            let mut absent = input.clone();
+            match key {
+                "s3:prefix" => {
+                    non_matching.prefix = Some("other/".into());
+                    absent.prefix = None;
+                }
+                "s3:delimiter" => {
+                    non_matching.delimiter = Some("|".into());
+                    absent.delimiter = None;
+                }
+                "s3:max-keys" => {
+                    non_matching.max_keys = Some(3);
+                    absent.max_keys = None;
+                }
+                _ => unreachable!("known list condition"),
+            }
+            for source in ["iam-allow", "iam-deny", "bucket-deny"] {
+                let conditional = json!({"Effect":if source == "iam-allow" { "Allow" } else { "Deny" },
+                    "Action":"s3:ListBucket","Resource":format!("arn:aws:s3:::{bucket}"),
+                    "Condition":{(operator):{(key):value.clone()}}});
+                let iam_statements = match source {
+                    "iam-allow" => json!([conditional.clone()]),
+                    "iam-deny" => json!([allow.clone(), conditional.clone()]),
+                    _ => json!([allow.clone()]),
+                };
+                iam.set_policy(
+                    "protocol-policy",
+                    decode_policy(json!({"Version":"2012-10-17","Statement":iam_statements})).expect("parse list policy"),
+                )
+                .await
+                .expect("save list policy");
+                let bucket_statements = if source == "bucket-deny" {
+                    let mut statement = conditional;
+                    statement["Principal"] = json!({"AWS":"*"});
+                    json!([statement])
+                } else {
+                    json!([])
+                };
+                store
+                    .update_bucket_metadata_config(
+                        bucket,
+                        "policy.json",
+                        serde_json::to_vec(&json!({"Version":"2012-10-17","Statement":bucket_statements}))
+                            .expect("encode list bucket policy"),
+                    )
+                    .await
+                    .expect("save list bucket policy");
+                for session in &sessions {
+                    for (request, matches_condition) in [(&input, true), (&non_matching, false), (&absent, false)] {
+                        let result = backend.authorize_list_objects(session, request).await;
+                        let should_allow = if source == "iam-allow" {
+                            matches_condition
+                        } else {
+                            !matches_condition
+                        };
+                        if should_allow {
+                            result.unwrap_or_else(|error| panic!("{source} {key} should allow {:?}: {error}", session.protocol));
+                        } else {
+                            assert!(
+                                matches!(result, Err(AuthorizationError::AccessDenied)),
+                                "{source} {key} must deny {:?}",
+                                session.protocol
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        store
+            .update_bucket_metadata_config(
+                bucket,
+                "policy.json",
+                serde_json::to_vec(&json!({"Version":"2012-10-17","Statement":[]})).expect("encode empty list policy"),
+            )
+            .await
+            .expect("clear list bucket policy");
         for (condition, should_deny) in [
             (json!({"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}), true),
             (json!({"IpAddress":{"aws:SourceIp":"192.0.2.0/24"}}), false),

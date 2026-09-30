@@ -171,11 +171,6 @@ where
         // SECURITY: s3:DeleteBucket does not imply the right to destroy the
         // bucket contents. Enumerating and deleting each object are separate
         // authorization boundaries and must be cleared on their own.
-        self.storage
-            .authorize_operation(session_context, &S3Action::ListBucket, bucket, None)
-            .await
-            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -188,6 +183,11 @@ where
             let list_input = list_input.build().map_err(|e| {
                 Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
             })?;
+
+            self.storage
+                .authorize_list_objects(session_context, &list_input)
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
             if let Ok(output) = self.storage.list_objects_v2(list_input, session_context.credentials()).await {
                 // Delete all objects in this page
@@ -338,12 +338,6 @@ where
         let (bucket, prefix) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
-        // Authorize the operation
-        self.storage
-            .authorize_operation(session_context, &S3Action::ListBucket, &bucket, prefix.as_deref())
-            .await
-            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-
         let prefix_with_slash = prefix.clone().map(|p| if p.ends_with('/') { p } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
@@ -354,6 +348,11 @@ where
             .map_err(|e| {
                 Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
             })?;
+
+        self.storage
+            .authorize_list_objects(session_context, &list_input)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         match self.storage.list_objects_v2(list_input, session_context.credentials()).await {
             Ok(output) => {
@@ -799,6 +798,40 @@ where
 mod tests {
     use super::parse_s3_path;
     use rustfs_utils::path;
+
+    #[tokio::test]
+    async fn listing_authorizes_normalized_prefix_and_delimiter() {
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+        let backend = DummyBackend::new();
+        let driver = super::FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "protocol-user".into(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+        with_test_auth_override(
+            |_, bucket, prefix| bucket == "bucket" && prefix == Some("private/"),
+            driver.list(&user, "/bucket/private"),
+        )
+        .await
+        .expect("normalized prefix satisfies conditional allow");
+        let authorized = backend.list_authorizations();
+        let executed = backend.list_objects_calls();
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(executed.len(), 1);
+        assert_eq!(authorized[0].prefix.as_deref(), Some("private/"));
+        assert_eq!(authorized[0].delimiter.as_deref(), Some("/"));
+        assert_eq!(authorized[0].prefix, executed[0].prefix);
+        assert_eq!(authorized[0].delimiter, executed[0].delimiter);
+        assert_eq!(authorized[0].max_keys, executed[0].max_keys);
+        let denied =
+            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.list(&user, "/bucket/private")).await;
+        assert!(denied.is_err(), "matching prefix deny blocks LIST");
+        assert_eq!(backend.list_objects_calls().len(), 1, "denied LIST cannot reach storage");
+    }
 
     /// GHSA-g3vq-vv42-f647: MKD creates a bucket, so it must clear the
     /// `s3:CreateBucket` authorization boundary before touching the backend.

@@ -157,6 +157,8 @@ struct Inner {
     upload_part_copy: VecDeque<Result<UploadPartCopyOutput, DummyError>>,
 
     // Observation logs.
+    list_authorizations: Vec<ListObjectsV2Input>,
+    list_objects_calls: Vec<ListObjectsV2Input>,
     abort_multipart_calls: Vec<AbortCall>,
     put_object_calls: Vec<PutObjectCall>,
     create_multipart_calls: Vec<CreateMultipartCall>,
@@ -212,6 +214,8 @@ impl Inner {
             complete_multipart_upload: VecDeque::new(),
             abort_multipart_upload: VecDeque::new(),
             upload_part_copy: VecDeque::new(),
+            list_authorizations: Vec::new(),
+            list_objects_calls: Vec::new(),
             abort_multipart_calls: Vec::new(),
             put_object_calls: Vec::new(),
             create_multipart_calls: Vec::new(),
@@ -271,6 +275,14 @@ impl DummyBackend {
         }
     }
 
+    pub fn list_authorizations(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list authorization log").list_authorizations.clone()
+    }
+
+    pub fn list_objects_calls(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list call log").list_objects_calls.clone()
+    }
+
     pub fn deny_authorization(mut self) -> Self {
         self.deny_authorization = true;
         self
@@ -302,6 +314,14 @@ impl DummyBackend {
 
     // Queue-configuration helpers. Each test stages the responses it
     // expects in order. The method pops in FIFO order.
+
+    pub fn queue_head_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("queue bucket metadata")
+            .head_bucket
+            .push_back(Ok(HeadBucketOutput::default()));
+    }
 
     /// Queue a head_object Ok response with the given size and mtime.
     pub fn queue_head_object_ok(&self, size: u64, mtime: Option<Timestamp>) {
@@ -659,6 +679,25 @@ impl StorageBackend for DummyBackend {
         crate::common::gateway::authorize_operation(session, action, bucket, object).await
     }
 
+    async fn authorize_list_objects(
+        &self,
+        session: &crate::common::session::SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        self.inner
+            .lock()
+            .expect("record list authorization")
+            .list_authorizations
+            .push(input.clone());
+        self.authorize_operation(
+            session,
+            &crate::common::gateway::S3Action::ListBucket,
+            &input.bucket,
+            input.prefix.as_deref(),
+        )
+        .await
+    }
+
     async fn get_object(
         &self,
         bucket: &str,
@@ -756,7 +795,7 @@ impl StorageBackend for DummyBackend {
 
     async fn list_objects_v2(
         &self,
-        _input: ListObjectsV2Input,
+        input: ListObjectsV2Input,
         _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
@@ -764,6 +803,7 @@ impl StorageBackend for DummyBackend {
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
+            inner.list_objects_calls.push(input);
             let stall = inner.stall_list_objects_v2;
             let entered = inner.list_objects_v2_entered.clone();
             let popped = if stall { None } else { inner.list_objects_v2.pop_front() };

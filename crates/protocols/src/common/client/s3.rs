@@ -25,6 +25,7 @@ pub trait StorageBackend: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
     /// Authorize a protocol operation against the backend's policy domain.
     /// Backends with resource policies must override this identity-policy fallback.
+    /// Use `authorize_list_objects` for ListObjectsV2 requests.
     async fn authorize_operation(
         &self,
         session: &SessionContext,
@@ -33,6 +34,17 @@ pub trait StorageBackend: Send + Sync {
         object: Option<&str>,
     ) -> Result<(), AuthorizationError> {
         crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
+    /// Authorize listing with the exact parameters passed to `list_objects_v2`.
+    /// Backends with resource or request-condition policies must override this fallback.
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        self.authorize_operation(session, &S3Action::ListBucket, &input.bucket, input.prefix.as_deref())
+            .await
     }
 
     /// Get object content and metadata

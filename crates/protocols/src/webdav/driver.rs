@@ -525,6 +525,11 @@ where
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
 
+        self.storage
+            .authorize_list_objects(&self.session_context, &list_input)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
+
         let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
             error!(
                 event = EVENT_WEBDAV_LIST_FAILED,
@@ -704,14 +709,16 @@ where
                     });
                 }
 
-                if size == 0
-                    && self
-                        .storage
-                        .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
-                        .await
-                        .is_ok()
-                    && self.prefix_has_entries(bucket, &prefix).await?
-                {
+                let has_entries = if size == 0 {
+                    match self.prefix_has_entries(bucket, &prefix).await {
+                        Ok(has_entries) => has_entries,
+                        Err(FsError::Forbidden) => false,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
+                if has_entries {
                     return Ok(ResolvedPath::Directory {
                         prefix,
                         metadata: Some(output),
@@ -739,16 +746,11 @@ where
             HeadObjectProbe::Forbidden => {}
         }
 
-        if self
-            .storage
-            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
-            .await
-            .is_ok()
-        {
-            had_visibility = true;
-            if self.prefix_has_entries(bucket, &prefix).await? {
-                return Ok(ResolvedPath::Directory { prefix, metadata: None });
-            }
+        match self.prefix_has_entries(bucket, &prefix).await {
+            Ok(true) => return Ok(ResolvedPath::Directory { prefix, metadata: None }),
+            Ok(false) => had_visibility = true,
+            Err(FsError::Forbidden) => {}
+            Err(error) => return Err(error),
         }
 
         if had_visibility {
@@ -876,12 +878,6 @@ where
 
     /// List objects in a bucket
     async fn list_objects(&self, bucket: &str, prefix: Option<&str>) -> FsResult<Vec<WebDavDirEntry>> {
-        // Authorize the operation
-        self.storage
-            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, prefix)
-            .await
-            .map_err(|_| FsError::Forbidden)?;
-
         let prefix_with_slash = prefix.map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
@@ -890,6 +886,11 @@ where
             .delimiter(Some("/".to_string()))
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
+
+        self.storage
+            .authorize_list_objects(&self.session_context, &list_input)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
 
         match self.storage.list_objects_v2(list_input, self.credentials()).await {
             Ok(output) => {
@@ -1014,11 +1015,6 @@ where
         // SECURITY: s3:DeleteBucket does not imply the right to destroy the
         // bucket contents. Enumerating and deleting each object are separate
         // authorization boundaries and must be cleared on their own.
-        self.storage
-            .authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
-            .await
-            .map_err(|_| FsError::Forbidden)?;
-
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -1029,6 +1025,11 @@ where
             }
 
             let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
+
+            self.storage
+                .authorize_list_objects(&self.session_context, &list_input)
+                .await
+                .map_err(|_| FsError::Forbidden)?;
 
             if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                 // Delete all objects in this page
@@ -1356,11 +1357,6 @@ where
                 // says nothing about the children stored under it. Enumerating the
                 // prefix and deleting each child are separate authorization
                 // boundaries and must be cleared on their own.
-                self.storage
-                    .authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-
                 // List and delete all objects with this prefix
                 let mut continuation_token = None;
                 loop {
@@ -1373,6 +1369,11 @@ where
                     }
 
                     let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
+
+                    self.storage
+                        .authorize_list_objects(&self.session_context, &list_input)
+                        .await
+                        .map_err(|_| FsError::Forbidden)?;
 
                     if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                         if let Some(objects) = output.contents {
@@ -1540,12 +1541,15 @@ where
             };
             let dst_prefix = format!("{}/", dst_key);
 
+            let mut list_input = ListObjectsV2Input::builder()
+                .bucket(src_bucket.clone())
+                .prefix(Some(src_prefix.clone()))
+                .build()
+                .map_err(|_| FsError::GeneralFailure)?;
             self.storage
-                .authorize_operation(&self.session_context, &S3Action::ListBucket, &src_bucket, Some(&src_prefix))
+                .authorize_list_objects(&self.session_context, &list_input)
                 .await
                 .map_err(|_| FsError::Forbidden)?;
-
-            let mut continuation_token: Option<String> = None;
             let mut renamed_any = false;
 
             if include_src_marker {
@@ -1568,30 +1572,30 @@ where
             }
 
             loop {
-                let mut list_builder = ListObjectsV2Input::builder()
-                    .bucket(src_bucket.clone())
-                    .prefix(Some(src_prefix.clone()));
+                self.storage
+                    .authorize_list_objects(&self.session_context, &list_input)
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
 
-                if let Some(ref token) = continuation_token {
-                    list_builder = list_builder.continuation_token(Some(token.clone()));
-                }
-
-                let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
-                let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
-                    error!(
-                        event = EVENT_WEBDAV_RENAME_STATE,
-                        component = LOG_COMPONENT_PROTOCOLS,
-                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                        state = "directory_list_failed",
-                        src_bucket = %src_bucket,
-                        src_prefix = %src_prefix,
-                        dst_bucket = %dst_bucket,
-                        dst_prefix = %dst_prefix,
-                        error = %e,
-                        "WebDAV rename directory listing failed"
-                    );
-                    FsError::GeneralFailure
-                })?;
+                let output = self
+                    .storage
+                    .list_objects_v2(list_input.clone(), credentials)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            event = EVENT_WEBDAV_RENAME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "directory_list_failed",
+                            src_bucket = %src_bucket,
+                            src_prefix = %src_prefix,
+                            dst_bucket = %dst_bucket,
+                            dst_prefix = %dst_prefix,
+                            error = %e,
+                            "WebDAV rename directory listing failed"
+                        );
+                        FsError::GeneralFailure
+                    })?;
 
                 let mut page_pairs: Vec<(String, String)> = Vec::new();
                 if let Some(objects) = output.contents {
@@ -1627,7 +1631,7 @@ where
                 if !output.is_truncated.unwrap_or(false) {
                     break;
                 }
-                continuation_token = output.next_continuation_token;
+                list_input.continuation_token = output.next_continuation_token;
             }
 
             if !renamed_any {
@@ -1687,6 +1691,32 @@ mod tests {
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn listing_authorizes_normalized_prefix_and_delimiter() {
+        let backend = DummyBackend::new();
+        let driver = WebDavDriver::new(backend.clone(), Arc::new(test_session(Protocol::WebDav)));
+        with_test_auth_override(
+            |_, bucket, prefix| bucket == "bucket" && prefix == Some("private/"),
+            driver.list_objects("bucket", Some("private")),
+        )
+        .await
+        .expect("normalized prefix satisfies conditional allow");
+        let authorized = backend.list_authorizations();
+        let executed = backend.list_objects_calls();
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(executed.len(), 1);
+        assert_eq!(authorized[0].prefix.as_deref(), Some("private/"));
+        assert_eq!(authorized[0].delimiter.as_deref(), Some("/"));
+        assert_eq!(authorized[0].prefix, executed[0].prefix);
+        assert_eq!(authorized[0].delimiter, executed[0].delimiter);
+        assert_eq!(authorized[0].max_keys, executed[0].max_keys);
+        let denied =
+            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.list_objects("bucket", Some("private")))
+                .await;
+        assert!(matches!(denied, Err(FsError::Forbidden)));
+        assert_eq!(backend.list_objects_calls().len(), 1, "denied listing cannot reach storage");
+    }
 
     #[tokio::test]
     async fn backend_policy_denial_blocks_webdav_delete() {
