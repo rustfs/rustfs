@@ -916,8 +916,9 @@ impl DataUsageCache {
         // cursor/coverage receipt.  Caches without that proof still take the
         // normal rebuild path; this keeps an old, incomplete writer from
         // authorizing a new leader to skip namespace coverage.
+        // Cycle deadlines advance both counters, so a validated frontier from
+        // an earlier cycle must remain eligible for adoption.
         let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
-            && self.info.next_cycle == next_cycle
             && self.info.scan_identity == Some(identity)
             && (self.validated_scan_frontier().is_some()
                 || self.validated_raw_enumeration_cursor().is_some()
@@ -998,7 +999,18 @@ impl DataUsageCache {
             // not bind to the process-local leader epoch.
             receipt.digest = digest;
         }
-        if let Some(progress) = &mut self.info.scan_progress {
+        // A sweep without a durable position restarts from the first entry,
+        // so it observes nothing under the plan that finished the previous
+        // sweep. Keeping that plan would mark every sweep of a bucket written
+        // between cycles as mixed, and the bucket could never certify.
+        let has_position = self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some();
+        if let Some(progress) = &mut self.info.scan_progress
+            && has_position
+        {
             progress.requested_plan = scan_plan_digest;
         } else {
             self.info.scan_progress = Some(DataUsageScanProgress {

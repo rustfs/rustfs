@@ -47,12 +47,12 @@ permissions:
   contents: read
 
 # Concurrency groups are scoped per event so different triggers never cancel
-# each other: PR pushes cancel the previous run of that PR, main pushes keep
-# latest-wins semantics among themselves, and scheduled runs always complete
-# (a shared group used to let every merge kill the weekly scheduled run).
+# each other. PR pushes cancel superseded attempts; main and scheduled runs
+# finish so a busy merge stream cannot starve the complete baseline. For main,
+# GitHub retains one running run and replaces the pending run with the latest.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -128,7 +128,7 @@ jobs:
 
   test-and-lint:
     name: Workspace Test and Lint
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -146,11 +146,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # Every lane in this workflow reads its cache and none writes it.
-          # cache-warm.yml is the sole writer for all four keys: this workflow
-          # cancels superseded runs on main, and a cancelled run never reaches
-          # rust-cache's post step, so writing from here saved nothing (12 of 15
-          # consecutive main-push runs were cancelled). See rustfs/backlog#1600.
+          # Every lane reads its cache; cache-warm.yml remains the sole writer
+          # with the matching feature closure. Tests never compete to replace
+          # shared caches, including when a PR attempt is cancelled.
           cache-shared-key: ci-dev
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
@@ -195,13 +193,10 @@ jobs:
           # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
           # merge path is untouched while the experiment runs.
           #
-          # Dispatch is included because push alone cannot supply the samples:
-          # this workflow cancels superseded runs on main, and only 4 of the last
-          # 20 push-triggered Test and Lint jobs reached a terminal state — at
-          # that rate ten samples would take roughly fifty merges. The
-          # concurrency group is scoped by event_name, so a dispatched run has
-          # its own group and is not cancelled by merge traffic, which makes the
-          # sample collectable on demand rather than by waiting.
+          # During baseline collection, main pushes cancelled superseded runs:
+          # only 4 of 20 Test and Lint jobs reached a terminal state. Running
+          # main validations now finish; dispatch remains an independent group
+          # for collecting additional samples on demand.
           #
           # Baseline over 17 samples at 2:
           # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
@@ -250,11 +245,11 @@ jobs:
           mkdir -p artifacts/test-and-lint
           set +e
           timeout --verbose --signal=TERM --kill-after=30s 15m \
-            cargo test --all --doc \
+            cargo test --all --exclude e2e_test --doc \
             2>&1 | tee artifacts/test-and-lint/doctest.log
           status=${PIPESTATUS[0]}
           {
-            echo "command=cargo test --all --doc"
+            echo "command=cargo test --all --exclude e2e_test --doc"
             echo "exit_status=${status}"
             echo "finished_at=$(date --utc --iso-8601=seconds)"
             echo
@@ -281,21 +276,10 @@ jobs:
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
 
-      # Explicit gate for migration-critical suites. These tests already ran in
-      # the full nextest pass above; a single filtered nextest invocation keeps
-      # the named gate without rebuilding or re-running them one package at a time.
-      #
-      # The gate selects tests by name substring (data_movement / rebalance /
-      # decommission / source_cleanup / delete_marker), so renames can silently
-      # thin it. The script owns the filter expression and first verifies the
-      # selected-test count against the committed floor in
-      # .config/migration-gate-floor.txt before running the gate; renames or
-      # removals must update that file consciously (see the script header).
-      # Kept on the default profile (no --profile ci): a second --profile ci run
-      # would clobber target/nextest/ci/junit.xml, and none of these tests are
-      # quarantined so they gain nothing from the ci profile's retry overrides.
-      - name: Run rebalance/decommission migration proofs
-        run: ./scripts/check_migration_gate_count.sh
+      # Preserve the migration floor and require successful execution evidence
+      # from the workspace run, without compiling or executing its subset again.
+      - name: Verify rebalance/decommission migration proofs
+        run: ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
 
   # This gate builds into a fresh target directory to isolate the E2E root.
   # Give its cold build a separate budget from workspace tests and migration proofs.
@@ -525,13 +509,9 @@ jobs:
     runs-on: sm-standard-4
     timeout-minutes: 90
     strategy:
-      # On a PR, one failing protocol leg is enough to know the PR is not ready,
-      # so stop the sibling leg instead of paying another ~40 minutes for it.
-      # Everywhere else (main pushes, the merge queue, the weekly schedule) keep
-      # the full signal: there we want to know whether swift AND sftp are broken,
-      # not just whichever failed first. This is the only part of the early-stop
-      # work that also covers fork PRs, since it needs no token.
-      fail-fast: ${{ github.event_name == 'pull_request' }}
+      # Preserve both independent results when one protocol fails, so diagnosis
+      # and a focused fix do not require rebuilding an interrupted sibling.
+      fail-fast: false
       matrix:
         features:
           - name: swift
@@ -554,27 +534,50 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Protect Connect test home
-        run: chmod go-w "$(realpath "$HOME")"
+      - name: Prepare protocol test state
+        run: |
+          rm -f target/nextest/ci/junit.xml
+          chmod go-w "$(realpath "$HOME")"
 
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
+          ./scripts/ci/resource_sampler.sh start clippy
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
+        id: protocol-tests
+        shell: bash
         env:
           # Keep feature-test linking under the same bounded concurrency as the
           # main nextest lane; Clippy is metadata-only and needs no such limit.
           CARGO_BUILD_JOBS: "2"
+          SAMPLER_INTERVAL_SECS: "15"
         run: |
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+          mkdir -p artifacts/protocol-tests
+          ./scripts/ci/resource_sampler.sh start nextest
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }} \
+            2>&1 | tee artifacts/protocol-tests/nextest.log
+
+      - name: Upload protocol test reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-test-and-lint-${{ matrix.features.name }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/ci/junit.xml
+            artifacts/protocol-tests
+            artifacts/test-and-lint
+          retention-days: 3
+          if-no-files-found: warn
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 30
@@ -827,6 +830,10 @@ jobs:
           python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
           ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
 
+      # Keep E2E documentation coverage with its already-built package graph.
+      - name: Run E2E documentation tests
+        run: cargo test -p e2e_test --doc
+
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
       # profile.e2e-smoke default-filter in .config/nextest.toml is the single
       # wiring mechanism for e2e tests in CI — extend that filter instead of
@@ -836,18 +843,22 @@ jobs:
         env:
           NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
+          SAMPLER_INTERVAL_SECS: "15"
         run: |
+          ./scripts/ci/resource_sampler.sh start e2e-smoke
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
           python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
             --status-level all --final-status-level all --failure-output final
 
       - name: Upload e2e smoke diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-smoke-diagnostics-${{ github.run_number }}
           path: |
             ${{ runner.temp }}/rustfs-e2e-smoke-logs/
             ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+            artifacts/test-and-lint
           if-no-files-found: warn
 
       - name: Upload e2e smoke JUnit report

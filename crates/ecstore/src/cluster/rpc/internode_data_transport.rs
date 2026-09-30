@@ -901,6 +901,7 @@ pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeData
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
 
     async fn wait_for_capability_flight_waiters(entry: &PutFileCapabilityCacheEntry, waiters: usize) {
@@ -1024,6 +1025,45 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(open_err, Error::MethodNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn walk_dir_restores_explicit_remote_missing_error() {
+        let _ = rustfs_credentials::set_global_rpc_secret("walk-dir-error-test-secret".to_string());
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("test listener address should be available");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test server should accept the request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.expect("request should be readable");
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nx-rustfs-disk-error: file-not-found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("typed disk error response should be writable");
+        });
+
+        let endpoint = format!("http://{addr}");
+        let error = match TcpHttpInternodeDataTransport
+            .open_walk_dir(WalkDirStreamRequest {
+                endpoint: endpoint.clone(),
+                disk: "disk-a".to_string(),
+                body: b"{}".to_vec(),
+                stall_timeout: Some(Duration::from_secs(2)),
+            })
+            .await
+        {
+            Ok(_) => panic!("an explicit remote missing-path response must fail the open"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::FileNotFound));
+        server.await.expect("test server task should finish");
     }
 
     #[test]

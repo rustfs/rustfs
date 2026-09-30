@@ -1587,26 +1587,31 @@ where
         .iter()
         .filter_map(|replica| replica.revision.clone().map(|revision| (replica.id, revision)))
         .collect::<HashMap<_, _>>();
-    let results = join_all(writable.into_iter().map(|set| {
-        let id = ScannerPauseBacklogReplicaId {
-            pool_index: set.pool_index,
-            set_index: set.set_index,
-        };
-        let revision = revisions.get(&id).cloned();
-        let data = data.clone();
-        let storeapi = storeapi.clone();
-        async move {
-            let Some(revision) = revision else {
-                return (id, Err("replica revision is unavailable".to_string()));
+    // Replica writes can share the pool namespace or the fixed multipool lock.
+    // Finish each write before starting another acquisition for this publication.
+    // Own the whole selected cohort so canceling the waiter cannot abandon
+    // replicas that have not started their serialized write yet.
+    let results = tokio::spawn(async move {
+        let mut results = Vec::with_capacity(writable.len());
+        for set in writable {
+            let id = ScannerPauseBacklogReplicaId {
+                pool_index: set.pool_index,
+                set_index: set.set_index,
             };
-            let result = storeapi
-                .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data, revision.preconditions())
-                .await
-                .map_err(|err| err.to_string());
-            (id, result)
+            let result = match revisions.get(&id) {
+                Some(revision) => storeapi
+                    .clone()
+                    .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data.clone(), revision.preconditions())
+                    .await
+                    .map_err(|err| err.to_string()),
+                None => Err("replica revision is unavailable".to_string()),
+            };
+            results.push((id, result));
         }
-    }))
-    .await;
+        results
+    })
+    .await
+    .map_err(|err| format!("scanner pause backlog publication owner failed: {err}"))?;
 
     let failures = results
         .iter()
@@ -2245,6 +2250,48 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn native_writer_does_not_spend_replica_lock_budget_waiting_for_its_own_write() {
+        run_native_retirement_test(async || {
+            use crate::storage_api::owner::{PutObjectCommitBarrier, PutObjectCommitPause, ecstore_get_lock_acquire_timeout};
+
+            let (_root, store) = native_retirement_store().await;
+            let before = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("load the native multipool cohort before its first claim");
+            assert_eq!(before.replicas.len(), 6);
+            let now = unix_now();
+            let expected = claim_scanner_pause_backlog_writer(&before.ledger, now).expect("the first writer generation");
+            let acquire_timeout = ecstore_get_lock_acquire_timeout();
+            assert_eq!(acquire_timeout, Duration::from_secs(5), "retain the production acquisition budget");
+            let barrier = PutObjectCommitBarrier::install(
+                RUSTFS_META_BUCKET,
+                &SCANNER_PAUSE_BACKLOG_PATH,
+                PutObjectCommitPause::AfterNamespace,
+            );
+            let writer_store = Arc::clone(&store);
+            let writer = tokio::spawn(async move { ScannerPauseBacklogController::claim(writer_store, now).await });
+            barrier.wait_until_paused().await;
+
+            // Every native multipool replica takes the same fixed outer lock.
+            // A parallel sibling would exhaust its unchanged budget while this
+            // write owns that lock. Keep real time and the native lock budget.
+            tokio::time::sleep(acquire_timeout + Duration::from_secs(1)).await;
+            assert!(!writer.is_finished(), "the first native write must remain behind the barrier");
+            drop(barrier);
+
+            let controller = writer
+                .await
+                .expect("the native writer task completes")
+                .expect("one publication must not time out acquiring locks held by its own replica writes");
+            assert!(!controller.loaded.requires_reload);
+            assert_current_native_writer_ledger(&store, &expected).await;
+            drop(controller);
+            shutdown_native_retirement_store(store).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn native_writer_expansion_seed_failure_preserves_old_authority() {
         run_native_retirement_test(async || {
             for old_pool_count in [1, 2] {
@@ -2355,18 +2402,57 @@ mod tests {
             assert!(pool_meta_lock.get_write_lock_quiet(Duration::from_millis(100)).await.is_err());
             barrier.release();
             tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
+                let loaded = loop {
                     let loaded = load_scanner_pause_backlog(Arc::clone(&store))
                         .await
                         .expect("cancellation cannot erase the old authority");
                     assert_eq!(loaded.ledger, original);
-                    let committed = loaded.authoritative_commit.expect("seed retains the old cohort proof");
+                    let committed = loaded
+                        .authoritative_commit
+                        .as_ref()
+                        .expect("seed retains the old cohort proof");
                     assert_eq!(committed.replicas, vec![replica_id(0, 0), replica_id(0, 1)]);
+                    assert_eq!(loaded.replica_count, 6);
                     if loaded.healthy_replicas == loaded.replica_count {
-                        break;
+                        break loaded;
                     }
                     tokio::task::yield_now().await;
-                }
+                };
+                let drained_fence = pool_meta_lock
+                    .get_write_lock_quiet(Duration::from_secs(30))
+                    .await
+                    .expect("the detached seed owner releases its membership fence after persistence");
+                drop(drained_fence);
+                assert_eq!(loaded.ledger, original);
+                let committed = loaded
+                    .authoritative_commit
+                    .as_ref()
+                    .expect("seed retains the old cohort proof");
+                assert_eq!(committed.replicas, vec![replica_id(0, 0), replica_id(0, 1)]);
+                assert_eq!(loaded.replica_count, 6);
+                assert_eq!(loaded.healthy_replicas, 6);
+                let seeded = loaded
+                    .replicas
+                    .iter()
+                    .find(|replica| replica.id == replica_id(2, 0))
+                    .expect("the canceled caller's admitted seed replica");
+                assert!(matches!(
+                    &seeded.state,
+                    ScannerPauseBacklogReplicaState::Valid(record)
+                        if record.stable.as_ref() == Some(&original) && record.committed.as_ref() == Some(committed)
+                ));
+                // The detached publication owner finishes every selected replica
+                // without advancing beyond the old committed authority.
+                let remaining = loaded
+                    .replicas
+                    .iter()
+                    .find(|replica| replica.id == replica_id(2, 1))
+                    .expect("the remaining seed replica");
+                assert!(matches!(
+                    &remaining.state,
+                    ScannerPauseBacklogReplicaState::Valid(record)
+                        if record.stable.as_ref() == Some(&original) && record.committed.as_ref() == Some(committed)
+                ));
             })
             .await
             .expect("detached native seed owners must drain without the canceled caller");

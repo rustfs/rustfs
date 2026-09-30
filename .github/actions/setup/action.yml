@@ -107,6 +107,8 @@ runs:
     - name: Install cargo-nextest
       if: inputs.install-test-tools == 'true'
       uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
+      with:
+        tool: cargo-nextest@0.9.138
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

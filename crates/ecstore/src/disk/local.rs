@@ -1372,13 +1372,24 @@ pub(crate) fn durability_mode() -> DurabilityMode {
             rustfs_utils::get_env_opt_str(ENV_RUSTFS_DURABILITY_MODE),
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
         );
-        info!(
-            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-            mode = mode.as_str(),
-            "Storage durability mode resolved"
-        );
+        if mode == DurabilityMode::Strict {
+            info!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                mode = mode.as_str(),
+                "Storage durability mode resolved"
+            );
+        } else {
+            warn!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                state = "non_strict_mode_configured",
+                mode = mode.as_str(),
+                "Storage durability mode does not provide strict power-loss durability"
+            );
+        }
         mode
     })
 }
@@ -6915,7 +6926,9 @@ impl LocalDisk {
 
         let (buf, mtime) = res?;
         if buf.is_empty() {
-            return Err(DiskError::FileNotFound);
+            // A missing xl.meta is mapped by the open/read error above. A file
+            // that exists but has no metadata bytes is corruption, not absence.
+            return Err(DiskError::FileCorrupt);
         }
 
         Ok((buf, mtime))
@@ -11698,6 +11711,39 @@ mod test {
     }
 
     #[tokio::test]
+    async fn read_version_reports_empty_xl_meta_as_corrupt_not_missing() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("test directory should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("test path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "empty-metadata";
+        ensure_test_volume(&disk, bucket).await;
+
+        let missing_err = disk
+            .read_version("", bucket, "missing-object", "", &ReadOptions::default())
+            .await
+            .expect_err("a missing xl.meta remains not found");
+        assert_eq!(missing_err, DiskError::FileNotFound);
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir)
+            .await
+            .expect("object directory should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"")
+            .await
+            .expect("empty metadata fixture should be written");
+
+        let err = disk
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("an existing zero-length xl.meta is corrupt, not an absent object");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
     async fn read_version_delete_marker_never_enters_inline_shard_math() {
         use tempfile::tempdir;
 
@@ -13382,24 +13428,24 @@ mod test {
         );
     }
 
-    /// A writer that stalls on every write, standing in for a slow listing
-    /// consumer (quorum merge, a lagging peer drive).
+    /// A writer that advances paused time on every write, standing in for a
+    /// slow listing consumer without depending on host scheduling.
     struct SlowWriter {
         delay: Duration,
-        sleep: Option<Pin<Box<Sleep>>>,
+        advance: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     }
 
     impl AsyncWrite for SlowWriter {
         fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-            if self.sleep.is_none() {
+            if self.advance.is_none() {
                 let delay = self.delay;
-                self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                self.advance = Some(Box::pin(tokio::time::advance(delay)));
             }
 
-            let sleep = self.sleep.as_mut().expect("sleep was just installed");
-            match sleep.as_mut().poll(cx) {
+            let advance = self.advance.as_mut().expect("clock advance was just installed");
+            match advance.as_mut().poll(cx) {
                 Poll::Ready(()) => {
-                    self.sleep = None;
+                    self.advance = None;
                     Poll::Ready(Ok(buf.len()))
                 }
                 Poll::Pending => Poll::Pending,
@@ -13434,6 +13480,7 @@ mod test {
 
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.wait_for_startup_cleanup().await;
 
         let stall = Duration::from_millis(300);
         let write_delay = Duration::from_millis(150);
@@ -13447,12 +13494,21 @@ mod test {
 
         let mut writer = SlowWriter {
             delay: write_delay,
-            sleep: None,
+            advance: None,
         };
 
-        let started = std::time::Instant::now();
+        // A live blocking task inhibits Tokio's automatic clock advance while
+        // real filesystem reads are pending. Only consumer writes advance time.
+        let (clock_guard_tx, clock_guard_rx) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || clock_guard_rx.recv());
+        tokio::time::pause();
+        let started = Instant::now();
         let result = disk.walk_dir(opts, &mut writer).await;
         let elapsed = started.elapsed();
+        drop(clock_guard_tx);
+        let _ = clock_guard
+            .await
+            .expect("clock guard should exit after its sender is dropped");
 
         assert!(result.is_ok(), "a walk making steady progress must not time out, got {result:?}");
         assert!(
