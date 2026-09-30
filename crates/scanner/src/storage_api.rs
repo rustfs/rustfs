@@ -349,8 +349,9 @@ pub(crate) mod scanner_io {
             metadata_sys::update as update_bucket_metadata,
         },
         data_usage::{
-            apply_bucket_usage_memory_overlay, record_bucket_object_delete_memory, record_bucket_object_write_memory,
-            replace_bucket_usage_memory_from_info,
+            apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached, load_data_usage_from_backend,
+            record_bucket_object_delete_memory, record_bucket_object_write_memory, replace_bucket_usage_memory_from_info,
+            store_data_usage_in_backend as seed_persisted_usage,
         },
     };
 }
