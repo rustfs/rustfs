@@ -16,7 +16,7 @@
 
 use super::client::ProtocolStorageClient;
 use crate::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
-use crate::storage_api::protocols::client::{BucketOperations, FS, MakeBucketOptions};
+use crate::storage_api::protocols::client::{BucketOperations, FS, ListObjectsV2Input, MakeBucketOptions};
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{
@@ -31,7 +31,6 @@ use rustfs_protocols::common::{
     gateway::{AuthorizationError, S3Action},
     session::{Protocol, ProtocolPrincipal, SessionContext},
 };
-use s3s::dto::ListObjectsV2Input;
 use serde_json::json;
 use std::sync::Arc;
 
